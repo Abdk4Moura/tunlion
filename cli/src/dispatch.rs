@@ -2083,7 +2083,14 @@ pub(crate) async fn async_main() -> Result<()> {
             capability,
             tag,
             user,
+            on,
         } => {
+            if let Some(target) = on {
+                let (Some(device), Some(capability)) = (device, capability) else {
+                    crate::bail_usage!("usage: tunlion grant <device> <capability> --on <device>");
+                };
+                return crate::fleet_trust_cmd::grant_on(&device, &capability, &target);
+            }
             let (device, capability) = grant_operands(device, capability, tag.as_deref())?;
             // Valid on every device or on none: checked before the owner/joined
             // split, so no advice below can name a spec that would be refused.
@@ -2432,7 +2439,14 @@ pub(crate) async fn async_main() -> Result<()> {
             capability,
             certificate,
             user,
+            on,
         } => {
+            if let Some(target) = on {
+                let Some(capability) = capability else {
+                    crate::bail_usage!("usage: tunlion revoke <device> <capability> --on <device>");
+                };
+                return crate::fleet_trust_cmd::revoke_on(&device, &capability, &target);
+            }
             if certificate {
                 if capability.is_some() {
                     crate::bail_usage!("choose either a capability or --certificate, not both");

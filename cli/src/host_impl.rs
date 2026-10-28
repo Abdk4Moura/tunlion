@@ -201,6 +201,28 @@ impl HostServices for CliHost {
     fn fleet_rv_present(&self) -> bool {
         crate::fleet::rv().is_some()
     }
+    fn fleet_grants_snapshot_json(&self, target_pub: &[u8; 32]) -> Option<String> {
+        // Owner only, and only for a certified, unrevoked device of THIS owner
+        // that has ever been granted something here.
+        let owner = crate::load_owner_key()?;
+        let store = crate::devices_store::store();
+        let rec = store.devices_find_by_device_pub(target_pub)?;
+        let cert = crate::identity::DeviceCert::from_json(&rec["deviceCert"])?;
+        if cert.user_pub != owner.public_key_bytes()
+            || store.device_cert_revoked(target_pub)
+            || !store.fleet_grants_ever_for(target_pub)
+        {
+            return None;
+        }
+        let now = crate::identity::now_secs();
+        let blob = store
+            .mint_fleet_grant_set(&owner, target_pub, now, crate::roster::roster_ttl_secs())
+            .ok()?;
+        serde_json::to_string(&blob).ok()
+    }
+    fn fleet_grant_held(&self, device_pub: &[u8; 32], capability: &str) -> bool {
+        crate::devices_store::store().fleet_grant_held(device_pub, capability, crate::identity::now_secs())
+    }
     #[cfg(l3)]
     fn hostname(&self) -> String {
         crate::l3::hostname()

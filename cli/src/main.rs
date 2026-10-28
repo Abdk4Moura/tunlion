@@ -160,6 +160,7 @@ pub(crate) use mount_cmd::{reset_cmd, resolve_mount_plan};
 pub(crate) use mount_cmd::mount_fuse_cmd;
 /// Fleet helpers and mesh housekeeping.
 mod fleet_support;
+mod fleet_trust_cmd;
 /// Forget and revoke, in effect in the running daemon.
 mod revocation_live;
 /// Used invitations, kept on disk apart from any device record.

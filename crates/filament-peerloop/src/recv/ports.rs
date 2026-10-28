@@ -170,6 +170,18 @@ pub trait RecvIdentity: Send + Sync {
         owner_pub: &[u8; 32],
         now: u64,
     ) -> anyhow::Result<bool>;
+    /// Judge and, on accept, keep an owner-signed fleet grant set about this
+    /// device (`DeviceStore::verify_and_store_fleet_grants`). A host with no
+    /// device store refuses, so nothing is ever applied by default.
+    fn verify_and_store_fleet_grants(
+        &self,
+        _blob: &Value,
+        _owner_pub: &[u8; 32],
+        _device_pub: &[u8; 32],
+        _now: u64,
+    ) -> anyhow::Result<filament_cap::fleet_grants::GrantSetJudgement> {
+        anyhow::bail!("this host keeps no fleet grants")
+    }
     fn verify_depart(
         &self,
         device_pub: &[u8; 32],

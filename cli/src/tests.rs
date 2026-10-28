@@ -2817,22 +2817,22 @@ fn upgrade_never_promotes_a_link_to_owner() {
     use crate::capability::PrincipalKind;
 
     // A fleet device stays a fleet device, and stays untrusted.
-    let fleet = upgrade_principal(&Some((false, PrincipalKind::FleetDevice)));
+    let fleet = upgrade_principal(&Some((false, PrincipalKind::FleetSibling)));
     assert!(
         !fleet.0,
         "an untrusted link must not become trusted by upgrading"
     );
     assert_eq!(
         fleet.1,
-        PrincipalKind::FleetDevice,
+        PrincipalKind::FleetSibling,
         "a fleet device must not be promoted to OwnerDevice by upgrading"
     );
 
     // A trusted fleet device keeps its KIND even though it is trusted, which
     // is the case the old code silently collapsed into OwnerDevice.
-    let trusted_fleet = upgrade_principal(&Some((true, PrincipalKind::FleetDevice)));
+    let trusted_fleet = upgrade_principal(&Some((true, PrincipalKind::FleetSibling)));
     assert!(trusted_fleet.0);
-    assert_eq!(trusted_fleet.1, PrincipalKind::FleetDevice);
+    assert_eq!(trusted_fleet.1, PrincipalKind::FleetSibling);
 
     // An owner device is unchanged, so the fix is not a behaviour regression
     // for the ordinary path.

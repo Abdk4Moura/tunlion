@@ -937,72 +937,6 @@ pub fn fleet_auto_trust(
     same_owner && binding == BindingStrength::Proven && scoped_in_bounds && cert_not_revoked
 }
 
-/// The transfer scope a fleet SIBLING may use (fleet auto-mesh, 0.9.2 scope).
-///
-/// A sibling is a `FleetDevice` principal: a device admitted on its own
-/// owner-signed certificate over the fleet channel, never paired with this
-/// machine. Auto-mesh gives it REACHABILITY; it does not give it the inbox.
-/// The transfer scoped default ("drop a file in the receiving directory with no
-/// grant") stays with devices this machine actually paired with, and a sibling
-/// lands a file only when an explicit grant for `transfer` exists. So for a
-/// sibling the scope is in force only together with that grant; for every other
-/// principal it is returned unchanged.
-///
-/// Purely restrictive: the result is never true unless `scoped_in_bounds` is,
-/// so this cannot widen any gate it is applied to.
-pub fn sibling_transfer_scope(
-    is_fleet_sibling: bool,
-    scoped_in_bounds: bool,
-    has_explicit_grant: bool,
-) -> bool {
-    if is_fleet_sibling {
-        scoped_in_bounds && has_explicit_grant
-    } else {
-        scoped_in_bounds
-    }
-}
-
-#[cfg(test)]
-mod sibling_transfer_scope_laws {
-    use super::*;
-
-    #[test]
-    fn a_sibling_needs_an_explicit_grant_and_the_rule_never_widens() {
-        // Sibling without a grant: no scoped default, in or out of bounds.
-        assert!(!sibling_transfer_scope(true, true, false));
-        assert!(!sibling_transfer_scope(true, false, false));
-        // Sibling with a grant: only inside the receiving directory.
-        assert!(sibling_transfer_scope(true, true, true));
-        assert!(!sibling_transfer_scope(true, false, true));
-        // Everyone else: unchanged, whatever the grant says.
-        for g in [false, true] {
-            assert!(sibling_transfer_scope(false, true, g));
-            assert!(!sibling_transfer_scope(false, false, g));
-        }
-        // Never widens: exhaustive over the three inputs.
-        for a in [false, true] {
-            for b in [false, true] {
-                for c in [false, true] {
-                    assert!(!sibling_transfer_scope(a, b, c) || b);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn an_ungranted_sibling_gets_no_fleet_auto_trust_for_transfer() {
-        // Composed with the auto-trust rule the gate uses: the sibling's
-        // in-bounds drop no longer auto-authorizes without a grant.
-        let scope = sibling_transfer_scope(true, true, false);
-        assert!(!fleet_auto_trust(true, BindingStrength::Proven, scope, true));
-        let scope = sibling_transfer_scope(true, true, true);
-        assert!(fleet_auto_trust(true, BindingStrength::Proven, scope, true));
-        // A revoked or unproven sibling stays out even with a grant.
-        assert!(!fleet_auto_trust(true, BindingStrength::Proven, scope, false));
-        assert!(!fleet_auto_trust(true, BindingStrength::Inferred, scope, true));
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tag store objects  (owner-signed, verified at resolution time)
 // ---------------------------------------------------------------------------
@@ -1525,23 +1459,27 @@ pub enum PrincipalKind {
     Delegated {
         caps: Vec<String>,
     },
-    /// A same-owner FLEET device: identity proven by an owner-signed certificate
-    /// bound to the link, but NOT this machine's owner principal.
+    /// A same-owner fleet SIBLING: "your device", not owner-equivalent.
+    ///
+    /// Identity proven by its own owner-signed `DeviceCert`, bound to the live
+    /// link (a verified `fleet-hello`, or a meeting place a verified sibling
+    /// brokered). Never paired with this machine. What the kind implies is
+    /// exactly `fleet_grants::FLEET_SIBLING_DEFAULT` (file transfer into the
+    /// receiving directory); shell, exec, forward, mount and routes, including
+    /// the scoped defaults a paired same-owner device gets, each need an
+    /// explicit grant (the receiver's own, or an owner-signed grant about this
+    /// device). A local deny, revocation (local, or the owner's roster dropping
+    /// it) or certificate expiry ends everything at once. The mapping into the
+    /// gate is `fleet_grants::fleet_sibling_inputs`; its laws live there.
     ///
     /// Distinct from both neighbours on purpose:
-    ///   - not `Delegated`, because that carries an auth-key CEILING, and the
-    ///     ceiling check is unconditional and purely restrictive. A fleet sibling
-    ///     is not an auth-key borrower, and giving it an empty ceiling denied
-    ///     everything before the fleet policy in `cap_gate_effective` was ever
-    ///     consulted. (Delegated also means "ephemeral, drop on disconnect",
-    ///     which a persistent sibling is not.)
+    ///   - not `Delegated`, whose auth-key CEILING is unconditional and purely
+    ///     restrictive and which means "ephemeral, drop on disconnect";
     ///   - not `OwnerDevice`, so nothing reads it as the local primary.
     ///
-    /// It carries no ceiling, which is safe precisely because
-    /// `cap_gate_effective` DISCARDS the owner shortcut for a same-owner peer and
-    /// recomputes from fleet policy: a scoped default within bounds plus Proven
-    /// is auto-authorized, and everything else stays grant-only.
-    FleetDevice,
+    /// Replaces the filament-era `FleetDevice`, which carried every scoped
+    /// default a paired same-owner device has.
+    FleetSibling,
 }
 
 impl PrincipalKind {
@@ -1549,8 +1487,9 @@ impl PrincipalKind {
     pub fn auth_key_caps(&self) -> Option<&[String]> {
         match self {
             PrincipalKind::OwnerDevice => None,
-            // No ceiling: the fleet policy in `cap_gate_effective` decides.
-            PrincipalKind::FleetDevice => None,
+            // No auth-key ceiling: its bound is the kind itself, applied by
+            // `fleet_grants::fleet_sibling_inputs` before the shared gate.
+            PrincipalKind::FleetSibling => None,
             PrincipalKind::Delegated { caps } => Some(caps),
         }
     }

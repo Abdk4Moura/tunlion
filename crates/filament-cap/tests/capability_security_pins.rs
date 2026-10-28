@@ -462,7 +462,7 @@ fn delegated_principal_carries_its_ceiling() {
     let p = PrincipalKind::Delegated { caps: caps.clone() };
     assert_eq!(p.auth_key_caps(), Some(&caps[..]));
     assert_eq!(PrincipalKind::OwnerDevice.auth_key_caps(), None);
-    assert_eq!(PrincipalKind::FleetDevice.auth_key_caps(), None);
+    assert_eq!(PrincipalKind::FleetSibling.auth_key_caps(), None);
 }
 
 /// Only shell and route are deliberate-tier; transfer and mount are scoped

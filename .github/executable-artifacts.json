@@ -240,6 +240,17 @@
       ]
     },
     {
+      "path": "cli/tests/fleet-trust-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/fleet-trust-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/revocation-live-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/revocation-live-gates.sh",
@@ -440,6 +451,7 @@
         "cli/tests/expiry-race-gates.sh",
         "cli/tests/fleet-automesh-gates.sh",
         "cli/tests/fleet-cert-gates.sh",
+        "cli/tests/fleet-trust-gates.sh",
         "cli/tests/forward-refusal-gates.sh",
         "cli/tests/invite-expiry-gates.sh",
         "cli/tests/l2-revoke-gates.sh",
@@ -803,6 +815,17 @@
       "path": "proofs/fleet_automesh_model.py",
       "disposition": "required",
       "entrypoint": "python3 proofs/fleet_automesh_model.py",
+      "matrix": [
+        {
+          "platform": "portable",
+          "topology": "model-checker"
+        }
+      ]
+    },
+    {
+      "path": "proofs/fleet_trust_model.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/fleet_trust_model.py",
       "matrix": [
         {
           "platform": "portable",

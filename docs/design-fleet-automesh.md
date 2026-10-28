@@ -63,6 +63,75 @@ tree from the filament era are named honestly: the `FleetDevice` principal kind
 `fleet-policy` relay of owner-signed cap ops (unchanged; an owner-signed grant
 already counted as an explicit grant on every fleet device in 0.9.1).
 
+## 0.9.2 fleet trust: the two deferred decisions, decided (2026-10-28)
+
+Stacked on the auto-mesh change above. The owner decided both items that
+section left out.
+
+### 1. The `FleetSibling` principal kind
+
+"Identity proven by a valid owner-signed DeviceCert, same owner, NOT
+owner-equivalent." It replaces the filament-era `FleetDevice`, which carried
+every scoped default a paired same-owner device has. What the kind itself
+implies is `filament_cap::fleet_grants::FLEET_SIBLING_DEFAULT`, which is file
+transfer into the receiving directory and nothing else. Shell, exec, forward
+(even to an exposed port), mount and routes are never implied; each needs an
+explicit grant (this device's own, or an owner-signed one about this device).
+
+The bound is applied by one pure mapping, `fleet_sibling_inputs`, before the
+shared gate, at every sibling-reachable gate (file-offer, sync, shell/exec/pty,
+forward, mount). Everything absolute stays absolute and comes first: a local
+deny, revocation (local, or the owner's roster dropping the device) and
+certificate expiry each refuse whatever the kind or a grant says, and the
+auto-mesh sweep closes the link at once. Laws: `fleet_grants::laws`, plus
+`local_deny_outranks_a_fleet_siblings_default_and_owner_grant` composing the
+mapping with the real gate in both modes.
+
+Interpretation recorded: "a ceiling that denies everything else" is read as a
+ceiling on what the KIND implies, not on what a device may explicitly grant. A
+sibling granted shell on the receiver (or by the owner, below) gets shell; a
+sibling with no grant gets transfer only. If a hard cap on grants is wanted
+instead, it is a one-line change in `fleet_sibling_inputs`.
+
+The device view lists a sibling as "your device" with its transfer default and
+any granted capability; owner-equivalent is still spelled out wherever shell is
+held.
+
+### 2. Owner-signed grant distribution
+
+`tunlion grant <subject> <cap> --on <target>` on the owner device (and
+`revoke ... --on`). The owner keeps the grant as local state; its daemon signs
+the current set ABOUT EACH TARGET (`filament_id::FleetGrantSet`: owner, target,
+epoch, valid_until, grants; its own signature domain) and pushes it over the
+existing authenticated link to that target only, every roster tick. The target
+judges it with `judge_grant_set`: signed by the owner key it already holds,
+naming itself as target, unexpired, strictly newer in `(epoch, valid_until)`
+(replay and older sets are no-ops). It keeps the newest accepted set as a
+separate file and re-verifies it on every read; a held set past its
+`valid_until` grants nothing, so grants lapse when the owner stops refreshing.
+A revoked subject is left out of the next set. Only `transfer`, `shell` and
+`mount` are distributable.
+
+**Why this does not reopen "the cap store has no network write".** The set is
+never written into the capability store; it is consulted only for a
+`FleetSibling` subject on the target it names. Only the owner key can author one:
+a compromised sibling holds no such key, a set it signs with its own key is
+another owner's and refused, and a genuine set it relays for another device
+names the wrong target. Cross-owner isolation is the owner-key match. A local
+deny on the target outranks it. As part of this change the old `fleet-policy`
+relay, which did write owner grant ops into every joined device's cap store
+(they applied the owner's grants about the OWNER on every device, which is not
+what the owner decided), now merges revocations only. The honest cost: an owner
+key compromise can now author shell grants on fleet devices, where before it
+could only mint certificates. The containment that remains is the local deny and
+the time box.
+
+Proven by `proofs/fleet_trust_model.py` (CI-gated): forged, foreign and
+misdirected sets never held; no expired set accepted or used; held epoch
+monotone, so a replay cannot resurrect a withdrawn grant; deny and known
+revocation always refuse; no trap states. Six mutants, each must fail. Live:
+`cli/tests/fleet-trust-gates.sh`.
+
 ## Problem
 
 Install plus pair does not give a mesh. A pairing mints one shared secret and

@@ -385,6 +385,12 @@ pub trait HostServices: Send + Sync + 'static {
     /// The owner-signed roster blob, serialized, or `None` when this device has
     /// no owner key or minting fails.
     fn roster_snapshot_json(&self) -> Option<String>;
+    /// Owner-only: the owner-signed fleet grant set about the fleet device
+    /// `target_pub`, freshly minted. `None` on a device that holds no owner key,
+    /// or when `target_pub` is not a certified, unrevoked device of this owner.
+    fn fleet_grants_snapshot_json(&self, _target_pub: &[u8; 32]) -> Option<String> {
+        None
+    }
     /// Is there a fleet rendezvous value on this machine at all?
     fn fleet_rv_present(&self) -> bool;
     /// This machine's short host label, as the mesh uses it for `<name>.mesh`.
@@ -585,6 +591,11 @@ pub trait HostServices: Send + Sync + 'static {
     /// only thing that may authorize, such as a fleet sibling's transfer. An
     /// inert host grants nothing.
     fn device_record_grants(&self, _name: &str, _capability: &str) -> bool {
+        false
+    }
+    /// Does an owner-signed fleet grant set held by this device grant the
+    /// sibling `device_pub` the `capability`, right now? Inert hosts hold none.
+    fn fleet_grant_held(&self, _device_pub: &[u8; 32], _capability: &str) -> bool {
         false
     }
     /// Is this device key present in the host's device store at all? Used by

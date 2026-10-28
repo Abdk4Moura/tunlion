@@ -307,11 +307,11 @@ mod tests {
         let prior = std::env::var("TUNLION_CAP_AUTHORITATIVE").ok();
         unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", "0") };
 
-        let fp = fleet_link_proven(&PrincipalKind::FleetDevice, BindingStrength::Proven, true, true);
+        let fp = fleet_link_proven(&PrincipalKind::FleetSibling, BindingStrength::Proven, true, true);
         assert!(fp, "what admit_fleet leaves on a verified fleet-hello link");
-        assert!(!fleet_link_proven(&PrincipalKind::FleetDevice, BindingStrength::Inferred, true, true));
-        assert!(!fleet_link_proven(&PrincipalKind::FleetDevice, BindingStrength::Proven, true, false));
-        assert!(!fleet_link_proven(&PrincipalKind::FleetDevice, BindingStrength::Proven, false, true));
+        assert!(!fleet_link_proven(&PrincipalKind::FleetSibling, BindingStrength::Inferred, true, true));
+        assert!(!fleet_link_proven(&PrincipalKind::FleetSibling, BindingStrength::Proven, true, false));
+        assert!(!fleet_link_proven(&PrincipalKind::FleetSibling, BindingStrength::Proven, false, true));
         assert!(!fleet_link_proven(&PrincipalKind::OwnerDevice, BindingStrength::Proven, true, true));
 
         let owner = [0x11u8; 32];

@@ -53,7 +53,7 @@ pub fn link_must_close(
     f.device_pub.as_ref().is_some_and(|k| key_listed(k))
 }
 
-/// Must this fleet SIBLING link close now? A sibling (a `FleetDevice`
+/// Must this fleet SIBLING link close now? A sibling (a `FleetSibling`
 /// principal: admitted on its owner-signed certificate, never paired) holds its
 /// link on exactly two facts, and loses it the moment either stops being true:
 /// the device is not revoked (locally, or by the owner withdrawing it from the

@@ -195,6 +195,11 @@ pub async fn admit_forward_open(
         // Forward's auto-trust bound is the EXPOSE list (a scoped default,
         // mode-independent); the enrolment ceiling plays no part here.
         gate_inputs.scoped_default = reach_port != 0 && (cfg.is_exposed)(reach_port);
+        // A FleetSibling gets no forward scoped default: the kind implies
+        // transfer only, so an exposed port still needs an explicit grant.
+        let sib = crate::shell_gate::sibling_facts(conn, pid, "forward");
+        gate_inputs.scoped_default =
+            crate::shell_gate::sibling_gate_inputs(&sib, "forward", gate_inputs.scoped_default, false).0;
         gate_inputs.ceiling_covers = false;
         let legacy_ok = {
             let blanket = cfg.shell_policy.enables_l2() || cfg.l2_forced;

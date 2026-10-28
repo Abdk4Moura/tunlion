@@ -776,6 +776,12 @@ pub(crate) enum Cmd {
         /// certified receives it (for your own fleet, that is every device).
         #[arg(long, conflicts_with = "tag")]
         user: bool,
+        /// Owner device only: grant it on ANOTHER of your devices instead of
+        /// this one. Signed by your owner key and delivered to that device; it
+        /// applies there to DEVICE as a device of yours, and a deny recorded on
+        /// that device still wins. `tunlion grant laptop shell --on server`.
+        #[arg(long, value_name = "DEVICE", conflicts_with_all = ["tag", "user"])]
+        on: Option<String>,
     },
     /// Revoke a capability or a fleet certificate from a known device.
     Revoke {
@@ -790,6 +796,9 @@ pub(crate) enum Cmd {
         /// removes it from every device of that user.
         #[arg(long, conflicts_with = "certificate")]
         user: bool,
+        /// Owner device only: withdraw a grant made with `grant --on DEVICE`.
+        #[arg(long, value_name = "DEVICE", conflicts_with_all = ["certificate", "user"])]
+        on: Option<String>,
     },
     /// Mount a remote directory over Tunlion's native filesystem protocol.
     /// Read-only is the default; the remote share root and grant remain authoritative.
