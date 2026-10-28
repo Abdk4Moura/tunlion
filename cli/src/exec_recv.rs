@@ -161,10 +161,13 @@ pub(crate) fn resolve_in_path(program: &str) -> Option<PathBuf> {
     }
     // The PATH the child will run with: the account's default as it is NOW
     // (a tool installed or a PATH edit made after the daemon started is
-    // found), never the daemon's own start-time PATH.
+    // found), never the daemon's own start-time PATH. Windows with no account
+    // block keeps the daemon PATH it used before (the filtered fallback);
+    // Unix falls back to the standard path, as sshd has none to copy.
     let account = crate::platform::account_environment().unwrap_or_default();
     let path = filament_peerloop::shell::user_env::path_of(&account)
         .map(str::to_string)
+        .or_else(crate::platform::daemon_path)
         .unwrap_or_else(|| filament_peerloop::shell::user_env::UNIX_DEFAULT_PATH.to_string());
     resolve_on(program, &path)
 }

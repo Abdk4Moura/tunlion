@@ -14,9 +14,10 @@
 #   2 the user variable set after the daemon started is visible
 #   3 the tool in the PATH directory added after the daemon started is found
 #   4 the daemon-only variable is NOT visible
-# plus E5: the new tool runs as a bare `exec` argv[0] (resolved on the fresh PATH),
-# and S5: the shell is the user's default PowerShell with its profile loaded
-# (a variable the user's profile.ps1 sets is visible).
+# plus E5: the new tool (a real .exe; CreateProcess cannot start a .cmd) runs as
+# a bare `exec` argv[0] (resolved on the fresh PATH), and S5: the shell is the
+# user's default PowerShell with its profile loaded (a variable the user's
+# profile.ps1 sets is visible).
 param(
     [Parameter(Mandatory = $true)][string]$Bin,
     [string]$Python = 'python'
@@ -80,7 +81,9 @@ try {
 
     # --------------------------------- the user's environment changes NOW
     New-Item -ItemType Directory -Force -Path $toolDir | Out-Null
-    "@echo off`r`necho TOOL-RAN-$nonce`r`n" | Set-Content -LiteralPath (Join-Path $toolDir "$tool.cmd") -Encoding Ascii
+    # A real executable: Windows CreateProcess cannot start a .cmd directly, so
+    # a batch file would test the wrong thing. whoami.exe prints the account.
+    Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\whoami.exe') -Destination (Join-Path $toolDir "$tool.exe")
     [Environment]::SetEnvironmentVariable($userVar, $userVal, 'User')
     [Environment]::SetEnvironmentVariable('Path', ($(if ($savedUserPath) { "$savedUserPath;" } else { '' }) + $toolDir), 'User')
     foreach ($pf in $profiles) {
@@ -128,10 +131,10 @@ try {
         } else { Bad "${k}4: the daemon-only variable reached the child (or the probe did not run)" }
     }
 
-    $execText = Run-Tunlion 'exec' @('exec', 'boxB', '--', $probe)
+    $execText = Run-Tunlion 'exec' @('exec', 'boxB', '--', 'cmd', '/c', $probe)
     Check 'E' $execText
     $toolText = Run-Tunlion 'exec-tool' @('exec', 'boxB', '--', $tool)
-    if ($toolText -match "TOOL-RAN-$nonce") {
+    if ($toolText -match [regex]::Escape($env:USERNAME)) {
         Ok 'E5: a tool installed after the daemon started runs as a bare exec argv[0]'
     } else { Bad 'E5: the late tool was not found as a bare exec argv[0]' }
     $shellText = Run-Tunlion 'shell' @('shell', 'boxB', '--', $probe)

@@ -111,20 +111,21 @@ fn default_exec_cwd(user: &ExecUserContext) -> PathBuf {
 }
 
 /// The child's environment: the account's own default, as sshd builds it,
-/// never the daemon's process environment (`shell::user_env`). Windows
-/// refuses when there is no account block (a service-account daemon, an API
-/// failure) rather than hand out the daemon's.
+/// never the daemon's process environment (`shell::user_env`). Windows with no
+/// account block (a service-account daemon, an API failure) keeps the filtered
+/// daemon baseline instead, and the caller logs why.
 fn build_env(
     process: &dyn ExecProcess,
     explicit: &[(String, String)],
     user: &ExecUserContext,
     dropped: bool,
+    account: Result<Vec<(String, String)>, String>,
 ) -> Result<Vec<(String, String)>, String> {
     super::user_env::child_env(
         cfg!(windows),
         user,
         dropped,
-        process.account_environment(),
+        account,
         &process.daemon_environment(),
         explicit,
     )
@@ -345,7 +346,15 @@ pub async fn serve_exec(
             .await;
         return;
     }
-    let env = match build_env(process.as_ref(), &req.env, &user, dropped) {
+    let account = process.account_environment();
+    if cfg!(windows) {
+        if let Err(why) = &account {
+            log.debug(&format!(
+                "l2: account environment unavailable ({why}); keeping the filtered Windows baseline"
+            ));
+        }
+    }
+    let env = match build_env(process.as_ref(), &req.env, &user, dropped, account) {
         Ok(env) => env,
         Err(reason) => {
             log.say(&format!("l2: {reason}"));
@@ -1379,7 +1388,7 @@ mod tests {
         let env = windows_filtered_env();
         assert!(
             env_value(&env, "SystemRoot").is_some(),
-            "the daemon's own SystemRoot is the source of the baseline"
+            "the account block supplies SystemRoot"
         );
         assert!(env_value(&env, "PATH").is_some());
 

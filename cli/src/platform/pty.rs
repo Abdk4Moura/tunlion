@@ -120,8 +120,16 @@ pub fn spawn_shell(argv: &[String], cols: u16, rows: u16, term: &str) -> Result<
         }
         // Like sshd: the account's default environment and identity, never
         // the daemon's process environment; the login shell's profile files
-        // build the rest. (`runuser -l` for --shell-user resets it again for
-        // the target account.)
+        // build the rest. A `--shell-user` argv is the `runuser -l` drop: the
+        // target's identity is runuser's job (it resets HOME/USER/LOGNAME/
+        // SHELL/PATH), but the daemon's TUNLION_CONFIG_DIR must not follow it
+        // there (#602 is same-account only).
+        let dropped = argv.first().is_some_and(|a| {
+            std::path::Path::new(a)
+                .file_name()
+                .and_then(|n| n.to_str())
+                == Some("runuser")
+        });
         let daemon: Vec<(String, String)> = std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
             .collect();
@@ -129,7 +137,7 @@ pub fn spawn_shell(argv: &[String], cols: u16, rows: u16, term: &str) -> Result<
         let env = filament_peerloop::shell::user_env::child_env(
             false,
             &user,
-            false,
+            dropped,
             crate::platform::account_environment(),
             &daemon,
             &[],

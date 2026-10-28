@@ -13,8 +13,9 @@
 //!   the daemon's own token, not inheriting the daemon's block), read fresh
 //!   per spawn. Machine and user registry variables, a merged current PATH,
 //!   the profile directories: what Explorer gives a new process. Without one
-//!   (the daemon runs as a service account, the API failed) the spawn is
-//!   refused; another account's profile is never handed out.
+//!   (the daemon runs as a service account, the API failed) another account's
+//!   profile is never handed out: the child keeps the filtered baseline this
+//!   module replaced, and the caller says why in its debug log.
 //! - Unix: what sshd builds before the shell runs. The system default
 //!   variables (the pam_env files, `/etc/environment` and
 //!   `/etc/default/locale`), then `HOME`, `USER`, `LOGNAME` and `SHELL` from
@@ -22,14 +23,15 @@
 //!   PATH when the system defines none. An interactive shell is a login
 //!   shell, so `/etc/profile`, `~/.profile` and `~/.bashrc` do the rest.
 //!
-//! Layered on top, and nothing else from the daemon: `TERM`/`COLORTERM` (the
-//! session's terminal), the daemon's `TUNLION_CONFIG_DIR` for a same-account
-//! child (#602: a `tunlion` it runs finds the daemon that served it), and the
-//! explicit `--env` pairs, which win. A daemon-only variable reaches the child
-//! only when the account's own default environment also defines it, and then
-//! with that value.
+//! Layered on top, and nothing else from the daemon: `TERM`/`COLORTERM`/`LANG`
+//! and `LC_*` (the session's terminal and locale), the daemon's
+//! `TUNLION_CONFIG_DIR` for a same-account child (#602: a `tunlion` it runs
+//! finds the daemon that served it), and the explicit `--env` pairs, which win.
+//! A daemon-only variable reaches the child only when the account's own
+//! default environment also defines it, and then with that value.
 
 use super::exec::ExecUserContext;
+use std::path::Path;
 
 /// The variable that moves tunlion's config dir off its platform default.
 pub const CONFIG_DIR_ENV: &str = "TUNLION_CONFIG_DIR";
@@ -38,8 +40,131 @@ pub const CONFIG_DIR_ENV: &str = "TUNLION_CONFIG_DIR";
 /// none: OpenSSH's standard path with the local and sbin directories.
 pub const UNIX_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-/// The session's terminal facts, the only daemon variables a child keeps.
-const SESSION_VARS: [&str; 2] = ["TERM", "COLORTERM"];
+/// The session's terminal and locale facts: the only daemon variables a child
+/// keeps. `LC_*` joins by prefix.
+fn is_session_var(k: &str, windows: bool) -> bool {
+    ["TERM", "COLORTERM", "LANG"]
+        .iter()
+        .any(|name| same_name(k, name, windows))
+        || if windows {
+            k.get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("LC_"))
+        } else {
+            k.starts_with("LC_")
+        }
+}
+
+/// The non-secret Windows platform variables the pre-account-block builder
+/// copied from the daemon, kept ONLY for the fallback below. Values are the
+/// daemon's, but these names cannot carry a credential, and they are what a
+/// normal Windows process needs (`SystemRoot` and friends for Win32 itself,
+/// `PATH`/`PATHEXT`/`COMSPEC` for program lookup, the profile roots for
+/// toolchains). Deliberately absent, as before: proxies, tokens, `NODE_OPTIONS`,
+/// `SSH_AUTH_SOCK`, session-bus addresses and every variable that can carry a
+/// secret.
+const WINDOWS_PLATFORM_ENV: [&str; 23] = [
+    "SystemRoot",
+    "WINDIR",
+    "SYSTEMDRIVE",
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "PSModulePath",
+    "USERNAME",
+    "USERDOMAIN",
+    "COMPUTERNAME",
+    "PROCESSOR_ARCHITECTURE",
+];
+
+/// Split a `C:\Users\name` home into `(C:, \Users\name)` for the legacy
+/// HOMEDRIVE/HOMEPATH pair Windows tools still read. UNC and drive-relative
+/// homes are left alone: inventing a drive for them would be worse than
+/// omitting the pair.
+fn windows_home_parts(home: &Path) -> Option<(String, String)> {
+    let text = home.to_str()?;
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let rest = &text[2..];
+    if !rest.starts_with('\\') {
+        return None;
+    }
+    let rest = if rest.is_empty() { "\\" } else { rest };
+    Some((text[..2].to_string(), rest.to_string()))
+}
+
+/// Whether `home` is an absolute Windows path. Checked as text, not with
+/// `Path::is_absolute`, so the Windows rule is testable on every host.
+fn windows_absolute(home: &Path) -> bool {
+    let Some(text) = home.to_str() else {
+        return false;
+    };
+    let bytes = text.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || text.starts_with(r"\\")
+}
+
+/// The Windows environment this module replaced: the daemon's non-secret
+/// platform variables, with the profile roots filled from the resolved
+/// account. Used only when there is no account block to read, so a service
+/// account's profile is never handed out in its place.
+fn windows_daemon_baseline(
+    daemon: &[(String, String)],
+    user: &ExecUserContext,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in daemon {
+        if let Some(canonical) = WINDOWS_PLATFORM_ENV
+            .iter()
+            .copied()
+            .find(|name| name.eq_ignore_ascii_case(k))
+        {
+            set(&mut out, canonical, v, true);
+        }
+    }
+    let ensure = |out: &mut Vec<(String, String)>, k: &str, v: &str| {
+        if !out.iter().any(|(name, _)| name.eq_ignore_ascii_case(k)) {
+            out.push((k.to_string(), v.to_string()));
+        }
+    };
+    if !user.name.is_empty() {
+        ensure(&mut out, "USERNAME", &user.name);
+    }
+    if windows_absolute(&user.home) {
+        ensure(&mut out, "USERPROFILE", &user.home.to_string_lossy());
+        if let Some((drive, path)) = windows_home_parts(&user.home) {
+            ensure(&mut out, "HOMEDRIVE", &drive);
+            ensure(&mut out, "HOMEPATH", &path);
+        }
+        ensure(
+            &mut out,
+            "APPDATA",
+            &user.home.join("AppData").join("Roaming").to_string_lossy(),
+        );
+        ensure(
+            &mut out,
+            "LOCALAPPDATA",
+            &user.home.join("AppData").join("Local").to_string_lossy(),
+        );
+    }
+    out
+}
 
 fn same_name(a: &str, b: &str, windows: bool) -> bool {
     if windows {
@@ -90,10 +215,11 @@ pub fn child_env(
                 }
             }
         }
-        Err(why) if windows => {
-            return Err(format!(
-                "exec refused: this account's own environment is unavailable ({why}); the daemon's environment is never handed out instead"
-            ));
+        Err(_) if windows => {
+            // Owner's rule: never hand out a service account's (or another
+            // account's) profile. This corner keeps the filtered baseline the
+            // account block replaced; the caller logs why.
+            out = windows_daemon_baseline(daemon, user);
         }
         // Unix: no system defaults readable; the identity and PATH below
         // are still the account's.
@@ -109,7 +235,7 @@ pub fn child_env(
         }
     }
     for (k, v) in daemon {
-        let session = SESSION_VARS.iter().any(|s| same_name(k, s, windows));
+        let session = is_session_var(k, windows);
         let config_dir = !dropped && same_name(k, CONFIG_DIR_ENV, windows);
         if session || config_dir {
             set(&mut out, k, v, windows);
@@ -297,6 +423,7 @@ mod tests {
             ("TERM", "xterm-256color"),
             ("COLORTERM", "truecolor"),
             ("LANG", "daemon-locale"),
+            ("LC_ALL", "daemon-lc"),
         ])
     }
 
@@ -325,17 +452,31 @@ mod tests {
         assert_eq!(get(&env, "TERM"), Some("xterm-256color"));
         assert_eq!(get(&env, "COLORTERM"), Some("truecolor"));
         assert_eq!(get(&env, "TUNLION_CONFIG_DIR"), Some("/srv/cfg"));
-        assert_eq!(get(&env, "LANG"), None, "only the terminal facts follow the session");
+        assert_eq!(get(&env, "LANG"), Some("daemon-locale"), "locale is a session fact");
+        assert_eq!(get(&env, "LC_ALL"), Some("daemon-lc"));
         assert_eq!(get(&env, "HOME"), None, "Windows identity is the block's");
         assert!(env.iter().all(|(k, _)| !k.starts_with('=')));
         assert_nothing_else_of_the_daemon(&env);
     }
 
     #[test]
-    fn windows_without_a_block_or_for_another_account_is_refused() {
-        let err = child_env(true, &me(true), false, Err("the daemon runs as SYSTEM".into()), &daemon(), &[])
-            .unwrap_err();
-        assert!(err.contains("SYSTEM") && err.contains("never handed out"), "{err}");
+    fn windows_without_a_block_keeps_the_filtered_baseline_not_the_whole_daemon_env() {
+        let env = child_env(true, &me(true), false, Err("the daemon runs as SYSTEM".into()), &daemon(), &[])
+            .unwrap();
+        // The old baseline: the daemon's allowlisted platform variables...
+        assert_eq!(get(&env, "PATH"), Some("/stale/daemon/path"));
+        assert_eq!(get(&env, "HOME"), None, "HOME is not a Windows platform variable");
+        assert_eq!(get(&env, "USERNAME"), Some("me"), "filled from the resolved account");
+        assert_eq!(get(&env, "USERPROFILE"), Some(r"C:\Users\me"));
+        assert_eq!(get(&env, "HOMEDRIVE"), Some("C:"));
+        assert_eq!(get(&env, "HOMEPATH"), Some(r"\Users\me"));
+        // ...the session facts, and nothing that could carry a secret.
+        assert_eq!(get(&env, "TERM"), Some("xterm-256color"));
+        assert_eq!(get(&env, "TUNLION_CONFIG_DIR"), Some("/srv/cfg"));
+        for k in ["TUNLION_AUTHKEY", "HTTPS_PROXY", "SSH_AUTH_SOCK"] {
+            assert_eq!(get(&env, k), None, "{k} exists only in the daemon process");
+        }
+
         let guest = ExecUserContext { name: "guest".into(), ..me(true) };
         let err = child_env(true, &guest, true, Ok(vec![]), &daemon(), &[]).unwrap_err();
         assert!(err.contains("--shell-user guest") && err.contains("token environment"), "{err}");
@@ -350,15 +491,20 @@ mod tests {
         assert_eq!(get(&env, "LOGNAME"), Some("me"));
         assert_eq!(get(&env, "SHELL"), Some("/bin/zsh"));
         assert_eq!(get(&env, "PATH"), Some("/usr/local/bin:/usr/bin:/snap/bin"));
-        assert_eq!(get(&env, "LANG"), Some("en_US.UTF-8"), "the system's locale, not the daemon's");
+        assert_eq!(get(&env, "LANG"), Some("daemon-locale"), "the session's locale wins over the system default");
+        assert_eq!(get(&env, "LC_ALL"), Some("daemon-lc"));
         assert_eq!(get(&env, "TERM"), Some("xterm-256color"));
         assert_eq!(get(&env, "TUNLION_CONFIG_DIR"), Some("/srv/cfg"));
         assert_nothing_else_of_the_daemon(&env);
 
         // No readable defaults: identity, a standard PATH and the session.
         let env = child_env(false, &me(false), false, Err("none".into()), &daemon(), &[]).unwrap();
-        let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(names, ["HOME", "USER", "LOGNAME", "SHELL", "PATH", "TERM", "COLORTERM", "TUNLION_CONFIG_DIR"]);
+        let mut names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["COLORTERM", "HOME", "LANG", "LC_ALL", "LOGNAME", "PATH", "SHELL", "TERM", "TUNLION_CONFIG_DIR", "USER"]
+        );
         assert_eq!(get(&env, "PATH"), Some(UNIX_DEFAULT_PATH));
     }
 

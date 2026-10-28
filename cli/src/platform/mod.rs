@@ -2303,6 +2303,30 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
     Ok(cmd.spawn()?)
 }
 
+// ------------------------------------------------------------- environment --
+
+/// The OS default environment for a new process of this account, read
+/// fresh now: Windows' `CreateEnvironmentBlock` on this process's token
+/// (an `Err` for a service account), the pam_env defaults on Unix. A served
+/// exec or shell is built on it, never on this process's own environment
+/// (`filament_peerloop::shell::user_env`).
+pub fn account_environment() -> std::result::Result<Vec<(String, String)>, String> {
+    filament_peerloop::shell::user_env::os_account_environment()
+}
+
+/// The daemon's own PATH. Search-path fallback for `argv[0]` only where the
+/// account default carries none and there is no standard path to offer:
+/// Windows. Unix falls back to the standard sshd path instead.
+#[cfg(windows)]
+pub fn daemon_path() -> Option<String> {
+    std::env::var_os("PATH").map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(not(windows))]
+pub fn daemon_path() -> Option<String> {
+    None
+}
+
 // --------------------------------------------------- process identity --
 
 /// The absolute path of the executable backing a live process, or `None` when
@@ -2315,15 +2339,6 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
 /// /proc on either). The arms must ship together; a missing variant makes
 /// `daemon_alive` constant-false on that platform, which is the #204 bug this
 /// predicate exists to close for good.
-/// The OS default environment for a new process of this account, read
-/// fresh now: Windows' `CreateEnvironmentBlock` on this process's token
-/// (refused for a service account), the pam_env defaults on Unix. A served
-/// exec or shell is built on it, never on this process's own environment
-/// (`filament_peerloop::shell::user_env`).
-pub fn account_environment() -> std::result::Result<Vec<(String, String)>, String> {
-    filament_peerloop::shell::user_env::os_account_environment()
-}
-
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()

@@ -707,16 +707,17 @@ stream kinds are refused, never misinterpreted.
   - Windows: the account's environment block (`CreateEnvironmentBlock` on the
     daemon's token, not inheriting the daemon's block), read per spawn, so
     PATH and user variables are current. With none (the daemon runs as
-    SYSTEM, LocalService or NetworkService, or the call failed) the exec is
-    refused; that account's profile is never handed out.
+    SYSTEM, LocalService or NetworkService, or the call failed) the child
+    keeps the filtered non-secret baseline that predates the block; that
+    account's profile is never handed out.
   - Unix: the system defaults pam_env gives an ssh session
     (`/etc/environment`, `/etc/default/locale`), then `HOME`, `USER`,
     `LOGNAME`, `SHELL` from the password database for the account the child
     runs as, and `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
     when the system sets no PATH.
-  Layered on top, and nothing else from the daemon: `TERM`/`COLORTERM`, the
-  daemon's `TUNLION_CONFIG_DIR` for a same-account child, and the explicit
-  `--env` pairs, which win. `argv[0]` resolves on the child's PATH (an explicit
+  Layered on top, and nothing else from the daemon: `TERM`/`COLORTERM`/`LANG`
+  and `LC_*`, the daemon's `TUNLION_CONFIG_DIR` for a same-account child, and
+  the explicit `--env` pairs, which win. `argv[0]` resolves on the child's PATH (an explicit
   `--env PATH` when sent, else the account default). An interactive `pty-open`
   shell gets the same environment and is the account's login shell (Unix: the
   passwd shell with `-l`; Windows: OpenSSH's `DefaultShell` when configured,

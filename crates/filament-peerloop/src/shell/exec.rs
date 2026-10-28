@@ -142,8 +142,9 @@ pub trait ExecProcess: Send + Sync {
     /// read fresh now (Windows: `CreateEnvironmentBlock` on the daemon's
     /// token without inheriting the daemon's block; Unix: the pam_env
     /// defaults). `Err` names why there is none (a service account, an API
-    /// failure): Windows then refuses the spawn, Unix keeps only the passwd
-    /// identity and a standard PATH. See `shell::user_env`.
+    /// failure): Windows then keeps the filtered daemon baseline it used
+    /// before, Unix keeps only the passwd identity and a standard PATH. See
+    /// `shell::user_env`.
     fn account_environment(&self) -> Result<Vec<(String, String)>, String> {
         Err("this host does not read the account environment".into())
     }
