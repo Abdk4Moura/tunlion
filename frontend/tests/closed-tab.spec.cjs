@@ -169,6 +169,7 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
   const browser = await playwright.chromium.launch();
   try {
     const a = await open(browser, false);
+    const aName = await deviceName(a.page);
 
     // 1. Polling transport.
     const p = await open(browser, true);
@@ -197,7 +198,11 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
       const back = await waitTile(a.page, name, true, 10000);
       const sock2 = await sockAt();
       await sleep(3000);
+      // Both directions: a wedged long-poll can still deliver an earlier
+      // join while the restored page itself hears nothing.
+      const sees = await waitTile(b.page, aName, true, 10000);
       const why = back == null ? 'the restored page never came back on the other peer'
+        : sees == null ? 'the restored page never saw the other peer again'
         : (await tilesFor(a.page, name)) === 0 ? 'the restored page dropped off the other peer again'
           : /took over/i.test(await b.page.evaluate(() => document.body.innerText)) ? 'the restored page shows itself superseded' : null;
       const seen = telEvents().slice(mark).filter((e) => !/^web:(vis|net|conn|link|ice|tile|cfg)/.test(e.ev))

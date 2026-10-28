@@ -256,6 +256,18 @@ class SocketIOSignaling extends Emitter {
   reconnect() {
     if (this.socket && !this.suspended && !this.socket.connected) this.socket.connect()
   }
+  // A page back from bfcache cannot trust its socket. engine.io-client
+  // abandons every in-flight long-poll request on pagehide (its own unload
+  // handler drops the XHR without settling it), so a polling transport comes
+  // back believing a poll and a write are still in flight: it reports
+  // connected, sends nothing and receives nothing until a ping timeout
+  // (85 s in production). Start a fresh connection instead; the connect
+  // handler rejoins under the identity the caller has just set.
+  restart() {
+    if (this.suspended) return
+    try { this.socket.disconnect() } catch {}
+    this.socket.connect()
+  }
   // Test-only: drop and re-open the signaling socket without touching the
   // WebRTC links, so a gate can prove the reconnect cache (gen/name) without
   // conflating it with network emulation.

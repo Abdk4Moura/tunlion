@@ -1551,6 +1551,10 @@ export function useTunlion() {
       if (supersededRef.current) return
       if (restoring) {
         rejoinFresh()
+        // After the fresh generation is cached, so the reconnect's join
+        // carries it. The pagehide close already took the old sid off every
+        // roster, so a new sid costs the other peers nothing.
+        sigRef.current?.restart?.()
         tel('bfcache-restore', { gen: genRef.current.slice(0, 8) })
       }
       sessionRef.current?.start()
