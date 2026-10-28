@@ -4394,7 +4394,7 @@ mod detach_inheritance_tests {
                 .join("System32\\PING.EXE");
             let child = super::spawn_detached(&ping, &["-n", "60", "127.0.0.1"], std::path::Path::new(&log))
                 .expect("spawn_detached");
-            println!("GRANDCHILD={}", child.id());
+            crate::outln!("GRANDCHILD={}", child.id());
             return;
         }
         let dir = std::env::temp_dir().join(format!("tunlion-detach-inherit-{}", std::process::id()));
