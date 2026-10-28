@@ -3632,6 +3632,108 @@ impl InstanceLock {
 
 // --------------------------------------------------------- process control --
 
+/// What asking a Windows daemon to stop achieved. Windows has no SIGTERM and
+/// no `kill` program, so a `down` there used to fail with "program not found"
+/// and leave the daemon running (incident: dgmfa). The daemon instead waits on
+/// a named event keyed by its pid, and `down` sets it: the same graceful
+/// shutdown a ctrl-c gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum StopAsk {
+    /// The daemon's stop event was set; it shuts down on its own.
+    Sent,
+    /// No stop event for that pid: an older tunlion, or one whose event name
+    /// was already taken when it started, so there is no graceful path.
+    NoListener,
+    /// The event exists but this process may not set it: the daemon runs
+    /// elevated and this `down` does not.
+    Denied,
+}
+
+/// The stop event names for `pid`, tried in order. `Global\` first: only an
+/// administrator or service can create a global object, so a standard user
+/// cannot squat the name ahead of an elevated daemon; `Local\` (this logon
+/// session) for a daemon that is not elevated.
+#[cfg(any(windows, test))]
+pub(crate) fn stop_event_names(pid: u32) -> [String; 2] {
+    [format!("Global\\tunlion-stop-{pid}"), format!("Local\\tunlion-stop-{pid}")]
+}
+
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Daemon side: create this process's stop event and return a receiver that
+/// fires when a `down` sets it. None when no event could be created, or when
+/// the name already existed (someone else's object: never listen on it, so
+/// whoever created it cannot stop us, and `down` falls back to terminating).
+#[cfg(windows)]
+pub(crate) fn listen_for_stop_request() -> Option<tokio::sync::oneshot::Receiver<()>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+    const WAIT_OBJECT_0: u32 = 0;
+    for name in stop_event_names(std::process::id()) {
+        let w = wide(&name);
+        // SAFETY: a null security descriptor means the default DACL of this
+        // process's token (no widening); `w` is NUL-terminated and outlives
+        // the call. The returned handle is owned below.
+        let h = unsafe { CreateEventW(std::ptr::null(), 1, 0, w.as_ptr()) };
+        if h.is_null() {
+            continue; // Global\ needs SeCreateGlobalPrivilege; try Local\
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe { CloseHandle(h) };
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let raw = h as usize;
+        // A plain thread, not spawn_blocking: it waits for the life of the
+        // process and must never hold up runtime shutdown.
+        std::thread::Builder::new()
+            .name("tunlion-stop-event".into())
+            .spawn(move || {
+                let h = raw as windows_sys::Win32::Foundation::HANDLE;
+                // SAFETY: `h` is a live event handle this thread owns.
+                if unsafe { WaitForSingleObject(h, INFINITE) } == WAIT_OBJECT_0 {
+                    let _ = tx.send(());
+                }
+            })
+            .ok()?;
+        return Some(rx);
+    }
+    None
+}
+
+/// `down` side: set the daemon's stop event.
+#[cfg(windows)]
+pub fn ask_daemon_to_stop(pid: u32) -> std::io::Result<StopAsk> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND};
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+    let mut denied = false;
+    for name in stop_event_names(pid) {
+        let w = wide(&name);
+        // SAFETY: `w` is NUL-terminated; the handle is closed below.
+        let h = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, w.as_ptr()) };
+        if h.is_null() {
+            match unsafe { GetLastError() } {
+                ERROR_FILE_NOT_FOUND => continue,
+                ERROR_ACCESS_DENIED => {
+                    denied = true;
+                    continue;
+                }
+                e => return Err(std::io::Error::from_raw_os_error(e as i32)),
+            }
+        }
+        // SAFETY: `h` is a live event handle opened with EVENT_MODIFY_STATE.
+        let ok = unsafe { SetEvent(h) } != 0;
+        let err = std::io::Error::last_os_error();
+        unsafe { CloseHandle(h) };
+        return if ok { Ok(StopAsk::Sent) } else { Err(err) };
+    }
+    Ok(if denied { StopAsk::Denied } else { StopAsk::NoListener })
+}
+
 /// The signals `down` uses beyond its first polite request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Escalate {
@@ -4336,4 +4438,33 @@ mod detach_inheritance_tests {
             started.elapsed()
         );
     }
+}
+
+/// `down` and the daemon must derive the same event name from the pid, and it
+/// must name exactly one pid (no prefix collisions such as 12 vs 123).
+#[test]
+fn stop_event_names_are_per_pid_global_then_local() {
+    let [g, l] = stop_event_names(123);
+    assert_eq!(g, "Global\\tunlion-stop-123");
+    assert_eq!(l, "Local\\tunlion-stop-123");
+    assert_ne!(stop_event_names(12), stop_event_names(123));
+}
+
+/// A real daemon-side listener and a real `down`-side request, in one process:
+/// the event is created under this pid, `ask_daemon_to_stop` sets it and the
+/// listener fires. A pid with no listener reports NoListener, never Sent.
+#[cfg(windows)]
+#[test]
+fn a_stop_request_reaches_the_daemons_listener() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rx = listen_for_stop_request().expect("create the stop event");
+    assert_eq!(ask_daemon_to_stop(std::process::id()).unwrap(), StopAsk::Sent);
+    rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the listener fired")
+            .expect("sender kept");
+    });
+    // No process creates events under an impossible pid.
+    assert_eq!(ask_daemon_to_stop(u32::MAX - 3).unwrap(), StopAsk::NoListener);
 }

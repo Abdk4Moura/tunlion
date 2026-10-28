@@ -51,7 +51,10 @@ impl Stopped {
         match self {
             Stopped::Asked => "",
             Stopped::Resumed => "; it was suspended (SIGSTOP), so it was resumed to let it exit",
+            #[cfg(not(windows))]
             Stopped::Killed => "; it did not exit within 10s of SIGTERM, so it was killed (SIGKILL)",
+            #[cfg(windows)]
+            Stopped::Killed => "; it did not exit within 10s of the stop request, so it was terminated",
         }
     }
 }

@@ -1505,6 +1505,7 @@ fn load_delegation(path: &std::path::Path) -> Result<crate::ephemeral::Invitatio
 
 
 /// The refusal for a `kill` that did not succeed, or None when it did.
+#[cfg_attr(windows, allow(dead_code))]
 fn kill_failure(pid: u32, status: &std::process::ExitStatus) -> Option<String> {
     if status.success() {
         return None;
@@ -1532,6 +1533,9 @@ fn down_cmd() -> Result<()> {
             // through the manager first, and only fall back to a bare kill
             // when no manager owns the daemon (a foreground `up`, or a
             // non-service-managed box).
+            #[allow(unused_mut)]
+            let mut note_override: Option<&str> = None;
+            #[cfg(not(windows))]
             if !stop_managed_service(pid) {
                 let status = crate::platform::command("kill").arg(pid.to_string()).status()?;
                 // A failed kill leaves the daemon running. Saying "stopped" and
@@ -1540,6 +1544,30 @@ fn down_cmd() -> Result<()> {
                 if let Some(why) = kill_failure(pid, &status) {
                     bail!("{why}");
                 }
+            }
+            // Windows has no `kill` program and no SIGTERM: spawning `kill`
+            // failed with "program not found" and the daemon kept running
+            // (incident: dgmfa). Ask through the daemon's stop event instead.
+            #[cfg(windows)]
+            match platform::ask_daemon_to_stop(pid) {
+                Ok(platform::StopAsk::Sent) => {}
+                Ok(platform::StopAsk::Denied) => bail!(
+                    "could not stop the daemon (pid {pid}): it runs elevated (as Administrator) and this \
+                     terminal does not, so Windows refuses the request. It is still running. Run \
+                     `tunlion down` from an elevated terminal. The pidfile is kept."
+                ),
+                Ok(platform::StopAsk::NoListener) => {
+                    // An older daemon has no stop event: end it now.
+                    if let Err(e) = platform::escalate(pid, platform::Escalate::Kill) {
+                        bail!(
+                            "could not stop the daemon (pid {pid}): it has no stop request listener (an older \
+                             tunlion) and terminating it failed ({e}); it is still running. If it runs elevated, \
+                             run `tunlion down` from an elevated terminal. The pidfile is kept."
+                        );
+                    }
+                    note_override = Some("; it had no stop request listener (an older tunlion), so it was terminated");
+                }
+                Err(e) => bail!("could not ask the daemon (pid {pid}) to stop: {e}. It is still running; the pidfile is kept."),
             }
             // Stopped means GONE. A suspended daemon cannot act on SIGTERM and a
             // busy one may take a moment; "stopped" used to be printed 6 ms
@@ -1550,7 +1578,7 @@ fn down_cmd() -> Result<()> {
             ui::say(&format!(
                 "  {} stopped (pid {pid}){}",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                how.note()
+                note_override.unwrap_or_else(|| how.note())
             ));
             Ok(())
         }

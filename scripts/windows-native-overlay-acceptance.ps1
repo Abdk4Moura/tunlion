@@ -8,9 +8,9 @@
 #              not asserted: this is the version the incident ran.
 #   update     the binary is replaced in place by this commit's build and
 #              started again with the same identity. Asserted.
-#   restart    the daemon is killed (teardown asserted) and started again.
-#              Asserted.
-#   teardown   the daemon is killed; adapter and routes must be gone.
+#   restart    the daemon is killed outright, the crash case (teardown
+#              asserted), and started again. Asserted.
+#   teardown   `tunlion down` stops it gracefully; adapter and routes gone.
 #
 # Asserted in update and restart: `up --detach` returns with its output
 # captured; kernel mode ready; the exact IPv4 from `addr --v4` is on tunlion0,
@@ -113,20 +113,28 @@ function Wait-Ready([string]$phase) {
   [ordered]@{ ready = $false; json = $null; raw = $last }
 }
 
-function Stop-Daemon([string]$phase) {
+# $how: 'observe' (released build: try `down`, record what happened, then make
+# sure it is gone), 'down' (graceful stop through `tunlion down`, ASSERTED) or
+# 'kill' (TerminateProcess, the crash case: the adapter must still go away).
+function Stop-Daemon([string]$phase, [string]$how) {
   $d = Get-Daemon
   if (-not $d) { Record "$phase-stop" 'FAIL' 'no daemon of ours to stop'; return }
-  # `tunlion down` first: what a person would run. Recorded either way.
-  $down = Invoke-Tun @('down') 60
-  Start-Sleep -Seconds 2
-  $still = Get-CimInstance Win32_Process -Filter "ProcessId=$($d.pid)" -ErrorAction SilentlyContinue
-  $stoppedByDown = -not ($still -and [string]$still.CreationDate -eq $d.created)
-  Record "$phase-down" 'OBSERVED' ([ordered]@{ down = $down; daemonStoppedByDown = $stoppedByDown })
-  if (-not $stoppedByDown) {
-    # A verified pid (same executable, same creation time) only.
-    Stop-Process -Id $d.pid -Force
-    Wait-Process -Id $d.pid -Timeout 30 -ErrorAction SilentlyContinue
+  if ($how -ne 'kill') {
+    $down = Invoke-Tun @('down') 60
+    $still = Get-CimInstance Win32_Process -Filter "ProcessId=$($d.pid)" -ErrorAction SilentlyContinue
+    $stoppedByDown = -not ($still -and [string]$still.CreationDate -eq $d.created)
+    $detail = [ordered]@{ down = $down; daemonStoppedByDown = $stoppedByDown }
+    if ($how -eq 'down') {
+      # Stopped by its own graceful path: exit 0, gone, and not terminated.
+      $null = Check "$phase-down-stops-daemon-gracefully" ($down.state -eq 'ok' -and $down.exitCode -eq 0 -and $stoppedByDown -and ($down.stdout + $down.stderr) -notmatch 'terminated') $detail
+    } else {
+      Record "$phase-down" 'OBSERVED' $detail
+    }
+    if ($stoppedByDown) { return }
   }
+  # A verified pid (same executable, same creation time) only.
+  Stop-Process -Id $d.pid -Force
+  Wait-Process -Id $d.pid -Timeout 30 -ErrorAction SilentlyContinue
   $gone = -not (Get-CimInstance Win32_Process -Filter "ProcessId=$($d.pid)" -ErrorAction SilentlyContinue | Where-Object { [string]$_.CreationDate -eq $d.created })
   $null = Check "$phase-daemon-exited" $gone $d
 }
@@ -281,7 +289,7 @@ try {
     Record 'released-native-http-v4' 'OBSERVED' (Get-Http "http://$($script:PeerV4):8766/token.txt")
   }
   Remove-Item Env:TUNLION_LOG
-  Stop-Daemon 'released'
+  Stop-Daemon 'released' 'observe'
   Record 'released-teardown' 'OBSERVED' ([ordered]@{ adapters = @(Get-NetAdapter -Name 'tunlion0' -ErrorAction SilentlyContinue | Select-Object Name, Status) })
   $log = Join-Path $Cfg 'daemon.log'
   if (Test-Path $log) { Copy-Item $log (Join-Path $Ev 'daemon-released.log') }
@@ -291,13 +299,13 @@ try {
   Record 'updated-binary' 'OBSERVED' ([ordered]@{ version = (Invoke-Tun @('--version') 30).stdout; sha256 = (Get-FileHash $Exe -Algorithm SHA256).Hash.ToLower() })
   if (Start-Daemon 'update' $true) { Assert-Native 'update' }
 
-  # ---- restart: kill, prove teardown, start again.
-  Stop-Daemon 'restart'
+  # ---- restart: the crash case (killed outright), prove teardown, start again.
+  Stop-Daemon 'restart' 'kill'
   Assert-TornDown 'restart'
   if (Start-Daemon 'restart' $true) { Assert-Native 'restart' }
 
-  # ---- teardown.
-  Stop-Daemon 'final'
+  # ---- teardown: graceful, through `tunlion down`.
+  Stop-Daemon 'final' 'down'
   Assert-TornDown 'final'
 } catch {
   Record 'abort' 'FAIL' ([ordered]@{ message = $_.Exception.Message; at = $_.InvocationInfo.PositionMessage })
