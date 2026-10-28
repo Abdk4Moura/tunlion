@@ -993,6 +993,88 @@ fn require_known_device_names_the_known_devices() {
 }
 
 #[test]
+fn device_names_resolve_forgivingly_against_the_real_store() {
+    // Owner report: `add "pop os"` stored a name with a space, and `popos`
+    // could not find `pop-os`. Selecting verbs resolve to the stored spelling
+    // when exactly one device matches; a legacy spaced name still resolves.
+    use crate::device_names::canonicalize_cmd;
+    let _guard = lock_test_config();
+    let dir = std::env::temp_dir().join(format!("fil-names-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+    std::fs::write(
+        dir.join("devices.json"),
+        serde_json::to_string(&json!([
+            {"name": "pop-os", "secret": "b".repeat(64)},
+            {"name": "old box", "secret": "c".repeat(64)},
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let shell = |p: &str| match canonicalize_cmd(Cmd::Shell { peer: Some(p.into()), ssh: false, args: vec![] }) {
+        Ok(Cmd::Shell { peer, .. }) => Ok(peer.unwrap()),
+        Ok(_) => unreachable!(),
+        Err(e) => Err(e),
+    };
+    for typed in ["pop-os", "popos", "PopOS", "pop os"] {
+        assert_eq!(shell(typed).unwrap(), "pop-os", "{typed}");
+    }
+    assert_eq!(shell("old box").unwrap(), "old box");
+    assert_eq!(shell("old-box").unwrap(), "old box");
+    assert_eq!(shell("nobody").unwrap(), "nobody", "a miss keeps the verb's own answer");
+    // The record was not renamed by being looked up.
+    let raw = std::fs::read_to_string(dir.join("devices.json")).unwrap();
+    assert!(raw.contains("\"old box\""), "{raw}");
+    // A forward target keeps its port.
+    match canonicalize_cmd(Cmd::Forward {
+        target: "PopOS:5432".into(), lport: None, stdio: false, socks: false,
+        port: 1080, bind: "127.0.0.1".into(), http_port: 0, allow_remote: false,
+    }).unwrap() {
+        Cmd::Forward { target, .. } => assert_eq!(target, "pop-os:5432"),
+        _ => unreachable!(),
+    }
+    // Two devices sharing the key: refused with both names, exit 3.
+    std::fs::write(
+        dir.join("devices.json"),
+        serde_json::to_string(&json!([
+            {"name": "pop-os", "secret": "b".repeat(64)},
+            {"name": "pop-o-s", "secret": "c".repeat(64)},
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let err = shell("PopOS").unwrap_err();
+    assert_eq!(crate::exit_codes::classify(&err).code(), 3, "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("pop-os") && msg.contains("pop-o-s"), "{msg}");
+    // A name being GIVEN is normalized: `devices rename x "Pop OS 2"`.
+    match canonicalize_cmd(Cmd::Devices {
+        action: Some(DevicesAction::Rename { old: "pop-os".into(), new: "Pop OS 2".into() }),
+        json: false,
+        caps: None,
+    }).unwrap() {
+        Cmd::Devices { action: Some(DevicesAction::Rename { old, new }), .. } => {
+            assert_eq!(old, "pop-os");
+            assert_eq!(new, "pop-os-2");
+        }
+        _ => unreachable!(),
+    }
+    // `add "pop os"` names the new device pop-os-style, kind words untouched.
+    match canonicalize_cmd(Cmd::Add {
+        who: Some("Travel Laptop".into()), name: None, word: None, for_: Some(String::new()),
+        allow: vec![], expires: None, reuse: None, out: None, via: None,
+    }).unwrap() {
+        Cmd::Add { who, for_, .. } => {
+            assert_eq!(who.as_deref(), Some("travel-laptop"));
+            assert_eq!(for_.as_deref(), Some(""));
+        }
+        _ => unreachable!(),
+    }
+    unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn roster_is_newer_lexicographic() {
     use crate::roster::roster_is_newer;
     // Fresh accept (nothing seen).

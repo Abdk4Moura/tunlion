@@ -18,6 +18,8 @@
 #      before any code is minted (it silently re-enrolled it as fleet).
 #   F2 `devices restore` of a FORGOTTEN device lifts the key block and says to
 #      re-add it; restore of a name nobody had exits 3.
+#   Q  a default-verbosity `add <device>` + `join <code>` prints its steps and
+#      the outcome, and no internal trace lines (peer=, source paths, ICE urls).
 #   X  a `--for person` pairing between two identities prints no "filed as
 #      EXTERNAL ... reset" warning on either side: EXTERNAL is what was asked.
 set -uo pipefail
@@ -129,6 +131,22 @@ if pair "$OWN" "$DEV" f1a own d1; then
     fi
   else bad "F1 re-add pairing ($PAIR_RC)"; tail -n 5 "$WORK/f1b-add.log" "$WORK/f1b-join.log"; fi
 else bad "F1 first pairing ($PAIR_RC)"; tail -n 5 "$WORK/f1a-add.log" "$WORK/f1a-join.log"; fi
+
+# ---------------------------------------------------------------------- Q --
+say "Q: a default-verbosity add/join prints the steps, never internal trace lines"
+# Owner report: ADOPT peer=..., ICE-CONFIG urls, drop_link(...) ordered by
+# <source path>, "deferring drop" and "waiting briefly" between the friendly
+# lines. They are debug output; at the default level none may appear.
+if [ -s "$WORK/f1a-add.log" ] && [ -s "$WORK/f1a-join.log" ]; then
+  LEAK=$(grep -nE 'peer=|\.rs:[0-9]|ICE-CONFIG|ADOPT|ESTABLISH|drop_link|deferring drop|dropping now|waiting briefly|caller=' \
+    "$WORK/f1a-add.log" "$WORK/f1a-join.log" "$WORK/f1b-add.log" "$WORK/f1b-join.log" 2>/dev/null)
+  if [ -z "$LEAK" ] && grep -q "one of your devices" "$WORK/f1a-add.log" \
+     && grep -q "Verified end to end" "$WORK/f1a-join.log" && grep -q "Certified by" "$WORK/f1a-join.log"; then
+    ok "Q: add/join at the default level print steps and the outcome, no trace lines"
+  else
+    bad "Q default-verbosity pairing output"; echo "$LEAK"; cat "$WORK/f1a-add.log" "$WORK/f1a-join.log"
+  fi
+else bad "Q has no pairing logs to read (F1 did not pair)"; fi
 
 # ---------------------------------------------------------------------- P --
 say "P: --for person cannot name one of your own devices"

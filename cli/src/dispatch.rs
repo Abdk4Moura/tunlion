@@ -639,6 +639,9 @@ pub(crate) async fn async_main() -> Result<()> {
         }
         crate::state_files::check_all()?;
     }
+    // Device names: a name given to a device takes the label rule, and a name
+    // that selects a device resolves to its stored spelling (device_names.rs).
+    let cmd = crate::device_names::canonicalize_cmd(cmd)?;
     match cmd {
         Cmd::Init {
             name,
@@ -1268,8 +1271,8 @@ pub(crate) async fn async_main() -> Result<()> {
                 && reuse.is_none() && out.is_none() && via.is_none()
             {
                 let choices = vec![
-                    "Another device I own".to_string(),
-                    "Someone else's device".to_string(),
+                    "Another device I own \u{b7} it becomes one of your devices".to_string(),
+                    "Someone else's device \u{b7} you send each other files".to_string(),
                     "Temporary access (folders, ports or a shell)".to_string(),
                 ];
                 match codeentry::pick("CONNECT", &choices)? {
@@ -1632,16 +1635,25 @@ pub(crate) async fn async_main() -> Result<()> {
                             ),
                             crate::roster::RosterStaleness::None => None,
                         };
-                        let rendered = fleet_ui::devices::render_devices(
+                        let rendered = fleet_ui::devices::render_devices_for(
                             &device_entries(warm.as_ref()),
                             pending_request_count(pending.as_ref()),
                             roster_heading,
+                            load_owner_key().is_some(),
                         );
                         crate::outln!("{rendered}");
                         // Read only: a device with no identity is told how to
                         // get one, and nothing is minted by looking.
                         if !crate::identity_flow::has_identity() {
-                            ui::say(&format!("  {}", crate::identity_flow::NO_IDENTITY_MSG));
+                            // Paired by code with no identity of its own: `init`
+                            // would make this device its OWN owner, the wrong
+                            // thing for a device that belongs to someone here.
+                            let line = if nothing_to_list {
+                                crate::identity_flow::NO_IDENTITY_MSG.to_string()
+                            } else {
+                                crate::identity_flow::paired_only_hint(&crate::display_name())
+                            };
+                            ui::say(&format!("  {line}"));
                         }
                         // The screen keeps its shape (the empty list on
                         // stdout, the hint above); the exit says why.

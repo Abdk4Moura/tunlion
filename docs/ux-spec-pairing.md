@@ -127,7 +127,7 @@ ceremony.
      ● pixel-7    online   shell reach:8080 inbox   renews in 9m
      ● studio-mac offline  shell reach inbox mount  renews in 3m (last seen 2h ago)
   ○ EXTERNAL — other people, time-boxed, deny-by-default
-     ○ carol      online   send→you                 expires in 4m
+     ○ carol      online   can send you files       expires in 4m
   ◐ NEEDS REVIEW — paired before scoped trust; promote to sort into a tier
      ◐ old-laptop offline  (full legacy trust)       promote to continue
        ↳ tunlion devices promote old-laptop

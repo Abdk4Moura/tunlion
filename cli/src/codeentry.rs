@@ -292,13 +292,19 @@ fn render(prompt: &str, buf: &str, j: &Judgment) {
     let mut err = std::io::stderr();
     let reset = ui::tone_reset();
     let color = level_color(j.level);
-    let preview = match &j.preview {
-        Some(p) => format!("  {}", ui::paint(ui::Tone::Dim, p)),
+    // ONE terminal row, always: a steer longer than what is left of the row
+    // wrapped, and `\r\x1b[2K` then cleared only the last row, so every
+    // keystroke left a stale line behind. Fit steer and preview to the width.
+    let used = prompt.chars().count() + buf.chars().count() + 3;
+    let room = term_width().saturating_sub(used + 1);
+    let (steer, preview_text) = fit_steer(&j.steer, j.preview.as_deref(), room);
+    let preview = match preview_text {
+        Some(p) => format!("  {}", ui::paint(ui::Tone::Dim, &p)),
         None => String::new(),
     };
     // Clear the whole line, then draw: prompt+buffer, a gap, the colored steer
     // plus optional dim preview.
-    let _ = write!(err, "\r\x1b[2K{prompt}{buf}   {color}{}{reset}{preview}", j.steer);
+    let _ = write!(err, "\r\x1b[2K{prompt}{buf}   {color}{steer}{reset}{preview}");
     // Put the caret back right after the typed buffer (browser-like), so typing
     // continues at the end of the code rather than after the steer text.
     let col = prompt.chars().count() + buf.chars().count();
@@ -307,6 +313,19 @@ fn render(prompt: &str, buf: &str, j: &Judgment) {
         let _ = write!(err, "\x1b[{col}C");
     }
     let _ = err.flush();
+}
+
+/// Fit the steer (and the preview after it, two spaces apart) into `room`
+/// columns: the preview goes first, then the steer is clipped with an
+/// ellipsis. Pure.
+pub(crate) fn fit_steer(steer: &str, preview: Option<&str>, room: usize) -> (String, Option<String>) {
+    let s_len = steer.chars().count();
+    if let Some(p) = preview {
+        if s_len + 2 + p.chars().count() <= room {
+            return (steer.to_string(), Some(p.to_string()));
+        }
+    }
+    (fit(steer, room), None)
 }
 
 /// Which slice of a list a picker shows, and how much is out of sight.
@@ -646,6 +665,192 @@ pub fn run(prompt: &str, mode: Mode, prefill: &str, auto_nameplate: &str) -> std
     }
 }
 
+// --------------------------------------------------------------------------
+// ACCEPT: the one `join` entry. It takes a pairing code, a pasted invitation,
+// or the path to an invitation file, and it behaves like the code entry above
+// for codes (live dashes, lowercase, bad characters refused, colour judgement)
+// while never echoing invitation material. `classify_join_input` stays the one
+// decision about what the buffer IS; this only decides how to draw it.
+// --------------------------------------------------------------------------
+
+/// How the accept buffer is drawn. Pure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AcceptView {
+    /// Code-shaped so far: drawn exactly as the code entry draws it.
+    Code(String),
+    /// A file path: drawn as typed (paths are case-sensitive).
+    Path(String),
+    /// Invitation material: never drawn, only its length.
+    Hidden(usize),
+}
+
+/// Characters that can only belong to a path (or an invitation's `:`), so
+/// typing one switches the entry out of code mode instead of being refused.
+fn is_path_char(c: char) -> bool {
+    matches!(c, '/' | '\\' | '.' | '~' | ':')
+}
+
+/// Which view the raw buffer is in. Pure.
+pub fn accept_view(raw: &str) -> AcceptView {
+    let t = raw.trim_start();
+    if t.starts_with(crate::file_io::INVITE_PREFIX) {
+        return AcceptView::Hidden(t.trim_end().chars().count());
+    }
+    if t.chars().any(is_path_char) {
+        return AcceptView::Path(raw.to_string());
+    }
+    AcceptView::Code(format_buffer(raw))
+}
+
+/// Append one typed character under the current view's rules. In code mode a
+/// character that is neither part of a code nor a path is refused (not
+/// inserted), exactly like the code entry; a path or invitation takes any
+/// printable character. Pure over the buffer.
+pub fn accept_insert(raw: &mut String, c: char) {
+    if c.is_control() {
+        return;
+    }
+    let allowed = match accept_view(raw) {
+        AcceptView::Code(_) => c.is_ascii_alphanumeric() || c == '-' || c.is_whitespace() || is_path_char(c),
+        AcceptView::Path(_) | AcceptView::Hidden(_) => true,
+    };
+    if allowed {
+        raw.push(c);
+    }
+}
+
+/// One Backspace: in code mode remove one VISIBLE character (a collapsed run
+/// of spaces is one dash on screen, so it goes in one press); otherwise one
+/// character. Pure over the buffer.
+pub fn accept_backspace(raw: &mut String) {
+    match accept_view(raw) {
+        AcceptView::Code(shown) => {
+            while !raw.is_empty() && format_buffer(raw) == shown {
+                raw.pop();
+            }
+        }
+        _ => {
+            raw.pop();
+        }
+    }
+}
+
+/// Judge the accept buffer. PURE: the file test is injected, and the decision
+/// is `classify_join_input`, the same one `join_guided` acts on.
+pub fn judge_accept(raw: &str, is_file: &dyn Fn(&str) -> bool) -> Judgment {
+    use crate::identity_flow::JoinInput;
+    let view = accept_view(raw);
+    if raw.trim().is_empty() {
+        return Judgment {
+            level: Level::Empty,
+            steer: "type the code, paste an invitation, or give its file".to_string(),
+            preview: None,
+        };
+    }
+    let ready = |steer: String| Judgment { level: Level::Ready, steer, preview: None };
+    let more = |steer: String| Judgment { level: Level::Incomplete, steer, preview: None };
+    match crate::identity_flow::classify_join_input(raw, is_file) {
+        JoinInput::Code(_) => ready("\u{2713} pairing code, press enter".to_string()),
+        JoinInput::Invitation(_) => ready("\u{2713} invitation, hidden on screen, press enter".to_string()),
+        JoinInput::File(_) => ready("\u{2713} invitation file, press enter".to_string()),
+        JoinInput::TransferCode(code) => more(format!(
+            "keep going: 4 digits at the end (or `tunlion receive {code}`)"
+        )),
+        JoinInput::Unknown => match view {
+            AcceptView::Path(_) => more("no invitation file at that path yet".to_string()),
+            AcceptView::Hidden(_) => more("that invitation looks cut off; paste all of it".to_string()),
+            AcceptView::Code(shown) => more(judge(&shown, Mode::Claim, "").steer),
+        },
+    }
+}
+
+/// What the accept entry draws after the prompt. Pure.
+pub fn accept_display(raw: &str) -> String {
+    match accept_view(raw) {
+        AcceptView::Code(shown) => shown,
+        AcceptView::Path(p) => p,
+        AcceptView::Hidden(n) => format!("\u{2022}\u{2022}\u{2022}\u{2022} invitation, {n} characters"),
+    }
+}
+
+/// Restores bracketed paste on every exit path, like `RawGuard` for raw mode.
+struct PasteGuard(bool);
+
+impl Drop for PasteGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = crossterm::execute!(std::io::stderr(), crossterm::event::DisableBracketedPaste);
+        }
+    }
+}
+
+/// The accept entry. Submits the classified input's text: a normalized code,
+/// a trimmed path, or the trimmed invitation (the caller wraps it in
+/// `Zeroizing`). Enter on an incomplete or empty buffer keeps steering.
+pub fn run_accept(prompt: &str) -> std::io::Result<Outcome> {
+    use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use zeroize::Zeroize;
+
+    let _guard = RawGuard::enable()?;
+    // A paste arrives as ONE event, so its newline cannot submit it early.
+    let _paste = PasteGuard(crossterm::execute!(std::io::stderr(), event::EnableBracketedPaste).is_ok());
+    let is_file = |p: &str| std::path::Path::new(p).is_file();
+    // Room for an invitation without reallocating (and leaving copies behind).
+    let mut raw = String::with_capacity(8192);
+    let draw = |raw: &str| render(prompt, &accept_display(raw), &judge_accept(raw, &is_file));
+    draw(&raw);
+    let outcome = loop {
+        match event::read()? {
+            Event::Paste(text) => {
+                for c in text.chars() {
+                    accept_insert(&mut raw, c);
+                }
+            }
+            Event::Key(KeyEvent { code, modifiers, kind, .. }) => {
+                if kind == KeyEventKind::Release {
+                    continue;
+                }
+                match code {
+                    KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => break Outcome::Interrupted,
+                    KeyCode::Char('\u{3}') => break Outcome::Interrupted,
+                    KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        if raw.is_empty() {
+                            break Outcome::Cancelled;
+                        }
+                    }
+                    KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => raw.zeroize(),
+                    KeyCode::Esc => break Outcome::Cancelled,
+                    KeyCode::Enter => {
+                        if judge_accept(&raw, &is_file).level == Level::Ready {
+                            use crate::identity_flow::JoinInput;
+                            let text = match crate::identity_flow::classify_join_input(&raw, &is_file) {
+                                JoinInput::Code(c) => c,
+                                _ => raw.trim().to_string(),
+                            };
+                            break Outcome::Submitted(text);
+                        }
+                    }
+                    KeyCode::Backspace => accept_backspace(&mut raw),
+                    KeyCode::Char(c) => accept_insert(&mut raw, c),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        draw(&raw);
+    };
+    // Leave the line saying what was accepted, never the material itself.
+    let shown = match &outcome {
+        Outcome::Submitted(_) => accept_display(&raw),
+        _ => String::new(),
+    };
+    let mut err = std::io::stderr();
+    let _ = write!(err, "\r\x1b[2K{prompt}{shown}");
+    let _ = err.flush();
+    raw.zeroize();
+    Ok(outcome)
+}
+
 // -------------------------------------------------------------------- tests --
 
 #[cfg(test)]
@@ -820,6 +1025,91 @@ mod tests {
         // "cat-12345" -> split_chosen strips 12345, leaves "cat" = 1 token
         let j = judge("cat-12345", Mode::Create, NP);
         assert_eq!(j.level, Level::Incomplete);
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::*;
+
+    /// A steer never makes the entry wrap: wrapped, every redraw left a stale
+    /// row behind (seen in tmux at 100 columns).
+    #[test]
+    fn the_steer_fits_the_row() {
+        let long = "a pairing code ends in a 4-digit number; a transfer code like this is `tunlion receive x`";
+        let (s, p) = fit_steer(long, Some("preview"), 40);
+        assert!(s.chars().count() <= 40, "{s}");
+        assert!(s.ends_with('\u{2026}'), "{s}");
+        assert_eq!(p, None);
+        let (s, p) = fit_steer("ok", Some("brave \u{b7} 3141"), 40);
+        assert_eq!((s.as_str(), p.as_deref()), ("ok", Some("brave \u{b7} 3141")));
+    }
+
+    fn none(_: &str) -> bool {
+        false
+    }
+
+    fn typed(s: &str) -> String {
+        let mut raw = String::new();
+        for c in s.chars() {
+            accept_insert(&mut raw, c);
+        }
+        raw
+    }
+
+    /// Owner's check: typing "clever lynx 63" shows clever-lynx-63 live.
+    #[test]
+    fn spaces_become_dashes_as_you_type() {
+        assert_eq!(accept_display(&typed("clever lynx 63")), "clever-lynx-63");
+        assert_eq!(accept_display(&typed("Clever Lynx")), "clever-lynx");
+        assert_eq!(accept_display(&typed("brave otter 3141")), "brave-otter-3141");
+    }
+
+    #[test]
+    fn bad_characters_are_refused_in_a_code() {
+        assert_eq!(accept_display(&typed("brave!otter@#")), "braveotter");
+        assert_eq!(accept_display(&typed("caf\u{e9}")), "caf");
+    }
+
+    #[test]
+    fn the_judgement_is_live_and_matches_join() {
+        assert_eq!(judge_accept("", &none).level, Level::Empty);
+        assert_eq!(judge_accept(&typed("brave otter"), &none).level, Level::Incomplete);
+        let j = judge_accept(&typed("brave otter 3141"), &none);
+        assert_eq!(j.level, Level::Ready, "{j:?}");
+        // A transfer code is named, and not submitted as a pairing code.
+        let j = judge_accept(&typed("clever lynx 63"), &none);
+        assert_eq!(j.level, Level::Incomplete);
+        assert!(j.steer.contains("tunlion receive clever-lynx-63"), "{}", j.steer);
+    }
+
+    #[test]
+    fn a_pasted_invitation_is_never_drawn() {
+        let secret = "filament-invite:v2:AbC_dEf-123xyzSECRET";
+        let raw = typed(secret);
+        assert_eq!(raw, secret, "every character of the material is kept");
+        let shown = accept_display(&raw);
+        assert!(!shown.contains("SECRET") && !shown.contains("AbC"), "{shown}");
+        assert!(shown.contains("invitation"), "{shown}");
+        assert_eq!(judge_accept(&raw, &none).level, Level::Ready);
+    }
+
+    #[test]
+    fn a_path_is_drawn_as_typed_and_judged_by_existence() {
+        let raw = typed("./Pop-OS.invite");
+        assert_eq!(accept_display(&raw), "./Pop-OS.invite");
+        assert_eq!(judge_accept(&raw, &none).level, Level::Incomplete);
+        assert_eq!(judge_accept(&raw, &|p| p == "./Pop-OS.invite").level, Level::Ready);
+    }
+
+    #[test]
+    fn backspace_removes_one_visible_character() {
+        let mut raw = typed("brave   ");
+        assert_eq!(accept_display(&raw), "brave-");
+        accept_backspace(&mut raw);
+        assert_eq!(accept_display(&raw), "brave");
+        accept_backspace(&mut raw);
+        assert_eq!(accept_display(&raw), "brav");
     }
 }
 

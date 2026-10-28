@@ -102,6 +102,8 @@ mod enrollment;
 mod membership;
 /// `tunlion pair` and its pair-specific helpers.
 mod pair_cmd;
+/// One spelling rule for device names, and the forgiving lookup.
+mod device_names;
 mod preconnect;
 mod access_ui;
 mod temporary_session;

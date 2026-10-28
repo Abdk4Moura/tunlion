@@ -229,9 +229,15 @@ pub(crate) fn cert_expiry_text(cert_expires: Option<u64>, now: u64) -> String {
 }
 
 pub(crate) fn device_countdown(
-    _tier: fleet_ui::devices::DeviceTier,
+    tier: fleet_ui::devices::DeviceTier,
     cert: Option<&identity::DeviceCert>,
 ) -> String {
+    // A paired device's certificate is ITS OWNER's business, not a clock on
+    // anything this device allowed: showing "cert expires in 77d" read as a
+    // deadline on the pairing, which has none.
+    if tier == fleet_ui::devices::DeviceTier::Paired {
+        return String::new();
+    }
     // #240: no certificate means there is no expiry to count down to, and
     // nothing is blocked, so the column says what is true ("no certificate").
     // "cert expires in", the words the delegated rows use for the same clock.
@@ -259,11 +265,12 @@ fn device_caps_summary(caps: &[String], tier: fleet_ui::devices::DeviceTier) -> 
     let mut labels = Vec::new();
     for cap in caps {
         let label = match (tier, cap.as_str()) {
-            (fleet_ui::devices::DeviceTier::External, "transfer") => "send→you",
+            (fleet_ui::devices::DeviceTier::External, "transfer") => "can send you files",
+            (fleet_ui::devices::DeviceTier::Paired, "transfer" | "send") => "files",
             (_, "transfer") => "inbox",
             (_, "shell") => "OWNER-EQUIVALENT shell",
             (_, "mount") => "mount",
-            (_, "send") => "send→you",
+            (_, "send") => "can send you files",
             (_, "read") => "read ~/share",
             _ => cap.as_str(),
         };
@@ -327,6 +334,21 @@ pub(crate) fn tier_for(
     }
 }
 
+/// The tier the `devices` LIST shows. A device with no identity of its own
+/// (paired by code, never joined anyone) has nobody to call "other people"
+/// and no owner key to review with, so every row there is simply paired.
+/// The capability view (`devices --caps`) keeps `tier_for`. Pure.
+pub(crate) fn list_tier(
+    cert: Option<&identity::DeviceCert>,
+    same_owner: Option<&[u8; 32]>,
+    invited_as_person: bool,
+) -> fleet_ui::devices::DeviceTier {
+    if same_owner.is_none() && !invited_as_person {
+        return fleet_ui::devices::DeviceTier::Paired;
+    }
+    tier_for(cert, same_owner, invited_as_person)
+}
+
 pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
     let warm_names = warm_device_names(warm);
     let same_owner = same_owner_key();
@@ -360,7 +382,7 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
                 .iter()
                 .find(|r| r["name"].as_str() == Some(name.as_str()))
                 .is_some_and(|r| r["invitedAs"].as_str() == Some("person"));
-            let tier = tier_for(cert.as_ref(), same_owner.as_ref(), invited_as_person);
+            let tier = list_tier(cert.as_ref(), same_owner.as_ref(), invited_as_person);
             let caps = effective_device_caps(&name);
             let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
             let address = stored_v6.or(stored_v4);
@@ -522,7 +544,7 @@ mod roster_row_label_tests {
 
 #[cfg(test)]
 mod person_tier_tests {
-    use super::tier_for;
+    use super::{list_tier, tier_for};
     use crate::fleet_ui::devices::DeviceTier;
 
     /// Launch matrix: a person admitted by `add --for person` holds an
@@ -535,5 +557,9 @@ mod person_tier_tests {
         assert_eq!(tier_for(Some(&cert), Some(&owner), false), DeviceTier::Fleet);
         assert_eq!(tier_for(Some(&cert), Some(&owner), true), DeviceTier::External);
         assert_eq!(tier_for(None, Some(&owner), true), DeviceTier::NeedsReview);
+        // No identity here: whatever the peer holds, the list says paired.
+        assert_eq!(list_tier(Some(&cert), None, false), DeviceTier::Paired);
+        assert_eq!(list_tier(None, None, false), DeviceTier::Paired);
+        assert_eq!(list_tier(Some(&cert), Some(&owner), false), DeviceTier::Fleet);
     }
 }
