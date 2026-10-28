@@ -147,20 +147,24 @@ else
 fi
 
 # ===================================================================== GATE S ==
-# STATUS THROUGH EXEC: `exec boxB -- tunlion status` reports boxB's daemon as
-# up. boxB runs with TUNLION_CONFIG_DIR, as any hermetic or relocated daemon
-# does; the served child used to lose that variable, look in the default config
-# dir and say "not running" while the daemon that served it was alive.
+# STATUS THROUGH EXEC: `exec boxB -- tunlion status` reports boxB's OWN daemon
+# as up. boxB runs with TUNLION_CONFIG_DIR, as any hermetic or relocated daemon
+# does; the served child used to lose that variable and read the default
+# config dir instead: "not running", or, on a box whose default config has a
+# daemon of its own, that other daemon. So the pid must be boxB's. The exit
+# code is not asserted: the hermetic boxB has no identity, which `status`
+# reports as 9 whatever the daemon's state.
 say S
-OUTS=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$BIN" status 2>"$WORK/S.err" </dev/null)
+BPID=$(head -1 "$DB/up.pid" 2>/dev/null | tr -d '[:space:]')
+OUTS=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$BIN" status 2>&1 </dev/null)
 rcS=$?
-echo "## (status via exec) rc=$rcS out='$(printf '%s' "$OUTS" | head -3)'"
-if [ "$rcS" = "0" ] && printf '%s' "$OUTS" | grep -q "up (pid" \
+echo "## (status via exec) rc=$rcS boxB pid=$BPID first='$(printf '%s' "$OUTS" | grep -m1 'up (pid\|not running')'"
+if [ -n "$BPID" ] && printf '%s' "$OUTS" | grep -q "up (pid $BPID)" \
    && ! printf '%s' "$OUTS" | grep -qi "not running"; then
-  ok "gateS: status run through exec sees the daemon that served it"
+  ok "gateS: status run through exec sees the daemon that served it (pid $BPID)"
 else
-  echo "-- S out --"; printf '%s\n' "$OUTS"; echo "-- S.err --"; cat "$WORK/S.err"
-  bad "gateS: status through exec did NOT see boxB's daemon (rc=$rcS)"
+  echo "-- S out --"; printf '%s\n' "$OUTS"
+  bad "gateS: status through exec did NOT see boxB's daemon pid=$BPID (rc=$rcS)"
 fi
 
 # ===================================================================== GATE C ==
