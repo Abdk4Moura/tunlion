@@ -5,9 +5,10 @@
 //! and re-grants what the platform needs. Moved as one unit, including the nested
 //! `key` helper that computes its own paths.
 //!
-//! Four cfg attributes gate statements inside the body -- the Linux getcap probe,
-//! the Windows rename, the unix chmod and the daemon reload -- and all four travel
-//! verbatim. No import needs a cfg gate: every crate-root item this uses (ctl,
+//! Four cfg attributes gate statements inside the body -- the Linux getcap probe
+//! and re-grant, the Windows rename and the unix chmod. The daemon reload is
+//! portable (ctl answers None where there is no control socket), and the old
+//! daemon's argv and launchd job are read through platform/. No import needs a cfg gate: every crate-root item this uses (ctl,
 //! daemon_alive, platform, release_target, sha256_hex, ui) is defined
 //! unconditionally, and the unix permission call carries its own function-local
 //! `use anyhow::{ Result, anyhow, bail };
@@ -256,10 +257,7 @@ pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
     // exact command for how it runs: its service manager's restart, or `down`
     // and `up --detach` with the flags it was started with. Windows has no
     // control socket, so it always takes the second path.
-    #[cfg(unix)]
     let answer = ctl::try_reload().await;
-    #[cfg(not(unix))]
-    let answer: Option<Value> = None;
     let reloading = matches!(answer, Some(ref v) if v["reloading"].as_bool() == Some(true));
     if reloading {
         println!("reloading the daemon onto the new binary (graceful restart, no sudo)");
@@ -296,7 +294,7 @@ impl OldDaemon {
         OldDaemon {
             pid,
             supervisor: supervisor_of(pid),
-            up_flags: process_argv(pid).and_then(|argv| up_flags_from_argv(&argv)),
+            up_flags: platform::process_argv(pid).and_then(|argv| up_flags_from_argv(&argv)),
         }
     }
 }
@@ -307,48 +305,10 @@ fn supervisor_of(pid: u32) -> Supervisor {
         Some(crate::ServiceManager::SystemdUser) => return Supervisor::SystemdUser,
         None => {}
     }
-    #[cfg(target_os = "macos")]
-    {
-        let uid = unsafe { libc::getuid() };
-        for target in [
-            format!("gui/{uid}/{}", platform::LAUNCHD_LABEL),
-            format!("system/{}", platform::LAUNCHD_LABEL),
-        ] {
-            let out = platform::command("launchctl").args(["print", &target]).output();
-            if let Ok(out) = out {
-                if out.status.success()
-                    && launchd_pid(&String::from_utf8_lossy(&out.stdout)) == Some(pid)
-                {
-                    return Supervisor::Launchd(target);
-                }
-            }
-        }
+    if let Some(target) = platform::launchd_target_running(pid) {
+        return Supervisor::Launchd(target);
     }
     Supervisor::None
-}
-
-/// The running pid in `launchctl print <target>` output (`\tpid = 123`).
-pub(crate) fn launchd_pid(print: &str) -> Option<u32> {
-    print.lines().find_map(|l| {
-        let (k, v) = l.trim().split_once(" = ")?;
-        (k == "pid").then(|| v.trim().parse().ok()).flatten()
-    })
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn process_argv(pid: u32) -> Option<Vec<String>> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    Some(
-        raw.split(|b| *b == 0)
-            .filter(|a| !a.is_empty())
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .collect(),
-    )
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn process_argv(_pid: u32) -> Option<Vec<String>> {
-    None
 }
 
 /// The flags a daemon was started with, from its full argv (`tunlion up
@@ -515,7 +475,7 @@ mod tests {
     #[test]
     fn launchd_print_names_the_running_pid() {
         let print = "gui/501/autumated.tunlion = {\n\tactive count = 1\n\tpath = /Users/me/Library/LaunchAgents/autumated.tunlion.plist\n\tstate = running\n\tpid = 812\n\tlast exit code = 0\n}\n";
-        assert_eq!(launchd_pid(print), Some(812));
-        assert_eq!(launchd_pid("gui/501/autumated.tunlion = {\n\tstate = waiting\n}\n"), None);
+        assert_eq!(platform::launchd_pid(print), Some(812));
+        assert_eq!(platform::launchd_pid("gui/501/autumated.tunlion = {\n\tstate = waiting\n}\n"), None);
     }
 }

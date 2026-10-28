@@ -1585,7 +1585,7 @@ impl ServiceHost {
 // installed side by side. Pinned by `frozen_service_names`.
 pub(crate) const SYSTEMD_UNIT: &str = "tunlion";
 #[allow(dead_code)] // macOS only
-pub(crate) const LAUNCHD_LABEL: &str = "autumated.tunlion";
+const LAUNCHD_LABEL: &str = "autumated.tunlion";
 #[allow(dead_code)] // Windows only
 const WINDOWS_AUTOSTART_NAME: &str = "Tunlion";
 #[allow(dead_code)] // Windows only
@@ -2255,6 +2255,60 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
 /// /proc on either). The arms must ship together; a missing variant makes
 /// `daemon_alive` constant-false on that platform, which is the #204 bug this
 /// predicate exists to close for good.
+/// Another process's full argv, where the platform exposes it to the same
+/// user (Linux: `/proc/<pid>/cmdline`). None elsewhere; callers say what they
+/// could not read rather than guess.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn process_argv(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        raw.split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect(),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn process_argv(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
+/// The launchd service target (`gui/<uid>/autumated.tunlion` or
+/// `system/autumated.tunlion`) whose running job is `pid`, or None. Always
+/// None off macOS.
+pub fn launchd_target_running(pid: u32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let uid = unsafe { libc::getuid() };
+        for target in [
+            format!("gui/{uid}/{LAUNCHD_LABEL}"),
+            format!("system/{LAUNCHD_LABEL}"),
+        ] {
+            let Ok(out) = command("launchctl").args(["print", &target]).output() else {
+                continue;
+            };
+            if out.status.success() && launchd_pid(&String::from_utf8_lossy(&out.stdout)) == Some(pid) {
+                return Some(target);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// The running pid in `launchctl print <target>` output (`\tpid = 123`).
+pub fn launchd_pid(print: &str) -> Option<u32> {
+    print.lines().find_map(|l| {
+        let (k, v) = l.trim().split_once(" = ")?;
+        (k == "pid").then(|| v.trim().parse().ok()).flatten()
+    })
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
