@@ -2726,12 +2726,9 @@ pub(crate) async fn send_cmd(
             let out = outgoing.lock().await;
             if !out.is_empty() && out.iter().all(|o| o.done) {
                 if let Some(t) = conn.transport() {
-                    // Block until the peer has acked every byte before we exit,
-                    // a torn-down QUIC connection drops un-acked send-buffer bytes
-                    // and truncates the last file (no-op on DataChannel, which
-                    // already drained in flush()). Surface a drain failure rather
-                    // than silently reporting "done" on a partial transfer.
-                    if let Err(e) = t.drain_finish().await {
+                    // Surface a drain failure rather than silently reporting
+                    // "done" on a partial transfer.
+                    if let Err(e) = exit_drain(&out, &t).await {
                         // CRITICAL, a possibly-incomplete delivery; must-see even under -q.
                         ui::critical(&ui::paint(
                             ui::Tone::Warn,
@@ -2789,6 +2786,16 @@ pub(crate) async fn send_cmd(
             }
         }
     }
+}
+
+/// The sender's final teardown drain, run once every transfer reached a
+/// terminal state and just before the process exits.
+///
+/// Block until the peer has acked every byte before we exit: a torn-down QUIC
+/// connection drops un-acked send-buffer bytes and truncates the last file.
+async fn exit_drain(out: &[Outgoing], t: &Arc<dyn Transport>) -> Result<()> {
+    let _ = out;
+    t.drain_finish().await
 }
 
 /// Copy `from` into the spool file, returning the bytes written, or the bytes
@@ -3346,5 +3353,120 @@ mod code_window_tests {
         let w = code_establish_window(None, Some("90"), claim);
         assert_eq!(code_expiry_secs(600, w), 90);
         assert_eq!(code_expiry_secs(600, Duration::ZERO), 600);
+    }
+}
+
+#[cfg(test)]
+mod exit_drain_tests {
+    use super::{exit_drain, Outgoing, Transport};
+    use serde_json::Value;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A link whose tail never drains: the peer's transport-level ack of the
+    /// last bytes is late (the WebRTC SCTP SACK the D harness measured at ~1 s),
+    /// or never comes. Counts how often the exit drain was entered.
+    struct SlowTail {
+        drains: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for SlowTail {
+        async fn send_control(&self, _msg: &Value) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn drain_finish(&self) -> anyhow::Result<()> {
+            self.drains.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn slow_tail() -> (Arc<dyn Transport>, Arc<AtomicUsize>) {
+        let drains = Arc::new(AtomicUsize::new(0));
+        (Arc::new(SlowTail { drains: drains.clone() }), drains)
+    }
+
+    fn file(name: &str, full: Option<&str>) -> Outgoing {
+        Outgoing {
+            id: format!("id-{name}"),
+            sid: 1,
+            name: name.into(),
+            size: 4,
+            head: None,
+            full: full.map(str::to_string),
+            path: std::path::PathBuf::from(name),
+            temp: false,
+            accepted_once: true,
+            sent: true,
+            acked: false,
+            declined: false,
+            done: false,
+            stream_started: None,
+            stream_bytes: 4,
+        }
+    }
+
+    /// The receiver's whole-file-verified delivery-ack (what the event loop's
+    /// `delivery-ack` arm records).
+    fn delivered(name: &str) -> Outgoing {
+        let mut o = file(name, Some("digest"));
+        o.acked = true;
+        o.done = true;
+        o
+    }
+
+    async fn finishes_within(out: &[Outgoing], t: &Arc<dyn Transport>, wall: Duration) -> bool {
+        tokio::time::timeout(wall, exit_drain(out, t)).await.is_ok()
+    }
+
+    /// Every file came back delivery-acked: the receiver hashed every byte and
+    /// matched the digest, so nothing a transport-level ack could add is owed.
+    /// The sender exits on the ack, not ~1 s later on the WebRTC tail drain.
+    #[tokio::test]
+    async fn a_delivery_acked_send_does_not_wait_for_the_link_tail() {
+        let (t, _) = slow_tail();
+        let out = vec![delivered("a.bin"), delivered("b.bin")];
+        assert!(
+            finishes_within(&out, &t, Duration::from_millis(500)).await,
+            "every file was delivery-acked, yet the exit waited on the transport drain"
+        );
+    }
+
+    /// A file with no whole-file digest completes on send (the size-only path)
+    /// without the receiver confirming anything: its bytes are only safe once
+    /// the link has drained, so the exit still waits for that.
+    #[tokio::test]
+    async fn a_file_done_without_a_delivery_ack_still_drains() {
+        let (t, drains) = slow_tail();
+        let mut size_only = file("c.bin", None);
+        size_only.acked = true;
+        size_only.done = true;
+        let out = vec![delivered("a.bin"), size_only];
+        assert!(
+            !finishes_within(&out, &t, Duration::from_millis(300)).await,
+            "a file the receiver never confirmed must not skip the drain"
+        );
+        assert_eq!(drains.load(Ordering::SeqCst), 1);
+    }
+
+    /// Nothing to confirm is never "everything confirmed".
+    #[tokio::test]
+    async fn an_empty_send_still_drains() {
+        let (t, drains) = slow_tail();
+        assert!(!finishes_within(&[], &t, Duration::from_millis(300)).await);
+        assert_eq!(drains.load(Ordering::SeqCst), 1);
     }
 }
