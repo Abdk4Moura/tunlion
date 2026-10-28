@@ -502,6 +502,8 @@ jobs:
               if ($env:TUNLION_CONFIG_DIR -and (Test-Path -LiteralPath $runExe)) {
                 & $runExe down --yes 2>&1 | Write-Host
               }
+              # Nothing from this test may outlive it into the harness below.
+              Get-Daemon $runExe | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
               $LASTEXITCODE = 0
               $env:TUNLION_INSTALL_DIR = $savedInstallDir
               $env:TUNLION_CONFIG_DIR = $savedConfig

@@ -425,6 +425,13 @@ try {
             Say "stopping the running daemon (pid $($d.Id)) to replace its binary ..."
             & $exe down --yes 2>&1 | Out-Null
             if (Get-Process -Id $d.Id -ErrorAction SilentlyContinue) {
+                # Releases whose `down` cannot stop a Windows daemon exist
+                # (it shelled out to `kill`). End it the way Task Manager
+                # would; the restart below brings it back.
+                Stop-Process -Id $d.Id -Force -ErrorAction SilentlyContinue
+                try { Wait-Process -Id $d.Id -Timeout 10 -ErrorAction Stop } catch { }
+            }
+            if (Get-Process -Id $d.Id -ErrorAction SilentlyContinue) {
                 Say "the daemon (pid $($d.Id)) did not stop; it keeps running the previous version"
                 $stuck += $d
             } else {
