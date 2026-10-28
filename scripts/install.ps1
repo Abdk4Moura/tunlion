@@ -187,12 +187,89 @@ function Remove-TlLauncher([string]$dir) {
     }
 }
 
+# ------------------------------------------------------- running binaries
+# Windows will not overwrite a running .exe, nor a DLL a running daemon has
+# loaded: copying the new release over them failed with "being used by
+# another process". A daemon running from this directory is stopped cleanly
+# with the binary it runs (`tunlion down`) and started again on the new one
+# with the same flags. Anything still running from here after that (a
+# `tunlion send`, a daemon that would not stop) keeps its old file, which is
+# renamed aside first, as `tunlion update` does, and removed on a later run.
+
+# Daemons (`tunlion.exe ... up ...`) running from $exe, with the flags after
+# `up`. The command line comes from Win32_Process; `--detach` is dropped
+# because the restart adds it.
+function Get-RunningDaemons([string]$exe) {
+    $found = @()
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name='tunlion.exe'" -ErrorAction SilentlyContinue)
+    foreach ($p in $procs) {
+        if (-not $p.ExecutablePath -or ($p.ExecutablePath -ine $exe)) { continue }
+        $tokens = @([regex]::Matches([string]$p.CommandLine, '(?:"[^"]*"|[^\s"])+') |
+            ForEach-Object { $_.Value.Replace('"', '') })
+        # The verb is the first word after the program that is not a flag.
+        $at = -1
+        for ($i = 1; $i -lt $tokens.Count; $i++) {
+            if (-not $tokens[$i].StartsWith('-')) { $at = $i; break }
+        }
+        if ($at -lt 0 -or $tokens[$at] -ne 'up') { continue }
+        $flags = @($tokens | Select-Object -Skip ($at + 1) | Where-Object { $_ -ne '--detach' })
+        $found += [pscustomobject]@{ Id = [int]$p.ProcessId; Flags = $flags }
+    }
+    return $found
+}
+
+# Running processes whose image is one of $paths.
+function Get-RunningFrom([string[]]$paths) {
+    @(Get-CimInstance Win32_Process -Filter "Name='tunlion.exe' OR Name='tunlion.old'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and ($paths -icontains $_.ExecutablePath) })
+}
+
+# Old binaries renamed aside by an earlier install or `tunlion update`. One
+# that is still running stays until a later run.
+function Remove-StaleOld([string]$dir) {
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+    foreach ($pattern in @('tunlion.old', 'tunlion.*.old', 'wintun.old', 'wintun.*.old')) {
+        Get-ChildItem -Force -LiteralPath $dir -Filter $pattern -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item -Force -LiteralPath $_.FullName -ErrorAction SilentlyContinue }
+    }
+}
+
+# Rename $path to <name>.old (MoveFile on the same volume succeeds even for a
+# running .exe), so the new file can be written in its place. When <name>.old
+# is itself still running, it is renamed to a unique .old name first.
+function Move-Aside([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $old = [System.IO.Path]::ChangeExtension($path, 'old')
+    if (Test-Path -LiteralPath $old) {
+        try {
+            Remove-Item -Force -LiteralPath $old -ErrorAction Stop
+        } catch {
+            $unique = [System.IO.Path]::ChangeExtension($path, ([guid]::NewGuid().ToString('N') + '.old'))
+            Move-Item -Force -LiteralPath $old -Destination $unique
+        }
+    }
+    Move-Item -Force -LiteralPath $path -Destination $old
+}
+
+function Format-UpCommand([string[]]$flags) {
+    $words = @('tunlion', 'up', '--detach') + @($flags | ForEach-Object {
+        if ($_ -match '\s') { "`"$_`"" } else { $_ }
+    })
+    return ($words -join ' ')
+}
+
 if ($DryRun) {
     Say 'dry run: no files, PATH entries or services were changed'
     Say "  scope:       $(if ($AllUsers) { 'all users' } else { 'current user' })"
     Say "  install dir: $InstallDir"
     Say "  PATH target: $Scope"
     Say '  short command: tl (installed only if no existing command collides)'
+    if (-not $Uninstall) {
+        $dryExe = Join-Path $InstallDir 'tunlion.exe'
+        foreach ($d in @(Get-RunningDaemons $dryExe)) {
+            Say "  would restart: the daemon (pid $($d.Id)) as: $(Format-UpCommand $d.Flags)"
+        }
+    }
     if ($Uninstall) {
         Say "  would remove: tunlion.exe and wintun.dll from $InstallDir"
         Say "  would remove: $InstallDir from the $Scope PATH"
@@ -219,6 +296,7 @@ if ($Uninstall) {
     foreach ($f in @('tunlion.exe', 'wintun.dll')) {
         Remove-FileWithRetry (Join-Path $InstallDir $f)
     }
+    Remove-StaleOld $InstallDir
     if ((Test-Path -LiteralPath $InstallDir) -and
         @(Get-ChildItem -Force -LiteralPath $InstallDir).Count -eq 0) {
         Remove-Item -Force -LiteralPath $InstallDir
@@ -318,16 +396,39 @@ try {
     $extract = Join-Path $tmp 'x'
     Expand-Archive -Path $ZipPath -DestinationPath $extract -Force
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    $exe = Join-Path $InstallDir 'tunlion.exe'
+    Remove-StaleOld $InstallDir
+
+    # A per-user daemon is stopped with the binary it runs, so it closes its
+    # links cleanly, and restarted below. An all-users install runs elevated
+    # as another account, whose `down` would not reach the user's daemon; it
+    # only renames the running files aside.
+    $restart = @()
+    if (-not $AllUsers -and (Test-Path -LiteralPath $exe)) {
+        foreach ($d in @(Get-RunningDaemons $exe)) {
+            Say "stopping the running daemon (pid $($d.Id)) to replace its binary ..."
+            & $exe down --yes 2>&1 | Out-Null
+            if (Get-Process -Id $d.Id -ErrorAction SilentlyContinue) {
+                Say "the daemon (pid $($d.Id)) did not stop; it keeps running the previous version"
+            } else {
+                $restart += $d
+            }
+        }
+    }
+
     foreach ($f in @('tunlion.exe', 'wintun.dll')) {
         $src = Join-Path $extract $f
         if (Test-Path -LiteralPath $src) {
             # Strip the mark-of-the-web so the extracted binary doesn't trip an
             # execution warning (the user explicitly ran this installer).
             try { Unblock-File -LiteralPath $src -ErrorAction Stop } catch { }
-            Copy-Item -LiteralPath $src -Destination (Join-Path $InstallDir $f) -Force
+            $dest = Join-Path $InstallDir $f
+            Move-Aside $dest
+            Copy-Item -LiteralPath $src -Destination $dest -Force
         }
     }
-    $exe = Join-Path $InstallDir 'tunlion.exe'
+    # Not running any more: nothing to keep.
+    Remove-StaleOld $InstallDir
     if (-not (Test-Path -LiteralPath $exe)) { Die 'install failed: tunlion.exe not found in the archive' }
 
     # --------------------------------------------------------- short command
@@ -370,6 +471,25 @@ try {
 
     $ver = (& $exe --version 2>$null) -join ' '
     Say "installed $exe ($(if ($ver) { $ver } else { $Tag }))"
+
+    foreach ($d in $restart) {
+        $cmd = Format-UpCommand $d.Flags
+        & $exe up --detach @($d.Flags) 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Say "restarted the daemon on the new version ($cmd)"
+        } else {
+            Say "the daemon was stopped but did not restart (exit $LASTEXITCODE); start it with: $cmd"
+        }
+    }
+    $oldExe = [System.IO.Path]::ChangeExtension($exe, 'old')
+    $stillOld = @(Get-RunningFrom @($oldExe))
+    if ($stillOld.Count -gt 0) {
+        $ids = ($stillOld | ForEach-Object { $_.ProcessId }) -join ', '
+        Say "still running the previous version from $oldExe (pid $ids); it is removed by the next install once it exits"
+        foreach ($d in @(Get-RunningDaemons $oldExe)) {
+            Say "  to move the daemon (pid $($d.Id)) to the new version:  tunlion down --yes, then: $(Format-UpCommand $d.Flags)"
+        }
+    }
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

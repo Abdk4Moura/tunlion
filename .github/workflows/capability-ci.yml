@@ -181,6 +181,9 @@ jobs:
       #   - a real per-user install into a temp dir, from a LOCALLY built zip
       #     with the same SHA-256 verification, leaves tunlion.exe and
       #     wintun.dll beside each other and adds that dir to the user PATH
+      #   - installing over a RUNNING tunlion.exe: a busy process keeps its
+      #     renamed-aside file, and a daemon is stopped, replaced and restarted
+      #     with its flags
       #
       # NOT COVERED HERE (a stock runner must not elevate or register services):
       #   - UAC elevation and the -AllUsers install into %ProgramFiles%
@@ -397,6 +400,97 @@ jobs:
               Write-Host 'OK: a non-Tunlion tl.cmd in the install dir is preserved'
             } finally {
               $env:TUNLION_INSTALL_DIR = $savedInstallDir
+            }
+
+            # 6. Install over a RUNNING tunlion.exe. Windows will not overwrite
+            #    a running image ("being used by another process"), which is
+            #    what reinstalling with a daemon up used to hit.
+            #    (a) Any process running from the install dir keeps its file,
+            #        renamed aside to tunlion.old; the new one is installed and
+            #        the stale .old is removed by the next install.
+            #    (b) A daemon (`up`) is stopped with its own binary, replaced,
+            #        and started again with the same flags.
+            $runDir = Join-Path $tempRoot 'running-install'
+            $runExe = Join-Path $runDir 'tunlion.exe'
+            $runOld = Join-Path $runDir 'tunlion.old'
+            $wantHash = (Get-FileHash -LiteralPath (Join-Path $payload 'tunlion.exe')).Hash
+            $savedInstallDir = $env:TUNLION_INSTALL_DIR
+            $savedConfig = $env:TUNLION_CONFIG_DIR
+            $busy = $null
+            function Get-Daemon([string]$exe) {
+              @(Get-CimInstance Win32_Process -Filter "Name='tunlion.exe'" |
+                Where-Object { $_.ExecutablePath -ieq $exe -and $_.CommandLine -match '\sup(\s|$)' })
+            }
+            try {
+              $env:TUNLION_INSTALL_DIR = $runDir
+              Run-Installer -InstallerArgs @('-Archive', $zip) | Write-Host
+
+              # (a) A stand-in holding the installed image open the way any
+              # running tunlion does: ping.exe copied to the installed path.
+              Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\PING.EXE') -Destination $runExe -Force
+              $busy = Start-Process -FilePath $runExe -ArgumentList @('-n', '600', '127.0.0.1') -PassThru -WindowStyle Hidden
+              Start-Sleep -Seconds 1
+              if ($busy.HasExited) { throw 'test setup: the running stand-in exited at once' }
+              $busyOut = Run-Installer -InstallerArgs @('-Archive', $zip)
+              Write-Host $busyOut
+              if ((Get-FileHash -LiteralPath $runExe).Hash -ne $wantHash) {
+                throw 'the running tunlion.exe was not replaced by the archive binary'
+              }
+              if (-not (Test-Path -LiteralPath $runOld)) { throw 'the running binary was not renamed aside to tunlion.old' }
+              if ($busy.HasExited) { throw 'the installer killed a process that was not a daemon' }
+              if ($busyOut -notmatch 'still running the previous version') {
+                throw 'the installer did not say a process still runs the previous version'
+              }
+              Write-Host 'OK: installing over a running tunlion.exe renames it aside and installs the new one'
+              Stop-Process -Id $busy.Id -Force
+              $busy.WaitForExit()
+              $busy = $null
+              Run-Installer -InstallerArgs @('-Archive', $zip) | Write-Host
+              if (Test-Path -LiteralPath $runOld) { throw 'the stale tunlion.old was not removed once nothing ran it' }
+              Write-Host 'OK: the next install removes the stale tunlion.old'
+
+              # (b) A real daemon from the installed binary. Its server is
+              # unreachable on purpose: `up` keeps retrying, which is all this
+              # needs (a live `up` holding the image), and it touches no network.
+              $cfg = Join-Path $tempRoot 'running-config'
+              New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+              ('[{"name":"boxB","secret":"' + ('ab' * 32) + '"}]') |
+                Set-Content -LiteralPath (Join-Path $cfg 'devices.json') -Encoding Ascii
+              $env:TUNLION_CONFIG_DIR = $cfg
+              & $runExe up --detach '--server=http://127.0.0.1:9' 2>&1 | Write-Host
+              $daemonsBefore = @()
+              for ($i = 0; $i -lt 50 -and $daemonsBefore.Count -eq 0; $i++) {
+                Start-Sleep -Milliseconds 200
+                $daemonsBefore = @(Get-Daemon $runExe)
+              }
+              if ($daemonsBefore.Count -ne 1) { throw "test setup: expected one daemon from $runExe, found $($daemonsBefore.Count)" }
+              $oldPid = $daemonsBefore[0].ProcessId
+              $daemonOut = Run-Installer -InstallerArgs @('-Archive', $zip)
+              Write-Host $daemonOut
+              if ($daemonOut -notmatch 'restarted the daemon on the new version') {
+                throw 'the installer did not restart the daemon it stopped'
+              }
+              if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) { throw "the old daemon (pid $oldPid) is still running" }
+              $daemonsAfter = @()
+              for ($i = 0; $i -lt 50 -and $daemonsAfter.Count -eq 0; $i++) {
+                Start-Sleep -Milliseconds 200
+                $daemonsAfter = @(Get-Daemon $runExe)
+              }
+              if ($daemonsAfter.Count -ne 1) { throw "expected one restarted daemon from $runExe, found $($daemonsAfter.Count)" }
+              if ($daemonsAfter[0].CommandLine -notmatch [regex]::Escape('--server=http://127.0.0.1:9')) {
+                throw "the restarted daemon lost its flags: $($daemonsAfter[0].CommandLine)"
+              }
+              if ((Get-FileHash -LiteralPath $runExe).Hash -ne $wantHash) { throw 'the daemon binary was not replaced' }
+              if (Test-Path -LiteralPath $runOld) { throw 'a tunlion.old was left although the daemon was stopped first' }
+              Write-Host "OK: a running daemon is stopped, replaced and restarted with its flags (pid $oldPid -> $($daemonsAfter[0].ProcessId))"
+            } finally {
+              if ($busy -and -not $busy.HasExited) { Stop-Process -Id $busy.Id -Force -ErrorAction SilentlyContinue }
+              if ($env:TUNLION_CONFIG_DIR -and (Test-Path -LiteralPath $runExe)) {
+                & $runExe down --yes 2>&1 | Write-Host
+              }
+              $LASTEXITCODE = 0
+              $env:TUNLION_INSTALL_DIR = $savedInstallDir
+              $env:TUNLION_CONFIG_DIR = $savedConfig
             }
 
             # 5. A tampered archive must be rejected before anything is
