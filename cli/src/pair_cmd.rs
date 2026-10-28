@@ -1014,7 +1014,9 @@ async fn pair_with_purpose(
             //    key-confirmation MAC over K + sorted fingerprints + caps. The MAC
             //    is gated on the fingerprints so a server that substitutes a DTLS
             //    cert produces a different fingerprint → the peer's verify fails.
-            if cer.has_k() {
+            //    The confirmation carries our element too, so gate 17b's stall
+            //    withholds it as well.
+            if !stall && cer.has_k() {
                 if let Some(l) = conn.link(&pid) {
                     if let Some((my_fp, their_fp)) = match &l.peer {
                         Some(p) => p.fingerprints().await,
@@ -1103,6 +1105,13 @@ async fn pair_with_purpose(
         }
 
         let poll_interval = temporary.as_ref().map_or(Duration::from_secs(2), |session| session.poll_interval());
+        // A ceremony in flight re-sends its current message on a sub-second
+        // backoff from the progression block above, so tick at that cadence.
+        let poll_interval = if pake_peer.is_some() && agreed_secret.is_none() {
+            poll_interval.min(Duration::from_millis(100))
+        } else {
+            poll_interval
+        };
         let ev = match tokio::time::timeout(poll_interval, rx.recv()).await {
             Ok(Some(ev)) => ev,
             Ok(None) => bail!("signaling closed"),
@@ -1291,6 +1300,12 @@ async fn pair_with_purpose(
                             );
                         }
                         PakeInbound::Ignored => {}
+                        // Our confirmation was lost: answer the peer's re-send.
+                        PakeInbound::Reply(reply) => {
+                            sio.emit("signal", json!({ "to": from, "data": reply }))
+                                .await
+                                .ok();
+                        }
                     }
                     continue;
                 }

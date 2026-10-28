@@ -867,6 +867,12 @@ async fn drive_over(
                                 )));
                             }
                             PakeInbound::Ignored => {}
+                            // Our confirmation was lost: answer the receiver's re-send.
+                            PakeInbound::Reply(reply) => {
+                                sio.emit("signal", json!({ "to": from, "data": reply }))
+                                    .await
+                                    .ok();
+                            }
                         }
                         continue;
                     }
