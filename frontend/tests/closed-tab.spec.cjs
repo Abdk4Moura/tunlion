@@ -192,7 +192,10 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
       await sleep(300);
       await b.page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })));
       // Stable presence after the restore: seen now, and still there later.
+      const sockAt = async () => b.page.evaluate(() => window.__tunlionTestSocket && window.__tunlionTestSocket());
+      const sock1 = await sockAt();
       const back = await waitTile(a.page, name, true, 10000);
+      const sock2 = await sockAt();
       await sleep(3000);
       const why = back == null ? 'the restored page never came back on the other peer'
         : (await tilesFor(a.page, name)) === 0 ? 'the restored page dropped off the other peer again'
@@ -200,6 +203,7 @@ async function closeAndTime(tag, observer, leaving, { polling }) {
       const seen = telEvents().slice(mark).filter((e) => !/^web:(vis|net|conn|link|ice|tile|cfg)/.test(e.ev))
         .map((e) => e.ev + (e.reason ? '(' + e.reason + ')' : '') + (e.status ? '(' + e.status + ')' : ''));
       console.log(`[closed-tab] ${tag}: relay saw [${seen.slice(0, 40).join(', ')}]`);
+      console.log(`[closed-tab] ${tag}: socket after restore ${JSON.stringify(sock1)} later ${JSON.stringify(sock2)}`);
       console.log(`[closed-tab] ${tag}: page requests [${b.sent.slice(Math.max(0, sentMark - 4), sentMark + 40).join(', ')}]`);
       if (why) failures.push(`${tag}: ${why}`);
       else ok(`${tag}: a restored page comes back and stays on the other peer`);

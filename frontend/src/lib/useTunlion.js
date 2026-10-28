@@ -621,6 +621,14 @@ export function useTunlion() {
       if (new URLSearchParams(window.location.search).has('test')) {
         window.__tunlionTestLinks = linksRef.current
         window.__tunlionTestReconnect = () => sigRef.current?.dropForTest?.()
+        // The signaling socket's transport state, for gates that must tell a
+        // stalled long-poll from a socket that is merely idle.
+        window.__tunlionTestSocket = () => {
+          const s = sigRef.current?.socket
+          const e = s?.io?.engine
+          const t = e?.transport
+          return { connected: !!s?.connected, suspended: !!sigRef.current?.suspended, engine: e?.readyState, transport: t?.name, tstate: t?.readyState, polling: t?._polling, writable: t?.writable, buffered: e?.writeBuffer?.length }
+        }
       }
     } catch {}
     ;(async () => {
