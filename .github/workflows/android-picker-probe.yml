@@ -26,6 +26,7 @@ jobs:
           (cd frontend && npm ci --no-audit --no-fund && npx playwright install --with-deps chromium)
           for d in main naive fix; do
             ln -s "$GITHUB_WORKSPACE/frontend/node_modules" ../$d/frontend/node_modules
+            sed -i 's/return { connected: !!s?.connected, suspended/return { id: s?.id, connected: !!s?.connected, suspended/' ../$d/frontend/src/lib/useTunlion.js
             (cd ../$d/frontend && VITE_TUNLION_API= npm run build)
           done
       - name: Enable KVM
