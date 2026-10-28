@@ -274,7 +274,6 @@ pub(crate) fn resolve_for_kind(
     }
 }
 
-#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn stop_managed_service(pid: u32) -> bool {
     // Only stop through the manager when THIS daemon is actually the managed
     // unit's process, AND the right manager. `systemctl stop tunlion` stops

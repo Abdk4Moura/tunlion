@@ -51,10 +51,7 @@ impl Stopped {
         match self {
             Stopped::Asked => "",
             Stopped::Resumed => "; it was suspended (SIGSTOP), so it was resumed to let it exit",
-            #[cfg(not(windows))]
-            Stopped::Killed => "; it did not exit within 10s of SIGTERM, so it was killed (SIGKILL)",
-            #[cfg(windows)]
-            Stopped::Killed => "; it did not exit within 10s of the stop request, so it was terminated",
+            Stopped::Killed => platform::FORCED_STOP_NOTE,
         }
     }
 }
@@ -279,15 +276,8 @@ mod tests {
     fn stop_notes_say_what_was_done() {
         assert_eq!(Stopped::Asked.note(), "");
         assert!(Stopped::Resumed.note().contains("resumed"));
-        #[cfg(not(windows))]
-        assert!(Stopped::Killed.note().contains("SIGKILL"));
-        // Windows has no signals: the note names the stop request and the
-        // termination that followed it, never a SIGKILL that did not happen.
-        #[cfg(windows)]
-        {
-            let n = Stopped::Killed.note();
-            assert!(n.contains("stop request") && n.contains("terminated") && !n.contains("SIG"), "{n}");
-        }
+        // The wording per platform is pinned in platform's own test.
+        assert_eq!(Stopped::Killed.note(), platform::FORCED_STOP_NOTE);
     }
 
     /// A pid with no process behind it is gone, whatever executable we expected.

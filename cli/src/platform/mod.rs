@@ -3638,8 +3638,11 @@ impl InstanceLock {
 /// a named event keyed by its pid, and `down` sets it: the same graceful
 /// shutdown a ctrl-c gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code))] // only Windows constructs the event outcomes
 pub enum StopAsk {
+    /// This platform stops a daemon with signals (SIGTERM via `kill`, or the
+    /// service manager); there is no stop event to set.
+    UseSignals,
     /// The daemon's stop event was set; it shuts down on its own.
     Sent,
     /// No stop event for that pid: an older tunlion, or one whose event name
@@ -3704,6 +3707,19 @@ pub(crate) fn listen_for_stop_request() -> Option<tokio::sync::oneshot::Receiver
     }
     None
 }
+
+/// `down` side: signals do the job here.
+#[cfg(not(windows))]
+pub fn ask_daemon_to_stop(_pid: u32) -> std::io::Result<StopAsk> {
+    Ok(StopAsk::UseSignals)
+}
+
+/// What `down` says when the daemon had to be ended forcibly after its grace.
+#[cfg(not(windows))]
+pub const FORCED_STOP_NOTE: &str = "; it did not exit within 10s of SIGTERM, so it was killed (SIGKILL)";
+/// Windows has no signals: name the stop request and the termination.
+#[cfg(windows)]
+pub const FORCED_STOP_NOTE: &str = "; it did not exit within 10s of the stop request, so it was terminated";
 
 /// `down` side: set the daemon's stop event.
 #[cfg(windows)]
@@ -4439,6 +4455,18 @@ mod detach_inheritance_tests {
         );
         assert!(grandchild.is_some(), "middle never reported its detached child; output: {text:?}");
     }
+}
+
+/// The forced-stop note names what this platform actually did.
+#[test]
+fn the_forced_stop_note_names_what_was_done() {
+    #[cfg(not(windows))]
+    assert!(FORCED_STOP_NOTE.contains("SIGKILL"));
+    #[cfg(windows)]
+    assert!(
+        FORCED_STOP_NOTE.contains("stop request") && FORCED_STOP_NOTE.contains("terminated") && !FORCED_STOP_NOTE.contains("SIG"),
+        "{FORCED_STOP_NOTE}"
+    );
 }
 
 /// `down` and the daemon must derive the same event name from the pid, and it
