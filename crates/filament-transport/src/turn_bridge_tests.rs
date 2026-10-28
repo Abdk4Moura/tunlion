@@ -457,3 +457,15 @@ async fn an_unreachable_tcp_server_fails_fast_and_is_counted() {
     assert_eq!(bridges.shared.view().tcp_failed, 1);
     client.close().await.unwrap();
 }
+
+/// The bridge's TCP socket keeps a small send buffer, so a stream slower than
+/// its sender drops instead of queueing seconds of data (see STREAM_SNDBUF).
+#[tokio::test]
+async fn bridge_sockets_have_a_bounded_send_buffer() {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s = dial(l.local_addr().unwrap()).await.unwrap();
+    let size = socket2::SockRef::from(&s).send_buffer_size().unwrap();
+    // Linux reports double what was set; nothing reports less than asked.
+    assert!(size <= 2 * STREAM_SNDBUF as usize, "send buffer {size} is not bounded");
+    assert!(size >= STREAM_SNDBUF as usize / 2, "send buffer {size} is implausibly small");
+}

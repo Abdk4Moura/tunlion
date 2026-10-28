@@ -66,6 +66,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE: Duration = Duration::from_secs(15 * 60);
 /// Packets held per session while it waits for its turn.
 const HOLD_MAX: usize = 32;
+/// Kernel send buffer for a bridge's TCP socket, and the packets queued ahead
+/// of it. A stream never drops, so without a bound a sender faster than the
+/// stream fills the socket buffer (autotuned to megabytes) and every packet on
+/// the path, ICE consent checks included, waits seconds behind it: CI measured
+/// exactly that on TLS 443, where the browser declared the path dead and
+/// restarted ICE mid-transfer. Bounded, the excess is dropped as it would be on
+/// a UDP relay, and SCTP congestion control backs off. 128 KiB (the kernel
+/// doubles it) still allows ~2.5 MB/s at 100 ms to the TURN server.
+const STREAM_SNDBUF: u32 = 128 * 1024;
+const SESSION_QUEUE: usize = 64;
 /// Opt-out: `TUNLION_TURN_STREAM=0` hands webrtc-ice the config untouched (TCP
 /// and TLS URLs are then ignored again, as before this bridge existed).
 pub const DISABLE_ENV: &str = "TUNLION_TURN_STREAM";
@@ -377,7 +387,7 @@ async fn listener(shared: Arc<Shared>, up: Upstream, sock: Arc<UdpSocket>) {
                 let tx = match live {
                     Some(tx) => tx,
                     None => {
-                        let (tx, rx) = mpsc::channel(256);
+                        let (tx, rx) = mpsc::channel(SESSION_QUEUE);
                         shared.register(src.port(), up.kind);
                         running.spawn(session(shared.clone(), up.clone(), sock.clone(), src, rx));
                         sessions.insert(src, tx.clone());
@@ -554,7 +564,7 @@ async fn connect(up: &Upstream) -> std::io::Result<Box<dyn ByteStream>> {
     let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "no address");
     let mut tcp = None;
     for a in addrs {
-        match TcpStream::connect(a).await {
+        match dial(a).await {
             Ok(s) => {
                 tcp = Some(s);
                 break;
@@ -574,6 +584,13 @@ async fn connect(up: &Upstream) -> std::io::Result<Box<dyn ByteStream>> {
             Ok(Box::new(tls))
         }
     }
+}
+
+async fn dial(a: SocketAddr) -> std::io::Result<TcpStream> {
+    let sock = if a.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+    // Before connect, so the window is sized from the start.
+    let _ = sock.set_send_buffer_size(STREAM_SNDBUF);
+    sock.connect(a).await
 }
 
 /// Client -> server: STUN goes as is (always a multiple of four); ChannelData
