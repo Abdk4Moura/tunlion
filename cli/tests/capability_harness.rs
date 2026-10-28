@@ -273,10 +273,23 @@ fn find_free_port() -> u16 {
         .unwrap_or(19079)
 }
 
+/// A distinct work directory per Harness, not one per test process. The tests
+/// run serially in one process, and a child a test does not reap (the sender in
+/// `pair_and_transfer_smoke`) can still be writing into its config dir while
+/// Drop removes it. On macOS that left `b/` behind with an identity, so the
+/// next test's `init` refused ("this device already has identity") and every
+/// test after it failed the same way, since a Harness that panics in `new`
+/// never reaches Drop.
+fn harness_seq() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Harness {
     fn new() -> Self {
         let work = std::env::temp_dir()
-            .join(format!("filament-harness-{}", std::process::id()));
+            .join(format!("filament-harness-{}-{}", std::process::id(), harness_seq()));
         std::fs::create_dir_all(&work).expect("create work dir");
 
         let a_dir = work.join("a");
