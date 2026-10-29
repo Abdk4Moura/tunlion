@@ -5574,3 +5574,27 @@ fn browser_pake_scope_matches_the_cli_code_flows() {
         identity::IntroScope::Device.to_byte()
     );
 }
+
+/// On Windows `tunlion update` renames the running `tunlion.exe` to
+/// `tunlion.old`, so the old daemon's image path ends in `.old` while its
+/// recorded executable is still `tunlion.exe`. `status` and `down` read that
+/// daemon as "not running" and the restart `update` advises could not stop it.
+#[test]
+fn a_daemon_running_from_the_update_renamed_old_binary_is_still_this_install() {
+    let dir = std::env::temp_dir().join(format!("tunlion-same-exe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("tunlion.exe");
+    let old = dir.join("tunlion.old");
+    let other = dir.join("other.old");
+    for p in [&exe, &old, &other] {
+        std::fs::write(p, b"x").unwrap();
+    }
+    assert!(same_executable(&old, &exe), "the renamed old binary is this install");
+    assert!(same_executable(&exe, &old));
+    assert!(!same_executable(&other, &exe), "only the same name with .old matches");
+    assert!(
+        !same_executable(&std::env::temp_dir().join("tunlion.old"), &exe),
+        "a .old elsewhere is not this install"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

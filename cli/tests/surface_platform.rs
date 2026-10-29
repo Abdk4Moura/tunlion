@@ -47,7 +47,9 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("exec_recv.rs", 7),
         ("file_io.rs", 5),
         ("install_service.rs", 5),
-        ("update_cmd.rs", 5),
+        // 5 -> 4: the reload answer is portable (ctl's Windows stub says
+        // None) and the daemon's argv and launchd job moved into platform/.
+        ("update_cmd.rs", 4),
         ("mount_cmd.rs", 4),
         ("dispatch.rs", 3),
         ("exec_send.rs", 3),
