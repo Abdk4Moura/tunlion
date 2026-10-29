@@ -146,6 +146,10 @@ pub trait RecvIdentity: Send + Sync {
     ) -> bool;
     fn device_name_for_pub(&self, device_pub: &[u8; 32]) -> Option<String>;
     fn device_cert_revoked(&self, device_pub: &[u8; 32]) -> bool;
+    /// Fleet auto-mesh: may this same-owner sibling be admitted over the fleet
+    /// channel? See `DeviceStore::sibling_admissible` (the owner's signed
+    /// roster is the revocation channel on a joined device).
+    fn sibling_admissible(&self, device_pub: &[u8; 32]) -> bool;
     fn device_cert_revoked_some(&self, device_pub: Option<&[u8; 32]>) -> bool {
         device_pub
             .map(|p| self.device_cert_revoked(p))
@@ -542,6 +546,9 @@ pub(crate) mod test_support {
             None
         }
         fn device_cert_revoked(&self, _: &[u8; 32]) -> bool {
+            false
+        }
+        fn sibling_admissible(&self, _: &[u8; 32]) -> bool {
             false
         }
         fn owner_pub_for_resources(&self) -> Option<[u8; 32]> {

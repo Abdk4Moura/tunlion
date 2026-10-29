@@ -5,6 +5,64 @@
 > owner accepted, why it does not reopen what that note closed, and the exact
 > mechanism.
 
+## 0.9.2: what ships, measured against 0.9.1 (2026-10-28)
+
+The owner's scope for 0.9.2, and how the tree meets it. Read this before the
+historical sections below; several of them describe work that went further than
+this scope or a mechanism (fleet_rv rotation) that was never built.
+
+Measured on the released 0.9.1 binary with three daemons (separate HOME, config
+and receive dir each), before any change:
+
+| | 0.9.1 | 0.9.2 |
+|---|---|---|
+| siblings meet and verify each other's certificate | yes | yes, and only if the owner's roster lists them |
+| `reach <sibling>` | "sibling connections are not in this release" | probes the daemon's sibling link |
+| `exec`/`shell <sibling>` | target's own shell grant decides | unchanged |
+| `send --to <sibling>`, no grant on the target | **delivered** (FleetDevice scoped default) | refused, nothing lands |
+| `send --to <sibling>`, target granted `transfer` | delivered | delivered, to the named device only |
+| owner revokes C; A and C stay linked | **yes, and A still delivered to C** | A closes the link within one roster push and refuses C's hello |
+
+**Transfer is grant-only between siblings.** `cap::sibling_transfer_scope`
+withholds the transfer scoped default from a `FleetDevice` principal unless an
+explicit grant exists (an owner-signed grant op in the cap store, or the
+receiver's own record grant from `tunlion grant <sibling> transfer`). Applied at
+both transfer gates, `file-offer` and `sync`. It is purely restrictive and never
+touches a paired device, the owner or a delegated device. A 0.9.1 receiver still
+applies its own 0.9.1 policy; that cannot be changed from here.
+
+**Revocation rides the owner's signed roster.** A joined device never learned of
+a revocation made on the owner, so a revoked sibling kept its links. The roster
+the owner already pushes over each pair link (signed, monotonic in
+`(epoch, valid_until)`, verified against the owner key the device already holds)
+now also NARROWS sibling admission on a joined device:
+
+- `DeviceStore::sibling_admissible`: a sibling is admitted over the fleet
+  channel only if the newest roster held lists its device key. No roster, no
+  admission (fail closed: without one, no revocation could reach us).
+- `DeviceStore::device_cert_revoked` reads a sibling record (certificate from
+  our owner, no pair secret) that the held roster no longer lists as revoked, so
+  every gate refuses it with "device revoked".
+- An accepted roster triggers the revocation sweep at once, and
+  `revocation::sibling_link_must_close` closes every `FleetDevice` link whose
+  device is revoked or whose certificate has expired (checked every 2 s).
+- A hello that verifies but is not listed YET is held, not dropped, and replayed
+  when the next roster arrives, so a hello winning the race against the first
+  roster does not lose the link for good.
+
+Not transitive: listing never authorizes, the certificate is still the evidence,
+and the roster is the OWNER's signed statement, never a peer's. The owner device
+and paired devices are not governed by it. `proofs/fleet_automesh_model.py` now
+models exactly this (no rv rotation, which was never built) with mutation
+controls for the cert check, the roster check, the sweep and the no-roster case.
+
+Out of scope for this release, deliberately: ungranted fleet-scope transfer and
+owner-signed grant distribution as designed features. Two things already in the
+tree from the filament era are named honestly: the `FleetDevice` principal kind
+(kept; its transfer scoped default is now withheld from siblings), and the
+`fleet-policy` relay of owner-signed cap ops (unchanged; an owner-signed grant
+already counted as an explicit grant on every fleet device in 0.9.1).
+
 ## Problem
 
 Install plus pair does not give a mesh. A pairing mints one shared secret and

@@ -67,6 +67,7 @@ on:
       - 'cli/tests/forward-refusal-gates.sh'
       - 'cli/tests/revocation-live-gates.sh'
       - 'cli/tests/invite-expiry-gates.sh'
+      - 'cli/tests/fleet-automesh-gates.sh'
       - 'cli/tests/lib/fixture.sh'
       - 'backend/**'
       - '.github/workflows/revoke-gates.yml'
@@ -91,7 +92,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: revoke gates (ubuntu)
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -243,3 +244,24 @@ jobs:
             fi
           done
           exit $rc
+
+      # Fleet auto-mesh: three daemons under one owner key plus an uncertified
+      # pairing, each with its own HOME, config and receive dir. Its own step
+      # with its own bound because it is the longest gate here (several
+      # deliberately refused sends, each waiting out its answer).
+      - name: Run fleet auto-mesh gates
+        env:
+          TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
+        run: |
+          set -uo pipefail
+          g=cli/tests/fleet-automesh-gates.sh
+          want=33
+          echo "gate tree: $(git rev-parse HEAD) ($g)"
+          code=0
+          out="$(timeout 600 bash "$g" 2>&1)" || code=$?
+          echo "$out"
+          got=$(printf '%s\n' "$out" | grep -cE '^(PASS|KNOWN-RED):' || true)
+          if [ "$code" -eq 124 ]; then echo "::error::$g HUNG (600s)"; exit 1; fi
+          if [ "$code" -ne 0 ]; then echo "::error::$g exited $code"; exit 1; fi
+          if [ "$got" -ne "$want" ]; then echo "::error::$g passed $got gates but $want were expected"; exit 1; fi
+          echo "$g: $got/$want gates passed"

@@ -434,6 +434,7 @@ pub async fn admit_sync_open(
     // The transfer gate is unconditional in both modes. The injected host is
     // the one policy site: it owns the store, mode, clock and verdict, so this
     // endpoint never re-derives a capability decision or reads a file.
+    let sibling = crate::shell_gate::sibling_transfer_facts(conn, pid);
     let denied_reason = {
         let host = conn.host.clone();
         let az = peer_authz(conn, pid);
@@ -446,6 +447,10 @@ pub async fn admit_sync_open(
         let outcome = cap::cap_trust_floor(&outcome, trusted, binding, authoritative);
         let (own_user, has_grant) =
             cap::fleet_inputs_in(&store, "self", cap::CAP_TRANSFER, idev, iusr, ak_caps, now);
+        // A fleet sibling syncs in only with an explicit transfer grant, the
+        // same rule as a `file-offer` (cap::sibling_transfer_scope).
+        let has_grant = has_grant || sibling.record_grant;
+        let scoped_in_bounds = cap::sibling_transfer_scope(sibling.is_sibling, true, has_grant);
         // These are the `file-offer` transfer-gate inputs exactly. `denied` is
         // false because no deny list is consulted on the transfer path today;
         // `ceiling_authorizes` is false because transfer is a SCOPED DEFAULT
@@ -461,7 +466,7 @@ pub async fn admit_sync_open(
             cert_expires: expires,
             auth_key_caps: ak_caps,
             own_user_pub: own_user.as_ref(),
-            scoped_in_bounds: true,
+            scoped_in_bounds,
             has_explicit_grant: has_grant,
             cert_revoked,
             denied: false,
