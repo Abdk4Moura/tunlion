@@ -51,21 +51,22 @@ on:
         description: "Churn start, seconds after the last idle step ends"
         default: "30"
       lead:
-        description: "Seconds from planning to T0 (runner start-up)"
-        default: "150"
+        description: "Seconds from the last load runner starting to T0"
+        default: "90"
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   plan:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
-      t0: ${{ steps.p.outputs.t0 }}
       idle: ${{ steps.p.outputs.idle }}
       churn: ${{ steps.p.outputs.churn }}
-      churn_at: ${{ steps.p.outputs.churn_at }}
+      churn_offset: ${{ steps.p.outputs.churn_offset }}
+      expected: ${{ steps.p.outputs.expected }}
       tag: ${{ steps.p.outputs.tag }}
     steps:
       - id: p
@@ -77,30 +78,29 @@ jobs:
           IN_RATES: ${{ inputs.rates }}
           IN_SLOT: ${{ inputs.slot }}
           IN_DELAY: ${{ inputs.churn_delay }}
-          IN_LEAD: ${{ inputs.lead }}
         run: |
           set -euo pipefail
           case "$IN_URL" in
             https://tunlion-signal-*.workers.dev|http://127.0.0.1:*) ;;
             *) echo "::error::refusing a non-staging URL: $IN_URL"; exit 1 ;;
           esac
-          t0=$(( $(date +%s) + IN_LEAD ))
           nsteps=$(echo "$IN_STEPS" | tr ',' '\n' | grep -c .)
-          echo "t0=$t0" >> "$GITHUB_OUTPUT"
           echo "idle=$(python3 -c "import json;print(json.dumps(list(range($IN_IDLE))))")" >> "$GITHUB_OUTPUT"
           if [ -n "$IN_RATES" ]; then
             echo "churn=$(python3 -c "import json;print(json.dumps(list(range($IN_CHURN))))")" >> "$GITHUB_OUTPUT"
           else
             echo "churn=[]" >> "$GITHUB_OUTPUT"
+            IN_CHURN=0
           fi
-          echo "churn_at=$(( t0 + nsteps * IN_SLOT + IN_DELAY ))" >> "$GITHUB_OUTPUT"
+          echo "expected=$(( IN_IDLE + IN_CHURN ))" >> "$GITHUB_OUTPUT"
+          echo "churn_offset=$(( nsteps * IN_SLOT + IN_DELAY ))" >> "$GITHUB_OUTPUT"
           echo "tag=r${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
-          echo "T0 $(date -u -d @$t0 +%FT%TZ), $nsteps idle steps, churn at +$(( nsteps * IN_SLOT + IN_DELAY ))s"
+          echo "$nsteps idle steps, churn at T0+$(( nsteps * IN_SLOT + IN_DELAY ))s"
 
   idle:
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 80
     strategy:
       fail-fast: false
       matrix:
@@ -113,6 +113,27 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -q 'websockets>=13,<16'
+      - name: Barrier (T0 once every load runner is up)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED: ${{ needs.plan.outputs.expected }}
+          LEAD: ${{ inputs.lead }}
+        run: |
+          set -euo pipefail
+          # Every load job computes the same T0: the latest start among them,
+          # plus LEAD. Queued jobs are not counted, so a busy runner pool only
+          # delays the whole fleet, never one shard against the others.
+          for i in $(seq 1 180); do
+            t=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" --jq \
+              '[.jobs[] | select((.name|startswith("idle")) or (.name|startswith("churn"))) | select(.status=="in_progress")] | if length == '"$EXPECTED"' then (map(.started_at|fromdateiso8601)|max) else empty end')
+            if [ -n "$t" ]; then
+              echo "T0=$(( t + LEAD ))" >> "$GITHUB_ENV"
+              echo "all $EXPECTED load runners up; T0 $(date -u -d @$(( t + LEAD )) +%FT%TZ)"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::the load runners never all started"; exit 1
       - name: Idle population
         env:
           IN_URL: ${{ inputs.url }}
@@ -123,7 +144,6 @@ jobs:
           IN_CYCLE: ${{ inputs.cycle }}
           IN_HOLD: ${{ inputs.final_hold }}
           SHARD: ${{ matrix.shard }}
-          T0: ${{ needs.plan.outputs.t0 }}
           TAG: ${{ needs.plan.outputs.tag }}
         run: |
           set -euo pipefail
@@ -144,7 +164,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.churn != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 80
     strategy:
       fail-fast: false
       matrix:
@@ -157,6 +177,27 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -q 'websockets>=13,<16'
+      - name: Barrier (T0 once every load runner is up)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED: ${{ needs.plan.outputs.expected }}
+          LEAD: ${{ inputs.lead }}
+        run: |
+          set -euo pipefail
+          # Every load job computes the same T0: the latest start among them,
+          # plus LEAD. Queued jobs are not counted, so a busy runner pool only
+          # delays the whole fleet, never one shard against the others.
+          for i in $(seq 1 180); do
+            t=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" --jq \
+              '[.jobs[] | select((.name|startswith("idle")) or (.name|startswith("churn"))) | select(.status=="in_progress")] | if length == '"$EXPECTED"' then (map(.started_at|fromdateiso8601)|max) else empty end')
+            if [ -n "$t" ]; then
+              echo "T0=$(( t + LEAD ))" >> "$GITHUB_ENV"
+              echo "all $EXPECTED load runners up; T0 $(date -u -d @$(( t + LEAD )) +%FT%TZ)"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::the load runners never all started"; exit 1
       - name: Pairing churn
         env:
           IN_URL: ${{ inputs.url }}
@@ -164,13 +205,13 @@ jobs:
           IN_SHARDS: ${{ inputs.churn_shards }}
           IN_DUR: ${{ inputs.dur }}
           SHARD: ${{ matrix.shard }}
-          AT: ${{ needs.plan.outputs.churn_at }}
+          OFFSET: ${{ needs.plan.outputs.churn_offset }}
           TAG: ${{ needs.plan.outputs.tag }}
         run: |
           set -euo pipefail
           ulimit -n "$(ulimit -Hn)"
           python edge/signal/test/hub_loadgen.py churn --url "$IN_URL" --out out --procs 3 \
-            --shard "$SHARD" --shards "$IN_SHARDS" --run-tag "$TAG" --start-at "$AT" \
+            --shard "$SHARD" --shards "$IN_SHARDS" --run-tag "$TAG" --start-at "$(( T0 + OFFSET ))" \
             --rates "$IN_RATES" --dur "$IN_DUR" --gap 15 | cut -c1-2000
       - uses: actions/upload-artifact@v4
         if: always()
