@@ -802,8 +802,20 @@ async fn pair_with_purpose(
     // out (the daemon's trick), the pair-claim moves people, not the room.
     let solo = format!("pairc-{}", fresh_secret());
     // C30: the session repairs the solo-room membership/lease if the join dies.
+    //
+    // Only the CREATOR desires its solo room. A claimer leaves it the moment
+    // `pair-matched` arrives, and its first tick runs right after `pair-claim`
+    // goes out, so desiring the solo room here put a `sync` naming it on the
+    // wire behind the claim. When the server handled that sync after the
+    // claimer's `join` of the creator's room, it moved the claimer back out:
+    // the creator saw the claimer leave and drop its link, and every SPAKE2
+    // message in that window came back `signal-refused`. Windows CI hit that
+    // ordering on most runs. The claimer's desire is set when `pair-matched`
+    // names the room, as the code-claim receive path already does.
     let mut sess = session::Session::new(&display_name(), &my_uid);
-    sess.room = Some(solo.clone());
+    if code.is_none() {
+        sess.room = Some(solo.clone());
+    }
     sess.emit(
         &sio,
         "join",

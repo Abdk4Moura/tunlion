@@ -1275,7 +1275,7 @@ def register(socketio, registry):
         # returns the live channel roster (deterministic discovery).
         n, chan_peers = _do_subscribe(sid, data.get("channels"))
 
-        _tel("sync", sid=sid, room_changed=room_changed, channels=n)
+        _tel("sync", sid=sid, room=room, room_changed=room_changed, channels=n)
         # Roster (C30 phase 2): the digest carries everyone the server holds in
         # the caller's room (welcome-shaped, self excluded). registry.peers_in
         # lease-filters; _sid_alive additionally drops locally-owned sids whose
