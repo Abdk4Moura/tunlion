@@ -47,6 +47,7 @@ the exit codes that command can return.
 | 10 | | `up`: a daemon already runs with different settings | run `tunlion down -y` first only if the user wants the new settings |
 | 11 | | `status`: no daemon running | start one with `tunlion up --detach` if the task needs it |
 | 12 | `local_resource` | disk, quota, open files or memory ran out here | stop and report |
+| 13 | `tls_certificate` | the tunlion server's TLS certificate was not trusted (a TLS-inspecting proxy, or a missing CA) | stop; tell the user to set `SSL_CERT_FILE` to their CA bundle |
 | 126 / 127 | | `exec`: remote command not executable / not on PATH | fix the command name or path |
 | 130 / 143 | | interrupted / terminated | report; do not retry automatically |
 | 141 | | output closed early (`| head`) | expected for piped reads |

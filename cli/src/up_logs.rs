@@ -1633,10 +1633,15 @@ pub(crate) async fn connect_signaling_patiently(
             Err(e) => {
                 let wait = signaling_backoff(attempt);
                 if attempt == 0 {
-                    ui::say(&format!(
-                        "  {} waiting for network: can't reach the tunlion server yet; retrying (ctrl-c to stop)",
-                        ui::paint(ui::Tone::Warn, "!")
-                    ));
+                    // An untrusted certificate is not the network: say so, or
+                    // the person checks their wifi while a proxy re-signs TLS.
+                    let raw = format!("{e:#}");
+                    let why = if filament_signal::tls::is_certificate_text(&raw) {
+                        format!("{} Retrying (ctrl-c to stop).", filament_signal::tls::untrusted_line_for(&raw))
+                    } else {
+                        "waiting for network: can't reach the tunlion server yet; retrying (ctrl-c to stop)".to_string()
+                    };
+                    ui::say(&format!("  {} {why}", ui::paint(ui::Tone::Warn, "!")));
                 }
                 ui::debug(&format!(
                     "  signaling connect failed ({e:#}); retry in {}s",

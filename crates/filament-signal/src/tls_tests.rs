@@ -82,7 +82,7 @@ fn provider_worker() {
         host.cipher_suites.reverse();
         host.install_default().unwrap();
     }
-    let cfg = tls_config();
+    let cfg = tls_config().unwrap();
     let suites = |p: &CryptoProvider| {
         p.cipher_suites
             .iter()

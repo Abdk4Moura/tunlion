@@ -87,6 +87,8 @@ EXIT CODES
   10   up: a daemon is already running with different settings (not applied)
   11   status: no daemon is running for this config directory
   12   a resource on this machine ran out (disk full, quota, open files, memory)
+  13   the tunlion server's TLS certificate was not trusted (a TLS-inspecting
+       proxy, or a missing CA: set SSL_CERT_FILE to your CA bundle)
   130  interrupted (SIGINT); 143 terminated (SIGTERM)
   exec passes the remote command's own exit status through; 127 when the
   command is not on the remote PATH, 126 when it cannot be executed there,

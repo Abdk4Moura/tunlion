@@ -33,6 +33,8 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
+pub mod tls;
+
 /// What the read loop delivers upward. One channel for everything, because every
 /// call site did the same thing with a per-event callback anyway.
 #[derive(Debug, Clone)]
@@ -356,22 +358,17 @@ pub async fn connect(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> Res
         .map_err(|_| anyhow!("signaling handshake timed out after {CONNECT_TIMEOUT:?}"))?
 }
 
-fn tls_config() -> rustls::ClientConfig {
-    // Match tokio-tungstenite 0.28's Mozilla trust store and default TLS versions,
-    // but never install or inherit a process-global crypto provider.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("ring supports the default TLS versions")
-        .with_root_certificates(rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        })
-        .with_no_client_auth()
+/// The websocket's TLS config: the trust every client of tunlion's servers
+/// shares ([`tls::client_config`]), with tungstenite's default empty ALPN.
+fn tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
+    tls::client_config()
 }
 
 async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> Result<Client> {
     let url = ws_url(base_url)?;
-    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config()));
+    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(
+        tls_config().context("loading the TLS trust store")?,
+    ));
     let (stream, _resp) =
         tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector))
             .await

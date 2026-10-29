@@ -261,6 +261,7 @@ test holds to the help text.
 | 10 | | `up`: a daemon is already running with different settings; nothing was applied, and the message names the restart (`DAEMON_CONFLICT`) |
 | 11 | | `status`: no daemon is running for this config directory (`STATUS_NOT_RUNNING`) |
 | 12 | `local_resource` | a resource on THIS machine ran out: its disk or quota is full, it has no file descriptors or memory left (a full stdin spool, `add --out` onto a full disk). A receiver's full disk is 4 for the sender, the peer refusing, with `error.reason: "no_space"`, and 12 for `receive` itself |
+| 13 | `tls_certificate` | the tunlion server answered, but its TLS certificate was not trusted here: a proxy that inspects TLS and re-signs with its own CA, or a missing CA. Set `SSL_CERT_FILE` (or `SSL_CERT_DIR`) to your CA bundle. Also a set `SSL_CERT_FILE` / `SSL_CERT_DIR` that loads no certificate |
 | 126 | | `exec`: the remote command was found but cannot be executed there |
 | 127 | | `exec`: the remote command is not on the remote daemon's PATH |
 | 130 | `interrupted` | interrupted (SIGINT) |
@@ -386,6 +387,20 @@ Rules that go with them:
 - **A network failure is one plain line**, `Can't reach the tunlion server (no
   internet or DNS?). Run tunlion doctor for details.`; the raw error chain is
   shown under `-v`.
+- **An untrusted server certificate is one plain line too**, exit 13, never
+  the network's 7: `The tunlion server's TLS certificate was not trusted. A
+  proxy that inspects TLS, or a missing CA? Set SSL_CERT_FILE to your CA
+  bundle.` The signaling websocket, the HTTPS API and the TURN-over-TLS relay
+  trust the same certificates: the OS trust store, plus `SSL_CERT_FILE` /
+  `SSL_CERT_DIR` (on Linux these replace the default locations, as for
+  OpenSSL; on macOS, Windows and Android they add to the store). When no
+  trust store loads at all (`SSL_CERT_FILE` naming a missing or empty file),
+  the line says that instead: `No CA certificates could be loaded, so no TLS
+  server can be trusted. ...`, also exit 13. `doctor` reports
+  `CERTIFICATE NOT TRUSTED` (or `NO TRUST STORE`) for its signaling check and exits 13;
+  `doctor --json` has `signaling.tls_certificate_trusted: false`. A daemon
+  waiting on such a server logs the same sentence instead of "waiting for
+  network".
 - **`send --json`** prints one result object: `ok`, `verb`, `peer`, `bytes`
   (total), `files` (each with `file`, `bytes`, `sha256`, `delivered`,
   `declined` (a person said no), `refused` (the receiver refused it for a
@@ -434,7 +449,8 @@ Rules that go with them:
 - **`up --detach` waits up to 10 s** for the daemon to report it is serving
   (the ready marker it writes beside systemd's READY=1, or its control
   socket). A daemon that exits during startup is reported with its last lines
-  of output and a nonzero exit (7 when it said the network was the cause). A
+  of output and a nonzero exit (7 when it said the network was the cause, 13
+  for an untrusted server certificate). A
   daemon still waiting for the network is reported as started but not
   connected yet, exit 0: it keeps retrying, by design.
 - **`up` does not exit when the tunlion server is unreachable.** The daemon

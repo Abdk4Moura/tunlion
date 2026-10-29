@@ -331,7 +331,11 @@ pub(crate) fn probe_outcome_kind(o: &crate::l2::ProbeOutcome) -> ExitKind {
 }
 
 /// [`probe_outcome_kind`] from the outcome's phase label and error. Pure.
+/// An untrusted server certificate is 13 in any phase: the server answered.
 pub(crate) fn cold_kind(phase: Option<&str>, error: Option<&str>) -> ExitKind {
+    if error.is_some_and(exit_codes::is_certificate_text) {
+        return ExitKind::TlsCertificate;
+    }
     if phase == Some("signaling") {
         return ExitKind::Network;
     }
@@ -339,10 +343,12 @@ pub(crate) fn cold_kind(phase: Option<&str>, error: Option<&str>) -> ExitKind {
 }
 
 /// The exit kind for a cold probe that did not establish: the tunlion server
-/// when that is what failed, otherwise the peer.
+/// when that is what failed (unreachable, or its certificate untrusted),
+/// otherwise the peer.
 pub(crate) fn cold_failure_kind(error: Option<&str>) -> ExitKind {
     match error.map(exit_codes::classify_text) {
         Some(ExitKind::Network) => ExitKind::Network,
+        Some(ExitKind::TlsCertificate) => ExitKind::TlsCertificate,
         _ => ExitKind::Unreachable,
     }
 }
@@ -468,8 +474,8 @@ async fn print_cold(server: &str, peer: &str, relay: bool, timeout: Option<u64>)
                 ui::paint(Tone::Dim, &format!("gave up at the {phase} phase (~{})", fmt_ms(o.total_ms)))
             ));
             let kind = probe_outcome_kind(&o);
-            if kind == ExitKind::Network {
-                ui::say(&format!("  {}", ui::paint(Tone::Dim, exit_codes::NETWORK_LINE)));
+            if let Some(line) = exit_codes::summary_line(kind, o.error.as_deref().unwrap_or_default()) {
+                ui::say(&format!("  {}", ui::paint(Tone::Dim, line)));
             } else {
                 ui::say(&format!(
                     "  {}",
@@ -608,10 +614,9 @@ pub(crate) fn reach_json_cold(
         v["path"] = path.cloned().unwrap_or(Value::Null);
     }
     if let Some(k) = kind.filter(|_| !established) {
-        let message = if k == ExitKind::Network {
-            exit_codes::NETWORK_LINE.to_string()
-        } else {
-            error.unwrap_or("the peer did not answer").to_string()
+        let message = match exit_codes::summary_line(k, error.unwrap_or_default()) {
+            Some(line) => line.to_string(),
+            None => error.unwrap_or("the peer did not answer").to_string(),
         };
         v["error"] = json!({ "code": k.token(), "exit": k.code(), "message": message });
     }
@@ -690,6 +695,22 @@ mod tests {
         assert_eq!(cold_kind(Some("presence"), Some("timed out")), ExitKind::Unreachable);
         let v = reach_json_cold(false, 0, None, Some(raw), Some(ExitKind::Network), None);
         assert_eq!(v["error"]["message"], json!(exit_codes::NETWORK_LINE));
+    }
+
+    /// Behind a TLS-inspecting proxy the server answers and its certificate
+    /// is refused: that is 13 with the certificate sentence, never the
+    /// network's 7 or the peer's 6, whichever phase it surfaced in.
+    #[test]
+    fn an_untrusted_server_certificate_is_not_the_network_or_the_peer() {
+        let raw = "signaling connect to https://x: websocket connect to wss://x/socket.io/: IO error: invalid peer certificate: UnknownIssuer";
+        assert_eq!(cold_failure_kind(Some(raw)), ExitKind::TlsCertificate);
+        assert_eq!(cold_kind(Some("signaling"), Some(raw)), ExitKind::TlsCertificate);
+        assert_eq!(cold_kind(Some("presence"), Some(raw)), ExitKind::TlsCertificate);
+        assert_eq!(cold_kind(Some("signaling"), Some("timed out")), ExitKind::Network, "the control");
+        let v = reach_json_cold(false, 0, None, Some(raw), Some(ExitKind::TlsCertificate), None);
+        assert_eq!(v["error"]["code"], json!("tls_certificate"));
+        assert_eq!(v["error"]["exit"], json!(13));
+        assert_eq!(v["error"]["message"], json!(exit_codes::CERT_LINE));
     }
 
     #[test]
