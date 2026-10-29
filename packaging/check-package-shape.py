@@ -6,6 +6,7 @@ Covers the files a release consumes:
   - the npm manifest and launcher
   - the Windows portable ZIP's managed tl.cmd and its installer fallback
   - the winget manifest's deliberate single command alias
+  - the installers' printed text (no em dash)
 
 Run: python3 packaging/check-package-shape.py
 """
@@ -120,6 +121,20 @@ def main() -> int:
     readme = " ".join(read("README.md").split())
     if " ".join(readme_tl.split()) not in readme:
         errors.append("README.md: the `tl` install-scope paragraph changed; re-check the brew/npm/winget caveats")
+
+    # ------------------------------------------------------- installer text
+    # What these print reaches every new user first (`curl ... | sh`, `irm |
+    # iex`, the npm shim). No em dash in any of it: the house style for
+    # user-facing text, and a byte some Windows consoles render as mojibake.
+    for rel in (
+        "scripts/install.sh",
+        "scripts/install.ps1",
+        "packaging/npm/bin/tunlion.js",
+        "packaging/npm/scripts/postinstall.js",
+    ):
+        for n, line in enumerate(read(rel).splitlines(), 1):
+            if "\u2014" in line:
+                errors.append(f"{rel}:{n}: em dash in installer text: {line.strip()}")
 
     if errors:
         for err in errors:
