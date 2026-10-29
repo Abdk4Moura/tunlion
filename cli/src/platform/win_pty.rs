@@ -842,12 +842,17 @@ pub fn relay(cols: u16, rows: u16, resize: &str, argv: &[String]) -> Result<()> 
         .map_err(|e| anyhow!("spawn shell: {e}"))?;
     relay_diag("shell spawned");
     drop(pair.slave);
-    let master = Arc::new(Mutex::new(pair.master));
+    // Held as an Option so the relay can close the pseudoconsole itself once
+    // the shell exits (see the drain below); the resize thread then has
+    // nothing left to resize.
+    let master = Arc::new(Mutex::new(Some(pair.master)));
     let mut reader = match master
         .lock()
         .map_err(|_| anyhow!("pseudoconsole master lock poisoned"))
         .and_then(|master| {
             master
+                .as_ref()
+                .ok_or_else(|| anyhow!("pseudoconsole already closed"))?
                 .try_clone_reader()
                 .map_err(|e| anyhow!("clone pseudoconsole reader: {e}"))
         }) {
@@ -865,6 +870,8 @@ pub fn relay(cols: u16, rows: u16, resize: &str, argv: &[String]) -> Result<()> 
         .map_err(|_| anyhow!("pseudoconsole master lock poisoned"))
         .and_then(|master| {
             master
+                .as_ref()
+                .ok_or_else(|| anyhow!("pseudoconsole already closed"))?
                 .take_writer()
                 .map_err(|e| anyhow!("take pseudoconsole writer: {e}"))
         }) {
@@ -886,7 +893,10 @@ pub fn relay(cols: u16, rows: u16, resize: &str, argv: &[String]) -> Result<()> 
                     let r = u16::from_le_bytes([buf[2], buf[3]]).clamp(1, i16::MAX as u16);
                     // A poisoned lock only means a previous resize panicked;
                     // stop resizing rather than panicking this thread too.
-                    let Ok(mut master) = resize_master.lock() else {
+                    let Ok(guard) = resize_master.lock() else {
+                        break;
+                    };
+                    let Some(master) = guard.as_ref() else {
                         break;
                     };
                     let _ = master.resize(PtySize {
@@ -947,6 +957,26 @@ pub fn relay(cols: u16, rows: u16, resize: &str, argv: &[String]) -> Result<()> 
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if let Ok(Some(_status)) = child.try_wait() {
                     relay_diag("shell exited");
+                    // A command that exits at once (`shell <device> -- cmd`)
+                    // can be gone before ConPTY has rendered its output into
+                    // the pipe, and ending here dropped all of it. Closing the
+                    // pseudoconsole makes ConPTY flush what it holds and end
+                    // the output pipe; forward everything until that EOF,
+                    // bounded so a pipe that never ends cannot hold the relay.
+                    if let Ok(mut guard) = master.lock() {
+                        drop(guard.take());
+                    }
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+                        match out_rx.recv_timeout(left) {
+                            Ok(bytes) => {
+                                if out.write_all(&bytes).is_err() || out.flush().is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     break;
                 }
             }
