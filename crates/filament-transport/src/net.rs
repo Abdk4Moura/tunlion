@@ -1227,11 +1227,54 @@ pub async fn http_get_json(context: &crate::TransportContext, url: &str) -> Resu
                 Ok(v) => return Ok(v),
                 Err(e) => last = Some(anyhow!(e)),
             },
+            Ok(resp) if resp.status().as_u16() == 407 => {
+                // The proxy, not the server, answered. No retry changes that.
+                return Err(proxy_refusal(url, &resp.status().to_string())).with_context(|| format!("GET {url}"));
+            }
             Ok(resp) => last = Some(anyhow!("GET {url} -> {}", resp.status())),
-            Err(e) => last = Some(anyhow!(e)),
+            Err(e) => {
+                let chain = error_chain_text(&e);
+                if chain.to_lowercase().contains("proxy authentication required") {
+                    return Err(proxy_refusal(url, "407 Proxy Authentication Required")).with_context(|| format!("GET {url}"));
+                }
+                last = Some(anyhow!(e))
+            }
         }
     }
     Err(last.unwrap_or_else(|| anyhow!("GET {url} failed"))).with_context(|| format!("GET {url}"))
+}
+
+fn error_chain_text(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(c) = cur {
+        out.push_str(": ");
+        out.push_str(&c.to_string());
+        cur = c.source();
+    }
+    out
+}
+
+/// A 407 from the proxy the REST client used, in the same words the carrier
+/// uses for signaling and TURN, so the CLI's one failure line names the proxy
+/// instead of blaming DNS (see `filament-carrier`).
+fn proxy_refusal(url: &str, status: &str) -> anyhow::Error {
+    let proxy = host_port_from_url(url)
+        .map(|(h, p)| {
+            let scheme = if url.starts_with("http://") { "http" } else { "https" };
+            filament_carrier::select(scheme, &h, p).carrier.describe()
+        })
+        .unwrap_or_else(|| "proxy".into());
+    let at = proxy.strip_prefix("proxy ").unwrap_or(&proxy).to_string();
+    let creds = if std::env::vars().any(|(k, v)| k.to_ascii_lowercase().ends_with("_proxy") && v.contains('@')) {
+        "it rejected the credentials in the proxy URL"
+    } else {
+        "put credentials in the proxy URL (http://user:password@host:port)"
+    };
+    anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("the proxy at {at} refused to forward to {url} ({status}): {creds}"),
+    ))
 }
 
 // ---------------------------------------------------------------- signaling --
@@ -1400,8 +1443,14 @@ pub async fn connect_signaling_owned(context: &crate::TransportContext, server: 
     // bounded so even a stalling resolver only adds `dns_race_ms`, not the full
     // ~5 s cold stall. In nearly every connect path `fetch_config` runs first and
     // has already warmed the cache, this just covers the socket.io-first paths.
+    // Through a proxy the proxy resolves the server's name, and a sandbox that
+    // forces a proxy often has no DNS at all: warming would only cost
+    // `dns_race_ms`.
     if let Some((host, port)) = host_port_from_url(server) {
-        let _ = resolve_warm(context, &host, port).await;
+        let scheme = if server.starts_with("http://") || server.starts_with("ws://") { "http" } else { "https" };
+        if !filament_carrier::select(scheme, &host, port).via_proxy() {
+            let _ = resolve_warm(context, &host, port).await;
+        }
     }
 
     // ONE channel instead of a dozen boxed callbacks. Every handler this
@@ -2036,15 +2085,40 @@ impl Peer {
         )
     }
 
+    /// The carrier under OUR side of a relayed path when it is not plain:
+    /// `Some("proxy")` when the TURN stream rides an HTTP CONNECT proxy.
+    /// `None` for a direct stream, webrtc-ice's own UDP relay, or no local relay.
+    pub async fn local_relay_carrier(&self) -> Option<&'static str> {
+        let pair = self
+            .pc
+            .sctp()
+            .transport()
+            .ice_transport()
+            .get_selected_candidate_pair()
+            .await?;
+        if pair.local.typ != RTCIceCandidateType::Relay {
+            return None;
+        }
+        self.turn_bridges
+            .as_ref()
+            .and_then(|b| b.carrier_for_port(pair.local.related_port))
+            .filter(|c| *c != "direct")
+    }
+
     /// `route()` for people: a relay route says what it rides on, e.g.
-    /// "relay (TURN over tcp)", so a UDP-blocked network is visible. Callers
-    /// that compare against [`ROUTE_RELAY`] keep using `route()`.
+    /// "relay (TURN over tcp)", so a UDP-blocked network is visible, and a
+    /// non-plain carrier is named: "relay (TURN over tls via proxy)". Callers
+    /// that compare against [`ROUTE_RELAY`] keep using `route()`, whose words
+    /// do not change (docs/carriers.md, section 7).
     pub async fn route_shown(&self, route: &str) -> String {
         if route != ROUTE_RELAY {
             return route.to_string();
         }
         match self.local_relay_transport().await {
-            Some(t) => format!("{route} (TURN over {t})"),
+            Some(t) => match self.local_relay_carrier().await {
+                Some(via) => format!("{route} (TURN over {t} via {via})"),
+                None => format!("{route} (TURN over {t})"),
+            },
             None => format!("{route} (the other side's TURN)"),
         }
     }

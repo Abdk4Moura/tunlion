@@ -630,10 +630,21 @@ pub(crate) fn json_error(kind: ExitKind, message: &str, detail: Option<&str>) ->
 /// human line for a network failure, the error's own text otherwise.
 pub(crate) fn human_message(e: &anyhow::Error) -> String {
     if classify(e) == ExitKind::Network && is_network_text(&format!("{e:#}")) {
-        NETWORK_LINE.to_string()
+        proxy_line(e).unwrap_or_else(|| NETWORK_LINE.to_string())
     } else {
         e.to_string()
     }
+}
+
+/// The network line when the failure was a proxy's (a carrier error from
+/// `filament-carrier`, which always begins "the proxy at" or "cannot reach the
+/// proxy at"). "no internet or DNS?" is wrong advice behind a proxy; the
+/// proxy's own refusal names the one thing to change.
+fn proxy_line(e: &anyhow::Error) -> Option<String> {
+    let cause = e.chain().map(|c| c.to_string()).find(|c| {
+        c.starts_with("the proxy at ") || c.starts_with("cannot reach the proxy at ")
+    })?;
+    Some(format!("Can't reach the tunlion server: {cause}. Run `tunlion doctor` for details."))
 }
 
 /// The message and its cause chain in the shape `{e:?}` prints, WITHOUT the
@@ -681,7 +692,7 @@ pub(crate) fn report(e: &anyhow::Error) -> i32 {
         ui::json_out(&v);
     }
     if network {
-        ui::critical(&format!("{} {NETWORK_LINE}", ui::error_label()));
+        ui::critical(&format!("{} {message}", ui::error_label()));
         ui::debug(&format!("  cause: {raw}"));
     } else {
         ui::critical(&format!("{} {}", ui::error_label(), error_with_causes(e)));
@@ -692,6 +703,24 @@ pub(crate) fn report(e: &anyhow::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_proxy_refusal_says_so_instead_of_blaming_dns() {
+        let io = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the proxy at 10.0.0.1:3128 refused to tunnel to api.example:443 (HTTP/1.1 407 Proxy Authentication Required): put credentials in the proxy URL (http://user:password@host:port)",
+        );
+        let e = anyhow::Error::new(io)
+            .context("signaling connect to api.example:443")
+            .context("signaling connect to https://api.example");
+        assert_eq!(classify(&e), ExitKind::Network);
+        let m = human_message(&e);
+        assert!(m.starts_with("Can't reach the tunlion server: the proxy at 10.0.0.1:3128 refused"), "{m}");
+        assert!(m.contains("put credentials in the proxy URL") && !m.contains("DNS"), "{m}");
+        // Without a proxy cause the line is unchanged.
+        let plain = anyhow::anyhow!("Connection refused").context("signaling connect to https://api.example");
+        assert_eq!(human_message(&plain), NETWORK_LINE);
+    }
 
     #[test]
     fn an_error_report_carries_the_cause_chain_and_never_a_backtrace() {

@@ -1,0 +1,23 @@
+# filament-carrier: how tunlion reaches its own infrastructure (signaling,
+# TURN) through whatever the network allows. A carrier only moves bytes: it
+# never authenticates a peer and never holds a key. See docs/carriers.md.
+[package]
+name = "filament-carrier"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/tunlion"
+description = "Byte carriers (direct TCP, HTTP CONNECT proxy) for tunlion's signaling and relay connections"
+
+[dependencies]
+async-trait = "0.1.89"
+http = "1.4.1"
+tokio = { version = "1", features = ["net", "io-util", "time"] }
+# The proxy matcher reqwest's `system-proxy` feature uses (env, macOS
+# SCDynamicStore, Windows Internet Settings). Using the SAME matcher is what
+# makes the REST client, signaling and TURN agree on when a proxy applies.
+# Already in the graph through reqwest.
+hyper-util = { version = "0.1.20", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "time", "macros", "rt-multi-thread"] }
