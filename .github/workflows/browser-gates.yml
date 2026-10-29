@@ -20,11 +20,13 @@ on:
     branches: [main, "integration/**"]
     paths:
       - "frontend/**"
+      - "backend/**"
       - "cli/dashboard-dist/**"
       - ".github/workflows/browser-gates.yml"
   pull_request:
     paths:
       - "frontend/**"
+      - "backend/**"
       - "cli/dashboard-dist/**"
       - ".github/workflows/browser-gates.yml"
 
@@ -163,6 +165,16 @@ jobs:
           TUNLION_TEST_VENV: python3
         run: node frontend/tests/closed-tab.spec.cjs
 
+      # A polling page that dies without pagehide (killed renderer, closed
+      # context with its beacon refused) leaves the other peer within seconds
+      # through the relay's polling liveness rule, under production's 25/60
+      # ping; a throttled, hidden, high-latency polling page never drops; and
+      # offline flaps come back. Production's async server (eventlet).
+      - name: polling-liveness
+        env:
+          TUNLION_TEST_VENV: python3
+        run: node frontend/tests/polling-liveness.spec.cjs
+
       # A re-pair used to append a second known-device record for the same local
       # petname, so both the iPad and Pixel showed two rows for one peer. Seed
       # the broken localStorage shape, prove load migration leaves ONE online
@@ -186,6 +198,9 @@ jobs:
       # does not tell the room the device left and came back.
       - name: backend duplicate join is idempotent
         run: python -m unittest backend.tests.test_join_idempotent
+
+      - name: backend polling liveness
+        run: python -m unittest backend.tests.test_poll_liveness
 
       - name: backend session close HTTP
         run: python -m unittest backend.tests.test_session_close_http
