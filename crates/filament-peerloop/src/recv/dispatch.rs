@@ -3331,6 +3331,7 @@ async fn recv_run(
         if daemon && last_roster_push.elapsed() >= Duration::from_secs(5) {
             last_roster_push = Instant::now();
             conn.roster_maintenance().await;
+            conn.fleet_grants_maintenance().await;
         }
 
         // Daemon-managed mount health check: the host server owns the mount
@@ -5900,7 +5901,7 @@ async fn recv_run(
                                                 // decides what the link says: a peer
                                                 // that reconnects through fleet-hello
                                                 // is admitted by admit_fleet as
-                                                // FleetDevice, which carries no caps
+                                                // FleetSibling, which carries no caps
                                                 // at all, while only a fresh
                                                 // enrollment produces Delegated{caps}.
                                                 // Matching on Delegated therefore
@@ -6245,6 +6246,52 @@ async fn recv_run(
                 // `devices` to render. The roster NEVER feeds an authorization
                 // decision, so a failed receipt (bad sig / wrong owner / replay /
                 // expired) is a silent no-op, logged at debug only.
+                // Owner-signed grants about THIS device (fleet trust). Judged by
+                // filament_cap::fleet_grants::judge_grant_set: the owner key we
+                // already hold, our own device key as target, unexpired, newer
+                // than what we hold. Kept apart from the capability store.
+                // This device's local fleet.owner_grants decides what applies:
+                // `off` refuses the set outright; nothing in the message can
+                // change that setting.
+                Some("fleet-grants") => {
+                    if let Some(cert) = ports.identity.local_device_cert() {
+                        match ports.identity.verify_and_store_fleet_grants(
+                            &v,
+                            &cert.user_pub,
+                            &cert.device_pub,
+                            identity::now_secs(),
+                        ) {
+                            Ok(j) => {
+                                log.debug(&format!(
+                                    "fleet-grants: epoch {} from {pid}: {j:?}",
+                                    v["epoch"].as_u64().unwrap_or(0)
+                                ));
+                                // The set is kept whole (its signature covers it);
+                                // entries the local fleet.owner_grants does not
+                                // allow are ignored at every use. Say which.
+                                let policy = conn.host.fleet_owner_grant_policy();
+                                let mut ignored: Vec<String> = v["grants"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|g| g["cap"].as_str())
+                                    .filter(|c| !policy.applies(c))
+                                    .map(str::to_string)
+                                    .collect();
+                                ignored.sort();
+                                ignored.dedup();
+                                if j == filament_cap::fleet_grants::GrantSetJudgement::Accept && !ignored.is_empty() {
+                                    log.debug(&format!(
+                                        "fleet-grants: not applied: {} (fleet.owner_grants={})",
+                                        ignored.join(", "),
+                                        policy.as_str()
+                                    ));
+                                }
+                            }
+                            Err(e) => log.debug(&format!("fleet-grants: rejected: {e}")),
+                        }
+                    }
+                }
                 Some("roster") => {
                     if let Some(cert) = ports.identity.local_device_cert() {
                         match ports.identity.verify_and_store_roster(
@@ -7681,7 +7728,8 @@ async fn recv_run(
                     // Fleet auto-mesh: a sibling (certificate-admitted, never
                     // paired) lands a file only with an explicit grant, read
                     // before peer_authz resolves anything (see below).
-                    let sibling = crate::shell_gate::sibling_transfer_facts(&conn, &pid);
+                    let sibling =
+                        crate::shell_gate::sibling_facts(&conn, &pid, cap::CAP_TRANSFER);
                     let (ok, xfer_deny_reason, xfer_gate) = {
                         let az = crate::shell_gate::peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
@@ -7725,9 +7773,11 @@ async fn recv_run(
                             ak_caps,
                             now,
                         );
-                        let has_grant = has_grant || sibling.record_grant;
-                        let scoped_in_bounds = cap::sibling_transfer_scope(
-                            sibling.is_sibling,
+                        // FleetSibling: the kind implies transfer into the drop
+                        // dir and nothing else; grants from either source count.
+                        let (scoped_in_bounds, has_grant) = crate::shell_gate::sibling_gate_inputs(
+                            &sibling,
+                            cap::CAP_TRANSFER,
                             scoped_in_bounds,
                             has_grant,
                         );
@@ -7747,7 +7797,9 @@ async fn recv_run(
                             scoped_in_bounds,
                             has_explicit_grant: has_grant,
                             cert_revoked,
-                            denied: false,
+                            // A sibling's local deny wins over its kind default and grants;
+                            // no deny list is consulted for anyone else on this path.
+                            denied: sibling.denied,
                             ceiling_authorizes: false,
                         });
                         let reason = if let cap::GateDecision::Deny { cap_reason } = &d {

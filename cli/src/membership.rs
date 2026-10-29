@@ -326,6 +326,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         warm_hold: WarmHold::default(),
         worker_port_tx: HashMap::new(),
         roster_pushed: None,
+        fleet_grants_pushed: Default::default(),
         stuck_retry: HashMap::new(),
         ice_cache: crate::conn::SharedIceCache::default(),
         roster_absent: HashMap::new(),

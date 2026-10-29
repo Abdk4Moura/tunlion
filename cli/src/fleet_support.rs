@@ -553,6 +553,11 @@ pub(crate) async fn apply_reconfigure(
         // auto-extract is re-read on every received file (finalize_incoming), so
         // it is already live; nothing to mutate here.
         "auto-extract" => true,
+        // fleet.owner_grants is read from config at every gate decision
+        // (DeviceStore::fleet_grant_applies), so the next session sees it.
+        // A session already open is not re-judged (no per-session withdrawal
+        // exists); narrowing refuses new ones at once.
+        "fleet.owner_grants" => true,
         "shell" => {
             *shell_policy = shell_policy_from_settings();
             // The per-request accept check consults `shell_policy` live, so a

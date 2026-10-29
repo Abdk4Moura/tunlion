@@ -399,6 +399,35 @@ The mutation controls run in CI with the model, and each must FAIL:
 on the channel, S1 was vacuous. A check that cannot fail is not evidence. If you
 extend this model, add a mutant and confirm it bites before trusting a green run.
 
+## Companion: the fleet trust proof
+
+`fleet_trust_model.py` checks owner-signed fleet grant sets
+(`docs/design-fleet-automesh.md`, "0.9.2 fleet trust") against a hostile
+network that replays every set ever minted, forges sets, relays genuine sets
+for another device and delivers sets from another owner, with a discrete clock
+for expiry, a local deny and the roster's revocation signal. Proven: P1 no
+forged, foreign or misdirected set is ever held; P2 no expired set is accepted
+or used; P3/P6 the held epoch never goes back, so a replay cannot resurrect a
+withdrawn grant, and every allow is backed by a genuine granting set; P4 a local
+deny always refuses; P5 a known-revoked subject is refused; P7 the target's
+local `fleet.owner_grants` knob (off | files | all) changes only by a local
+action, though the network also tries to set it; P8 an allow needs the knob to
+let an owner grant of that capability apply NOW (shell only under `all`,
+nothing under `off`), so narrowing applies at once to a set already held; P9
+nothing is accepted under `off`; no trap states. Runs once per capability
+class (`file`, `shell`).
+
+```
+python3 fleet_trust_model.py      # baseline (561528 states x 2 caps) + 10 mutants
+```
+
+Mutants that must fail: `no-sig`, `no-target` (P1), `no-monotone` (P6),
+`no-expiry`, `stale-use` (P2), `deny-last` (P4), `net-knob` (P7),
+`files-shell`, `accept-only` (P8; the latter caught for both caps),
+`off-keeps` (P9). `no-expiry` was NOT caught by
+the first version of this model, because the use-time expiry check masked it;
+acceptance is now checked on the transition itself.
+
 ## Companion: the bootstrap card reference codec
 
 `card_vectors.py` is not a model checker; it is the other kind of evidence.

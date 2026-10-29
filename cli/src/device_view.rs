@@ -434,8 +434,39 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
             let own_ended_here = own_ended
                 .as_ref()
                 .filter(|own| cert.as_ref().is_some_and(|c| c.user_pub == own.user_pub));
+            // A fleet SIBLING: certified by our owner, never paired here (no
+            // pair secret). Its kind implies transfer and nothing else; any
+            // other capability is this device's own grant or an owner-signed
+            // grant about this device. The owner's roster dropping it is a
+            // revocation (DeviceStore::device_cert_revoked).
+            let sibling_pub = records
+                .iter()
+                .find(|r| r["name"].as_str() == Some(name.as_str()))
+                .filter(|r| r["secret"].as_str().is_none_or(str::is_empty))
+                .and(cert.as_ref())
+                .filter(|c| same_owner.as_ref() == Some(&c.user_pub) && load_owner_key().is_none())
+                .map(|c| c.device_pub);
             let caps_summary = if revoked {
                 "no access (revoked)".to_string()
+            } else if sibling_pub.is_some_and(|p| crate::devices_store::store().device_cert_revoked(&p)) {
+                "no access (removed by your owner)".to_string()
+            } else if let Some(p) = sibling_pub {
+                let mut sib_caps = vec!["transfer".to_string()];
+                sib_caps.extend(caps.iter().cloned());
+                // Owner grants: only those this device's fleet.owner_grants lets
+                // apply count; the rest are named as held but not applied.
+                let store = crate::devices_store::store();
+                let (applied, held_only) = store.fleet_grant_caps_split(&p, now);
+                sib_caps.extend(applied);
+                let mut row = format!("your device · {}", device_caps_summary(&sib_caps, tier));
+                if !held_only.is_empty() {
+                    row.push_str(&format!(
+                        " · {} not applied: fleet.owner_grants={}",
+                        held_only.join(", "),
+                        store.owner_grant_policy().as_str()
+                    ));
+                }
+                row
             } else if let Some(own) = own_ended_here {
                 own_access_expired_label(own.expires)
             } else if let Some(st) = &ended {

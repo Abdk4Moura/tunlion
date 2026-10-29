@@ -385,6 +385,12 @@ pub trait HostServices: Send + Sync + 'static {
     /// The owner-signed roster blob, serialized, or `None` when this device has
     /// no owner key or minting fails.
     fn roster_snapshot_json(&self) -> Option<String>;
+    /// Owner-only: the owner-signed fleet grant set about the fleet device
+    /// `target_pub`, freshly minted. `None` on a device that holds no owner key,
+    /// or when `target_pub` is not a certified, unrevoked device of this owner.
+    fn fleet_grants_snapshot_json(&self, _target_pub: &[u8; 32]) -> Option<String> {
+        None
+    }
     /// Is there a fleet rendezvous value on this machine at all?
     fn fleet_rv_present(&self) -> bool;
     /// This machine's short host label, as the mesh uses it for `<name>.mesh`.
@@ -586,6 +592,18 @@ pub trait HostServices: Send + Sync + 'static {
     /// inert host grants nothing.
     fn device_record_grants(&self, _name: &str, _capability: &str) -> bool {
         false
+    }
+    /// Does an owner-signed fleet grant set held by this device grant the
+    /// sibling `device_pub` the `capability`, right now, AND does this device's
+    /// local `fleet.owner_grants` let an owner grant of that kind apply? Read at
+    /// every use. Inert hosts hold none.
+    fn fleet_grant_applies(&self, _device_pub: &[u8; 32], _capability: &str) -> bool {
+        false
+    }
+    /// This device's local `fleet.owner_grants` (for logging what a held set
+    /// does not apply). Inert hosts answer the default; they hold no sets.
+    fn fleet_owner_grant_policy(&self) -> filament_cap::fleet_grants::OwnerGrantPolicy {
+        filament_cap::fleet_grants::OwnerGrantPolicy::default()
     }
     /// Is this device key present in the host's device store at all? Used by
     /// the settle-then-evaluate park: a key with no record can never become

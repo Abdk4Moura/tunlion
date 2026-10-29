@@ -590,6 +590,20 @@ pub fn cap_gate_effective(
         };
     }
 
+    // === Explicit local deny, absolute (both modes) =======================
+    // A deny recorded on THIS device is a decision, and a decision outranks
+    // everything: grants (local or owner-signed), the fleet kind's default and
+    // `legacy_allowed`. Below, `denied` already blocked the capability layer,
+    // but in shadow mode the effective decision fell through to
+    // `legacy_allowed`, which never saw the deny, so a daemon run with `-y`
+    // still accepted a transfer from a device this machine had denied. Found by
+    // `local_deny_outranks_a_fleet_siblings_default_and_owner_grant`.
+    if denied {
+        return GateDecision::Deny {
+            cap_reason: Some("explicitly denied by owner (deniedCaps)".into()),
+        };
+    }
+
     // === Same-owner fleet trust (Proven-gated scoped defaults) =============
     // A peer whose device cert chains to MY user key (`own_user_pub`) is a FLEET
     // MEMBER, not the local primary. The owner shortcut inside
@@ -2147,6 +2161,53 @@ mod tests {
             d.allowed(),
             "same-owner Proven in-scope must ALLOW without a grant"
         );
+    }
+
+    /// Fleet trust: a deny recorded on THIS device outranks everything a
+    /// FleetSibling could otherwise use: the kind's own transfer default, the
+    /// receiver's grant and an owner-signed grant about this device. Composed
+    /// exactly as the gates compose it (fleet_sibling_inputs, then the shared
+    /// gate), in BOTH modes, with legacy trust on to make the deny the only
+    /// thing that can refuse.
+    #[test]
+    fn local_deny_outranks_a_fleet_siblings_default_and_owner_grant() {
+        use filament_cap::fleet_grants::fleet_sibling_inputs;
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let me = [0x5au8; 32];
+        let dev = [0x5bu8; 32];
+        let prior = std::env::var("TUNLION_CAP_AUTHORITATIVE").ok();
+        for mode in ["0", "1"] {
+            unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", mode) };
+            for (action, in_bounds) in [("transfer", true), ("shell", false)] {
+                // Owner-signed grant held, local record grant too.
+                let (scoped, has_grant) = fleet_sibling_inputs(true, action, in_bounds, false, true, true);
+                let run = |denied: bool| {
+                    cap_gate_effective(
+                        true,
+                        &CapOutcome::Authorized,
+                        action,
+                        "self",
+                        Some(&dev),
+                        Some(&me),
+                        BindingStrength::Proven,
+                        Some(u64::MAX),
+                        None,
+                        Some(&me),
+                        scoped,
+                        has_grant,
+                        false,
+                        denied,
+                        false,
+                    )
+                };
+                assert!(run(false).allowed(), "control: {action} allowed without the deny (mode {mode})");
+                assert!(!run(true).allowed(), "a local deny must refuse {action} (mode {mode})");
+            }
+        }
+        match prior {
+            Some(v) => unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", v) },
+            None => unsafe { std::env::remove_var("TUNLION_CAP_AUTHORITATIVE") },
+        }
     }
 
     #[test]

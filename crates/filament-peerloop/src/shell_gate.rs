@@ -249,6 +249,12 @@ pub fn gather_shell_gate_inputs(
     let outcome = authorize_in(&store, "self", action, idev, iusr, ak_caps, now);
     let ceiling_covers = host.ceiling_covers_action(idev, action);
     let (own_user, has_grant) = fleet_inputs_in(&store, "self", action, idev, iusr, ak_caps, now);
+    // FleetSibling: an owner-signed grant about this device counts as a grant
+    // (the receiver's own record grant already does, via store_allows), and a
+    // local deny was read above and outranks both.
+    let sib = sibling_facts(conn, pid, action);
+    let (_, has_grant) = sibling_gate_inputs(&sib, action, false, has_grant);
+    let store_allows = store_allows || (sib.is_sibling && sib.owner_grant);
     let inputs = ShellGateInputs {
         trusted,
         denied,
@@ -300,33 +306,68 @@ pub fn policy_trusted(
                 .any(|(n, secret)| n == name && !secret.is_empty()))
 }
 
-/// What the transfer gates need to know about a fleet SIBLING on this link.
+/// What a gate needs to know about a fleet SIBLING on this link, for one action.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SiblingTransferFacts {
-    /// The link's principal is a same-owner sibling admitted on its certificate
-    /// over the fleet channel (or a one-shot on a meeting place it brokered).
+pub struct SiblingFacts {
+    /// The link's principal is `FleetSibling`: a same-owner device admitted on
+    /// its certificate over the fleet channel (or a one-shot on a meeting place
+    /// it brokered), never paired here.
     pub is_sibling: bool,
-    /// THIS machine's own record grants that proven sibling `transfer`
-    /// (`tunlion grant <sibling> transfer` here). Only for a proven sibling: the
-    /// record is keyed by the name resolved from the proven key, never a
-    /// claimed one.
-    pub record_grant: bool,
+    /// THIS machine's own record grants the proven sibling the action
+    /// (`tunlion grant <sibling> <cap>` here). Keyed by the name resolved from
+    /// the proven key, never a claimed one.
+    pub local_grant: bool,
+    /// An owner-signed grant set held here grants the sibling's proven device
+    /// key the action (`tunlion grant <sibling> <cap> --on <this device>` on the
+    /// owner), and this device's `fleet.owner_grants` lets it apply.
+    pub owner_grant: bool,
+    /// This machine's record DENIES the action to the sibling. Outranks both
+    /// grant sources.
+    pub denied: bool,
 }
 
-/// Read the sibling facts for `pid`. Everything that is not a fleet sibling
-/// reads as `is_sibling: false`, so the gates it feeds are unchanged for it.
-pub fn sibling_transfer_facts(conn: &Conn, pid: &str) -> SiblingTransferFacts {
+/// Read the sibling facts for `pid` and `action`. Anything that is not a fleet
+/// sibling reads as all-false, so every gate it feeds is unchanged for it.
+pub fn sibling_facts(conn: &Conn, pid: &str, action: &str) -> SiblingFacts {
     let Some(l) = conn.link(pid) else {
-        return SiblingTransferFacts::default();
+        return SiblingFacts::default();
     };
-    let is_sibling = l.is_sibling_link();
-    let record_grant = is_sibling
-        && l.fleet_proven()
-        && l
-            .verified_name
-            .as_deref()
-            .is_some_and(|n| conn.host.device_record_grants(n, filament_cap::capability::CAP_TRANSFER));
-    SiblingTransferFacts { is_sibling, record_grant }
+    // A paired link that also carries the fleet principal is NOT a sibling
+    // (see `Link::is_sibling_link`): its pair secret governs it.
+    if !l.is_sibling_link() || !l.fleet_proven() {
+        return SiblingFacts {
+            is_sibling: l.is_sibling_link(),
+            ..SiblingFacts::default()
+        };
+    }
+    let name = l.verified_name.as_deref();
+    SiblingFacts {
+        is_sibling: true,
+        local_grant: name.is_some_and(|n| conn.host.device_record_grants(n, action)),
+        owner_grant: l
+            .identity_device_pub
+            .as_ref()
+            .is_some_and(|d| conn.host.fleet_grant_applies(d, action)),
+        denied: name.is_some_and(|n| conn.host.device_capability_denied(n, action)),
+    }
+}
+
+/// Apply the `FleetSibling` kind to a gate's `(scoped_in_bounds,
+/// has_explicit_grant)`. See `filament_cap::fleet_grants::fleet_sibling_inputs`.
+pub fn sibling_gate_inputs(
+    f: &SiblingFacts,
+    action: &str,
+    scoped_in_bounds: bool,
+    has_grant: bool,
+) -> (bool, bool) {
+    filament_cap::fleet_grants::fleet_sibling_inputs(
+        f.is_sibling,
+        action,
+        scoped_in_bounds,
+        has_grant,
+        f.local_grant,
+        f.owner_grant,
+    )
 }
 
 /// Pure predicate behind `Link::fleet_proven`: a same-owner fleet device whose
@@ -341,7 +382,7 @@ pub fn fleet_link_proven(
     has_verified_name: bool,
 ) -> bool {
     crate::host::fleet_link_proven(
-        matches!(kind, PrincipalKind::FleetDevice),
+        matches!(kind, PrincipalKind::FleetSibling),
         binding == BindingStrength::Proven,
         has_device_pub,
         has_verified_name,

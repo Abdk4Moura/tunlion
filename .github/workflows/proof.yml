@@ -48,6 +48,8 @@ jobs:
         run: python3 proofs/transport_upgrade_model.py
       - name: Model-check fleet auto-mesh (convergence / revocation / intruder)
         run: python3 proofs/fleet_automesh_model.py
+      - name: Model-check fleet trust (owner-signed grant sets; forgery / replay / expiry / deny)
+        run: python3 proofs/fleet_trust_model.py
       - name: Model-check stall ladder (calibration and recovery boundary)
         run: python3 proofs/stall_ladder_model.py
       - name: Link manager model (placement + upgrade verify)

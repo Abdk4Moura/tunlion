@@ -1381,6 +1381,35 @@ the peer's verified device identity, and checks the requested action
 against it (`ceiling_covers_action`). Anything outside the ceiling needs
 an explicit grant exactly as before.
 
+## Owner-signed fleet grant sets (`fleet-grants`) and `fleet.owner_grants`
+
+`{"type": "fleet-grants", owner_pub, target_pub, epoch, valid_until, grants:
+[{subject_pub, cap, expires}], sig}`, pushed by the owner daemon to one target
+over an authenticated link (domain `tunlion/fleet-grants/v1`). The target
+accepts it only if the signature verifies against the owner key it already
+holds, `target_pub` is its own device key, it is unexpired, and it is strictly
+newer in `(epoch, valid_until)` than the held set. It is kept whole in
+`fleet-grants-held.json`, never merged into the capability store. A peer that
+does not know the type (0.9.1) ignores it.
+
+What applies is capped by the TARGET's local setting `fleet.owner_grants`
+(`config` key `fleet_owner_grants`):
+
+- `off`: the set is refused and not kept; a fleet sibling gets only what its
+  kind implies (file transfer into the inbox).
+- `files` (default): only `transfer` and `mount` entries apply; `shell` is held
+  but not applied.
+- `all`: `transfer`, `mount` and `shell` apply.
+
+The setting is read at accept time and at every gate decision, so narrowing it
+applies at once to a set already held (new sessions are refused; a session
+already open is not re-judged). No frame sets or widens it: extra fields on a
+`fleet-grants` message are ignored and outside the signature, and `fleet-policy`
+carries revocations only. Local deny, revocation and certificate expiry outrank
+every mode. Threat statement: under the default a stolen owner key can grant
+transfer and mount, which it could already reach by enrolling a device; shell
+only on devices whose own owner chose `all`.
+
 ## Shadow accounting classes
 
 Shadow mode decides on the legacy fold and records what the flip WOULD do, so

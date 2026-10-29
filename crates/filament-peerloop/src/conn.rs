@@ -355,7 +355,7 @@ impl Link {
         self.identity_device_pub = Some(device_pub);
         self.identity_binding = BindingStrength::Proven;
         self.identity_cert_expires = Some(expires);
-        self.principal_kind = PrincipalKind::FleetDevice;
+        self.principal_kind = PrincipalKind::FleetSibling;
     }
 
     /// Identity bound by a verified fleet-hello: Proven possession of a cert
@@ -376,14 +376,14 @@ impl Link {
     /// ended a delegated guest's held exec as "revoked" instead of "expired".
     /// `trusted` is the pair-proof flag, which a sibling link never sets.
     pub fn is_sibling_link(&self) -> bool {
-        matches!(&self.principal_kind, PrincipalKind::FleetDevice) && !self.trusted
+        matches!(&self.principal_kind, PrincipalKind::FleetSibling) && !self.trusted
     }
 
     pub fn fleet_proven(&self) -> bool {
         // The rule lives in the crate (written once, shared with
         // `shell_gate::fleet_link_proven`); this is only the field extraction.
         crate::host::fleet_link_proven(
-            matches!(&self.principal_kind, PrincipalKind::FleetDevice),
+            matches!(&self.principal_kind, PrincipalKind::FleetSibling),
             self.identity_binding == BindingStrength::Proven,
             self.identity_device_pub.is_some(),
             self.verified_name.is_some(),
@@ -863,6 +863,9 @@ pub struct Conn {
     /// and the live links it reached, so a re-push fires only on a membership
     /// change (new epoch), a validity refresh (new valid_until), or a new link.
     pub roster_pushed: Option<(u64, u64, HashSet<String>)>,
+    /// Owner-only: the `(epoch, valid_until)` of the fleet grant set last
+    /// delivered on each link, so an unchanged set is not resent every tick.
+    pub fleet_grants_pushed: HashMap<String, (u64, u64)>,
     /// Retry ladder: the stuck attempt per peer sid whose backoff timer is
     /// running. `on_stuck` records it and returns; `Ev::RetryLink` resumes it.
     pub stuck_retry: HashMap<String, StuckRetry>,
@@ -1061,6 +1064,7 @@ impl Conn {
             warm_hold: WarmHold::default(),
             worker_port_tx: HashMap::new(),
             roster_pushed: None,
+            fleet_grants_pushed: HashMap::new(),
             stuck_retry: HashMap::new(),
             ice_cache: SharedIceCache::default(),
             roster_absent: HashMap::new(),
@@ -1165,6 +1169,53 @@ impl Conn {
             ));
         }
         self.roster_pushed = Some((epoch, until, pushed_to));
+    }
+
+    /// Owner-only: deliver each live link's device the owner-signed grant set
+    /// ABOUT THAT DEVICE, when it changed (new epoch or refreshed validity) or
+    /// the link is new. Each device only ever receives its own set. A failed
+    /// send is retried next tick because the mark is not advanced.
+    pub async fn fleet_grants_maintenance(&mut self) {
+        let targets: Vec<(String, [u8; 32])> = self
+            .links
+            .iter()
+            .filter(|(_, l)| l.transport.as_ref().is_some_and(|t| t.is_alive()))
+            .filter_map(|(pid, l)| {
+                // The proven device key when identity has resolved; otherwise the
+                // certificate on the record this PAIRED link was proven against
+                // (a pair-secret MAC proves the link is that device). Only a
+                // pair-secret link may use the fallback.
+                let dev = l.identity_device_pub.or_else(|| {
+                    let (name, _) = l.expected_secret.as_ref()?;
+                    self.host.device_cert_for(name).map(|c| c.device_pub)
+                })?;
+                Some((pid.clone(), dev))
+            })
+            .collect();
+        self.fleet_grants_pushed.retain(|pid, _| self.links.contains_key(pid));
+        for (pid, target) in targets {
+            let Some(blob) = self
+                .host
+                .fleet_grants_snapshot_json(&target)
+                .and_then(|j| serde_json::from_str::<Value>(&j).ok())
+            else {
+                continue;
+            };
+            let mark = (
+                blob["epoch"].as_u64().unwrap_or(0),
+                blob["valid_until"].as_u64().unwrap_or(0),
+            );
+            if self.fleet_grants_pushed.get(&pid) == Some(&mark) {
+                continue;
+            }
+            let mut msg = blob;
+            msg["type"] = json!("fleet-grants");
+            if let Some(t) = self.transport_of(&pid) {
+                if t.send_control(&msg).await.is_ok() {
+                    self.fleet_grants_pushed.insert(pid, mark);
+                }
+            }
+        }
     }
 
     /// #28: is the link keyed by `pid` actively moving transfer bytes right now?

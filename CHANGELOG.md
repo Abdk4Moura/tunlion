@@ -27,12 +27,25 @@ release build failed and nothing was published under it.
   interactive picker at a terminal (also under More, and on the dashboard's
   device page).
 
+- `tunlion grant <device> <capability> --on <other-device>` on your owner
+  device gives one of your devices `transfer`, `shell` or `mount` on another of
+  your devices. It is signed with your owner key, delivered to that device, and
+  stops applying if your owner device stays offline for 15 minutes.
+  `tunlion revoke <device> <capability> --on <other-device>` withdraws it. A
+  `revoke` made on the device itself still wins.
+- `tunlion set fleet.owner_grants off|files|all` on each device decides what
+  such an owner grant may give there: `files` (the default) applies transfer
+  and mount but never shell, `all` also applies shell, `off` ignores owner
+  grants entirely. It is set on the device only; nothing over the network
+  changes it, and narrowing it applies at once.
+
 ### Changed
 
-- A file sent between two of your devices that were never paired with each
-  other now needs a `transfer` grant on the receiving device
-  (`tunlion grant <sender> transfer` there). 0.9.1 accepted such files into the
-  inbox without one. Paired devices, and your owner device, are unchanged.
+- Two of your devices that were never paired with each other can send each
+  other files with no grant, and nothing else: shell, forward and mount between
+  them need a grant. `tunlion devices` lists them as "your device".
+- A grant made on your owner device is no longer copied onto your other devices
+  as if it were their own. Use `grant --on` for that.
 - Removed `revoke --certificate`, `devices revoke` and `devices restore`:
   `tunlion demote <device> --to cut` and `tunlion promote <device>` replace
   them. `grant` / `revoke <device> <capability>` stay for single capabilities.

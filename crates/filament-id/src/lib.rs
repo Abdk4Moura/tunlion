@@ -671,6 +671,185 @@ impl ring::aead::NonceSequence for OneNonce {
     }
 }
 
+/// One owner-signed grant inside a [`FleetGrantSet`]: `subject_pub` (a device
+/// key) may exercise `cap` on the set's target device, until `expires` (unix
+/// seconds; 0 means no grant-level expiry, the set's `valid_until` still binds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetGrant {
+    pub subject_pub: [u8; 32],
+    pub cap: String,
+    pub expires: u64,
+}
+
+/// Owner-signed grants ABOUT ONE fleet device (`target_pub`), pushed to that
+/// device over an existing authenticated link, exactly like the roster.
+///
+/// It is the one way authority made on the owner device reaches another fleet
+/// device, and it is deliberately narrow:
+///
+/// * only the owner key can author it (signature over `canonical_bytes`, with a
+///   domain separate from every other owner-signed struct);
+/// * it names its target, so a set for one device is meaningless on another;
+/// * it is time-boxed (`valid_until`) and monotonic in `(epoch, valid_until)`,
+///   so an expired set is never applied and a replay is a no-op;
+/// * it is never written into the capability store: the receiver keeps it as a
+///   separate, replaceable file and consults it only for a same-owner sibling.
+///
+/// Verification of the signature is here; whether to ACCEPT a verified set
+/// (owner, target, expiry, monotonicity) is the pure rule in
+/// `filament_cap::fleet_grants`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetGrantSet {
+    pub owner_pub: [u8; 32],
+    pub target_pub: [u8; 32],
+    pub epoch: u64,
+    pub valid_until: u64,
+    pub grants: Vec<FleetGrant>,
+}
+
+// PROTOCOL LITERAL: frozen, do not rename (fleet grant set signature domain).
+pub const FLEET_GRANTS_SIGN_DOMAIN: &[u8] = b"tunlion/fleet-grants/v1";
+
+impl FleetGrantSet {
+    /// Deterministic signing bytes: domain, owner, target, epoch, valid_until,
+    /// then the grants sorted by (subject, cap, expires), each as subject +
+    /// u16-LE-length cap + expires. A set ordered differently signs the same.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(FLEET_GRANTS_SIGN_DOMAIN.len() + 80 + self.grants.len() * 56);
+        v.extend_from_slice(FLEET_GRANTS_SIGN_DOMAIN);
+        v.extend_from_slice(&self.owner_pub);
+        v.extend_from_slice(&self.target_pub);
+        v.extend_from_slice(&self.epoch.to_le_bytes());
+        v.extend_from_slice(&self.valid_until.to_le_bytes());
+        let mut gs: Vec<&FleetGrant> = self.grants.iter().collect();
+        gs.sort_by(|a, b| {
+            (a.subject_pub, a.cap.as_str(), a.expires).cmp(&(b.subject_pub, b.cap.as_str(), b.expires))
+        });
+        v.extend_from_slice(&(gs.len() as u32).to_le_bytes());
+        for g in gs {
+            v.extend_from_slice(&g.subject_pub);
+            let cap = g.cap.as_bytes();
+            let len = cap.len().min(u16::MAX as usize) as u16;
+            v.extend_from_slice(&len.to_le_bytes());
+            v.extend_from_slice(&cap[..len as usize]);
+            v.extend_from_slice(&g.expires.to_le_bytes());
+        }
+        v
+    }
+
+    /// Sign with the owner key.
+    pub fn sign(&self, owner_key: &Ed25519KeyPair) -> Result<[u8; 64]> {
+        let sig = owner_key.sign(&self.canonical_bytes());
+        let mut out = [0u8; 64];
+        out.copy_from_slice(sig.as_ref());
+        Ok(out)
+    }
+
+    /// Verify the signature against `self.owner_pub`. Callers must ALSO check
+    /// that `owner_pub` is the owner key they already hold: a set signed by
+    /// some other key verifies against that other key.
+    pub fn verify(&self, sig: &[u8; 64]) -> Result<()> {
+        UnparsedPublicKey::new(&ED25519, &self.owner_pub)
+            .verify(&self.canonical_bytes(), sig)
+            .map_err(|_| anyhow!("fleet grant set signature invalid: not signed by the owner key"))
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "owner_pub": hex::encode(self.owner_pub),
+            "target_pub": hex::encode(self.target_pub),
+            "epoch": self.epoch,
+            "valid_until": self.valid_until,
+            "grants": self.grants.iter().map(|g| json!({
+                "subject_pub": hex::encode(g.subject_pub),
+                "cap": g.cap,
+                "expires": g.expires,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let key = |s: &str| -> Option<[u8; 32]> { hex::decode(s).ok()?.try_into().ok() };
+        let grants = v["grants"]
+            .as_array()?
+            .iter()
+            .map(|g| {
+                Some(FleetGrant {
+                    subject_pub: key(g["subject_pub"].as_str()?)?,
+                    cap: g["cap"].as_str()?.to_string(),
+                    expires: g["expires"].as_u64()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(FleetGrantSet {
+            owner_pub: key(v["owner_pub"].as_str()?)?,
+            target_pub: key(v["target_pub"].as_str()?)?,
+            epoch: v["epoch"].as_u64()?,
+            valid_until: v["valid_until"].as_u64()?,
+            grants,
+        })
+    }
+}
+
+#[cfg(test)]
+mod fleet_grant_set_tests {
+    use super::*;
+
+    fn set(owner: &UserKey) -> FleetGrantSet {
+        FleetGrantSet {
+            owner_pub: owner.public_key_bytes(),
+            target_pub: [2u8; 32],
+            epoch: 3,
+            valid_until: 1_000,
+            grants: vec![
+                FleetGrant { subject_pub: [5u8; 32], cap: "shell".into(), expires: 0 },
+                FleetGrant { subject_pub: [4u8; 32], cap: "transfer".into(), expires: 900 },
+            ],
+        }
+    }
+
+    #[test]
+    fn signs_verifies_and_roundtrips_independent_of_order() {
+        let owner = UserKey::from_seed(&[31u8; 32]).unwrap();
+        let a = set(&owner);
+        let mut b = a.clone();
+        b.grants.reverse();
+        let sig = a.sign(owner.keypair()).unwrap();
+        assert!(b.verify(&sig).is_ok(), "order must not change the signed bytes");
+        let back = FleetGrantSet::from_json(&a.to_json()).unwrap();
+        assert_eq!(back, a);
+        assert!(back.verify(&sig).is_ok());
+    }
+
+    #[test]
+    fn any_field_change_breaks_the_signature() {
+        let owner = UserKey::from_seed(&[32u8; 32]).unwrap();
+        let a = set(&owner);
+        let sig = a.sign(owner.keypair()).unwrap();
+        let mut t = a.clone(); t.target_pub = [3u8; 32]; assert!(t.verify(&sig).is_err());
+        let mut t = a.clone(); t.epoch += 1; assert!(t.verify(&sig).is_err());
+        let mut t = a.clone(); t.valid_until += 1; assert!(t.verify(&sig).is_err());
+        let mut t = a.clone(); t.grants[0].cap = "mount".into(); assert!(t.verify(&sig).is_err());
+        let mut t = a.clone(); t.grants[1].expires = 0; assert!(t.verify(&sig).is_err());
+        let mut t = a.clone(); t.grants.pop(); assert!(t.verify(&sig).is_err());
+    }
+
+    #[test]
+    fn a_set_signed_by_another_key_does_not_verify_as_the_owners() {
+        let owner = UserKey::from_seed(&[33u8; 32]).unwrap();
+        let sibling = UserKey::from_seed(&[34u8; 32]).unwrap();
+        let a = set(&owner);
+        // A compromised sibling signs a set that CLAIMS the owner's key.
+        let forged = a.sign(sibling.keypair()).unwrap();
+        assert!(a.verify(&forged).is_err());
+    }
+
+    #[test]
+    fn domain_is_separate_from_the_roster() {
+        assert_ne!(FLEET_GRANTS_SIGN_DOMAIN, ROSTER_SIGN_DOMAIN);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

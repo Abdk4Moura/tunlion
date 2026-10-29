@@ -22,8 +22,8 @@
 #       certificates; neither holds a pair secret for the other
 #   R   reach: `reach` works between the siblings, both directions
 #   S   shell: refused without a grant on the target, works with one
-#   T   transfer: refused without a grant (nothing lands ANYWHERE), lands at
-#       the named device only with one; and the other direction stays refused
+#   T   transfer: the FleetSibling default, at the named device only, both
+#       ways, with no grant and no pairing; a grant stays one-directional
 #   V   revocation: `demote charlie --to cut` on the OWNER cuts bravo<->charlie
 #       (link closed, exec refused, no file lands either way, no re-admission)
 #       while bravo<->alpha keeps working (the network did not just break)
@@ -142,37 +142,33 @@ if [ "$MIXED" = 0 ]; then
   else bad "gateR3: charlie reach bravo rc=$rc: $(fs_out | tail -5)"; fi
 fi
 
-say "T: transfer needs an explicit grant (checked BEFORE any grant exists)"
+say "T: transfer is the FleetSibling kind's one default (checked BEFORE any grant exists)"
+# 0.9.2 fleet trust (owner decision): a sibling may transfer with no grant, to
+# the NAMED device only. This gate asserted the opposite while auto-mesh shipped
+# grant-only transfer; the rule changed by decision, not to make a test pass.
 echo "t1-$$" > "$WORK/t1.txt"
 fs_cli 90 as_node bravo send "$WORK/t1.txt" --to charlie; rc=$(fs_rc)
 sleep 2
-if [ "$MIXED" = 0 ]; then
-  if [ "$rc" = 4 ] && nowhere t1.txt; then ok "gateT1: ungranted bravo->charlie refused (rc=$rc) and landed nowhere"
-  else bad "gateT1: ungranted bravo->charlie rc=$rc, landed: $(ls "$WORK"/*-drop "$WORK/Adrop" | tr '\n' ' ')"; fi
-else
-  echo "  (mixed: charlie is 0.9.1 and applies its own 0.9.1 policy; rc=$rc, charlie-drop: $(ls "$WORK/charlie-drop" | tr '\n' ' '))"
-fi
+if [ "$rc" = 0 ] && landed charlie t1.txt && ! landed alpha t1.txt && ! landed bravo t1.txt && ! landed dave t1.txt && [ ! -f "$WORK/Adrop/t1.txt" ]; then
+  ok "gateT1: ungranted bravo->charlie landed at charlie ONLY"
+else bad "gateT1: ungranted bravo->charlie rc=$rc, landed: $(ls "$WORK"/*-drop "$WORK/Adrop" | tr '\n' ' ')"; fi
 echo "t1r-$$" > "$WORK/t1r.txt"
 fs_cli 90 as_node charlie send "$WORK/t1r.txt" --to bravo; rc=$(fs_rc)
 sleep 2
-# In mixed mode the SENDER is 0.9.1, and a 0.9.1 daemon brokers its one-shot's
-# meeting place over whichever link carries the target's name, which after T1
-# can be bravo's lingering one-shot (fixed in this release, on the sender side).
-# The send then never reaches bravo: exit 6, nothing lands. That is 0.9.1's own
-# behaviour, unchanged by this release, so mixed mode asserts only that nothing
-# crossed.
+# In mixed mode the SENDER is 0.9.1, whose daemon brokers its one-shot's meeting
+# place over whichever link carries the target's name (fixed in this release,
+# on the sender side). Mixed mode asserts only that nothing was misdelivered.
 if [ "$MIXED" = 1 ]; then
-  if [ "$rc" != 0 ] && nowhere t1r.txt; then ok "gateT2: (mixed) ungranted 0.9.1 charlie->bravo landed nowhere (rc=$rc)"
-  else bad "gateT2: (mixed) ungranted charlie->bravo rc=$rc, landed: $(ls "$WORK"/*-drop | tr '\n' ' ')"; fi
-elif [ "$rc" = 4 ] && nowhere t1r.txt; then ok "gateT2: ungranted charlie->bravo refused by bravo (rc=$rc) and landed nowhere"
+  if nowhere t1r.txt || { landed bravo t1r.txt && ! landed charlie t1r.txt && ! landed dave t1r.txt; }; then ok "gateT2: (mixed) 0.9.1 charlie->bravo misdelivered nothing (rc=$rc)"
+  else bad "gateT2: (mixed) misdelivery: $(ls "$WORK"/*-drop | tr '\n' ' ')"; fi
+elif [ "$rc" = 0 ] && landed bravo t1r.txt && ! landed charlie t1r.txt && ! landed dave t1r.txt && [ ! -f "$WORK/Adrop/t1r.txt" ]; then
+  ok "gateT2: ungranted charlie->bravo landed at bravo ONLY"
 else bad "gateT2: ungranted charlie->bravo rc=$rc, landed: $(ls "$WORK"/*-drop | tr '\n' ' ')"; fi
-# The refusal must be bravo's capability gate deciding about charlie, not a
-# link that never formed (exit 4 alone could in principle come from elsewhere).
 if [ "$MIXED" = 1 ]; then
-  echo "  (mixed: the 0.9.1 sender's offer does not reach bravo, see gateT2)"
-elif grep -qE "transfer-gate: from=charlie allowed=false" "$WORK/up-bravo.log"; then
-  ok "gateT2b: bravo's transfer gate itself refused charlie (allowed=false)"
-else bad "gateT2b: no transfer-gate refusal of charlie in bravo's log"; grep -E "transfer-gate" "$WORK/up-bravo.log" | tail -3; fi
+  echo "  (mixed: see gateT2)"
+elif grep -qE "transfer-gate: from=charlie allowed=true .*trusted=false" "$WORK/up-bravo.log"; then
+  ok "gateT2b: bravo's transfer gate admitted charlie on the kind, on an UNTRUSTED link (no pairing)"
+else bad "gateT2b: no transfer-gate admission of charlie in bravo's log"; grep -E "transfer-gate" "$WORK/up-bravo.log" | tail -3; fi
 
 say "S: shell is the target's own grant decision"
 fs_cli 60 as_node bravo exec charlie -- echo EXEC-MARK-PRE; rc=$(fs_rc)
@@ -191,12 +187,10 @@ if [ "$rc" = 0 ] && landed charlie t2.txt && ! landed alpha t2.txt && ! landed b
    && [ "$(cat "$WORK/charlie-drop/t2.txt")" = "t2-$$" ]; then
   ok "gateT3: granted bravo->charlie landed at charlie ONLY, content intact"
 else bad "gateT3: granted send rc=$rc: $(fs_out | tail -3); drops: $(ls "$WORK"/*-drop "$WORK/Adrop" | tr '\n' ' ')"; fi
-# charlie's grant to bravo says nothing about bravo's inbox.
-echo "t2r-$$" > "$WORK/t2r.txt"
-fs_cli 90 as_node charlie send "$WORK/t2r.txt" --to bravo; rc=$(fs_rc)
-sleep 2
-if { [ "$rc" = 4 ] || { [ "$MIXED" = 1 ] && [ "$rc" != 0 ]; }; } && nowhere t2r.txt; then ok "gateT4: charlie->bravo still refused: a grant is one-directional"
-else bad "gateT4: charlie->bravo rc=$rc after charlie granted bravo; landed: $(ls "$WORK"/*-drop | tr '\n' ' ')"; fi
+# charlie's shell grant to bravo says nothing about bravo's shell.
+fs_cli 60 as_node charlie exec bravo -- echo EXEC-MARK-REV; rc=$(fs_rc)
+if [ "$rc" != 0 ] && ! fs_out | grep -q EXEC-MARK-REV; then ok "gateT4: charlie->bravo exec still refused: a grant is one-directional"
+else bad "gateT4: charlie->bravo exec rc=$rc after charlie granted bravo"; fi
 
 say "U: an uncertified pairing gets nothing new"
 if [ ! -e "$WORK/dave/fleet.rv" ]; then ok "gateU1: dave holds no fleet rendezvous secret"

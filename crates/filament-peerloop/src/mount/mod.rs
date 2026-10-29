@@ -100,7 +100,15 @@ pub async fn handle_mount_open(
                 )
             })
             .unwrap_or((false, false));
-        let legacy_ok = mount_legacy_allowed(trusted, record_grants, has_grant, denied);
+        // FleetSibling: an owner-signed mount grant about this device counts as a
+        // grant; no mount default is implied by the kind (or shipped at all).
+        let sib = crate::shell_gate::sibling_facts(conn, pid, cap::CAP_MOUNT);
+        let record_grants = record_grants || (sib.is_sibling && sib.owner_grant);
+        let has_grant = has_grant || (sib.is_sibling && sib.owner_grant);
+        // A proven sibling's identity answers "is this the device the grant
+        // names" as strongly as a pair MAC does (same rule as the shell fold).
+        let trusted_for_grant = trusted || conn.link(pid).is_some_and(|l| l.fleet_proven());
+        let legacy_ok = mount_legacy_allowed(trusted_for_grant, record_grants, has_grant, denied);
         let d = host.cap_gate_effective(CapGate {
             legacy_allowed: legacy_ok,
             outcome: &outcome,

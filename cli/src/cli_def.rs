@@ -777,6 +777,12 @@ pub(crate) enum Cmd {
         /// certified receives it (for your own fleet, that is every device).
         #[arg(long, conflicts_with = "tag")]
         user: bool,
+        /// Owner device only: grant it on ANOTHER of your devices instead of
+        /// this one. Signed by your owner key and delivered to that device; it
+        /// applies there to DEVICE as a device of yours, and a deny recorded on
+        /// that device still wins. `tunlion grant laptop shell --on server`.
+        #[arg(long, value_name = "DEVICE", conflicts_with_all = ["tag", "user"])]
+        on: Option<String>,
     },
     /// Revoke one capability from a known device. To move a device a whole
     /// step (cut off, paired, your device, your device + shell), use
@@ -790,6 +796,9 @@ pub(crate) enum Cmd {
         /// removes it from every device of that user.
         #[arg(long)]
         user: bool,
+        /// Owner device only: withdraw a grant made with `grant --on DEVICE`.
+        #[arg(long, value_name = "DEVICE", conflicts_with = "user")]
+        on: Option<String>,
     },
     /// Move a device one step up its ladder: cut off > paired > your device >
     /// your device + shell. `--to` jumps. At a terminal with no device, pick

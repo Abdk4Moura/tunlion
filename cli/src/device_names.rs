@@ -204,13 +204,16 @@ pub(crate) fn canonicalize_cmd(cmd: Cmd) -> Result<Cmd> {
         Cmd::Doctor { device, watch, repeat, timeout, json } => {
             Cmd::Doctor { device: opt(device, &mut known)?, watch, repeat, timeout, json }
         }
-        Cmd::Grant { device, capability, tag, user } => {
+        Cmd::Grant { device, capability, tag, user, on } => {
             // With --tag the single positional is the capability, not a device.
             let device = if tag.is_some() { device } else { opt(device, &mut known)? };
-            Cmd::Grant { device, capability, tag, user }
+            // `--on <target>` names a device too (the owner grants ON it).
+            let on = opt(on, &mut known)?;
+            Cmd::Grant { device, capability, tag, user, on }
         }
-        Cmd::Revoke { device, capability, user } => {
-            Cmd::Revoke { device: resolve_arg_in(&device, &known())?, capability, user }
+        Cmd::Revoke { device, capability, user, on } => {
+            let on = opt(on, &mut known)?;
+            Cmd::Revoke { device: resolve_arg_in(&device, &known())?, capability, user, on }
         }
         Cmd::Promote { device, to, json } => Cmd::Promote { device: opt(device, &mut known)?, to, json },
         Cmd::Demote { device, to, json } => Cmd::Demote { device: opt(device, &mut known)?, to, json },

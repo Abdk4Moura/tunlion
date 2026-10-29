@@ -367,6 +367,17 @@ impl RecvIdentity for CliRecv {
             now,
         )
     }
+    fn verify_and_store_fleet_grants(
+        &self,
+        blob: &Value,
+        owner_pub: &[u8; 32],
+        device_pub: &[u8; 32],
+        now: u64,
+    ) -> Result<filament_cap::fleet_grants::GrantSetJudgement> {
+        self.identity
+            .store()
+            .verify_and_store_fleet_grants(blob, owner_pub, device_pub, now)
+    }
     fn verify_depart(
         &self,
         device_pub: &[u8; 32],

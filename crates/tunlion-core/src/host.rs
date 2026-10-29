@@ -679,6 +679,20 @@ impl RecvIdentity for CoreIdentity {
         };
         filament_peerloop::recv::roster::verify_and_store_roster(&self.store, blob, &trusted, now)
     }
+    fn verify_and_store_fleet_grants(
+        &self,
+        blob: &Value,
+        _owner_pub: &[u8; 32],
+        device_pub: &[u8; 32],
+        now: u64,
+    ) -> anyhow::Result<filament_cap::fleet_grants::GrantSetJudgement> {
+        // Same owner source as the roster: the key this Core trusts, never the
+        // one the caller passes.
+        let Some(trusted) = self.trusted_owner() else {
+            anyhow::bail!("this device holds no trusted owner key for fleet grants");
+        };
+        self.store.verify_and_store_fleet_grants(blob, &trusted, device_pub, now)
+    }
     fn verify_depart(
         &self,
         device_pub: &[u8; 32],

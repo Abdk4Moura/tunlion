@@ -2077,12 +2077,30 @@ pub(crate) async fn async_main() -> Result<()> {
             capability,
             tag,
             user,
-        } => grant_cmd(device, capability, tag, user).await,
+            on,
+        } => {
+            if let Some(target) = on {
+                let (Some(device), Some(capability)) = (device, capability) else {
+                    crate::bail_usage!("usage: tunlion grant <device> <capability> --on <device>");
+                };
+                return crate::fleet_trust_cmd::grant_on(&device, &capability, &target);
+            }
+            grant_cmd(device, capability, tag, user).await
+        }
         Cmd::Revoke {
             device,
             capability,
             user,
-        } => revoke_cmd(&ui_caps, device, capability, user, true).await,
+            on,
+        } => {
+            if let Some(target) = on {
+                let Some(capability) = capability else {
+                    crate::bail_usage!("usage: tunlion revoke <device> <capability> --on <device>");
+                };
+                return crate::fleet_trust_cmd::revoke_on(&device, &capability, &target);
+            }
+            revoke_cmd(&ui_caps, device, capability, user, true).await
+        }
         Cmd::Promote { device, to, json } => {
             crate::ladder::ladder_cmd(&ui_caps, true, device, to, json || cli.json, &server, relay).await
         }

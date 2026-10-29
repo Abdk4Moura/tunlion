@@ -1357,7 +1357,17 @@ impl DeviceStore {
     }
 
     /// Merge fleet policy received from a peer, keeping only what the OWNER
-    /// signed. Returns how many were newly stored.
+    /// signed, and of that only REVOCATIONS. Returns how many were newly stored.
+    ///
+    /// Grant and modify ops are dropped. The owner's grant ops are about the
+    /// owner's own resource, whose id is derived from the owner key and so reads
+    /// the same on every fleet device: merging them let a grant made ON the
+    /// owner authorize the same subject on every other device, which is not
+    /// what the owner decided, and it was the capability store's only
+    /// network-origin write. Authority for another fleet device now travels as
+    /// an owner-signed set naming that device (`verify_and_store_fleet_grants`),
+    /// kept OUT of the capability store. A revocation only ever narrows, so it
+    /// is still accepted.
     pub fn merge_owner_cap_ops(&self, ops: &[Value]) -> usize {
         self.merge_owner_cap_ops_outcome(ops).unwrap_or(0)
     }
@@ -1377,6 +1387,9 @@ impl DeviceStore {
                 continue;
             };
             if op.grantor != owner || op.verify(&owner, now).is_err() {
+                continue;
+            }
+            if op.op != filament_cap::capability::CapOpKind::Revoke {
                 continue;
             }
             if superseded_by_tombstone(&store, &op) {
@@ -2100,6 +2113,294 @@ mod port_impl {
         fn any_shell_grant(&self) -> bool {
             DeviceStore::any_shell_grant(self)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Owner-signed fleet grant sets (see filament_cap::fleet_grants)
+// ---------------------------------------------------------------------------
+
+/// Owner side: grants the owner made FOR another fleet device. Local, plain.
+pub const FLEET_GRANTS_AUTHORED_FILE: &str = "fleet-grants.json";
+/// Owner side: per-target mint state, so an unchanged set keeps its epoch.
+pub const FLEET_GRANTS_STATE_FILE: &str = "fleet-grants-state.json";
+/// Receiver side: the newest accepted set about THIS device, as received.
+/// Never merged into the capability store.
+pub const FLEET_GRANTS_HELD_FILE: &str = "fleet-grants-held.json";
+/// The `config` line key that holds `fleet.owner_grants` (the CLI's typed
+/// settings registry writes it; `cli/src/settings.rs` pins the same string).
+/// Written only by a local `tunlion set`; no network message reaches it.
+pub const OWNER_GRANT_POLICY_STORE_KEY: &str = "fleet_owner_grants";
+
+impl DeviceStore {
+    fn json_array_at(&self, file: &str) -> Vec<Value> {
+        std::fs::read_to_string(self.root.join(file))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// The grants this OWNER device has made for other fleet devices.
+    pub fn fleet_grants_authored(&self) -> Vec<Value> {
+        self.json_array_at(FLEET_GRANTS_AUTHORED_FILE)
+    }
+
+    /// Record (or replace) "`subject` may `cap` on `target`", owner side.
+    /// `expires` 0 means no grant-level expiry.
+    pub fn fleet_grant_add(
+        &self,
+        target_pub: &[u8; 32],
+        subject_pub: &[u8; 32],
+        cap: &str,
+        expires: u64,
+    ) -> Result<()> {
+        let mut all = self.fleet_grants_authored();
+        let (t, s) = (hex::encode(target_pub), hex::encode(subject_pub));
+        all.retain(|g| !(g["target_pub"] == t && g["subject_pub"] == s && g["cap"] == cap));
+        all.push(json!({"target_pub": t, "subject_pub": s, "cap": cap, "expires": expires}));
+        secret_write::SecretFile::write_str(
+            &self.root.join(FLEET_GRANTS_AUTHORED_FILE),
+            &serde_json::to_string_pretty(&all)?,
+        )?;
+        Ok(())
+    }
+
+    /// Remove "`subject` may `cap` on `target`". Returns whether one existed.
+    pub fn fleet_grant_remove(&self, target_pub: &[u8; 32], subject_pub: &[u8; 32], cap: &str) -> Result<bool> {
+        let mut all = self.fleet_grants_authored();
+        let (t, s) = (hex::encode(target_pub), hex::encode(subject_pub));
+        let before = all.len();
+        all.retain(|g| !(g["target_pub"] == t && g["subject_pub"] == s && g["cap"] == cap));
+        let removed = all.len() != before;
+        if removed {
+            secret_write::SecretFile::write_str(
+                &self.root.join(FLEET_GRANTS_AUTHORED_FILE),
+                &serde_json::to_string_pretty(&all)?,
+            )?;
+        }
+        Ok(removed)
+    }
+
+    /// Has this owner ever authored a grant for `target_pub` (now, or in a set
+    /// it minted before)? A device that never had one is sent nothing.
+    pub fn fleet_grants_ever_for(&self, target_pub: &[u8; 32]) -> bool {
+        let t = hex::encode(target_pub);
+        self.fleet_grants_authored()
+            .iter()
+            .any(|g| g["target_pub"].as_str() == Some(t.as_str()))
+            || std::fs::read_to_string(self.root.join(FLEET_GRANTS_STATE_FILE))
+                .ok()
+                .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+                .is_some_and(|v| v.get(&t).is_some())
+    }
+
+    /// Mint and sign the current set about `target_pub`, owner side.
+    ///
+    /// A subject the owner has revoked is left out, so the next push withdraws
+    /// its grants everywhere (the receivers' revocation checks deny it anyway;
+    /// this keeps the signed statement honest). The epoch bumps only when the
+    /// content changes; `valid_until` refreshes once half the TTL has passed.
+    pub fn mint_fleet_grant_set(
+        &self,
+        owner: &UserKey,
+        target_pub: &[u8; 32],
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<Value> {
+        let t = hex::encode(target_pub);
+        let mut grants: Vec<filament_id::FleetGrant> = self
+            .fleet_grants_authored()
+            .iter()
+            .filter(|g| g["target_pub"].as_str() == Some(t.as_str()))
+            .filter_map(|g| {
+                let subject_pub: [u8; 32] = hex::decode(g["subject_pub"].as_str()?).ok()?.try_into().ok()?;
+                let expires = g["expires"].as_u64().unwrap_or(0);
+                if self.device_cert_revoked(&subject_pub) || (expires != 0 && expires <= now) {
+                    return None;
+                }
+                Some(filament_id::FleetGrant { subject_pub, cap: g["cap"].as_str()?.to_string(), expires })
+            })
+            .collect();
+        grants.sort_by(|a, b| (a.subject_pub, a.cap.as_str()).cmp(&(b.subject_pub, b.cap.as_str())));
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let probe = filament_id::FleetGrantSet {
+                owner_pub: owner.public_key_bytes(),
+                target_pub: *target_pub,
+                epoch: 0,
+                valid_until: 0,
+                grants: grants.clone(),
+            };
+            let mut h = Sha256::new();
+            h.update(probe.canonical_bytes());
+            h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let state_path = self.root.join(FLEET_GRANTS_STATE_FILE);
+        let mut state: serde_json::Map<String, Value> = std::fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|r| serde_json::from_str(&r).ok())
+            .unwrap_or_default();
+        let prev = state.get(&t).cloned().unwrap_or(Value::Null);
+        let (pe, ph, pu) = (
+            prev["epoch"].as_u64().unwrap_or(0),
+            prev["hash"].as_str().unwrap_or("").to_string(),
+            prev["valid_until"].as_u64().unwrap_or(0),
+        );
+        let epoch = if pe == 0 || ph != hash { pe + 1 } else { pe };
+        let valid_until = if ph == hash && pu > now.saturating_add(ttl_secs / 2) {
+            pu
+        } else {
+            now.saturating_add(ttl_secs)
+        };
+        if epoch != pe || valid_until != pu {
+            state.insert(t.clone(), json!({"epoch": epoch, "hash": hash, "valid_until": valid_until}));
+            secret_write::SecretFile::write_str(&state_path, &serde_json::to_string_pretty(&state)?)?;
+        }
+        let set = filament_id::FleetGrantSet {
+            owner_pub: owner.public_key_bytes(),
+            target_pub: *target_pub,
+            epoch,
+            valid_until,
+            grants,
+        };
+        let sig = set.sign(owner.keypair())?;
+        let mut blob = set.to_json();
+        blob["sig"] = json!(hex::encode(sig));
+        Ok(blob)
+    }
+
+    fn parse_signed_set(blob: &Value) -> Option<(filament_id::FleetGrantSet, bool)> {
+        let set = filament_id::FleetGrantSet::from_json(blob)?;
+        let sig: [u8; 64] = hex::decode(blob["sig"].as_str()?).ok()?.try_into().ok()?;
+        let ok = set.verify(&sig).is_ok();
+        Some((set, ok))
+    }
+
+    fn held_fleet_grants_raw(&self) -> Option<Value> {
+        std::fs::read_to_string(self.root.join(FLEET_GRANTS_HELD_FILE))
+            .ok()
+            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+    }
+
+    /// Receiver side: judge a pushed set and store it on `Accept`. A malformed
+    /// set is an error; every other outcome is the pure judgement.
+    pub fn verify_and_store_fleet_grants(
+        &self,
+        blob: &Value,
+        my_owner: &[u8; 32],
+        my_device: &[u8; 32],
+        now: u64,
+    ) -> Result<filament_cap::fleet_grants::GrantSetJudgement> {
+        use filament_cap::fleet_grants::{judge_grant_set_under, GrantSetHeader, GrantSetJudgement};
+        let Some((set, sig_ok)) = Self::parse_signed_set(blob) else {
+            anyhow::bail!("malformed fleet grant set");
+        };
+        let held = self
+            .held_fleet_grants_raw()
+            .and_then(|h| Some((h["epoch"].as_u64()?, h["valid_until"].as_u64()?)));
+        let h = GrantSetHeader {
+            owner_pub: set.owner_pub,
+            target_pub: set.target_pub,
+            epoch: set.epoch,
+            valid_until: set.valid_until,
+        };
+        let j = judge_grant_set_under(self.owner_grant_policy(), &h, sig_ok, my_owner, my_device, now, held);
+        if j == GrantSetJudgement::Accept {
+            let mut keep = set.to_json();
+            keep["sig"] = blob["sig"].clone();
+            keep["received_at"] = json!(now);
+            secret_write::SecretFile::write_str(
+                &self.root.join(FLEET_GRANTS_HELD_FILE),
+                &serde_json::to_string_pretty(&keep)?,
+            )?;
+        }
+        Ok(j)
+    }
+
+    /// This device's `fleet.owner_grants`, read from its own `config` file on
+    /// every call (so a `tunlion set` applies to the next decision, with no
+    /// restart). Absent means the default (`files`); unreadable means `off`.
+    pub fn owner_grant_policy(&self) -> filament_cap::fleet_grants::OwnerGrantPolicy {
+        let raw = std::fs::read_to_string(self.root.join("config")).ok();
+        let v = raw.as_deref().and_then(|r| {
+            r.lines().find_map(|l| {
+                let (k, v) = l.split_once(char::is_whitespace)?;
+                (k == OWNER_GRANT_POLICY_STORE_KEY).then(|| v.trim().to_string())
+            })
+        });
+        filament_cap::fleet_grants::OwnerGrantPolicy::from_stored(v.as_deref())
+    }
+
+    /// Receiver side, what the gates ask: does the held set grant `subject` the
+    /// `action` now, AND does this device's `fleet.owner_grants` let an owner
+    /// grant of that kind apply? The policy is read at this moment, so a set
+    /// accepted under `all` stops granting shell the instant the device's owner
+    /// narrows it to `files`.
+    pub fn fleet_grant_applies(&self, subject: &[u8; 32], action: &str, now: u64) -> bool {
+        self.owner_grant_policy().applies(action) && self.fleet_grant_held(subject, action, now)
+    }
+
+    /// Receiver side: does the held set grant `subject` the `action` now?
+    /// (Held and valid; whether it APPLIES is [`DeviceStore::fleet_grant_applies`].)
+    ///
+    /// The held file is re-verified on every read (signature, owner, target):
+    /// a file that was edited, or that predates a change of owner, grants
+    /// nothing. Only meaningful on a joined device; the owner holds none.
+    pub fn fleet_grant_held(&self, subject: &[u8; 32], action: &str, now: u64) -> bool {
+        use filament_cap::fleet_grants::{grant_set_allows, HeldGrant};
+        let Some(raw) = self.held_fleet_grants_raw() else {
+            return false;
+        };
+        let Some((set, sig_ok)) = Self::parse_signed_set(&raw) else {
+            return false;
+        };
+        let Some(owner) = self.owner_pub_for_resources(None) else {
+            return false;
+        };
+        let Some(me) = self.local_device_cert_record().and_then(|r| DeviceCert::from_json(&r["cert"])) else {
+            return false;
+        };
+        if !sig_ok || set.owner_pub != owner || set.target_pub != me.device_pub {
+            return false;
+        }
+        let grants: Vec<HeldGrant> = set
+            .grants
+            .iter()
+            .map(|g| HeldGrant { subject_pub: g.subject_pub, cap: g.cap.clone(), expires: g.expires })
+            .collect();
+        grant_set_allows(set.valid_until, &grants, subject, action, now)
+    }
+
+    /// Receiver side, for display: the held, valid owner grants for `subject`,
+    /// split into those that apply under this device's `fleet.owner_grants` and
+    /// those held but not applied.
+    pub fn fleet_grant_caps_split(&self, subject: &[u8; 32], now: u64) -> (Vec<String>, Vec<String>) {
+        let policy = self.owner_grant_policy();
+        self.fleet_grant_caps_for(subject, now)
+            .into_iter()
+            .partition(|c| policy.applies(c))
+    }
+
+    /// Receiver side: the capabilities the held set grants `subject` now, for
+    /// display (`devices`). Same checks as [`DeviceStore::fleet_grant_held`];
+    /// the local policy is not applied here (see `fleet_grant_caps_split`).
+    pub fn fleet_grant_caps_for(&self, subject: &[u8; 32], now: u64) -> Vec<String> {
+        let Some(raw) = self.held_fleet_grants_raw() else {
+            return Vec::new();
+        };
+        let Some(set) = filament_id::FleetGrantSet::from_json(&raw) else {
+            return Vec::new();
+        };
+        let mut caps: Vec<String> = set
+            .grants
+            .iter()
+            .filter(|g| g.subject_pub == *subject)
+            .map(|g| g.cap.clone())
+            .filter(|c| self.fleet_grant_held(subject, c, now))
+            .collect();
+        caps.sort();
+        caps.dedup();
+        caps
     }
 }
 
@@ -3025,5 +3326,351 @@ mod sibling_roster_revocation {
     fn the_roster_file_name_matches_the_roster_module() {
         #[cfg(feature = "dispatch")]
         assert_eq!(crate::recv::roster::ROSTER_FILE, "roster.json");
+    }
+}
+
+#[cfg(test)]
+mod fleet_grant_set_security {
+    //! Owner-signed fleet grant sets, end to end through the store: an owner
+    //! mints, a joined device judges and holds, the gate asks. Each test is one
+    //! attack or failure the design must survive.
+    use super::*;
+    use filament_cap::fleet_grants::{GrantSetJudgement, GrantSetRefusal};
+    use filament_id::{DeviceCert, FleetGrant, FleetGrantSet, UserKey};
+    use serde_json::json;
+
+    fn unique(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fil-fg-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const ME: [u8; 32] = [0x21; 32];
+    const BRAVO: [u8; 32] = [0x22; 32];
+
+    /// A joined device certified by `owner`, plus the owner's own store with
+    /// both devices on record.
+    fn fleet(tag: &str) -> (UserKey, DeviceStore, DeviceStore, PathBuf, PathBuf) {
+        let owner = UserKey::from_seed(&[0x41; 32]).unwrap();
+        let now = now_secs();
+        let oroot = unique(&format!("{tag}-owner"));
+        let ostore = DeviceStore::open(&oroot);
+        let me_cert = DeviceCert::certify(&owner, ME, now, 3600).unwrap();
+        let b_cert = DeviceCert::certify(&owner, BRAVO, now, 3600).unwrap();
+        std::fs::write(
+            ostore.devices_path(),
+            serde_json::to_string(&json!([
+                {"name": "charlie", "secret": "aa".repeat(32), "deviceCert": me_cert.to_json()},
+                {"name": "bravo", "secret": "bb".repeat(32), "deviceCert": b_cert.to_json()},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let jroot = unique(&format!("{tag}-joined"));
+        let jstore = DeviceStore::open(&jroot);
+        jstore
+            .write_local_device_cert_record(&json!({"name": "charlie", "cert": me_cert.to_json()}))
+            .unwrap();
+        (owner, ostore, jstore, oroot, jroot)
+    }
+
+    fn cleanup(a: PathBuf, b: PathBuf) {
+        let _ = std::fs::remove_dir_all(a);
+        let _ = std::fs::remove_dir_all(b);
+    }
+
+    #[test]
+    fn an_owner_grant_reaches_its_target_and_grants_only_what_it_says() {
+        let (owner, ostore, jstore, a, b) = fleet("happy");
+        let now = now_secs();
+        ostore.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        let blob = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        let j = jstore
+            .verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now)
+            .unwrap();
+        assert_eq!(j, GrantSetJudgement::Accept);
+        assert!(jstore.fleet_grant_held(&BRAVO, "shell", now));
+        assert!(!jstore.fleet_grant_held(&BRAVO, "mount", now), "no cap it does not list");
+        assert!(!jstore.fleet_grant_held(&[0x99; 32], "shell", now), "no third party");
+        assert!(!jstore.load_cap_store().iter().any(|_| true), "never written into the cap store");
+        cleanup(a, b);
+    }
+
+    #[test]
+    fn a_compromised_sibling_cannot_author_a_set() {
+        let (owner, _ostore, jstore, a, b) = fleet("forge");
+        let now = now_secs();
+        let sibling = UserKey::from_seed(&[0x42; 32]).unwrap();
+        let set = FleetGrantSet {
+            owner_pub: owner.public_key_bytes(), // claims to be the owner's
+            target_pub: ME,
+            epoch: 1,
+            valid_until: now + 600,
+            grants: vec![FleetGrant { subject_pub: BRAVO, cap: "shell".into(), expires: 0 }],
+        };
+        let mut blob = set.to_json();
+        blob["sig"] = json!(hex::encode(set.sign(sibling.keypair()).unwrap()));
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now).unwrap(),
+            GrantSetJudgement::Refuse(GrantSetRefusal::BadSignature)
+        );
+        // Honestly signed with its own key instead: another owner, refused.
+        let mut honest = set.clone();
+        honest.owner_pub = sibling.public_key_bytes();
+        let mut blob = honest.to_json();
+        blob["sig"] = json!(hex::encode(honest.sign(sibling.keypair()).unwrap()));
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now).unwrap(),
+            GrantSetJudgement::Refuse(GrantSetRefusal::OtherOwner)
+        );
+        assert!(!jstore.fleet_grant_held(&BRAVO, "shell", now));
+        cleanup(a, b);
+    }
+
+    #[test]
+    fn a_set_relayed_from_another_device_or_another_fleet_is_refused() {
+        let (owner, ostore, jstore, a, b) = fleet("relay");
+        let now = now_secs();
+        // A genuine owner set about BRAVO, relayed to charlie by bravo.
+        ostore.fleet_grant_add(&BRAVO, &ME, "shell", 0).unwrap();
+        let for_bravo = ostore.mint_fleet_grant_set(&owner, &BRAVO, now, 600).unwrap();
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&for_bravo, &owner.public_key_bytes(), &ME, now).unwrap(),
+            GrantSetJudgement::Refuse(GrantSetRefusal::OtherTarget)
+        );
+        // A genuine set from ANOTHER owner, about a device with our key bytes.
+        let other = UserKey::from_seed(&[0x43; 32]).unwrap();
+        let (_o2, o2store, _j2, a2, b2) = fleet("relay-other");
+        o2store.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        let foreign = o2store.mint_fleet_grant_set(&other, &ME, now, 600).unwrap();
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&foreign, &owner.public_key_bytes(), &ME, now).unwrap(),
+            GrantSetJudgement::Refuse(GrantSetRefusal::OtherOwner)
+        );
+        assert!(!jstore.fleet_grant_held(&BRAVO, "shell", now));
+        cleanup(a, b);
+        cleanup(a2, b2);
+    }
+
+    #[test]
+    fn replay_is_a_no_op_and_an_older_set_cannot_win_back_a_revoked_grant() {
+        let (owner, ostore, jstore, a, b) = fleet("replay");
+        let now = now_secs();
+        let op = owner.public_key_bytes();
+        ostore.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        let granted = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        assert_eq!(jstore.verify_and_store_fleet_grants(&granted, &op, &ME, now).unwrap(), GrantSetJudgement::Accept);
+        assert_eq!(jstore.verify_and_store_fleet_grants(&granted, &op, &ME, now).unwrap(), GrantSetJudgement::Stale);
+        // The owner withdraws it: a newer epoch without the grant.
+        assert!(ostore.fleet_grant_remove(&ME, &BRAVO, "shell").unwrap());
+        let withdrawn = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        assert!(withdrawn["epoch"].as_u64() > granted["epoch"].as_u64());
+        assert_eq!(jstore.verify_and_store_fleet_grants(&withdrawn, &op, &ME, now).unwrap(), GrantSetJudgement::Accept);
+        assert!(!jstore.fleet_grant_held(&BRAVO, "shell", now));
+        // A sibling replays the OLD set that still granted it: refused as stale.
+        assert_eq!(jstore.verify_and_store_fleet_grants(&granted, &op, &ME, now).unwrap(), GrantSetJudgement::Stale);
+        assert!(!jstore.fleet_grant_held(&BRAVO, "shell", now));
+        cleanup(a, b);
+    }
+
+    #[test]
+    fn an_expired_set_is_never_applied_and_a_held_one_lapses() {
+        let (owner, ostore, jstore, a, b) = fleet("expiry");
+        let now = now_secs();
+        let op = owner.public_key_bytes();
+        ostore.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        let blob = ostore.mint_fleet_grant_set(&owner, &ME, now, 60).unwrap();
+        let until = blob["valid_until"].as_u64().unwrap();
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&blob, &op, &ME, until).unwrap(),
+            GrantSetJudgement::Refuse(GrantSetRefusal::Expired)
+        );
+        assert_eq!(jstore.verify_and_store_fleet_grants(&blob, &op, &ME, now).unwrap(), GrantSetJudgement::Accept);
+        assert!(jstore.fleet_grant_held(&BRAVO, "shell", until - 1));
+        assert!(!jstore.fleet_grant_held(&BRAVO, "shell", until), "owner offline past validity: lapsed");
+        cleanup(a, b);
+    }
+
+    #[test]
+    fn a_revoked_subject_is_left_out_of_the_next_set() {
+        let (owner, ostore, jstore, a, b) = fleet("revoked");
+        let now = now_secs();
+        ostore.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        ostore
+            .with_devices_mut(|arr| {
+                for d in arr.iter_mut() {
+                    if d["name"] == "bravo" {
+                        d["certRevoked"] = json!(true);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        let blob = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        assert!(blob["grants"].as_array().unwrap().is_empty());
+        jstore.verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now).unwrap();
+        assert!(!jstore.fleet_grant_held(&BRAVO, "shell", now));
+        cleanup(a, b);
+    }
+
+    #[test]
+    fn a_tampered_held_file_grants_nothing() {
+        let (owner, ostore, jstore, a, b) = fleet("tamper");
+        let now = now_secs();
+        ostore.fleet_grant_add(&ME, &BRAVO, "transfer", 0).unwrap();
+        let blob = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        jstore.verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now).unwrap();
+        let p = jstore.root().join(FLEET_GRANTS_HELD_FILE);
+        let raw = std::fs::read_to_string(&p).unwrap().replace("\"transfer\"", "\"shell\"");
+        std::fs::write(&p, raw).unwrap();
+        assert!(!jstore.fleet_grant_held(&BRAVO, "shell", now));
+        assert!(!jstore.fleet_grant_held(&BRAVO, "transfer", now));
+        cleanup(a, b);
+    }
+
+    fn set_policy(store: &DeviceStore, v: &str) {
+        std::fs::write(store.root().join("config"), format!("name charlie\n{OWNER_GRANT_POLICY_STORE_KEY} {v}\n")).unwrap();
+    }
+
+    #[test]
+    fn under_the_default_files_policy_an_owner_shell_grant_is_held_but_not_applied() {
+        use filament_cap::fleet_grants::OwnerGrantPolicy;
+        let (owner, ostore, jstore, a, b) = fleet("pol-files");
+        let now = now_secs();
+        assert_eq!(jstore.owner_grant_policy(), OwnerGrantPolicy::Files, "no config: the default");
+        ostore.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        ostore.fleet_grant_add(&ME, &BRAVO, "mount", 0).unwrap();
+        let blob = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now).unwrap(),
+            GrantSetJudgement::Accept
+        );
+        assert!(jstore.fleet_grant_held(&BRAVO, "shell", now), "the signed set is kept whole");
+        assert!(!jstore.fleet_grant_applies(&BRAVO, "shell", now), "files: shell never applies");
+        assert!(jstore.fleet_grant_applies(&BRAVO, "mount", now), "files: mount applies");
+        assert_eq!(
+            jstore.fleet_grant_caps_split(&BRAVO, now),
+            (vec!["mount".to_string()], vec!["shell".to_string()])
+        );
+        cleanup(a, b);
+    }
+
+    #[test]
+    fn an_incoming_set_cannot_set_or_widen_the_local_owner_grant_policy() {
+        use filament_cap::fleet_grants::OwnerGrantPolicy;
+        let (owner, ostore, jstore, a, b) = fleet("pol-net");
+        let now = now_secs();
+        set_policy(&jstore, "files");
+        let cfg = jstore.root().join("config");
+        let before = std::fs::read(&cfg).unwrap();
+        // A genuine owner-signed set carrying shell, with every spelling of the
+        // setting a hostile or confused owner could add riding along. The
+        // signature covers the set's own fields only; nothing else is read.
+        ostore.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        let mut blob = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        blob["fleet.owner_grants"] = json!("all");
+        blob[OWNER_GRANT_POLICY_STORE_KEY] = json!("all");
+        blob["settings"] = json!({"fleet.owner_grants": "all", "fleet_owner_grants": "all"});
+        blob["policy"] = json!("all");
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now).unwrap(),
+            GrantSetJudgement::Accept
+        );
+        assert_eq!(std::fs::read(&cfg).unwrap(), before, "config untouched");
+        assert_eq!(jstore.owner_grant_policy(), OwnerGrantPolicy::Files);
+        assert!(!jstore.fleet_grant_applies(&BRAVO, "shell", now), "a set carrying shell is not applied under files");
+        // The other network paths that write local state: the fleet-policy
+        // relay (revocations only) and a roster. Neither touches the setting.
+        assert_eq!(jstore.merge_owner_cap_ops(&[json!({"fleet.owner_grants": "all"})]), 0);
+        assert_eq!(std::fs::read(&cfg).unwrap(), before);
+        // And where the device never set it, receiving sets does not create it.
+        let (owner2, ostore2, jstore2, a2, b2) = fleet("pol-net-none");
+        ostore2.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        let mut blob2 = ostore2.mint_fleet_grant_set(&owner2, &ME, now, 600).unwrap();
+        blob2["fleet.owner_grants"] = json!("all");
+        jstore2.verify_and_store_fleet_grants(&blob2, &owner2.public_key_bytes(), &ME, now).unwrap();
+        assert!(!jstore2.root().join("config").exists());
+        assert_eq!(jstore2.owner_grant_policy(), OwnerGrantPolicy::Files);
+        assert!(!jstore2.fleet_grant_applies(&BRAVO, "shell", now));
+        cleanup(a, b);
+        cleanup(a2, b2);
+    }
+
+    #[test]
+    fn under_off_every_owner_set_is_refused_and_nothing_is_kept() {
+        let (owner, ostore, jstore, a, b) = fleet("pol-off");
+        let now = now_secs();
+        set_policy(&jstore, "off");
+        ostore.fleet_grant_add(&ME, &BRAVO, "transfer", 0).unwrap();
+        ostore.fleet_grant_add(&ME, &BRAVO, "mount", 0).unwrap();
+        let blob = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now).unwrap(),
+            GrantSetJudgement::Refuse(GrantSetRefusal::OwnerGrantsOff)
+        );
+        assert!(!jstore.root().join(FLEET_GRANTS_HELD_FILE).exists());
+        for c in ["transfer", "mount", "shell"] {
+            assert!(!jstore.fleet_grant_applies(&BRAVO, c, now), "{c}");
+        }
+        cleanup(a, b);
+    }
+
+    #[test]
+    fn narrowing_the_policy_applies_at_once_to_a_set_already_held() {
+        let (owner, ostore, jstore, a, b) = fleet("pol-narrow");
+        let now = now_secs();
+        set_policy(&jstore, "all");
+        ostore.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        ostore.fleet_grant_add(&ME, &BRAVO, "mount", 0).unwrap();
+        let blob = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now).unwrap(),
+            GrantSetJudgement::Accept
+        );
+        assert!(jstore.fleet_grant_applies(&BRAVO, "shell", now), "all: shell applies");
+        // No new set arrives; only the local setting changes.
+        set_policy(&jstore, "files");
+        assert!(!jstore.fleet_grant_applies(&BRAVO, "shell", now), "files: shell stops at once");
+        assert!(jstore.fleet_grant_applies(&BRAVO, "mount", now));
+        set_policy(&jstore, "off");
+        assert!(!jstore.fleet_grant_applies(&BRAVO, "mount", now), "off: the held set grants nothing");
+        assert!(!jstore.fleet_grant_applies(&BRAVO, "shell", now));
+        // An unreadable value is the narrowest, not the widest.
+        set_policy(&jstore, "everything");
+        assert!(!jstore.fleet_grant_applies(&BRAVO, "mount", now));
+        cleanup(a, b);
+    }
+
+    #[test]
+    fn the_network_relay_merges_revocations_only_never_grants() {
+        // The old `fleet-policy` relay was the capability store's one network
+        // write. A grant op signed by the owner must no longer enter it.
+        let owner = UserKey::from_seed(&[0x44; 32]).unwrap();
+        let root = unique("relay-merge");
+        let store = DeviceStore::open(&root).with_owner_pub(Some(owner.public_key_bytes()));
+        let mut op = filament_cap::capability::CapOp {
+            op: filament_cap::capability::CapOpKind::Grant,
+            grantor: owner.public_key_bytes(),
+            target_kind: 0x01,
+            target: BRAVO,
+            resource: "self".into(),
+            permissions: vec!["shell".into()],
+            expires: now_secs() + 3600,
+            issued_at: now_secs(),
+            version: 1,
+            sig: [0u8; 64],
+        };
+        op.sig = filament_cap::capability::sign_cap_op(&op, owner.keypair());
+        assert_eq!(store.merge_owner_cap_ops(&[op.to_json()]), 0);
+        assert!(store.load_cap_store().is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 }
