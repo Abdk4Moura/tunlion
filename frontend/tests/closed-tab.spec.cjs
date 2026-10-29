@@ -18,7 +18,8 @@
 // The relay runs with a long ping timeout (as the other browser gates do), so
 // the backstop cannot pass this gate: only an explicit departure can. A page
 // that dies without running pagehide at all (a killed renderer) is outside
-// what any explicit signal can cover; there the ping timeout still decides.
+// what any explicit signal can cover; there the relay's polling liveness rule
+// (polling, polling-liveness.spec.cjs) or the TCP close (websocket) decides.
 //
 //   node frontend/tests/closed-tab.spec.cjs        (from the repo root; needs frontend/dist)
 const { spawn } = require('child_process');

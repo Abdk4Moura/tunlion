@@ -6,7 +6,7 @@
 #
 # Gates:
 #   A  POSITIVE no-keys bootstrap — client has NO ssh keypair and NO ~/.ssh;
-#      `grant boxA shell` on the acceptor, then `tunlion ssh boxB 'hostname'`
+#      `grant boxa shell` on the acceptor, then `tunlion ssh boxb 'hostname'`
 #      returns the acceptor's hostname. Full bootstrap: key gen + authorized_keys
 #      install + host-key pin + ssh, zero prompts.
 #   B  NEGATIVE no-cap refusal — a paired device WITHOUT the shell cap is REFUSED
@@ -86,13 +86,13 @@ ss -tlnp 2>/dev/null | grep -q ":$SSHD_PORT " || { echo "## sshd FAILED"; cat "$
 # --- two mutually-trusted devices: reciprocal pair secret ---
 DA="$WORK/A"; DB="$WORK/B"; mkdir -p "$DA" "$DB"
 SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
-printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
+printf '[{"name":"boxb","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
+printf '[{"name":"boxa","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
 # Acceptor (side B): HOME sandboxed; reports the throwaway hostkey; TUNLION_L2=1.
 B_DROP="$WORK/Bdrop"; mkdir -p "$B_DROP"
 start_acceptor() {
-  env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" TUNLION_L2=1 TUNLION_NAME=boxB \
+  env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" TUNLION_L2=1 TUNLION_NAME=boxb \
       TUNLION_SSH_HOSTKEY="$SSHD/hostkey.pub" USER="$USERNAME" \
       "$BIN" up --dir "$B_DROP" --server "$SERVER" >"$WORK/up.log" 2>&1 &
   pids+=($!)
@@ -103,7 +103,7 @@ sleep 3
 # Initiator env (side A). NO ssh keypair anywhere: config dir has only devices.json,
 # and HOME points at an empty dir with no ~/.ssh — proving zero pre-existing setup.
 AHOME="$WORK/Ahome"; mkdir -p "$AHOME"
-A_ENV=(env HOME="$AHOME" TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA \
+A_ENV=(env HOME="$AHOME" TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa \
        TUNLION_SSH_PORT="$SSHD_PORT" TUNLION_SSH_USER="$USERNAME")
 
 # Sanity: the client truly has no ssh key/known_hosts at the start.
@@ -113,7 +113,7 @@ A_ENV=(env HOME="$AHOME" TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA \
 # NEGATIVE: no shell cap granted yet. The bootstrap must be REFUSED and ssh must
 # NOT run. We run it BEFORE the grant so the deny path is clean.
 say B
-OUTB=$(timeout 45 "${A_ENV[@]}" "$BIN" --server "$SERVER" ssh boxB 'echo SHOULD-NOT-RUN; hostname' 2>"$WORK/sshB.err" </dev/null)
+OUTB=$(timeout 45 "${A_ENV[@]}" "$BIN" --server "$SERVER" ssh boxb 'echo SHOULD-NOT-RUN; hostname' 2>"$WORK/sshB.err" </dev/null)
 rcB=$?
 echo "## (no-cap) rc=$rcB out='$OUTB'"
 if [ "$rcB" != "0" ] \
@@ -127,18 +127,18 @@ else
 fi
 
 # ===================================================================== grant ===
-# Acceptor-side consent: grant boxA the shell cap. (Mutates devices.json; the
+# Acceptor-side consent: grant boxa the shell cap. (Mutates devices.json; the
 # running acceptor reads caps live from disk in the bootstrap arm.)
-env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
+env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxa shell >"$WORK/grant.log" 2>&1
 echo "## grant: $(cat "$WORK/grant.log")"
 grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "$DB/devices.json"; }
 
 # ===================================================================== GATE A ==
 # POSITIVE: with the cap granted and NO pre-existing ssh setup on the client,
-# `tunlion ssh boxB hostname` lands a shell and returns the acceptor's hostname.
+# `tunlion ssh boxb hostname` lands a shell and returns the acceptor's hostname.
 say A
 ACCEPTOR_HOST=$(hostname)
-OUTA=$(timeout 60 "${A_ENV[@]}" "$BIN" --server "$SERVER" ssh boxB 'hostname' 2>"$WORK/sshA.err" </dev/null)
+OUTA=$(timeout 60 "${A_ENV[@]}" "$BIN" --server "$SERVER" ssh boxb 'hostname' 2>"$WORK/sshA.err" </dev/null)
 rcA=$?
 echo "## (granted) rc=$rcA out='$OUTA' expect-host='$ACCEPTOR_HOST'"
 if [ "$rcA" = "0" ] && echo "$OUTA" | grep -qx "$ACCEPTOR_HOST"; then
@@ -152,10 +152,10 @@ fi
 # ===================================================================== GATE C ==
 # Marked + removable: the managed block is present after grant, gone after revoke.
 say C
-if grep -q "# BEGIN tunlion-managed boxA" "$AK" && grep -q "# END tunlion-managed boxA" "$AK"; then
-  env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "$BIN" revoke boxA shell >"$WORK/revoke.log" 2>&1
+if grep -q "# BEGIN tunlion-managed boxa" "$AK" && grep -q "# END tunlion-managed boxa" "$AK"; then
+  env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "$BIN" revoke boxa shell >"$WORK/revoke.log" 2>&1
   echo "## revoke: $(cat "$WORK/revoke.log")"
-  if ! grep -q "tunlion-managed boxA" "$AK"; then
+  if ! grep -q "tunlion-managed boxa" "$AK"; then
     ok "gateC: authorized_keys tunlion-managed block present after grant, removed by revoke"
   else
     echo "-- authorized_keys --"; cat "$AK"
@@ -174,9 +174,9 @@ fi
 say D
 KH="$DA/ssh/known_hosts"
 KEY="$DA/ssh/id_ed25519"
-HOST="tunlion-boxB"
+HOST="tunlion-boxb"
 if [ -f "$KH" ] && grep -q "^$HOST " "$KH"; then
-  # Re-install boxA's key directly (gate C just revoked it) so pubkey auth works
+  # Re-install boxa's key directly (gate C just revoked it) so pubkey auth works
   # for this isolated check; we are only testing the HOST-key pin here.
   cat "$KEY.pub" > "$AK"; chmod 600 "$AK"
   # Connect to 127.0.0.1 (the real sshd) but force the known_hosts lookup to use
@@ -208,29 +208,29 @@ fi
 # ASSERTION: warm ssh < 5s AND L3 path is exercised.
 say E
 
-# SYNTHETIC L3-DOWN REPRO: register boxB.mesh in /etc/hosts with a fake overlay
+# SYNTHETIC L3-DOWN REPRO: register boxb.mesh in /etc/hosts with a fake overlay
 # address so l3_mesh_addr() returns Some (the L3 path is triggered), but keep the
 # overlay DOWN so the revive path is exercised (same condition as popos/agboola).
 FAKE_L3_ADDR="fdf1:1af7:c30d:dead:beef::1"
-echo "$FAKE_L3_ADDR boxB.mesh" >> /etc/hosts
-cleanup_hosts() { sed -i "/$FAKE_L3_ADDR boxB\.mesh/d" /etc/hosts 2>/dev/null; }
+echo "$FAKE_L3_ADDR boxb.mesh" >> /etc/hosts
+cleanup_hosts() { sed -i "/$FAKE_L3_ADDR boxb\.mesh/d" /etc/hosts 2>/dev/null; }
 trap cleanup_hosts EXIT
 
-# Use the existing boxB setup (sshd already running, bootstrap cached).
+# Use the existing boxb setup (sshd already running, bootstrap cached).
 # The first ssh already cached bootstrap, so subsequent ones are warm.
 # Measure 3 ssh runs and assert median < 5s.
 SSH_TIMES=()
 L3_PATH_HIT=0
 for i in 1 2 3; do
   START_SSH=$(date +%s%N)
-  SSH_STDERR=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" ssh boxB 'echo SSH-CEILING-OK' 2>&1 </dev/null)
+  SSH_STDERR=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" ssh boxb 'echo SSH-CEILING-OK' 2>&1 </dev/null)
   rcS=$?
   END_SSH=$(date +%s%N)
   SSH_MS=$(( (END_SSH - START_SSH) / 1000000 ))
   SSH_TIMES+=($SSH_MS)
   echo "## ssh run $i: ${SSH_MS}ms (rc=$rcS)"
   # Check if L3 path was exercised
-  if echo "$SSH_STDERR" | grep -q "L3 overlay to 'boxB' down"; then
+  if echo "$SSH_STDERR" | grep -q "L3 overlay to 'boxb' down"; then
     L3_PATH_HIT=1
     echo "## L3 REVIVE PATH EXERCISED ✓"
   fi

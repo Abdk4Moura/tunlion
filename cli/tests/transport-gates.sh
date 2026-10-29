@@ -68,23 +68,23 @@ pair() {
   # successful transfer. The invitation flow is the supported non-interactive
   # ceremony; the owner's daemon must be UP or `join` only times out.
   # `add --for` needs an owner identity ("no identity. Run `tunlion init` first").
-  env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name boxA --recovery-file "$DA/rec.txt" --yes \
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name boxa --recovery-file "$DA/rec.txt" --yes \
       >"$WORK/pair-a-init.log" 2>&1 || { echo "init failed"; cat "$WORK/pair-a-init.log"; return 1; }
   env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$DDROP" \
       >"$WORK/pair-a-daemon.log" 2>&1 &
   PAIR_DAEMON=$!
   sleep 3
-  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for boxB \
+  env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for boxb \
       --out "$WORK/inv.txt" --yes >"$WORK/pair-a.log" 2>&1
   env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" \
-      --name boxB --no-interactive >"$WORK/pair-b.log" 2>&1
+      --name boxb --no-interactive >"$WORK/pair-b.log" 2>&1
   kill "$PAIR_DAEMON" 2>/dev/null; sleep 2
 }
 say "setup: pairing A<->B (bounded invitation + join)"
 pair
-if TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q 'boxB' \
+if TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q 'boxb' \
    && [ -s "$DB/devices.json" ]; then
-  ok "paired (A knows boxB by name)"
+  ok "paired (A knows boxb by name)"
 else
   bad "pairing setup"; tail -n 5 "$WORK/pair-a.log" "$WORK/pair-b.log"
   echo "RESULT: $PASS passed, $FAIL failed"; exit 1
@@ -99,7 +99,7 @@ DG="$WORK/g1drop"; mkdir -p "$DG"
 TUNLION_CONFIG_DIR="$DB" timeout 60 "$BIN" -v up --dir "$DG" --server "$SERVER" >"$WORK/g1-up.log" 2>&1 &
 UP=$!; pids+=($UP); sleep 3
 G1=0
-TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" -v send "$BIG" --to boxB --server "$SERVER" >"$WORK/g1-send.log" 2>&1 || G1=1
+TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" -v send "$BIG" --to boxb --server "$SERVER" >"$WORK/g1-send.log" 2>&1 || G1=1
 sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null
 GOT="$DG/big.bin"
 if [ $G1 -eq 0 ] \
@@ -133,11 +133,11 @@ DBX="$WORK/devBwrong"; cp -r "$DB" "$DBX"
 import json,sys
 p=sys.argv[1]; d=json.load(open(p))
 for e in d:
-    if e.get("name")=="boxA":
+    if e.get("name")=="boxa":
         # flip every hex nibble -> a valid-length but WRONG 64-hex secret
         e["secret"]="".join("0" if c!="0" else "f" for c in e["secret"])[:64]
 json.dump(d,open(p,"w"))
-print("tampered boxA secret")
+print("tampered boxa secret")
 PY
 DG2="$WORK/g2drop"; mkdir -p "$DG2"
 # B (wrong secret) receives; no -y, stdin from /dev/null => untrusted offer declined.
@@ -146,7 +146,7 @@ TUNLION_CONFIG_DIR="$DBX" TUNLION_REJOIN_SECS=4 timeout 45 \
 RP=$!; pids+=($RP); sleep 3
 # A (correct secret) tries to send.
 TUNLION_CONFIG_DIR="$DA" timeout 25 \
-  "$BIN" send "$SMALL" --to boxB --server "$SERVER" </dev/null >"$WORK/g2-send.log" 2>&1
+  "$BIN" send "$SMALL" --to boxb --server "$SERVER" </dev/null >"$WORK/g2-send.log" 2>&1
 sleep 2; kill $RP 2>/dev/null; wait $RP 2>/dev/null
 # zero bytes: no completed file in the drop dir
 BYTES=0; [ -f "$DG2/small.bin" ] && BYTES=$(stat -c%s "$DG2/small.bin" 2>/dev/null || echo 0)
@@ -173,7 +173,7 @@ TUNLION_CONFIG_DIR="$DB" TUNLION_DIRECT_TEST_BLOCK=1 timeout 90 \
 UP=$!; pids+=($UP); sleep 3
 G3=0
 TUNLION_CONFIG_DIR="$DA" TUNLION_DIRECT_TEST_BLOCK=1 timeout 75 \
-  "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$WORK/g3-send.log" 2>&1 || G3=1
+  "$BIN" send "$BIG" --to boxb --server "$SERVER" >"$WORK/g3-send.log" 2>&1 || G3=1
 sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null
 GOT3="$DG3/big.bin"
 if [ $G3 -eq 0 ] && [ -f "$GOT3" ] && [ "$(hashof "$GOT3")" = "$H_BIG" ] \

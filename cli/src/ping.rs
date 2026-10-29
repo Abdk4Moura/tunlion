@@ -179,6 +179,75 @@ pub async fn ping_cmd(
     }
 }
 
+/// `reach <sibling>`: a same-owner device this one never paired with.
+///
+/// A sibling's only link is the one the local `up` daemon formed on the fleet
+/// channel (admitted on the sibling's owner-signed certificate), so that link
+/// is the only thing to probe. Waits briefly for it, because a daemon that just
+/// started may still be meeting its siblings; never attempts a cold dial, which
+/// needs a pair secret a sibling does not have.
+pub async fn reach_sibling(peer: &str, json_out: bool, timeout: Option<u64>) -> Result<()> {
+    let budget = std::time::Duration::from_secs(timeout.unwrap_or(15).max(1));
+    let deadline = std::time::Instant::now() + budget;
+    if !json_out {
+        ui::say(&format!(
+            "{} {}",
+            ui::paint(Tone::Dim, "tunlion reach →"),
+            ui::paint(Tone::Brand, peer)
+        ));
+    }
+    let warm = loop {
+        // Portable: off Unix there is no control socket and this is `None`.
+        if let Some(v) = crate::ctl::try_ping(peer).await {
+            break Some(v);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+    match warm {
+        Some(v) if json_out => {
+            ui::json_out(&reach_json_warm(v));
+            Ok(())
+        }
+        Some(v) => {
+            print_warm_line(&v);
+            print_warm_verdict(peer, &v);
+            Ok(())
+        }
+        None => {
+            let running = crate::ctl::daemon_present().await;
+            let why = if running {
+                format!(
+                    "'{peer}' is in your mesh, but this device has no connection to it right now. \
+                     Sibling devices connect through the background service on both ends; check \
+                     that `tunlion up` is running on '{peer}'."
+                )
+            } else {
+                format!(
+                    "'{peer}' is in your mesh, and sibling devices connect through the background \
+                     service. Start it here with `tunlion up`."
+                )
+            };
+            let e = exit_codes::err(exit_codes::ExitKind::Unreachable, why);
+            if json_out {
+                let message = exit_codes::human_message(&e);
+                ui::json_out(&reach_json_cold(
+                    false,
+                    0,
+                    None,
+                    Some(&message),
+                    Some(exit_codes::ExitKind::Unreachable),
+                    None,
+                ));
+                return Err(exit_codes::reported(exit_codes::ExitKind::Unreachable));
+            }
+            Err(e)
+        }
+    }
+}
+
 /// `reach <device> --until-direct`: print one line per probe and stop as soon as
 /// the daemon's link to the peer stops being relayed (exit 0), or at the timeout
 /// (exit 5). It WATCHES the local `up` daemon's link rather than establishing one

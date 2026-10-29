@@ -639,6 +639,9 @@ pub(crate) async fn async_main() -> Result<()> {
         }
         crate::state_files::check_all()?;
     }
+    // Device names: a name given to a device takes the label rule, and a name
+    // that selects a device resolves to its stored spelling (device_names.rs).
+    let cmd = crate::device_names::canonicalize_cmd(cmd)?;
     match cmd {
         Cmd::Init {
             name,
@@ -990,11 +993,17 @@ pub(crate) async fn async_main() -> Result<()> {
                         // not routable.
                         ui::say(&crate::ui::paint(crate::ui::Tone::Warn, &note));
                     }
+                    for note in crate::l3_state::native_notes(&l3_status) {
+                        ui::say(&crate::ui::paint(crate::ui::Tone::Warn, &note));
+                    }
                 } else {
                     crate::outln!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
                     crate::outln!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
                     crate::outln!("  mesh:     {mesh_name}.mesh");
                     if let Some(note) = crate::l3_state::not_ready_note(&l3_status) {
+                        ui::say(&format!("  {}", ui::paint(ui::Tone::Warn, &note)));
+                    }
+                    for note in crate::l3_state::native_notes(&l3_status) {
                         ui::say(&format!("  {}", ui::paint(ui::Tone::Warn, &note)));
                     }
                     if let Some(p) = crate::proxy_state::current() {
@@ -1268,8 +1277,8 @@ pub(crate) async fn async_main() -> Result<()> {
                 && reuse.is_none() && out.is_none() && via.is_none()
             {
                 let choices = vec![
-                    "Another device I own".to_string(),
-                    "Someone else's device".to_string(),
+                    "Another device I own \u{b7} it becomes one of your devices".to_string(),
+                    "Someone else's device \u{b7} you send each other files".to_string(),
                     "Temporary access (folders, ports or a shell)".to_string(),
                 ];
                 match codeentry::pick("CONNECT", &choices)? {
@@ -1632,16 +1641,25 @@ pub(crate) async fn async_main() -> Result<()> {
                             ),
                             crate::roster::RosterStaleness::None => None,
                         };
-                        let rendered = fleet_ui::devices::render_devices(
+                        let rendered = fleet_ui::devices::render_devices_for(
                             &device_entries(warm.as_ref()),
                             pending_request_count(pending.as_ref()),
                             roster_heading,
+                            load_owner_key().is_some(),
                         );
                         crate::outln!("{rendered}");
                         // Read only: a device with no identity is told how to
                         // get one, and nothing is minted by looking.
                         if !crate::identity_flow::has_identity() {
-                            ui::say(&format!("  {}", crate::identity_flow::NO_IDENTITY_MSG));
+                            // Paired by code with no identity of its own: `init`
+                            // would make this device its OWN owner, the wrong
+                            // thing for a device that belongs to someone here.
+                            let line = if nothing_to_list {
+                                crate::identity_flow::NO_IDENTITY_MSG.to_string()
+                            } else {
+                                crate::identity_flow::paired_only_hint(&crate::display_name())
+                            };
+                            ui::say(&format!("  {line}"));
                         }
                         // The screen keeps its shape (the empty list on
                         // stdout, the hint above); the exit says why.
@@ -1950,30 +1968,18 @@ pub(crate) async fn async_main() -> Result<()> {
                 ),
                 Some(d) => {
                     require_known_device(&d)?;
-                    // A mesh sibling is a known NAME (via the owner's roster) but
-                    // carries no channel, so there is nothing to probe. Say so
-                    // honestly instead of reporting "may be offline" (#240/#241
-                    // shape) about a device this side has never contacted.
-                    let roster_only = crate::roster::roster_device_names().iter().any(|n| n == &d)
-                        && !devices_load().iter().any(|(n, _)| n == &d);
-                    if roster_only {
-                        // Human narration goes through ui::, not println!: this is
-                        // stderr for a person, and println! would put it on stdout
-                        // where a script parsing `reach` output would collect it.
-                        ui::say(&format!(
-                            "{} {}",
-                            ui::paint(ui::Tone::Dim, "tunlion reach →"),
-                            ui::paint(ui::Tone::Brand, &d)
-                        ));
-                        ui::say(&format!(
-                            "  {} {}",
-                            ui::paint(ui::Tone::Brand, ui::glyph_mesh()),
-                            ui::paint(
-                                ui::Tone::Dim,
-                                "in your mesh via the owner's roster; sibling connections are not in this release"
-                            )
-                        ));
-                        return Ok(());
+                    // A mesh sibling (certified by the same owner key, never
+                    // paired here) has no pair channel to dial: its link is the
+                    // one the daemon formed on the fleet channel, admitted on
+                    // its certificate. So reach asks the daemon about THAT link
+                    // instead of attempting a cold dial that cannot work.
+                    let sibling = !devices_load().iter().any(|(n, _)| n == &d)
+                        && (crate::fleet_indexed_name(&d)
+                            || crate::roster::roster_device_names().iter().any(|n| n == &d));
+                    if sibling && !until_direct {
+                        // `--until-direct` already watches the daemon's link,
+                        // which is the sibling's link, so it needs no branch.
+                        return crate::ping::reach_sibling(&d, json, timeout).await;
                     }
                     if until_direct {
                         crate::ping::reach_until_direct(&d, timeout.unwrap_or(30), json, relay).await

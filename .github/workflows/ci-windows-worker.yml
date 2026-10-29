@@ -1,0 +1,158 @@
+# A reusable Windows worker over tunlion: the Windows twin of ci-dogfood's
+# worker mode (the ci-worker-dovm-N Linux leases).
+#
+# The runner builds THIS ref's tunlion.exe (so a Windows fix can be exercised
+# on the binary under test), joins the owner's fleet with a bounded invitation
+# from the TUNLION_CI_WINDOWS_WORKER_INVITE secret (the owner names the device
+# when minting, e.g. ci-worker-win-N), and serves with `--shell-only <host>`:
+# one trusted caller, no sshd, no tunnel service, the Actions sandbox only. It
+# then holds for the lease, so the owner can reuse one warm box:
+#
+#   TUNLION_NO_WARM_REUSE=1 tunlion exec ci-worker-win-N -- powershell -NoProfile -Command '...'
+#
+# The worker's own daemon runs the USERSPACE overlay with its own config dir, so
+# the kernel adapter (tunlion0) and the default config stay free for whatever is
+# being tested on the box. Runners are disposable and already elevated; nothing
+# here changes privileges.
+#
+# Start a lease by pushing a ci/windows-worker* branch (a new workflow cannot be
+# dispatched until it is on main) or, once merged, by dispatch. End it early by
+# creating %TUNLION_WORKER_ROOT%\STOP over exec.
+name: ci-windows-worker
+
+on:
+  push:
+    branches: ["ci/windows-worker*"]
+  workflow_dispatch:
+    inputs:
+      host_name:
+        description: "Owner device allowed to open a shell here"
+        required: true
+        default: "dovm"
+      worker_minutes:
+        description: "Lease length, 1-330 minutes"
+        required: true
+        default: "180"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-windows-worker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    uses: ./.github/workflows/changes.yml
+
+  worker:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      HOST_NAME: ${{ inputs.host_name || 'dovm' }}
+      WORKER_MINUTES: ${{ inputs.worker_minutes || '180' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target
+          key: ci-windows-worker-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: ci-windows-worker-
+
+      - name: Build this ref's tunlion.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:TUNLION_BUILD_SHA = "${{ github.sha }}".Substring(0,7)
+          cargo build --locked -p filament-cli --bin tunlion
+          if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target
+          key: ci-windows-worker-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+
+      - name: Install it with a signature-checked Wintun
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = Join-Path $env:RUNNER_TEMP 'bin'
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          Copy-Item target/debug/tunlion.exe $bin
+          $zip = Join-Path $env:RUNNER_TEMP 'wintun.zip'
+          Invoke-WebRequest 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $zip
+          $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51') { throw "wintun sha256 $h" }
+          Expand-Archive $zip (Join-Path $env:RUNNER_TEMP 'wintun') -Force
+          $dll = Join-Path $env:RUNNER_TEMP 'wintun\wintun\bin\amd64\wintun.dll'
+          $sig = Get-AuthenticodeSignature $dll
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'WireGuard LLC') { throw "wintun signature $($sig.Status)" }
+          Copy-Item $dll $bin
+          & (Join-Path $bin 'tunlion.exe') --version
+          "$bin" | Out-File -Append $env:GITHUB_PATH
+
+      - name: Join the fleet and serve (shell for one host only)
+        shell: pwsh
+        env:
+          # From the environment, never argv or a file the job writes.
+          TUNLION_AUTHKEY: ${{ secrets.TUNLION_CI_WINDOWS_WORKER_INVITE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:TUNLION_AUTHKEY) { throw 'TUNLION_CI_WINDOWS_WORKER_INVITE is not set' }
+          $minutes = [int]$env:WORKER_MINUTES
+          if ($minutes -lt 1 -or $minutes -gt 330) { throw 'worker_minutes must be 1-330' }
+          $root = Join-Path $env:RUNNER_TEMP 'tunlion-work'
+          $cfg = Join-Path $env:RUNNER_TEMP 'tunlion-worker-config'
+          New-Item -ItemType Directory -Force -Path $root, $cfg, (Join-Path $root 'jobs') | Out-Null
+          "TUNLION_WORKER_ROOT=$root" | Out-File -Append $env:GITHUB_ENV
+          "TUNLION_WORKER_CONFIG=$cfg" | Out-File -Append $env:GITHUB_ENV
+          # Read by a job over exec: the worker's paths and its warm target.
+          @(
+            "`$env:TUNLION_WORKER_ROOT = '$root'"
+            "`$env:CARGO_TARGET_DIR = '$env:GITHUB_WORKSPACE\target'"
+            "`$env:TUNLION_WORKER_SRC = '$env:GITHUB_WORKSPACE'"
+          ) | Set-Content (Join-Path $root 'worker.env.ps1')
+          $env:TUNLION_CONFIG_DIR = $cfg
+          # Output to files, not this step's pipes: an older tunlion's detached
+          # daemon inherits a captured stdout and the step would never end.
+          $out = Join-Path $root 'up.out'; $err = Join-Path $root 'up.err'
+          $p = Start-Process -FilePath tunlion.exe -NoNewWindow -Wait -PassThru `
+            -ArgumentList @('up', '--detach', '--userspace', '--dir', (Join-Path $root 'inbox'), '--shell-only', $env:HOST_NAME, '--i-know', '--no-interactive') `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+          Get-Content $out, $err -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "up --detach exited $($p.ExitCode)" }
+          for ($i = 0; $i -lt 30; $i++) {
+            $null = & tunlion.exe status --json 2>$null
+            if ($LASTEXITCODE -eq 0) { break }
+            Start-Sleep -Seconds 1
+          }
+          & tunlion.exe id 2>&1 | Select-Object -First 3
+
+      - name: Hold the lease
+        shell: pwsh
+        run: |
+          $end = (Get-Date).AddMinutes([int]$env:WORKER_MINUTES)
+          "worker root: $env:TUNLION_WORKER_ROOT" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "caller: $env:HOST_NAME; lease: $env:WORKER_MINUTES minutes" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          while ((Get-Date) -lt $end) {
+            if (Test-Path (Join-Path $env:TUNLION_WORKER_ROOT 'STOP')) { Write-Host 'STOP requested'; break }
+            Start-Sleep -Seconds 10
+          }
+
+      - name: Leave the mesh
+        if: always()
+        shell: pwsh
+        run: |
+          $env:TUNLION_CONFIG_DIR = $env:TUNLION_WORKER_CONFIG
+          if ($env:TUNLION_CONFIG_DIR) { & tunlion.exe depart 2>&1 | Out-Host; & tunlion.exe down -y 2>&1 | Out-Host }

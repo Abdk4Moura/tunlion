@@ -365,6 +365,20 @@ impl Link {
     /// grants it", as strongly as a pair MAC does. Deliberately NOT written
     /// into `trusted`, which also drives transfer auto-accept, vouching and the
     /// blanket `--shell` policy.
+    /// Is this a fleet SIBLING link: certificate-admitted over the fleet channel
+    /// (or a meeting place a verified sibling brokered), and NOT pair-proven?
+    ///
+    /// The principal kind alone does not say so. A verified `fleet-hello` also
+    /// arrives over the owner's own PAIR link, and the hello arm admits that
+    /// link with the fleet principal too. Rules written for siblings (the
+    /// cut-on-revocation sweep, the transfer scope) must not touch a paired
+    /// link, whose authorization is its pair secret: treating it as a sibling
+    /// ended a delegated guest's held exec as "revoked" instead of "expired".
+    /// `trusted` is the pair-proof flag, which a sibling link never sets.
+    pub fn is_sibling_link(&self) -> bool {
+        matches!(&self.principal_kind, PrincipalKind::FleetDevice) && !self.trusted
+    }
+
     pub fn fleet_proven(&self) -> bool {
         // The rule lives in the crate (written once, shared with
         // `shell_gate::fleet_link_proven`); this is only the field extraction.

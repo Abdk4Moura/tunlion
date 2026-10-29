@@ -54,18 +54,18 @@ curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat
 DA="$WORK/A"; DB="$WORK/B"; mkdir -p "$DA" "$DB"
 SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 # A knows B; B knows A — same secret => same presence channel; proof verifies.
-printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
-printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
+printf '[{"name":"boxb","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
+printf '[{"name":"boxa","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
 # Start the acceptor (side B) ONCE; reused across gates. TUNLION_L2=1 opts in.
 B_DROP="$WORK/Bdrop"; mkdir -p "$B_DROP"
-TUNLION_CONFIG_DIR="$DB" TUNLION_L2=1 TUNLION_NAME=boxB \
+TUNLION_CONFIG_DIR="$DB" TUNLION_L2=1 TUNLION_NAME=boxb \
   "$BIN" up --dir "$B_DROP" --server "$SERVER" >"$WORK/up.log" 2>&1 &
 pids+=($!)
 # Give the daemon time to subscribe to A's presence channel.
 sleep 3
 
-A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA)
+A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa)
 
 # ===================================================================== gate 4 ==
 # Capability + SSRF deny. The acceptor must refuse a non-loopback dial target
@@ -77,7 +77,7 @@ A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA)
 # a link whose proof fails never gets `trusted=true` so its l2-open is denied
 # the same way.
 say 4
-TUNLION_L2_DIALHOST=8.8.8.8 timeout 25 "${A_ENV[@]}" "$BIN" netcat boxB 53 --server "$SERVER" </dev/null >"$WORK/g4.log" 2>&1 || true
+TUNLION_L2_DIALHOST=8.8.8.8 timeout 25 "${A_ENV[@]}" "$BIN" netcat boxb 53 --server "$SERVER" </dev/null >"$WORK/g4.log" 2>&1 || true
 if grep -q "non-loopback denied" "$WORK/up.log"; then
   ok "gate4: non-loopback dial refused (l2-close{non-loopback denied})"
 else
@@ -107,7 +107,7 @@ PY
 pids+=($!)
 sleep 1
 LPORT=9200
-"${A_ENV[@]}" "$BIN" forward $LPORT boxB $ECHO_PORT --server "$SERVER" >"$WORK/fwd.log" 2>&1 &
+"${A_ENV[@]}" "$BIN" forward $LPORT boxb $ECHO_PORT --server "$SERVER" >"$WORK/fwd.log" 2>&1 &
 FWD=$!; pids+=($!)
 for _ in $(seq 1 40); do grep -q "forwarding" "$WORK/fwd.log" && break; sleep 0.5; done
 sleep 2
@@ -162,12 +162,12 @@ pids+=($!)
 sleep 1
 ss -tlnp 2>/dev/null | grep -q ":$SSHD_PORT " || { echo "## sshd FAILED"; cat "$SSHD/sshd.log"; }
 
-# `tunlion ssh boxB <ssh-args>` -> ssh -o ProxyCommand="tunlion netcat boxB 22".
+# `tunlion ssh boxb <ssh-args>` -> ssh -o ProxyCommand="tunlion netcat boxb 22".
 # Our sshd listens on $SSHD_PORT, not 22, so we drive netcat directly via
 # ProxyCommand to that port (tunlion ssh hardcodes 22; for the gate we point a
 # custom ProxyCommand at our throwaway sshd to avoid needing real :22).
-PROXY="$BIN --server $SERVER netcat boxB $SSHD_PORT"
-OUT=$(TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA timeout 60 ssh \
+PROXY="$BIN --server $SERVER netcat boxb $SSHD_PORT"
+OUT=$(TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa timeout 60 ssh \
   -o ProxyCommand="$PROXY" \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o IdentitiesOnly=yes -i "$SSHD/id" -o BatchMode=yes \
@@ -209,7 +209,7 @@ sleep 1
 FIFO="$WORK/fifo"; mkfifo "$FIFO"
 ( exec 3>"$FIFO"; sleep 30 ) &  # holds the fifo writer open ~30s
 HOLDER=$!
-TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA timeout 30 "$BIN" netcat boxB $HOLD_PORT --server "$SERVER" <"$FIFO" >"$WORK/nc5.log" 2>&1 &
+TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa timeout 30 "$BIN" netcat boxb $HOLD_PORT --server "$SERVER" <"$FIFO" >"$WORK/nc5.log" 2>&1 &
 NC=$!
 sleep 4
 # Kill the initiator; the acceptor's stream must end cleanly (no hang/leak).
@@ -229,7 +229,7 @@ b=c.recv(65536); c.sendall(b); c.close()
 PY
   pids+=($!)
   sleep 1
-  echo -n "PING-AFTER-TEARDOWN" | timeout 25 "${A_ENV[@]}" "$BIN" netcat boxB 9401 --server "$SERVER" >"$WORK/after.out" 2>/dev/null
+  echo -n "PING-AFTER-TEARDOWN" | timeout 25 "${A_ENV[@]}" "$BIN" netcat boxb 9401 --server "$SERVER" >"$WORK/after.out" 2>/dev/null
   if grep -q "PING-AFTER-TEARDOWN" "$WORK/after.out" 2>/dev/null; then
     ok "gate5: teardown — initiator killed, acceptor aborted the stream and stayed live (no hang)"
   else

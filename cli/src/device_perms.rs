@@ -174,12 +174,13 @@ pub(crate) fn perms_for(
         DeviceTier::External => "EXTERNAL",
         DeviceTier::NeedsReview => "NEEDS REVIEW",
         DeviceTier::MeshRoster => "MESH",
+        DeviceTier::Paired => "PAIRED",
     };
     let state = record["principalState"].as_str();
     let mut caveats = Vec::new();
     match cert.as_ref() {
         None => caveats.push(format!(
-            "uncertified: pairing permissions only, not scoped by an owner key. If it is yours, run `tunlion add {name}` on the device you ran `tunlion init` on, and `tunlion join <code>` on {name}"
+            "uncertified: pairing permissions only, not yet one of your devices. If it is yours: `tunlion add {name}` on your owner device, then `tunlion join <code>` on {name}"
         )),
         Some(c) if c.expires <= now => caveats.push(format!("cert expired {}", when(c.expires, now))),
         Some(_) => {}

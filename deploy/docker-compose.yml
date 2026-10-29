@@ -45,6 +45,14 @@ services:
       # dropped and reconnect-storm. The liveness lease in signaling.py keeps
       # ghosts out of rosters, so a longer window is safe. Tests already use
       # 120/25 for exactly this reason.
+      #
+      # These no longer decide how long a dead LONG-POLLING client lingers
+      # (it used to be interval + timeout, about 85 s): signaling.PollWatch
+      # closes a polling socket that has had no GET for FIL_POLL_GRACE_S
+      # (default 7 s), answering a GET held FIL_POLL_HOLD_S (default 2 s) with
+      # a NOOP so a live client re-polls. A page that says it is hidden (a
+      # file picker) gets FIL_POLL_AWAY_S (180 s) instead, so the ping timeout
+      # rules it as before. Websocket deaths end on TCP close.
       FIL_PING_TIMEOUT: "60"
       FIL_PING_INTERVAL: "25"
       # The api is reachable ONLY through cloudflared (expose, not ports), so
@@ -121,20 +129,40 @@ services:
     network_mode: host
     volumes:
       - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./coturn/start.sh:/etc/coturn/start.sh:ro
       # TLS cert (Let's Encrypt for turn.filament.autumated.com) for turns: on 443.
       - ./coturn/cert.pem:/etc/coturn/cert.pem:ro
       - ./coturn/pkey.pem:/etc/coturn/pkey.pem:ro
-    # Secret/realm/IP come from .env so they live in exactly one place.
+    # The TURN secret must never be on the command line: argv is readable by
+    # every user on the host (`ps`, /proc/PID/cmdline) and `docker inspect`
+    # shows it as Cmd. Compose hands it in as a file instead (/run/secrets,
+    # owned by coturn's user, mode 0400, sourced from FIL_TURN_SECRET so .env
+    # stays the one place it lives and it stays equal to the api's), and
+    # start.sh renders turnserver.conf plus that line into a mode 600 file on
+    # this tmpfs, then execs turnserver -c on it.
+    secrets:
+      - source: turn_secret
+        uid: "65534"
+        gid: "65534"
+        mode: 0400
+    tmpfs:
+      - /run/coturn:uid=65534,gid=65534,mode=0700,size=1m
+    entrypoint: ["/bin/sh", "/etc/coturn/start.sh"]
+    # Realm/IP come from .env so they live in exactly one place; they are not
+    # secret, so they stay as flags.
     # listening-ip pins coturn to the PUBLIC address only (avoids clashing with
     # tailscale and the docker bridges). 443 serves TLS-TURN (turns:, via
     # tls-listening-port in turnserver.conf) + DTLS on UDP 443 — looks like HTTPS
     # so it passes strict/throttling mobile networks that RST plain TURN.
     command:
-      - -c
-      - /etc/coturn/turnserver.conf
-      - --static-auth-secret=${FIL_TURN_SECRET}
       - --realm=${TURN_REALM}
       - --external-ip=${DROPLET_IP}
       - --listening-ip=${DROPLET_IP}
     mem_limit: ${COTURN_MEM:-96m}
     cpus: ${COTURN_CPUS:-0.50}
+
+secrets:
+  # Read from FIL_TURN_SECRET (the .env value compose already interpolates);
+  # compose writes it into the container as a file, not an environment entry.
+  turn_secret:
+    environment: FIL_TURN_SECRET

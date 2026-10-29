@@ -74,7 +74,7 @@ pub use imp::{
 pub use stub::{
     daemon_present, daemon_responds, forward_probe, try_approve_request, try_cap_status,
     try_deny_request, try_fleet_rendezvous, try_list_pending, try_list_warm, try_ping,
-    try_reconfigure, try_revocation_sync, try_wake,
+    try_reconfigure, try_reload, try_revocation_sync, try_wake,
 };
 
 // --------------------------------------------------------------- unix impl ----
@@ -1080,6 +1080,12 @@ mod stub {
     /// revocation now; `None` makes the command say it applies within a few
     /// seconds (the daemon's own store scan) or at the next start.
     pub async fn try_revocation_sync() -> Option<Value> {
+        None
+    }
+
+    /// No control socket here, so no daemon can be asked to reload onto an
+    /// updated binary; `update` then prints how to restart it instead.
+    pub async fn try_reload() -> Option<Value> {
         None
     }
 
