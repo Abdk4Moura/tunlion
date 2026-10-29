@@ -1,6 +1,9 @@
 # Edge signaling — Cloudflare Workers + Durable Objects
 
 > Status: proposed. Design only; the Flask + Socket.IO backend remains the shipped implementation.
+> A Durable Object duplicate of the CURRENT protocol (socket.io, one hub, as
+> a failover behind a router) is built: see docs/cf-signaling.md. This page's
+> per-channel sharding and raw-WS protocol remain a proposal.
 
 **Status:** design. The one rearchitecture that fixes *speed*, *presence reliability*,
 and *scale* at once, because all three have the same root cause: a **single-origin

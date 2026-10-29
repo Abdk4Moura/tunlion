@@ -27,6 +27,11 @@ networking layer, the CLI, and any UI all depend on this and nothing else.
 A dumb relay. It tracks room membership and forwards opaque WebRTC payloads.
 Firebase mode mirrors these exact events client-side via Firestore.
 
+Two servers implement this section: the Flask relay (`backend/signaling.py`)
+and its Cloudflare Durable Object port (`edge/signal`, the failover duplicate,
+see `docs/cf-signaling.md`). `backend/conformance` runs one wire-level suite
+against both; a change here lands in both, with a conformance test.
+
 **client → server**
 - `join`   `{ room, name }`
 - `signal` `{ to, data }`  — relay `data` to peer whose id == `to`

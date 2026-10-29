@@ -1,0 +1,87 @@
+# Cloudflare duplicate of the tunlion signaling backend (see docs/cf-signaling.md).
+#
+# One script, two roles chosen by ORIGIN_URL:
+#   unset -> a complete signaling backend (REST in the Worker, sockets in SignalHub)
+#   set   -> the router: proxy to ORIGIN_URL while it is up, serve from here when down
+#
+# Secrets (never in this file; `wrangler secret put NAME --env ENV` from stdin):
+#   FIL_SECRET             must equal the VPS FIL_SECRET, or /api/room differs
+#   FIL_TURN_SECRET        coturn static-auth-secret (REST credentials)
+#   FIL_CF_TURN_API_TOKEN  Cloudflare Realtime TURN key token
+
+name = "tunlion-signal"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+workers_dev = false
+
+# Production is NOT deployed from this file by default: routes are added by
+# the owner at cutover (docs/cf-signaling.md, "Putting it in front").
+[vars]
+ROUTER_MODE = "auto"
+FIL_PING_INTERVAL = "25"
+FIL_PING_TIMEOUT = "60"
+
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "SignalHub"
+
+[[durable_objects.bindings]]
+name = "HEALTH"
+class_name = "HealthState"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SignalHub", "HealthState"]
+
+[observability]
+enabled = true
+
+# ---------------------------------------------------------------- staging --
+# Hub-only backend on workers.dev: the conformance and Playwright target.
+[env.staging]
+name = "tunlion-signal-staging"
+workers_dev = true
+vars = { ROUTER_MODE = "cf", FIL_PING_INTERVAL = "25", FIL_PING_TIMEOUT = "60", FIL_CLAIM_LIMIT = "200", FIL_PAIR_CREATE_LIMIT = "800" }
+durable_objects.bindings = [
+  { name = "HUB", class_name = "SignalHub" },
+  { name = "HEALTH", class_name = "HealthState" },
+]
+
+# Same code with small limits, for the rate-limit conformance tests only.
+[env.limits]
+name = "tunlion-signal-staging-limits"
+workers_dev = true
+vars = { ROUTER_MODE = "cf", FIL_PING_INTERVAL = "25", FIL_PING_TIMEOUT = "60", FIL_SESSION_CLAIM_LIMIT = "8", FIL_CLAIM_LIMIT = "3", FIL_CLOSE_LIMIT = "4" }
+durable_objects.bindings = [
+  { name = "HUB", class_name = "SignalHub" },
+  { name = "HEALTH", class_name = "HealthState" },
+]
+
+# Same code with the rate limits lifted, as in the 2026-10-26 VPS load test:
+# the hub load test (test/hub_loadgen.py, .github/workflows/hub-loadtest.yml)
+# drives thousands of devices from a handful of runner IPs.
+[env.loadtest]
+name = "tunlion-signal-loadtest"
+workers_dev = true
+vars = { ROUTER_MODE = "cf", FIL_PING_INTERVAL = "25", FIL_PING_TIMEOUT = "60", FIL_SESSION_CLAIM_LIMIT = "100000000", FIL_CLAIM_LIMIT = "100000000", FIL_PAIR_CREATE_LIMIT = "100000000", FIL_CLOSE_LIMIT = "100000000" }
+durable_objects.bindings = [
+  { name = "HUB", class_name = "SignalHub" },
+  { name = "HEALTH", class_name = "HealthState" },
+]
+
+# Router in front of a throwaway origin, for the failover drill (see
+# docs/cf-signaling.md). The route, ORIGIN_URL and KV id below were throwaway
+# resources, deleted after the 2026-10-28 drill; recreate before reuse. Same zone as
+# production (autumated.com) on purpose: a same-zone subrequest keeps the
+# client's CF-Connecting-IP, which the origin's rate limits and /api/room need.
+[env.drill]
+name = "tunlion-router-staging"
+workers_dev = true
+routes = [{ pattern = "sig-drill.autumated.com/*", zone_name = "autumated.com" }]
+vars = { ROUTER_MODE = "auto", ORIGIN_URL = "https://sig-drill-origin.autumated.com", FIL_PING_INTERVAL = "25", FIL_PING_TIMEOUT = "60", FIL_CLAIM_LIMIT = "200", FIL_PAIR_CREATE_LIMIT = "800" }
+triggers = { crons = ["* * * * *"] }
+kv_namespaces = [{ binding = "FLAGS", id = "cf84f2de4f524ac797706465bd412389" }]
+durable_objects.bindings = [
+  { name = "HUB", class_name = "SignalHub" },
+  { name = "HEALTH", class_name = "HealthState" },
+]
