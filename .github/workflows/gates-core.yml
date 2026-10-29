@@ -122,6 +122,25 @@ jobs:
       - name: Ratchet
         run: bash cli/tests/gates-ratchet.sh /tmp/gates.log
 
+      # A code pairing delivers each side's certificate or fails on both sides
+      # (identity-expose). Uses the test-hooks binary built above (the gates
+      # drop frames on purpose) and the 0.9.1 release for the mixed-version
+      # gates, pinned by digest as well as by the release's SHA256SUMS.
+      - name: Identity-expose gates (with the 0.9.1 release)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          old="$RUNNER_TEMP/tunlion-0.9.1"; mkdir -p "$old"
+          base=https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.1
+          asset=tunlion-x86_64-unknown-linux-musl.tar.gz
+          curl -fsSL -o "$old/$asset" "$base/$asset"
+          curl -fsSL -o "$old/SHA256SUMS" "$base/SHA256SUMS"
+          ( cd "$old" && grep " $asset\$" SHA256SUMS | sha256sum -c - \
+            && echo "d2a7c82902880b0ad3875cb47fd19837960b58681359c21075aaef63e07442b3  $asset" | sha256sum -c - \
+            && tar -xzf "$asset" )
+          TUNLION_BIN=target/debug/tunlion TUNLION_OLD_BIN="$(find "$old" -name tunlion -type f | head -1)" \
+            bash cli/tests/identity-expose-gates.sh
+
       - name: Preserve the run log
         if: always()
         uses: actions/upload-artifact@v4

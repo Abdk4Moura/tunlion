@@ -68,6 +68,7 @@ pub mod daemon_ctl;
 pub mod driver;
 pub mod download_output;
 pub mod exec_frame;
+pub mod expose;
 #[cfg(feature = "mount-server")]
 pub mod fs_at;
 pub mod handoff;

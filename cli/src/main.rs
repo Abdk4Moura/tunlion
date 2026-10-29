@@ -356,6 +356,20 @@ mod test_hooks {
     pub fn pair_stall() -> bool {
         std::env::var("TUNLION_TEST_PAIR_STALL").is_ok()
     }
+    /// identity-expose gates: drop the first N pairing identity-expose
+    /// frames this process would send (`all` drops every one), so the
+    /// re-send, and the honest failure when nothing arrives, run on a real
+    /// relay. Counts calls: each call is one send attempt.
+    pub fn drop_identity_expose() -> bool {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SENT: AtomicUsize = AtomicUsize::new(0);
+        let n = SENT.fetch_add(1, Ordering::Relaxed);
+        match std::env::var("TUNLION_TEST_DROP_IDENTITY_EXPOSE").ok().as_deref() {
+            Some("all") => true,
+            Some(v) => v.parse::<usize>().is_ok_and(|drop| n < drop),
+            None => false,
+        }
+    }
     /// P1: force every WebRTC link relay-only (models a hard-NAT peer).
     pub fn webrtc_relay_only() -> bool {
         std::env::var("TUNLION_TEST_WEBRTC_RELAY_ONLY").map(|v| v == "1").unwrap_or(false)
@@ -485,6 +499,7 @@ mod test_hooks {
 #[cfg(not(feature = "test-hooks"))]
 mod test_hooks {
     #[inline] pub fn pair_stall() -> bool { false }
+    #[inline] pub fn drop_identity_expose() -> bool { false }
     /// No stall in a build without test hooks: the send loop is untouched.
     #[inline] pub fn transfer_stall_ms() -> u64 { 0 }
     #[inline] pub fn webrtc_relay_only() -> bool { false }

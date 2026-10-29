@@ -390,6 +390,56 @@ single emit is load-bearing (C30):
 - A receiver that has authenticated its sender keeps that one ceremony to
   answer re-sends; it still ignores PAKE traffic from every other peer.
 
+### Pairing certificates (`identity-expose`, `identity-expose-ack`)
+After a code pairing's key confirmation, a side that holds a device
+certificate sends it to the other, sealed under the ceremony key with a
+possession signature over this session's confirmation MAC:
+`{ type:"identity-expose", v:2, nonce, sealed }`. Through 0.9.1 it went out
+once, unacknowledged, and the other side waited 5 s for it, so one lost frame
+left the device paired but uncertified while both sides reported success. The
+same lost-message class as the ceremony frames above, fixed the same way:
+
+- **Advertisement.** Every `pake-msg` and `pake-confirm` of a standing pairing
+  carries `expose_ack: 1` (this side acknowledges identity-expose) and, when
+  this side holds a certificate at the start, `exposes: true`. The
+  confirmation carries it too, so it is known by the time the peer's
+  confirmation verifies even if every element copy was lost. A temporary-access
+  ceremony carries neither (it refuses identity frames).
+- **Re-send.** Facing a peer that advertised `expose_ack`, the sender re-sends
+  the SAME frame (built once) at 250 ms, 500 ms, 1 s, then every 2 s until it
+  is acknowledged or the ceremony budget ends.
+- **Acknowledgement.** `{ type:"identity-expose-ack", v:1, nonce, sealed }`,
+  sealed under the ceremony key (`tunlion-identity-expose-ack-v1:` + the
+  acknowledged frame's nonce), so the relay can neither read which frame it
+  answers nor make one up. The receiver acknowledges every copy it ACCEPTED
+  (opened and verified), with the same acknowledgement: a duplicate is
+  harmless. A copy that could not be checked yet (no K, fingerprints unknown) is
+  not acknowledged; a later copy is checked. An acknowledgement is never
+  answered, and is sent only to a peer that advertised `expose_ack`.
+- **No success without it.** A side whose peer advertised `exposes: true` does
+  not report success until that certificate arrived and verified; a side that
+  sent its certificate to a peer that acknowledges does not report success until
+  it was acknowledged. Otherwise the pairing fails on that side, stores nothing
+  there, and says which: the certificate never arrived, did not verify (at once:
+  every copy is the same bytes), or was never confirmed received. With every
+  frame lost, both sides fail.
+- **Linger.** A side that acknowledged the peer's frame keeps answering re-sent
+  copies after it succeeded, until the peer leaves the room or no copy came for
+  2.2 s (wider than the largest re-send gap). The one outcome left: a copy lost
+  during that linger can leave the receiver paired with the certificate and the
+  sender reporting failure (it cannot know the certificate landed), never the
+  reverse.
+- A peer that does not advertise `expose_ack` (0.9.1, the browser) gets exactly
+  the old behaviour: one send, the 5 s window, never an acknowledgement. Against
+  a peer that does, a device certified during the ceremony (enrolment) does not
+  send its new certificate: the peer issued it and holds it.
+- The fields are advisory and ride the opaque relay like `handoff`; a relay that
+  strips them selects the old behaviour, which is no more than a relay that drops
+  the frame could always do. The certificate itself is authenticated by the seal
+  and the possession signature, never by these fields.
+- Model: `proofs/identity_expose_model.py` (every version mix, bounded loss,
+  with mutants including send-once).
+
 ### Post-PAKE promotion is make-before-break (`path-promote`)
 
 After the code ceremony confirms, both CLI ends race direct QUIC keyed by the

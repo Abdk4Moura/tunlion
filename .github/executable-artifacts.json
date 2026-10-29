@@ -53,6 +53,17 @@
       ]
     },
     {
+      "path": "cli/tests/identity-expose-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/debug/tunlion bash cli/tests/identity-expose-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/concurrent-code-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/concurrent-code-gates.sh",
@@ -884,6 +895,17 @@
       "path": "proofs/link_manager_model.py",
       "disposition": "required",
       "entrypoint": "python3 proofs/link_manager_model.py",
+      "matrix": [
+        {
+          "platform": "portable",
+          "topology": "model-checker"
+        }
+      ]
+    },
+    {
+      "path": "proofs/identity_expose_model.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/identity_expose_model.py",
       "matrix": [
         {
           "platform": "portable",
