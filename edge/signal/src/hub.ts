@@ -39,6 +39,8 @@ import { originAllowed, type Env } from "./shared";
 
 const SEP = "\x1e"; // engine.io v4 polling payload record separator
 const SWEEP_EVERY_MS = 5 * 60 * 1000;
+/** Websocket pings go out in at most this many slices per interval (one a second at 25 s). */
+const PING_SLICES_MAX = 25;
 
 /** What a hibernatable websocket carries across hibernation (< 2 KiB). */
 interface WsAttachment {
@@ -98,6 +100,7 @@ export class SignalHub extends DurableObject<Env> {
   private createLimiter: MemLimiter;
   private closeLimiter: MemLimiter;
   private nextSweep = 0;
+  private pingGen = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -564,8 +567,49 @@ export class SignalHub extends DurableObject<Env> {
 
   async alarm() {
     const now = Date.now();
+    // Websocket pings are spread over the interval, one slice a second, not
+    // sent to every socket at once. python-engineio pings each socket on its
+    // own timer, so its pongs arrive spread out; one alarm pinging N sockets
+    // brings N pongs back inside one round trip, and the hub load test
+    // (docs/cf-signaling.md, "Hub load test") showed that burst closing the
+    // whole population with 1013 at 4,000 devices. Each socket is still
+    // checked and pinged once per interval. The slices run on in-memory
+    // timers, so this is still one alarm (one billed request) per interval.
+    const sockets = this.ctx.getWebSockets();
+    const slices = Math.max(1, Math.min(PING_SLICES_MAX, Math.floor(this.ping.interval)));
+    const per = Math.ceil(sockets.length / slices);
+    const gen = ++this.pingGen;
+    this.pingSlice(sockets, 0, per);
+    for (let k = 1; k < slices && k * per < sockets.length; k++) {
+      setTimeout(() => {
+        if (gen === this.pingGen) this.pingSlice(sockets, k * per, per);
+      }, (k * this.ping.interval * 1000) / slices);
+    }
     const deadAfter = (this.ping.interval + this.ping.timeout) * 1000;
-    for (const ws of this.ctx.getWebSockets()) {
+    for (const sess of [...this.polls.values()]) {
+      if (now - sess.lastSeen > deadAfter && !sess.waiter) {
+        tel("ping-timeout", { sid: sess.sid });
+        this.dropPoll(sess);
+        this.transportGone(sess.sid, sess.eid, false);
+        continue;
+      }
+      this.pollPush(sess, "2");
+    }
+    if (now >= this.nextSweep) {
+      this.nextSweep = now + SWEEP_EVERY_MS;
+      this.sweepDead();
+    }
+    if (sockets.length || this.polls.size) {
+      await this.ctx.storage.setAlarm(Date.now() + this.ping.interval * 1000);
+    }
+  }
+
+  /** Ping-timeout check and ping for sockets[from, from + n). */
+  private pingSlice(sockets: WebSocket[], from: number, n: number) {
+    const now = Date.now();
+    const deadAfter = (this.ping.interval + this.ping.timeout) * 1000;
+    for (const ws of sockets.slice(from, from + n)) {
+      if (ws.readyState !== WebSocket.OPEN) continue; // closed since the alarm listed it
       const att = ws.deserializeAttachment() as WsAttachment | null;
       if (!att) continue;
       let seen = this.lastSeen.get(att.eid);
@@ -585,22 +629,6 @@ export class SignalHub extends DurableObject<Env> {
           ws.send("2");
         } catch {}
       }
-    }
-    for (const sess of [...this.polls.values()]) {
-      if (now - sess.lastSeen > deadAfter && !sess.waiter) {
-        tel("ping-timeout", { sid: sess.sid });
-        this.dropPoll(sess);
-        this.transportGone(sess.sid, sess.eid, false);
-        continue;
-      }
-      this.pollPush(sess, "2");
-    }
-    if (now >= this.nextSweep) {
-      this.nextSweep = now + SWEEP_EVERY_MS;
-      this.sweepDead();
-    }
-    if (this.ctx.getWebSockets().length || this.polls.size) {
-      await this.ctx.storage.setAlarm(Date.now() + this.ping.interval * 1000);
     }
   }
 
