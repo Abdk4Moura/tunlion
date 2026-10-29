@@ -51,17 +51,34 @@ pub fn init_verbosity(verbose: u8, quiet: bool) {
         }
     } else if !quiet && verbose == 0 {
         // No CLI override; check persistent setting.
-        match crate::settings::get_str("verbosity", None).as_deref() {
+        let level = match crate::settings::get_str("verbosity", None).as_deref() {
             Some("critical" | "crit" | "quiet" | "q") => Level::Critical,
             Some("info") => Level::Info,
             Some("debug" | "v") => Level::Debug,
             Some("trace" | "vv") => Level::Trace,
             _ => Level::Info, // default
+        };
+        if level >= Level::Debug {
+            DEBUG_FROM_SETTING.store(true, Ordering::Relaxed);
         }
+        level
     } else {
         resolve_from_flags(verbose, quiet)
     };
     VERBOSITY.store(level as u8, Ordering::Relaxed);
+}
+
+/// Set when debug output comes from the SAVED `verbosity` setting rather than
+/// a flag or `TUNLION_LOG` on this run, so it can be named instead of looking
+/// like internal lines leaking into normal output.
+static DEBUG_FROM_SETTING: AtomicBool = AtomicBool::new(false);
+
+/// The one dim line that says debug output is on because of a saved setting,
+/// and how to turn it off. None when it is not.
+pub fn saved_debug_note() -> Option<String> {
+    DEBUG_FROM_SETTING
+        .load(Ordering::Relaxed)
+        .then(|| paint(Tone::Dim, "  debug output is on for this device (saved setting); `tunlion set verbosity info` turns it off"))
 }
 
 fn resolve_from_flags(verbose: u8, quiet: bool) -> Level {

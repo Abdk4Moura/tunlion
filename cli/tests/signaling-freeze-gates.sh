@@ -102,15 +102,15 @@ hashof() { sha256sum "$1" | cut -d' ' -f1; }
 
 # ============================================================ fixture ==
 DA="$WORK/cfg-A"; DB="$WORK/cfg-B"; mkdir -p "$DA" "$DB" "$WORK/Adrop" "$WORK/Bdrop"
-env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name boxA --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1 \
+env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name boxa --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1 \
   || { echo "init failed"; exit 2; }
 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/A-up.log" 2>&1 &
 APID=$!; pids+=($APID)
 sleep 3
-env TUNLION_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for boxB --out "$WORK/inv.txt" --yes >"$WORK/add.log" 2>&1
-env TUNLION_CONFIG_DIR="$DB" timeout 45 "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" --name boxB --no-interactive >"$WORK/join.log" 2>&1
-if ! TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q boxB; then
-  echo "setup: boxB did not join"; tail -5 "$WORK/add.log" "$WORK/join.log"; exit 2
+env TUNLION_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for boxb --out "$WORK/inv.txt" --yes >"$WORK/add.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" timeout 45 "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" --name boxb --no-interactive >"$WORK/join.log" 2>&1
+if ! TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q boxb; then
+  echo "setup: boxb did not join"; tail -5 "$WORK/add.log" "$WORK/join.log"; exit 2
 fi
 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" up --dir "$WORK/Bdrop" >"$WORK/B-up.log" 2>&1 &
 BPID=$!; pids+=($BPID)
@@ -118,7 +118,7 @@ sleep 5
 
 send_ok() { # $1 = file, $2 = label
   local out rc
-  out=$(env TUNLION_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$1" --to boxB 2>&1); rc=$?
+  out=$(env TUNLION_CONFIG_DIR="$DA" timeout 90 "$BIN" --server "$SERVER" send "$1" --to boxb 2>&1); rc=$?
   echo "## $2: send rc=$rc"; echo "$out" | tail -4 | sed 's/^/    /'
   [ "$rc" = "0" ] && [ -f "$WORK/Bdrop/$(basename "$1")" ] \
     && [ "$(hashof "$1")" = "$(hashof "$WORK/Bdrop/$(basename "$1")")" ]
@@ -165,7 +165,7 @@ PY
   sleep 1
 done
 if [ -z "$held" ]; then
-  echo "REFUSED: B never held a link to boxA within 60s, so the freeze would not reproduce the finding"
+  echo "REFUSED: B never held a link to boxa within 60s, so the freeze would not reproduce the finding"
   tail -20 "$WORK/B-up.log"; tail -20 "$WORK/A-up.log"
   exit 2
 fi

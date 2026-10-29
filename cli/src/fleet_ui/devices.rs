@@ -29,12 +29,42 @@ pub enum DeviceTier {
     /// key, but no direct channel yet (sibling-to-sibling is not in v1). Liveness
     /// is unknown (#217), so the row must not assert online/idle/offline.
     MeshRoster,
+    /// This device has no identity of its own (it paired by code and never
+    /// joined anyone), so "other people" and "needs review" mean nothing here:
+    /// the honest word is paired.
+    Paired,
+}
+
+/// `render_devices_for` on the owner device.
+#[cfg(test)]
+pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize, roster_heading: Option<String>) -> String {
+    render_devices_for(devices, pending_requests, roster_heading, true)
 }
 
 /// Render the full device list. `roster_heading` is the already-honest heading
 /// for the mesh-roster section (epoch + when received, or the expired note);
 /// `Some` renders the section, `None` omits it.
-pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize, roster_heading: Option<String>) -> String {
+/// The one-line resolution under a NEEDS REVIEW row. `owner_here`: this
+/// device holds the owner key, so `add` here is the step that certifies.
+/// Pure.
+pub fn review_hint(name: &str, owner_here: bool) -> String {
+    let n = crate::refusal::word(name);
+    let add = if owner_here {
+        format!("`tunlion add {n}`")
+    } else {
+        format!("`tunlion add {n}` on your owner device")
+    };
+    format!("\u{21b3} yours? {add}, then `tunlion join <code>` on {n} \u{b7} not yours? keep it, or `tunlion devices forget {n}`")
+}
+
+/// Render the full device list. `owner_here` picks where the NEEDS REVIEW
+/// hint sends you (see `review_hint`).
+pub fn render_devices_for(
+    devices: &[DeviceEntry],
+    pending_requests: usize,
+    roster_heading: Option<String>,
+    owner_here: bool,
+) -> String {
     if devices.is_empty() && pending_requests == 0 && roster_heading.is_none() {
         return render_empty();
     }
@@ -95,27 +125,34 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize, roster_h
         lines.push(String::new());
     }
 
+    // Paired section: a device with no identity of its own.
+    let paired: Vec<_> = devices.iter().filter(|d| d.tier == DeviceTier::Paired).collect();
+    if !paired.is_empty() {
+        lines.push(format!(
+            "  {} {}",
+            ui::paint(Tone::Brand, ui::glyph_extern()),
+            ui::header(Tone::Bold, Tone::Dim, "PAIRED  /  you can send each other files")
+        ));
+        for d in &paired {
+            lines.push(render_device_row(d));
+        }
+        lines.push(String::new());
+    }
+
     // Needs-review section
     let review: Vec<_> = devices.iter().filter(|d| d.tier == DeviceTier::NeedsReview).collect();
     if !review.is_empty() {
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Warn, ui::glyph_review()),
-            ui::header(Tone::Warn, Tone::Dim, "NEEDS REVIEW  /  paired, but not certified by your owner key")
+            ui::header(Tone::Warn, Tone::Dim, "NEEDS REVIEW  /  paired, not yet one of your devices")
         ));
         for d in &review {
             lines.push(render_device_row(d));
-            // #240: was `↳ tunlion devices promote <name>`, a verb that does
-            // not exist, rendered as the prescribed next step.
-            // Eval item 7: "re-pair to scope it" named no command, and
-            // re-pairing the same way produces the same row. Name both
-            // resolutions exactly, one per answer to "whose is it".
-            lines.push(ui::paint(Tone::Dim, &format!(
-                "       ↳ yours: run `tunlion add {n}` on the device you ran `tunlion init` on, then `tunlion join <code>` on {n}",
-                n = d.name
-            )));
-            lines.push(ui::paint(Tone::Dim,
-                "       ↳ someone else's: leave it as a pairing, or `tunlion devices forget <name>` to remove it"));
+            // One line per device, both answers to "whose is it", each an exact
+            // command (#240: never a verb that does not exist; eval item 7:
+            // never "re-pair" with no command).
+            lines.push(ui::paint(Tone::Dim, &format!("       {}", review_hint(&d.name, owner_here))));
         }
         lines.push(String::new());
     }
@@ -141,6 +178,7 @@ fn render_device_row(d: &DeviceEntry) -> String {
         DeviceTier::External => ui::paint(Tone::Dim, ui::glyph_extern()),
         DeviceTier::NeedsReview => ui::paint(Tone::Warn, ui::glyph_review()),
         DeviceTier::MeshRoster => ui::paint(Tone::Brand, ui::glyph_mesh()),
+        DeviceTier::Paired => ui::paint(Tone::Brand, ui::glyph_extern()),
     };
     // #217 for the mesh: a sibling we have never contacted has UNKNOWN liveness,
     // never "idle"/"offline". The roster carries name + key only, so the row says
@@ -298,6 +336,33 @@ mod tests {
         assert!(s.contains("tunlion add old-laptop"), "must give the exact command: {s}");
         assert!(!s.contains("trusted in full"), "must not claim full trust: {s}");
         assert!(!s.contains("re-pair to scope it"), "a hint with no command: {s}");
+        // Owner report: two hint lines per device was a wall. One line, both answers.
+        let after_row: Vec<&str> = s.lines().skip_while(|l| !l.contains("old-laptop")).collect();
+        assert!(after_row[1].contains("yours?") && after_row[1].contains("not yours?"), "{s}");
+        assert!(after_row[1].contains("tunlion devices forget old-laptop"), "{s}");
+        assert!(!after_row.get(2).is_some_and(|l| l.contains("\u{21b3}")), "a second hint line: {s}");
+        // On a device without the owner key, `add` is sent to the owner device.
+        let member = render_devices_for(&devices, 0, None, false);
+        assert!(member.contains("on your owner device"), "{member}");
+        assert!(!s.contains("on your owner device"), "{s}");
+    }
+
+    /// Owner report: on a device with no identity, the owner that paired it
+    /// was filed under "EXTERNAL / other people, time-boxed, deny-by-default".
+    #[test]
+    fn a_device_with_no_identity_says_paired() {
+        let devices = vec![DeviceEntry {
+            name: "dovm".into(),
+            tier: DeviceTier::Paired,
+            online: Some(true),
+            caps_summary: "files".into(),
+            countdown: String::new(),
+            last_seen: Some("just now".into()),
+        }];
+        let s = ui::strip_ansi(&render_devices(&devices, 0, None));
+        assert!(s.contains("PAIRED  /  you can send each other files"), "{s}");
+        assert!(!s.contains("EXTERNAL") && !s.contains("other people"), "{s}");
+        assert!(s.contains("dovm"), "{s}");
     }
 
     #[test]

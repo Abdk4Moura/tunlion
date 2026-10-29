@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Warm-hold stability: two paired daemons on loopback whose PETNAMES differ
-# from their DISPLAY names (the normal case: petname `boxB`, display
-# `user@boxB-host`) must sit on one link and do nothing, while the peer device
+# from their DISPLAY names (the normal case: petname `boxb`, display
+# `user@boxb-host`) must sit on one link and do nothing, while the peer device
 # runs ordinary one-shot commands at them now and then. Standalone, hermetic,
 # fixture port 8131 ONLY.
 #
@@ -23,12 +23,12 @@
 # new sid on the shared pair channel under the SAME display name. Those sids
 # stayed in the roster forever, warm-hold looked them up by display name,
 # dialled the departed ones and tore down the live link. So during the window
-# B runs `reach boxA` and `send <file> --to boxA` every 30s, exactly the lab's
+# B runs `reach boxa` and `send <file> --to boxa` every 30s, exactly the lab's
 # probe loop minus exec (which needs a shell grant), and those round trips must
 # succeed quickly too.
 #
 # Gates (each line below is one PASS):
-#   setup     A holds a verified link to boxB, keyed by petname
+#   setup     A holds a verified link to boxb, keyed by petname
 #   instr     the instrument is present: warm-hold ran during the idle window
 #             and logged that it skipped the live link (debug logging is on),
 #             so the zero counts below are measurements, not silence
@@ -42,7 +42,7 @@
 #             under ONE pid (never torn down and rebuilt)
 #   traffic   every one-shot round from B during the window succeeded (reach
 #             ok, the file landed on A), each command within 15s
-#   rtt       a `reach boxB` round trip at the end succeeds within 10s
+#   rtt       a `reach boxb` round trip at the end succeeds within 10s
 #
 # WHY 180s. In the lab the first wrong establish fired 21s after the first
 # one-shot ghost appeared (warm ticks are 10s apart), and the re-dial cycle
@@ -70,14 +70,14 @@ start_backend
 
 mkdir -p "$DA" "$DB" "$WORK/Adrop" "$WORK/Bdrop"
 SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
-printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
+printf '[{"name":"boxb","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
+printf '[{"name":"boxa","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
 # Display names deliberately differ from the petnames each side stores.
-env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME="user@boxA-host" TUNLION_LOG=debug \
+env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME="user@boxa-host" TUNLION_LOG=debug \
   "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/upA.log" 2>&1 &
 FIX_PIDS+=($!)
-env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME="user@boxB-host" TUNLION_LOG=debug \
+env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME="user@boxb-host" TUNLION_LOG=debug \
   "$BIN" --server "$SERVER" up --dir "$WORK/Bdrop" >"$WORK/upB.log" 2>&1 &
 FIX_PIDS+=($!)
 
@@ -119,22 +119,22 @@ with open(out_path, "w") as out:
         time.sleep(max(0.0, 0.3 - (time.monotonic() - t0)))
 PY
 
-# --- setup: wait (bounded) for A to hold a verified link to boxB -------------
+# --- setup: wait (bounded) for A to hold a verified link to boxb -------------
 say "setup: link up under the petname"
 linked=0
 for _ in $(seq 1 60); do
-  if python3 "$WORK/probe.py" "$DA/control.sock" "$WORK/once.jsonl" 0.1 boxB 2>/dev/null \
+  if python3 "$WORK/probe.py" "$DA/control.sock" "$WORK/once.jsonl" 0.1 boxb 2>/dev/null \
      && grep -q '"pids": \["' "$WORK/once.jsonl"; then
     linked=1; break
   fi
   sleep 1
 done
 if [ "$linked" = 1 ]; then
-  ok "setup: A holds a verified link to petname boxB (display name user@boxB-host)"
+  ok "setup: A holds a verified link to petname boxb (display name user@boxb-host)"
 else
   echo "-- upA.log (tail) --"; tail -30 "$WORK/upA.log"
   echo "-- upB.log (tail) --"; tail -30 "$WORK/upB.log"
-  fixture_die "setup: A never held a link to boxB within 60s"
+  fixture_die "setup: A never held a link to boxb within 60s"
 fi
 # Let both ends settle (B's side of the link, the first warm ticks), then mark
 # where the idle window starts in each log.
@@ -143,9 +143,9 @@ LA0=$(wc -l <"$WORK/upA.log"); LB0=$(wc -l <"$WORK/upB.log")
 
 # --- idle window, probed ------------------------------------------------------
 say "idle ${IDLE_SECS}s, probing both control sockets every 0.3s"
-python3 "$WORK/probe.py" "$DA/control.sock" "$WORK/probeA.jsonl" "$IDLE_SECS" boxB &
+python3 "$WORK/probe.py" "$DA/control.sock" "$WORK/probeA.jsonl" "$IDLE_SECS" boxb &
 PA=$!
-python3 "$WORK/probe.py" "$DB/control.sock" "$WORK/probeB.jsonl" "$IDLE_SECS" boxA &
+python3 "$WORK/probe.py" "$DB/control.sock" "$WORK/probeB.jsonl" "$IDLE_SECS" boxa &
 PB=$!
 # The peer device's ordinary use: one-shot commands at A every 30s.
 cat >"$WORK/traffic.sh" <<'SH'
@@ -153,11 +153,11 @@ cat >"$WORK/traffic.sh" <<'SH'
 # $1 = rounds. Writes one line per command: "<tag> rc=<rc> ms=<ms>".
 for n in $(seq 1 "$1"); do
   t0=$(date +%s%N)
-  timeout 15 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach boxA --json </dev/null >"$WORK/traffic-reach-$n.out" 2>&1
+  timeout 15 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach boxa --json </dev/null >"$WORK/traffic-reach-$n.out" 2>&1
   rc=$?; t1=$(date +%s%N); echo "reach-$n rc=$rc ms=$(( (t1 - t0) / 1000000 ))"
   printf 'probe %s\n' "$n" >"$WORK/probe-$n.txt"
   t0=$(date +%s%N)
-  timeout 15 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" send "$WORK/probe-$n.txt" --to boxA </dev/null >"$WORK/traffic-send-$n.out" 2>&1
+  timeout 15 env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" send "$WORK/probe-$n.txt" --to boxa </dev/null >"$WORK/traffic-send-$n.out" 2>&1
   rc=$?; t1=$(date +%s%N); echo "send-$n rc=$rc ms=$(( (t1 - t0) / 1000000 ))"
   sleep 30
 done
@@ -175,10 +175,10 @@ idle_log "$WORK/upB.log" "$LB0" >"$WORK/idleB.log"
 count() { cat "$WORK/idleA.log" "$WORK/idleB.log" | grep -cE "$1" || true; }
 
 # --- instrument present -------------------------------------------------------
-skips=$(grep -c "warm-hold: skip 'boxB'" "$WORK/idleA.log" || true)
+skips=$(grep -c "warm-hold: skip 'boxb'" "$WORK/idleA.log" || true)
 min_skips=$(( IDLE_SECS / 10 - 3 ))
 if [ "$skips" -ge "$min_skips" ]; then
-  ok "instr: warm-hold ran on A and skipped the live link to boxB ($skips ticks, >= $min_skips)"
+  ok "instr: warm-hold ran on A and skipped the live link to boxb ($skips ticks, >= $min_skips)"
 else
   echo "-- idleA.log (warm-hold lines) --"; grep "warm-hold" "$WORK/idleA.log" | tail -20
   bad "instr: warm-hold skip lines on A: $skips, expected >= $min_skips (instrument absent or link not recognised)"
@@ -268,16 +268,16 @@ fi
 # --- a round trip at the end --------------------------------------------------
 say "round trip after idle"
 t0=$(date +%s%N)
-fs_cli 30 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" reach boxB
+fs_cli 30 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" reach boxb
 rc=$?
 t1=$(date +%s%N)
 ms=$(( (t1 - t0) / 1000000 ))
 fs_out
 if [ "$rc" = "0" ] && [ "$ms" -lt 10000 ]; then
-  ok "rtt: reach boxB succeeded in ${ms}ms after ${IDLE_SECS}s idle"
+  ok "rtt: reach boxb succeeded in ${ms}ms after ${IDLE_SECS}s idle"
 else
   tail -20 "$WORK/upA.log"
-  bad "rtt: reach boxB rc=$rc in ${ms}ms (want rc=0 within 10000ms)"
+  bad "rtt: reach boxb rc=$rc in ${ms}ms (want rc=0 within 10000ms)"
 fi
 
 declare_known_red_summary
