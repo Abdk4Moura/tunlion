@@ -273,6 +273,83 @@ deleted after the drill), `wrangler deploy --env drill`, and run the script
 with `ROUTER`, `ORIGIN_CMD_KILL`, `ORIGIN_CMD_START`. Delete the staging
 router afterwards: its cron keeps probing and spends free-tier requests.
 
+## Hub load test (staging, 2026-10-29)
+
+`edge/signal/test/hub_loadgen.py` drives `tunlion up`-shaped devices over
+the CLI's raw framing (no socket.io library), and `hub-loadtest.yml`
+(workflow_dispatch) runs it as a fleet of GitHub runners on one wall-clock
+schedule: the idle group ramps the steps, then holds the last one while the
+churn group runs pairing bursts on top. Each device joins a solo room,
+subscribes to two pair channels, and every 20 s sends a full `sync`, with a
+room-null heartbeat `sync` 10 s after it; with the 25 s ping that is 0.14
+messages a second per device. A pairing is the VPS test's: create, claim,
+join, offer and answer (~3 KB each), 4 ICE candidates each way. Target:
+`tunlion-signal-loadtest` (`[env.loadtest]`, rate limits lifted as in the
+VPS test). Nothing ran on the VPS beyond 20-device smokes. Raw rows and the
+Durable Object analytics are in
+`/root/pairing-ux/evidence/cf-signal/loadtest-20261029/`.
+
+Run 1 (run 40874481363, the hub as at `3a420bb1`, one alarm pinging every socket),
+4 idle runners and 2 churn runners. Latencies include about 70 ms of round
+trip from the runners to the object (the p50 floor):
+
+| devices | connects ok / failed | alive at end | dropped | sync p50 / p99 / max ms | heartbeat p99 ms | client msgs/s |
+|---|---|---|---|---|---|---|
+| 500 | 500 / 0 | 500 | 0 | 71 / 96 / 316 | 100 | 71 |
+| 1,000 | 1,000 / 0 | 1,000 | 0 | 72 / 152 / 435 | 146 | 141 |
+| 2,000 | 1,999 / 1 | 1,832 | 167 (abnormal close) | 72 / 180 / 1,581 | 331 | 260 |
+| 4,000 | 3,999 / 1 | 0 | 3,832 (518 with 1013, the rest abnormal) | 73 / 743 / 1,045 | 749 | collapsed |
+
+Durable Object analytics for the same minutes: at most 8.4 s of CPU a
+minute (14% of one core), at most 35 MB of memory, no exceededCpu, no
+exceededMemory. The hub was not short of CPU. What closed the population is
+the ping: one alarm sent "2" to every socket at once, so every pong came
+back inside one round trip, a burst of N inbound messages queued at a single
+object. At 1,000 that passed, at 2,000 it shed 8%, and at 4,000 the object
+closed everyone, 518 of them with 1013 (try again later). The VPS holds
+4,000 at p99 759 ms because python-engineio pings each socket on its own
+timer.
+
+Pairing churn, which in run 1 ran on an emptied hub because the idle
+population had already collapsed:
+
+| pairs/s | ok / started | signal p50 / p99 ms | setup p50 / p99 ms |
+|---|---|---|---|
+| 20 | 600 / 600 | 90 / 110 | 841 / 1,023 |
+| 40 | 1,200 / 1,200 | 103 / 192 | 909 / 1,249 |
+| 60 | 1,800 / 1,800 | 155 / 269 | 1,262 / 1,826 |
+| 80 | 841 / 2,400 (connect timeouts) | 191 / 361 | 1,602 / 3,186 |
+
+The 80 pairs/s step straddled the moment the account crossed the Free
+rows-written cap (below), so it does not show the hub's churn ceiling.
+
+The fix (`e4d7ad53`): the alarm still fires once per ping interval, but it
+pings the sockets in 25 slices, one a second, on in-memory timers; each
+socket is still checked and pinged once per interval, and it is still one
+billed alarm per interval. Conformance (all three transports and limits)
+passes with it in CI.
+
+Run 2 (run 40878097639, the fix deployed) measured nothing: every connect
+got 500, because the account had crossed the Free plan's 100k rows written
+per day in Durable Objects ("Exceeded allowed rows written in Durable
+Objects free tier", from `wrangler tail`). That cap is account wide, so the
+staging and limits workers answer 1101 until 00:00 UTC as well. Rerun the
+same dispatch after the reset, or once Workers Paid is active:
+
+```
+gh workflow run hub-loadtest.yml --ref feat/cf-signaling -f steps=500,1000,2000,4000 \
+  -f idle_shards=4 -f slot=180 -f ramp=60 -f final_hold=240 -f rates=20,40,60 \
+  -f churn_shards=2 -f dur=30 -f churn_delay=20
+```
+
+That is about 36k rows for the idle ramp and 27k for the churn, inside one
+Free day with nothing else running.
+
+Rows written, measured: about 9 rows per device connect (join, session,
+two channels, first sync) and about 15 per pairing. 100k rows a day is
+therefore about 11,000 device connects or 6,600 pairings, and a failover of
+4,000 daemons spends about 36k rows just reconnecting.
+
 ## Free plan fit
 
 Free plan limits (Workers and Durable Objects, per day): 100k Worker
@@ -295,7 +372,9 @@ only for probes.
 
 Rows: a refresh writes nothing; a session row is rewritten at most every 30
 minutes, so an always-on daemon is about 50 rows written a day plus one per
-join or leave. Reads come from memory, a few rows per claim.
+join or leave; the load test measured about 9 rows per
+connect and 15 per pairing ("Hub load test" above). Reads come from memory,
+a few rows per claim.
 
 What that means:
 
