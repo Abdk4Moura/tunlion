@@ -186,11 +186,12 @@ pub(crate) static STEPS: &[Step] = &[
         title: "Cut a device off",
         acts: &[
             Say("Lost a phone? Cut it off. It is refused from that moment, and its open sessions close within seconds."),
-            Run { on: "laptop", cmd: "tunlion devices revoke old-phone" },
-            Out("durably revoke old-phone (it will stop being recognized and cannot"),
-            Out("rejoin until restored)? [y/N] y"),
+            Run { on: "laptop", cmd: "tunlion demote old-phone --to cut" },
+            Out("cut off old-phone (refused on every connection until you promote it) [y/N] y"),
             Out("revoked 'old-phone'; it is denied on reconnect and a fresh invitation"),
-            Out("cannot revive it (only `tunlion devices restore old-phone` can)"),
+            Out("cannot revive it (only `tunlion promote old-phone` can)"),
+            Out("OK old-phone is now cut off  (was paired)"),
+            Out("   undo: tunlion promote old-phone --to paired"),
         ],
     },
     Step {

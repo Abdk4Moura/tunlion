@@ -506,7 +506,7 @@ pub(crate) fn delegated_device_state(
     // REVOCATION FIRST, before the principal-kind gate. Revoking is a decision
     // about a device, not about a principal kind, and it applies to any record we
     // hold. A fleet sibling is indexed WITHOUT a delegated principal, so gating
-    // this behind "delegated" meant `devices revoke <sibling>` succeeded, wrote
+    // this behind "delegated" meant `demote <sibling> --to cut` succeeded, wrote
     // certRevoked, correctly denied the device on reconnect, and then listed it
     // as perfectly healthy. A revocation you cannot see is one you cannot trust.
     if record["certRevoked"].as_bool() == Some(true)

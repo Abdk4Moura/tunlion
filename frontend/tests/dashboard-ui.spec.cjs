@@ -14,6 +14,8 @@
 //   7. a nav control cannot be reached with Tab or shows no focus ring;
 //   8. on a phone, the bottom nav targets are under 44 px;
 //   9. any screen shows an em dash;
+//  11. the device ladder does not mark the current rung, offers an illegal
+//      move, skips the confirm for a cut off, or omits the undo;
 //  10. a paired-but-uncertified device is not named "paired, not yet one of
 //      your devices" with the CLI's one-line fix, or a PAIRED row on a device
 //      with no identity is flagged as if it needed review.
@@ -54,6 +56,26 @@ function seed() {
       { name: 'old-phone', tier: 'EXTERNAL', caveats: [], caps: [] },
       { name: 'pop-os', tier: 'NEEDS REVIEW', caveats: ['uncertified: pairing permissions only, not yet one of your devices. If it is yours: `tunlion add pop-os` on your owner device, then `tunlion join <code>` on pop-os'], caps: [
         { action: 'transfer', resource: 'self', source: 'pairing', valid_until: null, effective: null }] },
+    ],
+    ladder: [
+      { name: 'web-vps', kind: 'mine', rung: 'shell', label: 'your device + shell',
+        rungs: [
+          { rung: 'cut', label: 'cut off', meaning: 'refused on every connection' },
+          { rung: 'paired', label: 'paired', meaning: 'you can send each other files; not one of your devices' },
+          { rung: 'device', label: 'your device', meaning: 'certified with your owner key: files and your shared folder' },
+          { rung: 'shell', label: 'your device + shell', meaning: 'can open a shell here: it can act as you' }],
+        moves: [
+          { to: 'device', label: 'your device', meaning: 'certified with your owner key: files and your shared folder', dir: 'demote', confirm: false, says: ['web-vps can no longer open a shell here'], needs_terminal: false, undo: 'tunlion promote web-vps' },
+          { to: 'cut', label: 'cut off', meaning: 'refused on every connection', dir: 'demote', confirm: true, says: ['web-vps is refused on every connection; its open sessions end'], needs_terminal: false, undo: 'tunlion promote web-vps --to shell' }] },
+      { name: 'pop-os', kind: 'mine', rung: 'paired', label: 'paired',
+        rungs: [
+          { rung: 'cut', label: 'cut off', meaning: 'refused on every connection' },
+          { rung: 'paired', label: 'paired', meaning: 'you can send each other files; not one of your devices' },
+          { rung: 'device', label: 'your device', meaning: 'certified with your owner key: files and your shared folder' },
+          { rung: 'shell', label: 'your device + shell', meaning: 'can open a shell here: it can act as you' }],
+        moves: [
+          { to: 'device', label: 'your device', meaning: '', dir: 'promote', confirm: false, says: [], needs_terminal: true, undo: 'tunlion demote pop-os' },
+          { to: 'cut', label: 'cut off', meaning: 'refused on every connection', dir: 'demote', confirm: true, says: ['pop-os is refused on every connection; its open sessions end'], needs_terminal: false, undo: 'tunlion promote pop-os --to paired' }] },
     ],
     requests: [{ id: 7, peer: 'jane-phone', capability: 'shell', ago: '3m ago' }],
     history: ['2026-10-14 07:13:37 web-vps opened a shell', '2026-10-14 08:15:02 received notes.txt from jane-phone'],
@@ -136,6 +158,30 @@ function startServer() {
   if (!(await p.getByText(/Applied on laptop/).count())) fail('a grant did not say it applied on this device');
   ok('Allow shell confirms first, then applies on this device');
   await shot('device'); await noEmDash('device page');
+
+  // 11. the ladder: the current rung is marked, only legal moves are offered,
+  // a confirm says what changes and the undo, and Yes sends the ladder verb.
+  await p.getByRole('button', { name: 'Devices and people', exact: true }).click();
+  await p.getByRole('button', { name: /web-vps/ }).first().click();
+  await p.getByTestId('ladder').waitFor();
+  if ((await p.getByTestId('rung-shell').getAttribute('data-current')) !== 'yes') fail('the ladder does not mark the current rung');
+  if (await p.getByTestId('move-shell').count()) fail('the current rung is offered as a move');
+  if (await p.getByTestId('move-paired').count()) fail('an illegal move (your device -> paired) is offered');
+  const n11 = state.acts.length;
+  await p.getByTestId('move-cut').click();
+  await p.getByTestId('ladder-confirm').waitFor();
+  if (state.acts.length !== n11) fail('a cut off on the ladder took effect without a confirm');
+  if (!(await p.getByTestId('ladder-confirm').getByText('Undo: tunlion promote web-vps --to shell').count())) fail('the ladder confirm does not name the undo');
+  await shot('ladder-confirm'); await noEmDash('ladder confirm');
+  await p.getByTestId('ladder-yes').click();
+  await p.waitForTimeout(300);
+  const la = state.acts[state.acts.length - 1];
+  if (!(la.verb === 'demote' && la.device === 'web-vps' && la.to === 'cut')) fail(`ladder sent ${JSON.stringify(la)}`);
+  await p.getByRole('button', { name: 'Devices and people', exact: true }).click();
+  await p.getByRole('button', { name: /pop-os/ }).first().click();
+  await p.getByTestId('ladder').waitFor();
+  if (!(await p.getByTestId('move-device').getByText(/tunlion promote pop-os/).count())) fail('the your-device move does not send the person to the terminal code step');
+  ok('the ladder marks the rung, offers only legal moves, confirms with the undo and sends demote --to cut');
 
   // 4. cut off an online device confirms
   await p.getByRole('button', { name: 'Devices and people', exact: true }).click();

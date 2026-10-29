@@ -3503,7 +3503,7 @@ async fn recv_run(
                     let _ = &unrouted;
                     let closed = doomed.len();
                     // Links to a device revoked IN PLACE stay up to carry the
-                    // refusal; count them so `devices revoke` can say so.
+                    // refusal; count them so `demote --to cut` can say so.
                     let refused = conn
                         .links
                         .values()
@@ -7154,7 +7154,18 @@ async fn recv_run(
                     let isec = v["secret"].as_str().unwrap_or_default().to_string();
                     let hub = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                     let hub_record = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                    // And only from a device of THIS device's own owner: from
+                    // someone else's device (or a plain pairing) an
+                    // introduction would add a device nobody here agreed to.
+                    let same_owner_hub = hub_record.as_deref().is_some_and(|h| {
+                        let records: Vec<Value> = std::fs::read_to_string(ports.store.devices_path())
+                            .ok()
+                            .and_then(|raw| serde_json::from_str(&raw).ok())
+                            .unwrap_or_default();
+                        crate::consent::intro_hub_is_same_owner(&records, h, ports.identity.owner_pub_for_resources())
+                    });
                     let may_vouch = trusted
+                        && same_owner_hub
                         && hub_record
                             .as_deref()
                             .is_some_and(|h| !ports.store.device_was_introduced(h));
@@ -7174,10 +7185,12 @@ async fn recv_run(
                         }
                     } else {
                         if !may_vouch {
-                            log.say(&log.paint(
-                                Tone::Warn,
-                                &format!("  ignored pair-intro from unverified peer {hub}"),
-                            ));
+                            let why = if trusted && !same_owner_hub {
+                                format!("  ignored an introduction from {hub}: it is not one of this device's owner's devices; pair with a code instead")
+                            } else {
+                                format!("  ignored pair-intro from unverified peer {hub}")
+                            };
+                            log.say(&log.paint(Tone::Warn, &why));
                         }
                         None
                     };

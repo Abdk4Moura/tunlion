@@ -401,7 +401,7 @@ pub(crate) fn verb_exit_codes(verb: &str) -> &'static [i32] {
         "up" => UP_CODES,
         "logs" => LOGS_CODES,
         "down" => DOWN_CODES,
-        "init" | "add" | "join" | "pair" | "depart" | "enroll" | "grant" | "revoke" => PAIRING_CODES,
+        "init" | "add" | "join" | "pair" | "depart" | "enroll" | "grant" | "revoke" | "promote" | "demote" => PAIRING_CODES,
         "set" | "addr" | "id" | "config" | "completions" | "man" => LOCAL_CODES,
         "skill" => SKILL_CODES,
         "demo" => DEMO_CODES,
