@@ -64,7 +64,7 @@ cleanup() {
   [ -f "$WORK/turn.pid" ] && run_root kill -9 "$(cat "$WORK/turn.pid")" 2>/dev/null
   run_root ip netns del "$NS" 2>/dev/null || true
   run_root ip link del "$H_IF" 2>/dev/null || true
-  for f in "$WORK"/*.log "$WORK"/squid/*.log; do [ -f "$f" ] && cp "$f" "$EVID/" 2>/dev/null; done
+  for f in "$WORK"/*.log "$WORK"/squid/*.log; do run_root cat "$f" >"$EVID/${f##*/}" 2>/dev/null; done
   rm -rf "$WORK/home-"* 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -93,12 +93,17 @@ nsx() { run_root ip netns exec "$NS" "$@"; }
 nsx iptables -F OUTPUT
 nsx iptables -A OUTPUT -o lo -j ACCEPT
 nsx iptables -A OUTPUT -p tcp -d "$H" --dport "$PPORT" -m comment --comment proxy -j ACCEPT
-# Replies on connections the proxy accepted.
-nsx iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 nsx iptables -A OUTPUT -p udp -m comment --comment udpdrop -j DROP
 nsx iptables -A OUTPUT -p tcp -m comment --comment tcpdrop -j DROP
 nsx iptables -A OUTPUT -m comment --comment otherdrop -j DROP
-counter() { nsx iptables -L OUTPUT -v -n -x | grep -F "/* $1 */" | awk '{s+=$1} END {print s+0}'; }
+# Inbound too: a sandbox is not reachable from outside. Without this the
+# owner's direct-QUIC dial INTO the namespace succeeds and the profile tests
+# "one side reachable" instead of "proxy only" (the first run did exactly that).
+nsx iptables -F INPUT
+nsx iptables -A INPUT -i lo -j ACCEPT
+nsx iptables -A INPUT -p tcp -s "$H" --sport "$PPORT" -j ACCEPT
+nsx iptables -A INPUT -m comment --comment indrop -j DROP
+counter() { nsx iptables -L -v -n -x | grep -F "/* $1 */" | awk '{s+=$1} END {print s+0}'; }
 
 # ------------------------------------------------------------ TLS for coturn
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=carrier gate CA" \
@@ -194,7 +199,6 @@ PIDS+=($!)
 sleep 4
 timeout 45 "${AENV[@]}" "$BIN" --server "$SERVER" add --for carrier-b --allow shell,transfer --out "$WORK/inv.txt" --yes \
   >"$WORK/add.log" 2>&1 || { echo "REFUSED: add failed"; tail "$WORK/add.log"; exit 2; }
-chmod 644 "$WORK/inv.txt"
 
 say "P1: join through the proxy"
 b_run 90 "$PROXY_URL" join --invite-file "$WORK/inv.txt" --name carrier-b --no-interactive -v \
@@ -238,12 +242,14 @@ if [ "$t" -eq 0 ] && [ "$p" -gt 0 ]; then ok "P5: every TCP connection went to t
 else bad "P5: $t direct TCP packet(s) beside the proxy (proxy=$p)" P5; fi
 
 say "P6: what squid carried"
-cp "$WORK/squid/access.log" "$EVID/squid-access.log" 2>/dev/null
-if grep -E "TCP_TUNNEL/200 .*CONNECT $H:443 " "$WORK/squid/access.log" >/dev/null; then ok "P6: squid tunnelled TLS to the relay on 443"
+# squid writes its log as its own user.
+run_root cat "$WORK/squid/access.log" >"$EVID/squid-access.log" 2>/dev/null
+SQLOG="$EVID/squid-access.log"
+if grep -E "TCP_TUNNEL/200 .*CONNECT $H:443 " "$SQLOG" >/dev/null; then ok "P6: squid tunnelled TLS to the relay on 443"
 else bad "P6: no CONNECT tunnel to $H:443 in squid's log" P6; fi
-if grep -E "TCP_TUNNEL/200 .*CONNECT $H:$PORT " "$WORK/squid/access.log" >/dev/null; then ok "P6: signaling went through a CONNECT tunnel"
+if grep -E "TCP_TUNNEL/200 .*CONNECT $H:$PORT " "$SQLOG" >/dev/null; then ok "P6: signaling went through a CONNECT tunnel"
 else bad "P6: no CONNECT tunnel to the signaling port" P6; fi
-if grep -E "/403 .*CONNECT $H:3478 " "$WORK/squid/access.log" >/dev/null; then ok "P6: TURN TCP 3478 was tried and refused by policy (TLS then went at once)"
+if grep -E "/403 .*CONNECT $H:3478 " "$SQLOG" >/dev/null; then ok "P6: TURN TCP 3478 was tried and refused by policy (TLS then went at once)"
 else note "P6: no refused CONNECT to 3478 (TCP TURN not tried through the proxy)"; fi
 
 say "P7: no credentials"

@@ -242,7 +242,10 @@ pub(crate) fn classify(e: &anyhow::Error) -> ExitKind {
 /// the whole chain, lowercased.
 pub(crate) fn is_network_text(s: &str) -> bool {
     let s = s.to_lowercase();
-    const PATTERNS: [&str; 14] = [
+    const PATTERNS: [&str; 16] = [
+        // filament-carrier and the REST client's 407: the proxy in the way.
+        "the proxy at ",
+        "cannot reach the proxy at ",
         "signaling connect to",
         "websocket connect to",
         "failed to lookup address",
@@ -717,6 +720,15 @@ mod tests {
         let m = human_message(&e);
         assert!(m.starts_with("Can't reach the tunlion server: the proxy at 10.0.0.1:3128 refused"), "{m}");
         assert!(m.contains("put credentials in the proxy URL") && !m.contains("DNS"), "{m}");
+        // The REST client's 407 alone (no signaling context) is a network
+        // failure with the same line.
+        let rest = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the proxy at 10.0.0.1:3128 refused to forward to http://x/api/room (407 Proxy Authentication Required): put credentials in the proxy URL (http://user:password@host:port)",
+        ))
+        .context("GET http://x/api/room");
+        assert_eq!(classify(&rest), ExitKind::Network);
+        assert!(human_message(&rest).starts_with("Can't reach the tunlion server: the proxy at 10.0.0.1:3128"));
         // Without a proxy cause the line is unchanged.
         let plain = anyhow::anyhow!("Connection refused").context("signaling connect to https://api.example");
         assert_eq!(human_message(&plain), NETWORK_LINE);
