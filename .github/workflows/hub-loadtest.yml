@@ -9,6 +9,12 @@ name: hub-loadtest
 # the runners are plain clients. See docs/cf-signaling.md, "Hub load test".
 
 on:
+  # The push trigger exists only so GitHub registers this workflow while it
+  # lives on a branch (dispatch needs a registered workflow); every job skips
+  # on it.
+  push:
+    branches: [feat/cf-signaling]
+    paths: [".github/workflows/hub-loadtest.yml"]
   workflow_dispatch:
     inputs:
       url:
@@ -53,6 +59,7 @@ permissions:
 
 jobs:
   plan:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
       t0: ${{ steps.p.outputs.t0 }}
