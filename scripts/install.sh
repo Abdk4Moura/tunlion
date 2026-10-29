@@ -1,5 +1,5 @@
 #!/bin/sh
-# tunlion installer — https://tunlion.autumated.com/install
+# tunlion installer: https://tunlion.autumated.com/install
 #
 #   curl -fsSL https://tunlion.autumated.com/install | sh
 #
@@ -43,7 +43,7 @@ ARCH=$(uname -m)
 case "$OS" in
   Linux)  case "$ARCH" in
             x86_64|amd64) TARGET="x86_64-unknown-linux-musl" ;;
-            *) die "no prebuilt binary for Linux/$ARCH yet — build from source: cargo install filament-cli" ;;
+            *) die "no prebuilt binary for Linux/$ARCH yet; build from source: cargo install filament-cli" ;;
           esac ;;
   Darwin) case "$ARCH" in
             arm64)  TARGET="aarch64-apple-darwin" ;;
@@ -66,7 +66,7 @@ trap 'rm -rf "$TMP"' EXIT
 # skipped unless the caller opts in with TUNLION_CHANNEL=beta. Fetch once.
 RELEASES=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=20") \
   || die "could not reach the GitHub releases API"
-# Highest version, NOT first listed — the API's order is not newest-tag-first
+# Highest version, NOT first listed: the API's order is not newest-tag-first
 # (observed live). sort -V orders 0.2.0 < 0.2.1-beta.1 < 0.2.1 correctly.
 pick_tag() { printf '%s\n' "$RELEASES" | grep -o "$1" | cut -d'"' -f4 | sort -V | tail -n 1; }
 
@@ -98,7 +98,7 @@ else
   die "need sha256sum or shasum to verify the download"
 fi
 WANT=$(grep "$ASSET" "$TMP/SHA256SUMS" | cut -d' ' -f1)
-[ "$GOT" = "$WANT" ] || die "checksum mismatch (got $GOT, want $WANT) — aborting"
+[ "$GOT" = "$WANT" ] || die "checksum mismatch (got $GOT, want $WANT), aborting"
 say "checksum verified"
 
 # ------------------------------------------------------------------- install
@@ -136,9 +136,9 @@ fi
 # PATH hint
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
-  *) say "note: $INSTALL_DIR is not on your PATH — add:  export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
+  *) say "note: $INSTALL_DIR is not on your PATH; add:  export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
 esac
 
 say ""
 say "try it:   tunlion send <file> --code"
-say "          (the other end can be a terminal — or any browser at https://tunlion.autumated.com)"
+say "          (the other end can be a terminal, or any browser at https://tunlion.autumated.com)"
