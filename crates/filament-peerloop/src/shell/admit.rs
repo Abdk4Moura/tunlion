@@ -1150,7 +1150,7 @@ mod tests {
         let l = conn.links.get_mut(PID).unwrap();
         if warm {
             l.trusted = false;
-            l.principal_kind = cap::PrincipalKind::FleetDevice;
+            l.principal_kind = cap::PrincipalKind::FleetSibling;
         } else {
             l.trusted = true;
             l.principal_kind = cap::PrincipalKind::OwnerDevice;
