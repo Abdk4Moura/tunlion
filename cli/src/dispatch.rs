@@ -990,11 +990,17 @@ pub(crate) async fn async_main() -> Result<()> {
                         // not routable.
                         ui::say(&crate::ui::paint(crate::ui::Tone::Warn, &note));
                     }
+                    for note in crate::l3_state::native_notes(&l3_status) {
+                        ui::say(&crate::ui::paint(crate::ui::Tone::Warn, &note));
+                    }
                 } else {
                     crate::outln!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
                     crate::outln!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
                     crate::outln!("  mesh:     {mesh_name}.mesh");
                     if let Some(note) = crate::l3_state::not_ready_note(&l3_status) {
+                        ui::say(&format!("  {}", ui::paint(ui::Tone::Warn, &note)));
+                    }
+                    for note in crate::l3_state::native_notes(&l3_status) {
                         ui::say(&format!("  {}", ui::paint(ui::Tone::Warn, &note)));
                     }
                     if let Some(p) = crate::proxy_state::current() {

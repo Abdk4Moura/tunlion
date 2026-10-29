@@ -95,7 +95,7 @@ async function main() {
     if (process.platform !== 'win32') fs.chmodSync(binaryPath(), 0o755)
     console.log(`tunlion: installed ${TAG} for ${tgt.t}`)
   } catch (e) {
-    console.error(`tunlion: install failed — ${e.message}`)
+    console.error(`tunlion: install failed: ${e.message}`)
     console.error('Install another way: https://tunlion.autumated.com  or  cargo install filament-cli')
     process.exit(1)
   } finally {
