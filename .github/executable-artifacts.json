@@ -20,6 +20,17 @@
       ]
     },
     {
+      "path": "cli/tests/carrier-proxy-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/carrier-proxy-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "linux-netns"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/config-scope-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/config-scope-gates.sh",
@@ -821,6 +832,17 @@
         {
           "platform": "portable",
           "topology": "unit"
+        }
+      ]
+    },
+    {
+      "path": "proofs/carrier_model.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/carrier_model.py",
+      "matrix": [
+        {
+          "platform": "portable",
+          "topology": "model-checker"
         }
       ]
     },

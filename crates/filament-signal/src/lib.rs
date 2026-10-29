@@ -22,6 +22,13 @@
 //!
 //! Anything this does not implement is an error rather than a silent no-op, so
 //! an unexpected server change surfaces as a failure instead of a hang.
+//!
+//! PROXIES. The websocket goes through an HTTP CONNECT proxy whenever the
+//! REST client would use one for the same URL (`filament-carrier`, which uses
+//! reqwest's own proxy matcher: `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
+//! `NO_PROXY`, and the macOS and Windows system settings). TLS runs end to end
+//! inside the tunnel. Before this, signaling dialled directly while the REST
+//! calls used the proxy, so behind a proxy pairing never started.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -105,9 +112,17 @@ pub struct Client {
     reader_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     stopping: Arc<Mutex<bool>>,
     stop_tx: watch::Sender<bool>,
+    /// How this connection reaches the server: "direct" or "proxy host:port".
+    carrier: Arc<str>,
 }
 
 impl Client {
+    /// How this connection reaches the server, for status and doctor:
+    /// `"direct"` or `"proxy host:port"` (never credentials).
+    pub fn carrier(&self) -> &str {
+        &self.carrier
+    }
+
     /// The id of the connection behind this handle, the same value its
     /// [`Incoming::Down`] carries when it ends.
     ///
@@ -214,6 +229,7 @@ impl Client {
                 reader_task: Arc::new(Mutex::new(None)),
                 stopping: Arc::new(Mutex::new(false)),
                 stop_tx: watch::channel(false).0,
+                carrier: "direct".into(),
             },
             far,
         ))
@@ -369,13 +385,39 @@ fn tls_config() -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
+/// Scheme, host and port of a websocket URL, for carrier selection.
+fn ws_target(url: &str) -> Result<(String, String, u16)> {
+    let u = url::Url::parse(url).with_context(|| format!("parse {url}"))?;
+    let host = u.host_str().ok_or_else(|| anyhow!("{url} has no host"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
+    let port = u.port_or_known_default().ok_or_else(|| anyhow!("{url} has no port"))?;
+    Ok((u.scheme().to_string(), host, port))
+}
+
 async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> Result<Client> {
     let url = ws_url(base_url)?;
     let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config()));
-    let (stream, _resp) =
+    // The same proxy rules as the REST client (filament-carrier). Without a
+    // proxy this is the websocket library's own dial, unchanged. Through a
+    // proxy the stream is a CONNECT tunnel and TLS runs end to end inside it,
+    // so the proxy sees only that a TLS connection went to this host.
+    let (scheme, host, port) = ws_target(&url)?;
+    let selected = filament_carrier::select(&scheme, &host, port);
+    let carrier: Arc<str> = selected.carrier.describe().into();
+    let (stream, _resp) = if selected.via_proxy() {
+        let tcp = selected
+            .carrier
+            .dial(&host, port, &filament_carrier::DialOpts::default())
+            .await
+            .with_context(|| format!("signaling connect to {host}:{port}"))?;
+        tokio_tungstenite::client_async_tls_with_config(&url, tcp, None, Some(connector))
+            .await
+            .with_context(|| format!("websocket connect to {url} through the {carrier}"))?
+    } else {
         tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector))
             .await
-            .with_context(|| format!("websocket connect to {url}"))?;
+            .with_context(|| format!("websocket connect to {url}"))?
+    };
     let (writer, mut reader) = stream.split();
     let writer: Writer = Arc::new(Mutex::new(Some(writer)));
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -443,11 +485,32 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
         reader_task: reader_task.clone(),
         stopping: stopping.clone(),
         stop_tx,
+        carrier,
     };
     *reader_task.lock().await = Some(tokio::spawn(read_loop(
         id, reader, writer, tx, pending, stopping, stop_rx,
     )));
     Ok(client)
+}
+
+/// The carrier `connect` would use for this signaling URL, without dialling.
+pub fn carrier_for(base_url: &str) -> Result<filament_carrier::Selected> {
+    let url = ws_url(base_url)?;
+    let (scheme, host, port) = ws_target(&url)?;
+    Ok(filament_carrier::select(&scheme, &host, port))
+}
+
+/// For `tunlion doctor`: complete a real Engine.IO and Socket.IO handshake, then
+/// disconnect. Returns the round trip in ms. Joins no room and emits nothing.
+pub async fn probe(base_url: &str, budget: std::time::Duration) -> Result<u64> {
+    let started = std::time::Instant::now();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let client = tokio::time::timeout(budget, connect(base_url, tx))
+        .await
+        .map_err(|_| anyhow!("no signaling handshake within {} ms", budget.as_millis()))??;
+    let ms = started.elapsed().as_millis() as u64;
+    let _ = client.disconnect().await;
+    Ok(ms)
 }
 
 /// Pump packets until the socket ends, then report why exactly once.
@@ -526,6 +589,9 @@ async fn read_loop(
 
 #[cfg(test)]
 mod tls_tests;
+
+#[cfg(test)]
+mod proxy_tests;
 
 #[cfg(test)]
 mod tests {

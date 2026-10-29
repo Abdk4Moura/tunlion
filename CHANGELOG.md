@@ -15,6 +15,16 @@ release build failed and nothing was published under it.
 
 ### Added
 
+- tunlion works where the only way out is an HTTP proxy (CI, corporate
+  networks, AI agent sandboxes). Signaling and the TURN relay now go through
+  the same proxy the REST calls already used (`HTTPS_PROXY`, `HTTP_PROXY`,
+  `ALL_PROXY`, `NO_PROXY`, and the macOS and Windows system proxy), as an HTTP
+  CONNECT tunnel with TLS end to end inside it, with Basic credentials from the
+  proxy URL. A relayed route then reads `relay (TURN over tls via proxy)`. A
+  proxy refusal is one line naming the proxy and what to change, not "no
+  internet or DNS?", and `tunlion doctor` lists every path it tried to
+  signaling and each relay, and over which carrier.
+
 - Devices certified by your owner key now reach each other without pairing.
   `tunlion reach <device>` works between two of your devices that were each
   added to your mesh but never paired with each other, over the link their

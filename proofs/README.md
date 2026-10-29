@@ -428,6 +428,25 @@ Mutants that must fail: `no-sig`, `no-target` (P1), `no-monotone` (P6),
 the first version of this model, because the use-time expiry check masked it;
 acceptance is now checked on the transition itself.
 
+## Companion: the carrier selection model
+
+`carrier_model.py` discharges the establishment proof's assumption A4 ("a path
+exists") for the carriers that exist (`docs/carriers.md`). It enumerates every
+pair of peer environments (UDP, direct TCP ports, a configured HTTP proxy and
+what it allows, inbound reachability, refusal versus silent drop, a
+TLS-inspecting proxy) against every subset of a censor blocking relay UDP, TCP,
+TLS or signaling, runs the selection the code implements (signaling through a
+configured proxy; `turn_bridge.rs` gate order and timers; direct QUIC only with
+UDP and one inbound side), and checks REACH within a bound, QUIET (no direct TCP
+beside a configured proxy), and LEAK (carriers see only ciphertext, a SPAKE2
+element and, behind an inspecting proxy, signaling metadata). `--self-test`
+requires each of five mutants to be caught by the property it breaks.
+
+```
+python3 carrier_model.py              # 230400 cases, worst 13 ticks (3.25 s), bound 14
+python3 carrier_model.py --self-test
+```
+
 ## Companion: the bootstrap card reference codec
 
 `card_vectors.py` is not a model checker; it is the other kind of evidence.

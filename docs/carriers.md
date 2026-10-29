@@ -229,29 +229,35 @@ OS trust store, and already falls back from websocket to polling
 ## 10. Proof and tests
 
 `proofs/carrier_model.py` discharges the assumption the establishment model
-states as A4 ("a path exists", `proofs/README.md`): it explores every
-combination of per-peer carrier availability and a censor that blocks carrier
-classes at rendezvous, runs the selector, and checks:
+states as A4 ("a path exists", `proofs/README.md`). It enumerates every pair of
+peer environments (UDP, direct TCP ports, a configured proxy and what it allows,
+inbound reachability, refusal versus silent drop, a TLS-inspecting proxy)
+against every subset of a censor blocking relay UDP, relay TCP, relay TLS or
+signaling: 230400 cases. The selector is deterministic given an environment,
+so that is exhaustive over its behaviours. It checks:
 
-- **reach**: if both peers have at least one unblocked carrier class to a
-  reachable signaling rendezvous, and to a reachable relay (or one side is
-  directly reachable), establishment succeeds within a bound fixed by the
-  tier gates;
-- **no leak by selection**: a carrier is only ever handed bytes that are
-  already encrypted end to end, or signaling TLS (the metadata caveat in
-  section 2 is modelled as an explicit observer, not assumed away).
+- **REACH**: if each peer has a usable class to signaling and (a direct path
+  exists, or each peer has a usable class to the relay), establishment
+  succeeds within a bound fixed by the tier gates (worst 3.25 s, bound 3.5 s).
+  "Usable" treats a configured proxy as the egress policy (section 5);
+- **QUIET**: with a proxy configured, no direct TCP attempt is ever made;
+- **LEAK**: what a carrier, proxy or relay observes is ciphertext, a SPAKE2
+  element, and, behind an inspecting proxy, signaling metadata (section 2).
+  Nothing else.
 
-It runs with `--self-test`, which re-runs it against mutants (a selector that
-stops at the first failed tier; signaling that ignores the proxy; a TLS gate
-keyed on a TCP attempt starting rather than a TCP relay existing) and requires
-each to be caught.
+`--self-test` requires each mutant to be caught by the property it breaks:
+a selector that stops at the first failed tier (REACH); signaling that ignores
+the proxy, the pre-0.9.3 behaviour (QUIET); a bridge that ignores the proxy
+(REACH); a TLS gate keyed on a TCP attempt starting rather than a TCP relay
+existing (REACH); the code itself on signaling instead of a SPAKE2 element
+(LEAK).
 
 CI network profiles (each must pair, transfer and exec, against a local
 signaling server and coturn, never production):
 
 | Profile | Network | 0.9.3 |
 |---|---|---|
-| proxy-only | network namespace, UDP and direct TCP dropped, only squid reachable | yes |
+| proxy-only | network namespace, all UDP and TCP dropped in and out except TCP to an authenticating squid (CONNECT to 443 and the signaling port only) | yes: `cli/tests/carrier-proxy-gates.sh` |
 | inspecting proxy | squid ssl-bump with a custom CA, `SSL_CERT_FILE` | after #621 is on main |
 | no websockets | proxy strips `Upgrade` | with long-polling |
 | DNS only, IP blocklist, inbound-only | as named | later |

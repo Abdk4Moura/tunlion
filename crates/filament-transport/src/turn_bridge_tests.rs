@@ -463,9 +463,140 @@ async fn an_unreachable_tcp_server_fails_fast_and_is_counted() {
 #[tokio::test]
 async fn bridge_sockets_have_a_bounded_send_buffer() {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let s = dial(l.local_addr().unwrap()).await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let opts = filament_carrier::DialOpts { send_buffer: Some(STREAM_SNDBUF) };
+    let s = filament_carrier::StreamCarrier::dial(&filament_carrier::Direct, "127.0.0.1", port, &opts).await.unwrap();
     let size = socket2::SockRef::from(&s).send_buffer_size().unwrap();
     // Linux reports double what was set; nothing reports less than asked.
     assert!(size <= 2 * STREAM_SNDBUF as usize, "send buffer {size} is not bounded");
     assert!(size >= STREAM_SNDBUF as usize / 2, "send buffer {size} is implausibly small");
+}
+
+// ------------------------------------------------------- through a proxy --
+
+/// A CONNECT proxy that records each request line and either splices (200) or
+/// refuses with `status`.
+async fn connect_proxy(status: &'static str) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = lines.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if s.read(&mut b).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(b[0]);
+                }
+                let head = String::from_utf8(head).unwrap();
+                let line = head.lines().next().unwrap().to_string();
+                let target = line.split_whitespace().nth(1).unwrap().to_string();
+                seen.lock().unwrap().push(line);
+                let _ = s.write_all(format!("HTTP/1.1 {status}\r\n\r\n").as_bytes()).await;
+                if status.starts_with("200") {
+                    let mut up = tokio::net::TcpStream::connect(target).await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut s, &mut up).await;
+                }
+            });
+        }
+    });
+    (port, lines)
+}
+
+/// HTTPS_PROXY is process-global, so the proxy cases run in a fresh process.
+#[test]
+fn the_bridge_honours_the_proxy_environment_in_a_fresh_process() {
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.args(["--ignored", "--nocapture", "--exact", "turn_bridge::tests::proxy_worker"]);
+    for k in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "REQUEST_METHOD"] {
+        cmd.env_remove(k);
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+}
+
+#[test]
+#[ignore = "run only by the_bridge_honours_the_proxy_environment_in_a_fresh_process"]
+fn proxy_worker() {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        // Through a proxy that tunnels: a real allocation, and the bridge
+        // records that the stream rode the proxy.
+        let srv = tcp_turn_server().await;
+        let (pport, lines) = connect_proxy("200 Connection established").await;
+        std::env::set_var("HTTPS_PROXY", format!("http://127.0.0.1:{pport}"));
+        let (out, bridges) = install(vec![RTCIceServer {
+            urls: vec![format!("turn:127.0.0.1:{srv}?transport=tcp")],
+            username: "user".into(),
+            credential: "secret".into(),
+        }])
+        .await;
+        let bridges = bridges.unwrap();
+        let client = turn_client(bridged_port(&out)).await;
+        tokio::time::timeout(Duration::from_secs(10), client.allocate())
+            .await
+            .expect("allocation must not hang")
+            .expect("allocation through the proxy succeeds");
+        let client_port = *bridges.shared.sources.lock().unwrap().keys().next().unwrap();
+        assert_eq!(bridges.kind_for_port(client_port), Some(StreamKind::Tcp));
+        assert_eq!(bridges.carrier_for_port(client_port), Some("proxy"));
+        assert_eq!(lines.lock().unwrap().clone(), vec![format!("CONNECT 127.0.0.1:{srv} HTTP/1.1")]);
+        client.close().await.unwrap();
+
+        // NO_PROXY: the same server directly, and the proxy never hears of it.
+        std::env::set_var("NO_PROXY", "127.0.0.1");
+        let (out, bridges) = install(vec![RTCIceServer {
+            urls: vec![format!("turn:127.0.0.1:{srv}?transport=tcp")],
+            username: "user".into(),
+            credential: "secret".into(),
+        }])
+        .await;
+        let bridges = bridges.unwrap();
+        let client = turn_client(bridged_port(&out)).await;
+        tokio::time::timeout(Duration::from_secs(10), client.allocate()).await.unwrap().unwrap();
+        let client_port = *bridges.shared.sources.lock().unwrap().keys().next().unwrap();
+        assert_eq!(bridges.carrier_for_port(client_port), Some("direct"));
+        assert_eq!(lines.lock().unwrap().len(), 1);
+        client.close().await.unwrap();
+        std::env::remove_var("NO_PROXY");
+
+        // A proxy that refuses the port (squid allows CONNECT to 443 only): the
+        // TCP stream fails at once and counts as failed, so TLS 443 is not kept
+        // waiting for it.
+        let (rport, _) = connect_proxy("403 Forbidden").await;
+        std::env::set_var("HTTPS_PROXY", format!("http://127.0.0.1:{rport}"));
+        let (out, bridges) = install(vec![RTCIceServer {
+            urls: vec![format!("turn:127.0.0.1:{srv}?transport=tcp")],
+            username: "user".into(),
+            credential: "secret".into(),
+        }])
+        .await;
+        let bridges = bridges.unwrap();
+        let client = turn_client(bridged_port(&out)).await;
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(8), client.allocate()).await.expect("must not hang");
+        assert!(r.is_err());
+        assert_eq!(bridges.shared.view().tcp_failed, 1);
+        assert!(started.elapsed() < Duration::from_secs(3), "refusal took {:?}", started.elapsed());
+        client.close().await.unwrap();
+    });
 }

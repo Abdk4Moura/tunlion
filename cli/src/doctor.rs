@@ -439,7 +439,11 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     // independent network round-trips; run them CONCURRENTLY so the preflight's
     // wall-clock is the slower of the two, not their sum (on a slow link that is
     // ~2.7s + ~0.9s sequential -> ~2.7s).
-    let (sig, ice) = tokio::join!(check_signaling(&context, server), check_stun(&context, server));
+    let (sig, ice, carriers) = tokio::join!(
+        check_signaling(&context, server),
+        check_stun(&context, server),
+        check_carriers(&context, server),
+    );
     let ifaces = list_interfaces();
     let history = diag::summarize(HISTORY_LIMIT);
     // Local file read (fast, no IO worth joining): sshd CA trust presence.
@@ -456,6 +460,7 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     if json_out {
         let mut v = preflight_json(server, &sig, &ice, &ifaces, &history, &sshca);
         v["daemon"] = daemon.to_json();
+        v["carriers"] = carriers.to_json();
         ui::json_out(&v);
         return preflight_result(&sig);
     }
@@ -549,6 +554,7 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
 
     // Interfaces.
     crate::outln!("  {:<13} {}", "interfaces", iface_summary(&ifaces));
+
     if ifaces.iter().any(|i| i.vpn) {
         let mut names: Vec<&str> = ifaces.iter().filter(|i| i.vpn).map(|i| i.name.as_str()).collect();
         names.sort_unstable();
@@ -562,6 +568,12 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
             ),
         );
     }
+
+    // Carriers: every path to tunlion's servers this machine tried.
+    crate::outln!();
+    crate::outln!("{}", ui::paint(Tone::Bold, "carriers (how this machine reaches tunlion's servers)"));
+    crate::outln!();
+    carriers.print();
 
     // History.
     crate::outln!();
@@ -619,6 +631,128 @@ async fn check_signaling(context: &filament_transport::TransportContext, server:
     match crate::net::http_get_json(context, &url).await {
         Ok(_) => Ok(start.elapsed().as_millis() as u64),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The carrier table: signaling and every TURN URL `/api/config` hands out,
+/// each tried over the carrier a real connection would use.
+struct Carriers {
+    signaling_carrier: String,
+    signaling_note: Option<String>,
+    signaling: std::result::Result<u64, String>,
+    relays: Vec<filament_transport::turn_bridge::CarrierProbe>,
+    config_error: Option<String>,
+}
+
+const CARRIER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn check_carriers(context: &filament_transport::TransportContext, server: &str) -> Carriers {
+    let (signaling_carrier, signaling_note) = match filament_signal::carrier_for(server) {
+        Ok(sel) => (sel.carrier.describe(), sel.skipped_proxy),
+        Err(e) => (format!("unknown ({e})"), None),
+    };
+    let sig = filament_signal::probe(server, std::time::Duration::from_secs(10));
+    let relays = async {
+        let cfg = crate::net::fetch_config(context, server).await.map_err(|e| e.to_string())?;
+        let mut urls: Vec<String> = cfg.ice_servers.iter().flat_map(|s| s.urls.iter().cloned()).collect();
+        urls.dedup();
+        let mut set = tokio::task::JoinSet::new();
+        for (i, u) in urls.into_iter().enumerate() {
+            set.spawn(async move { (i, filament_transport::turn_bridge::probe(&u, CARRIER_BUDGET).await) });
+        }
+        let mut rows = Vec::new();
+        while let Some(r) = set.join_next().await {
+            if let Ok((i, Some(row))) = r {
+                rows.push((i, row));
+            }
+        }
+        rows.sort_by_key(|(i, _)| *i);
+        Ok::<_, String>(rows.into_iter().map(|(_, r)| r).collect::<Vec<_>>())
+    };
+    let (sig, relays) = tokio::join!(sig, relays);
+    let (relays, config_error) = match relays {
+        Ok(r) => (r, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    Carriers {
+        signaling_carrier,
+        signaling_note,
+        signaling: sig.map_err(|e| format!("{e:#}")),
+        relays,
+        config_error,
+    }
+}
+
+impl Carriers {
+    fn row(what: &str, transport: &str, target: &str, carrier: &str, outcome: &std::result::Result<u64, String>) {
+        let verdict = match outcome {
+            Ok(ms) => ui::paint(Tone::Ok, &format!("ok {ms} ms")),
+            Err(e) => ui::paint(Tone::Warn, &format!("blocked: {e}")),
+        };
+        crate::outln!("  {:<10} {:<4} {:<34} {:<26} {}", what, transport, target, carrier, verdict);
+    }
+
+    fn print(&self) {
+        Self::row("signaling", "wss", "", &self.signaling_carrier, &self.signaling);
+        if let Some(n) = &self.signaling_note {
+            crate::outln!("  {:<10} {}", "", ui::paint(Tone::Dim, n));
+        }
+        if let Some(e) = &self.config_error {
+            crate::outln!("  {:<10} {}", "relay", ui::paint(Tone::Warn, &format!("not tried: no relay list ({e})")));
+            return;
+        }
+        if self.relays.is_empty() {
+            crate::outln!("  {:<10} {}", "relay", ui::paint(Tone::Dim, "the server lists no TURN relay"));
+        }
+        for r in &self.relays {
+            Self::row("relay", r.transport, &r.target, &r.carrier, &r.outcome);
+            if let Some(n) = &r.note {
+                crate::outln!("  {:<10} {}", "", ui::paint(Tone::Dim, n));
+            }
+        }
+        let any_relay = self.relays.iter().any(|r| r.outcome.is_ok());
+        if self.signaling.is_err() || (!self.relays.is_empty() && !any_relay) {
+            crate::outln!();
+            crate::outln!("  {}", ui::paint(Tone::Warn, &self.advice()));
+        }
+    }
+
+    /// The one sentence for a failure, naming one thing to do.
+    fn advice(&self) -> String {
+        let proxied = self.signaling_carrier.starts_with("proxy");
+        match &self.signaling {
+            Err(e) if proxied => format!("Signaling is blocked through the {}: {e}", self.signaling_carrier),
+            Err(_) => "Signaling is blocked: if this network only allows a web proxy, set HTTPS_PROXY to it (http://host:port).".into(),
+            Ok(_) if proxied => "No relay answered through the proxy: it must allow CONNECT to port 443.".into(),
+            Ok(_) => "No relay answered: this network blocks UDP and TCP to the relays; set HTTPS_PROXY if it has a web proxy.".into(),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let outcome = |o: &std::result::Result<u64, String>| match o {
+            Ok(ms) => json!({ "ok": true, "round_trip_ms": ms }),
+            Err(e) => json!({ "ok": false, "error": e }),
+        };
+        let mut sig = json!({ "carrier": self.signaling_carrier, "result": outcome(&self.signaling) });
+        if let Some(n) = &self.signaling_note {
+            sig["note"] = json!(n);
+        }
+        json!({
+            "signaling": sig,
+            "relays": self.relays.iter().map(|r| {
+                let mut v = json!({
+                    "target": r.target,
+                    "transport": r.transport,
+                    "carrier": r.carrier,
+                    "result": outcome(&r.outcome),
+                });
+                if let Some(n) = &r.note {
+                    v["note"] = json!(n);
+                }
+                v
+            }).collect::<Vec<_>>(),
+            "relay_list_error": self.config_error,
+        })
     }
 }
 

@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use webrtc::ice::url::{ProtoType, SchemeType, Url};
@@ -197,6 +197,9 @@ struct Shared {
     /// Client source port (the turn client's socket, which is also the relay
     /// candidate's related port) -> the stream that carries it.
     sources: Mutex<HashMap<u16, StreamKind>>,
+    /// Same key -> the carrier the stream rode ("direct", "proxy"), once it
+    /// connected. Shown in the route so a proxied relay is visible.
+    carriers: Mutex<HashMap<u16, &'static str>>,
     tcp_upstreams: usize,
     udp_wait: Duration,
 }
@@ -285,6 +288,13 @@ impl TurnBridges {
     pub fn kind_for_port(&self, related_port: u16) -> Option<StreamKind> {
         self.shared.sources.lock().unwrap().get(&related_port).copied()
     }
+
+    /// The carrier under a bridged relay candidate ("direct" or "proxy"), by
+    /// its related port. `None` for webrtc-ice's own UDP relay, or a stream
+    /// that has not connected.
+    pub fn carrier_for_port(&self, related_port: u16) -> Option<&'static str> {
+        self.shared.carriers.lock().unwrap().get(&related_port).copied()
+    }
 }
 
 /// Rewrite `turn:?transport=tcp` and `turns:` URLs to loopback bridges. Returns
@@ -328,6 +338,7 @@ pub async fn install(ice_servers: Vec<RTCIceServer>) -> (Vec<RTCIceServer>, Opti
         state: Mutex::new(GateState::default()),
         changed,
         sources: Mutex::new(HashMap::new()),
+        carriers: Mutex::new(HashMap::new()),
         tcp_upstreams,
         udp_wait: if has_udp_turn { TCP_AFTER } else { Duration::ZERO },
     });
@@ -462,7 +473,10 @@ async fn session(
     }
     crate::hooks::debug(&format!("tunlion: {up}: allocating (no UDP relay yet)"));
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, connect(&up)).await {
-        Ok(Ok(s)) => s,
+        Ok(Ok((s, carrier))) => {
+            shared.carriers.lock().unwrap().insert(src.port(), carrier);
+            s
+        }
         Ok(Err(e)) => {
             crate::hooks::debug(&format!("tunlion: {up}: {e}"));
             shared.note_failed(&up);
@@ -557,40 +571,36 @@ pub(crate) fn forbidden_response(req: &[u8]) -> Option<Vec<u8>> {
 trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ByteStream for T {}
 
-async fn connect(up: &Upstream) -> std::io::Result<Box<dyn ByteStream>> {
-    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((up.host.as_str(), up.port)).await?.collect();
-    // IPv4 first: many hosts have no route to public IPv6 (see net::prefer_v4).
-    addrs.sort_by_key(|a| a.is_ipv6());
-    let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "no address");
-    let mut tcp = None;
-    for a in addrs {
-        match dial(a).await {
-            Ok(s) => {
-                tcp = Some(s);
-                break;
-            }
-            Err(e) => last = e,
-        }
+/// A stream to the TURN server, through whatever carrier the proxy rules pick
+/// (`filament-carrier`, the same rules as the REST client), and the carrier's
+/// name. TLS is end to end with the TURN server, inside a proxy tunnel too.
+async fn connect(up: &Upstream) -> std::io::Result<(Box<dyn ByteStream>, &'static str)> {
+    let scheme = match up.kind {
+        StreamKind::Tcp => "turn",
+        StreamKind::Tls => "turns",
+    };
+    let selected = filament_carrier::select(scheme, &up.host, up.port);
+    if let Some(note) = &selected.skipped_proxy {
+        crate::hooks::debug(&format!("tunlion: {up}: {note}"));
     }
-    let tcp = tcp.ok_or(last)?;
-    let _ = tcp.set_nodelay(true);
+    if selected.via_proxy() {
+        crate::hooks::debug(&format!("tunlion: {up} via {}", selected.carrier.describe()));
+    }
+    // Before connect, so the window is sized from the start. Through a proxy
+    // it bounds the leg to the proxy, which is the one this host controls.
+    let opts = filament_carrier::DialOpts { send_buffer: Some(STREAM_SNDBUF) };
+    let tcp = selected.carrier.dial(&up.host, up.port, &opts).await?;
+    let carrier = selected.carrier.name();
     match up.kind {
-        StreamKind::Tcp => Ok(Box::new(tcp)),
+        StreamKind::Tcp => Ok((Box::new(tcp), carrier)),
         StreamKind::Tls => {
             let cfg = crate::http::turn_tls_config().map_err(std::io::Error::other)?;
             let name = rustls::pki_types::ServerName::try_from(up.host.clone())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
             let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, tcp).await?;
-            Ok(Box::new(tls))
+            Ok((Box::new(tls), carrier))
         }
     }
-}
-
-async fn dial(a: SocketAddr) -> std::io::Result<TcpStream> {
-    let sock = if a.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
-    // Before connect, so the window is sized from the start.
-    let _ = sock.set_send_buffer_size(STREAM_SNDBUF);
-    sock.connect(a).await
 }
 
 /// Client -> server: STUN goes as is (always a multiple of four); ChannelData
@@ -626,6 +636,111 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Resu
     r.read_exact(&mut out[4..]).await?;
     out.truncate(4 + keep);
     Ok(out)
+}
+
+// ------------------------------------------------------------------ doctor --
+
+/// One row of `tunlion doctor`'s carrier table: whether a TURN URL answered,
+/// over which transport and carrier.
+#[derive(Clone, Debug)]
+pub struct CarrierProbe {
+    /// `host:port` of the TURN server.
+    pub target: String,
+    /// "udp", "tcp" or "tls".
+    pub transport: &'static str,
+    /// "direct" or "proxy host:port".
+    pub carrier: String,
+    /// Round trip in ms, or why it failed (one sentence).
+    pub outcome: Result<u64, String>,
+    /// A configured proxy that could not be used for this URL.
+    pub note: Option<String>,
+}
+
+/// An unauthenticated TURN Allocate. Every TURN server answers it (with 401
+/// and a nonce), which proves the server is reachable over this path without
+/// credentials and without relying on the server also answering STUN Binding.
+fn allocate_probe() -> Vec<u8> {
+    let mut txid = [0u8; 12];
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    txid.copy_from_slice(&t.to_be_bytes()[4..16]);
+    let mut m = Vec::with_capacity(28);
+    m.extend_from_slice(&0x0003u16.to_be_bytes()); // Allocate request
+    m.extend_from_slice(&8u16.to_be_bytes()); // one 8-byte attribute
+    m.extend_from_slice(&MAGIC_COOKIE);
+    m.extend_from_slice(&txid);
+    m.extend_from_slice(&0x0019u16.to_be_bytes()); // REQUESTED-TRANSPORT
+    m.extend_from_slice(&4u16.to_be_bytes());
+    m.extend_from_slice(&[17, 0, 0, 0]); // UDP
+    m
+}
+
+fn is_stun_response_to(resp: &[u8], req: &[u8]) -> bool {
+    resp.len() >= 20 && resp[0] & 0xC0 == 0 && resp[4..8] == MAGIC_COOKIE && resp[8..20] == req[8..20]
+}
+
+/// Probe one ICE URL as `doctor` reports it. `None` for a URL that is not TURN.
+pub async fn probe(url: &str, budget: Duration) -> Option<CarrierProbe> {
+    let u = Url::parse_url(url.trim()).ok()?;
+    if !matches!(u.scheme, SchemeType::Turn | SchemeType::Turns) {
+        return None;
+    }
+    let target = if u.host.contains(':') { format!("[{}]:{}", u.host, u.port) } else { format!("{}:{}", u.host, u.port) };
+    let req = allocate_probe();
+    let started = Instant::now();
+    match classify(url) {
+        None if u.proto == ProtoType::Udp && u.scheme == SchemeType::Turn => {
+            let r = tokio::time::timeout(budget, async {
+                let addr = tokio::net::lookup_host((u.host.as_str(), u.port))
+                    .await?
+                    .min_by_key(|a| a.is_ipv6())
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address"))?;
+                let sock = UdpSocket::bind(if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }).await?;
+                let mut buf = vec![0u8; 1500];
+                // Two sends: one lost datagram is not a blocked port.
+                for _ in 0..2 {
+                    sock.send_to(&req, addr).await?;
+                    if let Ok(Ok((n, _))) = tokio::time::timeout(budget / 2, sock.recv_from(&mut buf)).await {
+                        if is_stun_response_to(&buf[..n], &req) {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "no answer"))
+            })
+            .await;
+            let outcome = match r {
+                Ok(Ok(())) => Ok(started.elapsed().as_millis() as u64),
+                Ok(Err(e)) if e.kind() != std::io::ErrorKind::TimedOut => Err(e.to_string()),
+                _ => Err(format!("no answer within {} ms (UDP blocked?)", budget.as_millis())),
+            };
+            Some(CarrierProbe { target, transport: "udp", carrier: "direct".into(), outcome, note: None })
+        }
+        None => None, // turns: over DTLS: webrtc-ice cannot use it either
+        Some(up) => {
+            let scheme = if up.kind == StreamKind::Tls { "turns" } else { "turn" };
+            let selected = filament_carrier::select(scheme, &up.host, up.port);
+            let carrier = selected.carrier.describe();
+            let note = selected.skipped_proxy.clone();
+            let r = tokio::time::timeout(budget, async {
+                let (stream, _) = connect(&up).await?;
+                let (mut rd, mut wr) = tokio::io::split(stream);
+                write_frame(&mut wr, &req).await?;
+                let resp = read_frame(&mut rd).await?;
+                if is_stun_response_to(&resp, &req) {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "answered with something other than TURN"))
+                }
+            })
+            .await;
+            let outcome = match r {
+                Ok(Ok(())) => Ok(started.elapsed().as_millis() as u64),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err(format!("no answer within {} ms", budget.as_millis())),
+            };
+            Some(CarrierProbe { target, transport: up.kind.label(), carrier, outcome, note })
+        }
+    }
 }
 
 #[cfg(test)]
