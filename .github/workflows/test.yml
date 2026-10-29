@@ -35,7 +35,9 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: cargo test (linux)
     runs-on: ubuntu-latest
-    # A passing run takes about 24 minutes, so 25 cancelled healthy runs.
+    # A passing run takes about 24 minutes, and the suite includes the
+    # non-default `l3` library tests plus the CLI integration binary, so keep
+    # headroom for a cold cache.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4

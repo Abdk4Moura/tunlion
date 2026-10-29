@@ -36,7 +36,7 @@ STATE <-> CODE MAPPING
   discover        fleet-hello verified: cert chains to the owner
                   key (verify_hello), not revoked, AND listed in the
                   roster held (DeviceStore::sibling_admissible)
-  revoke          `devices revoke` on the owner
+  revoke          `demote --to cut` on the owner
 
 The owner's own admissions are decided by its local records (it is paired with
 every device), so the roster rule applies to joined devices only, exactly as

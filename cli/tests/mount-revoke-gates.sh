@@ -92,7 +92,7 @@ say "mount-revoke gate B"
 # the peer was revoked (the critical line mount_proto.rs prints on that branch).
 REASON="mount: peer revoked, closing the live session"
 reason_before=$(grep -cF "$REASON" "$WORK/up.log" 2>/dev/null || true)
-env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" demote bravo --to cut --yes >"$WORK/revoke.out" 2>&1
 revoke_rc=$?
 echo "## revoke rc=$revoke_rc"
 echo "written AFTER the revoke" > "$WORK/share/after.txt"

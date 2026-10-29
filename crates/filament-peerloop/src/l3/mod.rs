@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -361,6 +362,8 @@ pub struct L3 {
     signaling: Vec<IpAddr>,
     /// Persisted next-sequence provider (host-configured).
     next_seq: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// False once the packet pump has observed the endpoint go away.
+    endpoint_alive: Arc<AtomicBool>,
 }
 
 type ExitRoutePlan = Vec<Vec<String>>;
@@ -520,6 +523,8 @@ impl L3 {
             },
         };
         let userspace = netstack.is_some();
+        let endpoint_alive = Arc::new(AtomicBool::new(true));
+        let pump_alive = endpoint_alive.clone();
         let routes: Arc<Mutex<RouteTable>> = Arc::new(Mutex::new(RouteTable::default()));
         let l3 = Arc::new(L3 {
             tun: tun.clone(),
@@ -536,6 +541,7 @@ impl L3 {
             advertised: advertised_prefixes,
             signaling: signaling_addrs,
             next_seq,
+            endpoint_alive,
         });
         // Clear any stale MagicDNS block from a previous run - but only in kernel
         // mode; the userspace path never writes /etc/hosts (see `userspace`).
@@ -550,9 +556,15 @@ impl L3 {
             let mut buf = vec![0u8; 65535];
             loop {
                 let n = match tun.recv(&mut buf).await {
-                    Ok(0) => continue,
+                    Ok(0) => {
+                        pump_alive.store(false, Ordering::Relaxed);
+                        break; // endpoint closed
+                    }
                     Ok(n) => n,
-                    Err(_) => break, // TUN closed -> daemon shutting down
+                    Err(_) => {
+                        pump_alive.store(false, Ordering::Relaxed);
+                        break; // TUN/netstack dead -> endpoint is gone
+                    }
                 };
                 let Some(dst) = dest_ip(&buf[..n]) else { continue };
                 let peer = routes.lock().await.lookup(dst);
@@ -580,6 +592,13 @@ impl L3 {
     /// tools need the proxy/dial to reach `<peer>.mesh`.
     pub fn is_userspace(&self) -> bool {
         self.netstack.is_some()
+    }
+
+    /// Is the packet endpoint still alive? A dead TUN pump or netstack task
+    /// means a published `ready` must be downgraded, not kept forever.
+    pub fn l3_live(&self) -> bool {
+        self.endpoint_alive.load(Ordering::Relaxed)
+            && self.netstack.as_ref().map_or(true, |ns| ns.is_alive())
     }
 
     /// Access the overlay identity (crypto mode only).
@@ -1137,6 +1156,9 @@ impl MeshTunnel for L3 {
     }
     fn is_userspace(&self) -> bool {
         L3::is_userspace(self)
+    }
+    fn l3_live(&self) -> bool {
+        L3::l3_live(self)
     }
     fn native_v4_problem(&self) -> Option<String> {
         if L3::is_userspace(self) {
@@ -2194,7 +2216,19 @@ mod tests {
             advertised: Vec::new(),
             signaling: Vec::new(),
             next_seq: std::sync::Arc::new(|| 1),
+            endpoint_alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
+    }
+
+    /// A published `ready` is not immortal: when the endpoint pump dies, the
+    /// daemon's liveness check must be able to downgrade it.
+    #[tokio::test]
+    async fn a_dead_endpoint_is_not_live() {
+        let l3 = test_l3();
+        assert!(l3.l3_live(), "a fresh userspace endpoint is live");
+        l3.endpoint_alive
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!l3.l3_live(), "a stopped pump means the endpoint is gone");
     }
 
     #[tokio::test]

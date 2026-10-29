@@ -1769,7 +1769,7 @@ async fn recv_run(
         None
     };
     #[cfg(feature = "mesh")]
-    let l3_status_json = serde_json::to_value(&l3_status)
+    let mut l3_status_json = serde_json::to_value(&l3_status)
         .unwrap_or_else(|_| json!({"state": "down", "mode": "none", "reason": "L3 state unavailable"}));
     #[cfg(feature = "mesh")]
     if let Ok(text) = serde_json::to_string(&l3_status) {
@@ -1825,6 +1825,11 @@ async fn recv_run(
     // believe it. Reconcile on a short tick wherever an L3 endpoint exists, and
     // let expose-bound.json be the truth the CLI waits for.
     let mut last_expose_tick = Instant::now();
+    // Refresh the published L3 state every second: a stalled/removed endpoint
+    // must downgrade `ready`, and a live one must keep the file fresh enough
+    // for `expose --list`/`status` to trust it.
+    #[cfg(feature = "mesh")]
+    let mut last_l3_tick = Instant::now();
     // L2 (ssh/TCP tunnel) acceptor: one mux per link, created on the first
     // l2-open seen on that link. `l2_enabled` is computed once above (it also
     // gates the direct-QUIC path); reused here for the mux/cap machinery.
@@ -3499,7 +3504,7 @@ async fn recv_run(
                     let _ = &unrouted;
                     let closed = doomed.len();
                     // Links to a device revoked IN PLACE stay up to carry the
-                    // refusal; count them so `devices revoke` can say so.
+                    // refusal; count them so `demote --to cut` can say so.
                     let refused = conn
                         .links
                         .values()
@@ -3617,6 +3622,24 @@ async fn recv_run(
             }
         }
 
+        #[cfg(feature = "mesh")]
+        if daemon && last_l3_tick.elapsed() >= Duration::from_secs(1) {
+            last_l3_tick = Instant::now();
+            if let Some(m) = l3.as_ref() {
+                if l3_status.is_ready() && !m.l3_live() {
+                    l3_status = L3Status::down(
+                        l3_mode_word(m.is_userspace()),
+                        "the L3 endpoint stopped after it was reported ready",
+                    );
+                    l3_status_json = serde_json::to_value(&l3_status).unwrap_or_else(|_| {
+                        json!({"state": "down", "mode": "none", "reason": "L3 endpoint lost"})
+                    });
+                }
+                if let Ok(text) = serde_json::to_string(&l3_status) {
+                    host.l3_state_report(&text);
+                }
+            }
+        }
         if daemon && l3.is_some() && last_expose_tick.elapsed() >= Duration::from_secs(1) {
             last_expose_tick = Instant::now();
             ports.servers.reload_expose().await;
@@ -7178,7 +7201,18 @@ async fn recv_run(
                     let isec = v["secret"].as_str().unwrap_or_default().to_string();
                     let hub = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                     let hub_record = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                    // And only from a device of THIS device's own owner: from
+                    // someone else's device (or a plain pairing) an
+                    // introduction would add a device nobody here agreed to.
+                    let same_owner_hub = hub_record.as_deref().is_some_and(|h| {
+                        let records: Vec<Value> = std::fs::read_to_string(ports.store.devices_path())
+                            .ok()
+                            .and_then(|raw| serde_json::from_str(&raw).ok())
+                            .unwrap_or_default();
+                        crate::consent::intro_hub_is_same_owner(&records, h, ports.identity.owner_pub_for_resources())
+                    });
                     let may_vouch = trusted
+                        && same_owner_hub
                         && hub_record
                             .as_deref()
                             .is_some_and(|h| !ports.store.device_was_introduced(h));
@@ -7198,10 +7232,12 @@ async fn recv_run(
                         }
                     } else {
                         if !may_vouch {
-                            log.say(&log.paint(
-                                Tone::Warn,
-                                &format!("  ignored pair-intro from unverified peer {hub}"),
-                            ));
+                            let why = if trusted && !same_owner_hub {
+                                format!("  ignored an introduction from {hub}: it is not one of this device's owner's devices; pair with a code instead")
+                            } else {
+                                format!("  ignored pair-intro from unverified peer {hub}")
+                            };
+                            log.say(&log.paint(Tone::Warn, &why));
                         }
                         None
                     };

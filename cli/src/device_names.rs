@@ -211,10 +211,12 @@ pub(crate) fn canonicalize_cmd(cmd: Cmd) -> Result<Cmd> {
             let on = opt(on, &mut known)?;
             Cmd::Grant { device, capability, tag, user, on }
         }
-        Cmd::Revoke { device, capability, certificate, user, on } => {
+        Cmd::Revoke { device, capability, user, on } => {
             let on = opt(on, &mut known)?;
-            Cmd::Revoke { device: resolve_arg_in(&device, &known())?, capability, certificate, user, on }
+            Cmd::Revoke { device: resolve_arg_in(&device, &known())?, capability, user, on }
         }
+        Cmd::Promote { device, to, json } => Cmd::Promote { device: opt(device, &mut known)?, to, json },
+        Cmd::Demote { device, to, json } => Cmd::Demote { device: opt(device, &mut known)?, to, json },
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             let peer = resolve_arg_in(&peer, &known())?;
             Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options }
@@ -235,12 +237,6 @@ pub(crate) fn canonicalize_cmd(cmd: Cmd) -> Result<Cmd> {
             let action = match action {
                 Some(DevicesAction::Forget { name }) => {
                     Some(DevicesAction::Forget { name: resolve_arg_in(&name, &known())? })
-                }
-                Some(DevicesAction::Revoke { name }) => {
-                    Some(DevicesAction::Revoke { name: resolve_arg_in(&name, &known())? })
-                }
-                Some(DevicesAction::Restore { name }) => {
-                    Some(DevicesAction::Restore { name: resolve_arg_in(&name, &known())? })
                 }
                 Some(DevicesAction::Rename { old, new }) => Some(DevicesAction::Rename {
                     old: resolve_arg_in(&old, &known())?,

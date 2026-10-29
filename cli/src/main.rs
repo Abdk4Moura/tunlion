@@ -104,6 +104,8 @@ mod membership;
 mod pair_cmd;
 /// One spelling rule for device names, and the forgiving lookup.
 mod device_names;
+/// `tunlion promote` / `tunlion demote`: one ladder for what a device may do.
+mod ladder;
 mod preconnect;
 mod access_ui;
 mod temporary_session;
@@ -959,7 +961,7 @@ fn enrollment_refusal(prior: &Value) -> Option<String> {
     let revoked = prior["certRevoked"].as_bool() == Some(true)
         || prior["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED);
     if revoked {
-        Some("this device was revoked; the owner must run 'tunlion devices restore <name>' to allow it back".to_string())
+        Some("this device was revoked; the owner must run 'tunlion promote <name>' to allow it back".to_string())
     } else {
         None
     }
@@ -1369,7 +1371,7 @@ fn local_request(id: u64) -> Option<PendingRequest> {
     load_requests().into_iter().find(|request| request.id == id)
 }
 
-fn warm_device_names(value: Option<&Value>) -> HashSet<String> {
+pub(crate) fn warm_device_names(value: Option<&Value>) -> HashSet<String> {
     value
         .and_then(|v| v.get("links"))
         .and_then(Value::as_array)
@@ -1539,6 +1541,9 @@ fn down_cmd() -> Result<()> {
             // Taken BEFORE signalling, so the wait below can tell this daemon
             // from an unrelated process that later reuses its pid.
             let exe = platform::process_exe_path(pid);
+            // Capture the process incarnation BEFORE signalling: a pid that is
+            // reused by another tunlion must never be force-terminated.
+            let start = platform::process_start_token(pid);
             daemon_stop::mark_down(pid);
             // #191: a managed service restarts a killed process. systemd's
             // Restart=always reacts to an UNEXPECTED exit; a manual
@@ -1569,7 +1574,17 @@ fn down_cmd() -> Result<()> {
                      `tunlion down` from an elevated terminal. The pidfile is kept."
                 ),
                 Ok(platform::StopAsk::NoListener) => {
-                    // An older daemon has no stop event: end it now.
+                    // An older daemon has no stop event: end it now, but only
+                    // if the pid is still the exact incarnation captured above.
+                    // A recycled pid (or one whose start token cannot be read)
+                    // is never force-terminated.
+                    if !daemon_stop::safe_to_force(pid, exe.as_deref(), start.as_deref()) {
+                        bail!(
+                            "could not stop the daemon (pid {pid}): it has no stop request listener (an older \
+                             tunlion), and the process at that pid cannot be verified as the daemon, so it was \
+                             not terminated. The pidfile is kept."
+                        );
+                    }
                     if let Err(e) = platform::escalate(pid, platform::Escalate::Kill) {
                         bail!(
                             "could not stop the daemon (pid {pid}): it has no stop request listener (an older \
@@ -1585,10 +1600,42 @@ fn down_cmd() -> Result<()> {
             // busy one may take a moment; "stopped" used to be printed 6 ms
             // after the signal while the process lived on, holding the lock the
             // next `up` then lost to. Wait (bounded), resume, then kill.
-            let how = daemon_stop::await_exit(pid, exe.as_deref())?;
-            let _ = std::fs::remove_file(pidfile());
+            let (how, replaced) = daemon_stop::await_exit(pid, exe.as_deref(), start.as_deref())?;
+            // Only delete a pidfile that still names the daemon we stopped,
+            // under the same instance lock `up` holds before write_pidfile, so
+            // a replacement cannot write between the check and the remove.
+            let removal = if replaced {
+                daemon_stop::PidfileRemoval::NotOurs
+            } else {
+                daemon_stop::remove_pidfile_if_stopped(
+                    &pidfile(),
+                    &platform::Paths::config_path("up.lock"),
+                    pid,
+                    start.as_deref(),
+                )
+            };
+            let extra = if replaced {
+                "; another process now holds that pid, so its pidfile was left untouched".to_string()
+            } else {
+                match removal {
+                    daemon_stop::PidfileRemoval::LockBusy => {
+                        "; another daemon process holds the election lock (running or starting), so the pidfile was left untouched".to_string()
+                    }
+                    daemon_stop::PidfileRemoval::LockError(e) => format!(
+                        "; the election lock could not be checked ({e}), so the pidfile was left untouched"
+                    ),
+                    daemon_stop::PidfileRemoval::NotOurs => {
+                        "; the pidfile names another daemon/incarnation, so it was left untouched".to_string()
+                    }
+                    daemon_stop::PidfileRemoval::RemoveFailed(e) => format!(
+                        "; the pidfile was ours but could not be removed ({e})"
+                    ),
+                    daemon_stop::PidfileRemoval::Removed
+                    | daemon_stop::PidfileRemoval::Missing => String::new(),
+                }
+            };
             ui::say(&format!(
-                "  {} stopped (pid {pid}){}",
+                "  {} stopped (pid {pid}){}{extra}",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                 note_override.unwrap_or_else(|| how.note())
             ));

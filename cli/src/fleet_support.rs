@@ -46,7 +46,7 @@ pub(crate) fn fleet_certificate_warning_for(
         return None;
     }
     Some(format!(
-        "{} {} still has fleet access via its certificate.\n  Revoke it: tunlion revoke {} --certificate",
+        "{} {} still has fleet access via its certificate.\n  Cut it off: tunlion demote {} --to cut",
         ui::paint(ui::Tone::Warn, ui::glyph_warn()),
         name,
         name,
@@ -211,7 +211,7 @@ pub(crate) fn key_revocation_for(entries: &[Value], device_pub: &[u8; 32], now: 
 /// Remove every entry for `device_pub` (or, with `by_name`, every entry
 /// recorded under that name) from `path`. Returns what was lifted as
 /// (name, revokedAt, devicePub hex). An explicit owner action is the only
-/// caller: a fresh `add` of that device, or `devices restore <name>`.
+/// caller: a fresh `add` of that device, or `promote <name>`.
 pub(crate) fn lift_key_revocations_at(
     path: &Path,
     device_pub: Option<&[u8; 32]>,
@@ -250,7 +250,7 @@ pub(crate) fn lift_key_revocation(device_pub: &[u8; 32]) -> Result<Vec<(String, 
     lift_key_revocations_at(&key_revocations_path(), Some(device_pub), None)
 }
 
-/// Lift the blocks recorded under `name`, for `devices restore` of a device
+/// Lift the blocks recorded under `name`, for `promote` of a device
 /// that was forgotten (and so has no record left to restore).
 pub(crate) fn lift_key_revocations_named(name: &str) -> Result<Vec<(String, u64, String)>> {
     lift_key_revocations_at(&key_revocations_path(), None, Some(name))
@@ -271,7 +271,7 @@ pub(crate) fn readmit_line(name: &str, forgotten_at: u64) -> String {
     )
 }
 
-/// What `devices restore <name>` reports. Pure. `record`: a record by that
+/// What `promote <name>` reports from cut off. Pure. `record`: a record by that
 /// name exists; `revoked`: it was revoked and is now restored; `lifted`: key
 /// blocks a forget had left under that name, now lifted.
 pub(crate) fn restore_report(name: &str, record: bool, revoked: bool, lifted: &[(String, u64, String)]) -> String {
@@ -323,7 +323,7 @@ mod key_revocation_lift_tests {
         assert!(!key_revocation_in_force(&entries, &[1; 32], 200), "the re-added key is admitted");
         assert!(key_revocation_in_force(&entries, &[2; 32], 200), "another forgotten key stays blocked");
 
-        // `devices restore u2-b`: the forgotten device has no record, so the
+        // `promote u2-b`: the forgotten device has no record, so the
         // block is found by the name it was recorded under.
         let lifted = lift_key_revocations_at(&path, None, Some("U2-B")).unwrap();
         assert_eq!(lifted.len(), 1);

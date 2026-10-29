@@ -20,7 +20,7 @@
 # whatever the product does: revoking a CERTIFICATE (rather than a grant) had
 # no live coverage anywhere, only a unit matrix over fabricated inputs. That
 # arm enrols through `add --for` / `join` and revokes with
-# `revoke <device> --certificate`, and carries its own restore control so a
+# `demote <device> --to cut`, and carries its own restore control so a
 # broken link cannot masquerade as a revocation.
 #
 # Also carries forward-refusal-gates (#232/#268): the same question, asked of a

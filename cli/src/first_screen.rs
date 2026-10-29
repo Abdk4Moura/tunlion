@@ -84,6 +84,7 @@ pub(crate) fn more_actions(owner: bool) -> Vec<(&'static str, &'static str)> {
         vec![
             ("Open files on another device", "mount"),
             ("See my devices", "devices"),
+            ("Change what a device can do", "promote"),
             ("Invite with a file they claim later", "add --for"),
             // An unattended runner is a THIRD thing, not pairing: nobody is there
             // to consent live, so it gets a temporary key.
@@ -94,6 +95,7 @@ pub(crate) fn more_actions(owner: bool) -> Vec<(&'static str, &'static str)> {
     } else {
         vec![
             ("Open files on another device", "mount"),
+            ("Change what a device can do", "promote"),
             ("Show this device's identity", "id"),
         ]
     }

@@ -258,7 +258,7 @@ say "K12: revoking charlie on the owner"
 start_acceptor "$DA"
 PID_alpha=${FIX_PIDS[-1]}
 sleep 6
-as_node alpha devices revoke charlie --yes </dev/null >/dev/null 2>&1 || bad "gateK12-setup: revoke failed"
+as_node alpha demote charlie --to cut --yes </dev/null >/dev/null 2>&1 || bad "gateK12-setup: revoke failed"
 if wait_log "$WORK/up-bravo.log" "closed the link to 'charlie'" 40; then
   echo "k12-$$" > "$WORK/k12.txt"
   fs_cli 90 as_node charlie send "$WORK/k12.txt" --to bravo; rc=$(fs_rc); sleep 2

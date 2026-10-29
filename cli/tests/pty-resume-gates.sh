@@ -153,7 +153,7 @@ if [ "$age" -le 4 ]; then
 else
   bad "V1: the shell died when its link did (beat ${age}s old); V2 would prove nothing"
 fi
-env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" demote bravo --to cut --yes >"$WORK/revoke.out" 2>&1
 revoke_rc=$?
 sleep "$GRACE"
 age=$(file_age "$WORK/beat-v")

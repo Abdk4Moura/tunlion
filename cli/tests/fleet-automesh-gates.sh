@@ -24,7 +24,7 @@
 #   S   shell: refused without a grant on the target, works with one
 #   T   transfer: the FleetSibling default, at the named device only, both
 #       ways, with no grant and no pairing; a grant stays one-directional
-#   V   revocation: `devices revoke charlie` on the OWNER cuts bravo<->charlie
+#   V   revocation: `demote charlie --to cut` on the OWNER cuts bravo<->charlie
 #       (link closed, exec refused, no file lands either way, no re-admission)
 #       while bravo<->alpha keeps working (the network did not just break)
 #   U   uncertified: dave gets nothing new (no fleet secret, no siblings, the
@@ -209,7 +209,7 @@ if [ "$rc" = 0 ] && landed bravo u1.txt; then ok "gateU5: dave->bravo, the ordin
 else bad "gateU5: dave->bravo rc=$rc: $(fs_out | tail -3)"; fi
 
 say "V: revoking charlie on the OWNER cuts bravo<->charlie"
-as_node alpha devices revoke charlie --yes </dev/null >"$WORK/revoke.log" 2>&1 || bad "gateV-setup: owner revoke failed: $(cat "$WORK/revoke.log")"
+as_node alpha demote charlie --to cut --yes </dev/null >"$WORK/revoke.log" 2>&1 || bad "gateV-setup: owner revoke failed: $(cat "$WORK/revoke.log")"
 T0=$(date +%s)
 if wait_log "$WORK/up-bravo.log" "closed the link to 'charlie'" 30; then
   ok "gateV1: bravo closed its link to charlie within $(( $(date +%s) - T0 ))s of the owner's revoke"

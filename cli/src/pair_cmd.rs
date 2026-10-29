@@ -1317,7 +1317,7 @@ async fn pair_with_purpose(
                         // still refused every send. On the OWNER side, a completed
                         // pairing the operator started is consent to lift that
                         // block; say so. A device REVOKED in place (record kept,
-                        // `devices revoke`) is not re-admitted by a pairing: say
+                        // `demote --to cut`) is not re-admitted by a pairing: say
                         // that openly and fail, never print "joined".
                         if load_owner_key().is_some() {
                             let peer_key = peer_identity_cert
@@ -1344,7 +1344,7 @@ async fn pair_with_purpose(
                             if crate::device_view::device_record_revoked(&n) {
                                 bail!(
                                     "{n} paired, but it is REVOKED on this device, so it stays refused. \
-                                     To let it back in:  tunlion devices restore {n}"
+                                     To let it back in:  tunlion promote {n}"
                                 );
                             }
                         }

@@ -1049,7 +1049,82 @@ pub fn process_start_token(pid: u32) -> Option<String> {
         let rest = &stat[stat.rfind(')')? + 1..];
         rest.split_whitespace().nth(19).map(str::to_string)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(windows)]
+    {
+        unsafe {
+            unsafe extern "system" {
+                fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+                fn GetProcessTimes(
+                    h: isize,
+                    creation: *mut u64,
+                    exit: *mut u64,
+                    kernel: *mut u64,
+                    user: *mut u64,
+                ) -> i32;
+                fn CloseHandle(h: isize) -> i32;
+            }
+            const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h == 0 {
+                return None;
+            }
+            let (mut creation, mut exit, mut kernel, mut user) = (0u64, 0u64, 0u64, 0u64);
+            let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user);
+            CloseHandle(h);
+            (ok != 0).then(|| creation.to_string())
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // proc_pidinfo(PROC_PIDTBSDINFO) has the kernel's microsecond start
+        // time, so this is both cheap enough for a 100ms poll and distinguishes
+        // a same-second pid replacement (unlike `ps -o lstart=`).
+        #[repr(C)]
+        struct ProcBsdInfo {
+            pbi_flags: u32,
+            pbi_status: u32,
+            pbi_xstatus: u32,
+            pbi_pid: u32,
+            pbi_ppid: u32,
+            pbi_uid: u32,
+            pbi_gid: u32,
+            pbi_ruid: u32,
+            pbi_rgid: u32,
+            pbi_svuid: u32,
+            pbi_svgid: u32,
+            rfu_1: u32,
+            pbi_comm: [u8; 16],
+            pbi_name: [u8; 32],
+            pbi_nfiles: u32,
+            pbi_pgid: u32,
+            pbi_pjobc: u32,
+            e_tdev: u32,
+            e_tpgid: u32,
+            pbi_nice: i32,
+            pbi_start_tvsec: u64,
+            pbi_start_tvusec: u64,
+        }
+        unsafe extern "C" {
+            fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut u8, size: i32) -> i32;
+        }
+        const PROC_PIDTBSDINFO: i32 = 3;
+        let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+        let want = std::mem::size_of::<ProcBsdInfo>() as i32;
+        let got = unsafe {
+            proc_pidinfo(
+                pid as i32,
+                PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut ProcBsdInfo as *mut u8,
+                want,
+            )
+        };
+        if got != want {
+            return None;
+        }
+        Some(format!("{}.{}", info.pbi_start_tvsec, info.pbi_start_tvusec))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows, target_os = "macos")))]
     {
         let _ = pid;
         None
@@ -3831,17 +3906,31 @@ pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
 pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
     match how {
         Escalate::Continue => Ok(()),
-        Escalate::Kill => {
-            let st = crate::platform::command("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()?;
-            if st.success() {
-                Ok(())
-            } else {
-                Err(std::io::Error::other(format!("taskkill exited {st}")))
+        // Native forced termination, not a spawned `taskkill`. The caller checks
+        // that this PID is still the daemon it recorded before reaching here.
+        Escalate::Kill => unsafe {
+            unsafe extern "system" {
+                fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+                fn TerminateProcess(h: isize, code: u32) -> i32;
+                fn WaitForSingleObject(h: isize, ms: u32) -> u32;
+                fn CloseHandle(h: isize) -> i32;
             }
+            const PROCESS_TERMINATE: u32 = 0x0001;
+            const SYNCHRONIZE: u32 = 0x0010_0000;
+            let h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid);
+            if h == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if TerminateProcess(h, 1) == 0 {
+                let e = std::io::Error::last_os_error();
+                CloseHandle(h);
+                return Err(e);
+            }
+            // Bounded wait so `await_exit` observes the exit promptly instead of
+            // spinning for its whole grace window.
+            WaitForSingleObject(h, 5000);
+            CloseHandle(h);
+            Ok(())
         }
     }
 }
@@ -4550,4 +4639,88 @@ fn a_stop_request_reaches_the_daemons_listener() {
     });
     // No process creates events under an impossible pid.
     assert_eq!(ask_daemon_to_stop(u32::MAX - 3).unwrap(), StopAsk::NoListener);
+}
+
+/// The stop request across two real processes, as `down` and the daemon use it.
+/// This replaces the request-file tests (pid-scoped, consumed once, a foreign
+/// or stale request ignored): a child plays the daemon and listens on its own
+/// event; asking any other pid must not stop it; two downs asking at once are
+/// both delivered and stop it once; and once it has exited nothing is left
+/// behind, so a later process given that pid cannot be stopped by a stale ask.
+#[cfg(windows)]
+#[test]
+fn a_stop_request_is_pid_scoped_and_dies_with_the_daemon() {
+    use std::io::BufRead;
+    use std::time::{Duration, Instant};
+    const ROLE: &str = "TUNLION_TEST_STOP_LISTENER_ROLE";
+    const TEST_PATH: &str = "platform::a_stop_request_is_pid_scoped_and_dies_with_the_daemon";
+    if std::env::var_os(ROLE).is_some() {
+        // Daemon role: listen like recv_signals does and exit only when asked.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rx = listen_for_stop_request().expect("the daemon role creates its stop event");
+        crate::outln!("LISTENING");
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(60), rx)
+                .await
+                .expect("asked to stop within 60s")
+                .expect("sender kept");
+        });
+        crate::outln!("STOPPED-BY-REQUEST");
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    let mut daemon = command(&exe)
+        .args([TEST_PATH, "--exact", "--nocapture", "--test-threads=1"])
+        .env(ROLE, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = daemon.id();
+    let out = daemon.stdout.take().unwrap();
+    let (tx, lines) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let saw = |marker: &str, within: Duration| -> bool {
+        let until = Instant::now() + within;
+        loop {
+            match lines.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(line) if line.contains(marker) => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+    };
+    if !saw("LISTENING", Duration::from_secs(30)) {
+        let _ = daemon.kill();
+        panic!("the daemon role never reported its stop event");
+    }
+    // A request for any other pid never reaches this daemon.
+    assert_eq!(ask_daemon_to_stop(u32::MAX - 5).unwrap(), StopAsk::NoListener);
+    std::thread::sleep(Duration::from_millis(500));
+    let still_running = daemon.try_wait().unwrap().is_none();
+    if !still_running {
+        panic!("a request for another pid stopped this daemon");
+    }
+    // Two downs at once: both are delivered, the daemon stops once.
+    let first = ask_daemon_to_stop(pid).unwrap();
+    let second = ask_daemon_to_stop(pid).unwrap();
+    if first != StopAsk::Sent || second != StopAsk::Sent {
+        let _ = daemon.kill();
+        panic!("both requests must be delivered: {first:?} {second:?}");
+    }
+    let stopped = saw("STOPPED-BY-REQUEST", Duration::from_secs(20));
+    if !stopped {
+        let _ = daemon.kill();
+    }
+    let status = daemon.wait().unwrap();
+    assert!(stopped, "the daemon did not stop on its request");
+    assert!(status.success(), "the daemon role failed: {status}");
+    // Gone with the daemon: nothing is left that a later process with this pid
+    // would inherit.
+    assert_eq!(ask_daemon_to_stop(pid).unwrap(), StopAsk::NoListener);
 }

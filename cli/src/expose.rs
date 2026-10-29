@@ -105,6 +105,13 @@ pub fn bound_ports(daemon: Option<u32>) -> Vec<u16> {
     bound_state(daemon).ports
 }
 
+/// Is THIS exact binding served right now? A record is history; the endpoint
+/// must be live too. Shared by `expose --list`, `status` and `expose <port>` so
+/// none of them can drift into trusting a stale record.
+pub fn bound_now(state: &BoundState, want: &Binding, l3_ready: bool) -> bool {
+    l3_ready && state.bindings.get(&want.port) == Some(want)
+}
+
 fn save(bindings: &[Binding]) -> Result<()> {
     let p = expose_path();
     // Atomic replace (SecretFile also creates the directory, owner-only) so a concurrent daemon read never sees a half-written file.
@@ -145,7 +152,7 @@ pub async fn expose_cmd(
     list: bool,
 ) -> Result<()> {
     if list || port.is_none() {
-        return print_list();
+        return print_list().await;
     }
     let port = port.unwrap();
     let target = resolve_target(port, &to);
@@ -229,14 +236,18 @@ pub enum BindOutcome {
 /// a listener. The EXACT binding must be present: an old listener on the same
 /// port (a replaced target) is not this request's proof.
 pub fn classify_bind(state: &BoundState, want: &Binding, l3_ready: bool) -> BindOutcome {
+    // LIVE ENDPOINT FIRST. A stale bound record (a previous daemon incarnation,
+    // or a listener from before L3 went away) must never turn a saved-only
+    // request into success. `ready` is the daemon's own proof that bind/dial can
+    // work; the record alone is history.
+    if !l3_ready {
+        return BindOutcome::NoEndpoint;
+    }
     if state.bindings.get(&want.port) == Some(want) {
         return BindOutcome::Bound;
     }
     if let Some(why) = state.errors.get(&want.port) {
         return BindOutcome::Failed(why.clone());
-    }
-    if !l3_ready {
-        return BindOutcome::NoEndpoint;
     }
     BindOutcome::TimedOut
 }
@@ -276,7 +287,7 @@ pub async fn unexpose_cmd(port: u16) -> Result<()> {
     Ok(())
 }
 
-fn print_list() -> Result<()> {
+async fn print_list() -> Result<()> {
     let cfg = load();
     if cfg.is_empty() {
         ui::say(&ui::paint(ui::Tone::Dim, "  no ports exposed. try: tunlion expose 8080"));
@@ -284,20 +295,24 @@ fn print_list() -> Result<()> {
     }
     let daemon = crate::daemon_alive();
     let state = bound_state(daemon);
+    let l3 = crate::l3_state::current().await;
+    let l3_ready = crate::l3_state::is_ready(&l3);
     ui::say("  exposed on this device's .mesh address:");
     for b in cfg {
         // Distinguish REQUESTED from SERVED. Printing "exposed" for a port that
         // never bound is what let addr+expose look trustworthy with no endpoint.
-        let mark = if state.bindings.get(&b.port) == Some(&b) {
+        let mark = if crate::expose::bound_now(&state, &b, l3_ready) {
             ui::paint(ui::Tone::Ok, "[bound]").to_string()
         } else if let Some(why) = state.errors.get(&b.port) {
             ui::paint(ui::Tone::Err, &format!("[NOT bound: {why}]")).to_string()
         } else if daemon.is_none() {
             ui::paint(ui::Tone::Warn, "[NOT bound: no running daemon]").to_string()
+        } else if !l3_ready {
+            ui::paint(ui::Tone::Warn, "[NOT bound: no live L3 endpoint]").to_string()
         } else if state.bindings.contains_key(&b.port) {
             ui::paint(ui::Tone::Warn, "[NOT bound: old target still serving]").to_string()
         } else {
-            ui::paint(ui::Tone::Warn, "[NOT bound: no live L3 endpoint]").to_string()
+            ui::paint(ui::Tone::Warn, "[NOT bound: no live listener]").to_string()
         };
         ui::say(&format!(
             "    :{} {} {}  ({}) {mark}",
@@ -523,6 +538,13 @@ mod tests {
             errors: Default::default(),
         };
         assert_eq!(classify_bind(&bound, &want, true), BindOutcome::Bound);
+        // A bound RECORD is not enough when the endpoint is gone: this is the
+        // Windows saved-but-NOT-bound case, and it must be a failure.
+        assert_eq!(
+            classify_bind(&bound, &want, false),
+            BindOutcome::NoEndpoint,
+            "a stale bind record must never mask a down L3 endpoint"
+        );
         let refused = BoundState {
             ports: vec![],
             bindings: Default::default(),
@@ -617,6 +639,46 @@ mod tests {
             "must wait for the new binding, not accept the old one"
         );
         assert_eq!(classify_bind(&bound_state(Some(pid)), &new, true), BindOutcome::Bound);
+    }
+
+    /// The stale-record bug the review found: a matching PID + exact binding is
+    /// not "bound" when the L3 endpoint is down. This is what `--list` and
+    /// `status` must use too.
+    #[test]
+    fn a_stale_binding_is_not_bound_when_l3_is_down() {
+        let b = Binding { port: 8080, target: "127.0.0.1:8080".into(), peers: None };
+        let state = BoundState {
+            ports: vec![8080],
+            bindings: [(8080, b.clone())].into_iter().collect(),
+            errors: Default::default(),
+        };
+        assert!(bound_now(&state, &b, true));
+        assert!(!bound_now(&state, &b, false), "L3 down means NOT bound");
+        let other = Binding { target: "127.0.0.1:9090".into(), ..b.clone() };
+        assert!(!bound_now(&state, &other, true), "old target is not this binding");
+    }
+
+    /// Exactly the reviewer's scenario: matching-PID bound record + L3 down.
+    /// `expose --list` and `status` call `bound_now`, so both stop claiming it.
+    #[test]
+    fn a_matching_pid_record_is_not_bound_when_l3_is_down() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("tunlion-bound-pid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let _restore = Restore(previous, dir);
+
+        let pid = std::process::id();
+        let b = Binding { port: 8080, target: "127.0.0.1:8080".into(), peers: None };
+        write_bound(pid, &[b.clone()], &[]);
+        let state = bound_state(Some(pid));
+        assert!(bound_now(&state, &b, true), "live endpoint + record is bound");
+        assert!(
+            !bound_now(&state, &b, false),
+            "matching PID is not enough when L3 is down"
+        );
     }
 
     #[test]

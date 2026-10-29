@@ -29,7 +29,7 @@
 # lib/fixture.sh) proves that before any gate runs.
 #
 # THE REVOCATION IS THE CERTIFICATE'S, NOT THE GRANT'S. `tunlion revoke
-# <device> --certificate` writes the durable `certRevoked` marker
+# <device> --to cut` writes the durable `certRevoked` marker
 # (identity_state.rs `set_device_revoked`) and touches nothing else -- gate B
 # asserts exactly that by diffing the store, so a reader can see that the
 # spoke's shell authority (its enrolment ceiling) is still fully in place when
@@ -63,7 +63,7 @@
 #   E   NEGATIVE ssh     -- `shell --ssh` refused with the revoked reason and
 #       NO further certificate is issued
 #   F   no ssh key was installed anywhere by A3/E (authorized_keys byte-equal)
-#   G   A/B CONTROL: `devices restore` and exec works again -- so C/D/E were
+#   G   A/B CONTROL: `promote` and exec works again -- so C/D/E were
 #       the revocation and not a broken link, a dead daemon or a lost secret.
 #   FORGET-REVOKES  `devices forget` on a live certificate holder revokes its
 #       KEY (revoked-keys.json) and frees the name; a fresh fleet-hello from
@@ -77,7 +77,7 @@
 #   AUTH-A/B/C under TUNLION_CAP_AUTHORITATIVE=1 on a restarted owner
 #       daemon: shell within the enrolment ceiling succeeds (A); exec
 #       outside the ceiling (transfer-only enrolment) is refused with the
-#       grant reason (B); revoke --certificate refuses too (C).
+#       grant reason (B); demote --to cut refuses too (C).
 #
 # G is the gate that stops this suite passing for the wrong reason. Without it
 # "everything is refused after the revoke" is equally satisfied by a harness
@@ -228,7 +228,7 @@ print(json.dumps({"caps":rec.get("caps"),"ceiling":rec.get("principalCeiling"),
                   "certRevoked":rec.get("certRevoked",False),
                   "hasCert":bool(rec.get("deviceCert"))},sort_keys=True))
 PY
-"${O_ENV[@]}" "$BIN" --server "$SERVER" revoke "$SPOKE" --certificate --yes >"$WORK/revoke.log" 2>&1
+"${O_ENV[@]}" "$BIN" --server "$SERVER" demote "$SPOKE" --to cut --yes >"$WORK/revoke.log" 2>&1
 rcRev=$?
 python3 - "$DA/devices.json" "$SPOKE" >"$WORK/rec.after" <<'PY'
 import json,sys
@@ -249,7 +249,7 @@ ok = (b["certRevoked"] is False and a["certRevoked"] is True
 sys.exit(0 if ok else 1)
 PY
 then
-  ok "gateB: revoke --certificate set certRevoked and left the shell ceiling intact"
+  ok "gateB: demote --to cut set certRevoked and left the shell ceiling intact"
 else
   echo "-- revoke.log --"; cat "$WORK/revoke.log"
   bad "gateB: the revoke did not isolate the certificate (rc=$rcRev)"
@@ -324,7 +324,7 @@ fi
 # revocation -- a dead daemon, a torn-down link, a lost secret -- restoring
 # the record cannot bring exec back. It must.
 say "G: restore the certificate and the same exec works again"
-"${O_ENV[@]}" "$BIN" --server "$SERVER" devices restore "$SPOKE" >"$WORK/restore.log" 2>&1
+"${O_ENV[@]}" "$BIN" --server "$SERVER" promote "$SPOKE" >"$WORK/restore.log" 2>&1
 sleep 8
 OUTG=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo FLEET-RESTORED-OK 2>"$WORK/G.err" </dev/null)
 rcG=$?
@@ -649,8 +649,8 @@ else
 fi
 
 # ================================================================== GATE AUTH-C =
-say "AUTH-C: revoke --certificate refuses under authoritative too"
-"${O_ENV[@]}" "$BIN" --server "$SERVER" revoke "$SPOKE" --certificate --yes >"$WORK/revoke-auth.log" 2>&1
+say "AUTH-C: demote --to cut refuses under authoritative too"
+"${O_ENV[@]}" "$BIN" --server "$SERVER" demote "$SPOKE" --to cut --yes >"$WORK/revoke-auth.log" 2>&1
 rcRevAC=$?
 # Counted, not grepped: the line must be NEW, from this exec, not left over.
 ac_reason_before=$(grep -c "exec refused: device revoked" "$WORK/up-auth.log" 2>/dev/null || true)

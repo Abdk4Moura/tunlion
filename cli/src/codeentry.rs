@@ -389,7 +389,10 @@ pub struct PickOpts<'a> {
 pub enum Picked {
     Item(usize),
     Key(char),
+    /// Esc / q: go back.
     Cancelled,
+    /// Ctrl-C. Callers that do not tell it apart treat it as Cancelled.
+    Interrupted,
 }
 
 /// The digit that answers item `i` directly, when the list is short enough for
@@ -509,7 +512,7 @@ pub(crate) fn summary_line(item: &str) -> String {
 pub fn pick(header: &str, items: &[String]) -> std::io::Result<Option<usize>> {
     match pick_opts(header, items, PickOpts::default())? {
         Picked::Item(i) => Ok(Some(i)),
-        Picked::Key(_) | Picked::Cancelled => Ok(None),
+        Picked::Key(_) | Picked::Cancelled | Picked::Interrupted => Ok(None),
     }
 }
 
@@ -555,8 +558,8 @@ pub fn pick_opts(header: &str, items: &[String], opts: PickOpts<'_>) -> std::io:
             continue;
         }
         match k.code {
-            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break Picked::Cancelled,
-            KeyCode::Char('\u{3}') => break Picked::Cancelled,
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break Picked::Interrupted,
+            KeyCode::Char('\u{3}') => break Picked::Interrupted,
             KeyCode::Up | KeyCode::Char('k') => sel = if sel == 0 { items.len() - 1 } else { sel - 1 },
             KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % items.len(),
             KeyCode::Home => sel = 0,

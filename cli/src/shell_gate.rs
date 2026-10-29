@@ -288,7 +288,7 @@ mod tests {
     // recorded as verdict debt behind an ignored placeholder here. The debt is
     // paid LIVE instead, by `cli/tests/fleet-cert-gates.sh`, which enrols a
     // real certified device (`add --for` / `join`), revokes its CERTIFICATE
-    // (`revoke <device> --certificate`) and asserts all three paths -- exec,
+    // (`demote <device> --to cut`) and asserts all three paths -- exec,
     // pty and ssh-sign -- refuse it, with a restore control so a broken link
     // cannot pass as a revocation. Keep that gate and this matrix together:
     // the matrix pins the decision, the gate pins that the decision is reached

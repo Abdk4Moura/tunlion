@@ -151,7 +151,7 @@ echo "## kim pair rc=$kpair caps '$k0' -> grant $k1b '$k1' -> revoke $k2b '$k2'"
 echo "## dana grant mount (past its ceiling) ok=$d1b; revoke shell (from its ceiling) ok=$d2b"
 if [ "$kpair" = 0 ] && [ "$k1b" = True ] && echo " $k1 " | grep -q ' shell ' && [ "$k2b" = True ] && ! echo " $k2 " | grep -q ' shell ' \
    && [ "$d1b" = False ] && echo "$d1m" | grep -q "cannot widen a ceiling" \
-   && [ "$d2b" = False ] && echo "$d2m" | grep -q -- "--certificate"; then
+   && [ "$d2b" = False ] && echo "$d2m" | grep -q -- "demote .* --to cut"; then
   ok "G: grant and revoke changed kim's caps; a grant past dana's ceiling and a revoke of a ceiling cap were refused with the CLI's own advice"
 else
   bad "G grant/revoke"; echo "$d1m"; echo "$d2m"; tail -n 5 "$WORK/k-add.log" "$WORK/k-join.log"

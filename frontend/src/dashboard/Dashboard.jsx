@@ -250,6 +250,57 @@ function Devices({ A }) {
   )
 }
 
+// The same ladder `tunlion promote` / `tunlion demote` shows: the rungs, the
+// current one marked, only the legal moves offered, a confirm that says what
+// changes and how to undo it.
+function Ladder({ A, name }) {
+  const { T } = useT()
+  const [pick, setPick] = React.useState(null)
+  const l = (A.state.ladder || []).find((x) => x.name === name)
+  if (!l) return null
+  const back = (m) => (m.dir === 'promote' ? 'demote' : 'promote')
+  const apply = (m) => {
+    setPick(null)
+    A.run(m.dir, { device: name, to: m.to }, `${name} is now ${m.label}. Undo: ${m.undo}`,
+      () => A.run(back(m), { device: name, to: l.rung }, `Undone: ${name} is ${l.label} again.`))
+  }
+  return (
+    <Card testid="ladder">
+      <Section>Change what {name} can do</Section>
+      {l.kind === 'theirs' && <div style={{ fontSize: 12.5, color: T.sub, marginBottom: 6 }}>Someone else's device: there is no "your device" rung, these are what it may do here.</div>}
+      <div style={{ display: 'grid', gap: 2 }}>
+        {l.rungs.slice().reverse().map((g) => (
+          <div key={g.rung} data-testid={'rung-' + g.rung} data-current={g.rung === l.rung ? 'yes' : 'no'} style={{ display: 'flex', gap: 10, alignItems: 'baseline', padding: '4px 0' }}>
+            <span aria-hidden="true" style={{ color: g.rung === l.rung ? T.accInk : T.sub }}>{g.rung === l.rung ? '●' : '○'}</span>
+            <span style={{ fontWeight: g.rung === l.rung ? 700 : 400, minWidth: 190 }}>{g.label}</span>
+            <span style={{ fontSize: 13, color: g.rung === 'shell' ? T.bad : T.sub }}>{g.meaning}</span>
+          </div>
+        ))}
+      </div>
+      {pick
+        ? (
+          <div data-testid="ladder-confirm" style={{ display: 'grid', gap: 6, marginTop: 10 }}>
+            <b>{name}: {l.label} → {pick.label}</b>
+            {pick.says.map((x, i) => <span key={i} style={{ fontSize: 13, color: pick.to === 'shell' ? T.bad : T.sub }}>{x}</span>)}
+            <span style={{ fontSize: 12.5, color: T.sub }}>Undo: {pick.undo}</span>
+            <span style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <Btn kind={pick.to === 'shell' || pick.to === 'cut' ? 'dan' : 'pri'} small testid="ladder-yes" onClick={() => apply(pick)}>{pick.to === 'cut' ? `Yes, cut off ${name}` : pick.to === 'shell' ? `Yes, ${name} may act as me` : 'Yes, do it'}</Btn>
+              <Btn kind="ghost" small onClick={() => setPick(null)}>No, go back</Btn>
+            </span>
+          </div>
+        )
+        : (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
+            {l.moves.length === 0 && <span style={{ fontSize: 13, color: T.sub }}>Nothing to change from here.</span>}
+            {l.moves.map((m) => m.needs_terminal
+              ? <span key={m.to} data-testid={'move-' + m.to} style={{ fontSize: 13, color: T.sub }}>To make it {m.label}: run <code>tunlion promote {name}</code> in a terminal; {name} joins once with a code.</span>
+              : <Btn key={m.to} small testid={'move-' + m.to} kind={m.dir === 'promote' ? 'sec' : 'ghost'} onClick={() => (m.confirm ? setPick(m) : apply(m))}>{m.dir === 'promote' ? 'Promote to' : 'Demote to'} {m.label}</Btn>)}
+          </div>
+        )}
+    </Card>
+  )
+}
+
 function Device({ A, sel }) {
   const { T, narrow } = useT()
   const [confirm, setConfirm] = React.useState(null)
@@ -267,6 +318,7 @@ function Device({ A, sel }) {
       <Title right={<span style={{ display: 'flex', gap: 8 }}>{r.online != null && <Tag tone={r.online ? 'ok' : 'n'}>{r.online ? 'online' : 'idle'}</Tag>}</span>} sub={r.online ? 'online now' : 'last seen ' + ago(A.state.now, r.lastSeen)}>{r.name}</Title>
       <Line>{r.line}</Line>
       {r.caveats.length > 0 && <div style={{ fontSize: 13.5, color: T.sub }}>{r.caveats.join(' ')}</div>}
+      <Ladder A={A} name={r.name} />
       {!gone && (
         <div style={{ display: 'grid', gridTemplateColumns: narrow ? '1fr' : '1fr 1fr', gap: 16 }}>
           <Card testid="caps-here">

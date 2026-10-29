@@ -69,7 +69,7 @@ fi
 # reason reaches the initiator's stderr. Exit 0 is the #223 false success; a
 # still-running process is a wedge (the terminal stopped but cannot be reaped).
 say B
-env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" demote bravo --to cut --yes >"$WORK/revoke.out" 2>&1
 revoke_rc=$?
 echo "## revoke exit code: $revoke_rc"
 sleep "$GRACE"
