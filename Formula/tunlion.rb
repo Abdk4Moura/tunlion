@@ -1,24 +1,26 @@
 # Homebrew formula for the tunlion CLI — lives in Abdk4Moura/homebrew-tap.
 # Regenerated per release by packaging/release-followup.sh.
+# Placeholder until cli-v0.9.2 is tagged: the zero checksums make any install
+# fail closed, and release-followup.sh overwrites this file with the real ones.
 class Tunlion < Formula
   desc "P2P file transfer between terminals and browsers - no upload, no account"
   homepage "https://tunlion.autumated.com"
-  version "0.9.1"
+  version "0.9.2"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.1/tunlion-aarch64-apple-darwin.tar.gz"
-      sha256 "375f059cc82d7e669ec4252a7c9113c83abf37307316e0a30ba9135ef0ddc42d"
+      url "https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.2/tunlion-aarch64-apple-darwin.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     else
-      url "https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.1/tunlion-x86_64-apple-darwin.tar.gz"
-      sha256 "21307e25f58e5908810ac59057a1fc966e83a95e7b7cf646bb1dec37296e17cc"
+      url "https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.2/tunlion-x86_64-apple-darwin.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end
 
   on_linux do
-    url "https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.1/tunlion-x86_64-unknown-linux-musl.tar.gz"
-    sha256 "d2a7c82902880b0ad3875cb47fd19837960b58681359c21075aaef63e07442b3"
+    url "https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.2/tunlion-x86_64-unknown-linux-musl.tar.gz"
+    sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   end
 
   def install

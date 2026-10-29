@@ -20,7 +20,7 @@ Set-Content -Path "$stage\wintun.dll" -Value 'placeholder-for-compile' -NoNewlin
 
 $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
 if (-not $iscc) { $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' }
-& $iscc '/DAppVersion=0.9.1' 'packaging\windows-installer\tunlion.iss'
+& $iscc '/DAppVersion=0.9.2' 'packaging\windows-installer\tunlion.iss'
 if ($LASTEXITCODE -ne 0) { throw "ISCC exited $LASTEXITCODE" }
 
 $out = 'packaging\windows-installer\Output\TunlionSetup.exe'
