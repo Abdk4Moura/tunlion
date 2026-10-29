@@ -138,7 +138,11 @@ jobs:
           ( cd "$old" && grep " $asset\$" SHA256SUMS | sha256sum -c - \
             && echo "d2a7c82902880b0ad3875cb47fd19837960b58681359c21075aaef63e07442b3  $asset" | sha256sum -c - \
             && tar -xzf "$asset" )
-          TUNLION_BIN=target/debug/tunlion TUNLION_OLD_BIN="$(find "$old" -name tunlion -type f | head -1)" \
+          # The suite's own `cargo test` rebuilt target/debug/tunlion without
+          # the hooks; build them back in (cached) and run from a copy.
+          ( cd cli && cargo build --bin tunlion --features test-hooks )
+          cp target/debug/tunlion "$RUNNER_TEMP/tunlion-hooks"
+          TUNLION_BIN="$RUNNER_TEMP/tunlion-hooks" TUNLION_OLD_BIN="$(find "$old" -name tunlion -type f | head -1)" \
             bash cli/tests/identity-expose-gates.sh
 
       - name: Preserve the run log

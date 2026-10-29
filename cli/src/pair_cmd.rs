@@ -1179,6 +1179,9 @@ async fn pair_with_purpose(
     // that acknowledges identity-expose knows to wait for it.
     let exposes_at_start = temporary.is_none() && local_device_cert().is_some();
     cer.set_exposes(exposes_at_start);
+    if exposes_at_start {
+        expose_x.promise();
+    }
     // A joining client waits for the host's first element so the authenticated
     // purpose can choose temporary access without ever entering permanent pairing.
     let mut host_element_received = creator;
@@ -1886,6 +1889,8 @@ async fn pair_with_purpose(
                             let session = crate::temporary_session::Session::recipient(binding);
                             cer = session.ceremony(&my_words, &my_nameplate);
                             temporary = Some(session);
+                            // Temporary access sends and expects no identity frames.
+                            expose_x = filament_peerloop::expose::ExposeExchange::new();
                         }
                         host_element_received = true;
                     }

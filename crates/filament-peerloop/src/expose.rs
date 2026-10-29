@@ -72,6 +72,9 @@ pub enum Unmet {
 pub struct ExposeExchange {
     /// Our frame, built once; every copy is these bytes.
     frame: Option<Value>,
+    /// We told the peer we will send a frame (`exposes: true`): until it is
+    /// acknowledged we may not succeed, even before it was built or sent.
+    promised: bool,
     sent: bool,
     resend: Resend,
     acked: bool,
@@ -93,6 +96,14 @@ impl ExposeExchange {
         if self.frame.is_none() {
             self.frame = Some(frame);
         }
+    }
+
+    /// We advertised `exposes: true`. Without this a side whose frame was not
+    /// built yet (its secret agreed one tick before the send) completed with
+    /// nothing outstanding, and its peer, told a certificate was coming,
+    /// failed while this side said "connected".
+    pub fn promise(&mut self) {
+        self.promised = true;
     }
 
     /// Whether our frame was built (we hold a certificate to present).
@@ -174,7 +185,7 @@ impl ExposeExchange {
     /// it also advertised `exposes: true`. A refused certificate does not
     /// wait: it fails now (see [`ExposeExchange::unmet`]).
     pub fn waiting(&self, peer_acks: bool, peer_will_expose: bool) -> bool {
-        let ours = self.sent && peer_acks && !self.acked;
+        let ours = (self.sent || self.promised) && peer_acks && !self.acked;
         let theirs = peer_will_expose && !self.peer_cert && self.refused.is_none();
         ours || theirs
     }
@@ -188,7 +199,7 @@ impl ExposeExchange {
                 None => Unmet::CertMissing,
             });
         }
-        if self.sent && peer_acks && !self.acked {
+        if (self.sent || self.promised) && peer_acks && !self.acked {
             return Some(Unmet::NotAcknowledged);
         }
         None
@@ -319,6 +330,22 @@ mod tests {
         assert!(!b.on_peer_frame(t0, Verdict::Refused("seal does not open".into()), true));
         assert!(!b.waiting(true, true), "refused: fail now, do not wait");
         assert_eq!(b.unmet(true, true), Some(Unmet::CertRefused("seal does not open".into())));
+    }
+
+    /// The promise binds before the frame exists: a side whose secret was
+    /// agreed a tick before its frame went out must not complete in between.
+    #[test]
+    fn a_promised_frame_is_waited_for_before_it_is_built() {
+        let t0 = Instant::now();
+        let mut a = ExposeExchange::new();
+        a.promise();
+        assert!(a.waiting(true, false), "promised, not yet built: wait");
+        assert_eq!(a.unmet(true, false), Some(Unmet::NotAcknowledged));
+        assert!(!a.waiting(false, false), "a peer that does not acknowledge is not waited for");
+        a.offer(frame("aa"));
+        assert!(a.take_due(t0, true).is_some());
+        assert!(a.on_ack("aa"));
+        assert!(!a.waiting(true, false));
     }
 
     #[test]

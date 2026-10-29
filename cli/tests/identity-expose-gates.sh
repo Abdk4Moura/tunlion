@@ -107,6 +107,7 @@ if [ "$RC_A" = 0 ] && [ "$RC_B" = 0 ] && [ "$ca" != absent ] && [ "$ca" != None 
   ok "E2: 3 frames lost, the certificate landed on the 4th copy"
 else
   bad "E2 lost first frames"; show e2
+  [ "$dropped" = 0 ] && echo "## no frame was dropped: $BIN was built without --features test-hooks" 
 fi
 
 # ------------------------------------------------------------------ E3 --
