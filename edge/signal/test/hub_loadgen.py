@@ -47,8 +47,11 @@ import time
 
 try:
     from websockets.asyncio.client import connect as ws_connect
-except ImportError:  # websockets < 13
-    from websockets import connect as ws_connect  # type: ignore
+except ImportError:  # websockets < 13, or absent (aggregate needs no client)
+    try:
+        from websockets import connect as ws_connect  # type: ignore
+    except ImportError:
+        ws_connect = None
 
 
 def pct(xs, p):
@@ -634,7 +637,7 @@ def run_fleet(a):
 
 def aggregate(a):
     rows = []
-    for f in sorted(glob.glob(os.path.join(a.indir, "**", "*.jsonl"), recursive=True)):
+    for f in sorted(glob.glob(os.path.join(a.indir, "**", "*-shard*.jsonl"), recursive=True)):
         with open(f) as fh:
             rows += [json.loads(line) for line in fh if line.strip()]
     out = []
