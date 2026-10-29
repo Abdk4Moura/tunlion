@@ -35,7 +35,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${TUNLION_BIN:?set TUNLION_BIN to the tunlion binary under test}"
+BIN="$(realpath "${TUNLION_BIN:?set TUNLION_BIN to the tunlion binary under test}")"
 PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/carrier-proxy.XXXXXX")"
 chmod 755 "$WORK"
