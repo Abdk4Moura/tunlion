@@ -35,7 +35,8 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     name: cargo test (linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # A passing run takes about 24 minutes, so 25 cancelled healthy runs.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Check Unix installer syntax

@@ -418,6 +418,18 @@ pub trait Transport: Send + Sync {
     async fn drain_finish(&self) -> Result<()> {
         self.flush().await
     }
+    /// Must the final teardown still run `drain_finish()` once the receiver has
+    /// delivery-acked every file? The app-level ack is sent only after the
+    /// receiver hashed every byte and matched the offered digest, so for a
+    /// transport whose drain only waits for the transport-level ack of bytes
+    /// already sent (the DataChannel's SCTP SACK of its tail, which the
+    /// cross-network D harness measured holding the exit about 1 s after the
+    /// delivery-ack) the drain adds nothing and the default is `false`. The
+    /// direct-QUIC transport returns `true`: its drain also ends the stream
+    /// (`finish()`), which the receiver reads as the clean end of the link.
+    fn drain_after_delivery_ack(&self) -> bool {
+        false
+    }
     fn max_payload(&self) -> usize;
     /// Which half of the L2 sid space THIS end allocates from. Both ends of a
     /// link MUST return opposite values (derived from the deterministic `polite`

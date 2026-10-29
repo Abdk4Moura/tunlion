@@ -988,7 +988,7 @@ fn keep_endpoint_alive(ep: Endpoint, conn: &quinn::Connection) {
     tokio::spawn(async move {
         c.closed().await;
         #[cfg(debug_assertions)]
-        eprintln!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?} — connection closed, dropping endpoint");
+        eprintln!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?}: connection closed, dropping endpoint");
         drop(ep);
     });
 }
@@ -1376,6 +1376,11 @@ impl Transport for DirectTransport {
             Ok(Err(e)) => Err(anyhow!("direct drain: peer dropped before full ack: {e}")),
             Err(_) => Err(anyhow!("direct drain: timed out after 180s awaiting peer ack")),
         }
+    }
+
+    fn drain_after_delivery_ack(&self) -> bool {
+        // The drain is also how the receiver sees the stream end cleanly.
+        true
     }
 
     fn max_payload(&self) -> usize {
