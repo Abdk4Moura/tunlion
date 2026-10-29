@@ -74,7 +74,7 @@ export function exposure(state, rs, done) {
   }
   for (const r of rs) {
     if (r.group === 'gone') continue
-    if (r.tier && r.tier !== 'FLEET' && r.tier !== 'EXTERNAL') out.push({ id: 'tr-' + r.name, risk: 'mid', name: r.name, title: `${r.name} is trusted without a certified identity`, sub: r.caveats.join(' ') || r.line, fix: 'Review', open: r.name })
+    if (r.tier === 'NEEDS REVIEW') out.push({ id: 'tr-' + r.name, risk: 'mid', name: r.name, title: `${r.name} is paired, not yet one of your devices`, sub: r.caveats.join(' ') || r.line, fix: 'Review', open: r.name })
   }
   for (const r of rs) {
     const shell = r.live.find((c) => c.action === 'shell')

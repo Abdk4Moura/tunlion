@@ -157,8 +157,9 @@ jobs:
             # 28: W1-W6 (real two-process warm reuse, explicit cold fallback,
             # -q silence, frozen-peer silence bound, no replay when the daemon
             # dies, and the PTY wait-line timing/erase) joined the 22 that
-            # included Q1/Q2, R, and L's target-user environment.
-            [cli/tests/exec-gates.sh]=28
+            # included Q1/Q2, R, and L's target-user environment. 29: S
+            # (`tunlion status` run through exec sees the serving daemon).
+            [cli/tests/exec-gates.sh]=29
             [cli/tests/sync-gates.sh]=18
             # 23 gate slots (FORGET-REFUSED, from #385, is the 23rd). This was 24 while gateRECON existed, but RECON read
             # AUTH-A's own exec result and printed a second PASS for it, so one

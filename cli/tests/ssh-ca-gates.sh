@@ -70,10 +70,10 @@ command -v ssh >/dev/null || { echo "no ssh on PATH"; exit 2; }
 
 DA="$WORK/A"; DB="$WORK/B"; mkdir -p "$DA" "$DB"
 SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
-printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
+printf '[{"name":"boxb","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
+printf '[{"name":"boxa","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
-A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA)
+A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa)
 B_USER="$(id -un)"
 # B's daemon HOME: where the per-user CA trust line (and any managed key
 # block) is written. The temp sshd reads authorized_keys from here.
@@ -103,12 +103,12 @@ chmod 600 "$WORK/hooked-hostkey"
 printf 'Port 9123\nHostKey %s\nListenAddress 127.0.0.1\nPidFile %s\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nPermitRootLogin prohibit-password\nLogLevel VERBOSE\nAuthorizedKeysFile %s\n' "$WORK/hooked-hostkey" "$SSHD/sshd.pid" "$BHOME/.ssh/authorized_keys" > "$WORK/hooked-sshd-config"
 # Byte copy of the config as WE wrote it: gate C asserts arming left it alone.
 cp "$WORK/hooked-sshd-config" "$WORK/sshd-config.as-written"
-env TUNLION_L2=1 HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxB USER="$B_USER" \
+env TUNLION_L2=1 HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxb USER="$B_USER" \
   TUNLION_SSH_HOSTKEY="$WORK/hooked-hostkey.pub" \
   "${HOOK_ENV[@]}" "$BIN" up --dir "$WORK/Bdrop" --server "$SERVER" >"$WORK/up.log" 2>&1 &
 pids+=($!)
 sleep 3
-env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
+env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxa shell >"$WORK/grant.log" 2>&1
 
 # A ~10-minute grant window, seeded AFTER the grant (grant rewrites the
 # device record and would wipe a pre-seeded capExpires -- gate D caught
@@ -120,7 +120,7 @@ import json,sys
 p,exp=sys.argv[1],int(sys.argv[2])
 arr=json.load(open(p))
 for d in arr:
-    if d.get("name")=="boxA":
+    if d.get("name")=="boxa":
         d.setdefault("capExpires",{})["shell"]=exp
 json.dump(arr,open(p,"w"))
 PY2
@@ -145,7 +145,7 @@ AK_BEFORE="$WORK/ak.before"; AK_AFTER="$WORK/ak.after"
 # authorized_keys holds only the CA trust line (no plain keys), and sshd's
 # own log must name a certificate as the accepted credential.
 say A
-OUTA=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxB -- 'echo SSH-CA-OK; id -un' 2>"$WORK/A.err" </dev/null)
+OUTA=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxb -- 'echo SSH-CA-OK; id -un' 2>"$WORK/A.err" </dev/null)
 rcA=$?
 echo "## (cert login) rc=$rcA"
 echo "$OUTA" | sed 's/^/##   /'
@@ -161,8 +161,8 @@ fi
 # ===================================================================== GATE B ==
 # NEGATIVE revoked: same command refused after the grant goes (nonzero).
 say B
-env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" revoke boxA shell -y >"$WORK/revoke.log" 2>&1
-OUTB=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxB -- 'echo SHOULD-NOT-RUN' 2>"$WORK/B.err" </dev/null)
+env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" revoke boxa shell -y >"$WORK/revoke.log" 2>&1
+OUTB=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxb -- 'echo SHOULD-NOT-RUN' 2>"$WORK/B.err" </dev/null)
 rcB=$?
 echo "## (revoked) rc=$rcB out='$OUTB'"
 if [ "$rcB" != "0" ] \
@@ -259,9 +259,9 @@ fi
 # cached bootstrap hits 255, the rebootstrap (cert mode too) retries, ssh
 # fails 255 again -- and STILL nothing is installed. Proves the 255 retry
 # path honors cert-only.
-env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grantE2.log" 2>&1
+env HOME="$BHOME" TUNLION_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxa shell >"$WORK/grantE2.log" 2>&1
 kill "$SSHD_PID" 2>/dev/null; sleep 1
-OUTE2=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxB -- 'echo NOPE' 2>"$WORK/E2.err" </dev/null)
+OUTE2=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxb -- 'echo NOPE' 2>"$WORK/E2.err" </dev/null)
 rcE2=$?
 echo "## (dead sshd) rc=$rcE2"
 [ -f "$AK_FILE" ] && cp "$AK_FILE" "$WORK/ak.after2" || : > "$WORK/ak.after2"

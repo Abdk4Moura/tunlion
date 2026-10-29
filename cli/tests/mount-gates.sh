@@ -59,10 +59,10 @@ curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat
 # --- two mutually-trusted devices: reciprocal pair secret (what `pair` mints) ---
 DA="$WORK/A"; DB="$WORK/B"; mkdir -p "$DA" "$DB"
 SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
-printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
+printf '[{"name":"boxb","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
+printf '[{"name":"boxa","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
-# --- the directory boxB will serve, seeded with known fixtures ---
+# --- the directory boxb will serve, seeded with known fixtures ---
 SERVED="$WORK/served"; mkdir -p "$SERVED/subdir"
 head -c 1048576 /dev/urandom > "$SERVED/big.bin"
 printf 'hello mesh mount\n' > "$SERVED/hello.txt"
@@ -73,23 +73,23 @@ printf 'non-utf8-name-payload' > "$SERVED/$WEIRD"
 
 # Start the acceptor (side B) ONCE. TUNLION_L2=1 opts into the L2/mount path.
 B_DROP="$WORK/Bdrop"; mkdir -p "$B_DROP"
-start_boxB() {
-  TUNLION_CONFIG_DIR="$DB" TUNLION_L2=1 TUNLION_NAME=boxB \
+start_boxb() {
+  TUNLION_CONFIG_DIR="$DB" TUNLION_L2=1 TUNLION_NAME=boxb \
     "$BIN" up --dir "$B_DROP" --server "$SERVER" >"$WORK/up.log" 2>&1 &
   BPID=$!
   pids+=("$BPID")
   sleep 3
 }
 BPID=""
-start_boxB
+start_boxb
 
-A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_L2=1 TUNLION_NAME=boxA)
+A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_L2=1 TUNLION_NAME=boxa)
 
 # Helper: mount $SERVED at $1 in the background; wait until it is live.
 start_mount() {
   local mnt="$1"; local remote="$2"; local log="$3"
   MNTS+=("$mnt")
-  "${A_ENV[@]}" "$BIN" mount boxB "$remote" "$mnt" --server "$SERVER" >"$log" 2>&1 &
+  "${A_ENV[@]}" "$BIN" mount boxb "$remote" "$mnt" --server "$SERVER" >"$log" 2>&1 &
   echo $! > "$WORK/mount.pid"
   pids+=($!)
   for _ in $(seq 1 60); do
@@ -231,16 +231,16 @@ fi
 # path that rejects an untrusted peer (there the stream EOFs instead of ENOENT);
 # either way: fail loud pre-mount, no stale dir.
 #
-# Restart boxB first so this is a FRESH first establishment (a second cold
+# Restart boxb first so this is a FRESH first establishment (a second cold
 # direct-quic establish to the same peer is flaky in this sandbox and would mask
 # the server-side refusal we are actually testing).
 say 6
 kill "$BPID" 2>/dev/null; sleep 2
-start_boxB
+start_boxb
 BADMNT="$WORK/badmnt"  # must NOT exist beforehand so we can assert no stale dir
 rc6=1
 for attempt in 1 2 3; do
-  timeout 30 "${A_ENV[@]}" "$BIN" mount boxB "$SERVED/does-not-exist" "$BADMNT" \
+  timeout 30 "${A_ENV[@]}" "$BIN" mount boxb "$SERVED/does-not-exist" "$BADMNT" \
     --server "$SERVER" >"$WORK/m6.log" 2>&1
   rc6=$?
   # A clean server refusal names ENOENT / "refused"; retry only on a transport

@@ -1599,7 +1599,8 @@ async fn recv_run(
                     };
                     match host.l3_start(&cidr, 1280, identity, mode) {
                         Ok(m) => {
-                            l3_status = L3Status::ready(l3_mode_word(m.is_userspace()));
+                            l3_status = L3Status::ready(l3_mode_word(m.is_userspace()))
+                                .with_v4_problem(m.native_v4_problem());
                             if let Ok(text) = serde_json::to_string(&l3_status) {
                                 host.l3_state_report(&text);
                             }
@@ -5159,7 +5160,7 @@ async fn recv_run(
                                     // direct vs relayed. Always shown, even under -q.
                                     log.debug(&format!(
                                         "    {}",
-                                        log.paint(Tone::Dim, &format!("route: {r}"))
+                                        log.paint(Tone::Dim, &format!("route: {}", p.route_shown(&r).await))
                                     ));
                                     // Relay honesty (§3.3): the quiet `route:` line
                                     // is legible but not loud. When the route is

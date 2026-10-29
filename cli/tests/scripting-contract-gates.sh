@@ -83,15 +83,15 @@ curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat
 # daemon of its own (that is also J2's "local daemon down").
 DA="$WORK/cfg-A"; DB="$WORK/cfg-B"; mkdir -p "$DA" "$DB"
 A() { env TUNLION_CONFIG_DIR="$DA" "$@"; }
-env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name boxA --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1
+env TUNLION_CONFIG_DIR="$DA" "$BIN" init --name boxa --recovery-file "$DA/rec.txt" --yes >/dev/null 2>&1
 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$WORK/A-drop" >"$WORK/A-up.log" 2>&1 &
 ADAEMON=$!; pids+=($ADAEMON)
 sleep 3
-env TUNLION_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for boxB --out "$WORK/inv.txt" --yes >"$WORK/add.log" 2>&1
-env TUNLION_CONFIG_DIR="$DB" timeout 45 "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" --name boxB --no-interactive >"$WORK/join.log" 2>&1
+env TUNLION_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for boxb --out "$WORK/inv.txt" --yes >"$WORK/add.log" 2>&1
+env TUNLION_CONFIG_DIR="$DB" timeout 45 "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" --name boxb --no-interactive >"$WORK/join.log" 2>&1
 kill "$ADAEMON" 2>/dev/null; sleep 2
-if ! TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q boxB; then
-  echo "setup: boxB did not join"; tail -5 "$WORK/add.log" "$WORK/join.log"; exit 2
+if ! TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q boxb; then
+  echo "setup: boxb did not join"; tail -5 "$WORK/add.log" "$WORK/join.log"; exit 2
 fi
 DROP="$WORK/B-drop"; mkdir -p "$DROP"
 start_b() {
@@ -107,7 +107,7 @@ delivered() { [ -f "$DROP/$(basename "$1")" ] && cmp -s "$1" "$DROP/$(basename "
 # ==================================================================== J1a ======
 say "J1a: send 2>&1 | head -1 is truthful"
 head -c 200000 /dev/urandom >"$WORK/pipetest.txt"
-env TUNLION_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/pipetest.txt" --to boxB 2>&1 | head -1 >"$WORK/j1a.head"
+env TUNLION_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/pipetest.txt" --to boxb 2>&1 | head -1 >"$WORK/j1a.head"
 rc=${PIPESTATUS[0]}
 sleep 1
 d=no; delivered "$WORK/pipetest.txt" && d=yes
@@ -122,7 +122,7 @@ fi
 # ==================================================================== J1b ======
 say "J1b: send --json | head -c 1 is truthful"
 head -c 200000 /dev/urandom >"$WORK/pipejson.txt"
-env TUNLION_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/pipejson.txt" --to boxB --json 2>"$WORK/j1b.err" | head -c 1 >/dev/null
+env TUNLION_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/pipejson.txt" --to boxb --json 2>"$WORK/j1b.err" | head -c 1 >/dev/null
 rc=${PIPESTATUS[0]}
 sleep 1
 d=no; delivered "$WORK/pipejson.txt" && d=yes
@@ -136,7 +136,7 @@ fi
 
 # ===================================================================== J2 ======
 say "J2: reach --json with no local daemon"
-env TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" --server "$SERVER" reach boxB --json >"$WORK/j2.json" 2>"$WORK/j2.err"
+env TUNLION_CONFIG_DIR="$DA" timeout 60 "$BIN" --server "$SERVER" reach boxb --json >"$WORK/j2.json" 2>"$WORK/j2.err"
 rc=$?
 echo "## rc=$rc"; cat "$WORK/j2.json"
 if "$PYV" - "$WORK/j2.json" "$rc" <<'PY'
@@ -166,7 +166,7 @@ fi
 j3() {  # $1 signal name, $2 expected exit
   local out="$WORK/j3-$1.json" rc
   ( sleep 60 ) | env TUNLION_CONFIG_DIR="$DA" timeout --preserve-status -s "$1" 4 \
-      "$BIN" --server "$SERVER" send - --to boxB --json >"$out" 2>"$WORK/j3-$1.err"
+      "$BIN" --server "$SERVER" send - --to boxb --json >"$out" 2>"$WORK/j3-$1.err"
   rc=${PIPESTATUS[1]}
   echo "## $1: rc=$rc stdout: $(cat "$out")"
   "$PYV" - "$out" "$rc" "$2" "SIG$1" <<'PY'
@@ -195,7 +195,7 @@ sudo -n mount -t tmpfs -o "size=2m,uid=$(id -u),gid=$(id -g),mode=0700" tmpfs "$
 MOUNTS+=("$TINY")
 start_b "$TINY"
 head -c 3000000 /dev/urandom >"$WORK/three.bin"
-env TUNLION_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/three.bin" --to boxB --json >"$WORK/j5.json" 2>"$WORK/j5.err"
+env TUNLION_CONFIG_DIR="$DA" timeout 120 "$BIN" --server "$SERVER" send "$WORK/three.bin" --to boxb --json >"$WORK/j5.json" 2>"$WORK/j5.err"
 rc=$?
 echo "## rc=$rc"; cat "$WORK/j5.json"
 if "$PYV" - "$WORK/j5.json" "$rc" <<'PY'
@@ -293,8 +293,8 @@ DK3="$WORK/cfg-K3"; cp -a "$DA" "$DK3"
 printf '{garbage\n' >"$DK3/devices.json"
 env TUNLION_CONFIG_DIR="$DK3" timeout 20 "$BIN" devices >"$WORK/k3-dev.out" 2>"$WORK/k3-dev.err"; r1=$?
 env TUNLION_CONFIG_DIR="$DK3" timeout 20 "$BIN" devices --json >"$WORK/k3-json.out" 2>"$WORK/k3-json.err"; r2=$?
-env TUNLION_CONFIG_DIR="$DK3" timeout 30 "$BIN" --server "$SERVER" send "$WORK/small.bin" --to boxB >"$WORK/k3-send.out" 2>&1; r3=$?
-env TUNLION_CONFIG_DIR="$DK3" timeout 20 "$BIN" grant boxB shell -y >"$WORK/k3-grant.out" 2>&1; r4=$?
+env TUNLION_CONFIG_DIR="$DK3" timeout 30 "$BIN" --server "$SERVER" send "$WORK/small.bin" --to boxb >"$WORK/k3-send.out" 2>&1; r3=$?
+env TUNLION_CONFIG_DIR="$DK3" timeout 20 "$BIN" grant boxb shell -y >"$WORK/k3-grant.out" 2>&1; r4=$?
 echo "## devices rc=$r1 devices --json rc=$r2 send rc=$r3 grant rc=$r4"
 cat "$WORK/k3-dev.err" "$WORK/k3-json.out"
 if [ "$r1" = 2 ] && [ "$r2" = 2 ] && [ "$r3" = 2 ] && [ "$r4" != 0 ] \
@@ -320,7 +320,7 @@ DK5="$WORK/cfg-K5"; cp -a "$DA" "$DK5"
 : >"$DK5/devices.json"
 env TUNLION_CONFIG_DIR="$DK5" timeout 20 "$BIN" devices >"$WORK/k5-dev.out" 2>"$WORK/k5-dev.err"; r1=$?
 env TUNLION_CONFIG_DIR="$DK5" timeout 20 "$BIN" devices --json >"$WORK/k5-json.out" 2>"$WORK/k5-json.err"; r2=$?
-env TUNLION_CONFIG_DIR="$DK5" timeout 30 "$BIN" --server "$SERVER" send "$WORK/small.bin" --to boxB >"$WORK/k5-send.out" 2>&1; r3=$?
+env TUNLION_CONFIG_DIR="$DK5" timeout 30 "$BIN" --server "$SERVER" send "$WORK/small.bin" --to boxb >"$WORK/k5-send.out" 2>&1; r3=$?
 DK5R="$WORK/cfg-K5R"; cp -a "$DA" "$DK5R"
 : >"$DK5R/revoked-keys.json"
 env TUNLION_CONFIG_DIR="$DK5R" timeout 20 "$BIN" devices >"$WORK/k5-rev.out" 2>"$WORK/k5-rev.err"; r4=$?

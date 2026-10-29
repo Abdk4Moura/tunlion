@@ -182,6 +182,11 @@ const UNIX_PLATFORM_ENV: &[&str] = &[
     "XDG_RUNTIME_DIR",
 ];
 
+/// The variable that moves tunlion's config dir off its platform default. A
+/// daemon started with it serves THAT config dir, so a same-account child
+/// keeps it (see `build_env_for`).
+const CONFIG_DIR_ENV: &str = "TUNLION_CONFIG_DIR";
+
 /// The Unix default when the daemon has no usable PATH. It is the conventional
 /// system path, not a copy of any account's private bin directories.
 const UNIX_DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -287,6 +292,10 @@ fn build_env_for(
         ));
     }
 
+    let daemon_config_dir = daemon
+        .iter()
+        .find(|(k, _)| env_names_equal(k, CONFIG_DIR_ENV, windows))
+        .cloned();
     let mut out: Vec<(String, String)> = Vec::new();
     for (k, v) in daemon {
         if windows {
@@ -383,6 +392,18 @@ fn build_env_for(
                 let default = home.join(suffix);
                 ensure_env(&mut out, name, &default.to_string_lossy(), false);
             }
+        }
+    }
+
+    // The daemon's own config-dir override. A same-account child that runs
+    // `tunlion status` (or any tunlion verb) must find the daemon that served
+    // it; without this it fell back to the default config dir and reported
+    // "not running" while the daemon was alive. It is a path, not a
+    // credential, and it never follows a dropped (--shell-user) account,
+    // which has its own config dir.
+    if !dropped {
+        if let Some((_, v)) = daemon_config_dir {
+            set_env(&mut out, CONFIG_DIR_ENV, &v, windows);
         }
     }
 
@@ -1799,6 +1820,56 @@ mod tests {
         assert_eq!(env_value(&env, "SHELL"), Some("/bin/bash"));
         assert_eq!(env_value(&env, "SystemRoot"), None);
         assert_eq!(env_value(&env, "SSH_AUTH_SOCK"), None);
+    }
+
+    /// `tunlion exec <device> -- tunlion status` said "not running" while the
+    /// daemon served: the daemon ran with TUNLION_CONFIG_DIR, the child did not
+    /// get it, and so looked in the default config dir. A same-account child
+    /// keeps the daemon's config dir on both platforms; a dropped account never
+    /// inherits it; an explicit `--env` still wins.
+    #[test]
+    fn same_account_child_keeps_the_daemon_config_dir_and_a_dropped_one_does_not() {
+        let daemon = || {
+            vec![
+                ("HOME".to_string(), "/home/daemon".to_string()),
+                ("TUNLION_CONFIG_DIR".to_string(), "/srv/tunlion/cfg".to_string()),
+                ("TUNLION_AUTHKEY".to_string(), "secret".to_string()),
+            ]
+        };
+        let me = ExecUserContext {
+            name: "daemon".into(),
+            home: PathBuf::from("/home/daemon"),
+            shell: Some("/bin/sh".into()),
+            uid: Some(1000),
+        };
+        for windows in [false, true] {
+            let env = build_env_for(daemon(), &[], windows, &me, false).expect("same account");
+            assert_eq!(
+                env_value(&env, "TUNLION_CONFIG_DIR"),
+                Some("/srv/tunlion/cfg"),
+                "windows={windows}: a same-account child must find the daemon that served it"
+            );
+            assert_eq!(
+                env_value(&env, "TUNLION_AUTHKEY"),
+                None,
+                "windows={windows}: only the config dir crosses, never other TUNLION_ secrets"
+            );
+            let explicit = vec![("TUNLION_CONFIG_DIR".to_string(), "/elsewhere".to_string())];
+            let env = build_env_for(daemon(), &explicit, windows, &me, false).expect("explicit");
+            assert_eq!(env_value(&env, "TUNLION_CONFIG_DIR"), Some("/elsewhere"));
+        }
+        let guest = ExecUserContext {
+            name: "guest".into(),
+            home: PathBuf::from("/home/guest"),
+            shell: Some("/bin/sh".into()),
+            uid: Some(1001),
+        };
+        let env = build_env_for(daemon(), &[], false, &guest, true).expect("dropped");
+        assert_eq!(
+            env_value(&env, "TUNLION_CONFIG_DIR"),
+            None,
+            "a --shell-user account has its own config dir, never the daemon's"
+        );
     }
 
     #[cfg(unix)]

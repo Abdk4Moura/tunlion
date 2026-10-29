@@ -102,6 +102,8 @@ mod enrollment;
 mod membership;
 /// `tunlion pair` and its pair-specific helpers.
 mod pair_cmd;
+/// One spelling rule for device names, and the forgiving lookup.
+mod device_names;
 mod preconnect;
 mod access_ui;
 mod temporary_session;
@@ -1105,12 +1107,23 @@ fn up_log() -> PathBuf {
 /// after an in-place binary upgrade ignored. Without the latter, upgrading the
 /// binary under a running daemon reads as "not running" and starts a second
 /// daemon, the very bug this check exists to prevent.
+///
+/// Windows has the same upgrade in another shape: a running .exe cannot be
+/// replaced, so `tunlion update` (and the installer) rename it to
+/// `tunlion.old` and put the new binary at `tunlion.exe`. The old daemon then
+/// runs from `tunlion.old`, and `status`/`down` must still see it as this
+/// install's daemon.
 fn same_executable(a: &Path, b: &Path) -> bool {
     let norm = |p: &Path| {
         let s = p.to_string_lossy();
-        match s.strip_suffix(" (deleted)") {
+        let p = match s.strip_suffix(" (deleted)") {
             Some(t) => PathBuf::from(t),
             None => p.to_path_buf(),
+        };
+        if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("old")) {
+            p.with_extension("exe")
+        } else {
+            p
         }
     };
     let (a, b) = (norm(a), norm(b));
@@ -1533,14 +1546,40 @@ fn down_cmd() -> Result<()> {
             // through the manager first, and only fall back to a bare kill
             // when no manager owns the daemon (a foreground `up`, or a
             // non-service-managed box).
-            if !stop_managed_service(pid) {
-                let status = crate::platform::command("kill").arg(pid.to_string()).status()?;
-                // A failed kill leaves the daemon running. Saying "stopped" and
-                // deleting the pidfile would hide it from `status` and `reset`
-                // while it keeps serving, so keep the pidfile and say why.
-                if let Some(why) = kill_failure(pid, &status) {
-                    bail!("{why}");
+            let mut note_override: Option<&str> = None;
+            match platform::ask_daemon_to_stop(pid) {
+                Ok(platform::StopAsk::UseSignals) => {
+                    if !stop_managed_service(pid) {
+                        let status = crate::platform::command("kill").arg(pid.to_string()).status()?;
+                        // A failed kill leaves the daemon running. Saying
+                        // "stopped" and deleting the pidfile would hide it from
+                        // `status` and `reset` while it keeps serving.
+                        if let Some(why) = kill_failure(pid, &status) {
+                            bail!("{why}");
+                        }
+                    }
                 }
+                // Windows: no `kill` program and no SIGTERM (spawning `kill`
+                // failed with "program not found" and the daemon kept running,
+                // incident: dgmfa). The daemon's stop event was set instead.
+                Ok(platform::StopAsk::Sent) => {}
+                Ok(platform::StopAsk::Denied) => bail!(
+                    "could not stop the daemon (pid {pid}): it runs elevated (as Administrator) and this \
+                     terminal does not, so Windows refuses the request. It is still running. Run \
+                     `tunlion down` from an elevated terminal. The pidfile is kept."
+                ),
+                Ok(platform::StopAsk::NoListener) => {
+                    // An older daemon has no stop event: end it now.
+                    if let Err(e) = platform::escalate(pid, platform::Escalate::Kill) {
+                        bail!(
+                            "could not stop the daemon (pid {pid}): it has no stop request listener (an older \
+                             tunlion) and terminating it failed ({e}); it is still running. If it runs elevated, \
+                             run `tunlion down` from an elevated terminal. The pidfile is kept."
+                        );
+                    }
+                    note_override = Some("; it had no stop request listener (an older tunlion), so it was terminated");
+                }
+                Err(e) => bail!("could not ask the daemon (pid {pid}) to stop: {e}. It is still running; the pidfile is kept."),
             }
             // Stopped means GONE. A suspended daemon cannot act on SIGTERM and a
             // busy one may take a moment; "stopped" used to be printed 6 ms
@@ -1551,7 +1590,7 @@ fn down_cmd() -> Result<()> {
             ui::say(&format!(
                 "  {} stopped (pid {pid}){}",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                how.note()
+                note_override.unwrap_or_else(|| how.note())
             ));
             Ok(())
         }

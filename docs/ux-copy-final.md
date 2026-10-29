@@ -241,7 +241,7 @@ Shell row reuses the type-`SHELL`-to-confirm interaction from 1d. Success:
      ● studio-mac     offline    shell reach inbox mount    renews in 3m  (last seen 2h ago)  [Dim tail]
 
   ○ EXTERNAL  — other people, time-boxed, deny-by-default                        [Dim]
-     ○ carol          online     send→you                   expires in 4m        [Warn on countdown]
+     ○ carol          online     can send you files         expires in 4m        [Warn on countdown]
      ○ dave           offline    read ~/share               expires in 6h
 
   ◐ NEEDS REVIEW  — paired before scoped trust; promote to sort into a tier      [Warn]

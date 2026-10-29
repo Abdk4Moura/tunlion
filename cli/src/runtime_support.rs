@@ -237,8 +237,8 @@ pub(crate) fn resolve_for_kind(
                 // what `ephemeral mint` used to be a separate verb for: an
                 // unattended machine is not a member, it holds a temporary key.
                 let choices = vec![
-                    "Another device I own".to_string(),
-                    "Someone else's device".to_string(),
+                    "Another device I own \u{b7} it becomes one of your devices".to_string(),
+                    "Someone else's device \u{b7} you send each other files".to_string(),
                     "A CI runner or borrowed machine (temporary key)".to_string(),
                 ];
                 match codeentry::pick("WHO IS IT FOR", &choices)? {
