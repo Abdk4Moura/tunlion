@@ -272,7 +272,7 @@ jobs:
         run: |
           set -uo pipefail
           g=cli/tests/fleet-trust-gates.sh
-          want=24
+          want=33  # 24 + fleet.owner_grants: KF1 (premise, refusal, log, view), KF2, KO (msg, refusal, exec, transfer)
           echo "gate tree: $(git rev-parse HEAD) ($g)"
           code=0
           out="$(timeout 600 bash "$g" 2>&1)" || code=$?
