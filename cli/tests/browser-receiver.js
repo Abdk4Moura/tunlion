@@ -12,12 +12,17 @@ const { chromium } = require('playwright');
   await page.goto(url, { waitUntil: 'networkidle' });
   console.log('[pw] app loaded');
 
-  const accept = page.getByText('accept', { exact: true }).first();
+  // The offer row's buttons (TransferRow in frontend/src/ui/Tunlion.jsx).
+  // Match them by role and their exact, capitalized label: Playwright's
+  // `exact: true` is case-sensitive, so a lowercase 'accept' never matched the
+  // real 'Accept' button and this gate could only time out.
+  const accept = page.getByRole('button', { name: 'Accept', exact: true }).first();
   await accept.waitFor({ timeout: 90000 });
-  console.log('[pw] offer visible, clicking accept');
+  console.log('[pw] offer visible, clicking Accept');
   await accept.click();
 
-  await page.getByText('save', { exact: true }).first().waitFor({ timeout: 120000 });
+  // Save appears only once the row reaches 'complete' (all bytes in).
+  await page.getByRole('button', { name: 'Save', exact: true }).first().waitFor({ timeout: 120000 });
   console.log('[pw] RECEIVE COMPLETE in browser');
 
   await browser.close();
