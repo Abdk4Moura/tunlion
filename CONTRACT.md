@@ -438,7 +438,7 @@ same lost-message class as the ceremony frames above, fixed the same way:
   the frame could always do. The certificate itself is authenticated by the seal
   and the possession signature, never by these fields.
 - Model: `proofs/identity_expose_model.py` (every version mix, bounded loss,
-  with mutants including send-once).
+  with mutants including send-once and no-promise).
 
 ### Post-PAKE promotion is make-before-break (`path-promote`)
 

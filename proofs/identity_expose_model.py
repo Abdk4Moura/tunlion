@@ -56,6 +56,7 @@ MUTANTS = {
     "ack-once": "the receiver acknowledges only the first copy",
     "no-linger": "the receiver leaves the moment it succeeds",
     "ack-to-old": "acknowledgements are sent to a peer that never advertised them",
+    "no-promise": "the sender completes before its promised frame went out (CI found it)",
 }
 
 
@@ -86,6 +87,8 @@ def successors(s, a_new, b_new, F, mutant):
         elif peer_acks and not acked and copies < R and mutant != "send-once":
             out.append(st(copies=copies + 1, chx=chx + 1))
         if copies > 0 and (acked or not peer_acks):
+            out.append(st(a=OK))
+        elif mutant == "no-promise" and copies == 0:
             out.append(st(a=OK))
         # Deadline: every copy is out and nothing in flight can still answer.
         exhausted = copies >= R or (mutant == "send-once" and copies > 0)

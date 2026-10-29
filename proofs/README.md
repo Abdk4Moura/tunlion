@@ -441,7 +441,8 @@ certificate delivered; with F < R the certificate always lands, and A fails
 only when a copy was lost while B lingered (it cannot know it landed); a 0.9.1
 peer never fails from this machinery and never receives an acknowledgement.
 Mutants that must be caught: send-once (the 0.9.1 behaviour), no-wait,
-ack-once, no-linger, ack-to-old.
+ack-once, no-linger, ack-to-old, no-promise (the sender completing before its
+promised frame went out, which CI found in the first push).
 
 | model | code |
 |---|---|
