@@ -206,13 +206,18 @@ impl Paths {
     /// privileges (CreateProcessAsUser) or the target user's credentials
     /// (CreateProcessWithLogonW), both of which have security implications.
     pub fn shell_argv(shell_program: Option<&str>, shell_config: Option<&str>, shell_user: Option<&str>) -> (Vec<String>, bool) {
-        let shell = shell_program
+        let configured = shell_program
             .map(|s| s.to_string())
             .or_else(|| std::env::var("TUNLION_SHELL").ok().filter(|s| !s.is_empty()))
-            .or_else(|| shell_config.map(|s| s.to_string()))
-            .unwrap_or_else(|| Self::default_shell());
-
-        let parts: Vec<String> = shell.split_whitespace().map(|s| s.to_string()).collect();
+            .or_else(|| shell_config.map(|s| s.to_string()));
+        // Only a configured value is argv-split. The default is one program
+        // path, and on Windows it usually has a space in it
+        // (`C:\Program Files\PowerShell\7\pwsh.exe`): splitting it ran
+        // `C:\Program` and every shell session failed to spawn.
+        let parts: Vec<String> = match configured {
+            Some(s) => split_shell_setting(&s),
+            None => vec![Self::default_shell()],
+        };
         #[cfg(unix)]
         {
             let argv = match shell_user {
@@ -406,6 +411,17 @@ impl Paths {
             "/bin/sh".into()
         }
     }
+}
+
+/// A configured shell value as argv: a value that names an existing program
+/// as a whole (a Windows path with spaces in it) is that one program, anything
+/// else is split on whitespace so it can carry arguments (`pwsh -NoLogo`).
+fn split_shell_setting(value: &str) -> Vec<String> {
+    let whole = value.trim();
+    if !whole.is_empty() && Path::new(whole).is_file() {
+        return vec![whole.to_string()];
+    }
+    value.split_whitespace().map(str::to_string).collect()
 }
 
 /// OpenSSH for Windows' `DefaultShell` (`HKLM\SOFTWARE\OpenSSH`), when the
@@ -3034,6 +3050,23 @@ mod tests {
         // Same tool as the PTY drop: one mechanism, not two.
         let (pty, _) = Paths::shell_argv(Some("bash"), None, Some("nobody"));
         assert_eq!(pty[0], argv[0]);
+    }
+
+    /// A shell program path with a space in it (every Windows default under
+    /// `C:\Program Files`) stays one argv element; a value with arguments is
+    /// still split.
+    #[test]
+    fn a_shell_path_with_a_space_is_one_program() {
+        let dir = std::env::temp_dir().join(format!("tl shell {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("pwsh.exe");
+        std::fs::write(&program, b"").unwrap();
+        let whole = program.to_string_lossy().into_owned();
+        assert_eq!(super::split_shell_setting(&whole), vec![whole.clone()]);
+        let (argv, _) = Paths::shell_argv(Some(&whole), None, None);
+        assert_eq!(argv, vec![whole.clone()]);
+        assert_eq!(super::split_shell_setting("pwsh -NoLogo"), vec!["pwsh", "-NoLogo"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// OpenSSH's `DefaultShell` as `reg query` prints it.
