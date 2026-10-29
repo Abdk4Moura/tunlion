@@ -1,11 +1,12 @@
 {
   "authkeys-managed": 4,
   "filament-cap": 110,
+  "filament-carrier": 13,
   "filament-fleet": 13,
   "filament-id": 33,
   "filament-overlay": 16,
-  "filament-peerloop": 99,
   "filament-pair": 21,
+  "filament-peerloop": 99,
   "filament-proto": 8,
   "filament-signal": 7,
   "filament-transfer": 14,
