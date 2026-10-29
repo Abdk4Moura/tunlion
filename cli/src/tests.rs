@@ -2587,6 +2587,44 @@ fn printed_hints_parse_as_typed() {
 }
 
 #[test]
+fn product_text_has_no_em_dash() {
+    // House style for everything a user reads: no em dash. The installers are
+    // checked by packaging/check-package-shape.py; this covers the CLI's own
+    // strings. An em dash counts when it is code, not comment: the line is not
+    // a comment line and no `//` outside a string literal comes before it.
+    // Test modules are blanked by `product_sources`, so assertion messages
+    // that quote old output are not product text.
+    let mut bad = Vec::new();
+    for (rel, text) in product_sources() {
+        for (n, line) in text.lines().enumerate() {
+            let Some(at) = line.find('\u{2014}') else { continue };
+            let t = line.trim_start();
+            if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+                continue;
+            }
+            let before = &line[..at];
+            let mut in_str = false;
+            let mut prev = '\0';
+            let mut commented = false;
+            for (i, c) in before.char_indices() {
+                if c == '"' && prev != '\\' {
+                    in_str = !in_str;
+                }
+                if !in_str && before[i..].starts_with("//") {
+                    commented = true;
+                    break;
+                }
+                prev = c;
+            }
+            if !commented {
+                bad.push(format!("  {rel}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "em dash in user-facing CLI text:\n{}", bad.join("\n"));
+}
+
+#[test]
 fn printed_hints_carry_every_required_flag() {
     // #227: `tunlion requests` printed `[ tunlion requests approve 1 ]`.
     // Both `--allow` and `--for` are REQUIRED, so typing the hint exactly as

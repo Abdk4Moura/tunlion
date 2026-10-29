@@ -2235,12 +2235,47 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         const DETACHED_PROCESS: u32 = 0x00000008;
         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        stop_std_handle_inheritance();
     }
     #[cfg(not(any(unix, windows)))]
     {
         anyhow::bail!("detached spawn is not supported on this platform");
     }
     Ok(cmd.spawn()?)
+}
+
+/// Keep this process's own stdin/stdout/stderr out of a detached daemon.
+///
+/// Windows `CreateProcess` is called with handle inheritance on (it has to be,
+/// for the log file the daemon writes to), and that passes on EVERY inheritable
+/// handle this process holds, not only the three it was given. A `tunlion`
+/// started with its output captured (PowerShell `$x = tunlion up --detach`, a
+/// redirect, a CI step, a scheduled task wrapper) holds the capturing pipe as
+/// an inheritable stdout, so the daemon kept a stray copy of it for its whole
+/// life and the caller waited for an end of file that never came: `up
+/// --detach` printed "serving" and never returned (observed on a real
+/// windows-latest runner, a 54-minute hang until the job was cancelled).
+/// Unix is unaffected: Rust opens every descriptor close-on-exec and the
+/// child's 0/1/2 are replaced.
+///
+/// Clearing the inherit flag on our three standard handles is enough and is
+/// safe for later spawns: a child given `Stdio::inherit()` receives a fresh
+/// inheritable duplicate, not the original handle.
+#[cfg(windows)]
+fn stop_std_handle_inheritance() {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle has no preconditions; SetHandleInformation only
+        // changes a flag on a handle this process owns and fails cleanly on a
+        // null or invalid one.
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 // --------------------------------------------------- process identity --
@@ -3597,6 +3632,124 @@ impl InstanceLock {
 
 // --------------------------------------------------------- process control --
 
+/// What asking a Windows daemon to stop achieved. Windows has no SIGTERM and
+/// no `kill` program, so a `down` there used to fail with "program not found"
+/// and leave the daemon running (incident: dgmfa). The daemon instead waits on
+/// a named event keyed by its pid, and `down` sets it: the same graceful
+/// shutdown a ctrl-c gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))] // only Windows constructs the event outcomes
+pub enum StopAsk {
+    /// This platform stops a daemon with signals (SIGTERM via `kill`, or the
+    /// service manager); there is no stop event to set.
+    UseSignals,
+    /// The daemon's stop event was set; it shuts down on its own.
+    Sent,
+    /// No stop event for that pid: an older tunlion, or one whose event name
+    /// was already taken when it started, so there is no graceful path.
+    NoListener,
+    /// The event exists but this process may not set it: the daemon runs
+    /// elevated and this `down` does not.
+    Denied,
+}
+
+/// The stop event names for `pid`, tried in order. `Global\` first: only an
+/// administrator or service can create a global object, so a standard user
+/// cannot squat the name ahead of an elevated daemon; `Local\` (this logon
+/// session) for a daemon that is not elevated.
+#[cfg(any(windows, test))]
+pub(crate) fn stop_event_names(pid: u32) -> [String; 2] {
+    [format!("Global\\tunlion-stop-{pid}"), format!("Local\\tunlion-stop-{pid}")]
+}
+
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Daemon side: create this process's stop event and return a receiver that
+/// fires when a `down` sets it. None when no event could be created, or when
+/// the name already existed (someone else's object: never listen on it, so
+/// whoever created it cannot stop us, and `down` falls back to terminating).
+#[cfg(windows)]
+pub(crate) fn listen_for_stop_request() -> Option<tokio::sync::oneshot::Receiver<()>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+    const WAIT_OBJECT_0: u32 = 0;
+    for name in stop_event_names(std::process::id()) {
+        let w = wide(&name);
+        // SAFETY: a null security descriptor means the default DACL of this
+        // process's token (no widening); `w` is NUL-terminated and outlives
+        // the call. The returned handle is owned below.
+        let h = unsafe { CreateEventW(std::ptr::null(), 1, 0, w.as_ptr()) };
+        if h.is_null() {
+            continue; // Global\ needs SeCreateGlobalPrivilege; try Local\
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe { CloseHandle(h) };
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let raw = h as usize;
+        // A plain thread, not spawn_blocking: it waits for the life of the
+        // process and must never hold up runtime shutdown.
+        std::thread::Builder::new()
+            .name("tunlion-stop-event".into())
+            .spawn(move || {
+                let h = raw as windows_sys::Win32::Foundation::HANDLE;
+                // SAFETY: `h` is a live event handle this thread owns.
+                if unsafe { WaitForSingleObject(h, INFINITE) } == WAIT_OBJECT_0 {
+                    let _ = tx.send(());
+                }
+            })
+            .ok()?;
+        return Some(rx);
+    }
+    None
+}
+
+/// `down` side: signals do the job here.
+#[cfg(not(windows))]
+pub fn ask_daemon_to_stop(_pid: u32) -> std::io::Result<StopAsk> {
+    Ok(StopAsk::UseSignals)
+}
+
+/// What `down` says when the daemon had to be ended forcibly after its grace.
+#[cfg(not(windows))]
+pub const FORCED_STOP_NOTE: &str = "; it did not exit within 10s of SIGTERM, so it was killed (SIGKILL)";
+/// Windows has no signals: name the stop request and the termination.
+#[cfg(windows)]
+pub const FORCED_STOP_NOTE: &str = "; it did not exit within 10s of the stop request, so it was terminated";
+
+/// `down` side: set the daemon's stop event.
+#[cfg(windows)]
+pub fn ask_daemon_to_stop(pid: u32) -> std::io::Result<StopAsk> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND};
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+    let mut denied = false;
+    for name in stop_event_names(pid) {
+        let w = wide(&name);
+        // SAFETY: `w` is NUL-terminated; the handle is closed below.
+        let h = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, w.as_ptr()) };
+        if h.is_null() {
+            match unsafe { GetLastError() } {
+                ERROR_FILE_NOT_FOUND => continue,
+                ERROR_ACCESS_DENIED => {
+                    denied = true;
+                    continue;
+                }
+                e => return Err(std::io::Error::from_raw_os_error(e as i32)),
+            }
+        }
+        // SAFETY: `h` is a live event handle opened with EVENT_MODIFY_STATE.
+        let ok = unsafe { SetEvent(h) } != 0;
+        let err = std::io::Error::last_os_error();
+        unsafe { CloseHandle(h) };
+        return if ok { Ok(StopAsk::Sent) } else { Err(err) };
+    }
+    Ok(if denied { StopAsk::Denied } else { StopAsk::NoListener })
+}
+
 /// The signals `down` uses beyond its first polite request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Escalate {
@@ -4233,4 +4386,114 @@ pub async fn l3_state_over_control() -> Option<serde_json::Value> {
     {
         None
     }
+}
+
+/// `up --detach` from a caller that captures its output must return: the
+/// detached daemon may not keep the caller's pipe open (see
+/// `stop_std_handle_inheritance`). Real processes and a real pipe; Windows only,
+/// because that is where handle inheritance passes the pipe on.
+#[cfg(all(test, windows))]
+mod detach_inheritance_tests {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    const MIDDLE_ENV: &str = "TUNLION_TEST_DETACH_MIDDLE_LOG";
+    const TEST_PATH: &str = "platform::detach_inheritance_tests::a_detached_child_does_not_hold_the_callers_output_open";
+
+    #[test]
+    fn a_detached_child_does_not_hold_the_callers_output_open() {
+        // Middle role: this same test binary, run by the outer test with its
+        // stdout on a pipe. It starts a long-lived detached grandchild exactly
+        // as `up --detach` starts the daemon, prints the pid, and exits.
+        if let Ok(log) = std::env::var(MIDDLE_ENV) {
+            let ping = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()))
+                .join("System32\\PING.EXE");
+            let child = super::spawn_detached(&ping, &["-n", "60", "127.0.0.1"], std::path::Path::new(&log))
+                .expect("spawn_detached");
+            crate::outln!("GRANDCHILD={}", child.id());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tunlion-detach-inherit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("grandchild.log");
+        let exe = std::env::current_exe().unwrap();
+        let mut middle = super::command(&exe)
+            .args([TEST_PATH, "--exact", "--nocapture", "--test-threads=1"])
+            .env(MIDDLE_ENV, &log)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut out = middle.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = out.read_to_string(&mut text);
+            let _ = tx.send(text);
+        });
+        let status = middle.wait().unwrap();
+        // ping -n 60 lives about 59 s. EOF must come when the middle exits,
+        // not when the grandchild does.
+        let got = rx.recv_timeout(Duration::from_secs(20));
+        let text = got.as_deref().unwrap_or("");
+        // The harness prints "test <name> ... " before the test's own output,
+        // so the marker can sit mid-line.
+        let grandchild = text.split_once("GRANDCHILD=").and_then(|(_, rest)| {
+            rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().ok()
+        });
+        if let Some(pid) = grandchild {
+            let _ = super::command("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "middle process failed: {status}");
+        assert!(
+            got.is_ok(),
+            "the caller's stdout pipe stayed open after the middle exited ({:?}): the detached child inherited it",
+            started.elapsed()
+        );
+        assert!(grandchild.is_some(), "middle never reported its detached child; output: {text:?}");
+    }
+}
+
+/// The forced-stop note names what this platform actually did.
+#[test]
+fn the_forced_stop_note_names_what_was_done() {
+    #[cfg(not(windows))]
+    assert!(FORCED_STOP_NOTE.contains("SIGKILL"));
+    #[cfg(windows)]
+    assert!(
+        FORCED_STOP_NOTE.contains("stop request") && FORCED_STOP_NOTE.contains("terminated") && !FORCED_STOP_NOTE.contains("SIG"),
+        "{FORCED_STOP_NOTE}"
+    );
+}
+
+/// `down` and the daemon must derive the same event name from the pid, and it
+/// must name exactly one pid (no prefix collisions such as 12 vs 123).
+#[test]
+fn stop_event_names_are_per_pid_global_then_local() {
+    let [g, l] = stop_event_names(123);
+    assert_eq!(g, "Global\\tunlion-stop-123");
+    assert_eq!(l, "Local\\tunlion-stop-123");
+    assert_ne!(stop_event_names(12), stop_event_names(123));
+}
+
+/// A real daemon-side listener and a real `down`-side request, in one process:
+/// the event is created under this pid, `ask_daemon_to_stop` sets it and the
+/// listener fires. A pid with no listener reports NoListener, never Sent.
+#[cfg(windows)]
+#[test]
+fn a_stop_request_reaches_the_daemons_listener() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rx = listen_for_stop_request().expect("create the stop event");
+    assert_eq!(ask_daemon_to_stop(std::process::id()).unwrap(), StopAsk::Sent);
+    rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the listener fired")
+            .expect("sender kept");
+    });
+    // No process creates events under an impossible pid.
+    assert_eq!(ask_daemon_to_stop(u32::MAX - 3).unwrap(), StopAsk::NoListener);
 }
