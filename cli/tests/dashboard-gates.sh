@@ -22,6 +22,8 @@
 #      CLI's own advice.
 #   C  a pairing code shown by the dashboard (with its QR) pairs whoever types
 #      it, and the dashboard sees the pairing finish.
+#   C2 a claimer that holds its own identity leaves the owner holding its
+#      certificate, not an uncertified record.
 #   X  the dashboard closes when the background service it started beside
 #      stops.
 set -uo pipefail
@@ -173,6 +175,26 @@ if [ "$c1" = 200 ] && echo "$CODE" | grep -qE '^[a-z]+-[a-z]+-[0-9]{3,5}$' && [ 
   ok "C: the dashboard's code (with its QR) paired lee, and the dashboard saw it finish"
 else
   bad "C spoken code"; tail -n 8 "$WORK/l-join.log"; cat "$WORK/body"
+fi
+
+# A joiner that already holds its own identity: the owner must end up holding
+# its certificate (EXTERNAL with a cert), never "no certificate". The 0.9.2
+# launch matrix once left a dashboard-paired device uncertified on the owner
+# while both sides reported success; this asserts the owner's record directly.
+say "C2: a code claimed by a machine with its own identity leaves the owner holding its certificate"
+DM="$WORK/m"; mkdir -p "$DM"
+env TUNLION_CONFIG_DIR="$DM" "$BIN" init --name mira --recovery-file "$DM/rec.txt" --yes >/dev/null 2>&1
+code -X POST -H "$ORIGIN" -H "$CK" -H 'Content-Type: application/json' --data '{"kind":"person","name":"mira"}' "$B/api/code" >/dev/null
+CODE2=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("code") or "")' "$WORK/body")
+[ -n "$CODE2" ] && timeout 90 env TUNLION_CONFIG_DIR="$DM" "$BIN" --server "$SERVER" join "$CODE2" </dev/null >"$WORK/m-join.log" 2>&1
+mj=$?
+for _ in $(seq 1 40); do code -H "$CK" "$B/api/code" >/dev/null; cdone=$(python3 -c 'import json,sys; d=(json.load(open(sys.argv[1])).get("done") or {}); print(d.get("ok",""))' "$WORK/body"); [ -n "$cdone" ] && break; sleep 0.5; done
+mcert=$(env TUNLION_CONFIG_DIR="$DA" "$BIN" devices --json 2>/dev/null | python3 -c 'import json,sys; print(next((d.get("certExpires") for d in json.load(sys.stdin)["data"]["devices"] if d["name"]==sys.argv[1]), "absent"))' mira)
+echo "## code '$CODE2', join rc=$mj, dashboard done ok=$cdone, owner's certExpires for mira: $mcert"
+if [ "$mj" = 0 ] && [ "$cdone" = True ] && [ "$mcert" != absent ] && [ "$mcert" != None ]; then
+  ok "C2: the owner holds mira's certificate after a dashboard code"
+else
+  bad "C2 claimer certificate"; tail -n 8 "$WORK/m-join.log"; cat "$WORK/body"
 fi
 
 # ---------------------------------------------------------------------- X --

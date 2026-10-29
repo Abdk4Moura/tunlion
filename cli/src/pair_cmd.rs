@@ -475,6 +475,63 @@ pub(crate) fn open_enrol_offer(
     }
 }
 
+/// Open a peer's sealed `identity-expose` and check everything it claims: the
+/// seal (only this ceremony's K opens it), the certificate's own signature and
+/// lifetime, the possession signature over this session's confirmation MAC,
+/// and that it is not our own device key reflected back. `Err` names the check
+/// that refused it. Pure: the caller supplies the link's fingerprints and our
+/// device key (`None` when it could not be read, which refuses).
+pub(crate) fn open_identity_expose(
+    data: &Value,
+    k: &[u8],
+    fps: Option<(&str, &str)>,
+    caps_canon: &str,
+    scope: u8,
+    own_dpub: Option<[u8; 32]>,
+    now: u64,
+) -> std::result::Result<identity::DeviceCert, &'static str> {
+    let nonce = data["nonce"].as_str().and_then(|h| hex::decode(h).ok()).ok_or("nonce missing")?;
+    let nonce: [u8; 12] = nonce.as_slice().try_into().map_err(|_| "nonce is not 12 bytes")?;
+    let sealed = data["sealed"].as_str().and_then(|h| hex::decode(h).ok()).ok_or("sealed body missing")?;
+    let plain = identity::open_sealed(&identity::sealing_key_from_k(k), &nonce, &sealed)
+        .map_err(|_| "seal does not open under this ceremony's key")?;
+    let inner: Value = serde_json::from_slice(&plain).map_err(|_| "sealed body is not JSON")?;
+    let cert = identity::DeviceCert::from_json(&inner["cert"]).ok_or("no certificate in it")?;
+    cert.verify(now).map_err(|_| "certificate does not verify")?;
+    let sig = inner["possession_sig"].as_str().and_then(|h| hex::decode(h).ok()).ok_or("possession signature missing")?;
+    let sig: [u8; 64] = sig.as_slice().try_into().map_err(|_| "possession signature is not 64 bytes")?;
+    // Session-bound: the MAC binds K, both DTLS fingerprints, caps and scope.
+    let (my_fp, their_fp) = fps.ok_or("this link's fingerprints are not known")?;
+    let (lo, hi) = crate::pake::sort_fps(my_fp, their_fp);
+    let (_send, expect_dir) = crate::pake::confirm_dirs(my_fp, lo);
+    let mac = crate::pake::confirm_mac(k, expect_dir, lo, hi, caps_canon, scope);
+    let cmv: [u8; 32] = mac.as_slice().try_into().map_err(|_| "confirmation MAC is not 32 bytes")?;
+    // Reconstruct cert_hash locally from parsed cert fields (never hash a
+    // sender-framed blob). For the PAKE path receiver_device_pub MUST be zeros.
+    let msg = identity::possession_msg(
+        0x01,
+        &cmv,
+        scope,
+        &identity::caps_digest(caps_canon),
+        &identity::cert_hash(&cert),
+        &cert.device_pub,
+        &[0u8; 32],
+    );
+    identity::verify_possession_sig(&cert.device_pub, &msg, &sig)
+        .map_err(|_| "possession signature does not verify for this session")?;
+    // Anti-reflection, narrowed to device_pub (#41). LOAD-BEARING on this 0x01
+    // (PAKE) path: receiver_device_pub is zeroed in the possession message, so
+    // message binding does NOT carry the receiver identity, and THIS comparison
+    // is the only thing preventing a reflection. Do not remove it as redundant.
+    // A same-owner fleet device has a DIFFERENT device_pub under the same user
+    // key, so it is correctly admitted. Fail closed without our own key.
+    match own_dpub {
+        Some(own) if own == cert.device_pub => Err("it is this device's own key, reflected back"),
+        Some(_) => Ok(cert),
+        None => Err("this device's own key could not be read, so a reflection cannot be ruled out"),
+    }
+}
+
 /// Certify `dpub` with the owner key and seal the grant under this ceremony's
 /// key, ready to send as the `data` of a signal.
 fn seal_enrol_grant(
@@ -1158,6 +1215,7 @@ async fn pair_with_purpose(
                                                 ) {
                                                     sio.emit("signal", serde_json::json!({"to":pid2,"data":{"type":"identity-expose","v":2,"nonce":hex::encode(n),"sealed":hex::encode(s)}})).await.ok();
                                                     sent_identity = true;
+                                                    ui::debug(&format!("pair: identity-expose sent to {pid2}"));
                                                 }
                                             }
                                         }
@@ -1219,6 +1277,7 @@ async fn pair_with_purpose(
                             ui::say(&fleet_ui::pair_ui::render_same_person_banner(&n));
                         }
                         if peer_identity_cert.is_none() {
+                            ui::debug("pair: completing without the peer's certificate");
                             let p = devices_path();
                             if let Ok(raw) = std::fs::read_to_string(&p) {
                                 if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) {
@@ -1561,6 +1620,7 @@ async fn pair_with_purpose(
                                                 });
                                                 sio.emit("signal", serde_json::json!({"to": pid2, "data": payload})).await.ok();
                                                 sent_identity = true;
+                                                ui::debug(&format!("pair: identity-expose sent to {pid2}"));
                                             }
                                         }
                                     }
@@ -1998,114 +2058,35 @@ async fn pair_with_purpose(
                     }
                 }
                 if data["type"].as_str() == Some("identity-expose") {
-                    if let Some(k) = cer.k() {
-                        if let Some(nonce_hex) = data.get("nonce").and_then(|v| v.as_str()) {
-                            if let Some(sealed_hex) = data.get("sealed").and_then(|v| v.as_str()) {
-                                if let Ok(nonce_bytes) = hex::decode(nonce_hex) {
-                                    if let Ok(sealed_bytes) = hex::decode(sealed_hex) {
-                                        if nonce_bytes.len() == 12 {
-                                            let mut nonce_arr = [0u8; 12];
-                                            nonce_arr.copy_from_slice(&nonce_bytes);
-                                            let sealing_key = identity::sealing_key_from_k(k);
-                                            if let Ok(plaintext) = identity::open_sealed(
-                                                &sealing_key,
-                                                &nonce_arr,
-                                                &sealed_bytes,
-                                            ) {
-                                                if let Ok(inner) =
-                                                    serde_json::from_slice::<Value>(&plaintext)
-                                                {
-                                                    if let Some(cert_json) = inner.get("cert") {
-                                                        if let Some(cert) =
-                                                            identity::DeviceCert::from_json(
-                                                                cert_json,
-                                                            )
-                                                        {
-                                                            if cert
-                                                                .verify(identity::now_secs())
-                                                                .is_ok()
-                                                            {
-                                                                if let Some(sig_hex) = inner
-                                                                    .get("possession_sig")
-                                                                    .and_then(|v| v.as_str())
-                                                                {
-                                                                    if let Ok(sig_bytes) =
-                                                                        hex::decode(sig_hex)
-                                                                    {
-                                                                        if sig_bytes.len() == 64 {
-                                                                            let mut sig_arr =
-                                                                                [0u8; 64];
-                                                                            sig_arr
-                                                                                .copy_from_slice(
-                                                                                    &sig_bytes,
-                                                                                );
-                                                                            // Re-derive fps for possession verification (session-bound)
-                                                                            let fps2 = match conn.link(&from) {
-                                                                                Some(l) => match &l.peer { Some(p) => p.fingerprints().await, None => None },
-                                                                                None => None,
-                                                                            };
-                                                                            if let Some((
-                                                                                my_fp2,
-                                                                                their_fp2,
-                                                                            )) = fps2
-                                                                            {
-                                                                                let (lo, hi) = crate::pake::sort_fps(&my_fp2, &their_fp2);
-                                                                                let scope =
-                                                                                    cer.scope();
-                                                                                let (_send, expect_dir) = crate::pake::confirm_dirs(&my_fp2, lo);
-                                                                                let expected_confirm_vec = crate::pake::confirm_mac(k, expect_dir, lo, hi, cer.caps_canon(), scope);
-                                                                                let mut cmv_arr =
-                                                                                    [0u8; 32];
-                                                                                cmv_arr.copy_from_slice(&expected_confirm_vec);
-                                                                                // Reconstruct cert_hash locally from parsed cert fields (never hash sender-framed blob)
-                                                                                let chash = identity::cert_hash(&cert);
-                                                                                let caps_digest = identity::caps_digest(cer.caps_canon());
-                                                                                let sender_pub =
-                                                                                    cert.device_pub;
-                                                                                let receiver_zero =
-                                                                                    [0u8; 32];
-                                                                                // For PAKE path, receiver_device_pub MUST be zeros (verifier rejects non-zero)
-                                                                                let possession_msg = identity::possession_msg(
-                                                                                    0x01, &cmv_arr, scope, &caps_digest, &chash, &sender_pub, &receiver_zero
-                                                                                );
-                                                                                if identity::verify_possession_sig(&cert.device_pub, &possession_msg, &sig_arr).is_ok() {
-                                                                                    // Anti-reflection, narrowed to device_pub (#41). LOAD-BEARING on this
-                                                                                    // 0x01 (PAKE) path: receiver_device_pub is ZEROED in the possession_msg
-                                                                                    // above (receiver_zero), so message binding does NOT carry the receiver
-                                                                                    // identity — THIS single comparison is the ONLY thing preventing a
-                                                                                    // reflection here. Do NOT remove it as "redundant with message binding";
-                                                                                    // on 0x01 it is not. Compare cert.device_pub against THIS machine's LOCAL
-                                                                                    // device pubkey (overlay), never the peer payload; fail closed if the
-                                                                                    // local key can't be obtained. A same-owner fleet device has a DIFFERENT
-                                                                                    // device_pub under the same user key, so it is correctly admitted (the old
-                                                                                    // user_pub check refused it — the OwnerDevice-fleet bug).
-                                                                                    match crate::overlay::overlay_pubkey_bytes() {
-                                                                                        Ok(own_dpub) if cert.device_pub == own_dpub => {
-                                                                                            // reflection-to-self refused
-                                                                                        }
-                                                                                        Ok(_) => {
-                                                                                            peer_identity_cert = Some(cert);
-                                                                                        }
-                                                                                        Err(_) => {
-                                                                                            // cannot obtain own device_pub -> cannot rule out reflection -> refuse
-        }
-    }
-
-}
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                    // Every way this frame can fail to yield a certificate used to
+                    // be a silent fall-through, so a pairing that completed without
+                    // the peer's certificate (filed NEEDS REVIEW, "no certificate")
+                    // left no trace of why. Each refusal now says which check.
+                    let fps = match conn.link(&from) {
+                        Some(l) => match &l.peer {
+                            Some(p) => p.fingerprints().await,
+                            None => None,
+                        },
+                        None => None,
+                    };
+                    let opened = match cer.k() {
+                        Some(k) => open_identity_expose(
+                            &data,
+                            k,
+                            fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+                            cer.caps_canon(),
+                            cer.scope(),
+                            crate::overlay::overlay_pubkey_bytes().ok(),
+                            identity::now_secs(),
+                        ),
+                        None => Err("no key exchange yet"),
+                    };
+                    match opened {
+                        Ok(cert) => {
+                            ui::debug(&format!("pair: identity-expose from {from} accepted"));
+                            peer_identity_cert = Some(cert);
                         }
+                        Err(why) => ui::debug(&format!("pair: identity-expose from {from} refused: {why}")),
                     }
                     continue;
                 }
@@ -2636,5 +2617,51 @@ mod enrol_flow_tests {
         assert_eq!(plain_caps(&default_device_ceiling()), "send you files and open your shared folder");
         assert_eq!(plain_caps(&[]), "do nothing yet");
         assert!(plain_caps(&["shell".into()]).contains("acts as you"));
+    }
+}
+
+#[cfg(test)]
+mod identity_expose_tests {
+    use super::*;
+    use ring::signature::KeyPair as _;
+
+    /// The sender half exactly as the ceremony builds it (pair_with_purpose):
+    /// the possession signature over our_confirm(K, my_fp, their_fp).
+    fn expose(k: &[u8], my_fp: &str, their_fp: &str, caps: &str, scope: u8) -> (Value, [u8; 32]) {
+        let seed = [9u8; 32];
+        let dev = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let dpub: [u8; 32] = dev.public_key().as_ref().try_into().unwrap();
+        let owner = identity::UserKey::from_seed(&[3u8; 32]).unwrap();
+        let cert = identity::DeviceCert::certify(&owner, dpub, identity::now_secs(), identity::CERT_TTL_SECS).unwrap();
+        let cmv: [u8; 32] = crate::pake::our_confirm(k, my_fp, their_fp, caps, scope).as_slice().try_into().unwrap();
+        let msg = identity::possession_msg(0x01, &cmv, scope, &identity::caps_digest(caps), &identity::cert_hash(&cert), &dpub, &[0u8; 32]);
+        let sig = dev.sign(&msg);
+        let inner = json!({"cert": cert.to_json(), "possession_sig": hex::encode(sig.as_ref()), "device_pub": hex::encode(dpub)});
+        let (n, s) = identity::seal_plaintext(&identity::sealing_key_from_k(k), inner.to_string().as_bytes()).unwrap();
+        (json!({"type": "identity-expose", "v": 2, "nonce": hex::encode(n), "sealed": hex::encode(s)}), dpub)
+    }
+
+    /// What the receiver used to check in one silent nest of if-lets: the same
+    /// frame is accepted, and each way it can fail is refused with its reason.
+    #[test]
+    fn an_identity_expose_opens_only_for_this_session_and_says_why_not() {
+        let k = [5u8; 32];
+        let (a, b) = ("AA:11", "BB:22");
+        let (frame, dpub) = expose(&k, a, b, "transfer", 0x01);
+        let now = identity::now_secs();
+        let mine = Some([1u8; 32]);
+        // The receiver sees the fingerprints the other way round.
+        let cert = open_identity_expose(&frame, &k, Some((b, a)), "transfer", 0x01, mine, now).expect("accepted");
+        assert_eq!(cert.device_pub, dpub);
+        let why = |r: std::result::Result<identity::DeviceCert, &'static str>| r.err().unwrap();
+        assert_eq!(why(open_identity_expose(&frame, &[6u8; 32], Some((b, a)), "transfer", 0x01, mine, now)), "seal does not open under this ceremony's key");
+        assert_eq!(why(open_identity_expose(&frame, &k, None, "transfer", 0x01, mine, now)), "this link's fingerprints are not known");
+        assert_eq!(why(open_identity_expose(&frame, &k, Some((b, "CC:33")), "transfer", 0x01, mine, now)), "possession signature does not verify for this session");
+        assert_eq!(why(open_identity_expose(&frame, &k, Some((b, a)), "transfer,shell", 0x01, mine, now)), "possession signature does not verify for this session");
+        assert_eq!(why(open_identity_expose(&frame, &k, Some((b, a)), "transfer", 0x01, Some(dpub), now)), "it is this device's own key, reflected back");
+        assert!(why(open_identity_expose(&frame, &k, Some((b, a)), "transfer", 0x01, None, now)).contains("reflection"));
+        let mut torn = frame.clone();
+        torn["nonce"] = json!("00");
+        assert_eq!(why(open_identity_expose(&torn, &k, Some((b, a)), "transfer", 0x01, mine, now)), "nonce is not 12 bytes");
     }
 }

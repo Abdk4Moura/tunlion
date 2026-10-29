@@ -28,6 +28,9 @@ on:
       pairing_repeats:
         description: "Extra rounds of the browser pairing cells (B03 B04 B05 B08 B12 BB1)"
         default: "4"
+      dashboard_repeats:
+        description: "D05r: extra dashboard codes, each claimed by a fresh machine (owner must hold its certificate); against production each round spends a code claim (5 per minute per IP), so use signaling=local for many"
+        default: "0"
 
 permissions:
   contents: read
@@ -117,6 +120,7 @@ jobs:
           LAB_DIR: /home/runner/matrix
           PLAYWRIGHT: ${{ github.workspace }}/frontend/node_modules/playwright
           MX_DEBUG: ${{ inputs.debug }}
+          MX_DASH_REPEATS: ${{ inputs.dashboard_repeats }}
         run: |
           export FRONTEND_DIST="$RUNNER_TEMP/dist-prod"
           OUT="$RUNNER_TEMP/out"

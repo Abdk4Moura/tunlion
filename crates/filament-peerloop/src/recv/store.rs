@@ -330,6 +330,29 @@ fn keep_backup(path: &Path) {
     }
 }
 
+/// `keep_backup` for `devices.json`, minus every pair secret this write
+/// removes. The backup is the last good copy for recovering a damaged store,
+/// not an undo: a secret the write drops (a declined remember, a forgotten or
+/// re-keyed device) must not survive beside it in `.bak`, or "nothing stored"
+/// and "forgot" are untrue on disk. A record keeps its place in the backup
+/// while its secret is still held (a rename keeps it), and a record that holds
+/// no secret is kept as it was.
+fn keep_devices_backup(path: &Path, next: &[Value]) {
+    let Ok(raw) = std::fs::read_to_string(path) else { return };
+    let Ok(prev) = serde_json::from_str::<Vec<Value>>(&raw) else { return keep_backup(path) };
+    if prev.is_empty() {
+        return;
+    }
+    let held: std::collections::HashSet<&str> = next.iter().filter_map(|d| d["secret"].as_str()).collect();
+    let kept: Vec<&Value> = prev
+        .iter()
+        .filter(|d| d["secret"].as_str().is_none_or(|s| held.contains(s)))
+        .collect();
+    if let Ok(text) = serde_json::to_string_pretty(&kept) {
+        let _ = secret_write::SecretFile::write_str(&backup_path(path), &text);
+    }
+}
+
 /// Refuse to overwrite a JSON array that no longer parses, then keep a backup.
 fn before_write_json_array(path: &Path) -> io::Result<()> {
     match std::fs::read_to_string(path) {
@@ -569,7 +592,7 @@ impl DeviceStore {
             Err(e) => return Err(anyhow::anyhow!("read devices.json: {e}")),
         };
         let out = f(&mut arr)?;
-        keep_backup(&p);
+        keep_devices_backup(&p, &arr);
         secret_write::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
             .context("atomic write devices.json")?;
         Ok(out)
@@ -2578,6 +2601,32 @@ mod store_guards {
         let error = store.devices_remove("alpha").unwrap_err();
         assert!(error.downcast_ref::<CorruptStore>().is_some());
         assert_eq!(std::fs::read(&p).unwrap(), garbage);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A declined `--remember` and `devices forget` both remove a record; the
+    /// backup written beside that removal held the removed secret, so the
+    /// known-device gate's "nothing stored" was false on disk.
+    #[test]
+    fn a_removed_secret_does_not_survive_in_the_devices_backup() {
+        let root = unique("devbak");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DeviceStore::open(&root);
+        let p = store.devices_path();
+        let (gone, kept) = ("ab".repeat(32), "cd".repeat(32));
+        std::fs::write(&p, serde_json::to_string(&json!([
+            {"name": "declinedev", "secret": gone},
+            {"name": "laptop", "secret": kept},
+            {"name": "browser-only"},
+        ])).unwrap()).unwrap();
+        store.devices_remove("declinedev").unwrap();
+        let bak = std::fs::read_to_string(backup_path(&p)).unwrap();
+        assert!(!bak.contains(&gone) && !bak.contains("declinedev"), "{bak}");
+        assert!(bak.contains(&kept) && bak.contains("browser-only"), "the rest is still the last good copy: {bak}");
+        // A rename keeps the secret, so the record stays restorable.
+        store.with_devices_mut(|arr| { arr[0]["name"] = json!("laptop-2"); Ok(()) }).unwrap();
+        let bak = std::fs::read_to_string(backup_path(&p)).unwrap();
+        assert!(bak.contains(&kept) && bak.contains("\"laptop\""), "{bak}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
