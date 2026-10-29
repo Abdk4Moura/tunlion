@@ -57,6 +57,18 @@ durable_objects.bindings = [
   { name = "HEALTH", class_name = "HealthState" },
 ]
 
+# Same code with the rate limits lifted, as in the 2026-10-26 VPS load test:
+# the hub load test (test/hub_loadgen.py, .github/workflows/hub-loadtest.yml)
+# drives thousands of devices from a handful of runner IPs.
+[env.loadtest]
+name = "tunlion-signal-loadtest"
+workers_dev = true
+vars = { ROUTER_MODE = "cf", FIL_PING_INTERVAL = "25", FIL_PING_TIMEOUT = "60", FIL_SESSION_CLAIM_LIMIT = "100000000", FIL_CLAIM_LIMIT = "100000000", FIL_PAIR_CREATE_LIMIT = "100000000", FIL_CLOSE_LIMIT = "100000000" }
+durable_objects.bindings = [
+  { name = "HUB", class_name = "SignalHub" },
+  { name = "HEALTH", class_name = "HealthState" },
+]
+
 # Router in front of a throwaway origin, for the failover drill (see
 # docs/cf-signaling.md). The route, ORIGIN_URL and KV id below were throwaway
 # resources, deleted after the 2026-10-28 drill; recreate before reuse. Same zone as

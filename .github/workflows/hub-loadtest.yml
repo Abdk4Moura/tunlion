@@ -1,0 +1,204 @@
+name: hub-loadtest
+
+# Load test of the SignalHub Durable Object (edge/signal), run by hand only.
+# A fleet of runners drives one population on a shared wall-clock schedule:
+# the idle group ramps `tunlion up`-shaped devices through the steps, then
+# holds the last step while the churn group runs pairing bursts on top.
+# Point it at a STAGING worker (default: tunlion-signal-loadtest, the
+# lifted-limits env in wrangler.toml). No secrets and no Cloudflare account:
+# the runners are plain clients. See docs/cf-signaling.md, "Hub load test".
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Backend base URL (staging only)"
+        default: "https://tunlion-signal-loadtest.muddy-wind-6911.workers.dev"
+      steps:
+        description: "Idle steps, TOTAL devices across the idle runners"
+        default: "500,1000,2000,4000"
+      idle_shards:
+        description: "Idle runners"
+        default: "4"
+      slot:
+        description: "Seconds per idle step (ramp + hold)"
+        default: "180"
+      ramp:
+        description: "Ramp budget per idle step, seconds"
+        default: "60"
+      cycle:
+        description: "Device sync cycle, seconds (20 = 0.14 msgs/s with the 25 s ping)"
+        default: "20"
+      final_hold:
+        description: "Hold the last idle step this long (the churn runs inside it)"
+        default: "240"
+      rates:
+        description: "Churn steps, TOTAL pairs/s across the churn runners (empty = no churn)"
+        default: "20,40,60,80"
+      churn_shards:
+        description: "Churn runners"
+        default: "2"
+      dur:
+        description: "Seconds per churn step"
+        default: "30"
+      churn_delay:
+        description: "Churn start, seconds after the last idle step ends"
+        default: "30"
+      lead:
+        description: "Seconds from planning to T0 (runner start-up)"
+        default: "150"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      t0: ${{ steps.p.outputs.t0 }}
+      idle: ${{ steps.p.outputs.idle }}
+      churn: ${{ steps.p.outputs.churn }}
+      churn_at: ${{ steps.p.outputs.churn_at }}
+      tag: ${{ steps.p.outputs.tag }}
+    steps:
+      - id: p
+        env:
+          IN_URL: ${{ inputs.url }}
+          IN_STEPS: ${{ inputs.steps }}
+          IN_IDLE: ${{ inputs.idle_shards }}
+          IN_CHURN: ${{ inputs.churn_shards }}
+          IN_RATES: ${{ inputs.rates }}
+          IN_SLOT: ${{ inputs.slot }}
+          IN_DELAY: ${{ inputs.churn_delay }}
+          IN_LEAD: ${{ inputs.lead }}
+        run: |
+          set -euo pipefail
+          case "$IN_URL" in
+            https://tunlion-signal-*.workers.dev|http://127.0.0.1:*) ;;
+            *) echo "::error::refusing a non-staging URL: $IN_URL"; exit 1 ;;
+          esac
+          t0=$(( $(date +%s) + IN_LEAD ))
+          nsteps=$(echo "$IN_STEPS" | tr ',' '\n' | grep -c .)
+          echo "t0=$t0" >> "$GITHUB_OUTPUT"
+          echo "idle=$(python3 -c "import json;print(json.dumps(list(range($IN_IDLE))))")" >> "$GITHUB_OUTPUT"
+          if [ -n "$IN_RATES" ]; then
+            echo "churn=$(python3 -c "import json;print(json.dumps(list(range($IN_CHURN))))")" >> "$GITHUB_OUTPUT"
+          else
+            echo "churn=[]" >> "$GITHUB_OUTPUT"
+          fi
+          echo "churn_at=$(( t0 + nsteps * IN_SLOT + IN_DELAY ))" >> "$GITHUB_OUTPUT"
+          echo "tag=r${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "T0 $(date -u -d @$t0 +%FT%TZ), $nsteps idle steps, churn at +$(( nsteps * IN_SLOT + IN_DELAY ))s"
+
+  idle:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.idle) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: edge/signal/test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -q 'websockets>=13,<16'
+      - name: Idle population
+        env:
+          IN_URL: ${{ inputs.url }}
+          IN_STEPS: ${{ inputs.steps }}
+          IN_SHARDS: ${{ inputs.idle_shards }}
+          IN_SLOT: ${{ inputs.slot }}
+          IN_RAMP: ${{ inputs.ramp }}
+          IN_CYCLE: ${{ inputs.cycle }}
+          IN_HOLD: ${{ inputs.final_hold }}
+          SHARD: ${{ matrix.shard }}
+          T0: ${{ needs.plan.outputs.t0 }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ulimit -n "$(ulimit -Hn)"
+          now=$(date +%s)
+          [ "$now" -lt "$T0" ] || echo "::warning::runner started $(( now - T0 ))s after T0; its share of the first step is late"
+          python edge/signal/test/hub_loadgen.py idle --url "$IN_URL" --out out --procs 3 \
+            --shard "$SHARD" --shards "$IN_SHARDS" --run-tag "$TAG" --start-at "$T0" \
+            --steps "$IN_STEPS" --slot "$IN_SLOT" --ramp "$IN_RAMP" --cycle "$IN_CYCLE" --final-hold "$IN_HOLD" \
+            | cut -c1-2000
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: idle-${{ matrix.shard }}
+          path: out/
+
+  churn:
+    needs: plan
+    if: needs.plan.outputs.churn != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.churn) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: edge/signal/test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -q 'websockets>=13,<16'
+      - name: Pairing churn
+        env:
+          IN_URL: ${{ inputs.url }}
+          IN_RATES: ${{ inputs.rates }}
+          IN_SHARDS: ${{ inputs.churn_shards }}
+          IN_DUR: ${{ inputs.dur }}
+          SHARD: ${{ matrix.shard }}
+          AT: ${{ needs.plan.outputs.churn_at }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ulimit -n "$(ulimit -Hn)"
+          python edge/signal/test/hub_loadgen.py churn --url "$IN_URL" --out out --procs 3 \
+            --shard "$SHARD" --shards "$IN_SHARDS" --run-tag "$TAG" --start-at "$AT" \
+            --rates "$IN_RATES" --dur "$IN_DUR" --gap 15 | cut -c1-2000
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: churn-${{ matrix.shard }}
+          path: out/
+
+  aggregate:
+    needs: [plan, idle, churn]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: edge/signal/test
+      - uses: actions/download-artifact@v4
+        with:
+          path: raw
+      - name: Merge
+        run: |
+          set -euo pipefail
+          python3 edge/signal/test/hub_loadgen.py aggregate --indir raw --outfile aggregate.jsonl > /dev/null
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          rows = [json.loads(l) for l in open("aggregate.jsonl")]
+          print("| mode | step | ok | fail | alive | drops | ack timeouts | p50 ms | p99 ms | max ms | msgs/s | gen cpu max |")
+          print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+          for r in rows:
+              if r["mode"] == "idle":
+                  print(f"| idle | {r['step']} | {r.get('conn_ok')} | {r.get('conn_fail')} | {r.get('alive_end')} | {r.get('drops')} | {r.get('ack_timeouts')} | sync {r.get('sync_lat_p50')} / hb {r.get('hb_lat_p50')} | sync {r.get('sync_lat_p99')} / hb {r.get('hb_lat_p99')} | {r.get('sync_lat_max')} | {r.get('client_msgs_per_s')} | {r.get('gen_cpu_max_proc')} |")
+              else:
+                  print(f"| churn | {r['step']} | {r.get('pairs_ok')} | {r.get('pairs_fail')} | | | | sig {r.get('sig_lat_p50')} / setup {r.get('setup_lat_p50')} | sig {r.get('sig_lat_p99')} / setup {r.get('setup_lat_p99')} | {r.get('sig_lat_max')} | {r.get('ok_pairs_per_s')} ok/s | {r.get('gen_cpu_max_proc')} |")
+          EOF
+          cat "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aggregate
+          path: aggregate.jsonl
