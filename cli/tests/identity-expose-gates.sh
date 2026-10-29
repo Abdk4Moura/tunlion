@@ -71,11 +71,14 @@ pairing() {
     sleep 0.5
   done
   if [ -z "$code" ]; then echo "## $tag: no code"; tail -5 "$WORK/$tag-a.log"; RC_A=99; RC_B=99; kill $apid 2>/dev/null; return; fi
+  local t0; t0=$(date +%s.%N)
   env TUNLION_CONFIG_DIR="$db" TUNLION_LOG=debug TUNLION_PAIR_GRACE_SECS="$grace" $envb \
     timeout 120 "$bb" --server "$SERVER" join "$code" --name "peer-$tag" </dev/null >"$WORK/$tag-b.log" 2>&1
   RC_B=$?
+  local tb; tb=$(date +%s.%N)
   wait $apid; RC_A=$?
-  echo "## $tag: code $code, creator rc=$RC_A, claimer rc=$RC_B"
+  local ta; ta=$(date +%s.%N)
+  echo "## $tag: code $code, creator rc=$RC_A, claimer rc=$RC_B, claimer took $(awk "BEGIN{printf \"%.1f\", $tb - $t0}")s, creator done $(awk "BEGIN{printf \"%.1f\", $ta - $t0}")s after the join started"
 }
 
 show() { echo "--- $1 creator"; grep -vE "^\s*$" "$WORK/$1-a.log" | grep -viE "ice|candidate" | tail -n 8; echo "--- $1 claimer"; grep -vE "^\s*$" "$WORK/$1-b.log" | grep -viE "ice|candidate" | tail -n 8; }
