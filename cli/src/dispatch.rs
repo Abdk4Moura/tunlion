@@ -1282,7 +1282,13 @@ pub(crate) async fn async_main() -> Result<()> {
             reuse,
             out,
             via,
+            withdraw,
         } => {
+            // The inverse of minting lives on the verb that mints: `add` hands
+            // out an invitation, `add --withdraw` takes it back.
+            if let Some(selector) = withdraw {
+                return crate::add_for::withdraw_cmd(&ui_caps, &selector);
+            }
             // `--reuse` only means something for a bounded invitation artifact.
             // The first question is the relationship, as in the prototype: whose
             // device is it, or is this temporary access. Each answer goes
@@ -1634,7 +1640,14 @@ pub(crate) async fn async_main() -> Result<()> {
                         // explicit, so a script cannot read a stored overlay
                         // address as a route that exists.
                         let l3 = crate::l3_state::current().await;
-                        ui::json_out(&devices_json_envelope(arr, l3));
+                        let mut envelope = devices_json_envelope(arr, l3);
+                        // Outstanding invitations: unexpired, not withdrawn,
+                        // claims left. `[]` when there are none, so a script
+                        // can tell "none" from "this version does not say".
+                        envelope["data"]["invitations"] = Value::Array(
+                            crate::armed::outstanding().iter().map(|o| o.to_json()).collect(),
+                        );
+                        ui::json_out(&envelope);
                     } else {
                         // "online" on this screen means what it means in
                         // --json: the device answered a liveness ping on the
@@ -1664,6 +1677,16 @@ pub(crate) async fn async_main() -> Result<()> {
                             roster_heading,
                             load_owner_key().is_some(),
                         );
+                        // Outstanding invitations, beside the devices they may
+                        // yet become: an invitation is access already handed
+                        // out, so it is listed where access is listed.
+                        let rendered = match fleet_ui::devices::render_invitations(
+                            &crate::armed::outstanding(),
+                            now,
+                        ) {
+                            Some(block) => fleet_ui::devices::with_invitations(&rendered, &block),
+                            None => rendered,
+                        };
                         crate::outln!("{rendered}");
                         // Read only: a device with no identity is told how to
                         // get one, and nothing is minted by looking.

@@ -273,7 +273,7 @@ pub(crate) fn canonicalize_cmd(cmd: Cmd) -> Result<Cmd> {
             let remember = remember.map(|r| normalize_new_name(&r)).transpose()?;
             Cmd::Send { paths, code, word, remember, room, to, name, timeout, auth_key }
         }
-        Cmd::Add { who, name, word, for_, allow, expires, reuse, out, via } => {
+        Cmd::Add { who, name, word, for_, allow, expires, reuse, out, via, withdraw } => {
             // `add <who>` names a device of yours, or is a kind word. A name is
             // normalized, then matched to an existing device so `add popos`
             // re-adds the `pop-os` you already have instead of a second row.
@@ -297,7 +297,10 @@ pub(crate) fn canonicalize_cmd(cmd: Cmd) -> Result<Cmd> {
             let who = who.map(|w| norm_select(w, &known())).transpose()?;
             let for_ = for_.map(|f| norm_select(f, &known())).transpose()?;
             let name = name.map(|n| norm_select(n, &known())).transpose()?;
-            Cmd::Add { who, name, word, for_, allow, expires, reuse, out, via }
+            // `--withdraw` names an INVITATION, not a device: it is matched
+            // against the outstanding invitations, never resolved to a device
+            // record (a joined device often carries the same name).
+            Cmd::Add { who, name, word, for_, allow, expires, reuse, out, via, withdraw }
         }
         Cmd::Join { code, invite_file, invite_fd, name, to } => {
             let name = name.map(|n| normalize_new_name(&n)).transpose()?;

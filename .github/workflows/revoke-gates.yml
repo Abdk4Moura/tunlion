@@ -42,6 +42,11 @@
 # a real two-machine run, where renewal and a proof re-drive carried a guest
 # minutes past its invitation and forward ignored the end entirely.
 #
+# Also carries invite-withdraw-gates: `tunlion add --withdraw` disarms an
+# outstanding invitation. A claim with the withdrawn key is refused by the
+# RUNNING owner daemon, again after a restart, and from a 0.9.1 joiner, while
+# the device that joined before stays as it was.
+#
 # Linux only, deliberately. The mount arm needs FUSE, and the point here is to
 # run the guarantee somewhere real rather than to matrix it.
 
@@ -67,6 +72,7 @@ on:
       - 'cli/tests/forward-refusal-gates.sh'
       - 'cli/tests/revocation-live-gates.sh'
       - 'cli/tests/invite-expiry-gates.sh'
+      - 'cli/tests/invite-withdraw-gates.sh'
       - 'cli/tests/fleet-automesh-gates.sh'
       - 'cli/tests/lib/fixture.sh'
       - 'backend/**'
@@ -192,6 +198,11 @@ jobs:
             # (requests, device lists, one remedy: fix/rc-polish) + X12 (exec,
             # forward and send print one re-invite line: fix/concurrent-code-sends).
             [cli/tests/invite-expiry-gates.sh]=17
+            # 11 = W0 positive + W1/W2 listed + W3 withdraw report + W4 unlisted
+            # + W5 refused by the RUNNING daemon + W6 joined device unaffected
+            # + W7 refused after restart + W8 a 0.9.1 joiner refused + W9 the
+            # fresh-invitation control + W10 unknown/missing names.
+            [cli/tests/invite-withdraw-gates.sh]=11
           )
           rc=0
           for g in cli/tests/ssh-ca-gates.sh \
@@ -206,7 +217,8 @@ jobs:
                    cli/tests/shell-posture-gates.sh \
                    cli/tests/forward-refusal-gates.sh \
                    cli/tests/revocation-live-gates.sh \
-                   cli/tests/invite-expiry-gates.sh; do
+                   cli/tests/invite-expiry-gates.sh \
+                   cli/tests/invite-withdraw-gates.sh; do
             echo "::group::$g"
             # Label the tree the gates actually run against: CI checks out
             # GitHub's MERGE ref (pull/N/merge) by default, so "CI ran sha X"

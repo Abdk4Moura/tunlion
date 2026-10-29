@@ -265,6 +265,16 @@ pub(crate) fn action_argv(verb: &str, a: &Value, is_known: &dyn Fn(&str) -> bool
             [v(&["requests", "approve"]), vec![i], v(&["--allow"]), vec![c], v(&["--for"]), vec![dur], v(&["-y"])].concat()
         }
         "deny" => [v(&["requests", "deny"]), vec![id()?], v(&["-y"])].concat(),
+        // An invitation is named by its listed id (12 hex digits), never by a
+        // free-form string, so nothing the page sends can become a flag. The
+        // CLI then refuses an id that is not outstanding.
+        "withdraw" => {
+            let inv = s("invite");
+            if inv.len() != 12 || !inv.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                return Err("That is not an invitation id.".to_string());
+            }
+            [v(&["add", "--withdraw"]), vec![inv], v(&["-y"])].concat()
+        }
         other => return Err(format!("Unknown action '{other}'.")),
     })
 }
@@ -410,6 +420,7 @@ async fn state_json() -> Value {
         "devices": devices,
         "perms": perms,
         "ladder": crate::ladder::dashboard_ladder(),
+        "invitations": crate::armed::outstanding().iter().map(|o| o.to_json()).collect::<Vec<_>>(),
         "requests": requests,
         "history": daemon_log_tail(300),
     })
@@ -906,6 +917,14 @@ mod tests {
         );
         assert!(action_argv("promote", &json!({"device": "laptop", "to": "--json"}), &known).is_err());
         assert!(action_argv("promote", &json!({"device": "nobody"}), &known).is_err());
+        assert_eq!(
+            action_argv("withdraw", &json!({"invite": "0123456789ab"}), &known).unwrap(),
+            ["add", "--withdraw", "0123456789ab", "-y"]
+        );
+        assert!(action_argv("withdraw", &json!({"invite": "--yes"}), &known).is_err());
+        assert!(action_argv("withdraw", &json!({"invite": "ci"}), &known).is_err());
+        assert!(action_argv("withdraw", &json!({"invite": "0123456789AB"}), &known).is_err());
+        assert!(action_argv("withdraw", &json!({}), &known).is_err());
     }
 
     #[test]
