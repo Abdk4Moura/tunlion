@@ -30,6 +30,7 @@ mod android {
         }
         pub fn arg<S: AsRef<OsStr>>(&mut self, _arg: S) {}
         pub fn env<K: AsRef<OsStr>, V: AsRef<OsStr>>(&mut self, _key: K, _val: V) {}
+        pub fn env_clear(&mut self) {}
         pub fn cwd<D: AsRef<OsStr>>(&mut self, _dir: D) {}
     }
 
@@ -117,6 +118,34 @@ pub fn spawn_shell(argv: &[String], cols: u16, rows: u16, term: &str) -> Result<
         let mut cmd = CommandBuilder::new(&argv[0]);
         for a in &argv[1..] {
             cmd.arg(a);
+        }
+        // Like sshd: the account's default environment and identity, never
+        // the daemon's process environment; the login shell's profile files
+        // build the rest. A `--shell-user` argv is the `runuser -l` drop: the
+        // target's identity is runuser's job (it resets HOME/USER/LOGNAME/
+        // SHELL/PATH), but the daemon's TUNLION_CONFIG_DIR must not follow it
+        // there (#602 is same-account only).
+        let dropped = argv.first().is_some_and(|a| {
+            std::path::Path::new(a)
+                .file_name()
+                .and_then(|n| n.to_str())
+                == Some("runuser")
+        });
+        let daemon: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let user = crate::platform::Paths::exec_user_context(None)?;
+        let env = filament_peerloop::shell::user_env::child_env(
+            false,
+            &user,
+            dropped,
+            crate::platform::account_environment(),
+            &daemon,
+            &[],
+        )?;
+        cmd.env_clear();
+        for (k, v) in env {
+            cmd.env(k, v);
         }
         cmd.env("TERM", term);
         // Advertise 24-bit color. opentui-based TUIs (e.g. opencode) downgrade to a

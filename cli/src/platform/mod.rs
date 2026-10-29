@@ -206,13 +206,18 @@ impl Paths {
     /// privileges (CreateProcessAsUser) or the target user's credentials
     /// (CreateProcessWithLogonW), both of which have security implications.
     pub fn shell_argv(shell_program: Option<&str>, shell_config: Option<&str>, shell_user: Option<&str>) -> (Vec<String>, bool) {
-        let shell = shell_program
+        let configured = shell_program
             .map(|s| s.to_string())
             .or_else(|| std::env::var("TUNLION_SHELL").ok().filter(|s| !s.is_empty()))
-            .or_else(|| shell_config.map(|s| s.to_string()))
-            .unwrap_or_else(|| Self::default_shell());
-
-        let parts: Vec<String> = shell.split_whitespace().map(|s| s.to_string()).collect();
+            .or_else(|| shell_config.map(|s| s.to_string()));
+        // Only a configured value is argv-split. The default is one program
+        // path, and on Windows it usually has a space in it
+        // (`C:\Program Files\PowerShell\7\pwsh.exe`): splitting it ran
+        // `C:\Program` and every shell session failed to spawn.
+        let parts: Vec<String> = match configured {
+            Some(s) => split_shell_setting(&s),
+            None => vec![Self::default_shell()],
+        };
         #[cfg(unix)]
         {
             let argv = match shell_user {
@@ -353,15 +358,46 @@ impl Paths {
         }
     }
 
+    /// The shell a terminal on this machine would open for this account.
+    ///
+    /// Unix: the login shell the password database records (what sshd
+    /// runs), then `$SHELL`, then bash, then sh.
+    ///
+    /// Windows, mirroring OpenSSH for Windows: the machine's configured
+    /// `HKLM\SOFTWARE\OpenSSH` `DefaultShell` when it names an existing
+    /// program, else PowerShell 7 (`pwsh`) when installed, else Windows
+    /// PowerShell, else cmd. An explicit `--shell-program`, `TUNLION_SHELL`
+    /// or `tunlion set shell-program` comes before all of this.
     fn default_shell() -> String {
         #[cfg(unix)]
         {
-            std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
-                if Path::new("/bin/bash").exists() { "/bin/bash".into() } else { "/bin/sh".into() }
-            })
+            passwd_user_context(None)
+                .and_then(|u| u.shell)
+                .filter(|s| !s.is_empty() && Path::new(s).exists())
+                .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| {
+                    if Path::new("/bin/bash").exists() { "/bin/bash".into() } else { "/bin/sh".into() }
+                })
         }
         #[cfg(windows)]
         {
+            if let Some(configured) = openssh_default_shell() {
+                return configured;
+            }
+            let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+            let pwsh = Path::new(&program_files).join(r"PowerShell\7\pwsh.exe");
+            if pwsh.exists() {
+                return pwsh.to_string_lossy().into_owned();
+            }
+            let account = account_environment().unwrap_or_default();
+            if let Some(path) = filament_peerloop::shell::user_env::path_of(&account) {
+                if let Some(found) = std::env::split_paths(path)
+                    .map(|d| d.join("pwsh.exe"))
+                    .find(|p| p.is_file())
+                {
+                    return found.to_string_lossy().into_owned();
+                }
+            }
             if Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe").exists() {
                 "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into()
             } else if Path::new("C:\\Windows\\System32\\cmd.exe").exists() {
@@ -375,6 +411,46 @@ impl Paths {
             "/bin/sh".into()
         }
     }
+}
+
+/// A configured shell value as argv: a value that names an existing program
+/// as a whole (a Windows path with spaces in it) is that one program, anything
+/// else is split on whitespace so it can carry arguments (`pwsh -NoLogo`).
+fn split_shell_setting(value: &str) -> Vec<String> {
+    let whole = value.trim();
+    if !whole.is_empty() && Path::new(whole).is_file() {
+        return vec![whole.to_string()];
+    }
+    value.split_whitespace().map(str::to_string).collect()
+}
+
+/// OpenSSH for Windows' `DefaultShell` (`HKLM\SOFTWARE\OpenSSH`), when the
+/// machine sets one that exists: the owner already chose what a remote
+/// terminal opens here.
+#[cfg(windows)]
+fn openssh_default_shell() -> Option<String> {
+    let out = command("reg")
+        .args(["query", r"HKLM\SOFTWARE\OpenSSH", "/v", "DefaultShell"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_reg_sz(&String::from_utf8_lossy(&out.stdout), "DefaultShell")
+        .filter(|p| Path::new(p).is_file())
+}
+
+/// The data of `name` in `reg query` output (`    name    REG_SZ    data`).
+#[allow(dead_code)] // Windows only, tested everywhere
+pub fn parse_reg_sz(text: &str, name: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        let l = l.trim();
+        let rest = l.strip_prefix(name)?.trim_start();
+        let rest = rest
+            .strip_prefix("REG_EXPAND_SZ")
+            .or_else(|| rest.strip_prefix("REG_SZ"))?;
+        Some(rest.trim().to_string()).filter(|s| !s.is_empty())
+    })
 }
 
 /// The home directory the password database records for this effective uid.
@@ -2353,6 +2429,30 @@ fn stop_std_handle_inheritance() {
     }
 }
 
+// ------------------------------------------------------------- environment --
+
+/// The OS default environment for a new process of this account, read
+/// fresh now: Windows' `CreateEnvironmentBlock` on this process's token
+/// (an `Err` for a service account), the pam_env defaults on Unix. A served
+/// exec or shell is built on it, never on this process's own environment
+/// (`filament_peerloop::shell::user_env`).
+pub fn account_environment() -> std::result::Result<Vec<(String, String)>, String> {
+    filament_peerloop::shell::user_env::os_account_environment()
+}
+
+/// The daemon's own PATH. Search-path fallback for `argv[0]` only where the
+/// account default carries none and there is no standard path to offer:
+/// Windows. Unix falls back to the standard sshd path instead.
+#[cfg(windows)]
+pub fn daemon_path() -> Option<String> {
+    std::env::var_os("PATH").map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(not(windows))]
+pub fn daemon_path() -> Option<String> {
+    None
+}
+
 // --------------------------------------------------- process identity --
 
 /// The absolute path of the executable backing a live process, or `None` when
@@ -3025,6 +3125,35 @@ mod tests {
         // Same tool as the PTY drop: one mechanism, not two.
         let (pty, _) = Paths::shell_argv(Some("bash"), None, Some("nobody"));
         assert_eq!(pty[0], argv[0]);
+    }
+
+    /// A shell program path with a space in it (every Windows default under
+    /// `C:\Program Files`) stays one argv element; a value with arguments is
+    /// still split.
+    #[test]
+    fn a_shell_path_with_a_space_is_one_program() {
+        let dir = std::env::temp_dir().join(format!("tl shell {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("pwsh.exe");
+        std::fs::write(&program, b"").unwrap();
+        let whole = program.to_string_lossy().into_owned();
+        assert_eq!(super::split_shell_setting(&whole), vec![whole.clone()]);
+        let (argv, _) = Paths::shell_argv(Some(&whole), None, None);
+        assert_eq!(argv, vec![whole.clone()]);
+        assert_eq!(super::split_shell_setting("pwsh -NoLogo"), vec!["pwsh", "-NoLogo"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// OpenSSH's `DefaultShell` as `reg query` prints it.
+    #[test]
+    fn reg_query_output_names_the_default_shell() {
+        let out = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\OpenSSH\r\n    DefaultShell    REG_SZ    C:\\Program Files\\PowerShell\\7\\pwsh.exe\r\n\r\n";
+        assert_eq!(
+            parse_reg_sz(out, "DefaultShell").as_deref(),
+            Some(r"C:\Program Files\PowerShell\7\pwsh.exe")
+        );
+        assert_eq!(parse_reg_sz(out, "DefaultShellCommandOption"), None);
+        assert_eq!(parse_reg_sz("    DefaultShell    REG_SZ    \r\n", "DefaultShell"), None);
     }
 
     #[cfg(unix)]
