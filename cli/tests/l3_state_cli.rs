@@ -41,8 +41,8 @@ fn expose_without_an_endpoint_fails_nonzero_and_says_it_is_not_bound() {
         "expose must not report success with no live endpoint; stdout={stdout} stderr={stderr}"
     );
     assert!(
-        both.contains("NOT bound") || both.contains("not bound"),
-        "the failure must say the port is not bound: {both}"
+        stderr.contains("NOT bound") || stderr.contains("not bound"),
+        "the failure must say the port is not bound on STDERR: {stderr}"
     );
     // It may save the request for a later daemon, but it must not claim a bind.
     assert!(

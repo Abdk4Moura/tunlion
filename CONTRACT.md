@@ -1505,6 +1505,8 @@ command that mentions one now carries the LIVE endpoint state:
   nonzero with the bind failure or the missing-endpoint reason. `expose --list`
   marks each port `[bound]` or `[NOT bound: ...]`.
 - The userspace path binds through the same `MeshTunnel::bind` and needs no TUN.
+  It has NO kernel route: native tools reach `<peer>.mesh` only via
+  `tunlion forward <peer>:<port> --socks` or `L3::dial`.
 - The daemon reconciles `expose.json` on a short tick even where there is no
   unix control socket (Windows), so `expose` is verified on every platform.
 

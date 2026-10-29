@@ -237,6 +237,13 @@ pub trait MeshTunnel: Send + Sync + 'static {
     fn my_addr_v4(&self) -> Option<Ipv4Addr>;
     /// Is the endpoint the userspace netstack (no kernel TUN, no host firewall)?
     fn is_userspace(&self) -> bool;
+    /// Is the packet endpoint itself still alive? A run-time failure (the TUN
+    /// read loop ended, the netstack poll task died) must be able to downgrade
+    /// a previously published `ready`; the default is honest for hosts that
+    /// cannot tell.
+    fn l3_live(&self) -> bool {
+        true
+    }
     /// Why the kernel endpoint's native IPv4 address or route is missing, if it
     /// is. A userspace endpoint has no native address to miss.
     fn native_v4_problem(&self) -> Option<String> {

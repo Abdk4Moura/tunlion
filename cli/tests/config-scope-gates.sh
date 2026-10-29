@@ -162,12 +162,11 @@ else
   bad "gateP: a closed pipe changed status's exit code (unpiped $rcPU, piped $rcPP, head -1 $rcPH; json $rcPUJ vs $rcPPJ)"
 fi
 # ===================================================================== GATE H ==
-say "H: with HOME unset, init never writes a relative inbox"
+say "H: with HOME unset, init puts the inbox under the explicit config dir"
 DH="$WORK/cfg-nohome"
-PWHOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
-# init creates the default inbox under the password-database home; remove it
-# afterwards only if this gate created it (and it is still empty).
-[ -n "$PWHOME" ] && [ ! -e "$PWHOME/Tunlion" ] && CREATED_INBOX="$PWHOME/Tunlion"
+# No HOME but an explicit config dir: that dir is a complete location, so the
+# inbox defaults under it (never a relative ./Tunlion). The password database
+# is NOT consulted here; automation chose the config dir deliberately.
 ( cd "$WORK" && env -u HOME TUNLION_CONFIG_DIR="$DH" "$BIN" init --yes --name charlie \
     --recovery-file "$WORK/charlie-rec.txt" >"$WORK/nohome-init.log" 2>&1 ); rcH=$?
 DIRH=$(grep '^dir ' "$DH/config" 2>/dev/null | cut -d' ' -f2-)
@@ -175,13 +174,13 @@ DR="$WORK/cfg-relinbox"
 ( cd "$WORK" && env TUNLION_CONFIG_DIR="$DR" "$BIN" init --yes --name delta --inbox rel-inbox \
     --recovery-file "$WORK/delta-rec.txt" >"$WORK/relinbox-init.log" 2>&1 ); rcR=$?
 DIRR=$(grep '^dir ' "$DR/config" 2>/dev/null | cut -d' ' -f2-)
-echo "## env -u HOME init rc=$rcH, dir=[$DIRH] (password-database home: $PWHOME)"
+echo "## env -u HOME init rc=$rcH, dir=[$DIRH] (expected $DH/inbox)"
 echo "## --inbox rel-inbox init rc=$rcR, dir=[$DIRR]"
 grep -i "inbox" "$WORK/nohome-init.log" | head -2 | sed 's/^/    /'
-if [ "$rcH" = "0" ] && case "$DIRH" in /*) true ;; *) false ;; esac && case "$DIRH" in "$PWHOME"/*) true ;; *) false ;; esac \
+if [ "$rcH" = "0" ] && [ "$DIRH" = "$DH/inbox" ] && [ -d "$DH/inbox" ] \
    && ! grep -q "inbox: \./" "$WORK/nohome-init.log" \
    && [ "$rcR" = "0" ] && [ "$DIRR" = "$WORK/rel-inbox" ] && [ -d "$WORK/rel-inbox" ]; then
-  ok "gateH: HOME unset resolves the home from the password database; every inbox written is absolute"
+  ok "gateH: HOME unset uses the explicit config dir; every inbox written is absolute"
 else
   bad "gateH: relative inbox (HOME unset: rc=$rcH dir=[$DIRH]; --inbox rel: rc=$rcR dir=[$DIRR])"
   cat "$WORK/nohome-init.log" | head -5
