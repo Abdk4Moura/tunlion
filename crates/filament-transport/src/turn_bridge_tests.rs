@@ -514,6 +514,12 @@ async fn connect_proxy(status: &'static str) -> (u16, Arc<std::sync::Mutex<Vec<S
 #[test]
 fn the_bridge_honours_the_proxy_environment_in_a_fresh_process() {
     let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     cmd.args(["--ignored", "--nocapture", "--exact", "turn_bridge::tests::proxy_worker"]);
     for k in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "REQUEST_METHOD"] {
         cmd.env_remove(k);

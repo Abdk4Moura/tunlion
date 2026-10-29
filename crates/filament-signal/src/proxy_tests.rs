@@ -9,6 +9,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn test_process() -> std::process::Command {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
     command.args(["--ignored", "--nocapture"]);
     command
 }
