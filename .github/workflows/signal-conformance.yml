@@ -60,6 +60,9 @@ jobs:
           (cd backend && env $common PORT=5056 FIL_SESSION_CLAIM_LIMIT=8 FIL_CLAIM_LIMIT=3 FIL_CLOSE_LIMIT=4 \
              nohup python app.py > ../py-limits.log 2>&1 &)
           cd edge/signal
+          # Fetch wrangler once: two concurrent first-time npx installs race on the
+          # same cache directory (ENOTEMPTY) and one dev server never starts.
+          npx --yes wrangler@4.151.3 --version
           nohup npx wrangler@4.151.3 dev --env staging --port 8787 --ip 127.0.0.1 \
              --var FIL_SECRET:conformance --persist-to ../../.wrangler-main > ../../cf-main.log 2>&1 &
           nohup npx wrangler@4.151.3 dev --env limits --port 8788 --inspector-port 9230 --ip 127.0.0.1 \
