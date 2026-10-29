@@ -10,6 +10,8 @@
 #   A  NEGATIVE no-grant -- acceptor serving, initiator NOT granted: refused,
 #      nonzero, reason names the capability (exercises authorize_exec live).
 #   B  SPACES -- an argument with spaces arrives as ONE argv element.
+#   S  STATUS THROUGH EXEC -- `exec boxB -- tunlion status` sees boxB's daemon
+#      (the served child keeps the daemon's TUNLION_CONFIG_DIR).
 #   C  QUOTES -- single and double quotes inside one argument survive byte-exact.
 #   D  GLOB LITERAL -- `*.log` arrives literally (proves no shell expansion).
 #   E  STDERR SPLIT -- bytes written to each stream land on the right local
@@ -142,6 +144,27 @@ if [ "$rcB" = "0" ] && [ "$OUTB" = "hello world" ]; then
 else
   echo "-- B.err --"; cat "$WORK/B.err"
   bad "gateB: spaces NOT preserved (rc=$rcB out='$OUTB')"
+fi
+
+# ===================================================================== GATE S ==
+# STATUS THROUGH EXEC: `exec boxB -- tunlion status` reports boxB's OWN daemon
+# as up. boxB runs with TUNLION_CONFIG_DIR, as any hermetic or relocated daemon
+# does; the served child used to lose that variable and read the default
+# config dir instead: "not running", or, on a box whose default config has a
+# daemon of its own, that other daemon. So the pid must be boxB's. The exit
+# code is not asserted: the hermetic boxB has no identity, which `status`
+# reports as 9 whatever the daemon's state.
+say S
+BPID=$(head -1 "$DB/up.pid" 2>/dev/null | tr -d '[:space:]')
+OUTS=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- "$BIN" status 2>&1 </dev/null)
+rcS=$?
+echo "## (status via exec) rc=$rcS boxB pid=$BPID first='$(printf '%s' "$OUTS" | grep -m1 'up (pid\|not running')'"
+if [ -n "$BPID" ] && printf '%s' "$OUTS" | grep -q "up (pid $BPID)" \
+   && ! printf '%s' "$OUTS" | grep -qi "not running"; then
+  ok "gateS: status run through exec sees the daemon that served it (pid $BPID)"
+else
+  echo "-- S out --"; printf '%s\n' "$OUTS"
+  bad "gateS: status through exec did NOT see boxB's daemon pid=$BPID (rc=$rcS)"
 fi
 
 # ===================================================================== GATE C ==
