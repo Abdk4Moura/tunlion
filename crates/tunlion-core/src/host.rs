@@ -190,6 +190,13 @@ impl CoreHost {
 
 #[async_trait]
 impl HostServices for CoreHost {
+    #[cfg(feature = "access-endpoints")]
+    async fn connect_local_stream(&self, host: &str, port: u16) -> std::io::Result<tokio::net::TcpStream> {
+        // Mechanism only. AccessDispatch selects this exact target from the
+        // accepted AgreementEngine scope; reduced standing server ports still
+        // refuse their absent endpoints.
+        tokio::net::TcpStream::connect((host, port)).await
+    }
     fn now_secs(&self) -> u64 {
         now_secs()
     }
@@ -445,6 +452,7 @@ impl HostServices for CoreHost {
         Err("this core profile serves no control socket".to_string())
     }
 
+    #[cfg(not(feature = "access-endpoints"))]
     async fn connect_local_stream(
         &self,
         _host: &str,

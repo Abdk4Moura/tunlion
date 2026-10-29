@@ -1,7 +1,9 @@
 # Tunlion launch checklist
 
 Owners: **C** = Claude (drafts/ships directly) · **A** = Abdul (account actions).
-Drafts land in `docs/launch/` ready to paste.
+Drafts land in `docs/launch/` ready to paste. The current paste-ready text
+for every channel is `docs/launch/LAUNCH-PACK.md` (0.9.1); the per-channel
+files are older drafts.
 
 **Strategy / why:** `docs/launch/CASE-STUDY-takeoff.md` — how the analogues
 (LocalSend, Snapdrop/PairDrop, magic-wormhole/croc, Syncthing/Tailscale/ngrok)
@@ -26,6 +28,8 @@ executing the phases below.
 - [x] awesome-selfhosted entry prepared → `docs/launch/awesome-selfhosted.md`
 - [x] MIT LICENSE added to the repo
 - [x] **v1.0.0 release** cut (required: awesome-selfhosted needs a release ≥ 4 months old)
+      (`v1.0.0` is the filament-era web app release on commit "Add MIT license"; CLI
+      versions are tagged separately as `cli-vX.Y.Z`, newest published `cli-v0.9.1`)
 
 ## Phase 2 — Launch (A executes, C's drafts in hand)
 - [ ] Publish the blog post on Abdk4Moura.github.io (C can push after approval)

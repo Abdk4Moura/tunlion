@@ -51,10 +51,10 @@ curl -fsSL https://tunlion.autumated.com/install | sh
 # Windows
 winget install Abdk4Moura.Tunlion
 
-# Homebrew / Cargo
-brew tap abdk4moura/tunlion https://github.com/Abdk4Moura/tunlion
-brew install abdk4moura/tunlion/tunlion
+# Homebrew / Cargo / npm
+brew install abdk4moura/tap/tunlion
 cargo install filament-cli
+npm i -g @abdk4moura/filament-cli
 ```
 
 Already installed? `tunlion update` fetches and checksum-verifies the latest

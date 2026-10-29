@@ -504,8 +504,8 @@ impl L3 {
         };
         let (tun, netstack): (Arc<dyn TunDevice>, Option<Arc<NetstackTun>>) = match mode {
             L3Mode::Userspace => open_netstack()?,
-            L3Mode::Kernel => (open_kernel(cidr, mtu, crypto, my_v4, log.as_ref())?, None),
-            L3Mode::Auto => match open_kernel(cidr, mtu, crypto, my_v4, log.as_ref()) {
+            L3Mode::Kernel => (open_kernel(cidr, mtu, crypto, my_v4, true, log.as_ref())?, None),
+            L3Mode::Auto => match open_kernel(cidr, mtu, crypto, my_v4, false, log.as_ref()) {
                 Ok(t) => (t, None),
                 Err(e) => {
                     log.say(&format!(
@@ -1160,6 +1160,13 @@ impl MeshTunnel for L3 {
     fn l3_live(&self) -> bool {
         L3::l3_live(self)
     }
+    fn native_v4_problem(&self) -> Option<String> {
+        if L3::is_userspace(self) {
+            None
+        } else {
+            native_v4_problem()
+        }
+    }
     fn identity_addrs(&self) -> Option<(Ipv6Addr, Ipv4Addr)> {
         self.identity_ref().map(|id| (id.addr(), id.addr_v4()))
     }
@@ -1236,15 +1243,45 @@ impl MeshListener for OverlayListener {
     }
 }
 
+static NATIVE_V4_PROBLEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Why the kernel endpoint's native IPv4 address or route is missing, if it is.
+/// Read by the daemon when it publishes `L3Status`, so `addr`/`status` stop
+/// implying a derived v4 address is installed.
+pub fn native_v4_problem() -> Option<String> {
+    NATIVE_V4_PROBLEM.lock().ok().and_then(|p| p.clone())
+}
+
+fn set_native_v4_problem(problem: Option<String>) {
+    if let Ok(mut slot) = NATIVE_V4_PROBLEM.lock() {
+        *slot = problem;
+    }
+}
+
+/// What a failed native-IPv4 install means for the start. `required` is true
+/// only for an explicit `l3-mode kernel`: the person asked for the native data
+/// plane, so a kernel adapter without its IPv4 is a failed start, not a quiet
+/// partial one. In `auto` the v6 overlay stays on the kernel path and the
+/// problem is recorded for `addr`/`status` (a v4 quirk must not force a
+/// needless userspace fallback). Ok carries the problem to record, if any.
+fn native_v4_outcome(required: bool, problem: Option<String>) -> Result<Option<String>> {
+    match problem {
+        Some(p) if required => anyhow::bail!("l3-mode kernel: native {p}"),
+        other => Ok(other),
+    }
+}
+
 /// Open the KERNEL TUN end to end: create the device AND install the overlay-prefix
 /// route (crypto mode). Both steps can fail in a container (no cap, no /dev/net/tun,
 /// no `ip`, locked netns); doing them together lets `L3Mode::Auto` catch ANY failure
 /// and fall back to the userspace netstack instead of dropping off the overlay.
+/// `v4_required` (explicit kernel mode) makes a missing native IPv4 fatal too.
 fn open_kernel(
     cidr: &str,
     mtu: u32,
     crypto: bool,
     addr_v4: Option<std::net::Ipv4Addr>,
+    v4_required: bool,
     log: &dyn LogSink,
 ) -> Result<Arc<dyn TunDevice>> {
     let tun: Arc<dyn TunDevice> = Arc::new(KernelTun::open(IFNAME, cidr, mtu)?);
@@ -1260,11 +1297,20 @@ fn open_kernel(
         // So assign our v4 address + route the v4 prefix, logging on failure rather
         // than bailing. `add_addr` first so the /32 is local before the /15 is routed.
         if let Some(v4) = addr_v4 {
-            if let Err(e) = tun::add_addr(&format!("{v4}/32"), &name) {
-                log.debug(&format!("  L3 v4 address not assigned ({e}); v6 overlay unaffected"));
+            // Best-effort for the DATA PLANE, never silent: a missing v4 address
+            // is exactly what made native IPv4 traffic fail while `addr --v4`
+            // still printed the derived address (incident: dgmfa). Say it at a
+            // level a person sees, with the captured cause.
+            let problem = if let Err(e) = tun::add_addr(&format!("{v4}/32"), &name) {
+                log.critical(&format!("  ! native IPv4 {v4} was NOT installed on {name}: {e:#}. IPv6 overlay unaffected; IPv4 overlay traffic will not use this adapter."));
+                Some(format!("IPv4 {v4} not installed on {name}: {e:#}"))
             } else if let Err(e) = tun::add_route(&filament_overlay::prefix_v4_cidr(), &name) {
-                log.debug(&format!("  L3 v4 route not installed ({e}); v6 overlay unaffected"));
-            }
+                log.critical(&format!("  ! native IPv4 route {} was NOT installed on {name}: {e:#}. IPv6 overlay unaffected.", filament_overlay::prefix_v4_cidr()));
+                Some(format!("IPv4 route {} not installed on {name}: {e:#}", filament_overlay::prefix_v4_cidr()))
+            } else {
+                None
+            };
+            set_native_v4_problem(native_v4_outcome(v4_required, problem)?);
         }
     }
     Ok(tun)
@@ -1781,6 +1827,19 @@ mod route_reconcile_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Incident dgmfa: a kernel adapter without its IPv4 looked like a working
+    /// start. Explicit kernel mode must refuse it; auto keeps the kernel path
+    /// and records the problem so `addr`/`status` can say so.
+    #[test]
+    fn a_missing_native_v4_fails_explicit_kernel_mode_and_is_recorded_in_auto() {
+        let problem = || Some("IPv4 198.18.0.1 not installed on tunlion0: netsh exit 1".to_string());
+        let err = super::native_v4_outcome(true, problem()).unwrap_err().to_string();
+        assert!(err.contains("l3-mode kernel") && err.contains("198.18.0.1 not installed"), "{err}");
+        assert_eq!(super::native_v4_outcome(false, problem()).unwrap(), problem());
+        assert_eq!(super::native_v4_outcome(true, None).unwrap(), None);
+        assert_eq!(super::native_v4_outcome(false, None).unwrap(), None);
+    }
 
     /// The failure that cost a whole session: a hardening default nobody had
     /// looked at since, surfaced only as a quoted `ip addr add`.

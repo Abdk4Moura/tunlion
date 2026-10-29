@@ -67,6 +67,22 @@ fn test_block() -> bool {
     std::env::var("TUNLION_DIRECT_TEST_BLOCK").map(|v| v == "1").unwrap_or(false)
 }
 
+/// Test-only: `TUNLION_TEST_DIRECT_DELAY_MS=N` holds an authenticated direct
+/// link for N ms before it is announced, modelling a slow direct-QUIC setup (a
+/// cross-network race that takes over a second to win). The make-before-break
+/// gates use it to show a code transfer starts, and can finish, on the serving
+/// WebRTC link instead of waiting for QUIC. Like `TUNLION_DIRECT_TEST_BLOCK`,
+/// only gate scripts set it.
+pub async fn test_setup_delay() {
+    let ms = std::env::var("TUNLION_TEST_DIRECT_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0);
+    if let Some(ms) = ms {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
 /// Bug 2 PROOF hook (test-only): `TUNLION_DIRECT_TEST_DIE_AT=<bytes>` forces
 /// the FIRST established direct transport's QUIC connection to DIE (structurally
 /// error, dead=true) after N cumulative bytes of file data have been written
@@ -972,7 +988,7 @@ fn keep_endpoint_alive(ep: Endpoint, conn: &quinn::Connection) {
     tokio::spawn(async move {
         c.closed().await;
         #[cfg(debug_assertions)]
-        eprintln!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?} — connection closed, dropping endpoint");
+        eprintln!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?}: connection closed, dropping endpoint");
         drop(ep);
     });
 }
@@ -1362,6 +1378,11 @@ impl Transport for DirectTransport {
         }
     }
 
+    fn drain_after_delivery_ack(&self) -> bool {
+        // The drain is also how the receiver sees the stream end cleanly.
+        true
+    }
+
     fn max_payload(&self) -> usize {
         MAX_DIRECT_PAYLOAD
     }
@@ -1598,6 +1619,11 @@ fn reader_task(
             }
             let kind = hdr[0];
             let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+            if kind == KIND_CONTROL && len > crate::control_limits::MAX_CONTROL_BYTES {
+                dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                note_reader_exit(&peer_id, primary, "control-metadata-too-large", frames, true);
+                break;
+            }
             // Guard against an absurd length (a corrupt/hostile peer); cap well
             // above MAX_DIRECT_PAYLOAD + the 4-byte sid.
             if len > MAX_DIRECT_PAYLOAD + 64 {
@@ -1633,14 +1659,14 @@ fn reader_task(
             frames += 1;
             match kind {
                 KIND_CONTROL => {
-                    match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => {
+                    match crate::control_limits::decode_control(&body) {
+                        Some(v) => {
                             let _ = tx.send(crate::net::Ev::Control(peer_id.clone(), v));
                         }
                         // A control frame we cannot parse used to vanish here with
                         // no trace; it is a frame the peer believes it sent.
-                        Err(e) => crate::hooks::debug(&format!(
-                            "l2: control frame dropped (unparseable) peer={peer_id} err={e} frames={frames}"
+                        None => crate::hooks::debug(&format!(
+                            "l2: control frame dropped (invalid or over metadata limits) peer={peer_id} frames={frames}"
                         )),
                     }
                 }

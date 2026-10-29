@@ -284,10 +284,25 @@ pub(crate) async fn async_main() -> Result<()> {
                     argv.push("--help".into());
                 }
                 BareTarget::Send => {
-                    // `tunlion <path>` mints a one-time code so the other side can
-                    // claim it without having been paired first.
-                    argv.insert(1, "send".into());
-                    argv.push("--code".into());
+                    // `tunlion <path> <device>`: the device name is the destination,
+                    // the same way `tunlion <device>` opens a shell there. Only when
+                    // the second word is a known device and NOT also a path, so
+                    // `tunlion a.txt b.txt` stays a two-file send by code.
+                    let to_device = argv.len() == 3
+                        && !argv[2].starts_with('-')
+                        && !std::path::Path::new(&argv[2]).exists()
+                        && devices_load().iter().any(|(n, _)| *n == argv[2]);
+                    if to_device {
+                        let device = argv.remove(2);
+                        argv.insert(1, "send".into());
+                        argv.push("--to".into());
+                        argv.push(device);
+                    } else {
+                        // `tunlion <path>` mints a one-time code so the other side
+                        // can claim it without having been paired first.
+                        argv.insert(1, "send".into());
+                        argv.push("--code".into());
+                    }
                 }
                 BareTarget::Add => {
                     // L1-a unification: a `word-word-NNNN` (4-digit) code now drives
@@ -408,21 +423,58 @@ pub(crate) async fn async_main() -> Result<()> {
     }
     if argv.len() == 1 && std::io::stdin().is_terminal() {
         let device_count = devices_load().len();
-        let availability = if daemon_alive().is_some() {
-            "AVAILABLE"
-        } else {
-            "PAUSED"
+        // Say the state in words. "PAUSED" on a fresh install read as an error
+        // when it only meant "not running in the background", which is normal.
+        let devices = match device_count {
+            0 => "no devices yet".to_string(),
+            1 => "1 device".to_string(),
+            n => format!("{n} devices"),
         };
-        let header = format!("TUNLION  /  {device_count} DEVICES  /  {availability}");
+        let header = if daemon_alive().is_some() {
+            format!("TUNLION  /  {devices}  /  ready")
+        } else {
+            format!("TUNLION  /  {devices}")
+        };
         let owner = identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some();
         let joined = !owner && local_device_cert().is_some();
-        let actions = first_screen_actions(owner, joined, device_count);
-        let labels = actions
-            .iter()
-            .map(|(label, _)| (*label).to_string())
-            .collect::<Vec<_>>();
-        match codeentry::pick(&header, &labels)? {
-            Some(index) => argv.extend(actions[index].1.split_whitespace().map(str::to_string)),
+        // Connect to signaling while the person reads the menu, so a pairing
+        // code is ready the moment they ask for one (see preconnect.rs).
+        crate::preconnect::start(crate::preconnect::default_server());
+        // "More…" opens a second short page in place; Esc there comes back here.
+        // The last interactive shell, if its device is still known, leads the
+        // home page: Enter repeats it.
+        let recent = crate::first_screen::recent_action(&devices_load().into_iter().map(|(n, _)| n).collect::<Vec<_>>());
+        let mut on_more = false;
+        let chosen = loop {
+            let (title, mut actions): (String, Vec<(String, String)>) = if on_more {
+                ("MORE".to_string(), crate::first_screen::more_actions(owner).into_iter().map(|(l, v)| (l.to_string(), v.to_string())).collect())
+            } else {
+                (header.clone(), first_screen_actions(owner, joined, device_count).into_iter().map(|(l, v)| (l.to_string(), v.to_string())).collect())
+            };
+            if !on_more {
+                if let Some(recent) = &recent {
+                    actions.insert(0, recent.clone());
+                }
+            }
+            let labels = actions
+                .iter()
+                .map(|(label, _)| label.clone())
+                .collect::<Vec<_>>();
+            // The home page erases itself when it opens More, so the two pages
+            // replace each other instead of stacking.
+            let collapse = Some(codeentry::Collapse::Erase);
+            match codeentry::pick_opts(&title, &labels, codeentry::PickOpts { collapse, ..Default::default() })? {
+                codeentry::Picked::Item(index) if actions[index].1 == crate::first_screen::MORE => on_more = true,
+                codeentry::Picked::Item(index) => {
+                    ui::say(&ui::paint(ui::Tone::Dim, &format!("  {}", codeentry::summary_line(&actions[index].0))));
+                    break Some(actions[index].1.clone());
+                }
+                _ if on_more => on_more = false,
+                _ => break None,
+            }
+        };
+        match chosen {
+            Some(verb) => argv.extend(verb.split_whitespace().map(str::to_string)),
             // #209: Ctrl-C means stop. Answering it with the full
             // status-and-help screen reads as "I picked the first item and got a
             // help page", which is what the owner reported on Windows. Exit
@@ -431,7 +483,14 @@ pub(crate) async fn async_main() -> Result<()> {
             // This arm was mostly unreachable until #203 made cancelling work,
             // so fixing cancel is what turned a bad destination into a live one.
             // Every other `None =>` on a picker deserves the same second look.
-            None => return Ok(()),
+            None => {
+                // Under the Start Menu launcher, tell it the menu was closed (not
+                // an action finished), so it closes instead of offering "back".
+                if std::env::var_os(crate::first_screen::HOME_CHILD_ENV).is_some() {
+                    std::process::exit(i32::from(crate::first_screen::HOME_CLOSED));
+                }
+                return Ok(());
+            }
         }
     }
     // `add <code>` was how you accepted a code until the verbs split by role.
@@ -564,6 +623,7 @@ pub(crate) async fn async_main() -> Result<()> {
             | Cmd::Update { .. }
             | Cmd::Skill { .. }
             | Cmd::Demo { .. }
+            | Cmd::WinPtyRelay { .. }
     );
     if !exempt {
         // A verb with its own --json flag must still answer in JSON.
@@ -939,11 +999,17 @@ pub(crate) async fn async_main() -> Result<()> {
                         // not routable.
                         ui::say(&crate::ui::paint(crate::ui::Tone::Warn, &note));
                     }
+                    for note in crate::l3_state::native_notes(&l3_status) {
+                        ui::say(&crate::ui::paint(crate::ui::Tone::Warn, &note));
+                    }
                 } else {
                     crate::outln!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
                     crate::outln!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
                     crate::outln!("  mesh:     {mesh_name}.mesh");
                     if let Some(note) = crate::l3_state::not_ready_note(&l3_status) {
+                        ui::say(&format!("  {}", ui::paint(ui::Tone::Warn, &note)));
+                    }
+                    for note in crate::l3_state::native_notes(&l3_status) {
                         ui::say(&format!("  {}", ui::paint(ui::Tone::Warn, &note)));
                     }
                     if let Some(p) = crate::proxy_state::current() {
@@ -1207,6 +1273,40 @@ pub(crate) async fn async_main() -> Result<()> {
             via,
         } => {
             // `--reuse` only means something for a bounded invitation artifact.
+            // The first question is the relationship, as in the prototype: whose
+            // device is it, or is this temporary access. Each answer goes
+            // straight to its code; HOW (file vs code) is a hint on the code
+            // screen, not another question.
+            let mut for_ = for_;
+            if ui_caps.interactive && who.is_none() && name.is_none() && word.is_none()
+                && for_.is_none() && allow.is_empty() && expires.is_none()
+                && reuse.is_none() && out.is_none() && via.is_none()
+            {
+                let choices = vec![
+                    "Another device I own".to_string(),
+                    "Someone else's device".to_string(),
+                    "Temporary access (folders, ports or a shell)".to_string(),
+                ];
+                match codeentry::pick("CONNECT", &choices)? {
+                    // Own device = membership (`--for device`), which bootstraps
+                    // this device's identity on first use and never replaces an
+                    // existing one. A device that only JOINED someone's identity
+                    // holds no owner key to enrol with, so it keeps the ordinary
+                    // pair it always had here.
+                    Some(0) => {
+                        let owner = identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some();
+                        if owner || local_device_cert().is_none() {
+                            for_ = Some("device".to_string());
+                        }
+                    }
+                    Some(1) => for_ = Some("person".to_string()),
+                    Some(_) => {
+                        let spec = crate::access_ui::temporary_access()?;
+                        return crate::pair_cmd::temporary_cmd(&server, spec, relay).await;
+                    }
+                    None => return Err(cancelled()),
+                }
+            }
             // Parse it before any prompt or mint so a typo, 0 or an
             // unrepresentable count fails with exit 2 and nothing on disk.
             let reuse = reuse
@@ -1333,8 +1433,8 @@ pub(crate) async fn async_main() -> Result<()> {
                             "them"
                         };
                         let choices = vec![
-                            "Read out a code now         (we are both here)".to_string(),
-                            format!("Write a file {who} claims later"),
+                            "Show a code now (you are both here)".to_string(),
+                            format!("Write a file {who} can claim later"),
                         ];
                         match codeentry::pick("HOW SHOULD THEY GET IT", &choices)? {
                             Some(0) => Some("code".to_string()),
@@ -1384,19 +1484,8 @@ pub(crate) async fn async_main() -> Result<()> {
                 let internal = kind == "device";
                 crate::pair_cmd::FOR_PERSON
                     .store(kind == "person", std::sync::atomic::Ordering::Relaxed);
-                if internal {
-                    if let Some(e) = crate::identity_flow::add_needs_init() {
-                        return Err(e);
-                    }
-                }
-                if internal && load_owner_key().is_none() {
-                    bail!(
-                        "`add --for device` enrols the other side into your mesh, which \
-                         needs this machine's owner key. Only the device you ran \
-                         `tunlion init` on holds it: run it there, or use \
-                         `--for person` to pair without enrolling."
-                    );
-                }
+                // The ceremony securely bootstraps only when it is ready to
+                // mutate. Existing/joined identities are never replaced.
                 // `--expires` is the certificate lifetime here, parsed and
                 // bounded the same way as the invitation path above. Resolved
                 // before the ceremony so a bad value fails before a code shows.
@@ -1726,6 +1815,11 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
             };
             require_known_device(&peer)?;
+            // The home screen offers the last interactive shell first, so the
+            // thing you do most is one Enter away (first_screen::recent_action).
+            if ui_caps.interactive && args.is_empty() {
+                crate::first_screen::remember_shell(&peer);
+            }
             // #219: a device whose invitation ceiling excludes shell can never
             // serve one, and the denial was surfacing as a silent hang (the
             // acceptor's l2-close is only sent when the acceptor is ON). Say so
@@ -1956,6 +2050,14 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
             }
         }
+        Cmd::WinPtyRelay {
+            cols,
+            rows,
+            resize,
+            argv,
+        } => crate::platform::win_pty::relay(cols, rows, &resize, &argv),
+        #[cfg(feature = "test-hooks")]
+        Cmd::WinPtySmoke { mode } => crate::platform::win_pty_smoke(&mode),
         Cmd::Netcat { peer, rport } => {
             // Hidden one-release alias for the netcat shape, now forward --stdio.
             #[cfg(not(feature = "forward-server"))]

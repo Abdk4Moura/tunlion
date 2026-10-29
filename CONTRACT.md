@@ -9,7 +9,7 @@ networking layer, the CLI, and any UI all depend on this and nothing else.
       │                 Socket.IO /socket.io ─────► signaling relay
       │
       └────────── WebRTC DataChannel (P2P) ───────► other browser
-                  (files travel here; server never sees bytes)
+                  (files travel here; server never sees file bytes)
 ```
 
 ## REST (Flask → browser)
@@ -18,7 +18,8 @@ networking layer, the CLI, and any UI all depend on this and nothing else.
 |--------|---------------------|---------|
 | GET    | `/api/config`       | `{ signaling: "socketio"\|"firebase", iceServers: RTCIceServer[], firebase: object\|null, chunkSize: number }` |
 | GET    | `/api/room`         | `{ room: string }` — stable default room derived from caller IP |
-| GET    | `/api/health`       | `{ ok: true }` |
+| GET    | `/api/health`       | `{ ok: true }`, process liveness only (never consults Redis) |
+| GET    | `/health`           | readiness for monitors: 200 `{ ok: true, redis: "up"\|"not-configured" }`, 503 `{ ok: false, redis: "down" }` when the configured Redis does not answer a PING. An explicit route, never the SPA fallback |
 | GET    | `/` and `/rooms/:id`| the SPA (`index.html`) |
 
 ## Signaling events (browser ↔ Flask, Socket.IO)
@@ -200,6 +201,16 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   first, and if all are live a new tokenless session is refused with a clear
   capacity error (never superseding a live sid). One sliding 24h TTL covers
   sid/gen/token together (one Redis hash/Lua).
+- A client that sends neither `token` nor `gen` (the CLI daemon) gets a session
+  on its first claim, and later claims on the SAME socket continue that
+  session instead of minting a new one each time. A new socket is a new
+  session.
+- Claims are rate-limited per socket and per client IP
+  (`FIL_SESSION_CLAIM_LIMIT`, 600/min). A `sync` that only refreshes a session
+  the same socket already holds (same token, same `gen`, same room) is charged
+  to the socket only, so the per-IP budget bounds new sessions, takeovers and
+  generation bumps, not the number of devices behind one address. Over budget,
+  the claim is refused with `session-superseded {reason: "rate-limited"}`.
 - `pagehide` closes local PeerConnections synchronously, stops link/session/
   pairing/config timers, and `sendBeacon`s `{token, gen}` to
   `POST /api/session/close`. The endpoint requires the token, honors the
@@ -343,6 +354,94 @@ may carry direct candidates, but it never supplies that secret.
 Thus "first contact rides WebRTC" is correct for first contact with an unknown
 peer, and is required by the authentication order. It is not a statement that
 every connection or every platform always starts on WebRTC.
+
+### Code ceremony frames (`pake-msg`, `pake-confirm`)
+The SPAKE2 code ceremony rides the opaque `signal` relay, which may lose a
+frame (a relay drop, a socket reconnect mid-ceremony) or deliver one twice. No
+single emit is load-bearing (C30):
+
+- `{ type:"pake-msg", v:2, msg, np, direct? }` carries our 33-byte element.
+  `{ type:"pake-confirm", v:2, mac, msg, caps, scope, np, answer? }` carries the
+  confirmation MAC and ALSO our element (`msg`): a peer whose copy of the
+  element was lost derives K from it instead of refusing a confirmation that
+  arrived before key exchange. A confirmation with no K and no `msg` is still
+  refused.
+- **Re-send.** Each side re-sends its current message (the element until it
+  sends its confirmation, then the confirmation) at 250 ms, 500 ms, 1 s, then
+  every 2 s, until the peer's confirmation verifies or the ceremony is refused.
+  The caller's ceremony budget still bounds the whole exchange.
+- **Same bytes.** Every copy is the same element and the same MAC. One SPAKE2
+  session per ceremony: K comes from the first element received, so a re-sent
+  (or different) element after K changes nothing, and a re-send is never
+  another password guess.
+- **Duplicates.** A confirmation that arrives before this link's DTLS
+  fingerprints are known is dropped unverified (a later copy is checked). After
+  a side has verified the peer's confirmation, a further copy that verifies is
+  answered once with our same confirmation marked `answer:true` (the peer is
+  still waiting for ours); an `answer` is never answered, so two confirmed
+  sides do not ping-pong. A copy that does not verify after confirmation (an
+  old link's) is ignored. Neither is a second attempt: the outcome is fixed by
+  the first verification, and only that one can refuse the ceremony.
+- A receiver that has authenticated its sender keeps that one ceremony to
+  answer re-sends; it still ignores PAKE traffic from every other peer.
+
+### Post-PAKE promotion is make-before-break (`path-promote`)
+
+After the code ceremony confirms, both CLI ends race direct QUIC keyed by the
+ceremony secret, **beside** the authenticated WebRTC link. The WebRTC link is
+never torn down to make room for the race: the transfer is offered and starts
+on it immediately, and it keeps serving if QUIC never comes up (no rebuild, no
+gap). This replaces "Option A", which dropped the WebRTC link at confirmation
+and made every cross-network code transfer wait the 1.35 to 1.5 s QUIC took to
+come up before its first byte.
+
+A race that wins yields a verified (authenticated, MAC-checked) direct link
+held as a standby. The two ends move to it at a frame boundary with one round
+trip on the **serving** channel, led by the sender (the end whose frames must
+stop):
+
+- `{ type:"path-promote", v:1 }` sender → receiver, on the serving channel,
+  written only after the last data frame the sender puts on that channel. The
+  sender sends no further frames anywhere until it has an answer; its control
+  messages keep riding the serving channel.
+- `{ type:"path-promoted", v:1 }` receiver → sender, on the serving channel.
+  Sent only when the receiver holds its own verified direct link. Because the
+  serving channel is one ordered channel, the receiver has processed every
+  frame that preceded the ask when it answers. It then installs the direct link
+  in place of the WebRTC one in a single step.
+- `{ type:"path-declined", v:1 }` receiver → sender: no direct link here (none
+  armed, or its race lost at its deadline). Nothing moves.
+- `{ type:"path-stay", v:1 }` sender → receiver: the sender stopped waiting for
+  an answer (a backstop longer than the receiver's own race budget). The
+  receiver must not move after it.
+
+On `path-promoted` the sender's frames resume on the direct link from the next
+chunk, at their absolute offsets: nothing is re-offered and nothing is resent,
+and `file-end` follows the remaining frames on the direct link. The ordering
+guarantee is the point of the round trip: no frame and no `file-end` can reach
+the receiver on the direct link before every byte the WebRTC link carried has
+been dispatched (receivers write at absolute offsets, so this is the only
+property the move needs). Both ends keep reading the retired WebRTC channel for
+a short grace (the drop-close grace, 2 s) so a message the peer queued on it
+just before moving is still delivered, then close it.
+
+Invariants this preserves: the direct link is adopted exactly as before
+(born untrusted, keyed by the ephemeral ceremony secret, never owner-equivalent);
+the race's pending is never reaped while its winner waits for the handoff, so
+the adoption always sees it; nothing is ever destroyed without an armed
+successor (`proofs/transport_upgrade_model.py`, design `PATHSET`). When the
+serving link dies while the race runs, the winner is adopted at once, as before.
+A browser peer never races (it announces `direct:false`), so it never sees these
+messages.
+
+**Mixed versions.** Each CLI's `pake-msg` carries `handoff: 1` beside
+`direct: true`. The make-before-break promotion runs only when the peer's
+`pake-msg` carried it. A peer without it (0.9.1 and earlier) tears its own
+WebRTC link down at confirm and never answers `path-promote`, so against such a
+peer the promotion behaves exactly as before: the WebRTC link is replaced at
+confirm and the direct link is adopted when the race wins. No frame gate is
+ever closed toward a peer that cannot answer it. The field is advisory and rides
+the opaque relay like `direct`; stripping it only selects the old behaviour.
 
 ### One-time pairing (#11)
 `generateCode()` mints a **speakable, single-use** code (`clever-lynx-63`; or

@@ -96,6 +96,13 @@ export function useTunlion() {
   // without a late close from that session tearing down the new link.
   const genRef = useRef(currentGeneration())
   const supersededRef = useRef(false)
+  // Between this page's pagehide and its pageshow. The pagehide close beacon
+  // makes the relay echo `session-superseded {reason: 'page-closed'}` to this
+  // page's own socket; a page that comes back from bfcache must not read that
+  // echo as another tab taking over.
+  const pageHiddenRef = useRef(false)
+  const closedGenRef = useRef(null) // the generation our own pagehide closed
+  const rejoinFreshRef = useRef(null) // rotate the generation and rejoin (set below)
   // Resume stores, deliberately OUTLIVE individual PeerLinks (see docs/resilience.md):
   const partialsRef = useRef(new Map()) // transferId -> { received, buffers, size, mime, name }
   const outgoingRef = useRef(new Map()) // transferId -> { file, name, size, mime, peerUid }
@@ -273,6 +280,11 @@ export function useTunlion() {
   const pendingPakeRef = useRef(null) // { nameplate, password } awaiting a peer
   const pakeRef = useRef(null) // active PakePairing for the current peer
   const pakePeerRef = useRef(null) // peer sid we run the PAKE with
+  // The last CONFIRMED ceremony, kept to answer its peer's re-sent
+  // confirmation should ours have been lost: { peerId, pairing }.
+  const pakeDoneRef = useRef(null)
+  // Ticks the live ceremony so its current message is re-sent on backoff.
+  const pakeTickRef = useRef(null)
   // A ceremony that never finishes must end in a clear failure, never in a
   // silent "paired" header: the CLI refuses a bad confirmation by leaving, and
   // nothing else would tell the browser.
@@ -609,23 +621,35 @@ export function useTunlion() {
       if (new URLSearchParams(window.location.search).has('test')) {
         window.__tunlionTestLinks = linksRef.current
         window.__tunlionTestReconnect = () => sigRef.current?.dropForTest?.()
+        // The signaling socket's transport state, for gates that must tell a
+        // stalled long-poll from a socket that is merely idle.
+        window.__tunlionTestSocket = () => {
+          const s = sigRef.current?.socket
+          const e = s?.io?.engine
+          const t = e?.transport
+          return { connected: !!s?.connected, suspended: !!sigRef.current?.suspended, engine: e?.readyState, transport: t?.name, tstate: t?.readyState, polling: t?._polling, writable: t?.writable, buffered: e?.writeBuffer?.length }
+        }
       }
     } catch {}
     ;(async () => {
+      // Auto room ('people near you' via shared network) unless the URL pins one.
+      // Both requests go out together: the room does not depend on the config,
+      // and in series they cost one extra round trip before the socket opens.
+      const urlRoom = roomFromUrl()
+      const autoP = urlRoom ? null : fetch(api('/api/room')).then((r) => r.json())
+      autoP?.catch(() => {}) // a config failure must not leave this one unhandled
       const cfg = await fetch(api('/api/config')).then((r) => r.json())
       if (cancelled) return
       cfgRef.current = cfg
       setSignalingKind(cfg.signaling)
 
-      // Auto room ('people near you' via shared network) unless the URL pins one.
-      const urlRoom = roomFromUrl()
       let room, scope
       if (urlRoom) {
         room = urlRoom
         scope = urlRoom.startsWith('code-') ? 'code' : 'link'
         if (scope === 'code') setRoomCode(urlRoom.slice(5))
       } else {
-        const auto = await fetch(api('/api/room')).then((r) => r.json())
+        const auto = await autoP
         room = auto.room
         scope = 'auto'
         setNetwork(auto.network)
@@ -740,6 +764,22 @@ export function useTunlion() {
       // the intentional way back, and loses no pairing (localStorage stays).
       sig.on('session-superseded', ({ reason } = {}) => {
         if (supersededRef.current) return
+        if (reason === 'page-closed') {
+          // Our own departure, confirmed: only this device's token at its
+          // current generation can close the session, so no other tab took
+          // over. Suspending here left a bfcache-restored page dead (it showed
+          // "a newer tab took over" and never rejoined). Hidden: pageshow
+          // rotates the generation and rejoins. Visible, and the generation
+          // was not already rotated since (the echo raced a restore, or a
+          // duplicated tab closed this page's shared generation): rejoin now
+          // under a fresh generation.
+          tel('session-closed-echo', { hidden: pageHiddenRef.current })
+          if (pageHiddenRef.current) return
+          if (closedGenRef.current && closedGenRef.current !== genRef.current) return
+          rejoinFreshRef.current?.()
+          sessionRef.current?.kick()
+          return
+        }
         supersededRef.current = true
         tel('session-superseded', {})
         for (const link of linksRef.current.values()) link.close()
@@ -792,6 +832,13 @@ export function useTunlion() {
         // pending v2 pairing, route pake-msg/pake-confirm into the PAKE machine
         // (creating the PakePairing on first contact), OUT of the WebRTC path.
         if (data?.type === 'pake-msg' || data?.type === 'pake-confirm') {
+          // A copy from the peer we already confirmed: it re-sends until it
+          // hears our confirmation, so ours was lost. Its ceremony answers.
+          const done = pakeDoneRef.current
+          if (done && done.peerId === from && (data.np == null || data.np === done.pairing.nameplate)) {
+            done.pairing.onSignal(data)
+            return
+          }
           const partner = pakePartnerFor({
             bound: pakeRef.current ? pakePeerRef.current : null,
             from,
@@ -898,6 +945,8 @@ export function useTunlion() {
     return () => {
       cancelled = true
       sessionRef.current?.stop() // clear the 5s loop (HMR/unmount leak otherwise)
+      if (pakeTickRef.current) clearInterval(pakeTickRef.current)
+      pakeTickRef.current = null
       sigRef.current?.leave()
       linksRef.current.forEach((l) => l.close())
       linksRef.current.clear()
@@ -979,6 +1028,7 @@ export function useTunlion() {
     }
     if (p.secret) {
       const peerId = pakePeerRef.current
+      pakeDoneRef.current = { peerId, pairing: p }
       const name = (peerId && linksRef.current.get(peerId)?.name) || 'device'
       // L1-a EPHEMERAL transfer-auth (receiveWithCode): the SAME ceremony runs,
       // but the agreed secret is DISCARDED, it only authenticated the link
@@ -1025,6 +1075,7 @@ export function useTunlion() {
     const cfg = pendingPakeRef.current
     if (!cfg || !pakeReadyRef.current) return null
     pakePeerRef.current = peerId
+    pakeDoneRef.current = null
     pakeRef.current = new PakePairing({
       nameplate: cfg.nameplate,
       password: cfg.password,
@@ -1032,6 +1083,20 @@ export function useTunlion() {
       sendSignal: (payload) => sigRef.current?.signal(peerId, payload),
       getFingerprints: () => linksRef.current.get(peerId)?.fingerprints() || null,
     })
+    // C30: a lost element or confirmation is re-sent on backoff by the
+    // ceremony; this tick gives it the chance. It stops with the ceremony.
+    if (!pakeTickRef.current) {
+      pakeTickRef.current = setInterval(() => {
+        const p = pakeRef.current
+        if (!p) {
+          clearInterval(pakeTickRef.current)
+          pakeTickRef.current = null
+          return
+        }
+        p.tick()
+        drivePakeRef.current()
+      }, 100)
+    }
     setPairStatus('pairing')
     if (pairTimerRef.current) clearTimeout(pairTimerRef.current)
     pairTimerRef.current = setTimeout(() => {
@@ -1428,6 +1493,7 @@ export function useTunlion() {
     // normal thing, not a departure).
     const onPageHide = () => {
       pageHideSeen = true
+      pageHiddenRef.current = true
       if (recoverTimer) { clearTimeout(recoverTimer); recoverTimer = null }
       for (const link of linksRef.current.values()) {
         try { link.close() } catch {}
@@ -1452,6 +1518,7 @@ export function useTunlion() {
         try { resolveWait?.(false) } catch {}
       }
       if (helperTimerRef.current) { clearInterval(helperTimerRef.current); helperTimerRef.current = null }
+      closedGenRef.current = genRef.current
       beaconSessionClose(genRef.current, loadOwnerToken())
     }
     // pageshow fires on a normal load AND on a BFCache restore. Always
@@ -1459,24 +1526,36 @@ export function useTunlion() {
     // because the relay may have retired the generation it was frozen under
     // (another load/tab owned the device meanwhile). The old close note then
     // cannot match, and the restored page legitimately takes over again.
+    // A fresh generation for this page, and the session re-asserted under it:
+    // the relay retired (or closed) the old one, so it can never be replayed.
+    const rejoinFresh = () => {
+      genRef.current = rotateGeneration()
+      try { document.documentElement.setAttribute('data-session-generation', genRef.current) } catch {}
+      supersededRef.current = false
+      setSuperseded(null)
+      // Update the reconnect cache BEFORE any socket reconnect can replay the
+      // retired generation in `join`.
+      sigRef.current?.setIdentity?.({ name: myNameRef.current, uid: uidRef.current, gen: genRef.current })
+      sigRef.current?.resume?.()
+      sessionRef.current?.setRoom(roomIdRef.current, myNameRef.current, uidRef.current, genRef.current)
+      sessionRef.current?.invalidate()
+    }
+    rejoinFreshRef.current = rejoinFresh
     const onPageShow = (e) => {
       const persisted = !!(e && e.persisted)
-      const restoring = persisted || pageHideSeen
+      const hidden = pageHideSeen
+      const restoring = persisted || hidden
       pageHideSeen = false
+      pageHiddenRef.current = false
       // A superseded tab stays suspended until an explicit full reload. A
       // BFCache restore is not a reload and must not steal the session back.
       if (supersededRef.current) return
       if (restoring) {
-        genRef.current = rotateGeneration()
-        try { document.documentElement.setAttribute('data-session-generation', genRef.current) } catch {}
-        supersededRef.current = false
-        setSuperseded(null)
-        // Update the reconnect cache BEFORE any socket reconnect can replay the
-        // retired generation in `join`.
-        sigRef.current?.setIdentity?.({ name: myNameRef.current, uid: uidRef.current, gen: genRef.current })
-        sigRef.current?.resume?.()
-        sessionRef.current?.setRoom(roomIdRef.current, myNameRef.current, uidRef.current, genRef.current)
-        sessionRef.current?.invalidate()
+        rejoinFresh()
+        // After the fresh generation is cached, so the reconnect's join
+        // carries it. The pagehide close already took the old sid off every
+        // roster, so a new sid costs the other peers nothing.
+        if (hidden) sigRef.current?.reviveAfterPageHide?.()
         tel('bfcache-restore', { gen: genRef.current.slice(0, 8) })
       }
       sessionRef.current?.start()

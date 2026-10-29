@@ -144,6 +144,25 @@ jobs:
           TUNLION_TEST_VENV: python3
         run: node frontend/tests/peer-reload.spec.cjs
 
+      # Peer detection does not wait on a fixed bound: a page behind a held
+      # websocket still sees its peer inside the old 4 s connect bound, and a
+      # reload never shows the other peer a leave + rejoin for the new session.
+      - name: fast-detect
+        env:
+          TUNLION_TEST_VENV: python3
+        run: node frontend/tests/fast-detect.spec.cjs
+
+      # A closed tab leaves the other peers' rosters at once on both socket.io
+      # transports, through its own pagehide close rather than the ping
+      # timeout, and a page restored from bfcache comes back on both: it used
+      # to suspend itself on the relay's echo of its own close (websocket) or
+      # keep a long-poll transport wedged by engine.io-client's pagehide abort
+      # (polling).
+      - name: closed-tab
+        env:
+          TUNLION_TEST_VENV: python3
+        run: node frontend/tests/closed-tab.spec.cjs
+
       # A re-pair used to append a second known-device record for the same local
       # petname, so both the iPad and Pixel showed two rows for one peer. Seed
       # the broken localStorage shape, prove load migration leaves ONE online
@@ -163,8 +182,16 @@ jobs:
           FIL_TEST_REDIS_URL: redis://127.0.0.1:6379/0
         run: python -m unittest backend.tests.test_session_generation_redis
 
+      # A second join to the room a sid already holds re-sends the roster and
+      # does not tell the room the device left and came back.
+      - name: backend duplicate join is idempotent
+        run: python -m unittest backend.tests.test_join_idempotent
+
       - name: backend session close HTTP
         run: python -m unittest backend.tests.test_session_close_http
+
+      - name: backend health HTTP
+        run: python -m unittest backend.tests.test_health_http
 
       - name: backend rate limiter (Mem + Redis)
         env:

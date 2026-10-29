@@ -102,6 +102,12 @@ mod enrollment;
 mod membership;
 /// `tunlion pair` and its pair-specific helpers.
 mod pair_cmd;
+mod preconnect;
+mod access_ui;
+mod temporary_session;
+mod access_end;
+mod folder_access;
+mod terminal_access;
 #[cfg(test)]
 use pair_cmd::invitation_not_a_code_msg;
 /// `tunlion up` / `tunlion logs`.
@@ -1498,6 +1504,18 @@ fn load_delegation(path: &std::path::Path) -> Result<crate::ephemeral::Invitatio
 
 
 
+/// The refusal for a `kill` that did not succeed, or None when it did.
+fn kill_failure(pid: u32, status: &std::process::ExitStatus) -> Option<String> {
+    if status.success() {
+        return None;
+    }
+    Some(format!(
+        "could not stop the daemon (pid {pid}): `kill` failed ({status}), so it is still running. \
+         It is probably owned by another user, for example started with sudo; stop it as that user \
+         (`sudo tunlion down`). The pidfile is kept so `tunlion status` and `tunlion reset` still see it."
+    ))
+}
+
 fn down_cmd() -> Result<()> {
     // The pidfile names the daemon; a daemon whose pidfile is gone (an older
     // `down` deleted it while the process lived on) is still found through the
@@ -1517,31 +1535,56 @@ fn down_cmd() -> Result<()> {
             // through the manager first, and only fall back to a bare kill
             // when no manager owns the daemon (a foreground `up`, or a
             // non-service-managed box).
-            let request_nonce = if !stop_managed_service(pid) {
-                // Platform control, not a shell command guess: SIGTERM on unix;
-                // on Windows a pid+token+nonce request the daemon loop consumes
-                // and exits through its normal cleanup. A failure leaves the
-                // daemon running, so keep the pidfile and say why instead of
-                // printing "stopped" over a live process.
-                match crate::platform::request_daemon_stop(pid) {
-                    Ok(nonce) => nonce,
-                    Err(why) => bail!(
-                        "could not stop the daemon (pid {pid}): {why}, so it is still running. \
-                         The pidfile is kept so `tunlion status` and `tunlion reset` still see it."
-                    ),
+            let mut note_override: Option<&str> = None;
+            match platform::ask_daemon_to_stop(pid) {
+                Ok(platform::StopAsk::UseSignals) => {
+                    if !stop_managed_service(pid) {
+                        let status = crate::platform::command("kill").arg(pid.to_string()).status()?;
+                        // A failed kill leaves the daemon running. Saying
+                        // "stopped" and deleting the pidfile would hide it from
+                        // `status` and `reset` while it keeps serving.
+                        if let Some(why) = kill_failure(pid, &status) {
+                            bail!("{why}");
+                        }
+                    }
                 }
-            } else {
-                None
-            };
+                // Windows: no `kill` program and no SIGTERM (spawning `kill`
+                // failed with "program not found" and the daemon kept running,
+                // incident: dgmfa). The daemon's stop event was set instead.
+                Ok(platform::StopAsk::Sent) => {}
+                Ok(platform::StopAsk::Denied) => bail!(
+                    "could not stop the daemon (pid {pid}): it runs elevated (as Administrator) and this \
+                     terminal does not, so Windows refuses the request. It is still running. Run \
+                     `tunlion down` from an elevated terminal. The pidfile is kept."
+                ),
+                Ok(platform::StopAsk::NoListener) => {
+                    // An older daemon has no stop event: end it now, but only
+                    // if the pid is still the exact incarnation captured above.
+                    // A recycled pid (or one whose start token cannot be read)
+                    // is never force-terminated.
+                    if !daemon_stop::safe_to_force(pid, exe.as_deref(), start.as_deref()) {
+                        bail!(
+                            "could not stop the daemon (pid {pid}): it has no stop request listener (an older \
+                             tunlion), and the process at that pid cannot be verified as the daemon, so it was \
+                             not terminated. The pidfile is kept."
+                        );
+                    }
+                    if let Err(e) = platform::escalate(pid, platform::Escalate::Kill) {
+                        bail!(
+                            "could not stop the daemon (pid {pid}): it has no stop request listener (an older \
+                             tunlion) and terminating it failed ({e}); it is still running. If it runs elevated, \
+                             run `tunlion down` from an elevated terminal. The pidfile is kept."
+                        );
+                    }
+                    note_override = Some("; it had no stop request listener (an older tunlion), so it was terminated");
+                }
+                Err(e) => bail!("could not ask the daemon (pid {pid}) to stop: {e}. It is still running; the pidfile is kept."),
+            }
             // Stopped means GONE. A suspended daemon cannot act on SIGTERM and a
             // busy one may take a moment; "stopped" used to be printed 6 ms
             // after the signal while the process lived on, holding the lock the
             // next `up` then lost to. Wait (bounded), resume, then kill.
-            let exit_result = daemon_stop::await_exit(pid, exe.as_deref(), start.as_deref());
-            // Whatever happened, this down's request is no longer actionable.
-            // (The daemon consumes it on match; this covers timeout/error.)
-            daemon_stop::clear_stop_request_for(pid, start.as_deref(), request_nonce.as_deref());
-            let (how, replaced) = exit_result?;
+            let (how, replaced) = daemon_stop::await_exit(pid, exe.as_deref(), start.as_deref())?;
             // Only delete a pidfile that still names the daemon we stopped,
             // under the same instance lock `up` holds before write_pidfile, so
             // a replacement cannot write between the check and the remove.
@@ -1578,7 +1621,7 @@ fn down_cmd() -> Result<()> {
             ui::say(&format!(
                 "  {} stopped (pid {pid}){}{extra}",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                how.note()
+                note_override.unwrap_or_else(|| how.note())
             ));
             Ok(())
         }
@@ -1777,14 +1820,52 @@ fn verb_on_command_line() -> Option<String> {
     })
 }
 
+/// Windows debug/release builds can exhaust the default 1 MB main-thread stack
+/// while constructing the large Clap command tree, before `main` can dispatch
+/// even a harmless command. The observed failure was an interactive shell
+/// printing `thread 'main' has overflowed its stack` before the menu. Run the
+/// real entry point on a bounded larger stack. This is a startup-stack fix, not
+/// a privilege or sandbox boundary.
+#[cfg(windows)]
 fn main() -> std::process::ExitCode {
+    match std::thread::Builder::new()
+        .name("tunlion-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(main_inner)
+    {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|_| std::process::ExitCode::from(1)),
+        Err(_) => main_inner(),
+    }
+}
+
+#[cfg(not(windows))]
+fn main() -> std::process::ExitCode {
+    main_inner()
+}
+
+fn main_inner() -> std::process::ExitCode {
     // Build the runtime AFTER deciding how much of one is needed. This is the
     // only reason `main` is not `#[tokio::main]`: that macro picks the runtime
     // before anything can look at the command.
+    ui::mark_start();
+    // Before anything draws: a classic Windows console interprets escapes only
+    // once asked (see platform::enable_vt_output).
+    platform::enable_vt_output();
+    // A Start Menu launch keeps its window and comes back to the menu after an
+    // action instead of closing on the result (first_screen::maybe_run_home_loop).
+    if let Some(code) = first_screen::maybe_run_home_loop() {
+        return code;
+    }
     ui::exit_quietly_on_broken_pipe();
     ui::set_closed_pipe_verb(verb_on_command_line().as_deref());
     let first = std::env::args().nth(1);
-    let rt = if is_light_command(first.as_deref()) {
+    // A bare launch at a terminal is the menu, and the menu leads straight into
+    // network actions (and pre-connects signaling while it waits for a key), so
+    // it needs worker threads. Bare and non-interactive stays the light tour.
+    let menu = first.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let rt = if is_light_command(first.as_deref()) && !menu {
         tokio::runtime::Builder::new_current_thread().enable_all().build()
     } else {
         tokio::runtime::Builder::new_multi_thread().enable_all().build()

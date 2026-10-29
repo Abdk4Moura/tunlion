@@ -79,7 +79,7 @@ pub(crate) async fn recv_cmd(
             .and_then(|v| v.parse().ok())
             .map(std::time::Duration::from_secs)
             .unwrap_or(std::time::Duration::from_secs(8)),
-        trace_throughput: std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok(),
+        trace_throughput: trace_throughput_requested(),
         supervised: std::env::var("INVOCATION_ID").is_ok(),
         loop_stall_secs: std::env::var("TUNLION_LOOP_STALL_SECS")
             .ok()
@@ -237,4 +237,16 @@ mod tests {
         let _ = host_impl::cli_screen;
         let _ = exit_codes::ExitKind::Usage;
     }
+}
+
+/// `TUNLION_TRACE_THROUGHPUT` is a `debug-logs` build knob: a release build
+/// must not even carry its name (cli-release fails a binary that does).
+#[cfg(feature = "debug-logs")]
+fn trace_throughput_requested() -> bool {
+    std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok()
+}
+
+#[cfg(not(feature = "debug-logs"))]
+fn trace_throughput_requested() -> bool {
+    false
 }

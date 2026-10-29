@@ -235,6 +235,8 @@ fn find_backend_app() -> PathBuf {
 struct Harness {
     backend: Child,
     backend_port: u16,
+    /// Every line the backend printed, in order, including its `TEL` events.
+    backend_log: Arc<Mutex<Vec<String>>>,
     daemon_a: Option<Child>,
     daemon_b: Option<Child>,
     daemon_a_log: Arc<Mutex<Vec<String>>>,
@@ -271,10 +273,23 @@ fn find_free_port() -> u16 {
         .unwrap_or(19079)
 }
 
+/// A distinct work directory per Harness, not one per test process. The tests
+/// run serially in one process, and a child a test does not reap (the sender in
+/// `pair_and_transfer_smoke`) can still be writing into its config dir while
+/// Drop removes it. On macOS that left `b/` behind with an identity, so the
+/// next test's `init` refused ("this device already has identity") and every
+/// test after it failed the same way, since a Harness that panics in `new`
+/// never reaches Drop.
+fn harness_seq() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Harness {
     fn new() -> Self {
         let work = std::env::temp_dir()
-            .join(format!("filament-harness-{}", std::process::id()));
+            .join(format!("filament-harness-{}-{}", std::process::id(), harness_seq()));
         std::fs::create_dir_all(&work).expect("create work dir");
 
         let a_dir = work.join("a");
@@ -283,6 +298,7 @@ impl Harness {
         // Start the Python Flask backend on an ephemeral port
         let app_path = find_backend_app();
         let port = find_free_port();
+        let backend_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let mut backend = {
             let mut b = Command::new(python_cmd())
                 .arg(&app_path)
@@ -297,21 +313,25 @@ impl Harness {
                 .expect("start backend");
             // Drain stderr in a background thread so the pipe buffer doesn't fill
             let stderr = b.stderr.take().unwrap();
+            let log = backend_log.clone();
             std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines() {
                     if let Ok(l) = line {
                         eprintln!("[backend] {l}");
+                        log.lock().unwrap().push(l);
                     }
                 }
             });
             // Drain stdout too
             let stdout = b.stdout.take().unwrap();
+            let log = backend_log.clone();
             std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines() {
                     if let Ok(l) = line {
                         eprintln!("[backend] {l}");
+                        log.lock().unwrap().push(l);
                     }
                 }
             });
@@ -360,6 +380,7 @@ impl Harness {
         Harness {
             backend,
             backend_port: port,
+            backend_log,
             daemon_a: None,
             daemon_b: None,
             daemon_a_log: Arc::new(Mutex::new(Vec::new())),
@@ -1055,6 +1076,109 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
     // Otherwise: FAIL-CLOSED-LOUD, the correct behaviour, and the test passes.
 }
 
+/// The backend's `TEL {...}` events, parsed, in the order it printed them.
+fn backend_tel(h: &Harness) -> Vec<Value> {
+    h.backend_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|l| l.strip_prefix("TEL "))
+        .filter_map(|j| serde_json::from_str::<Value>(j).ok())
+        .collect()
+}
+
+/// A `join` claimer must end up in the creator's room and stay there: nothing
+/// it sends may name any other room once it has claimed.
+///
+/// The claimer used to record its private `pairc-` room as the session's
+/// desired room. Its first tick then put a `sync` naming that room on the wire
+/// right behind `pair-claim`. Whenever the server handled that sync after the
+/// claimer's `join` of the creator's room (most Windows runs), the claimer was
+/// moved back out: the creator saw it leave and dropped the link, the SPAKE2
+/// element went to a peer no longer in the room (`signal-refused`), and the
+/// ceremony failed with "confirmation arrived before key exchange". That is
+/// why `revoked_device_direct_blocked_gets_no_fallback_access` failed in its
+/// pairing setup, before anything about revocation ran.
+///
+/// The server's ordering is a race, so the outcome of one run proves nothing
+/// either way. This asserts what the claimer SENT, which is deterministic: the
+/// backend logs the room of every `join` and `sync`, and after the claim no
+/// event from the claimer's socket may name a room other than the creator's,
+/// and no signal between the two may be refused.
+#[test]
+fn pair_claimer_never_asserts_a_room_other_than_the_creators() {
+    let h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+    let env = [("TUNLION_CAP_AUTHORITATIVE", "0"), ("TUNLION_DIRECT", "0")];
+    let word = format!("roomcell-pair-p{:x}", std::process::id());
+    live_pair(&bin, &server, &env, &h.a_dir, &h.b_dir, &word);
+
+    let tel = backend_tel(&h);
+    let dump = || {
+        tel.iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let claim_at = tel
+        .iter()
+        .position(|v| v["ev"] == "pair-claim-ok")
+        .unwrap_or_else(|| panic!("no pair-claim-ok in the backend telemetry:\n{}", dump()));
+    let claimer = tel[claim_at]["sid"].as_str().unwrap().to_string();
+    let creator = tel[claim_at]["creator"].as_str().unwrap().to_string();
+    let creator_room = tel[claim_at]["room"].as_str().unwrap().to_string();
+
+    // Every room the claimer's socket asked for, at any point. Before the claim
+    // a plain `join` of its own private room is expected; a `sync` (the session
+    // asserting it as DESIRED state) is not, because that is exactly what can
+    // land late and pull the claimer back out.
+    let stray: Vec<&Value> = tel
+        .iter()
+        .enumerate()
+        .filter(|(i, v)| {
+            v["sid"] == claimer.as_str()
+                && match v["ev"].as_str() {
+                    Some("sync") => true,
+                    Some("join") => *i > claim_at,
+                    _ => false,
+                }
+                && v["room"].as_str() != Some(creator_room.as_str())
+        })
+        .map(|(_, v)| v)
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "the claimer asserted a room other than the creator's ({creator_room}): {stray:?}\n\
+         full telemetry:\n{}",
+        dump()
+    );
+    // Up to the first disconnect of either side: a re-sent ceremony message
+    // that arrives after the other process has exited is refused for the
+    // right reason, and says nothing about the room both were in.
+    let until = tel[claim_at..]
+        .iter()
+        .position(|v| {
+            v["ev"] == "disconnect"
+                && (v["sid"] == claimer.as_str() || v["sid"] == creator.as_str())
+        })
+        .map_or(tel.len(), |p| claim_at + p);
+    let refused: Vec<&Value> = tel[claim_at..until]
+        .iter()
+        .filter(|v| {
+            v["ev"] == "signal-refused"
+                && ((v["sid"] == claimer.as_str() && v["to"] == creator.as_str())
+                    || (v["sid"] == creator.as_str() && v["to"] == claimer.as_str()))
+        })
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "pairing signals between creator and claimer were refused, so they were \
+         not in one room: {refused:?}\nfull telemetry:\n{}",
+        dump()
+    );
+}
+
 /// The case the WebRTC fallback EXISTS for: direct-QUIC enabled, direct-QUIC
 /// FAILS, and the transfer must still complete over WebRTC, promptly.
 ///
@@ -1416,8 +1540,20 @@ fn shell_owner_gate_refuses_real_spawn() {
         .expect("spawn shell gate probe");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "ungated shell spawn unexpectedly succeeded: {stderr}");
+    assert!(!stderr.contains("socket.io connect"), "a precondition did not fire before signaling: {stderr}");
+    // Unix: a plain `--shell` PTY runs as this process's user, so it is
+    // owner-equivalent and refused without --i-know.
+    #[cfg(unix)]
     assert!(stderr.contains("owner's authority"), "missing owner-equivalence refusal: {stderr}");
-    assert!(!stderr.contains("socket.io connect"), "shell gate did not fire before signaling: {stderr}");
+    // Windows (shell privilege plane): a plain `--shell` runs on the linked,
+    // NON-elevated standard token, so it is not owner-equivalent and needs no
+    // --i-know; it must get past the owner gate and stop at the next real
+    // precondition (no identity in this fresh dir), still before signaling.
+    #[cfg(windows)]
+    {
+        assert!(!stderr.contains("owner's authority"), "Windows standard shell wrongly treated as owner-equivalent: {stderr}");
+        assert!(stderr.contains("no identity yet"), "Windows standard shell did not reach the identity precondition: {stderr}");
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 

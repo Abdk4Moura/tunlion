@@ -113,22 +113,6 @@ pub(crate) fn implicit_init_disabled() -> bool {
 pub(crate) const NO_IDENTITY_MSG: &str =
     "no identity yet; run `tunlion init` or `tunlion join <invitation>`";
 
-/// `add` on a device with no identity. `add` offers THIS device's identity to
-/// another, so it needs one, and the one it used to mint on the spot ("created
-/// your identity at ...") came with no recovery phrase, while `init` insists on
-/// one. So `add` refuses (exit 9) and names the ceremony that does it right.
-pub(crate) const ADD_NEEDS_INIT_MSG: &str =
-    "no identity yet: `tunlion add` offers this device's identity, and it has none. \
-     Run `tunlion init` first (it creates the identity and shows its recovery phrase), then add again. \
-     To accept a code or an invitation you were given instead, run `tunlion join <code-or-file>`";
-
-/// [`ADD_NEEDS_INIT_MSG`] as the exit-9 error, or None when there is an identity.
-pub(crate) fn add_needs_init() -> Option<anyhow::Error> {
-    (!has_identity()).then(|| {
-        crate::exit_codes::err(crate::exit_codes::ExitKind::NoIdentity, ADD_NEEDS_INIT_MSG)
-    })
-}
-
 /// `up` on a device with no identity AND nothing paired: such a daemon serves
 /// no one, and `up --detach` used to exit 0 and run while `--help` says 9 is
 /// "no identity". A device with no identity that HAS code-paired devices is
@@ -947,19 +931,10 @@ pub(crate) async fn join_cmd(
         bail!("this invitation has expired");
     }
     let owner_name = to.or_else(|| Some(inv.owner_name.clone()));
-    let name_given = name.is_some();
-    let mut proposed_name = name.unwrap_or_else(l3::hostname);
+    let proposed_name = name.unwrap_or_else(l3::hostname);
     if caps.interactive {
-        // #183.3: join is the other first-run path; let the joined device name
-        // itself the way init does. The review below shows the chosen name,
-        // which is the name the owner sees in the device list.
-        if !name_given {
-            let answer = prompt_line(&format!("  name this device [{}]: ", proposed_name))?;
-            let trimmed = answer.trim();
-            if !trimmed.is_empty() {
-                proposed_name = trimmed.to_string();
-            }
-        }
+        // Default to the existing hostname; --name is an optional override,
+        // not a required onboarding question.
         eprintln!();
         eprintln!("  {}", ui::paint(ui::Tone::Brand, "JOIN"));
         eprintln!("  as       {proposed_name}");
@@ -1352,7 +1327,7 @@ mod init_refusal_tests {
 
 #[cfg(test)]
 mod rc_identity_gate_tests {
-    use super::{up_refused_for_identity, ADD_NEEDS_INIT_MSG, UP_NEEDS_IDENTITY_MSG};
+    use super::{up_refused_for_identity, UP_NEEDS_IDENTITY_MSG};
 
     /// RC lab item 5: `up` with no identity and nothing paired is refused;
     /// the receive-only daemon of a code-paired device still runs.
@@ -1366,20 +1341,6 @@ mod rc_identity_gate_tests {
         assert!(UP_NEEDS_IDENTITY_MSG.contains("tunlion init"));
     }
 
-    /// RC lab item 6: the refusal names init (the ceremony with the recovery
-    /// phrase), and classifies as exit 9 by its text too.
-    #[test]
-    fn add_without_identity_names_init_and_is_exit_9() {
-        assert!(ADD_NEEDS_INIT_MSG.contains("tunlion init"));
-        assert_eq!(
-            crate::exit_codes::classify_text(ADD_NEEDS_INIT_MSG),
-            crate::exit_codes::ExitKind::NoIdentity
-        );
-        assert_eq!(
-            crate::exit_codes::classify_text(UP_NEEDS_IDENTITY_MSG),
-            crate::exit_codes::ExitKind::NoIdentity
-        );
-    }
 }
 
 #[cfg(test)]

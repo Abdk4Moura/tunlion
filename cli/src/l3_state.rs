@@ -109,11 +109,18 @@ pub fn read_file_for(daemon: Option<u32>) -> Value {
             .unwrap_or_else(|_| json!({"state":"down","mode":"none","reason":"stale L3 state"}));
         }
     }
-    json!({
+    let mut out = json!({
         "state": state,
         "mode": v["mode"].as_str().unwrap_or("none"),
         "reason": v.get("reason").cloned().unwrap_or(Value::Null),
-    })
+    });
+    // The record is the ONLY source on Windows (no control socket there), so
+    // a missing native IPv4 has to survive this read, or `addr` reports a
+    // kernel endpoint as fine on exactly the platform of the incident.
+    if let Some(problem) = v.get("v4Problem").and_then(Value::as_str) {
+        out["v4Problem"] = json!(problem);
+    }
+    out
 }
 
 /// The live state: ask the daemon on a platform with a control socket, else
@@ -146,9 +153,89 @@ pub fn not_ready_note(state: &Value) -> Option<String> {
     ))
 }
 
+/// Warnings for a READY endpoint that still is not what a person expects from
+/// "native" overlay access (incident: dgmfa). Pure, testable without a daemon.
+/// - userspace mode: tunlion's own commands reach the overlay, but other apps on
+///   this machine (a browser, curl) cannot, because no adapter carries it;
+/// - kernel mode with native IPv4 missing: the v4 address prints but is not
+///   installed, so IPv4 overlay traffic cannot use the adapter.
+pub fn native_notes(state: &Value) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !is_ready(state) {
+        return notes;
+    }
+    match state["mode"].as_str() {
+        Some("userspace") => notes.push(
+            "overlay is userspace-only here: tunlion's own commands reach it, but other apps on \
+             this machine cannot (no network adapter carries it). For native access, run the \
+             daemon elevated with l3-mode kernel."
+                .to_string(),
+        ),
+        Some("kernel") => {
+            if let Some(problem) = state["v4Problem"].as_str() {
+                notes.push(format!(
+                    "native IPv4 is NOT installed on the overlay adapter ({problem}). IPv6 overlay \
+                     works; the v4 address above is not reachable from other apps here."
+                ));
+            }
+        }
+        _ => {}
+    }
+    notes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows reads the L3 state from the daemon's record, never over a
+    /// control socket. A recorded v4Problem must reach `addr`/`status`.
+    #[test]
+    fn a_recorded_v4_problem_survives_the_file_read() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("tunlion-l3-v4problem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+        let problem = "IPv4 198.18.194.149 not installed on tunlion0: x";
+        write(&L3Status::ready("kernel").with_v4_problem(Some(problem.into())));
+        let v = read_file_for(Some(std::process::id()));
+        let notes = native_notes(&v);
+        write(&L3Status::ready("kernel"));
+        let healthy = read_file_for(Some(std::process::id()));
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
+                None => std::env::remove_var("TUNLION_CONFIG_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(v["state"], "ready", "{v}");
+        assert_eq!(v["v4Problem"], problem, "{v}");
+        assert!(notes.iter().any(|n| n.contains("NOT installed")), "{notes:?}");
+        assert!(healthy.get("v4Problem").is_none(), "{healthy}");
+    }
+
+    #[test]
+    fn native_notes_distinguish_userspace_and_missing_native_v4() {
+        let kernel_ok = serde_json::to_value(L3Status::ready("kernel")).unwrap();
+        assert!(native_notes(&kernel_ok).is_empty(), "a healthy kernel endpoint says nothing extra");
+        let user = serde_json::to_value(L3Status::ready("userspace")).unwrap();
+        let notes = native_notes(&user);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("userspace-only") && notes[0].contains("other apps"), "{notes:?}");
+        let v4_missing = serde_json::to_value(
+            L3Status::ready("kernel").with_v4_problem(Some("IPv4 198.18.194.149 not installed on tunlion0: x".into())),
+        )
+        .unwrap();
+        assert_eq!(v4_missing["v4Problem"], "IPv4 198.18.194.149 not installed on tunlion0: x");
+        let notes = native_notes(&v4_missing);
+        assert!(notes.iter().any(|n| n.contains("NOT installed") && n.contains("198.18.194.149")), "{notes:?}");
+        // not ready: the existing not_ready_note speaks, native_notes stays quiet
+        let down = serde_json::to_value(L3Status::down("none", "no tun")).unwrap();
+        assert!(native_notes(&down).is_empty());
+    }
 
     #[test]
     fn ready_is_ready_and_says_nothing_extra() {

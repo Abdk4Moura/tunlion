@@ -8,7 +8,7 @@
 
 Tunlion started as the file transfer nothing else does: the **receiving end needs nothing installed** — it can be any browser, on any phone or laptop. That still holds. But the same crypto-addressed link that carries a file also lets you **shell into your machines, forward a port, or mount a folder** across the internet. One tool, one identity, your devices meshed.
 
-Files and streams travel **peer to peer** (WebRTC data channel in the browser, direct QUIC between terminals). The server only helps the two ends find each other — it never sees a byte.
+Files and streams travel **peer to peer** (WebRTC data channel in the browser, direct QUIC between terminals). The server only helps the two ends find each other. It sees who paired with whom and when, never file contents.
 
 ![tunlion demo: send with a speakable code + QR, receive in another terminal, remembered devices](docs/launch/demo.gif)
 
@@ -24,14 +24,14 @@ curl -fsSL https://tunlion.autumated.com/install | sh
 irm https://tunlion.autumated.com/install.ps1 | iex
 ```
 
-Or a package manager:
+Or a package manager (same release):
 
 | Manager | Command |
 |---|---|
-| **winget** (Windows) | `winget install Abdk4Moura.Tunlion` |
+| **winget** (Windows) | `winget install Abdk4Moura.Tunlion` (new package, in winget review) |
 | **Homebrew** (macOS/Linux) | `brew install abdk4moura/tap/tunlion` |
-| **Cargo** (Rust) | `cargo install filament-cli` |
-| **npm** (Node) | `npm i -g @abdk4moura/filament-cli` |
+| **Cargo** (Rust, from source) | `cargo install --locked --git https://github.com/Abdk4Moura/tunlion filament-cli` |
+| **npm** (Node) | `npm i -g tunlion` |
 
 Homebrew and npm install `tl` too. Homebrew reports a link conflict and leaves
 an existing `tl` in its bin directory in place; npm writes both shims into its

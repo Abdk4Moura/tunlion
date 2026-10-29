@@ -33,6 +33,9 @@
 
 use filament_pair::PakeState;
 use serde_json::{json, Value};
+use std::time::Instant;
+
+use crate::retry::Resend;
 
 /// The capability set v2 first-pairing / ephemeral transfer-auth agrees on.
 /// "transfer" is the L0 baseline (always allowed); deny-by-default future caps
@@ -116,6 +119,11 @@ pub enum Inbound {
     Abort(String),
     /// Not a PAKE payload (it is SDP/ICE); fall through to the WebRTC path.
     Ignored,
+    /// A re-sent copy of the peer's confirmation, which this ceremony already
+    /// verified: the peer is still waiting for OURS, so it was lost. Relay this
+    /// payload (our same confirmation) back to that peer. Nothing else changed;
+    /// it is not a new ceremony step and never a second attempt.
+    Reply(Value),
 }
 
 /// One SPAKE2 ceremony with one peer. Holds all the protocol state the loops
@@ -143,6 +151,9 @@ pub struct Ceremony {
     aborted: Option<String>,
     sent_msg: bool,
     sent_confirm: bool,
+    /// Re-sends whichever of our element / confirmation is current until the
+    /// peer's confirmation is verified (see [`Resend`]).
+    resend: Resend,
     /// The public routing nameplate this ceremony is for. Carried (as `np`) on
     /// every payload so a peer can tell whose ceremony a message belongs to:
     /// two concurrent `send --code` on one device share the sender's auto room,
@@ -157,6 +168,10 @@ pub struct Ceremony {
     /// stalled forever after "authenticated". Only routing, not a secret: a
     /// server that strips it just keeps the transfer on WebRTC.
     peer_direct: bool,
+    /// The peer can move a live transfer to direct QUIC at a frame boundary
+    /// (`handoff`, the make-before-break promotion). An older CLI advertises
+    /// `direct` without this and still tears its WebRTC link down at confirm.
+    peer_handoff: bool,
 }
 
 /// Who a pairing ceremony should run with, given one inbound PAKE payload.
@@ -229,8 +244,10 @@ impl Ceremony {
             aborted: None,
             sent_msg: false,
             sent_confirm: false,
+            resend: Resend::default(),
             nameplate: nameplate.to_string(),
             peer_direct: false,
+            peer_handoff: false,
         }
     }
 
@@ -248,6 +265,7 @@ impl Ceremony {
         self.aborted = None;
         self.sent_msg = false;
         self.sent_confirm = false;
+        self.resend = Resend::default();
     }
 
     /// Explicitly re-mint with a new scope (if the introduction token's scope
@@ -264,6 +282,7 @@ impl Ceremony {
         self.aborted = None;
         self.sent_msg = false;
         self.sent_confirm = false;
+        self.resend = Resend::default();
     }
 
     pub fn secret(&self) -> Option<&String> {
@@ -279,6 +298,7 @@ impl Ceremony {
             "msg": b64_encode(&self.msg),
             "np": self.nameplate,
             "direct": true,
+            "handoff": 1,
         })
     }
 
@@ -301,38 +321,66 @@ impl Ceremony {
         self.aborted.as_ref()
     }
 
-    /// The opaque `signal` payload carrying our SPAKE2 element, IF it hasn't been
-    /// sent yet. `None` once sent (idempotent). Marks it sent. The caller relays
-    /// the returned JSON to the peer (`{to, data: <this>}`).
+    /// The opaque `signal` payload carrying our SPAKE2 element: the first time
+    /// it is asked for, then again on the [`Resend`] backoff until our
+    /// confirmation supersedes it (that carries the element too). The caller
+    /// relays the returned JSON to the peer (`{to, data: <this>}`) and simply
+    /// calls this every tick. Every copy is the same element: one SPAKE2
+    /// session per ceremony, so a re-send is never another guess.
     pub fn take_msg_payload(&mut self) -> Option<Value> {
-        if self.sent_msg {
-            return None;
-        }
-        self.sent_msg = true;
-        Some(json!({
-            "type": "pake-msg", "v": 2,
-            "msg": b64_encode(&self.msg),
-            "np": self.nameplate,
-            "direct": true,
-        }))
+        self.take_msg_payload_at(Instant::now())
     }
 
-    /// The opaque `signal` payload carrying our key-confirmation MAC, IF K is
-    /// derived AND it hasn't been sent yet. Needs both DTLS fingerprints (so the
-    /// MAC binds them) AND the introduction scope byte (so a scope downgrade is
-    /// detected). `None` until ready / once sent.
-    pub fn take_confirm_payload(&mut self, my_fp: &str, their_fp: &str) -> Option<Value> {
-        if self.sent_confirm {
+    pub(crate) fn take_msg_payload_at(&mut self, now: Instant) -> Option<Value> {
+        if !self.sent_msg {
+            self.sent_msg = true;
+            self.resend.arm(now);
+        } else if self.sent_confirm || !self.unsettled() || !self.resend.due(now) {
             return None;
         }
+        Some(self.msg_payload())
+    }
+
+    /// The opaque `signal` payload carrying our key-confirmation MAC, once K is
+    /// derived: the first time it is asked for, then again on the [`Resend`]
+    /// backoff until the peer's confirmation verifies. Needs both DTLS
+    /// fingerprints (so the MAC binds them) AND the introduction scope byte (so
+    /// a scope downgrade is detected). `None` until ready / between re-sends.
+    pub fn take_confirm_payload(&mut self, my_fp: &str, their_fp: &str) -> Option<Value> {
+        self.take_confirm_payload_at(my_fp, their_fp, Instant::now())
+    }
+
+    pub(crate) fn take_confirm_payload_at(&mut self, my_fp: &str, their_fp: &str, now: Instant) -> Option<Value> {
+        self.k.as_ref()?;
+        if !self.sent_confirm {
+            self.sent_confirm = true;
+            self.resend.arm(now);
+        } else if !self.unsettled() || !self.resend.due(now) {
+            return None;
+        }
+        self.confirm_payload(my_fp, their_fp)
+    }
+
+    /// Neither confirmed nor refused: our current message still needs re-sending.
+    fn unsettled(&self) -> bool {
+        self.secret.is_none() && self.aborted.is_none()
+    }
+
+    /// Our confirmation for this link. Deterministic in K, the fingerprints, the
+    /// caps and the scope, so every copy (and a reply to a duplicate) is the
+    /// same. It also carries our element (`msg`): a peer whose copy of the
+    /// element was lost derives K from it instead of refusing a confirmation
+    /// that arrived before key exchange.
+    fn confirm_payload(&self, my_fp: &str, their_fp: &str) -> Option<Value> {
         let k = self.k.as_ref()?;
         // Scope byte is MANDATORY and is derived from the authenticated
         // introduction token (or the fixed convention for plain pair).
-        let mac = filament_pair::our_confirm(k, my_fp, their_fp, &self.caps_canon, self.scope);
-        self.sent_confirm = true;
+        let canon = self.caps_canon.clone();
+        let mac = filament_pair::our_confirm(k, my_fp, their_fp, &canon, self.scope);
         Some(json!({
             "type": "pake-confirm", "v": 2,
             "mac": b64_encode(&mac),
+            "msg": b64_encode(&self.msg),
             "caps": self.caps.clone(),
             "scope": self.scope,
             "np": self.nameplate,
@@ -353,6 +401,13 @@ impl Ceremony {
     /// browser: callers must then keep the WebRTC link instead of promoting.
     pub fn peer_supports_direct(&self) -> bool {
         self.peer_direct
+    }
+
+    /// Whether the peer runs the make-before-break promotion. Without it the
+    /// promotion must behave as the peer expects (tear down at confirm), or
+    /// the peer's teardown and our handoff would race on a dying link.
+    pub fn peer_supports_handoff(&self) -> bool {
+        self.peer_direct && self.peer_handoff
     }
 
     /// Scope byte (mandatory, no default).
@@ -376,53 +431,69 @@ impl Ceremony {
         ) && data["direct"].as_bool() == Some(true)
         {
             self.peer_direct = true;
+            if data["handoff"].as_u64() == Some(1) {
+                self.peer_handoff = true;
+            }
         }
         match data["type"].as_str() {
-            Some("pake-msg") => {
-                if self.k.is_none() {
-                    if let Some(state) = self.state.take() {
-                        let peer_el = data["msg"]
-                            .as_str()
-                            .and_then(b64_decode)
-                            .unwrap_or_default();
-                        match filament_pair::finish(state, &peer_el) {
-                            Some(k) => self.k = Some(k),
-                            None => {
-                                return Inbound::Abort(
-                                    "malformed key-exchange message (abort)".to_string(),
-                                )
-                            }
-                        }
+            // A re-sent element after K is a no-op: K comes from the FIRST
+            // element only (the SPAKE2 session is consumed), so neither a copy
+            // nor a different element can buy another guess.
+            Some("pake-msg") => match self.absorb_element(data) {
+                Ok(()) => Inbound::Consumed,
+                Err(abort) => abort,
+            },
+            Some("pake-confirm") => {
+                // Our copy of the peer's element was lost: its confirmation
+                // carries the same element, so derive K from that first.
+                if self.k.is_none() && data.get("msg").is_some() {
+                    if let Err(abort) = self.absorb_element(data) {
+                        return abort;
                     }
                 }
-                Inbound::Consumed
-            }
-            Some("pake-confirm") => {
                 let Some(k) = self.k.clone() else {
                     return Inbound::Abort(
                         "confirmation arrived before key exchange (abort)".to_string(),
                     );
                 };
-                let recv_mac = data["mac"]
-                    .as_str()
-                    .and_then(b64_decode)
-                    .unwrap_or_default();
+                let recv_mac = data["mac"].as_str().and_then(b64_decode).unwrap_or_default();
+                // Without this link's fingerprints there is nothing to verify the
+                // MAC against yet. Verify nothing, agree nothing: the peer re-sends
+                // its confirmation until ours arrives, and a later copy is checked.
                 let Some((my_fp, their_fp)) = fps else {
-                    return Inbound::Abort(
-                        "no DTLS fingerprints to bind confirmation (abort)".to_string(),
-                    );
+                    return Inbound::Consumed;
                 };
                 // We MAC against OUR fixed caps + scope, so a server that rewrites the
                 // relayed `caps` or `scope` field cannot make the MAC verify. Scope
                 // byte is read from the authenticated token, not a local guess.
-                if filament_pair::verify_peer_confirm(
+                let verified = filament_pair::verify_peer_confirm(
                     &k,
                     my_fp,
                     their_fp,
                     &self.caps_canon,
                     self.scope,
                     &recv_mac,
-                ) {
+                );
+                // Already confirmed: this is a re-send, so the peer has not heard
+                // our confirmation. Answer with the same one, marked `answer` so
+                // a peer that is itself confirmed never answers back (two
+                // confirmed sides would otherwise ping-pong). It is never a second
+                // attempt: the outcome was fixed by the first verification, and a
+                // copy that does not verify (an old link's) changes nothing.
+                if self.secret.is_some() {
+                    if !verified || data["answer"].as_bool() == Some(true) {
+                        return Inbound::Consumed;
+                    }
+                    self.sent_confirm = true;
+                    return match self.confirm_payload(my_fp, their_fp) {
+                        Some(mut reply) => {
+                            reply["answer"] = json!(true);
+                            Inbound::Reply(reply)
+                        }
+                        None => Inbound::Consumed,
+                    };
+                }
+                if verified {
                     self.secret = Some(filament_pair::secret_from_k(&k));
                     Inbound::Consumed
                 } else {
@@ -434,6 +505,25 @@ impl Ceremony {
             }
             _ => Inbound::Ignored,
         }
+    }
+
+    /// Derive K from the peer's element (`data["msg"]`), once. Later copies are
+    /// no-ops: the SPAKE2 session is consumed by the first.
+    fn absorb_element(&mut self, data: &Value) -> Result<(), Inbound> {
+        if self.k.is_none() {
+            if let Some(state) = self.state.take() {
+                let peer_el = data["msg"].as_str().and_then(b64_decode).unwrap_or_default();
+                match filament_pair::finish(state, &peer_el) {
+                    Some(k) => self.k = Some(k),
+                    None => {
+                        return Err(Inbound::Abort(
+                            "malformed key-exchange message (abort)".to_string(),
+                        ))
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -750,5 +840,238 @@ mod tests {
             Inbound::Consumed
         ));
         assert!(!cli.peer_supports_direct());
+    }
+
+    // ---- C30: the ceremony over a relay that loses or repeats frames --------
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fate {
+        Deliver,
+        Drop,
+        Twice,
+    }
+
+    const A_FPS: (&str, &str) = ("SHA-256 AA", "SHA-256 BB");
+    const B_FPS: (&str, &str) = ("SHA-256 BB", "SHA-256 AA");
+
+    /// Drive two ceremonies the way the event loops do (each tick: take our
+    /// element, then our confirmation; deliver what the relay lets through;
+    /// relay any `Reply` back), in REAL time on a 10 ms tick, until both settle
+    /// or `bound` passes. `fate(side, kind, n)` decides the n-th (1-based) copy
+    /// of `kind` sent by `side`. Uses only the drivers' API, so it runs the
+    /// same against a build without re-sends. Returns the elapsed time and
+    /// every payload each side put on the wire.
+    fn run_lossy(
+        a: &mut Ceremony,
+        b: &mut Ceremony,
+        fate: impl Fn(char, &str, usize) -> Fate,
+        bound: std::time::Duration,
+    ) -> (std::time::Duration, Vec<Value>, Vec<Value>) {
+        let started = std::time::Instant::now();
+        let mut wire: (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
+        let mut counts = std::collections::HashMap::<(char, String), usize>::new();
+        let mut queue: std::collections::VecDeque<(char, Value)> = Default::default();
+        let mut send = |side: char, v: Value, queue: &mut std::collections::VecDeque<(char, Value)>, wire: &mut (Vec<Value>, Vec<Value>)| {
+            let kind = v["type"].as_str().unwrap_or("").to_string();
+            let n = counts.entry((side, kind.clone())).or_default();
+            *n += 1;
+            if side == 'a' { wire.0.push(v.clone()) } else { wire.1.push(v.clone()) }
+            match fate(side, &kind, *n) {
+                Fate::Drop => {}
+                Fate::Deliver => queue.push_back((side, v)),
+                Fate::Twice => {
+                    queue.push_back((side, v.clone()));
+                    queue.push_back((side, v));
+                }
+            }
+        };
+        let settled = |c: &Ceremony| c.secret().is_some() || c.aborted().is_some();
+        loop {
+            for (side, c, fps) in [('a', &mut *a, A_FPS), ('b', &mut *b, B_FPS)] {
+                if let Some(v) = c.take_msg_payload() {
+                    send(side, v, &mut queue, &mut wire);
+                }
+                if c.has_k() {
+                    if let Some(v) = c.take_confirm_payload(fps.0, fps.1) {
+                        send(side, v, &mut queue, &mut wire);
+                    }
+                }
+            }
+            while let Some((from, v)) = queue.pop_front() {
+                let (to, side, fps) = if from == 'a' { (&mut *b, 'b', B_FPS) } else { (&mut *a, 'a', A_FPS) };
+                if let Inbound::Reply(r) = to.on_signal(&v, Some(fps)) {
+                    send(side, r, &mut queue, &mut wire);
+                }
+            }
+            if (settled(a) && settled(b)) || started.elapsed() > bound {
+                return (started.elapsed(), wire.0, wire.1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn honest() -> (Ceremony, Ceremony) {
+        let scope = filament_id::IntroScope::Device.to_byte();
+        (
+            Ceremony::new("brave-otter", "314", pair_v2_caps(), scope),
+            Ceremony::new("brave-otter", "314", pair_v2_caps(), scope),
+        )
+    }
+
+    /// The observed hang: each ceremony message went out exactly once, so one
+    /// lost relay frame left both sides waiting out the 60 s budget. Losing the
+    /// FIRST copy of every message (both elements, both confirmations) must
+    /// still confirm, in well under 3 s.
+    #[test]
+    fn losing_the_first_copy_of_every_ceremony_message_still_confirms_fast() {
+        let (mut a, mut b) = honest();
+        let (took, _, _) = run_lossy(
+            &mut a,
+            &mut b,
+            |_, _, n| if n == 1 { Fate::Drop } else { Fate::Deliver },
+            std::time::Duration::from_secs(3),
+        );
+        eprintln!("first copies lost: settled after {took:?}");
+        assert!(a.aborted().is_none() && b.aborted().is_none(), "{:?} {:?}", a.aborted(), b.aborted());
+        assert!(a.secret().is_some() && b.secret().is_some(), "no confirmation within {took:?}");
+        assert_eq!(a.secret(), b.secret());
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+    }
+
+    /// One side's element lost, the other's delivered: the side that derived K
+    /// confirms, and that confirmation reaches a peer that has no K yet. It
+    /// carries the element, so the peer derives K from it instead of refusing.
+    #[test]
+    fn a_lost_element_is_carried_by_the_confirmation() {
+        let (mut a, mut b) = honest();
+        let (took, _, _) = run_lossy(
+            &mut a,
+            &mut b,
+            |side, kind, n| if side == 'a' && kind == "pake-msg" && n == 1 { Fate::Drop } else { Fate::Deliver },
+            std::time::Duration::from_secs(3),
+        );
+        assert!(b.aborted().is_none(), "b refused: {:?}", b.aborted());
+        assert!(a.secret().is_some() && a.secret() == b.secret(), "no confirmation within {took:?}");
+    }
+
+    /// Our confirmation lost AFTER we verified the peer's: we have stopped
+    /// re-sending, so the peer's re-sent confirmation must be answered.
+    #[test]
+    fn a_confirmed_side_answers_the_peers_resent_confirmation() {
+        let (mut a, mut b) = honest();
+        let (took, _, wire_b) = run_lossy(
+            &mut a,
+            &mut b,
+            |side, kind, n| if side == 'b' && kind == "pake-confirm" && n == 1 { Fate::Drop } else { Fate::Deliver },
+            std::time::Duration::from_secs(3),
+        );
+        assert!(a.secret().is_some() && a.secret() == b.secret(), "no confirmation within {took:?}");
+        assert!(
+            wire_b.iter().any(|v| v["answer"].as_bool() == Some(true)),
+            "b answered a's re-sent confirmation"
+        );
+    }
+
+    /// Every frame delivered twice: idempotent on both sides, one K, no abort,
+    /// and a copy is never counted as a second attempt.
+    #[test]
+    fn duplicated_ceremony_messages_are_idempotent() {
+        let (mut a, mut b) = honest();
+        let (_, wire_a, wire_b) = run_lossy(&mut a, &mut b, |_, _, _| Fate::Twice, std::time::Duration::from_secs(3));
+        assert!(a.aborted().is_none() && b.aborted().is_none());
+        assert!(a.secret().is_some() && a.secret() == b.secret());
+
+        let k = b.k().cloned();
+        let secret = b.secret().cloned();
+        let a_msg = wire_a.iter().find(|v| v["type"] == "pake-msg").unwrap().clone();
+        let a_conf = wire_a.iter().find(|v| v["type"] == "pake-confirm" && v.get("answer").is_none()).unwrap().clone();
+        let b_conf = wire_b.iter().find(|v| v["type"] == "pake-confirm" && v.get("answer").is_none()).unwrap().clone();
+        // A re-sent element after K changes nothing.
+        assert!(matches!(b.on_signal(&a_msg, Some(B_FPS)), Inbound::Consumed));
+        assert_eq!(b.k().cloned(), k);
+        // A re-sent confirmation is answered with our same confirmation, marked.
+        let Inbound::Reply(answer) = b.on_signal(&a_conf, Some(B_FPS)) else { panic!("no answer") };
+        assert_eq!(answer["mac"], b_conf["mac"]);
+        assert_eq!(answer["answer"], json!(true));
+        assert_eq!(b.secret().cloned(), secret);
+        // An answer is never answered: two confirmed sides do not ping-pong.
+        assert!(matches!(a.on_signal(&answer, Some(A_FPS)), Inbound::Consumed));
+        // A copy that does not verify (an old link's fingerprints) is not a
+        // second attempt: it neither refuses nor re-agrees the ceremony.
+        assert!(matches!(b.on_signal(&a_conf, Some(("SHA-256 BB", "SHA-256 OLD"))), Inbound::Consumed));
+        assert_eq!(b.secret().cloned(), secret);
+        assert!(b.aborted().is_none());
+    }
+
+    /// A re-send is the SAME element on the documented backoff (never a fresh
+    /// SPAKE2 session per retry, which would hand an attacker another guess),
+    /// and re-sends stop once the ceremony is refused.
+    #[test]
+    fn resends_repeat_the_same_element_on_backoff_and_stop_when_refused() {
+        let scope = filament_id::IntroScope::Device.to_byte();
+        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let t0 = Instant::now();
+        let first = a.take_msg_payload_at(t0).unwrap();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        assert!(a.take_msg_payload_at(ms(249)).is_none());
+        let mut at = Vec::new();
+        for t in (250..=6000).step_by(10) {
+            if let Some(v) = a.take_msg_payload_at(ms(t)) {
+                assert_eq!(v, first, "every copy is the same element");
+                at.push(t);
+            }
+        }
+        assert_eq!(at, vec![250, 750, 1750, 3750, 5750]);
+
+        // Wrong code: the confirmation fails once, the ceremony is refused, and
+        // nothing more goes out however long the loop keeps ticking.
+        let mut b = Ceremony::new("brave-ottar", "314", pair_v2_caps(), scope);
+        let b_msg = b.take_msg_payload_at(t0).unwrap();
+        assert!(matches!(a.on_signal(&b_msg, None), Inbound::Consumed));
+        assert!(matches!(b.on_signal(&first, None), Inbound::Consumed));
+        assert!(a.take_confirm_payload_at(A_FPS.0, A_FPS.1, ms(6000)).is_some());
+        let b_conf = b.take_confirm_payload_at(B_FPS.0, B_FPS.1, ms(6000)).unwrap();
+        assert!(matches!(a.on_signal(&b_conf, Some(A_FPS)), Inbound::Abort(_)));
+        assert!(matches!(a.on_signal(&b_conf, Some(A_FPS)), Inbound::Abort(_)), "a copy cannot rescue it");
+        assert!(a.secret().is_none());
+        for t in (6000..=20000).step_by(10) {
+            assert!(a.take_msg_payload_at(ms(t)).is_none());
+            assert!(a.take_confirm_payload_at(A_FPS.0, A_FPS.1, ms(t)).is_none());
+        }
+    }
+
+    /// A confirmation that arrives before this link's fingerprints are known
+    /// verifies nothing and refuses nothing: a later copy is checked.
+    #[test]
+    fn a_confirmation_before_fingerprints_waits_for_a_copy() {
+        let (mut a, mut b) = honest();
+        let a_msg = a.take_msg_payload().unwrap();
+        let b_msg = b.take_msg_payload().unwrap();
+        b.on_signal(&a_msg, None);
+        a.on_signal(&b_msg, None);
+        let a_conf = a.take_confirm_payload(A_FPS.0, A_FPS.1).unwrap();
+        assert!(matches!(b.on_signal(&a_conf, None), Inbound::Consumed));
+        assert!(b.secret().is_none() && b.aborted().is_none());
+        assert!(matches!(b.on_signal(&a_conf, Some(B_FPS)), Inbound::Consumed));
+        assert!(b.secret().is_some());
+    }
+
+    /// Two current CLIs advertise the make-before-break handoff. A 0.9.1 CLI
+    /// sends `direct` but no `handoff` (its payload, byte for byte, minus the
+    /// new field): facing it, the promotion must behave the old way.
+    #[test]
+    fn only_a_peer_that_advertises_handoff_is_handed_off() {
+        let (a, b) = run_pair("brave-otter", "brave-otter", "314");
+        assert!(a.peer_supports_handoff() && b.peer_supports_handoff());
+
+        let scope = filament_id::IntroScope::Device.to_byte();
+        let mut new_cli = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut old_side = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut from_old = old_side.take_msg_payload().unwrap();
+        assert_eq!(from_old["handoff"], json!(1), "a current CLI must advertise it");
+        from_old.as_object_mut().unwrap().remove("handoff");
+        assert!(matches!(new_cli.on_signal(&from_old, None), Inbound::Consumed));
+        assert!(new_cli.peer_supports_direct(), "0.9.1 still goes direct");
+        assert!(!new_cli.peer_supports_handoff(), "0.9.1 cannot answer path-promote");
     }
 }

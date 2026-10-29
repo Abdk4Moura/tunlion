@@ -12,11 +12,26 @@
 # and redeploy just the api container:  API_MEM, API_CPUS, COTURN_MEM, ...
 # Usage:  cp .env.example .env && edit .env && docker compose up -d
 
+# Bounded container logs: the api writes a TEL line per connect, sync and
+# disconnect, and json-file with no options grows without limit.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   # Stateless behind Redis, so `docker compose up -d --scale api=N` (or
   # deploy/scale.sh N) spins replicas up/down in seconds. cloudflared
   # round-robins across them by the `api` service DNS name.
   api:
+    logging: *logging
+    # One fd per websocket: the default soft limit of 1024 capped the server at
+    # ~1000 devices whatever --worker-connections says.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     image: ghcr.io/abdk4moura/filament-api:latest
     build: # only used for local builds; CI/droplet use the GHCR image
       context: ..
@@ -60,13 +75,14 @@ services:
     # worse than no shield: the master respawns, the container never exits,
     # `docker ps` says Up, and every live socket.io connection dies anyway.
     oom_score_adj: -800
-    mem_limit: ${API_MEM:-220m}
-    cpus: ${API_CPUS:-0.40}
+    mem_limit: ${API_MEM:-512m}
+    cpus: ${API_CPUS:-1.00}
     pids_limit: 256
 
   # Shared room registry + Socket.IO message queue for the api replicas.
   # Ephemeral (no persistence) — it's coordination state, not data.
   redis:
+    logging: *logging
     image: redis:7-alpine
     restart: unless-stopped
     oom_score_adj: -800  # see the api service for why; -800 = last in line
@@ -84,6 +100,7 @@ services:
     cpus: ${REDIS_CPUS:-0.20}
 
   cloudflared:
+    logging: *logging
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
     oom_score_adj: -800  # see the api service for why; -800 = last in line
@@ -92,10 +109,11 @@ services:
       TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN}
     depends_on:
       - api
-    mem_limit: ${CLOUDFLARED_MEM:-64m}
-    cpus: ${CLOUDFLARED_CPUS:-0.20}
+    mem_limit: ${CLOUDFLARED_MEM:-128m}
+    cpus: ${CLOUDFLARED_CPUS:-0.50}
 
   coturn:
+    logging: *logging
     image: coturn/coturn:latest
     restart: unless-stopped
     oom_score_adj: -800  # see the api service for why; -800 = last in line

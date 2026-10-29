@@ -4,55 +4,16 @@ All notable, user-facing changes to tunlion are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+Versions here are CLI versions, tagged `cli-vX.Y.Z`. 0.9.1 is the first
+release published as `tunlion`; 0.8.x and earlier shipped the predecessor's
+`filament-*` binaries. The separate `v1.0.0` tag and release
+(2026-06-06) is the filament-era web app's first stable release; it is not a
+CLI version and does not mean the CLI is at 1.0. The `cli-v0.9.0` tag exists, but its
+release build failed and nothing was published under it.
+
 ## [Unreleased]
 
-### Breaking
-
-- `filament-transport` removes the process-global correctness hooks
-  `hooks::set_settings_get_str`, `hooks::set_raw_membership` and
-  `hooks::set_config_path` together with their getters. Pass an explicit
-  `TransportContext` to the transport config/discovery APIs instead; its DNS
-  cache path defaults to `None`, never the current directory. The shared
-  diagnostic hooks (`trace`, `debug`, `say`, `critical`) remain process-wide.
-
-### Fixed
-
-- The web shell no longer waits out the direct-QUIC budget before connecting. A
-  browser cannot answer a QUIC `transport-offer`, but the acceptor treated it
-  like a CLI peer and suppressed the WebRTC offer until the direct attempt
-  expired (5s plus the fallback tick), which the web client showed as
-  "connecting". The browser now sends `{type:"transport-hint",direct:false}`
-  before any SDP; the CLI cancels/skips the direct ladder for that peer and
-  answers WebRTC immediately. CLI peers carry no hint, so direct-first is
-  unchanged for them.
-- **Windows sync file receiving is enabled with handle-relative confinement.**
-  The previous fail-closed path is gone. A received file is staged in a
-  `.part` created relative to a chain of pinned directory HANDLEs (every
-  component opened with `FILE_OPEN_REPARSE_POINT` and refused if it is a
-  junction/symlink). The admitted root is opened ONCE at admission, with
-  `FILE_OPEN_REPARSE_POINT` and a volume-serial/file-index check, and the
-  staging parent HANDLE is retained through finalization; neither is ever
-  reopened by path. The open staging HANDLE is committed with
-  `NtSetInformationFile(FILE_RENAME_INFORMATION, RootDirectory=pinned parent)`.
-  Root/parent renames and junction swaps fail closed (the handles are opened
-  without `FILE_SHARE_DELETE`), and a destination symlink/junction is replaced
-  as a name and never followed. This covers receive/staging/finalization only:
-  sync delete remains on the existing path-based `delete_within` rule. Filesystems that cannot express the replace return the named
-  "Windows sync finalization is not supported on this filesystem" error. Unix
-  receive behavior is unchanged.
-
-- The first command typed into `tunlion shell` before the remote prompt appears
-  now runs when Enter is pressed. Input typed ahead is captured while the local
-  terminal is still in cooked mode, where Enter arrives as LF; a Windows ConPTY
-  shell (PowerShell/PSReadLine) treats LF as a new line in the edit buffer
-  rather than a submit, so the command sat behind a `>>` continuation prompt and
-  its output only appeared, out of order, after a later command. Typeahead now
-  restores the CR a raw terminal sends. Piped stdin and raw-mode keystrokes are
-  unchanged, including a deliberate Ctrl-J to a remote TUI. With a tty stdin
-  and a piped stdout (where raw mode is never entered) the same restoration
-  applies for the whole session, and a CRLF split across reads stays one Enter.
-
-## [0.9.0]
+## [0.9.1] - 2026-10-26
 
 ### Added
 
@@ -106,6 +67,41 @@ the GitHub release notes.
 - Direct links report their route as "direct".
 - The daemon closes its links when it exits.
 
+- The web shell no longer waits out the direct-QUIC budget before connecting. A
+  browser cannot answer a QUIC `transport-offer`, but the acceptor treated it
+  like a CLI peer and suppressed the WebRTC offer until the direct attempt
+  expired (5s plus the fallback tick), which the web client showed as
+  "connecting". The browser now sends `{type:"transport-hint",direct:false}`
+  before any SDP; the CLI cancels/skips the direct ladder for that peer and
+  answers WebRTC immediately. CLI peers carry no hint, so direct-first is
+  unchanged for them.
+- **Windows sync file receiving is enabled with handle-relative confinement.**
+  The previous fail-closed path is gone. A received file is staged in a
+  `.part` created relative to a chain of pinned directory HANDLEs (every
+  component opened with `FILE_OPEN_REPARSE_POINT` and refused if it is a
+  junction/symlink). The admitted root is opened ONCE at admission, with
+  `FILE_OPEN_REPARSE_POINT` and a volume-serial/file-index check, and the
+  staging parent HANDLE is retained through finalization; neither is ever
+  reopened by path. The open staging HANDLE is committed with
+  `NtSetInformationFile(FILE_RENAME_INFORMATION, RootDirectory=pinned parent)`.
+  Root/parent renames and junction swaps fail closed (the handles are opened
+  without `FILE_SHARE_DELETE`), and a destination symlink/junction is replaced
+  as a name and never followed. This covers receive/staging/finalization only:
+  sync delete remains on the existing path-based `delete_within` rule. Filesystems that cannot express the replace return the named
+  "Windows sync finalization is not supported on this filesystem" error. Unix
+  receive behavior is unchanged.
+
+- The first command typed into `tunlion shell` before the remote prompt appears
+  now runs when Enter is pressed. Input typed ahead is captured while the local
+  terminal is still in cooked mode, where Enter arrives as LF; a Windows ConPTY
+  shell (PowerShell/PSReadLine) treats LF as a new line in the edit buffer
+  rather than a submit, so the command sat behind a `>>` continuation prompt and
+  its output only appeared, out of order, after a later command. Typeahead now
+  restores the CR a raw terminal sends. Piped stdin and raw-mode keystrokes are
+  unchanged, including a deliberate Ctrl-J to a remote TUI. With a tty stdin
+  and a piped stdout (where raw mode is never entered) the same restoration
+  applies for the whole session, and a CRLF split across reads stays one Enter.
+
 ### Security
 
 - Invitation end times are enforced on every path: commands, shells, forwards,
@@ -135,6 +131,13 @@ the GitHub release notes.
 
   Wire formats (signing domains, ALPN, invite and recovery prefixes, the
   signaling server URL) are unchanged.
+
+- `filament-transport` removes the process-global correctness hooks
+  `hooks::set_settings_get_str`, `hooks::set_raw_membership` and
+  `hooks::set_config_path` together with their getters. Pass an explicit
+  `TransportContext` to the transport config/discovery APIs instead; its DNS
+  cache path defaults to `None`, never the current directory. The shared
+  diagnostic hooks (`trace`, `debug`, `say`, `critical`) remain process-wide.
 
 ## [0.8.5] - 2026-08-08
 

@@ -116,6 +116,71 @@ def _turn_servers():
     return [{"urls": urls, "username": username, "credential": credential}]
 
 
+# Cloudflare Realtime TURN, handed out NEXT TO coturn so a relay survives either
+# one being down (ICE tries every server it is given; no failover logic here).
+#   FIL_CF_TURN_KEY_ID     the TURN key id (dashboard: Realtime -> TURN)
+#   FIL_CF_TURN_API_TOKEN  that key's API token (server-side only, never sent out)
+# Credentials are minted for TURN_TTL and shared until half of it has passed,
+# so /api/config does not call Cloudflare per request. A failed mint is retried
+# after CF_TURN_RETRY seconds; until then the config simply has no CF entry.
+CF_TURN_KEY_ID = os.environ.get("FIL_CF_TURN_KEY_ID")
+CF_TURN_API_TOKEN = os.environ.get("FIL_CF_TURN_API_TOKEN")
+CF_TURN_RETRY = 60
+_cf_turn_cache = {"servers": [], "until": 0.0}
+
+
+def _cf_turn_servers(now=None, fetch=None):
+    if not (CF_TURN_KEY_ID and CF_TURN_API_TOKEN):
+        return []
+    import time
+
+    now = time.time() if now is None else now
+    if now < _cf_turn_cache["until"]:
+        return _cf_turn_cache["servers"]
+    try:
+        servers = (fetch or _cf_turn_fetch)()
+        _cf_turn_cache.update(servers=servers, until=now + TURN_TTL / 2)
+    except Exception:
+        _cf_turn_cache.update(servers=[], until=now + CF_TURN_RETRY)
+    return _cf_turn_cache["servers"]
+
+
+def _cf_turn_fetch():
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"https://rtc.live.cloudflare.com/v1/turn/keys/{CF_TURN_KEY_ID}"
+        "/credentials/generate-ice-servers",
+        data=json.dumps({"ttl": TURN_TTL}).encode(),
+        # Cloudflare rejects urllib's default User-Agent (error 1010, a 403).
+        headers={"Authorization": f"Bearer {CF_TURN_API_TOKEN}",
+                 "Content-Type": "application/json",
+                 "User-Agent": "tunlion-api"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=3) as resp:
+        body = json.loads(resp.read())
+    return _cf_turn_entries(body.get("iceServers") or [])
+
+
+def _cf_turn_entries(ice_servers):
+    """Keep Cloudflare's TURN entries, minus its STUN and port-53 urls.
+
+    Our own STUN is already in DEFAULT_ICE, and browsers refuse or stall on
+    port 53, which Cloudflare lists for networks that only allow DNS out.
+    """
+    out = []
+    for s in ice_servers:
+        urls = s.get("urls") or []
+        urls = [urls] if isinstance(urls, str) else urls
+        urls = [u for u in urls if u.startswith(("turn:", "turns:")) and ":53?" not in u
+                and not u.endswith(":53")]
+        if urls and s.get("username") and s.get("credential"):
+            out.append({"urls": urls, "username": s["username"],
+                        "credential": s["credential"]})
+    return out
+
+
 def _ice_servers():
     raw = os.environ.get("FIL_ICE_SERVERS")
     if raw:
@@ -124,7 +189,7 @@ def _ice_servers():
         except json.JSONDecodeError:
             pass
     # Default STUN + (when configured) ephemeral self-hosted TURN.
-    return DEFAULT_ICE + _turn_servers()
+    return DEFAULT_ICE + _turn_servers() + _cf_turn_servers()
 
 
 def _firebase_web_config():

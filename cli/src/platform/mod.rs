@@ -1,5 +1,6 @@
 pub mod fs_at;
 pub mod pty;
+pub mod win_pty;
 pub(crate) mod recv_signals;
 
 use std::path::{Path, PathBuf};
@@ -2309,12 +2310,47 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         const DETACHED_PROCESS: u32 = 0x00000008;
         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        stop_std_handle_inheritance();
     }
     #[cfg(not(any(unix, windows)))]
     {
         anyhow::bail!("detached spawn is not supported on this platform");
     }
     Ok(cmd.spawn()?)
+}
+
+/// Keep this process's own stdin/stdout/stderr out of a detached daemon.
+///
+/// Windows `CreateProcess` is called with handle inheritance on (it has to be,
+/// for the log file the daemon writes to), and that passes on EVERY inheritable
+/// handle this process holds, not only the three it was given. A `tunlion`
+/// started with its output captured (PowerShell `$x = tunlion up --detach`, a
+/// redirect, a CI step, a scheduled task wrapper) holds the capturing pipe as
+/// an inheritable stdout, so the daemon kept a stray copy of it for its whole
+/// life and the caller waited for an end of file that never came: `up
+/// --detach` printed "serving" and never returned (observed on a real
+/// windows-latest runner, a 54-minute hang until the job was cancelled).
+/// Unix is unaffected: Rust opens every descriptor close-on-exec and the
+/// child's 0/1/2 are replaced.
+///
+/// Clearing the inherit flag on our three standard handles is enough and is
+/// safe for later spawns: a child given `Stdio::inherit()` receives a fresh
+/// inheritable duplicate, not the original handle.
+#[cfg(windows)]
+fn stop_std_handle_inheritance() {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle has no preconditions; SetHandleInformation only
+        // changes a flag on a handle this process owns and fails cleanly on a
+        // null or invalid one.
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 // --------------------------------------------------- process identity --
@@ -2468,6 +2504,20 @@ impl InstallSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The UI must offer Download exactly where the pinned publisher exists.
+    /// Linux and Windows both do; a reduced build without `mount-server` or a
+    /// platform without a publisher must not advertise an action it cannot finish.
+    #[test]
+    fn folder_download_capability_matches_the_publisher_platforms() {
+        let expected = cfg!(feature = "mount-server")
+            && (cfg!(target_os = "linux") || cfg!(target_os = "windows"));
+        assert_eq!(super::folder_download_supported(), expected);
+        #[cfg(all(target_os = "windows", feature = "mount-server"))]
+        assert!(super::folder_download_supported(), "Windows must expose the validated download publisher");
+        #[cfg(all(target_os = "linux", feature = "mount-server"))]
+        assert!(super::folder_download_supported(), "Linux must expose the validated download publisher");
+    }
 
     // The record is in place before the child runs any of the program: the
     // child itself checks for what `record` wrote, so a record that landed
@@ -3052,6 +3102,36 @@ mod tests {
     }
 }
 
+/// Whether this build can publish a downloaded folder file. Browse and preview
+/// are protocol-level everywhere; download publication needs the `mount-server`
+/// feature and a pinned no-clobber publisher. Linux and Windows both provide one
+/// (`download_output::OwnedDownload`); Windows publishes through a retained
+/// directory HANDLE and does not claim directory-entry durability.
+
+/// The hidden `__win-pty-smoke` test command. Both arms here so the command
+/// itself is portable: Windows runs the relay smoke; elsewhere it refuses.
+#[cfg(feature = "test-hooks")]
+pub fn win_pty_smoke(mode: &str) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::platform::win_pty::smoke(mode)
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!("__win-pty-smoke {mode}: the Windows PTY relay exists only on Windows")
+    }
+}
+
+/// Can this build serve a temporary-access SHELL (a real interactive PTY on the
+/// host's account)? Unix builds with the PTY server only, today.
+pub fn temporary_shell_supported() -> bool {
+    cfg!(all(unix, feature = "pty-server"))
+}
+
+pub fn folder_download_supported() -> bool {
+    cfg!(all(any(target_os = "linux", target_os = "windows"), feature = "mount-server"))
+}
+
 /// Policy routing for exit nodes, kept behind the platform adapter so the rest
 /// of the tree stays free of `cfg(target_os)`.
 ///
@@ -3238,6 +3318,78 @@ impl ConsoleModes {
             }
         }
     }
+}
+
+/// Let the console interpret the escape sequences the menus and colours write.
+///
+/// WINDOWS: a classic console host (a Start Menu launch on Windows 10) has VT
+/// output processing OFF until a program asks for it. Nothing asked before the
+/// first menu drew, so `\x1b[2K` and the colour codes could print as literal
+/// `←[2K` until a later crossterm call happened to switch it on. Output only:
+/// VT *input* would change how keys reach crossterm, which the pickers rely on.
+///
+/// ELSEWHERE: terminals already interpret escapes; a no-op.
+pub fn enable_vt_output() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+        for handle in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            if let Some(cur) = win_console_get(handle) {
+                if cur & ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0 {
+                    win_console_set(handle, cur | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+                }
+            }
+        }
+    }
+}
+
+/// True when this process is the only one attached to its console, which is
+/// what a Start Menu or Explorer launch looks like: the console window was made
+/// for us and closes the moment we exit. Run from cmd/PowerShell/Terminal, the
+/// shell shares the console, so the count is at least two.
+///
+/// ELSEWHERE: there is no such window to lose; always false.
+pub fn console_is_ours() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::GetConsoleProcessList;
+        let mut ids = [0u32; 4];
+        // SAFETY: writes at most `ids.len()` process ids into a valid buffer and
+        // returns how many processes share the console (0 on failure).
+        let attached = unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) };
+        attached == 1
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Keep THIS process alive through console Ctrl-C/Ctrl-Break: the Start Menu
+/// launcher shares its console with the child it runs, the child decides what
+/// Ctrl-C means, and the launcher must not die of it and take the window with
+/// it. A handler, not the inherited "ignore" flag, so the child keeps normal
+/// Ctrl-C behaviour. Elsewhere there is no such launcher; a no-op.
+pub fn ignore_console_interrupts() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
+        unsafe extern "system" fn handler(kind: u32) -> windows_sys::Win32::Foundation::BOOL {
+            i32::from(kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT)
+        }
+        // SAFETY: registers a plain function pointer that touches no state.
+        unsafe {
+            SetConsoleCtrlHandler(Some(handler), 1);
+        }
+    }
+}
+
+/// Windows has the validated download publisher (mount-server), so the CLI
+/// offers Download there.
+#[cfg(all(test, target_os = "windows", feature = "mount-server"))]
+#[test]
+fn windows_offers_folder_download() {
+    assert!(folder_download_supported());
 }
 
 #[cfg(windows)]
@@ -3555,6 +3707,124 @@ impl InstanceLock {
 
 // --------------------------------------------------------- process control --
 
+/// What asking a Windows daemon to stop achieved. Windows has no SIGTERM and
+/// no `kill` program, so a `down` there used to fail with "program not found"
+/// and leave the daemon running (incident: dgmfa). The daemon instead waits on
+/// a named event keyed by its pid, and `down` sets it: the same graceful
+/// shutdown a ctrl-c gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))] // only Windows constructs the event outcomes
+pub enum StopAsk {
+    /// This platform stops a daemon with signals (SIGTERM via `kill`, or the
+    /// service manager); there is no stop event to set.
+    UseSignals,
+    /// The daemon's stop event was set; it shuts down on its own.
+    Sent,
+    /// No stop event for that pid: an older tunlion, or one whose event name
+    /// was already taken when it started, so there is no graceful path.
+    NoListener,
+    /// The event exists but this process may not set it: the daemon runs
+    /// elevated and this `down` does not.
+    Denied,
+}
+
+/// The stop event names for `pid`, tried in order. `Global\` first: only an
+/// administrator or service can create a global object, so a standard user
+/// cannot squat the name ahead of an elevated daemon; `Local\` (this logon
+/// session) for a daemon that is not elevated.
+#[cfg(any(windows, test))]
+pub(crate) fn stop_event_names(pid: u32) -> [String; 2] {
+    [format!("Global\\tunlion-stop-{pid}"), format!("Local\\tunlion-stop-{pid}")]
+}
+
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Daemon side: create this process's stop event and return a receiver that
+/// fires when a `down` sets it. None when no event could be created, or when
+/// the name already existed (someone else's object: never listen on it, so
+/// whoever created it cannot stop us, and `down` falls back to terminating).
+#[cfg(windows)]
+pub(crate) fn listen_for_stop_request() -> Option<tokio::sync::oneshot::Receiver<()>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+    const WAIT_OBJECT_0: u32 = 0;
+    for name in stop_event_names(std::process::id()) {
+        let w = wide(&name);
+        // SAFETY: a null security descriptor means the default DACL of this
+        // process's token (no widening); `w` is NUL-terminated and outlives
+        // the call. The returned handle is owned below.
+        let h = unsafe { CreateEventW(std::ptr::null(), 1, 0, w.as_ptr()) };
+        if h.is_null() {
+            continue; // Global\ needs SeCreateGlobalPrivilege; try Local\
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe { CloseHandle(h) };
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let raw = h as usize;
+        // A plain thread, not spawn_blocking: it waits for the life of the
+        // process and must never hold up runtime shutdown.
+        std::thread::Builder::new()
+            .name("tunlion-stop-event".into())
+            .spawn(move || {
+                let h = raw as windows_sys::Win32::Foundation::HANDLE;
+                // SAFETY: `h` is a live event handle this thread owns.
+                if unsafe { WaitForSingleObject(h, INFINITE) } == WAIT_OBJECT_0 {
+                    let _ = tx.send(());
+                }
+            })
+            .ok()?;
+        return Some(rx);
+    }
+    None
+}
+
+/// `down` side: signals do the job here.
+#[cfg(not(windows))]
+pub fn ask_daemon_to_stop(_pid: u32) -> std::io::Result<StopAsk> {
+    Ok(StopAsk::UseSignals)
+}
+
+/// What `down` says when the daemon had to be ended forcibly after its grace.
+#[cfg(not(windows))]
+pub const FORCED_STOP_NOTE: &str = "; it did not exit within 10s of SIGTERM, so it was killed (SIGKILL)";
+/// Windows has no signals: name the stop request and the termination.
+#[cfg(windows)]
+pub const FORCED_STOP_NOTE: &str = "; it did not exit within 10s of the stop request, so it was terminated";
+
+/// `down` side: set the daemon's stop event.
+#[cfg(windows)]
+pub fn ask_daemon_to_stop(pid: u32) -> std::io::Result<StopAsk> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND};
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+    let mut denied = false;
+    for name in stop_event_names(pid) {
+        let w = wide(&name);
+        // SAFETY: `w` is NUL-terminated; the handle is closed below.
+        let h = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, w.as_ptr()) };
+        if h.is_null() {
+            match unsafe { GetLastError() } {
+                ERROR_FILE_NOT_FOUND => continue,
+                ERROR_ACCESS_DENIED => {
+                    denied = true;
+                    continue;
+                }
+                e => return Err(std::io::Error::from_raw_os_error(e as i32)),
+            }
+        }
+        // SAFETY: `h` is a live event handle opened with EVENT_MODIFY_STATE.
+        let ok = unsafe { SetEvent(h) } != 0;
+        let err = std::io::Error::last_os_error();
+        unsafe { CloseHandle(h) };
+        return if ok { Ok(StopAsk::Sent) } else { Err(err) };
+    }
+    Ok(if denied { StopAsk::Denied } else { StopAsk::NoListener })
+}
+
 /// The signals `down` uses beyond its first polite request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Escalate {
@@ -3563,155 +3833,6 @@ pub enum Escalate {
     Continue,
     /// End it now (SIGKILL; TerminateProcess on Windows).
     Kill,
-}
-
-/// Where a sibling process asks the daemon to stop on a platform without
-/// SIGTERM or a unix control socket. The daemon consumes it (see
-/// `daemon_stop::stop_requested`).
-pub(crate) fn daemon_stop_request_path() -> PathBuf {
-    Paths::config_path("down.request")
-}
-
-/// Ask the daemon with `pid` to stop.
-///
-/// Unix sends SIGTERM (the existing, tested path). Windows has no SIGTERM and
-/// no unix control socket, so this writes a PID-scoped stop request that the
-/// daemon's own loop reads and exits through its normal cleanup. This is a
-/// real daemon-control path, not an external `taskkill` on a pid.
-/// Lock serializing reads/writes of the `down.request` file. A separate lock
-/// from the daemon election: a down must be able to write while a daemon holds
-/// `up.lock`.
-pub(crate) fn daemon_stop_request_lock_path() -> PathBuf {
-    Paths::config_path("down.request.lock")
-}
-
-/// Run `f` with the request-file lock held. Bounded wait (a stale holder is
-/// impossible: the kernel drops the lock on exit), then None.
-pub(crate) fn with_daemon_stop_request_lock<T>(
-    f: impl FnOnce(&Path) -> T,
-) -> Option<T> {
-    for _ in 0..100 {
-        match InstanceLock::try_acquire(&daemon_stop_request_lock_path()) {
-            Ok(Some(_lock)) => return Some(f(&daemon_stop_request_path())),
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
-            Err(_) => return None,
-        }
-    }
-    None
-}
-
-fn request_nonce() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!(
-        "{}-{}-{}",
-        std::process::id(),
-        nanos,
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-#[cfg(windows)]
-fn replace_request_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
-
-    let tmp: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
-    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // MoveFileExW with REPLACE_EXISTING performs a single filesystem rename:
-    // if replacement fails, the destination remains intact. It also handles a
-    // destination that does not exist yet.
-    if unsafe { MoveFileExW(tmp.as_ptr(), path.as_ptr(), MOVEFILE_REPLACE_EXISTING) } != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_request_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, path)
-}
-
-/// Write the request file, removing it if any step fails after the file
-/// landed (SecretFile writes the bytes, then restricts permissions; a failure
-/// in the second step must not leave a live request behind).
-fn write_request_file<F>(
-    path: &Path,
-    content: &str,
-    tag: &str,
-    write: F,
-) -> Result<(), String>
-where
-    F: FnOnce(&Path, &str) -> std::io::Result<()>,
-{
-    // Never write the live request path directly: a failed write/restrict step
-    // must not delete or truncate a request another down already wrote. Write a
-    // unique temp file, then atomically rename it into place.
-    let file = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "down.request".to_string());
-    let tmp = path.with_file_name(format!(".{file}.tmp.{}.{}", std::process::id(), tag));
-    let result = write(&tmp, content).and_then(|()| replace_request_file(&tmp, path));
-    if let Err(e) = result {
-        // Only OUR temp is removed; a pre-existing live request is untouched.
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "could not write the stop request {}: {e}",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-/// Ask the daemon with `pid` to stop. Returns a per-request nonce so the
-/// requester can clear exactly its own pending request.
-///
-/// Unix sends SIGTERM (the existing, tested path). Windows has no SIGTERM and
-/// no unix control socket, so this writes a PID+token+nonce stop request that
-/// the daemon's own loop reads and exits through its normal cleanup. This is a
-/// real daemon-control path, not an external `taskkill` on a pid.
-pub fn request_daemon_stop(pid: u32) -> Result<Option<String>, String> {
-    let nonce = request_nonce();
-    #[cfg(unix)]
-    {
-        let status = command("kill")
-            .arg(pid.to_string())
-            .status()
-            .map_err(|e| format!("could not run kill: {e}"))?;
-        if status.success() {
-            Ok(Some(nonce))
-        } else {
-            Err(format!("`kill` failed ({status})"))
-        }
-    }
-    #[cfg(windows)]
-    {
-        let token = process_start_token(pid).ok_or_else(|| {
-            format!("cannot read the daemon's start time (pid {pid}); refusing an unsafe stop")
-        })?;
-        match with_daemon_stop_request_lock(|path| {
-            write_request_file(path, &format!("{pid}\n{token}\n{nonce}\n"), &nonce, |p, c| {
-                SecretFile::write_str(p, c)
-            })
-            .map(|()| nonce.clone())
-        }) {
-            // Lock timeout: do not block `down`; proceed to the token-verified
-            // await_exit/force path without a request file.
-            None => Ok(None),
-            Some(result) => result.map(Some),
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        Err("cannot ask a daemon to stop on this platform".to_string())
-    }
 }
 
 #[cfg(unix)]
@@ -4340,7 +4461,7 @@ mod recv_daemon;
 pub(crate) use recv_daemon::*;
 
 mod stdin;
-pub(crate) use stdin::spawn_stdin;
+pub(crate) use stdin::{read_stdin_timeout, spawn_stdin, RawStdin};
 
 /// Ask the running daemon for its live L3 state, where this platform has a
 /// control socket. Windows has no unix-domain control socket; there the
@@ -4356,165 +4477,196 @@ pub async fn l3_state_over_control() -> Option<serde_json::Value> {
     }
 }
 
-#[cfg(all(test, target_os = "windows"))]
-mod windows_stop_request_tests {
-    /// The Windows `down` path writes a PID-scoped stop request for the daemon
-    /// loop to consume. This proves the real implementation (not `taskkill`)
-    /// produces the exact file the reader looks for, on Windows CI.
-    #[test]
-    fn windows_stop_request_is_a_pid_scoped_file() {
-        // TUNLION_CONFIG_DIR is process-global; other tests repoint it.
-        let _guard = crate::tests::lock_test_config();
-        let dir = std::env::temp_dir().join(format!(
-            "tunlion-win-stop-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let old = std::env::var_os("TUNLION_CONFIG_DIR");
-        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
-        let pid = std::process::id();
-        let nonce = super::request_daemon_stop(pid)
-            .expect("write the stop request")
-            .expect("request lock was free");
-        let path = super::daemon_stop_request_path();
-        let raw = std::fs::read_to_string(&path).expect("stop request exists");
-        let mut lines = raw.lines();
-        assert_eq!(lines.next().and_then(|s| s.trim().parse::<u32>().ok()), Some(pid));
-        assert_eq!(
-            lines.next().map(str::to_string),
-            super::process_start_token(pid),
-            "the request names this process incarnation, not just the pid"
-        );
-        assert_eq!(lines.next().map(str::to_string), Some(nonce), "and its unique nonce");
-        let _ = std::fs::remove_file(&path);
-        unsafe {
-            match old {
-                Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
-                None => std::env::remove_var("TUNLION_CONFIG_DIR"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+/// `up --detach` from a caller that captures its output must return: the
+/// detached daemon may not keep the caller's pipe open (see
+/// `stop_std_handle_inheritance`). Real processes and a real pipe; Windows only,
+/// because that is where handle inheritance passes the pipe on.
+#[cfg(all(test, windows))]
+mod detach_inheritance_tests {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
 
-    /// A live target plus a held request lock must return Ok(None) (proceed to
-    /// await_exit/force), not an error that makes down bail.
+    const MIDDLE_ENV: &str = "TUNLION_TEST_DETACH_MIDDLE_LOG";
+    const TEST_PATH: &str = "platform::detach_inheritance_tests::a_detached_child_does_not_hold_the_callers_output_open";
+
     #[test]
-    fn a_held_request_lock_falls_back_without_a_request() {
-        let _guard = crate::tests::lock_test_config();
-        let dir = std::env::temp_dir().join(format!("tunlion-win-stop-busy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn a_detached_child_does_not_hold_the_callers_output_open() {
+        // Middle role: this same test binary, run by the outer test with its
+        // stdout on a pipe. It starts a long-lived detached grandchild exactly
+        // as `up --detach` starts the daemon, prints the pid, and exits.
+        if let Ok(log) = std::env::var(MIDDLE_ENV) {
+            let ping = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()))
+                .join("System32\\PING.EXE");
+            let child = super::spawn_detached(&ping, &["-n", "60", "127.0.0.1"], std::path::Path::new(&log))
+                .expect("spawn_detached");
+            crate::outln!("GRANDCHILD={}", child.id());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tunlion-detach-inherit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let old = std::env::var_os("TUNLION_CONFIG_DIR");
-        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
-        let held = super::InstanceLock::try_acquire(&super::daemon_stop_request_lock_path())
-            .unwrap()
-            .expect("hold the request lock");
-        let out = super::request_daemon_stop(std::process::id()).expect("lock timeout is not an error");
-        assert!(out.is_none(), "no request can be written; proceed to await_exit");
-        assert!(!super::daemon_stop_request_path().exists());
-        drop(held);
-        unsafe {
-            match old {
-                Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
-                None => std::env::remove_var("TUNLION_CONFIG_DIR"),
-            }
+        let log = dir.join("grandchild.log");
+        let exe = std::env::current_exe().unwrap();
+        let mut middle = super::command(&exe)
+            .args([TEST_PATH, "--exact", "--nocapture", "--test-threads=1"])
+            .env(MIDDLE_ENV, &log)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut out = middle.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = out.read_to_string(&mut text);
+            let _ = tx.send(text);
+        });
+        let status = middle.wait().unwrap();
+        // ping -n 60 lives about 59 s. EOF must come when the middle exits,
+        // not when the grandchild does.
+        let got = rx.recv_timeout(Duration::from_secs(20));
+        let text = got.as_deref().unwrap_or("");
+        // The harness prints "test <name> ... " before the test's own output,
+        // so the marker can sit mid-line.
+        let grandchild = text.split_once("GRANDCHILD=").and_then(|(_, rest)| {
+            rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().ok()
+        });
+        if let Some(pid) = grandchild {
+            let _ = super::command("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
         }
         let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "middle process failed: {status}");
+        assert!(
+            got.is_ok(),
+            "the caller's stdout pipe stayed open after the middle exited ({:?}): the detached child inherited it",
+            started.elapsed()
+        );
+        assert!(grandchild.is_some(), "middle never reported its detached child; output: {text:?}");
     }
 }
 
-#[cfg(test)]
-mod request_write_tests {
-    /// SecretFile writes bytes then restricts permissions. If the restriction
-    /// step fails, the request file has already landed; the helper must remove
-    /// it so a daemon does not consume a request `down` reported as failed.
-    #[test]
-    fn a_post_write_failure_removes_the_landed_request() {
-        let dir = std::env::temp_dir().join(format!("tunlion-req-write-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("down.request");
-        let res = super::write_request_file(&path, "content", "tag", |p, c| {
-            std::fs::write(p, c)?;
-            Err(std::io::Error::other("simulated permission step failure"))
-        });
-        assert!(res.is_err());
-        assert!(!path.exists(), "a failed write must not leave a live request");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_failed_write_preserves_a_pre_existing_request() {
-        let dir = std::env::temp_dir().join(format!("tunlion-req-pre-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("down.request");
-        std::fs::write(&path, "old-request").unwrap();
-        let res = super::write_request_file(&path, "new-request", "tag", |p, c| {
-            std::fs::write(p, c)?;
-            Err(std::io::Error::other("simulated post-write failure"))
-        });
-        assert!(res.is_err());
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "old-request",
-            "a failed write must not delete another down's live request"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Windows must preserve a live request if the native atomic replacement
-    /// fails. Opening the destination without FILE_SHARE_DELETE makes the
-    /// replacement fail deterministically with a sharing violation.
+/// The forced-stop note names what this platform actually did.
+#[test]
+fn the_forced_stop_note_names_what_was_done() {
+    #[cfg(not(windows))]
+    assert!(FORCED_STOP_NOTE.contains("SIGKILL"));
     #[cfg(windows)]
-    #[test]
-    fn a_failed_windows_replacement_preserves_the_existing_request_and_nonce() {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
-        use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
-        };
+    assert!(
+        FORCED_STOP_NOTE.contains("stop request") && FORCED_STOP_NOTE.contains("terminated") && !FORCED_STOP_NOTE.contains("SIG"),
+        "{FORCED_STOP_NOTE}"
+    );
+}
 
-        let dir = std::env::temp_dir().join(format!("tunlion-req-replace-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("down.request");
-        let old_request = "481\nstart-token\nprior-live-nonce\n";
-        std::fs::write(&path, old_request).unwrap();
+/// `down` and the daemon must derive the same event name from the pid, and it
+/// must name exactly one pid (no prefix collisions such as 12 vs 123).
+#[test]
+fn stop_event_names_are_per_pid_global_then_local() {
+    let [g, l] = stop_event_names(123);
+    assert_eq!(g, "Global\\tunlion-stop-123");
+    assert_eq!(l, "Local\\tunlion-stop-123");
+    assert_ne!(stop_event_names(12), stop_event_names(123));
+}
 
-        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        let held = unsafe {
-            CreateFileW(
-                wide_path.as_ptr(),
-                GENERIC_READ,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                std::ptr::null_mut(),
-            )
-        };
-        assert_ne!(held, INVALID_HANDLE_VALUE, "hold the destination against replacement");
+/// A real daemon-side listener and a real `down`-side request, in one process:
+/// the event is created under this pid, `ask_daemon_to_stop` sets it and the
+/// listener fires. A pid with no listener reports NoListener, never Sent.
+#[cfg(windows)]
+#[test]
+fn a_stop_request_reaches_the_daemons_listener() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rx = listen_for_stop_request().expect("create the stop event");
+    assert_eq!(ask_daemon_to_stop(std::process::id()).unwrap(), StopAsk::Sent);
+    rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the listener fired")
+            .expect("sender kept");
+    });
+    // No process creates events under an impossible pid.
+    assert_eq!(ask_daemon_to_stop(u32::MAX - 3).unwrap(), StopAsk::NoListener);
+}
 
-        let result = super::write_request_file(&path, "482\nnew-token\nnew-nonce\n", "tag", |p, c| {
-            std::fs::write(p, c)
+/// The stop request across two real processes, as `down` and the daemon use it.
+/// This replaces the request-file tests (pid-scoped, consumed once, a foreign
+/// or stale request ignored): a child plays the daemon and listens on its own
+/// event; asking any other pid must not stop it; two downs asking at once are
+/// both delivered and stop it once; and once it has exited nothing is left
+/// behind, so a later process given that pid cannot be stopped by a stale ask.
+#[cfg(windows)]
+#[test]
+fn a_stop_request_is_pid_scoped_and_dies_with_the_daemon() {
+    use std::io::BufRead;
+    use std::time::{Duration, Instant};
+    const ROLE: &str = "TUNLION_TEST_STOP_LISTENER_ROLE";
+    const TEST_PATH: &str = "platform::a_stop_request_is_pid_scoped_and_dies_with_the_daemon";
+    if std::env::var_os(ROLE).is_some() {
+        // Daemon role: listen like recv_signals does and exit only when asked.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rx = listen_for_stop_request().expect("the daemon role creates its stop event");
+        crate::outln!("LISTENING");
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(60), rx)
+                .await
+                .expect("asked to stop within 60s")
+                .expect("sender kept");
         });
-        // The exclusive handle induces replacement failure, but it also
-        // prevents our own subsequent read. Release it before checking that
-        // the original request survived.
-        unsafe { CloseHandle(held) };
-        assert!(result.is_err(), "replacement must fail while deletion is denied");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), old_request);
-        assert!(
-            std::fs::read_dir(&dir)
-                .unwrap()
-                .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".tmp.")),
-            "the failed replacement must clean up its own temp file"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::outln!("STOPPED-BY-REQUEST");
+        return;
     }
+    let exe = std::env::current_exe().unwrap();
+    let mut daemon = command(&exe)
+        .args([TEST_PATH, "--exact", "--nocapture", "--test-threads=1"])
+        .env(ROLE, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = daemon.id();
+    let out = daemon.stdout.take().unwrap();
+    let (tx, lines) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let saw = |marker: &str, within: Duration| -> bool {
+        let until = Instant::now() + within;
+        loop {
+            match lines.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(line) if line.contains(marker) => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+    };
+    if !saw("LISTENING", Duration::from_secs(30)) {
+        let _ = daemon.kill();
+        panic!("the daemon role never reported its stop event");
+    }
+    // A request for any other pid never reaches this daemon.
+    assert_eq!(ask_daemon_to_stop(u32::MAX - 5).unwrap(), StopAsk::NoListener);
+    std::thread::sleep(Duration::from_millis(500));
+    let still_running = daemon.try_wait().unwrap().is_none();
+    if !still_running {
+        panic!("a request for another pid stopped this daemon");
+    }
+    // Two downs at once: both are delivered, the daemon stops once.
+    let first = ask_daemon_to_stop(pid).unwrap();
+    let second = ask_daemon_to_stop(pid).unwrap();
+    if first != StopAsk::Sent || second != StopAsk::Sent {
+        let _ = daemon.kill();
+        panic!("both requests must be delivered: {first:?} {second:?}");
+    }
+    let stopped = saw("STOPPED-BY-REQUEST", Duration::from_secs(20));
+    if !stopped {
+        let _ = daemon.kill();
+    }
+    let status = daemon.wait().unwrap();
+    assert!(stopped, "the daemon did not stop on its request");
+    assert!(status.success(), "the daemon role failed: {status}");
+    // Gone with the daemon: nothing is left that a later process with this pid
+    // would inherit.
+    assert_eq!(ask_daemon_to_stop(pid).unwrap(), StopAsk::NoListener);
 }

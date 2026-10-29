@@ -931,6 +931,13 @@ pub(crate) async fn send_cmd(
                 ));
             }
         }
+        // A code ceremony in flight: its next outbound step (our element, our
+        // confirmation) goes out from the progression block below this wait,
+        // but becomes sendable when an event is handled further down. Waiting
+        // a full 2 s slice in between cost a browser receiving a code about
+        // 2 s between "authenticating..." and "authenticated" (measured 2.0 to
+        // 2.1 s on every run). The ceremony is budgeted, so the short wait is.
+        let ceremony_live = pake_peer.is_some() && !pake_done;
         // The wait-for-peer deadline only applies while we have no peer (F3).
         let ev = if conn.active.is_none() && conn.rejoin.waiting_rejoin.is_none() {
             // C30: read in ≤2s slices, a blocking full-deadline read starves
@@ -944,10 +951,16 @@ pub(crate) async fn send_cmd(
             }
             let slice =
                 Duration::from_secs(2).min(claim_deadline.saturating_sub(started.elapsed()));
+            let slice = if ceremony_live { slice.min(CEREMONY_TICK) } else { slice };
             match tokio::time::timeout(slice, rx.recv()).await {
                 Ok(Some(ev)) => Some(ev),
                 Ok(None) => bail!("signaling channel closed"),
                 Err(_) => None, // tick
+            }
+        } else if ceremony_live && conn.rejoin.waiting_rejoin.is_none() {
+            match tokio::time::timeout(CEREMONY_TICK, next_ev(&mut rx, &conn, false)).await {
+                Ok(ev) => ev?,
+                Err(_) => None, // tick: drive the ceremony
             }
         } else {
             next_ev(&mut rx, &conn, false).await?
@@ -1471,15 +1484,22 @@ pub(crate) async fn send_cmd(
                                             ui::Tone::Dim,
                                             "  authenticated, sending",
                                         ));
-                                        // Option A: race direct-quic FIRST; start_direct
-                                        // replaces WebRTC only after pending registration.
-                                        // If direct wins: transfer rides QUIC (130+ MB/s).
-                                        // If direct fails: expired_direct → establish → WebRTC fallback
-                                        //   (bounded ~5s gap for NAT-blocked peers, then WebRTC reconnects).
-                                        // A browser cannot take direct QUIC: promoting
-                                        // it would drop the WebRTC link it is on.
+                                        // Make-before-break: race direct-quic BESIDE the
+                                        // authenticated WebRTC link, which starts the
+                                        // transfer now (rearm below). When direct wins, we
+                                        // lead the handoff and the stream continues on
+                                        // QUIC from the next chunk; if it never wins,
+                                        // WebRTC simply keeps serving. A browser cannot
+                                        // take direct QUIC, so it is not raced at all.
                                         let promo = if cer.peer_supports_direct() {
-                                            conn.start_direct_promote(&from, &from, &sec).await
+                                            conn.start_direct_promote(
+                                                &from,
+                                                &from,
+                                                &sec,
+                                                crate::conn::PromoteRole::Lead,
+                                                cer.peer_supports_handoff(),
+                                            )
+                                            .await
                                         } else {
                                             crate::conn::Promotion::Retained
                                         };
@@ -1510,6 +1530,12 @@ pub(crate) async fn send_cmd(
                                 );
                             }
                             PakeInbound::Ignored => {}
+                            // Our confirmation was lost: answer the receiver's re-send.
+                            PakeInbound::Reply(reply) => {
+                                sio.emit("signal", json!({ "to": from, "data": reply }))
+                                    .await
+                                    .ok();
+                            }
                         }
                         continue;
                     }
@@ -1779,6 +1805,10 @@ pub(crate) async fn send_cmd(
                 }
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
+                // The post-PAKE promotion's handoff (crate::conn, `handoff`).
+                Some("path-promote" | "path-promoted" | "path-declined" | "path-stay") => {
+                    let _ = conn.on_promote_control(&pid, &v).await;
+                }
                 // Fleet target: the peer's certificate. The fleet secret proved
                 // it is IN the fleet; this proves WHICH member. The device key it
                 // names must resolve to the local record the user typed, or we
@@ -2696,12 +2726,9 @@ pub(crate) async fn send_cmd(
             let out = outgoing.lock().await;
             if !out.is_empty() && out.iter().all(|o| o.done) {
                 if let Some(t) = conn.transport() {
-                    // Block until the peer has acked every byte before we exit,
-                    // a torn-down QUIC connection drops un-acked send-buffer bytes
-                    // and truncates the last file (no-op on DataChannel, which
-                    // already drained in flush()). Surface a drain failure rather
-                    // than silently reporting "done" on a partial transfer.
-                    if let Err(e) = t.drain_finish().await {
+                    // Surface a drain failure rather than silently reporting
+                    // "done" on a partial transfer.
+                    if let Err(e) = exit_drain(&out, &t).await {
                         // CRITICAL, a possibly-incomplete delivery; must-see even under -q.
                         ui::critical(&ui::paint(
                             ui::Tone::Warn,
@@ -2759,6 +2786,36 @@ pub(crate) async fn send_cmd(
             }
         }
     }
+}
+
+/// The sender's final teardown drain, run once every transfer reached a
+/// terminal state and just before the process exits.
+///
+/// Block until the peer has acked every byte before we exit: a torn-down QUIC
+/// connection drops un-acked send-buffer bytes and truncates the last file.
+///
+/// Except when the receiver has already confirmed everything: a whole-file
+/// verified `delivery-ack` for every file it accepted means every byte that
+/// matters is on the far side, so a transport whose drain only waits for its
+/// own ack of the tail (WebRTC's SCTP SACK, about 1 s late cross-network) is
+/// not waited on. A file done without that ack (no digest, so size-only) still
+/// drains, as does an empty send.
+async fn exit_drain(out: &[Outgoing], t: &Arc<dyn Transport>) -> Result<()> {
+    if receiver_confirmed_all(out) && !t.drain_after_delivery_ack() {
+        return Ok(());
+    }
+    t.drain_finish().await
+}
+
+/// Did the receiver itself confirm every file: a digest-verified delivery-ack,
+/// or its refusal (it answered, and nothing of that file is owed)? A file with
+/// no `full` digest is `acked` on send without the receiver saying anything,
+/// so it never counts.
+fn receiver_confirmed_all(out: &[Outgoing]) -> bool {
+    !out.is_empty()
+        && out
+            .iter()
+            .all(|o| o.declined || (o.acked && o.full.is_some()))
 }
 
 /// Copy `from` into the spool file, returning the bytes written, or the bytes
@@ -2946,6 +3003,8 @@ pub(crate) fn missing_input(path: &str, e: &std::io::Error) -> anyhow::Error {
 /// How long an offer may go unanswered before the send fails. Long enough for
 /// any receiver that is working; a person deciding stops the clock entirely.
 const SEND_ANSWER_WAIT: Duration = Duration::from_secs(60);
+/// Event wait while a code ceremony is in flight (see the send loop).
+const CEREMONY_TICK: Duration = Duration::from_millis(100);
 
 /// The receiver's reason, for a `file-decline` that carries one (a typed
 /// refusal); `None` for a plain decline (a person said no).
@@ -3314,5 +3373,168 @@ mod code_window_tests {
         let w = code_establish_window(None, Some("90"), claim);
         assert_eq!(code_expiry_secs(600, w), 90);
         assert_eq!(code_expiry_secs(600, Duration::ZERO), 600);
+    }
+}
+
+#[cfg(test)]
+mod exit_drain_tests {
+    use super::{exit_drain, Outgoing, Transport};
+    use serde_json::Value;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A link whose tail never drains: the peer's transport-level ack of the
+    /// last bytes is late (the WebRTC SCTP SACK the D harness measured at ~1 s),
+    /// or never comes. Counts how often the exit drain was entered.
+    struct SlowTail {
+        drains: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for SlowTail {
+        async fn send_control(&self, _msg: &Value) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn drain_finish(&self) -> anyhow::Result<()> {
+            self.drains.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn slow_tail() -> (Arc<dyn Transport>, Arc<AtomicUsize>) {
+        let drains = Arc::new(AtomicUsize::new(0));
+        (Arc::new(SlowTail { drains: drains.clone() }), drains)
+    }
+
+    fn file(name: &str, full: Option<&str>) -> Outgoing {
+        Outgoing {
+            id: format!("id-{name}"),
+            sid: 1,
+            name: name.into(),
+            size: 4,
+            head: None,
+            full: full.map(str::to_string),
+            path: std::path::PathBuf::from(name),
+            temp: false,
+            accepted_once: true,
+            sent: true,
+            acked: false,
+            declined: false,
+            done: false,
+            stream_started: None,
+            stream_bytes: 4,
+        }
+    }
+
+    /// The receiver's whole-file-verified delivery-ack (what the event loop's
+    /// `delivery-ack` arm records).
+    fn delivered(name: &str) -> Outgoing {
+        let mut o = file(name, Some("digest"));
+        o.acked = true;
+        o.done = true;
+        o
+    }
+
+    async fn finishes_within(out: &[Outgoing], t: &Arc<dyn Transport>, wall: Duration) -> bool {
+        tokio::time::timeout(wall, exit_drain(out, t)).await.is_ok()
+    }
+
+    /// Every file came back delivery-acked: the receiver hashed every byte and
+    /// matched the digest, so nothing a transport-level ack could add is owed.
+    /// The sender exits on the ack, not ~1 s later on the WebRTC tail drain.
+    #[tokio::test]
+    async fn a_delivery_acked_send_does_not_wait_for_the_link_tail() {
+        let (t, _) = slow_tail();
+        let out = vec![delivered("a.bin"), delivered("b.bin")];
+        assert!(
+            finishes_within(&out, &t, Duration::from_millis(500)).await,
+            "every file was delivery-acked, yet the exit waited on the transport drain"
+        );
+    }
+
+    /// A file with no whole-file digest completes on send (the size-only path)
+    /// without the receiver confirming anything: its bytes are only safe once
+    /// the link has drained, so the exit still waits for that.
+    #[tokio::test]
+    async fn a_file_done_without_a_delivery_ack_still_drains() {
+        let (t, drains) = slow_tail();
+        let mut size_only = file("c.bin", None);
+        size_only.acked = true;
+        size_only.done = true;
+        let out = vec![delivered("a.bin"), size_only];
+        assert!(
+            !finishes_within(&out, &t, Duration::from_millis(300)).await,
+            "a file the receiver never confirmed must not skip the drain"
+        );
+        assert_eq!(drains.load(Ordering::SeqCst), 1);
+    }
+
+    /// A link whose drain is also the receiver's clean end of stream (direct
+    /// QUIC) still drains after a full set of delivery-acks.
+    #[tokio::test]
+    async fn a_link_that_needs_its_drain_keeps_it_after_the_ack() {
+        struct EndsStream(SlowTail);
+        #[async_trait::async_trait]
+        impl Transport for EndsStream {
+            async fn send_control(&self, m: &Value) -> anyhow::Result<()> {
+                self.0.send_control(m).await
+            }
+            async fn send_frame(&self, sid: u32, off: u64, p: &[u8]) -> anyhow::Result<()> {
+                self.0.send_frame(sid, off, p).await
+            }
+            async fn flush(&self) -> anyhow::Result<()> {
+                self.0.flush().await
+            }
+            async fn drain_finish(&self) -> anyhow::Result<()> {
+                self.0.drain_finish().await
+            }
+            fn drain_after_delivery_ack(&self) -> bool {
+                true
+            }
+            fn max_payload(&self) -> usize {
+                self.0.max_payload()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let drains = Arc::new(AtomicUsize::new(0));
+        let t: Arc<dyn Transport> = Arc::new(EndsStream(SlowTail { drains: drains.clone() }));
+        let out = vec![delivered("a.bin")];
+        assert!(!finishes_within(&out, &t, Duration::from_millis(300)).await);
+        assert_eq!(drains.load(Ordering::SeqCst), 1);
+    }
+
+    /// A refusal is the receiver answering: with every other file
+    /// delivery-acked there is nothing left to wait for.
+    #[tokio::test]
+    async fn a_declined_file_counts_as_answered() {
+        let (t, _) = slow_tail();
+        let mut no = file("d.bin", Some("digest"));
+        no.declined = true;
+        no.done = true;
+        let out = vec![delivered("a.bin"), no];
+        assert!(finishes_within(&out, &t, Duration::from_millis(500)).await);
+    }
+
+    /// Nothing to confirm is never "everything confirmed".
+    #[tokio::test]
+    async fn an_empty_send_still_drains() {
+        let (t, drains) = slow_tail();
+        assert!(!finishes_within(&[], &t, Duration::from_millis(300)).await);
+        assert_eq!(drains.load(Ordering::SeqCst), 1);
     }
 }

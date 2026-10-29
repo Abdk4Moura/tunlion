@@ -1599,7 +1599,8 @@ async fn recv_run(
                     };
                     match host.l3_start(&cidr, 1280, identity, mode) {
                         Ok(m) => {
-                            l3_status = L3Status::ready(l3_mode_word(m.is_userspace()));
+                            l3_status = L3Status::ready(l3_mode_word(m.is_userspace()))
+                                .with_v4_problem(m.native_v4_problem());
                             if let Ok(text) = serde_json::to_string(&l3_status) {
                                 host.l3_state_report(&text);
                             }
@@ -2068,13 +2069,6 @@ async fn recv_run(
     let receive_started = Instant::now();
 
     loop {
-        // A portable stop request (Windows has no SIGTERM and no unix control
-        // socket). The host writes it for this PID; the daemon exits through the
-        // SAME cleanup path it uses for a signal, within one loop tick.
-        if daemon && host.stop_requested() {
-            log.say("tunlion: stop requested; shutting down");
-            return Ok(());
-        }
         sync_tasks.reap_sync_tasks(log.as_ref()).await;
         // Reap completed blocking writers every iteration: the handles are
         // owned until their write lands, but a long-lived daemon must not keep
@@ -2199,6 +2193,9 @@ async fn recv_run(
             cleanup.watchdog.tick(log.clone());
         }
         cleanup.tasks.reap(log.as_ref()).await;
+        // Read before the select: a code ceremony is in flight (see the
+        // event wait below for why that shortens the wait).
+        let ceremony_live = recv_code_path && !recv_pake_done && !st.recv_cers.is_empty();
         let ev = tokio::select! {
             biased;
             // Warm-link reuse request from a sibling process. Handle it inline
@@ -2487,7 +2484,17 @@ async fn recv_run(
                 // dispatched this iteration is acted on promptly instead of
                 // up to a full 2s later (a settled release must not miss its
                 // own bound). Idle cost is unchanged when nothing is parked.
-                if parked_opens.is_empty() {
+                //
+                // Same for a code ceremony in flight: the progression block
+                // that sends our SPAKE2 element and our confirmation runs at
+                // the top of an iteration, but the events that make them
+                // sendable (a candidate's channel opening, its element
+                // arriving) are handled at the bottom. Waiting the full 2s
+                // in between cost a cross-network `receive <code>` about 4s
+                // between "authenticating..." and "authenticated" (two such
+                // waits, measured 4.0 to 4.1s in 4 of 5 runs). The ceremony
+                // is budgeted, so the fast tick is too.
+                if parked_opens.is_empty() && !ceremony_live {
                     Duration::from_secs(2)
                 } else {
                     Duration::from_millis(100)
@@ -4549,8 +4556,25 @@ async fn recv_run(
                     )
                 {
                     // Already authenticated a sender? Ignore stray PAKE traffic
-                    // from anyone else, including a late decoy.
+                    // from anyone else, including a late decoy. The sender itself
+                    // re-sends its confirmation until it hears ours, so a copy
+                    // from it means ours was lost: answer it, change nothing.
                     if recv_pake_done {
+                        let fps = match conn.link(&from) {
+                            Some(l) => match &l.peer {
+                                Some(p) => p.fingerprints().await,
+                                None => None,
+                            },
+                            None => None,
+                        };
+                        let fp_ref = fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+                        if let Some(cer) = st.recv_cers.get_mut(&from) {
+                            if let PakeInbound::Reply(reply) = cer.on_signal(&data, fp_ref) {
+                                sio.emit("signal", json!({ "to": from, "data": reply }))
+                                    .await
+                                    .ok();
+                            }
+                        }
                         continue;
                     }
                     // A sender of ANOTHER code on the same device shares this
@@ -4610,31 +4634,60 @@ async fn recv_run(
                     let mut is_abort = false;
                     let mut abort_why = String::new();
                     let mut peer_direct = false;
+                    let mut peer_handoff = false;
                     if let Some(cer) = st.recv_cers.get_mut(&from) {
                         match cer.on_signal(&data, fp_ref) {
                             PakeInbound::Consumed => {
                                 secret_opt = cer.secret().cloned();
                                 peer_direct = cer.peer_supports_direct();
+                                peer_handoff = cer.peer_supports_handoff();
                             }
                             PakeInbound::Abort(why) => {
                                 is_abort = true;
                                 abort_why = why;
                             }
                             PakeInbound::Ignored => {}
+                            PakeInbound::Reply(reply) => {
+                                sio.emit("signal", json!({ "to": from, "data": reply }))
+                                    .await
+                                    .ok();
+                            }
                         }
                     }
                     if let Some(sec) = secret_opt {
-                        // This peer authenticated. Record it as THE sender
+                        // This peer authenticated. Record it as THE sender, and
+                        // keep only its ceremony: it answers the sender's re-sent
+                        // confirmation should ours have been lost.
                         recv_pake_done = true;
-                        st.recv_cers.clear();
+                        st.recv_cers.retain(|pid, _| pid == &from);
                         st.recv_deadlines.clear();
+                        // The progression block stops once a sender is settled, and
+                        // its confirmation can verify here before ours went out.
+                        if let Some((my_fp, their_fp)) = fp_ref {
+                            let ours = st
+                                .recv_cers
+                                .get_mut(&from)
+                                .and_then(|c| c.take_confirm_payload(my_fp, their_fp));
+                            if let Some(data) = ours {
+                                sio.emit("signal", json!({ "to": from, "data": data }))
+                                    .await
+                                    .ok();
+                            }
+                        }
                         log.say(&log.paint(Tone::Dim, "  authenticated, receiving"));
-                        // Option A: start the direct-QUIC race. start_direct owns
-                        // replacement after all fallible setup and pending registration.
-                        // A browser sender cannot take direct QUIC:
-                        // promoting it would drop the WebRTC link it is on.
+                        // Make-before-break: race direct QUIC beside the WebRTC
+                        // link, which keeps receiving; the sender leads the
+                        // move to QUIC at a frame boundary if it wins. A
+                        // browser sender cannot take direct QUIC at all.
                         let promo = if peer_direct {
-                            conn.start_direct_promote(&from, &from, &sec).await
+                            conn.start_direct_promote(
+                                &from,
+                                &from,
+                                &sec,
+                                crate::conn::PromoteRole::Follow,
+                                peer_handoff,
+                            )
+                            .await
                         } else {
                             crate::conn::Promotion::Retained
                         };
@@ -4644,12 +4697,13 @@ async fn recv_run(
                         // which a peer on a retained link would otherwise never get.
                         conn.rearm_channel_ready(&from, promo);
                         // #161 (WebRTC/relay path): issue the possession challenge
-                        // now that this peer authenticated. The direct path resolves
-                        // identity at DirectReady (start_direct_promote above); the
-                        // WebRTC path has no pair-proof for a fresh code peer (no
-                        // stored secret) and no DirectReady, so without this its
-                        // identity never resolves and revocation cannot bind. The
-                        // helper is idempotent with the DirectReady site.
+                        // now that this peer authenticated. The transfer starts on
+                        // the retained WebRTC link, which has no pair-proof for a
+                        // fresh code peer (no stored secret) and no DirectReady, so
+                        // without this its identity never resolves and revocation
+                        // cannot bind. If the promotion later hands over to direct,
+                        // DirectReady resolves it again on the new link; the helper
+                        // is idempotent with that site.
                         if recv_code_path {
                             if let Some(l) = conn.link_mut(&from) {
                                 crate::identity::resolve_peer_identity(l);
@@ -5176,6 +5230,11 @@ async fn recv_run(
                 }
             }
             Ev::Control(pid, v) => match log_ctl_rx(&pid, v["type"].as_str(), log.as_ref()) {
+                // The post-PAKE promotion's handoff: the sender asks us to move
+                // to the direct link at its frame boundary (crate::handoff).
+                Some("path-promote" | "path-promoted" | "path-declined" | "path-stay") => {
+                    let _ = conn.on_promote_control(&pid, &v).await;
+                }
                 // L3 (serve_tun): the peer announced its overlay IP. Route that IP
                 // to this link and start pumping its datagrams into our TUN. Only
                 // when we run an overlay ourselves; ignored otherwise.

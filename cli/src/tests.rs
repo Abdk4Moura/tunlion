@@ -2587,6 +2587,44 @@ fn printed_hints_parse_as_typed() {
 }
 
 #[test]
+fn product_text_has_no_em_dash() {
+    // House style for everything a user reads: no em dash. The installers are
+    // checked by packaging/check-package-shape.py; this covers the CLI's own
+    // strings. An em dash counts when it is code, not comment: the line is not
+    // a comment line and no `//` outside a string literal comes before it.
+    // Test modules are blanked by `product_sources`, so assertion messages
+    // that quote old output are not product text.
+    let mut bad = Vec::new();
+    for (rel, text) in product_sources() {
+        for (n, line) in text.lines().enumerate() {
+            let Some(at) = line.find('\u{2014}') else { continue };
+            let t = line.trim_start();
+            if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+                continue;
+            }
+            let before = &line[..at];
+            let mut in_str = false;
+            let mut prev = '\0';
+            let mut commented = false;
+            for (i, c) in before.char_indices() {
+                if c == '"' && prev != '\\' {
+                    in_str = !in_str;
+                }
+                if !in_str && before[i..].starts_with("//") {
+                    commented = true;
+                    break;
+                }
+                prev = c;
+            }
+            if !commented {
+                bad.push(format!("  {rel}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "em dash in user-facing CLI text:\n{}", bad.join("\n"));
+}
+
+#[test]
 fn printed_hints_carry_every_required_flag() {
     // #227: `tunlion requests` printed `[ tunlion requests approve 1 ]`.
     // Both `--allow` and `--for` are REQUIRED, so typing the hint exactly as
@@ -3073,9 +3111,10 @@ fn printed_hints_name_verbs_that_exist() {
 /// code, which has peers and no identity of its own.
 #[test]
 fn the_first_screen_menu_does_not_contradict_its_own_header() {
-    // Genuinely nothing here: the friendly first-run wording is true.
+    // First use starts from an action, not an identity/setup wizard.
     let fresh = first_screen_actions(false, false, 0);
-    assert!(fresh.iter().any(|(l, _)| l.contains("first device")));
+    assert!(fresh.iter().any(|(_, action)| *action == "add"));
+    assert!(!fresh.iter().any(|(_, action)| *action == "init"));
 
     // Peers but no identity. "first device" is false with a device count
     // printed directly above it.
@@ -3091,8 +3130,8 @@ fn the_first_screen_menu_does_not_contradict_its_own_header() {
             "a machine with peers must be offered `{verb}`: {paired:?}"
         );
     }
-    // Setting up an identity stays available, just not as a lie about order.
-    assert!(paired.iter().any(|(_, a)| *a == "init"));
+    assert!(paired.iter().any(|(_, action)| *action == "add"));
+    assert!(!paired.iter().any(|(_, action)| *action == "init"));
 
     // The owner and joined menus are unaffected by device count.
     assert_eq!(
@@ -4254,6 +4293,33 @@ fn the_relink_chain_runs_against_a_store_and_keeps_the_old_key_revoked() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// `down` printed "stopped" and deleted the pidfile even when `kill` failed (a
+// daemon started with sudo), hiding a running daemon from status and reset.
+// The kill result now decides: failure is reported and the pidfile kept.
+#[test]
+fn down_reports_a_failed_kill_instead_of_stopped() {
+    // A real failing exit status, portably: libtest rejects an unknown flag.
+    let failed = crate::platform::command(std::env::current_exe().unwrap())
+        .arg("--definitely-not-a-libtest-flag")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!failed.success());
+    let why = kill_failure(4242, &failed).expect("a failed kill is reported");
+    assert!(why.contains("pid 4242"), "{why}");
+    assert!(why.contains("still running"), "{why}");
+    assert!(why.contains("pidfile is kept"), "{why}");
+    assert!(!why.contains("stopped (pid"), "{why}");
+    let ok = crate::platform::command(std::env::current_exe().unwrap())
+        .args(["--list", "--exact", "no-such-test-name"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    assert!(kill_failure(4242, &ok).is_none());
+}
 // --- Windows reparse-point hardening tests (#43) ---
 // The resume/open tests use a file symlink to prove that the write cannot be
 // redirected outside the download directory. The create test remains a

@@ -34,10 +34,6 @@ pub(crate) const TERM_GRACE: Duration = Duration::from_secs(10);
 /// How long to wait for the kernel to reap a SIGKILLed daemon.
 pub(crate) const KILL_GRACE: Duration = Duration::from_secs(3);
 
-/// A stop request nobody consumed is garbage after this long. Bounded so a
-/// down that timed out/force-terminated cannot leave a file forever.
-const STOP_REQUEST_TTL: Duration = Duration::from_secs(300);
-
 /// What `down` had to do beyond asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stopped {
@@ -55,9 +51,7 @@ impl Stopped {
         match self {
             Stopped::Asked => "",
             Stopped::Resumed => "; it was suspended (SIGSTOP), so it was resumed to let it exit",
-            Stopped::Killed => {
-                "; it did not exit within 10s, so it was force-terminated"
-            }
+            Stopped::Killed => platform::FORCED_STOP_NOTE,
         }
     }
 }
@@ -136,6 +130,15 @@ fn identity_for_exit(pid: u32, exe: Option<&Path>, start: Option<&str>) -> Ident
     } else {
         id
     }
+}
+
+/// May `down` force-terminate `pid` right now? Only when the recorded start
+/// token is present and the pid is still that exact incarnation. Used where a
+/// daemon cannot be asked at all (a Windows daemon with no stop event): the
+/// same rule as the force step in [`await_exit`], so no path terminates a
+/// recycled pid or one whose identity cannot be read.
+pub(crate) fn safe_to_force(pid: u32, exe: Option<&Path>, start: Option<&str>) -> bool {
+    start.is_some() && identity_for_exit(pid, exe, start) == Identity::Ours
 }
 
 fn still_ours(pid: u32, exe: Option<&Path>, start: Option<&str>) -> bool {
@@ -306,66 +309,6 @@ pub(crate) fn remove_pidfile_if_stopped(
     })
 }
 
-/// Did this daemon receive a stop request? Read/decide/remove under the
-/// request-file lock, so a concurrent down cannot have its fresh request
-/// deleted by a cleanup that read an older one.
-pub(crate) fn stop_requested() -> bool {
-    platform::with_daemon_stop_request_lock(|path| {
-        let Ok(raw) = std::fs::read_to_string(path) else { return false };
-        let mut lines = raw.lines();
-        let requested = lines.next().and_then(|s| s.trim().parse::<u32>().ok());
-        let token = lines.next().map(|s| s.trim().to_string());
-        let my_pid = std::process::id();
-        if requested != Some(my_pid) {
-            // A request for another pid is garbage here. Remove it when that
-            // pid is dead/malformed, or when the file is older than the TTL.
-            let dead = requested.map_or(true, |p| !platform::process_exists(p));
-            let stale = std::fs::metadata(path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age > STOP_REQUEST_TTL);
-            if dead || stale {
-                let _ = std::fs::remove_file(path);
-            }
-            return false;
-        }
-        let mine = platform::process_start_token(my_pid);
-        if token.is_none() || token != mine {
-            // Same pid, different process incarnation: a recycled pid.
-            let _ = std::fs::remove_file(path);
-            return false;
-        }
-        let _ = std::fs::remove_file(path);
-        true
-    })
-    .unwrap_or(false)
-}
-
-/// Remove a request written for exactly this daemon incarnation AND request
-/// nonce. Two concurrent downs have different nonces, so one cannot delete the
-/// other's pending request.
-pub(crate) fn clear_stop_request_for(pid: u32, token: Option<&str>, nonce: Option<&str>) {
-    // A fallback down (request lock was held, so it wrote NO request) must not
-    // clear a concurrent down's valid request. No nonce means "I did not write
-    // one", not "match any".
-    let Some(nonce) = nonce else { return };
-    platform::with_daemon_stop_request_lock(|path| {
-        let Ok(raw) = std::fs::read_to_string(path) else { return };
-        let mut lines = raw.lines();
-        let req_pid = lines.next().and_then(|s| s.trim().parse::<u32>().ok());
-        let req_token = lines.next().map(|s| s.trim().to_string());
-        let req_nonce = lines.next().map(|s| s.trim().to_string());
-        if req_pid == Some(pid)
-            && (token.is_none() || req_token.as_deref() == token)
-            && req_nonce.as_deref() == Some(nonce)
-        {
-            let _ = std::fs::remove_file(path);
-        }
-    });
-}
-
-
 fn marker_path() -> PathBuf {
     platform::Paths::config_path("down.marker")
 }
@@ -521,49 +464,8 @@ mod tests {
     fn stop_notes_say_what_was_done() {
         assert_eq!(Stopped::Asked.note(), "");
         assert!(Stopped::Resumed.note().contains("resumed"));
-        assert!(Stopped::Killed.note().contains("force-terminated"));
-    }
-
-    struct ConfigDir(Option<std::ffi::OsString>, PathBuf);
-    impl Drop for ConfigDir {
-        fn drop(&mut self) {
-            unsafe {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
-                    None => std::env::remove_var("TUNLION_CONFIG_DIR"),
-                }
-            }
-            let _ = std::fs::remove_dir_all(&self.1);
-        }
-    }
-
-    /// The Windows stop path is a PID-scoped request file the daemon consumes.
-    /// This runs everywhere (the reader is portable), so the exact logic that
-    /// replaces `taskkill` is tested on every runner.
-    #[test]
-    fn a_stop_request_is_pid_scoped_and_consumed_once() {
-        let _guard = crate::tests::lock_test_config();
-        let dir = std::env::temp_dir().join(format!("tunlion-stop-req-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let previous = std::env::var_os("TUNLION_CONFIG_DIR");
-        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
-        let _restore = ConfigDir(previous, dir);
-
-        let path = platform::daemon_stop_request_path();
-        let my_pid = std::process::id();
-        let Some(token) = platform::process_start_token(my_pid) else { return };
-        std::fs::write(&path, format!("{my_pid}\n{token}\n")).unwrap();
-        assert!(stop_requested(), "our pid+incarnation must be accepted");
-        assert!(!stop_requested(), "one request stops one daemon");
-
-        // Same PID, different process start token: a recycled Windows pid.
-        std::fs::write(&path, format!("{my_pid}\n{token}-other\n")).unwrap();
-        assert!(!stop_requested(), "a recycled pid must be refused");
-        assert!(!path.exists(), "the stale request is removed");
-
-        std::fs::write(&path, "424242\n1\n").unwrap();
-        assert!(!stop_requested(), "another pid is not ours");
+        // The wording per platform is pinned in platform's own test.
+        assert_eq!(Stopped::Killed.note(), platform::FORCED_STOP_NOTE);
     }
 
     /// The forced path must require the recorded process incarnation, not only
@@ -578,6 +480,19 @@ mod tests {
                 !still_ours(pid, None, Some("0")),
                 "same pid, different start token must never be ours"
             );
+        }
+    }
+
+    /// The no-listener path (an older Windows daemon) terminates without asking
+    /// first, so it must hold the same incarnation rule as the forced step.
+    #[test]
+    fn force_without_asking_requires_this_exact_incarnation() {
+        let pid = std::process::id();
+        assert!(!safe_to_force(pid, None, None), "no token, no force");
+        assert!(!safe_to_force(pid, None, Some("0")), "a different incarnation is never forced");
+        assert!(!safe_to_force(u32::MAX - 1, None, Some("0")), "a gone pid is not forced");
+        if let Some(token) = platform::process_start_token(pid) {
+            assert!(safe_to_force(pid, None, Some(&token)), "this exact incarnation may be");
         }
     }
 
@@ -646,73 +561,6 @@ mod tests {
     }
 
     #[test]
-    fn a_fallback_down_with_no_nonce_never_clears_a_concurrent_request() {
-        let _guard = crate::tests::lock_test_config();
-        let dir = std::env::temp_dir().join(format!("tunlion-stop-nononce-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let previous = std::env::var_os("TUNLION_CONFIG_DIR");
-        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
-        let _restore = ConfigDir(previous, dir);
-
-        let pid = std::process::id();
-        let token = platform::process_start_token(pid).unwrap_or_default();
-        let path = platform::daemon_stop_request_path();
-        std::fs::write(&path, format!("{pid}\n{token}\nother-down\n")).unwrap();
-        clear_stop_request_for(pid, Some(&token), None);
-        assert!(
-            path.exists(),
-            "no nonce means this down wrote nothing, so it must clear nothing"
-        );
-    }
-
-    #[test]
-    fn concurrent_downs_clear_only_their_own_nonce() {
-        let _guard = crate::tests::lock_test_config();
-        let dir = std::env::temp_dir().join(format!("tunlion-stop-nonce-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let previous = std::env::var_os("TUNLION_CONFIG_DIR");
-        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
-        let _restore = ConfigDir(previous, dir);
-
-        let pid = std::process::id();
-        let token = platform::process_start_token(pid).unwrap_or_default();
-        let path = platform::daemon_stop_request_path();
-        std::fs::write(&path, format!("{pid}\n{token}\nother-down\n")).unwrap();
-        clear_stop_request_for(pid, Some(&token), Some("my-down"));
-        assert!(path.exists(), "the other down's request must survive");
-        clear_stop_request_for(pid, Some(&token), Some("other-down"));
-        assert!(!path.exists(), "our own nonce clears exactly one request");
-    }
-
-    /// Cleanup takes the request lock; while a writer holds it the reader must
-    /// not delete anything (it retries next tick instead).
-    #[test]
-    fn stale_cleanup_waits_for_the_request_lock() {
-        let _guard = crate::tests::lock_test_config();
-        let dir = std::env::temp_dir().join(format!("tunlion-stop-lock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let previous = std::env::var_os("TUNLION_CONFIG_DIR");
-        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
-        let _restore = ConfigDir(previous, dir);
-
-        let path = platform::daemon_stop_request_path();
-        std::fs::write(&path, format!("{}\n0\nold\n", u32::MAX - 1)).unwrap();
-        let held = platform::InstanceLock::try_acquire(
-            &platform::daemon_stop_request_lock_path(),
-        )
-        .unwrap()
-        .expect("hold the request lock");
-        assert!(!stop_requested(), "no lock, no cleanup this tick");
-        assert!(path.exists(), "the writer's file is untouched");
-        drop(held);
-        assert!(!stop_requested());
-        assert!(!path.exists(), "cleanup proceeds once the lock is free");
-    }
-
-    #[test]
     fn pidfile_removal_outcomes_are_distinct_and_truthful() {
         let dir = std::env::temp_dir().join(format!("tunlion-pidfile-out-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -751,22 +599,6 @@ mod tests {
             PidfileRemoval::LockError(_)
         ));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_request_for_a_dead_pid_is_removed() {
-        let _guard = crate::tests::lock_test_config();
-        let dir = std::env::temp_dir().join(format!("tunlion-stop-dead-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let previous = std::env::var_os("TUNLION_CONFIG_DIR");
-        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
-        let _restore = ConfigDir(previous, dir);
-
-        let path = platform::daemon_stop_request_path();
-        std::fs::write(&path, format!("{}\n0\n", u32::MAX - 1)).unwrap();
-        assert!(!stop_requested(), "a dead pid's request is not ours");
-        assert!(!path.exists(), "and it is swept away, not left forever");
     }
 
     /// A replacement that takes the election lock and writes its own pidfile

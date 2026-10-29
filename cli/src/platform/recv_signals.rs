@@ -21,6 +21,11 @@ impl Signals {
         };
         #[cfg(unix)]
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        // Windows has no SIGTERM: `tunlion down` sets a named event this
+        // process waits on (platform::ask_daemon_to_stop), and that ends it
+        // the same graceful way.
+        #[cfg(windows)]
+        let stop_request = crate::platform::listen_for_stop_request();
         let code = signals.code.clone();
         signals.tasks.push(tokio::spawn(async move {
             #[cfg(unix)]
@@ -28,7 +33,23 @@ impl Signals {
                 result = tokio::signal::ctrl_c() => result.map(|_| crate::exit_codes::INTERRUPTED),
                 _ = term.recv() => Ok(crate::exit_codes::TERMINATED),
             };
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            let received = {
+                let requested = async {
+                    let fired = match stop_request {
+                        Some(rx) => rx.await.is_ok(),
+                        None => false,
+                    };
+                    if !fired {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => result.map(|_| crate::exit_codes::INTERRUPTED),
+                    _ = requested => Ok(crate::exit_codes::TERMINATED),
+                }
+            };
+            #[cfg(not(any(unix, windows)))]
             let received = tokio::signal::ctrl_c()
                 .await
                 .map(|_| crate::exit_codes::INTERRUPTED);

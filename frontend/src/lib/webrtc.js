@@ -1,8 +1,8 @@
 // PeerLink: one live connection to one remote peer.
 //
 // Owns an RTCPeerConnection + a single RTCDataChannel and moves files across it
-// in chunks. The server never sees a byte, it only relayed the SDP/ICE that
-// got us here. Control messages are JSON strings; file chunks are ArrayBuffers.
+// in chunks. The signalling server never sees file contents, it only relayed
+// the SDP/ICE that got us here. Control messages are JSON strings; file chunks are ArrayBuffers.
 //
 // Transfer lifecycle (both directions surfaced to the UI via onTransfer):
 //   offered      -> receiver has been told a file is coming, not yet accepted

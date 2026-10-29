@@ -58,14 +58,19 @@
 #![cfg_attr(not(feature = "mesh"), doc = include_str!("mesh_disabled.md"))]
 
 mod adoption;
+pub mod access;
+#[cfg(feature = "dispatch")]
+pub mod access_session;
 pub mod conn;
 pub mod consent;
 pub mod control;
 pub mod daemon_ctl;
 pub mod driver;
+pub mod download_output;
 pub mod exec_frame;
 #[cfg(feature = "mount-server")]
 pub mod fs_at;
+pub mod handoff;
 pub mod holepunch;
 pub mod host;
 pub mod identity;

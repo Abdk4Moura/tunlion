@@ -1403,3 +1403,24 @@ mod scripting_output_tests {
         assert_eq!(strip_ansi(&h), "TUNLION  /  3 DEVICES  /  AVAILABLE");
     }
 }
+
+/// Process start, for `timing`. Set once, as early in `main` as possible.
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Record the process start. Idempotent.
+pub fn mark_start() {
+    let _ = STARTED.get_or_init(std::time::Instant::now);
+}
+
+/// `TUNLION_TIMING=1`: print how long after start a user-visible moment
+/// happened (menu drawn, code shown). Measures what "light" means, time to the
+/// next thing on screen, instead of guessing it. Silent otherwise.
+pub fn timing(moment: &str) {
+    if std::env::var_os("TUNLION_TIMING").is_none() {
+        return;
+    }
+    let ms = STARTED.get().map(|t| t.elapsed().as_millis()).unwrap_or(0);
+    let mut err = std::io::stderr().lock();
+    let _ = std::io::Write::write_all(&mut err, format!("\r\x1b[2K[tunlion t+{ms}ms] {moment}\r\n").as_bytes());
+}
+
