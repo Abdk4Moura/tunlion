@@ -24,7 +24,7 @@ use std::path::Path;
 #[allow(dead_code)] // enforcement hook (gate 5); exercised by the capability gate
 /// read as `["transfer"]` for backward compatibility; deny-by-default otherwise.
 /// Returns None if the device isn't known.
-fn device_caps(name: &str) -> Option<Vec<String>> {
+pub(crate) fn device_caps(name: &str) -> Option<Vec<String>> {
     device_caps_at(&devices_path(), name)
 }
 

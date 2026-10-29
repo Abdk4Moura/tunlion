@@ -229,6 +229,17 @@
       ]
     },
     {
+      "path": "cli/tests/fleet-automesh-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/fleet-automesh-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/revocation-live-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/revocation-live-gates.sh",
@@ -427,6 +438,7 @@
       "invoked_by": [
         "cli/tests/devices-write-race-gates.sh",
         "cli/tests/expiry-race-gates.sh",
+        "cli/tests/fleet-automesh-gates.sh",
         "cli/tests/fleet-cert-gates.sh",
         "cli/tests/forward-refusal-gates.sh",
         "cli/tests/invite-expiry-gates.sh",
@@ -636,6 +648,17 @@
       ]
     },
     {
+      "path": "cli/tests/turn-stream-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/turn-stream-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "linux-netns"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/warm-hold-idle-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/warm-hold-idle-gates.sh",
@@ -671,6 +694,19 @@
       "invoked_by": [
         "deploy/monitor/oom-shield-monitor.py"
       ]
+    },
+    {
+      "path": "deploy/coturn/start.sh",
+      "disposition": "operational",
+      "entrypoint": "sh deploy/coturn/start.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "deployment-host"
+        }
+      ],
+      "activation": "manual",
+      "invoked_by": []
     },
     {
       "path": "deploy/monitor/install-timers.sh",

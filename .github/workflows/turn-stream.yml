@@ -1,0 +1,88 @@
+# TURN over TCP and TLS for the CLI (crates/filament-transport/src/turn_bridge.rs).
+#
+# Runs cli/tests/turn-stream-gates.sh: a real CLI inside a network namespace
+# whose UDP egress is dropped (and, in the strict cells, every TCP port but
+# 443) delivers a file to a CLI and to a headless Chromium on the unblocked
+# host, through the production signaling server and the TURN servers its
+# /api/config hands out. The CLI fetches its own short-lived TURN credentials;
+# no secret is configured here. It also proves UDP still wins when UDP works
+# and that the bridge costs no time to deliver.
+#
+# The path filter is the bridge, the peer-connection code that installs it, the
+# gate, and this file: a browser-only change never starts it (no `changes`
+# gate needed, see scripts/check_ci_paths.py policy (a)).
+name: TURN stream gates
+
+on:
+  pull_request:
+    paths:
+      - 'crates/filament-transport/src/turn_bridge.rs'
+      - 'crates/filament-transport/src/turn_bridge_tests.rs'
+      - 'crates/filament-transport/src/net.rs'
+      - 'crates/filament-transport/src/http.rs'
+      - 'crates/filament-transport/Cargo.toml'
+      - 'cli/tests/turn-stream-gates.sh'
+      - 'cli/tests/turn-stream-browser.cjs'
+      - '.github/workflows/turn-stream.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: turn-stream-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  turn-stream:
+    name: turn stream gates (ubuntu, netns)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Fall back to uncached builds if the cache backend is down
+        shell: bash
+        run: |
+          if ! sccache --start-server >/dev/null 2>&1 && ! sccache --show-stats >/dev/null 2>&1; then
+            echo "::warning::sccache unavailable; building without it"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cli/tests/package-lock.json
+      - name: Install Playwright and Chromium
+        working-directory: cli/tests
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      # The bridge unit tests include a real webrtc-rs TURN client and server
+      # allocating and relaying through the TCP bridge.
+      - name: Bridge unit tests
+        run: cargo test -p filament-transport --lib turn_bridge
+
+      - name: Build the CLI
+        run: cargo build --release -p filament-cli --bin tunlion
+
+      - name: TURN TCP/TLS gates
+        env:
+          TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
+          TURN_GATE_EVIDENCE: ${{ runner.temp }}/turn-stream-evidence
+        run: bash cli/tests/turn-stream-gates.sh
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turn-stream-evidence
+          path: ${{ runner.temp }}/turn-stream-evidence
+          if-no-files-found: warn

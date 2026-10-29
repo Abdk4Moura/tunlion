@@ -82,7 +82,8 @@ function runJoin(dir, code) {
       if (offered) await rem.click()
       const { rc, out } = await joined
       fs.writeFileSync(path.join(work, `join-${i}.log`), out)
-      const links = [...out.matchAll(/^\s*\S+\s+(\S+)\s*$/gm)].map((m) => m[1])
+      // One line per link: `  ✓ Connected to <name>`.
+      const links = [...out.matchAll(/^\s*\S+\s+Connected to\s+(\S+)\s*$/gm)].map((m) => m[1])
         .filter((n) => n === by.name || n === cr.name)
       // Setup check: the bad order happened (the bystander linked first).
       if (links[0] !== by.name) {

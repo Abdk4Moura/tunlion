@@ -153,3 +153,9 @@ issue a cert for it.
   it). eventlet logs a deprecation warning — harmless.
 - TURN credentials are **ephemeral** (time-limited HMAC); the browser never holds
   a standing TURN password. Keep `FIL_TURN_SECRET` secret. `.env` is gitignored.
+- coturn never gets the secret on its command line (where `ps` and
+  `docker inspect` would show it). Compose passes `FIL_TURN_SECRET` in as a
+  secret file, and `coturn/start.sh` renders `turnserver.conf` plus the
+  `static-auth-secret` line into a mode 600 file on a tmpfs before it execs
+  turnserver. Check after a deploy: `ps -eo args | grep [t]urnserver` shows no
+  `--static-auth-secret`.

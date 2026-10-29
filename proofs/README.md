@@ -349,47 +349,55 @@ ONLY widening combination in the whole universe.
 
 `fleet_automesh_model.py` model-checks the membership plane added by
 `docs/design-fleet-automesh.md`: devices certified by one owner key discovering
-and admitting each other over a shared rendezvous channel, with revocation,
-fleet_rv rotation, and offline churn. Run it:
+and admitting each other over a shared rendezvous channel, with revocation on
+the owner, owner-signed roster pushes that narrow sibling admission, and
+offline churn. Run it:
 
 ```
-python3 fleet_automesh_model.py        # all three tiers
+python3 fleet_automesh_model.py        # all tiers plus the mutation controls
 python3 fleet_automesh_model.py 2      # only the intruder tier
+python3 fleet_automesh_model.py m      # only the mutation controls
 ```
 
 | Tier | Assumptions | What is proven |
 |---|---|---|
-| **0 GoodNet** | every device online, no revocation | convergence to a full mesh under EVERY enrollment / subscribe / discover interleaving |
-| **2 Intruder** | GoodNet plus an uncertified device parked on every channel id it could learn | presence on the fleet channel authorizes **nothing**: admission needs an owner-signed cert, and the fleet still converges with a squatter present |
-| **1 Degraded** | GoodNet **minus** stability: revocation, epoch rotation, revocation-propagation lag, offline/online churn | no reachable state is a trap (the fleet can always still converge), rotation never permanently partitions the fleet, and a learned revocation is never undone |
+| **0 GoodNet** | every device online, no revocation | convergence to a full mesh under EVERY enrollment / subscribe / roster push / discover interleaving |
+| **2 Intruder** | GoodNet plus an uncertified device parked on the fleet channel | presence on the fleet channel authorizes **nothing**: admission needs an owner-signed cert, and the fleet still converges with a squatter present |
+| **1 Degraded** | revocation on the owner, roster-push lag, offline/online churn | a joined device keeps a sibling only while the roster it holds lists it (S2), admits no sibling before it holds a roster (S3), and no reachable state is a trap |
 
 Liveness is checked by backward reachability from the goal, so the result is the
 strong form: not "the goal is reachable from the start" but "**no** reachable
 state is a trap".
 
+The model checks what the code does. An earlier version proved a design that
+rotated `fleet_rv` on revocation; that was never implemented, and the
+revocation that IS implemented is the owner's signed roster
+(`DeviceStore::sibling_admissible`, `revocation::sibling_link_must_close`).
+
 ### Latest result
 
 ```
-GoodNet  N=2 -> 9      N=3 -> 96     N=4 -> 4644
-Intruder N=2 -> 33     N=3 -> 708    N=2 K=1 -> 222
-Degraded N=2 K=1 -> 34               N=3 K=1 -> 3584
+GoodNet  N=2 -> 14     N=3 -> 454    N=4 -> 101648
+Intruder N=2 -> 14     N=3 -> 454    N=3 K=1 churn -> 5312
+Degraded N=2 K=1 -> 46  N=3 K=1 -> 5312  N=3 K=2 -> 7632
 ```
 
 0 safety violations, 0 trap states, in all runs.
 
 ### Negative controls (why a green run means something)
 
-The checker was validated by mutation, not by its own clean-run count. Deleting
-the local-revocation check makes Degraded fail `S2`; deleting the rotation
-delivery makes Degraded N=3 report 1088 trap states; deleting the certificate
-check makes Intruder fail `S1`.
+The mutation controls run in CI with the model, and each must FAIL:
 
-That last one is the reason the Intruder tier exists. Under tiers 0 and 1 alone,
-removing the cert check from `discover` changed **nothing**, because only an
-enrolled device could ever be on a channel, so `S1` was vacuous and passed on a
-model that could not express the attack. A check that cannot fail is not
-evidence. If you extend this model, mutate it and confirm it bites before
-trusting a green run.
+| mutant | what it removes | caught by |
+|---|---|---|
+| `no-cert` | the certificate check in `discover` | S1, Intruder tier |
+| `no-roster` | the roster listing in `discover` | S2 |
+| `no-sweep` | closing links a new roster drops | S2 |
+| `open-no-ros` | fail-closed admission before any roster | S3 |
+
+`no-cert` is the reason the Intruder tier exists: without an uncertified device
+on the channel, S1 was vacuous. A check that cannot fail is not evidence. If you
+extend this model, add a mutant and confirm it bites before trusting a green run.
 
 ## Companion: the bootstrap card reference codec
 

@@ -640,6 +640,9 @@ impl RecvIdentity for CoreIdentity {
     fn device_cert_revoked(&self, device_pub: &[u8; 32]) -> bool {
         self.identity.device_cert_revoked(device_pub)
     }
+    fn sibling_admissible(&self, device_pub: &[u8; 32]) -> bool {
+        self.identity.store().sibling_admissible(device_pub)
+    }
     fn owner_pub_for_resources(&self) -> Option<[u8; 32]> {
         self.identity.owner_pub_for_resources()
     }

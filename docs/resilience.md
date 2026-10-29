@@ -312,6 +312,76 @@ UI hid it.
 `frontend/tests/peer-reload.spec.cjs`,
 `backend/tests/test_session_generation.py`.
 
+## 14. A silently dead polling page stayed a ghost tile for about 85 s
+
+**Symptom.** A page on the socket.io long-polling transport (a network that
+holds or blocks websockets) that dies without `pagehide` (a killed renderer, a
+mobile OS kill) stayed on every other peer as a "connecting" tile for about
+85 s. Websocket pages that die the same way leave at once.
+
+**Problem.** A websocket death ends the engine.io socket on TCP close. A
+polling client has no connection of its own to close: its last long-poll GET
+sits in the relay until the next ping (25 s), the answer goes nowhere, and only
+the ping timeout (60 s) ends the socket. Until then `_eio_alive` called it open
+and the lease loop kept refreshing it. The ping values are long on purpose
+(slow, high-RTT and backgrounded clients reconnect-stormed at 10 s/5 s), so
+they could not simply be shortened.
+
+**Solution.** A separate rule for polling sockets, in the relay
+(`signaling.PollWatch`, a WSGI middleware that records each polling GET, plus a
+1 s loop). A live engine.io-client always holds one long-poll and sends the next
+from the previous one's load callback, not from a timer, so CPU throttling and
+background-tab timer throttling do not delay it. The loop answers a GET held
+`FIL_POLL_HOLD_S` (2 s) with a NOOP packet, and closes a polling socket that
+then has no GET for `FIL_POLL_GRACE_S` (7 s): a live client re-polls within one
+round trip, a dead one never does. Closing runs the normal disconnect path, so
+the room gets `peer-left`. The ping timeout is unchanged and still covers
+websocket half-opens. Upgraded sockets are forgotten; a socket mid-upgrade is
+left alone (the client pauses polling then). `FIL_POLL_GRACE_S=0` turns the
+rule off.
+
+**Bounds, measured** (`frontend/tests/polling-liveness.spec.cjs`, production
+25/60 ping, eventlet): a crashed or silently closed polling page leaves the
+other peer in 8.1 to 8.9 s over 12 runs (84 s and 114 s on the old relay). A
+polling page at 20x CPU throttling, hidden, never drops: 60 s at 2.5 s added
+latency, and 30 s each at 4, 5, 6 and 8 s. Three 3 s offline flaps never
+remove the tile (the reconnect supersedes by uid).
+
+**A frozen page is not a dead one.** On Android, choosing a file opens the
+system picker; the tab goes to the background and the OS may freeze it, and a
+frozen page cannot poll. The 7 s rule alone dropped such a page within seconds
+(measured: a 10 s freeze took the tile away for 61 s and the picked file never
+arrived), where the ping timeout had let it ride out up to about 60 s. So the
+page says it is going out of sight: `away {on: true}` on the signaling socket
+at the file-input click (capture phase, while the page still runs) and on
+`visibilitychange` hidden, `away {on: false}` when it is visible again. The
+relay keys the hint by the socket it arrived on (`request.sid`), so it can only
+lengthen that socket's own grace, to `FIL_POLL_AWAY_S` (180 s); inside it the
+ping timeout is again what ends a page that never comes back, exactly as
+before. A visible page that stops polling (a real crash) still drops in about
+8 s. With the hint, a page frozen 10, 30 or 60 s behind the picker keeps its
+tile, its sid and its WebRTC link, and the picked file arrives in under 0.5 s;
+a 120 s freeze is dropped by the ping timeout and rejoins, the same as before
+this rule. Opening the picker sends no session-close and no `leave` on either
+transport.
+
+What is left of the trade: a polling client that is visible and whose next
+GET takes longer than the grace to reach the relay (a round trip over about
+7 s) is closed and reconnects, where before it rode out up to 85 s.
+
+The freeze in the gate is the debugger's pause, not
+`Page.setWebLifecycleState frozen`: Chrome silently ignores that on a page it
+considers visible, and every page in a Playwright browser is one (measured:
+timers and long-polls ran on through the "frozen" state). The gate fails if
+the frozen page sends a long-poll.
+
+*Files:* `backend/signaling.py` (`PollWatch`, `poll_check`, the poll loop and
+the `away` handler in `register`), `backend/app.py`,
+`frontend/src/lib/signaling.js` (`away`), `frontend/src/lib/useTunlion.js`
+(`onVisibility`, `onPickerClick`).
+*Gates:* `backend/tests/test_poll_liveness.py`,
+`frontend/tests/polling-liveness.spec.cjs`.
+
 ## Testing
 
 `PeerLink`'s logic is exercised against a mock `RTCPeerConnection` (see the test

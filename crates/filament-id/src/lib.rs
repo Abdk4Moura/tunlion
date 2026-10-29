@@ -271,7 +271,14 @@ impl DeviceCert {
 /// authority, and a signed field reads as validated when it is only "the owner
 /// wrote it". ROSTER PRESENCE IS EVIDENCE OF NOTHING: the acceptor's
 /// authorization decision stays a pure function of (presented cert chain, local
-/// root, local tombstones) and must never take this object as an input.
+/// root, local tombstones) and must never take this object as a POSITIVE input.
+///
+/// The one use it does have in a decision is negative, and narrow: on a joined
+/// device, a fleet SIBLING (never paired) the newest roster no longer lists is
+/// treated as revoked, because the owner is the only party that admitted it and
+/// this is the owner's signed statement that it no longer does
+/// (`DeviceStore::sibling_admissible`). Absence can refuse; presence never
+/// authorizes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshRoster {
     pub owner_pub: [u8; 32],

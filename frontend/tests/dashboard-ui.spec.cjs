@@ -13,7 +13,10 @@
 //   6. a made invitation stays readable after "Copy and hide";
 //   7. a nav control cannot be reached with Tab or shows no focus ring;
 //   8. on a phone, the bottom nav targets are under 44 px;
-//   9. any screen shows an em dash.
+//   9. any screen shows an em dash;
+//  10. a paired-but-uncertified device is not named "paired, not yet one of
+//      your devices" with the CLI's one-line fix, or a PAIRED row on a device
+//      with no identity is flagged as if it needed review.
 //
 //   node frontend/tests/dashboard-ui.spec.cjs        (from the repo root)
 
@@ -40,6 +43,7 @@ function seed() {
       { name: 'web-vps', state: 'active', online: true, status: 'online', lastSeen: NOW - 5, caps: ['shell', 'transfer'] },
       { name: 'jane-phone', state: 'active', online: false, status: 'idle', lastSeen: NOW - 3600, caps: ['transfer'] },
       { name: 'old-phone', state: 'revoked', online: false, status: 'idle', lastSeen: NOW - 40 * 86400, caps: [] },
+      { name: 'pop-os', state: 'active', online: true, status: 'online', lastSeen: NOW - 5, caps: ['transfer'] },
     ],
     perms: [
       { name: 'web-vps', tier: 'FLEET', caveats: [], caps: [
@@ -48,6 +52,8 @@ function seed() {
       { name: 'jane-phone', tier: 'EXTERNAL', caveats: [], caps: [
         { action: 'transfer', resource: 'self', source: 'enrolment ceiling', valid_until: NOW + 2 * 86400, effective: true }] },
       { name: 'old-phone', tier: 'EXTERNAL', caveats: [], caps: [] },
+      { name: 'pop-os', tier: 'NEEDS REVIEW', caveats: ['uncertified: pairing permissions only, not yet one of your devices. If it is yours: `tunlion add pop-os` on your owner device, then `tunlion join <code>` on pop-os'], caps: [
+        { action: 'transfer', resource: 'self', source: 'pairing', valid_until: null, effective: null }] },
     ],
     requests: [{ id: 7, peer: 'jane-phone', capability: 'shell', ago: '3m ago' }],
     history: ['2026-10-14 07:13:37 web-vps opened a shell', '2026-10-14 08:15:02 received notes.txt from jane-phone'],
@@ -151,7 +157,30 @@ function startServer() {
   const risks = await p.$$eval('[data-testid=exposure-item]', (xs) => xs.map((x) => x.dataset.risk));
   if (!risks.length || risks[0] !== 'high') fail(`exposure order ${risks}`);
   ok(`exposure lists high first (${risks.join(',')})`);
+  // 10. the uncertified pairing, in the CLI's words, with its one-line fix.
+  const review = p.locator('[data-testid=exposure-item]', { hasText: 'pop-os is paired, not yet one of your devices' });
+  if (!(await review.count())) fail('the uncertified pairing is not named "paired, not yet one of your devices"');
+  if (!(await review.getByText(/tunlion add pop-os/).count())) fail('the review item does not carry the one-line fix');
+  if ((await p.evaluate(() => document.body.innerText)).includes('trusted without a certified identity')) fail('the old jargon title is still shown');
+  ok('an uncertified pairing reads "paired, not yet one of your devices" with the fix');
   await shot('exposure'); await noEmDash('exposure');
+
+  // 10b. on a device with no identity (the CLI reports its pairing as EXTERNAL there), nothing is flagged for review.
+  const saved = state.data;
+  state.data = JSON.parse(JSON.stringify(saved));
+  state.data.me = { name: 'pop-os', owner: false, identity: false };
+  state.data.devices = [{ name: 'dovm', state: 'active', online: true, status: 'online', lastSeen: NOW - 5, caps: ['transfer'] }];
+  state.data.perms = [{ name: 'dovm', tier: 'EXTERNAL', caveats: [], caps: [{ action: 'transfer', resource: 'self', source: 'pairing', valid_until: null, effective: null }] }];
+  state.data.requests = [];
+  await p.reload();
+  await p.locator('nav[aria-label=Dashboard]').getByRole('button', { name: /^Exposure/ }).click();
+  await p.getByRole('heading', { name: 'Exposure', exact: true }).waitFor();
+  if ((await p.evaluate(() => document.body.innerText)).includes('not yet one of your devices')) fail('a pairing on a device with no identity was flagged for review');
+  ok('a pairing on a device with no identity is not flagged for review');
+  await shot('exposure-paired'); await noEmDash('exposure (paired)');
+  state.data = saved;
+  await p.reload();
+  await p.getByRole('heading', { name: 'Overview', exact: true }).waitFor({ timeout: 15000 });
 
   // 6. invitation shown once
   await p.getByRole('button', { name: 'Codes and invitations', exact: true }).click();

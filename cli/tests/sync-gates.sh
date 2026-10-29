@@ -68,7 +68,7 @@
 #      move (one `updated` of exactly one chunk, one `sent`), the rest `same`,
 #      bytes moved == that chunk + the new file. The rsync claim, measured.
 #   C  NO-OP -- an unchanged re-run moves 0 bytes.
-#   D  ESCAPE -- `boxB:../x` and `boxB:/etc` are refused (exit 4), nothing created.
+#   D  ESCAPE -- `boxb:../x` and `boxb:/etc` are refused (exit 4), nothing created.
 #   E  DRY RUN -- `-n` prints the plan and creates nothing on B.
 #   F  UNKNOWN DEVICE -- exit 3.
 #   G  DELETE -- `--delete` removes the one file B has that A no longer does.
@@ -98,14 +98,14 @@ trap fixture_cleanup EXIT
 start_backend
 
 SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-printf '[{"name":"boxB","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
-printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
+printf '[{"name":"boxb","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
+printf '[{"name":"boxa","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 DROP="$WORK/Bdrop"; mkdir -p "$DROP"
-env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxB "$BIN" up --dir "$DROP" --server "$SERVER" >"$WORK/up.log" 2>&1 &
+env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxb "$BIN" up --dir "$DROP" --server "$SERVER" >"$WORK/up.log" 2>&1 &
 FIX_PIDS+=($!)
 sleep 3
 
-SYNC=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxA timeout 120 "$BIN" --server "$SERVER")
+SYNC=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa timeout 120 "$BIN" --server "$SERVER")
 CHUNK=262144
 
 # --- the tree: a (300 B), big (3 chunks), sub/c (5 B), link (symlink) ---
@@ -141,7 +141,7 @@ same_bytes() { cmp -s "$TREE/$1" "$DROP/inbox/$1"; }
 
 # ===================================================================== GATE A ==
 say A
-"${SYNC[@]}" --json sync "$TREE" boxB:inbox >"$WORK/A.jsonl" 2>"$WORK/A.err"; rcA=$?
+"${SYNC[@]}" --json sync "$TREE" boxb:inbox >"$WORK/A.jsonl" 2>"$WORK/A.err"; rcA=$?
 echo "## rc=$rcA"; cat "$WORK/A.jsonl"
 if [ "$rcA" = 0 ]; then ok "gateA: first sync exits 0"; else cat "$WORK/A.err"; tail -20 "$WORK/up.log"; bad "gateA: first sync rc=$rcA"; fi
 if [ "$(jstates "$WORK/A.jsonl")" = "$(printf 'sent\ta\t300\nsent\tbig\t%s\nskipped\tlink\t0\nsent\tsub/c\t5' $((CHUNK*3)))" ]; then
@@ -161,7 +161,7 @@ with open(p,"r+b") as f:
     f.seek(chunk+100); f.write(b"\xff\xfe\xfd")
 PY
 head -c 1000 /dev/urandom > "$TREE/d"
-"${SYNC[@]}" sync --json-lines "$TREE" boxB:inbox >"$WORK/B.jsonl" 2>"$WORK/B.err"; rcB=$?
+"${SYNC[@]}" sync --json-lines "$TREE" boxb:inbox >"$WORK/B.jsonl" 2>"$WORK/B.err"; rcB=$?
 echo "## rc=$rcB"; cat "$WORK/B.jsonl"
 if [ "$rcB" = 0 ] && [ "$(jstates "$WORK/B.jsonl")" = "$(printf 'same\ta\t0\nupdated\tbig\t%s\nsent\td\t1000\nskipped\tlink\t0\nsame\tsub/c\t0' "$CHUNK")" ]; then
   ok "gateB: exactly two files moved: one chunk of big, all of d"
@@ -200,7 +200,7 @@ PY
 
 # ===================================================================== GATE C ==
 say C
-"${SYNC[@]}" sync "$TREE" boxB:inbox >"$WORK/C.out" 2>&1; rcC=$?
+"${SYNC[@]}" sync "$TREE" boxb:inbox >"$WORK/C.out" 2>&1; rcC=$?
 cat "$WORK/C.out"
 if [ "$rcC" = 0 ] && grep -q '0 B of .* moved' "$WORK/C.out" && [ "$(grep -c '^  same ' "$WORK/C.out")" = 4 ] && ! grep -qE '^  (sent|updated) ' "$WORK/C.out"; then
   ok 'gateC: unchanged re-run moves 0 bytes, four same lines'
@@ -208,12 +208,12 @@ else bad "gateC: no-op re-run moved something (rc=$rcC)"; fi
 
 # ===================================================================== GATE D ==
 say D
-"${SYNC[@]}" sync "$TREE" boxB:../escape >"$WORK/D1.out" 2>&1; rcD1=$?
+"${SYNC[@]}" sync "$TREE" boxb:../escape >"$WORK/D1.out" 2>&1; rcD1=$?
 cat "$WORK/D1.out"
 if [ "$rcD1" = 4 ] && grep -qi 'outside' "$WORK/D1.out" && [ ! -e "$WORK/escape" ]; then
   ok "gateD: ../escape refused with exit 4, nothing created"
 else ls "$WORK"; bad "gateD: ../escape not refused cleanly (rc=$rcD1)"; fi
-"${SYNC[@]}" --json sync "$TREE" boxB:/etc >"$WORK/D2.jsonl" 2>/dev/null; rcD2=$?
+"${SYNC[@]}" --json sync "$TREE" boxb:/etc >"$WORK/D2.jsonl" 2>/dev/null; rcD2=$?
 cat "$WORK/D2.jsonl"
 if [ "$rcD2" = 4 ] && [ "$(jfinal "$WORK/D2.jsonl" code)" = denied ]; then
   ok "gateD: absolute /etc refused, --json error envelope code=denied exit 4"
@@ -221,7 +221,7 @@ else bad "gateD: /etc not refused (rc=$rcD2)"; fi
 
 # ===================================================================== GATE E ==
 say E
-"${SYNC[@]}" sync -n "$TREE" boxB:dry >"$WORK/E.out" 2>&1; rcE=$?
+"${SYNC[@]}" sync -n "$TREE" boxb:dry >"$WORK/E.out" 2>&1; rcE=$?
 cat "$WORK/E.out"
 if [ "$rcE" = 0 ] && [ ! -e "$DROP/dry" ] && [ "$(grep -c '^  would send ' "$WORK/E.out")" = 4 ] && grep -q 'nothing moved' "$WORK/E.out"; then
   ok "gateE: dry run prints the plan and creates nothing on B"
@@ -236,7 +236,7 @@ cat "$WORK/F.out"
 # ===================================================================== GATE G ==
 say G
 rm "$TREE/a"
-"${SYNC[@]}" sync --delete "$TREE" boxB:inbox >"$WORK/G.out" 2>&1; rcG=$?
+"${SYNC[@]}" sync --delete "$TREE" boxb:inbox >"$WORK/G.out" 2>&1; rcG=$?
 cat "$WORK/G.out"
 if [ "$rcG" = 0 ] && [ ! -e "$DROP/inbox/a" ] && grep -q '^  deleted  a$' "$WORK/G.out" && same_bytes big; then
   ok "gateG: --delete removed the one extraneous file"
@@ -246,7 +246,7 @@ else ls "$DROP/inbox"; bad "gateG: --delete did not remove a (rc=$rcG)"; fi
 say H
 rm "$DROP/inbox/sub/c"
 truncate -s $((CHUNK*2)) "$DROP/inbox/big"
-"${SYNC[@]}" --json sync "$TREE" boxB:inbox >"$WORK/H.jsonl" 2>"$WORK/H.err"; rcH=$?
+"${SYNC[@]}" --json sync "$TREE" boxb:inbox >"$WORK/H.jsonl" 2>"$WORK/H.err"; rcH=$?
 echo "## rc=$rcH"; cat "$WORK/H.jsonl"
 if [ "$rcH" = 0 ] && [ "$(jstates "$WORK/H.jsonl")" = "$(printf 'updated\tbig\t%s\nsame\td\t0\nskipped\tlink\t0\nsent\tsub/c\t5' "$CHUNK")" ] && same_bytes big && same_bytes sub/c; then
   ok "gateH: resume moves only the missing chunk and the missing file"
@@ -257,7 +257,7 @@ else cat "$WORK/H.err"; jstates "$WORK/H.jsonl"; bad "gateH: resume moved the wr
 # Criterion (a): a peer that cannot send/receive cannot sync, and one that CAN
 # still does. THIS IS THE ONLY ARM IN THIS GATE THAT USES THE ENROLLED PAIRING
 # STYLE, and it has to be: the capability check is keyed on IDENTITY, while the
-# boxA/boxB pair above is secret-paired and therefore resolves no identity at all
+# boxa/boxb pair above is secret-paired and therefore resolves no identity at all
 # (the same reason fleet-cert-gates.sh exists). Asserting a capability refusal on
 # a secret-paired link would pass for the wrong reason, which is the disease, not
 # the cure.
@@ -326,7 +326,7 @@ python3 -c "import sys; sys.stdout.buffer.write(bytes((i*7+3) % 251 for i in ran
 if cmp -s "$TREE/big" "$DROP/inbox/big"; then
   bad "gateJ: the corruption did not take, so this arm would have tested nothing"
 else
-  "${SYNC[@]}" --json sync "$TREE" boxB:inbox >"$WORK/J.jsonl" 2>"$WORK/J.err"; rcJ=$?
+  "${SYNC[@]}" --json sync "$TREE" boxb:inbox >"$WORK/J.jsonl" 2>"$WORK/J.err"; rcJ=$?
   echo "## rc=$rcJ"; cat "$WORK/J.jsonl"
   if [ "$rcJ" = 0 ] && jstates "$WORK/J.jsonl" | grep -q "$(printf 'updated\tbig\t%s' "$BIGSZ")" && same_bytes big; then
     ok "gateJ: a same-size corrupted block is re-sent ($BIGSZ bytes, state updated), never accepted as up to date"

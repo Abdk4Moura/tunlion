@@ -102,6 +102,8 @@ mod enrollment;
 mod membership;
 /// `tunlion pair` and its pair-specific helpers.
 mod pair_cmd;
+/// One spelling rule for device names, and the forgiving lookup.
+mod device_names;
 mod preconnect;
 mod access_ui;
 mod temporary_session;
@@ -1104,12 +1106,23 @@ fn up_log() -> PathBuf {
 /// after an in-place binary upgrade ignored. Without the latter, upgrading the
 /// binary under a running daemon reads as "not running" and starts a second
 /// daemon, the very bug this check exists to prevent.
+///
+/// Windows has the same upgrade in another shape: a running .exe cannot be
+/// replaced, so `tunlion update` (and the installer) rename it to
+/// `tunlion.old` and put the new binary at `tunlion.exe`. The old daemon then
+/// runs from `tunlion.old`, and `status`/`down` must still see it as this
+/// install's daemon.
 fn same_executable(a: &Path, b: &Path) -> bool {
     let norm = |p: &Path| {
         let s = p.to_string_lossy();
-        match s.strip_suffix(" (deleted)") {
+        let p = match s.strip_suffix(" (deleted)") {
             Some(t) => PathBuf::from(t),
             None => p.to_path_buf(),
+        };
+        if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("old")) {
+            p.with_extension("exe")
+        } else {
+            p
         }
     };
     let (a, b) = (norm(a), norm(b));

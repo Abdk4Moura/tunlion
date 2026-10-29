@@ -89,8 +89,13 @@ socketio = SocketIO(
     ping_timeout=int(os.environ.get("FIL_PING_TIMEOUT", "10")),
     ping_interval=int(os.environ.get("FIL_PING_INTERVAL", "5")),
 )
+# Outermost, so it sees every socket.io long-poll GET before engine.io holds it
+# (signaling.PollWatch: a dead polling client is closed in seconds, not after
+# the ping timeout).
+POLL_WATCH = signaling.PollWatch(app.wsgi_app)
+app.wsgi_app = POLL_WATCH
 REGISTRY = signaling.make_registry(config.REDIS_URL)
-signaling.register(socketio, REGISTRY)
+signaling.register(socketio, REGISTRY, poll_watch=POLL_WATCH)
 
 # Pagehide beacons are bearer-token authenticated by (token, gen). They are
 # never keyed by uid. Keep a per-IP budget and honor the configured origin

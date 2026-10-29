@@ -300,6 +300,35 @@ pub fn policy_trusted(
                 .any(|(n, secret)| n == name && !secret.is_empty()))
 }
 
+/// What the transfer gates need to know about a fleet SIBLING on this link.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SiblingTransferFacts {
+    /// The link's principal is a same-owner sibling admitted on its certificate
+    /// over the fleet channel (or a one-shot on a meeting place it brokered).
+    pub is_sibling: bool,
+    /// THIS machine's own record grants that proven sibling `transfer`
+    /// (`tunlion grant <sibling> transfer` here). Only for a proven sibling: the
+    /// record is keyed by the name resolved from the proven key, never a
+    /// claimed one.
+    pub record_grant: bool,
+}
+
+/// Read the sibling facts for `pid`. Everything that is not a fleet sibling
+/// reads as `is_sibling: false`, so the gates it feeds are unchanged for it.
+pub fn sibling_transfer_facts(conn: &Conn, pid: &str) -> SiblingTransferFacts {
+    let Some(l) = conn.link(pid) else {
+        return SiblingTransferFacts::default();
+    };
+    let is_sibling = l.is_sibling_link();
+    let record_grant = is_sibling
+        && l.fleet_proven()
+        && l
+            .verified_name
+            .as_deref()
+            .is_some_and(|n| conn.host.device_record_grants(n, filament_cap::capability::CAP_TRANSFER));
+    SiblingTransferFacts { is_sibling, record_grant }
+}
+
 /// Pure predicate behind `Link::fleet_proven`: a same-owner fleet device whose
 /// identity is Proven and whose local name came from that proven key. The RULE
 /// itself lives in `crate::host` (written once, shared with the peer loop);

@@ -113,6 +113,15 @@ pub(crate) fn implicit_init_disabled() -> bool {
 pub(crate) const NO_IDENTITY_MSG: &str =
     "no identity yet; run `tunlion init` or `tunlion join <invitation>`";
 
+/// `devices` on a device that paired by code and has no identity of its own.
+/// The way to make it one of someone's devices runs from THEIR owner device.
+pub(crate) fn paired_only_hint(me: &str) -> String {
+    let me = crate::refusal::word(me);
+    format!(
+        "this device is paired, not yet one of anyone's devices. If it is yours: on your owner device run `tunlion add {me}`, then `tunlion join <code>` here"
+    )
+}
+
 /// `up` on a device with no identity AND nothing paired: such a daemon serves
 /// no one, and `up --detach` used to exit 0 and run while `--help` says 9 is
 /// "no identity". A device with no identity that HAS code-paired devices is
@@ -805,23 +814,18 @@ pub(crate) fn join_transfer_code_msg(code: &str) -> String {
     )
 }
 
-/// The one accept prompt at a terminal. Invitation material may be pasted, so
-/// it is read on the alternate screen and cleared from the terminal after.
+/// The one accept prompt at a terminal: the same live entry as every other
+/// code prompt (dashes as you type, lowercase, bad characters refused, colour
+/// judgement), which also takes a pasted invitation or a file path. Invitation
+/// material is never drawn, so there is nothing to clear afterwards.
 fn prompt_accept_input() -> Result<Zeroizing<String>> {
-    use crossterm::{execute, terminal};
-    let mut err = std::io::stderr();
-    execute!(
-        err,
-        terminal::EnterAlternateScreen,
-        terminal::Clear(terminal::ClearType::All)
-    )?;
-    eprintln!(
-        "  Type the pairing code you were given, or paste the invitation, or give the path to\n  \
-         the invitation file. A pasted invitation is cleared from this terminal after reading."
-    );
-    let result = prompt_line("\n  code or invitation: ");
-    let _ = execute!(err, terminal::LeaveAlternateScreen);
-    Ok(Zeroizing::new(result?))
+    match crate::codeentry::run_accept("  join / code or invitation:  ")? {
+        crate::codeentry::Outcome::Submitted(s) | crate::codeentry::Outcome::Claim(s) => Ok(Zeroizing::new(s)),
+        crate::codeentry::Outcome::Empty | crate::codeentry::Outcome::Cancelled => Err(crate::cancelled()),
+        crate::codeentry::Outcome::Interrupted => {
+            crate::exit_codes::interrupted_exit(crate::exit_codes::INTERRUPTED)
+        }
+    }
 }
 
 /// `join` with nothing on the command line, at a terminal: ask once, then run
@@ -839,7 +843,7 @@ pub(crate) async fn join_guided(
         JoinInput::Code(code) => {
             ui::say(&ui::paint(
                 ui::Tone::Dim,
-                &format!("  that is a pairing code; accepting it as  tunlion join {code}"),
+                &format!("  same as  tunlion join {code}"),
             ));
             crate::pair_cmd::pair_cmd(server, Some(code), name, None, relay, false, Vec::new(), None, false)
                 .await
@@ -1201,6 +1205,10 @@ mod first_run_tests {
     #[test]
     fn the_no_identity_answer_names_two_commands_that_parse() {
         assert!(NO_IDENTITY_MSG.starts_with("no identity yet"));
+        // The paired-only hint never sends a paired device to `init`.
+        let hint = paired_only_hint("pop-os");
+        assert!(!hint.contains("init"), "{hint}");
+        assert!(hint.contains("tunlion add pop-os") && hint.contains("tunlion join <code>"), "{hint}");
         assert_eq!(assert_commands_parse(NO_IDENTITY_MSG), 2);
     }
 
