@@ -15,6 +15,15 @@
 # being tested on the box. Runners are disposable and already elevated; nothing
 # here changes privileges.
 #
+# The invitation must carry shell in its ceiling, like the Linux worker's
+# (TUNLION_CI_WORKER_INVITE, `transfer,shell`): the owner's `exec` to a joined
+# device whose ceiling lacks shell is refused on the owner before anything is
+# sent. Mint it on the owner device and set it from a file, never argv:
+#
+#   tunlion add --for device --name ci-worker-win --allow transfer,shell \
+#     --reuse 20 --expires 30d --out ci-worker-win.key -y --no-interactive
+#   gh secret set TUNLION_CI_WINDOWS_WORKER_INVITE -R Abdk4Moura/tunlion < ci-worker-win.key && rm ci-worker-win.key
+#
 # Start a lease by pushing a ci/windows-worker* branch (a new workflow cannot be
 # dispatched until it is on main) or, once merged, by dispatch. End it early by
 # creating %TUNLION_WORKER_ROOT%\STOP over exec.
@@ -127,16 +136,29 @@ jobs:
           # Output to files, not this step's pipes: an older tunlion's detached
           # daemon inherits a captured stdout and the step would never end.
           $out = Join-Path $root 'up.out'; $err = Join-Path $root 'up.err'
-          $p = Start-Process -FilePath tunlion.exe -NoNewWindow -Wait -PassThru `
+          # No -Wait: Start-Process -Wait waits for the process AND every
+          # descendant, and the detached daemon is a child of `up --detach`
+          # that lives for the whole lease, so the step never returned. Wait
+          # for the `up` process alone. Reading Handle right away keeps it
+          # open, so ExitCode is still readable after the process has gone.
+          $p = Start-Process -FilePath tunlion.exe -NoNewWindow -PassThru `
             -ArgumentList @('up', '--detach', '--userspace', '--dir', (Join-Path $root 'inbox'), '--shell-only', $env:HOST_NAME, '--i-know', '--no-interactive') `
             -RedirectStandardOutput $out -RedirectStandardError $err
+          $null = $p.Handle
+          if (-not $p.WaitForExit(180000)) { throw 'up --detach did not return within 180 s' }
           Get-Content $out, $err -ErrorAction SilentlyContinue
           if ($p.ExitCode -ne 0) { throw "up --detach exited $($p.ExitCode)" }
+          $up = $false
           for ($i = 0; $i -lt 30; $i++) {
             $null = & tunlion.exe status --json 2>$null
-            if ($LASTEXITCODE -eq 0) { break }
+            if ($LASTEXITCODE -eq 0) { $up = $true; break }
             Start-Sleep -Seconds 1
           }
+          if (-not $up) { throw 'the daemon did not answer status --json within 30 s' }
+          # The daemon is the detached child of the `up` process above.
+          Get-CimInstance Win32_Process -Filter "Name = 'tunlion.exe'" |
+            Select-Object ProcessId, ParentProcessId | Format-Table | Out-String | Write-Host
+          "up --detach pid: $($p.Id)" | Write-Host
           & tunlion.exe id 2>&1 | Select-Object -First 3
 
       - name: Hold the lease
