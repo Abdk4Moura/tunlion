@@ -15,6 +15,11 @@ release build failed and nothing was published under it.
 
 ### Added
 
+- Devices certified by your owner key now reach each other without pairing.
+  `tunlion reach <device>` works between two of your devices that were each
+  added to your mesh but never paired with each other, over the link their
+  background services form on their certificates. Shell, exec, forward and
+  mount between them follow the target device's grants, as before.
 - `tunlion promote` / `tunlion demote`: one ladder for what a device may do
   (cut off, paired, your device, your device + shell; for someone else's
   device: files, files + your shared folder, + shell). One step at a time or
@@ -24,6 +29,10 @@ release build failed and nothing was published under it.
 
 ### Changed
 
+- A file sent between two of your devices that were never paired with each
+  other now needs a `transfer` grant on the receiving device
+  (`tunlion grant <sender> transfer` there). 0.9.1 accepted such files into the
+  inbox without one. Paired devices, and your owner device, are unchanged.
 - Removed `revoke --certificate`, `devices revoke` and `devices restore`:
   `tunlion demote <device> --to cut` and `tunlion promote <device>` replace
   them. `grant` / `revoke <device> <capability>` stay for single capabilities.
@@ -31,6 +40,15 @@ release build failed and nothing was published under it.
   for anyone else it names the code pairing their person has to accept. A
   daemon now ignores an introduction from a device that is not its own
   owner's.
+
+### Security
+
+- Revoking a device on your owner device now cuts it off from your other
+  devices too. Previously only the owner refused it; your other devices kept
+  their links to it and still exchanged files with it. Each device now follows
+  the owner's signed device list and closes the link within seconds of
+  receiving it, and a device whose certificate has expired loses its links the
+  same way.
 
 ## [0.9.1] - 2026-10-26
 

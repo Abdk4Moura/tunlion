@@ -8,66 +8,79 @@ a trace we happened to hit.
 WHAT IS MODELLED
 ----------------
 A fleet of N devices under one owner key. Device 0 is the owner (holds the
-UserKey, always enrolled, never revoked, always online).
+UserKey, always enrolled, never revoked, always online). Every joined device is
+PAIRED with the owner (enrolment pairs them); joined devices are never paired
+with each other. That sibling relation is the one auto-mesh adds.
 
 Per device:
   enrolled   holds a DeviceCert chaining to the owner key
   revoked    global truth: the owner has revoked it
-  rv         which fleet_rv generation it HOLDS            (-1 = none)
-  sub        which fleet channel it is SUBSCRIBED to       (-1 = none)
+  sub        subscribed to the fleet channel (it holds fleet_rv)
   online     reachable right now
-  known      peers it has admitted (its live mesh view)
-  rev_known  peers it LOCALLY knows are revoked
+  ros        which owner roster generation it HOLDS (-1 = none yet)
+  known      peers it has admitted as SIBLINGS (its live mesh view)
 
-Global: `epoch`, the current fleet_rv generation.
+Global: `rosters`, the owner-signed roster generations minted so far. The owner
+mints a new generation on every membership change (an enrolment or a
+revocation); each generation lists the enrolled, non-revoked devices.
 
 STATE <-> CODE MAPPING
 ----------------------
-  enroll             identity-auth-key-enroll-ack carrying fleet_rv  (main.rs:6034)
-  subscribe          sess.emit("subscribe", channel_of(fleet_rv))    (main.rs:15915)
-  discover           known-peer push + subscribe-ACK roster          (signaling.py:546)
-  admit gate         verify_chain + local revocation record          (filament-id:220)
-  revoke             owner revokes; epoch bumps, fleet_rv rotates    (caps.json epoch)
-  propagate_revoke   revocation reaches a peer over its PAIRWISE channel
-  rotate             new fleet_rv delivered over the PAIRWISE channel
+  enroll          identity-auth-key-enroll-ack carrying fleet_rv   (recv/enrollment.rs)
+  subscribe       the daemon subscribes channel_of(fleet_rv)        (recv/dispatch.rs)
+  mint            owner roster on a membership change               (recv/roster.rs mint_roster)
+  push_roster     roster pushed over the owner<->device PAIR link,  (conn.rs roster_maintenance)
+                  accepted (monotonic), then the revocation sweep
+                  closes every sibling link the new roster drops     (dispatch.rs roster arm +
+                                                                     revocation::sibling_link_must_close)
+  discover        fleet-hello verified: cert chains to the owner
+                  key (verify_hello), not revoked, AND listed in the
+                  roster held (DeviceStore::sibling_admissible)
+  revoke          `demote --to cut` on the owner
 
-The `discover` action deliberately collapses the async known-peer push and the
-synchronous subscribe-ACK roster into one action: both have the identical,
-idempotent effect (a admits b), so no interleaving of the two can differ. That
-is the same reason net.rs handles them on one code path.
+The owner's own admissions are decided by its local records (it is paired with
+every device), so the roster rule applies to joined devices only, exactly as
+`sibling_admissible` returns true on the owner.
+
+The fleet_rv is never rotated. An earlier version of this model proved a design
+that rotated it on revocation; the implementation never did, and rotation only
+ever concerned VIEW (a revoked device watching presence), never admission. This
+model checks what the code does.
 
 WHAT IS PROVEN
 --------------
-Safety, checked in every reachable state:
+Safety, in every reachable state:
   S1  no admission without a cert: b in known[a] implies enrolled[b]
-  S2  no retention of a locally-known revoked peer: b in known[a] implies
-      b not in rev_known[a]
-  S3  a device holds a fleet_rv only if it is enrolled
+  S2  roster-bound: for a joined device a, b in known[a] implies a holds a
+      roster and that roster lists b. With S5 this is the revocation rule: once
+      a holds any roster minted after b's revocation, b is not in known[a].
+  S3  fail closed: a joined device holding no roster has admitted no one
   S4  the owner never admits a device it has revoked
 
-Tier 2 adds an INTRUDER: a device with no owner-signed cert that parks on every
-fleet channel id it could possibly learn. Without it, S1 is VACUOUS, because
-only an enrolled device can ever subscribe, so nothing uncertified is ever on a
-channel to be wrongly admitted. Removing the cert check from `discover` was
-caught by no tier until this one existed. That is the whole reason it is here:
-the check must be able to fail before a pass means anything.
+Tier 2 adds an INTRUDER: a device with no owner-signed cert parked on the fleet
+channel. Without it S1 is vacuous (only enrolled devices ever subscribe).
 
 Liveness, by backward reachability from the goal: EVERY reachable state can
-still reach full convergence, where every live (enrolled, non-revoked) device
-  - mutually knows every other live device,
-  - holds and is subscribed to the CURRENT epoch's channel,
-  - has learned every revocation and dropped those peers.
-This is the strong form: not "the goal is reachable from the start" but "no
-reachable state is a trap", which is what catches a protocol that can wedge.
+still reach full convergence, where every live (enrolled, non-revoked) device is
+online, holds the newest roster, mutually knows every other live device, and
+knows no revoked one. "No reachable state is a trap."
+
+MUTATION CONTROLS
+-----------------
+A checker that cannot fail proves nothing, so `main` also runs each mutant below
+and REQUIRES it to fail:
+  no-cert      discover skips the certificate check     -> S1 (intruder tier)
+  no-roster    discover skips the roster listing         -> S2
+  no-sweep     a new roster is stored but links are kept  -> S2
+  open-no-ros  a device with no roster admits anyone     -> S3
 
 THE RESIDUAL THIS MAKES EXPLICIT
 --------------------------------
-S2 is conditioned on rev_known, not on the global revoked flag, because a real
-device gates admission on its LOCAL record. So between `revoke` and
-`propagate_revoke` reaching a peer, that peer will still admit the revoked
-device. The model asserts that window closes (liveness) but does not pretend it
-does not exist. That window is revocation-propagation latency, which tunlion
-already has; the fleet channel neither widens nor narrows it.
+Between `revoke` and `push_roster` reaching a device, that device still holds
+the revoked sibling. That is propagation latency (one roster push, every 5 s on
+a live owner link), and the model proves it closes; it does not pretend the
+window is zero. A device the owner cannot reach keeps its stale roster until it
+can, which is the same boundary every pushed revocation has.
 """
 
 import sys
@@ -76,176 +89,156 @@ from itertools import product
 OWNER = 0
 
 
-class Dev:
-    __slots__ = ("enrolled", "revoked", "rv", "sub", "online", "known", "rev_known")
-
-    def __init__(self, enrolled, revoked, rv, sub, online, known, rev_known):
-        self.enrolled, self.revoked = enrolled, revoked
-        self.rv, self.sub, self.online = rv, sub, online
-        self.known, self.rev_known = known, rev_known
-
-
-def pack(devs, epoch):
-    return (epoch, tuple((d.enrolled, d.revoked, d.rv, d.sub, d.online,
-                          d.known, d.rev_known) for d in devs))
+def pack(devs, rosters):
+    return (rosters, tuple(devs))
 
 
 def unpack(state):
-    epoch, ds = state
-    return [Dev(*d) for d in ds], epoch
+    rosters, devs = state
+    return [list(d) for d in devs], rosters
+
+
+# device tuple: (enrolled, revoked, sub, online, ros, known)
+E, R, SUB, ON, ROS, K = range(6)
+
+
+def live_set(devs, n):
+    return frozenset(i for i in range(n) if devs[i][E] and not devs[i][R])
 
 
 def initial(n, with_intruder=False):
-    devs = []
-    for i in range(n):
-        if i == OWNER:
-            devs.append(Dev(True, False, 0, -1, True, frozenset(), frozenset()))
-        else:
-            devs.append(Dev(False, False, -1, -1, True, frozenset(), frozenset()))
+    devs = [[True, False, False, True, -1, frozenset()]]
+    for _ in range(1, n):
+        devs.append([False, False, False, True, -1, frozenset()])
     if with_intruder:
-        # INTRUDER (index n): knows the fleet channel id but holds NO cert from
-        # the owner key. Models the worst case for the "the channel is only a
-        # meeting point" claim: channel-id leakage via a stale fleet_rv, a
-        # compromised backup, or a signaling-server observer.
-        devs.append(Dev(False, False, -1, -1, True, frozenset(), frozenset()))
-    return pack(devs, 0)
+        devs.append([False, False, True, True, -1, frozenset()])
+    # Generation 0: the owner alone.
+    return pack([tuple(d) for d in devs], (frozenset({OWNER}),))
 
 
-def successors(state, n, max_epoch, allow_offline, total=None):
-    """Every enabled action. Returns a list of (label, next_state)."""
-    devs, epoch = unpack(state)
-    total = total if total is not None else n
+def successors(state, n, max_rev, allow_offline, total, mutant=None):
+    devs, rosters = unpack(state)
     out = []
 
-    def emit(label):
-        out.append((label, pack(devs, epoch)))
+    def emit(label, d2, r2):
+        out.append((label, pack([tuple(x) for x in d2], r2)))
 
-    # The intruder can park on ANY epoch's channel at will: assume total leakage
-    # of every channel id, so the cert gate is the only thing left standing.
-    for i in range(n, total):
+    def copy():
+        return [list(x) for x in devs]
+
+    revoked_count = sum(1 for i in range(n) if devs[i][R])
+
+    if devs[OWNER][ON] and not devs[OWNER][SUB]:
+        d2 = copy()
+        d2[OWNER][SUB] = True
+        emit("subscribe(0)", d2, rosters)
+
+    for i in range(1, n):
         d = devs[i]
-        for e in range(max_epoch + 1):
-            if d.sub != e:
-                old = d.sub
-                d.sub = e
-                emit(f"squat({i},{e})")
-                d.sub = old
+        # enroll: owner certifies i (pair link + fleet_rv) and mints a roster.
+        if not d[E] and d[ON]:
+            d2 = copy()
+            d2[i][E] = True
+            emit(f"enroll({i})", d2, rosters + (live_set(d2, n),))
+        # subscribe to the fleet channel.
+        if d[E] and d[ON] and not d[SUB]:
+            d2 = copy()
+            d2[i][SUB] = True
+            emit(f"subscribe({i})", d2, rosters)
+        # push_roster over the pair link with the owner; then the sweep.
+        latest = len(rosters) - 1
+        if d[E] and not d[R] and d[ON] and d[ROS] < latest:
+            d2 = copy()
+            d2[i][ROS] = latest
+            if mutant != "no-sweep":
+                d2[i][K] = frozenset(b for b in d[K] if b in rosters[latest])
+            emit(f"push_roster({i})", d2, rosters)
+        # revoke on the owner: owner drops it, new roster generation.
+        if d[E] and not d[R] and revoked_count < max_rev:
+            d2 = copy()
+            d2[i][R] = True
+            d2[OWNER][K] = d2[OWNER][K] - {i}
+            emit(f"revoke({i})", d2, rosters + (live_set(d2, n),))
+        if allow_offline:
+            d2 = copy()
+            d2[i][ON] = not d[ON]
+            emit(f"{'offline' if d[ON] else 'online'}({i})", d2, rosters)
 
-    for i in range(n):
-        d = devs[i]
-
-        # enroll: the owner certifies i and hands it the current fleet_rv.
-        if not d.enrolled and d.online and devs[OWNER].online:
-            d.enrolled, d.rv = True, epoch
-            emit(f"enroll({i})")
-            d.enrolled, d.rv = False, -1
-
-        # subscribe: join the channel for the fleet_rv this device holds.
-        if d.enrolled and d.online and d.sub != d.rv:
-            old = d.sub
-            d.sub = d.rv
-            emit(f"subscribe({i})")
-            d.sub = old
-
-        # rotate: current fleet_rv delivered over i's pairwise channel.
-        if d.enrolled and not d.revoked and d.online and devs[OWNER].online and d.rv != epoch:
-            old = d.rv
-            d.rv = epoch
-            emit(f"rotate({i})")
-            d.rv = old
-
-        # revoke: owner revokes i, which bumps the epoch and rotates fleet_rv.
-        if i != OWNER and d.enrolled and not d.revoked and epoch < max_epoch:
-            o = devs[OWNER]
-            sav = (d.revoked, epoch, o.rv, o.known, o.rev_known)
-            d.revoked = True
-            epoch += 1
-            o.rv = epoch
-            o.known = o.known - {i}
-            o.rev_known = o.rev_known | {i}
-            emit(f"revoke({i})")
-            d.revoked, epoch, o.rv, o.known, o.rev_known = sav
-
-        # propagate_revoke: i learns of a revocation over its pairwise channel
-        # and drops that peer.
-        if d.enrolled and not d.revoked and d.online and devs[OWNER].online:
-            for r in devs[OWNER].rev_known - d.rev_known:
-                sav = (d.rev_known, d.known)
-                d.rev_known = d.rev_known | {r}
-                d.known = d.known - {r}
-                emit(f"propagate_revoke({i},{r})")
-                d.rev_known, d.known = sav
-
-        # offline / online churn (degraded tier only; the owner stays up).
-        if allow_offline and i != OWNER:
-            d.online = not d.online
-            emit(f"{'offline' if d.online is False else 'online'}({i})")
-            d.online = not d.online
-
-    # discover: a admits b. Requires a shared live meeting point AND a valid
-    # owner-signed cert AND no local revocation record. Presence alone is not
-    # sufficient, which is the property that keeps the channel a rendezvous.
+    # discover: a admits b over the fleet channel (fleet-hello verified).
     for a, b in product(range(total), repeat=2):
         if a == b:
             continue
         da, db = devs[a], devs[b]
-        if not (da.online and db.online):
+        if not (da[ON] and db[ON] and da[SUB] and db[SUB]):
             continue
-        if da.sub == -1 or da.sub != db.sub:
-            continue          # not on the same fleet channel
-        if not db.enrolled:
-            continue          # no cert chaining to the owner key
-        if b in da.rev_known:
-            continue          # locally revoked
-        if b in da.known:
-            continue          # idempotent
-        old = da.known
-        da.known = da.known | {b}
-        emit(f"discover({a},{b})")
-        da.known = old
-
+        if b in da[K]:
+            continue
+        if mutant != "no-cert" and not db[E]:
+            continue                      # no cert chaining to the owner key
+        if a >= n:
+            continue                      # the intruder's own view is irrelevant
+        if a == OWNER:
+            if db[R] or (mutant != "no-cert" and not db[E]):
+                continue                  # owner: its local records decide
+        else:
+            if da[R] or not da[E]:
+                continue                  # a revoked device's view is not modelled
+            if da[ROS] == -1:
+                if mutant != "open-no-ros":
+                    continue              # fail closed: no roster, no sibling
+            elif mutant != "no-roster" and b not in rosters[da[ROS]]:
+                continue                  # the owner's roster must list b
+        d2 = copy()
+        d2[a][K] = da[K] | {b}
+        emit(f"discover({a},{b})", d2, rosters)
     return out
 
 
-def check_safety(state, n, total=None):
-    devs, epoch = unpack(state)
-    total = total if total is not None else n
-    for i in range(total):
-        d = devs[i]
-        for b in d.known:
-            if not devs[b].enrolled:
-                return f"S1 violated: {i} admitted uncertified {b}"
-            if b in d.rev_known:
-                return f"S2 violated: {i} retains locally-revoked {b}"
-        if d.rv != -1 and not d.enrolled:
-            return f"S3 violated: unenrolled {i} holds fleet_rv"
-        if i == OWNER:
-            for b in d.known:
-                if devs[b].revoked:
+def check_safety(state, n, total):
+    devs, rosters = unpack(state)
+    for a in range(n):
+        d = devs[a]
+        for b in d[K]:
+            if not devs[b][E]:
+                return f"S1 violated: {a} admitted uncertified {b}"
+        if a == OWNER:
+            for b in d[K]:
+                if devs[b][R]:
                     return f"S4 violated: owner admitted revoked {b}"
+            continue
+        if d[R]:
+            continue
+        if d[ROS] == -1 and d[K]:
+            return f"S3 violated: {a} admitted {set(d[K])} holding no roster"
+        if d[ROS] != -1:
+            for b in d[K]:
+                if b not in rosters[d[ROS]]:
+                    return f"S2 violated: {a} keeps {b}, which its roster no longer lists"
     return None
 
 
 def is_goal(state, n):
-    devs, epoch = unpack(state)
-    devs = devs[:n]          # the intruder is never part of convergence
-    live = [i for i in range(n) if devs[i].enrolled and not devs[i].revoked]
-    if len(live) + sum(1 for d in devs if d.revoked) != n:
-        return False                      # every device enrolled or revoked
+    devs, rosters = unpack(state)
+    latest = len(rosters) - 1
+    if any(not devs[i][E] for i in range(n)):
+        return False                      # every device has been enrolled
+    live = [i for i in range(n) if devs[i][E] and not devs[i][R]]
     for i in live:
         d = devs[i]
-        if not d.online or d.rv != epoch or d.sub != epoch:
+        if not d[ON] or not d[SUB]:
+            return False
+        if i != OWNER and d[ROS] != latest:
             return False
         for j in live:
-            if i != j and j not in d.known:
-                return False              # full mutual mesh among live devices
-        for r in range(n):
-            if devs[r].revoked and (r not in d.rev_known or r in d.known):
-                return False              # revocations learned and applied
+            if i != j and j not in d[K]:
+                return False
+        for j in d[K]:
+            if devs[j][R]:
+                return False
     return True
 
 
-def explore(n, max_epoch, allow_offline, with_intruder=False, cap=4_000_000):
+def explore(n, max_rev, allow_offline, with_intruder=False, mutant=None, cap=4_000_000):
     total = n + (1 if with_intruder else 0)
     start = initial(n, with_intruder)
     seen = {start}
@@ -256,7 +249,7 @@ def explore(n, max_epoch, allow_offline, with_intruder=False, cap=4_000_000):
         v = check_safety(s, n, total)
         if v:
             return None, None, f"{v}\n  in state {s}"
-        succ = successors(s, n, max_epoch, allow_offline, total)
+        succ = successors(s, n, max_rev, allow_offline, total, mutant)
         edges[s] = [t for _, t in succ]
         for _, t in succ:
             if t not in seen:
@@ -268,14 +261,11 @@ def explore(n, max_epoch, allow_offline, with_intruder=False, cap=4_000_000):
 
 
 def backward_can_reach_goal(seen, edges, n):
-    """States from which the goal is still reachable (least fixpoint)."""
     rev = {s: [] for s in seen}
     for s, ts in edges.items():
         for t in ts:
             rev[t].append(s)
     good = {s for s in seen if is_goal(s, n)}
-    if not good:
-        return good
     work = list(good)
     while work:
         s = work.pop()
@@ -286,22 +276,22 @@ def backward_can_reach_goal(seen, edges, n):
     return good
 
 
-def run(label, n, max_epoch, allow_offline, with_intruder=False):
-    seen, edges, err = explore(n, max_epoch, allow_offline, with_intruder)
+def run(label, n, max_rev, allow_offline, with_intruder=False, mutant=None, quiet=False):
+    seen, edges, err = explore(n, max_rev, allow_offline, with_intruder, mutant)
     if err:
-        print(f"  {label:<28} FAILED: {err}")
-        return False
+        if not quiet:
+            print(f"  {label:<30} FAILED: {err}")
+        return False, err
     good = backward_can_reach_goal(seen, edges, n)
     traps = seen - good
-    if not good:
-        print(f"  {label:<28} FAILED: goal unreachable in {len(seen)} states")
-        return False
-    if traps:
-        t = next(iter(traps))
-        print(f"  {label:<28} FAILED: {len(traps)} trap state(s), e.g. {t}")
-        return False
-    print(f"  {label:<28} PROVEN  ({len(seen)} states, 0 unsafe, 0 traps)")
-    return True
+    if not good or traps:
+        msg = "goal unreachable" if not good else f"{len(traps)} trap state(s)"
+        if not quiet:
+            print(f"  {label:<30} FAILED: {msg}")
+        return False, msg
+    if not quiet:
+        print(f"  {label:<30} PROVEN  ({len(seen)} states, 0 unsafe, 0 traps)")
+    return True, None
 
 
 def main():
@@ -311,28 +301,35 @@ def main():
 
     if only in (None, "0"):
         print("\nTier 0 GoodNet: all devices online, no revocation.")
-        print("  proves: convergence to a full mesh for EVERY enrollment /")
-        print("  subscribe / discover interleaving, and no admission without a cert.")
         for n in (2, 3, 4):
-            ok &= run(f"GoodNet N={n}", n, max_epoch=0, allow_offline=False)
+            ok &= run(f"GoodNet N={n}", n, 0, False)[0]
 
     if only in (None, "2"):
-        print("\nTier 2 Intruder: an uncertified device parks on every fleet")
-        print("  channel it can learn. proves: presence authorizes NOTHING, and")
-        print("  the fleet still converges with a squatter sitting on the channel.")
+        print("\nTier 2 Intruder: an uncertified device parks on the fleet channel.")
         for n in (2, 3):
-            ok &= run(f"Intruder N={n}", n, max_epoch=0,
-                      allow_offline=False, with_intruder=True)
-        ok &= run("Intruder N=2 K=1", 2, max_epoch=1,
-                  allow_offline=True, with_intruder=True)
+            ok &= run(f"Intruder N={n}", n, 0, False, with_intruder=True)[0]
+        ok &= run("Intruder N=3 K=1 churn", 3, 1, True, with_intruder=True)[0]
 
     if only in (None, "1"):
-        print("\nTier 1 Degraded: GoodNet plus revocation (epoch rotation),")
-        print("  revocation propagation lag, and offline/online churn.")
-        print("  proves: no reachable state is a trap, rotation never partitions")
-        print("  the fleet permanently, and a learned revocation is never undone.")
-        for n in (2, 3):
-            ok &= run(f"Degraded N={n} K=1", n, max_epoch=1, allow_offline=True)
+        print("\nTier 1 Degraded: revocation on the owner, roster-push lag,")
+        print("  offline/online churn.")
+        ok &= run("Degraded N=2 K=1", 2, 1, True)[0]
+        ok &= run("Degraded N=3 K=1", 3, 1, True)[0]
+        ok &= run("Degraded N=3 K=2", 3, 2, True)[0]
+
+    if only in (None, "m"):
+        print("\nMutation controls: each mutant MUST fail, or the tier proves nothing.")
+        cases = [
+            ("no-cert", dict(n=2, max_rev=0, allow_offline=False, with_intruder=True), "S1"),
+            ("no-roster", dict(n=3, max_rev=1, allow_offline=True), "S2"),
+            ("no-sweep", dict(n=3, max_rev=1, allow_offline=True), "S2"),
+            ("open-no-ros", dict(n=3, max_rev=0, allow_offline=False), "S3"),
+        ]
+        for mutant, kw, expect in cases:
+            passed, err = run(f"mutant {mutant}", mutant=mutant, quiet=True, **kw)
+            caught = (not passed) and err is not None and expect in err
+            print(f"  mutant {mutant:<22} {'CAUGHT' if caught else 'NOT CAUGHT'} (expects {expect})")
+            ok &= caught
 
     print("\n" + ("ALL PROVEN" if ok else "FAILURES ABOVE"))
     return 0 if ok else 1

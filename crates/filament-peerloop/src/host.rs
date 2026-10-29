@@ -579,6 +579,14 @@ pub trait HostServices: Send + Sync + 'static {
     fn device_allows(&self, _name: &str, _capability: &str) -> bool {
         false
     }
+    /// Does this device's store record LITERALLY list `capability` for `name`?
+    /// Unlike `device_allows`, no baseline is implied (`device_allows` answers
+    /// "transfer" with yes for every record). Used where a record grant is the
+    /// only thing that may authorize, such as a fleet sibling's transfer. An
+    /// inert host grants nothing.
+    fn device_record_grants(&self, _name: &str, _capability: &str) -> bool {
+        false
+    }
     /// Is this device key present in the host's device store at all? Used by
     /// the settle-then-evaluate park: a key with no record can never become
     /// Proven and must not occupy hold budget.

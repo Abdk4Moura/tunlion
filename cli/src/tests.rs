@@ -1070,6 +1070,14 @@ fn device_names_resolve_forgivingly_against_the_real_store() {
         }
         _ => unreachable!(),
     }
+    // This device's own name takes the rule too (`init --name`, `set name`).
+    match canonicalize_cmd(Cmd::Init {
+        name: Some("Box B".into()), inbox: None, recovery_file: None, recovery_fd: None,
+        background: false, no_background: false,
+    }).unwrap() {
+        Cmd::Init { name, .. } => assert_eq!(name.as_deref(), Some("box-b")),
+        _ => unreachable!(),
+    }
     unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2666,6 +2674,44 @@ fn printed_hints_parse_as_typed() {
         "printed hints that clap rejects when typed as shown:\n{}",
         bad.join("\n")
     );
+}
+
+#[test]
+fn product_text_has_no_em_dash() {
+    // House style for everything a user reads: no em dash. The installers are
+    // checked by packaging/check-package-shape.py; this covers the CLI's own
+    // strings. An em dash counts when it is code, not comment: the line is not
+    // a comment line and no `//` outside a string literal comes before it.
+    // Test modules are blanked by `product_sources`, so assertion messages
+    // that quote old output are not product text.
+    let mut bad = Vec::new();
+    for (rel, text) in product_sources() {
+        for (n, line) in text.lines().enumerate() {
+            let Some(at) = line.find('\u{2014}') else { continue };
+            let t = line.trim_start();
+            if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+                continue;
+            }
+            let before = &line[..at];
+            let mut in_str = false;
+            let mut prev = '\0';
+            let mut commented = false;
+            for (i, c) in before.char_indices() {
+                if c == '"' && prev != '\\' {
+                    in_str = !in_str;
+                }
+                if !in_str && before[i..].starts_with("//") {
+                    commented = true;
+                    break;
+                }
+                prev = c;
+            }
+            if !commented {
+                bad.push(format!("  {rel}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "em dash in user-facing CLI text:\n{}", bad.join("\n"));
 }
 
 #[test]
@@ -5617,4 +5663,28 @@ fn browser_pake_scope_matches_the_cli_code_flows() {
         crate::pake::BROWSER_SCOPE,
         identity::IntroScope::Device.to_byte()
     );
+}
+
+/// On Windows `tunlion update` renames the running `tunlion.exe` to
+/// `tunlion.old`, so the old daemon's image path ends in `.old` while its
+/// recorded executable is still `tunlion.exe`. `status` and `down` read that
+/// daemon as "not running" and the restart `update` advises could not stop it.
+#[test]
+fn a_daemon_running_from_the_update_renamed_old_binary_is_still_this_install() {
+    let dir = std::env::temp_dir().join(format!("tunlion-same-exe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("tunlion.exe");
+    let old = dir.join("tunlion.old");
+    let other = dir.join("other.old");
+    for p in [&exe, &old, &other] {
+        std::fs::write(p, b"x").unwrap();
+    }
+    assert!(same_executable(&old, &exe), "the renamed old binary is this install");
+    assert!(same_executable(&exe, &old));
+    assert!(!same_executable(&other, &exe), "only the same name with .old matches");
+    assert!(
+        !same_executable(&std::env::temp_dir().join("tunlion.old"), &exe),
+        "a .old elsewhere is not this install"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

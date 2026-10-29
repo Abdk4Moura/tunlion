@@ -1001,11 +1001,17 @@ pub(crate) async fn async_main() -> Result<()> {
                         // not routable.
                         ui::say(&crate::ui::paint(crate::ui::Tone::Warn, &note));
                     }
+                    for note in crate::l3_state::native_notes(&l3_status) {
+                        ui::say(&crate::ui::paint(crate::ui::Tone::Warn, &note));
+                    }
                 } else {
                     crate::outln!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
                     crate::outln!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
                     crate::outln!("  mesh:     {mesh_name}.mesh");
                     if let Some(note) = crate::l3_state::not_ready_note(&l3_status) {
+                        ui::say(&format!("  {}", ui::paint(ui::Tone::Warn, &note)));
+                    }
+                    for note in crate::l3_state::native_notes(&l3_status) {
                         ui::say(&format!("  {}", ui::paint(ui::Tone::Warn, &note)));
                     }
                     if let Some(p) = crate::proxy_state::current() {
@@ -1929,30 +1935,18 @@ pub(crate) async fn async_main() -> Result<()> {
                 ),
                 Some(d) => {
                     require_known_device(&d)?;
-                    // A mesh sibling is a known NAME (via the owner's roster) but
-                    // carries no channel, so there is nothing to probe. Say so
-                    // honestly instead of reporting "may be offline" (#240/#241
-                    // shape) about a device this side has never contacted.
-                    let roster_only = crate::roster::roster_device_names().iter().any(|n| n == &d)
-                        && !devices_load().iter().any(|(n, _)| n == &d);
-                    if roster_only {
-                        // Human narration goes through ui::, not println!: this is
-                        // stderr for a person, and println! would put it on stdout
-                        // where a script parsing `reach` output would collect it.
-                        ui::say(&format!(
-                            "{} {}",
-                            ui::paint(ui::Tone::Dim, "tunlion reach →"),
-                            ui::paint(ui::Tone::Brand, &d)
-                        ));
-                        ui::say(&format!(
-                            "  {} {}",
-                            ui::paint(ui::Tone::Brand, ui::glyph_mesh()),
-                            ui::paint(
-                                ui::Tone::Dim,
-                                "in your mesh via the owner's roster; sibling connections are not in this release"
-                            )
-                        ));
-                        return Ok(());
+                    // A mesh sibling (certified by the same owner key, never
+                    // paired here) has no pair channel to dial: its link is the
+                    // one the daemon formed on the fleet channel, admitted on
+                    // its certificate. So reach asks the daemon about THAT link
+                    // instead of attempting a cold dial that cannot work.
+                    let sibling = !devices_load().iter().any(|(n, _)| n == &d)
+                        && (crate::fleet_indexed_name(&d)
+                            || crate::roster::roster_device_names().iter().any(|n| n == &d));
+                    if sibling && !until_direct {
+                        // `--until-direct` already watches the daemon's link,
+                        // which is the sibling's link, so it needs no branch.
+                        return crate::ping::reach_sibling(&d, json, timeout).await;
                     }
                     if until_direct {
                         crate::ping::reach_until_direct(&d, timeout.unwrap_or(30), json, relay).await

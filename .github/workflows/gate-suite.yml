@@ -290,8 +290,9 @@ jobs:
             [cli/tests/scripting-contract-gates.sh]=11
             [cli/tests/net-blockers-gates.sh]=14
             [cli/tests/daemon-path-gates.sh]=7
-            # 7: R1 R2 K F1 P F2 X (fix/state-ux-blockers).
-            [cli/tests/state-ux-gates.sh]=7
+            # 8: R1 R2 K F1 Q P F2 X (fix/state-ux-blockers, plus Q from
+            # the enrollment UX change: no trace lines at default verbosity).
+            [cli/tests/state-ux-gates.sh]=8
             # 6: U N A M R S (fix/rc-polish, the RC lab verification).
             [cli/tests/rc-polish-gates.sh]=6
             # 7: C1 C2 C3 C4 C5 H J (fix/concurrent-code-sends, the RC lab pass).

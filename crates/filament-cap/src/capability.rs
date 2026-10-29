@@ -937,6 +937,72 @@ pub fn fleet_auto_trust(
     same_owner && binding == BindingStrength::Proven && scoped_in_bounds && cert_not_revoked
 }
 
+/// The transfer scope a fleet SIBLING may use (fleet auto-mesh, 0.9.2 scope).
+///
+/// A sibling is a `FleetDevice` principal: a device admitted on its own
+/// owner-signed certificate over the fleet channel, never paired with this
+/// machine. Auto-mesh gives it REACHABILITY; it does not give it the inbox.
+/// The transfer scoped default ("drop a file in the receiving directory with no
+/// grant") stays with devices this machine actually paired with, and a sibling
+/// lands a file only when an explicit grant for `transfer` exists. So for a
+/// sibling the scope is in force only together with that grant; for every other
+/// principal it is returned unchanged.
+///
+/// Purely restrictive: the result is never true unless `scoped_in_bounds` is,
+/// so this cannot widen any gate it is applied to.
+pub fn sibling_transfer_scope(
+    is_fleet_sibling: bool,
+    scoped_in_bounds: bool,
+    has_explicit_grant: bool,
+) -> bool {
+    if is_fleet_sibling {
+        scoped_in_bounds && has_explicit_grant
+    } else {
+        scoped_in_bounds
+    }
+}
+
+#[cfg(test)]
+mod sibling_transfer_scope_laws {
+    use super::*;
+
+    #[test]
+    fn a_sibling_needs_an_explicit_grant_and_the_rule_never_widens() {
+        // Sibling without a grant: no scoped default, in or out of bounds.
+        assert!(!sibling_transfer_scope(true, true, false));
+        assert!(!sibling_transfer_scope(true, false, false));
+        // Sibling with a grant: only inside the receiving directory.
+        assert!(sibling_transfer_scope(true, true, true));
+        assert!(!sibling_transfer_scope(true, false, true));
+        // Everyone else: unchanged, whatever the grant says.
+        for g in [false, true] {
+            assert!(sibling_transfer_scope(false, true, g));
+            assert!(!sibling_transfer_scope(false, false, g));
+        }
+        // Never widens: exhaustive over the three inputs.
+        for a in [false, true] {
+            for b in [false, true] {
+                for c in [false, true] {
+                    assert!(!sibling_transfer_scope(a, b, c) || b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_ungranted_sibling_gets_no_fleet_auto_trust_for_transfer() {
+        // Composed with the auto-trust rule the gate uses: the sibling's
+        // in-bounds drop no longer auto-authorizes without a grant.
+        let scope = sibling_transfer_scope(true, true, false);
+        assert!(!fleet_auto_trust(true, BindingStrength::Proven, scope, true));
+        let scope = sibling_transfer_scope(true, true, true);
+        assert!(fleet_auto_trust(true, BindingStrength::Proven, scope, true));
+        // A revoked or unproven sibling stays out even with a grant.
+        assert!(!fleet_auto_trust(true, BindingStrength::Proven, scope, false));
+        assert!(!fleet_auto_trust(true, BindingStrength::Inferred, scope, true));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tag store objects  (owner-signed, verified at resolution time)
 // ---------------------------------------------------------------------------

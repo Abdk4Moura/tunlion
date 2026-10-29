@@ -1599,7 +1599,8 @@ async fn recv_run(
                     };
                     match host.l3_start(&cidr, 1280, identity, mode) {
                         Ok(m) => {
-                            l3_status = L3Status::ready(l3_mode_word(m.is_userspace()));
+                            l3_status = L3Status::ready(l3_mode_word(m.is_userspace()))
+                                .with_v4_problem(m.native_v4_problem());
                             if let Ok(text) = serde_json::to_string(&l3_status) {
                                 host.l3_state_report(&text);
                             }
@@ -1914,6 +1915,13 @@ async fn recv_run(
     // answer is to wait for the identity to settle, not to widen the gate:
     // whether the peer is authorized is exactly what is still being computed.
     let mut fleet_deferred_offers: Vec<(String, serde_json::Value, Instant)> = Vec::new();
+    // Fleet auto-mesh: hellos from siblings whose certificate verified but whom
+    // the owner's signed roster we hold does not list (yet). Held, not
+    // admitted and not dropped: the roster usually arrives first, but when a
+    // sibling's hello wins that race the link must not be lost for good. Each
+    // accepted roster replays these through the same verification.
+    let mut fleet_unlisted_hellos: std::collections::HashMap<String, serde_json::Value> =
+        Default::default();
     // Brokered meeting places we have joined: channel -> its one-time secret.
     // Kept so a peer arriving on one is proved by that secret, exactly as a
     // paired peer is proved by a pair secret.
@@ -2381,7 +2389,26 @@ async fn recv_run(
                             // meet a known device on a shared secret. Its
                             // authenticity is inherited from the link it travelled
                             // over, which was verified by certificate.
-                            match crate::conn::warm_link_for(&conn, &name) {
+                            //
+                            // It must be the sibling's DAEMON link: only a link
+                            // that completed fleet-hello here accepts a
+                            // `fleet-rendezvous` at the far end. A one-shot of
+                            // that sibling, still lingering on a meeting place it
+                            // was brokered earlier, carries the same proven name,
+                            // and picking it handed the secret to a process that
+                            // never joins, so the send timed out as unreachable.
+                            let broker_link = crate::conn::warm_link_for(&conn, &name)
+                                .filter(|(pid, _)| fleet_verified.contains(pid))
+                                .or_else(|| {
+                                    conn.links.iter().find_map(|(pid, l)| {
+                                        (fleet_verified.contains(pid)
+                                            && l.verified_name.as_deref() == Some(name.as_str()))
+                                        .then(|| l.transport.clone().map(|t| (pid.clone(), t)))
+                                        .flatten()
+                                        .filter(|(_, t)| t.is_alive())
+                                    })
+                                });
+                            match broker_link {
                                 Some((pid, t)) => {
                                     let secret = fresh_secret();
                                     let sent = t
@@ -3328,6 +3355,15 @@ async fn recv_run(
         if daemon && (revocation_sweep_now || last_devices_scan.elapsed() >= Duration::from_secs(2))
         {
             last_devices_scan = Instant::now();
+            // A fleet sibling whose certificate has run out loses its link on
+            // this tick (the sweep below closes it), not on its next open.
+            let now_s = identity::now_secs();
+            if conn.links.values().any(|l| {
+                l.is_sibling_link()
+                    && l.identity_cert_expires.is_some_and(|e| e <= now_s)
+            }) {
+                revocation_sweep_now = true;
+            }
             // Forget / revoke, live. Runs FIRST so a forgotten secret is out of
             // `devices` before anything below can re-add or dial it.
             let snap = ports.daemon.revocation_snapshot();
@@ -3372,7 +3408,22 @@ async fn recv_run(
                             secret: l.expected_secret.as_ref().map(|(_, s)| s.as_str()),
                             device_pub: l.identity_device_pub,
                         };
-                        if crate::recv::revocation::link_must_close(
+                        // Fleet auto-mesh: a sibling link is closed, not merely
+                        // refused, when the owner withdrew the device (its
+                        // roster no longer lists it) or its certificate ran
+                        // out. Sibling links exist only because of that
+                        // certificate, so nothing is left to carry.
+                        let sibling_cut = crate::recv::revocation::sibling_link_must_close(
+                            l.is_sibling_link(),
+                            l.identity_device_pub.as_ref(),
+                            l.identity_cert_expires,
+                            identity::now_secs(),
+                            &|p: &[u8; 32]| ports.identity.device_cert_revoked(p),
+                        );
+                        if sibling_cut {
+                            key_revoked.insert(pid.clone());
+                            doomed.push((pid.clone(), l.shown().to_string()));
+                        } else if crate::recv::revocation::link_must_close(
                             &facts,
                             &revoked_secrets,
                             &|p: &[u8; 32]| ports.daemon.key_listed(p),
@@ -5108,7 +5159,7 @@ async fn recv_run(
                                     // direct vs relayed. Always shown, even under -q.
                                     log.debug(&format!(
                                         "    {}",
-                                        log.paint(Tone::Dim, &format!("route: {r}"))
+                                        log.paint(Tone::Dim, &format!("route: {}", p.route_shown(&r).await))
                                     ));
                                     // Relay honesty (§3.3): the quiet `route:` line
                                     // is legible but not loud. When the route is
@@ -5285,10 +5336,32 @@ async fn recv_run(
                         .transport_of(&pid)
                         .and_then(|t| in_binding(&t, &pid, &bind_ours, link_fps.as_ref()));
                     let owner = ports.identity.fleet_owner_pub();
+                    // A sibling link (met on the fleet channel, no pair secret):
+                    // the only kind the owner's roster governs. A paired link
+                    // carries its own, pairwise, authorization and is unchanged.
+                    let sibling_link = crate::recv::fleet::shaped_link(
+                        &conn,
+                        &pid,
+                        ports.identity.fleet_rv().as_deref(),
+                    );
                     match (cb, owner) {
                         (Some(cb), Some(owner)) => {
                             match fleet::verify_hello(&v, &cb, &owner, identity::now_secs()) {
+                                Ok(ok)
+                                    if sibling_link
+                                        && !ports.identity.device_cert_revoked(&ok.device_pub)
+                                        && !ports.identity.sibling_admissible(&ok.device_pub) =>
+                                {
+                                    // Certificate fine, owner roster silent on
+                                    // it: not admitted. Re-tried on the next
+                                    // accepted roster (see fleet_unlisted_hellos).
+                                    log.debug(&format!(
+                                        "fleet-hello from {pid} held: not listed in the owner's roster"
+                                    ));
+                                    fleet_unlisted_hellos.insert(pid.clone(), v.clone());
+                                }
                                 Ok(ok) if ports.identity.device_cert_revoked(&ok.device_pub) => {
+                                    fleet_unlisted_hellos.remove(&pid);
                                     log.debug(&format!(
                                         "fleet-hello from {pid} refused: device revoked"
                                     ));
@@ -5298,6 +5371,7 @@ async fn recv_run(
                                     conn.drop_link(&pid);
                                 }
                                 Ok(ok) => {
+                                    fleet_unlisted_hellos.remove(&pid);
                                     let fresh = fleet_verified.insert(pid.clone());
                                     // Identity has settled: replay whatever arrived
                                     // while it had not. This belongs HERE, beside
@@ -6155,10 +6229,22 @@ async fn recv_run(
                             &cert.user_pub,
                             identity::now_secs(),
                         ) {
-                            Ok(true) => log.debug(&format!(
-                                "roster: accepted epoch {} from owner",
-                                v["epoch"].as_u64().unwrap_or(0)
-                            )),
+                            Ok(true) => {
+                                log.debug(&format!(
+                                    "roster: accepted epoch {} from owner",
+                                    v["epoch"].as_u64().unwrap_or(0)
+                                ));
+                                // The roster is the owner's revocation channel
+                                // for siblings: sweep NOW, so a sibling the owner
+                                // removed loses its link at once rather than on
+                                // the next store change.
+                                revocation_sweep_now = true;
+                                for (hp, hv) in std::mem::take(&mut fleet_unlisted_hellos) {
+                                    if conn.links.contains_key(&hp) {
+                                        let _ = tx.send(Ev::Control(hp, hv));
+                                    }
+                                }
+                            }
                             Ok(false) => {}
                             Err(e) => log.debug(&format!("roster: rejected: {e}")),
                         }
@@ -7559,6 +7645,10 @@ async fn recv_run(
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under TUNLION_CAP_AUTHORITATIVE.
                     let authoritative = host.cap_authoritative();
+                    // Fleet auto-mesh: a sibling (certificate-admitted, never
+                    // paired) lands a file only with an explicit grant, read
+                    // before peer_authz resolves anything (see below).
+                    let sibling = crate::shell_gate::sibling_transfer_facts(&conn, &pid);
                     let (ok, xfer_deny_reason, xfer_gate) = {
                         let az = crate::shell_gate::peer_authz(&mut conn, &pid);
                         let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
@@ -7601,6 +7691,12 @@ async fn recv_run(
                             iusr,
                             ak_caps,
                             now,
+                        );
+                        let has_grant = has_grant || sibling.record_grant;
+                        let scoped_in_bounds = cap::sibling_transfer_scope(
+                            sibling.is_sibling,
+                            scoped_in_bounds,
+                            has_grant,
                         );
                         // No deny list is consulted on the transfer path today;
                         // false preserves that exactly.

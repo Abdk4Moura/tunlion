@@ -249,8 +249,22 @@ pub(crate) fn canonicalize_cmd(cmd: Cmd) -> Result<Cmd> {
         }
         Cmd::Set { key, value, peer, dry_run, reset, unset, hard, soft } => {
             let peer = peer.into_iter().map(|p| resolve_arg_in(&p, &known())).collect::<Result<Vec<_>>>()?;
+            // This device's own name is the name every peer files it under by
+            // default, so it takes the same rule.
+            let value = match (key.as_deref(), value) {
+                (Some("name"), Some(v)) => Some(normalize_new_name(&v)?),
+                (_, v) => v,
+            };
             Cmd::Set { key, value, peer, dry_run, reset, unset, hard, soft }
         }
+        Cmd::Init { name, inbox, recovery_file, recovery_fd, background, no_background } => Cmd::Init {
+            name: name.map(|n| normalize_new_name(&n)).transpose()?,
+            inbox,
+            recovery_file,
+            recovery_fd,
+            background,
+            no_background,
+        },
         Cmd::Send { paths, code, word, remember, room, to, name, timeout, auth_key } => {
             let to = opt(to, &mut known)?;
             let remember = remember.map(|r| normalize_new_name(&r)).transpose()?;
