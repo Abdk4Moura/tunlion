@@ -174,6 +174,9 @@ impl Transport for HandoffTransport {
     async fn drain_finish(&self) -> Result<()> {
         self.current().drain_finish().await
     }
+    fn drain_after_delivery_ack(&self) -> bool {
+        self.current().drain_after_delivery_ack()
+    }
     fn max_payload(&self) -> usize {
         self.current().max_payload()
     }
