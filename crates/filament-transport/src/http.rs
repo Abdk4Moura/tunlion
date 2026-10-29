@@ -22,6 +22,20 @@ pub fn client_builder() -> Result<reqwest::ClientBuilder, rustls::Error> {
 }
 
 fn tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
+    let mut cfg = trusted_tls_config()?;
+    // reqwest preserves preconfigured ALPN. Match its default HTTP/2 + HTTP/1.1
+    // configuration rather than silently losing HTTP/2 on desktop.
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(cfg)
+}
+
+/// The same trust decision as every HTTPS client, with no ALPN: for the
+/// TURN-over-TLS bridge (`turn_bridge`), which speaks STUN framing, not HTTP.
+pub(crate) fn turn_tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
+    trusted_tls_config()
+}
+
+fn trusted_tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()?;
@@ -37,11 +51,7 @@ fn tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
         .with_custom_certificate_verifier(std::sync::Arc::new(
             rustls_platform_verifier::Verifier::new(provider)?,
         ));
-    let mut cfg = builder.with_no_client_auth();
-    // reqwest preserves preconfigured ALPN. Match its default HTTP/2 + HTTP/1.1
-    // configuration rather than silently losing HTTP/2 on desktop.
-    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(cfg)
+    Ok(builder.with_no_client_auth())
 }
 
 #[cfg(test)]
