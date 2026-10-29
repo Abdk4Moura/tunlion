@@ -220,8 +220,12 @@ impl HostServices for CliHost {
             .ok()?;
         serde_json::to_string(&blob).ok()
     }
-    fn fleet_grant_held(&self, device_pub: &[u8; 32], capability: &str) -> bool {
-        crate::devices_store::store().fleet_grant_held(device_pub, capability, crate::identity::now_secs())
+    fn fleet_grant_applies(&self, device_pub: &[u8; 32], capability: &str) -> bool {
+        // The local fleet.owner_grants is read here, at use, every time.
+        crate::devices_store::store().fleet_grant_applies(device_pub, capability, crate::identity::now_secs())
+    }
+    fn fleet_owner_grant_policy(&self) -> filament_cap::fleet_grants::OwnerGrantPolicy {
+        crate::devices_store::store().owner_grant_policy()
     }
     #[cfg(l3)]
     fn hostname(&self) -> String {

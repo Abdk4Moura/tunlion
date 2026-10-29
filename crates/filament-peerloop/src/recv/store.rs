@@ -2127,6 +2127,10 @@ pub const FLEET_GRANTS_STATE_FILE: &str = "fleet-grants-state.json";
 /// Receiver side: the newest accepted set about THIS device, as received.
 /// Never merged into the capability store.
 pub const FLEET_GRANTS_HELD_FILE: &str = "fleet-grants-held.json";
+/// The `config` line key that holds `fleet.owner_grants` (the CLI's typed
+/// settings registry writes it; `cli/src/settings.rs` pins the same string).
+/// Written only by a local `tunlion set`; no network message reaches it.
+pub const OWNER_GRANT_POLICY_STORE_KEY: &str = "fleet_owner_grants";
 
 impl DeviceStore {
     fn json_array_at(&self, file: &str) -> Vec<Value> {
@@ -2287,7 +2291,7 @@ impl DeviceStore {
         my_device: &[u8; 32],
         now: u64,
     ) -> Result<filament_cap::fleet_grants::GrantSetJudgement> {
-        use filament_cap::fleet_grants::{judge_grant_set, GrantSetHeader, GrantSetJudgement};
+        use filament_cap::fleet_grants::{judge_grant_set_under, GrantSetHeader, GrantSetJudgement};
         let Some((set, sig_ok)) = Self::parse_signed_set(blob) else {
             anyhow::bail!("malformed fleet grant set");
         };
@@ -2300,7 +2304,7 @@ impl DeviceStore {
             epoch: set.epoch,
             valid_until: set.valid_until,
         };
-        let j = judge_grant_set(&h, sig_ok, my_owner, my_device, now, held);
+        let j = judge_grant_set_under(self.owner_grant_policy(), &h, sig_ok, my_owner, my_device, now, held);
         if j == GrantSetJudgement::Accept {
             let mut keep = set.to_json();
             keep["sig"] = blob["sig"].clone();
@@ -2313,7 +2317,31 @@ impl DeviceStore {
         Ok(j)
     }
 
+    /// This device's `fleet.owner_grants`, read from its own `config` file on
+    /// every call (so a `tunlion set` applies to the next decision, with no
+    /// restart). Absent means the default (`files`); unreadable means `off`.
+    pub fn owner_grant_policy(&self) -> filament_cap::fleet_grants::OwnerGrantPolicy {
+        let raw = std::fs::read_to_string(self.root.join("config")).ok();
+        let v = raw.as_deref().and_then(|r| {
+            r.lines().find_map(|l| {
+                let (k, v) = l.split_once(char::is_whitespace)?;
+                (k == OWNER_GRANT_POLICY_STORE_KEY).then(|| v.trim().to_string())
+            })
+        });
+        filament_cap::fleet_grants::OwnerGrantPolicy::from_stored(v.as_deref())
+    }
+
+    /// Receiver side, what the gates ask: does the held set grant `subject` the
+    /// `action` now, AND does this device's `fleet.owner_grants` let an owner
+    /// grant of that kind apply? The policy is read at this moment, so a set
+    /// accepted under `all` stops granting shell the instant the device's owner
+    /// narrows it to `files`.
+    pub fn fleet_grant_applies(&self, subject: &[u8; 32], action: &str, now: u64) -> bool {
+        self.owner_grant_policy().applies(action) && self.fleet_grant_held(subject, action, now)
+    }
+
     /// Receiver side: does the held set grant `subject` the `action` now?
+    /// (Held and valid; whether it APPLIES is [`DeviceStore::fleet_grant_applies`].)
     ///
     /// The held file is re-verified on every read (signature, owner, target):
     /// a file that was edited, or that predates a change of owner, grants
@@ -2343,8 +2371,19 @@ impl DeviceStore {
         grant_set_allows(set.valid_until, &grants, subject, action, now)
     }
 
+    /// Receiver side, for display: the held, valid owner grants for `subject`,
+    /// split into those that apply under this device's `fleet.owner_grants` and
+    /// those held but not applied.
+    pub fn fleet_grant_caps_split(&self, subject: &[u8; 32], now: u64) -> (Vec<String>, Vec<String>) {
+        let policy = self.owner_grant_policy();
+        self.fleet_grant_caps_for(subject, now)
+            .into_iter()
+            .partition(|c| policy.applies(c))
+    }
+
     /// Receiver side: the capabilities the held set grants `subject` now, for
-    /// display (`devices`). Same checks as [`DeviceStore::fleet_grant_held`].
+    /// display (`devices`). Same checks as [`DeviceStore::fleet_grant_held`];
+    /// the local policy is not applied here (see `fleet_grant_caps_split`).
     pub fn fleet_grant_caps_for(&self, subject: &[u8; 32], now: u64) -> Vec<String> {
         let Some(raw) = self.held_fleet_grants_raw() else {
             return Vec::new();
@@ -3494,6 +3533,119 @@ mod fleet_grant_set_security {
         std::fs::write(&p, raw).unwrap();
         assert!(!jstore.fleet_grant_held(&BRAVO, "shell", now));
         assert!(!jstore.fleet_grant_held(&BRAVO, "transfer", now));
+        cleanup(a, b);
+    }
+
+    fn set_policy(store: &DeviceStore, v: &str) {
+        std::fs::write(store.root().join("config"), format!("name charlie\n{OWNER_GRANT_POLICY_STORE_KEY} {v}\n")).unwrap();
+    }
+
+    #[test]
+    fn under_the_default_files_policy_an_owner_shell_grant_is_held_but_not_applied() {
+        use filament_cap::fleet_grants::OwnerGrantPolicy;
+        let (owner, ostore, jstore, a, b) = fleet("pol-files");
+        let now = now_secs();
+        assert_eq!(jstore.owner_grant_policy(), OwnerGrantPolicy::Files, "no config: the default");
+        ostore.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        ostore.fleet_grant_add(&ME, &BRAVO, "mount", 0).unwrap();
+        let blob = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now).unwrap(),
+            GrantSetJudgement::Accept
+        );
+        assert!(jstore.fleet_grant_held(&BRAVO, "shell", now), "the signed set is kept whole");
+        assert!(!jstore.fleet_grant_applies(&BRAVO, "shell", now), "files: shell never applies");
+        assert!(jstore.fleet_grant_applies(&BRAVO, "mount", now), "files: mount applies");
+        assert_eq!(
+            jstore.fleet_grant_caps_split(&BRAVO, now),
+            (vec!["mount".to_string()], vec!["shell".to_string()])
+        );
+        cleanup(a, b);
+    }
+
+    #[test]
+    fn an_incoming_set_cannot_set_or_widen_the_local_owner_grant_policy() {
+        use filament_cap::fleet_grants::OwnerGrantPolicy;
+        let (owner, ostore, jstore, a, b) = fleet("pol-net");
+        let now = now_secs();
+        set_policy(&jstore, "files");
+        let cfg = jstore.root().join("config");
+        let before = std::fs::read(&cfg).unwrap();
+        // A genuine owner-signed set carrying shell, with every spelling of the
+        // setting a hostile or confused owner could add riding along. The
+        // signature covers the set's own fields only; nothing else is read.
+        ostore.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        let mut blob = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        blob["fleet.owner_grants"] = json!("all");
+        blob[OWNER_GRANT_POLICY_STORE_KEY] = json!("all");
+        blob["settings"] = json!({"fleet.owner_grants": "all", "fleet_owner_grants": "all"});
+        blob["policy"] = json!("all");
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now).unwrap(),
+            GrantSetJudgement::Accept
+        );
+        assert_eq!(std::fs::read(&cfg).unwrap(), before, "config untouched");
+        assert_eq!(jstore.owner_grant_policy(), OwnerGrantPolicy::Files);
+        assert!(!jstore.fleet_grant_applies(&BRAVO, "shell", now), "a set carrying shell is not applied under files");
+        // The other network paths that write local state: the fleet-policy
+        // relay (revocations only) and a roster. Neither touches the setting.
+        assert_eq!(jstore.merge_owner_cap_ops(&[json!({"fleet.owner_grants": "all"})]), 0);
+        assert_eq!(std::fs::read(&cfg).unwrap(), before);
+        // And where the device never set it, receiving sets does not create it.
+        let (owner2, ostore2, jstore2, a2, b2) = fleet("pol-net-none");
+        ostore2.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        let mut blob2 = ostore2.mint_fleet_grant_set(&owner2, &ME, now, 600).unwrap();
+        blob2["fleet.owner_grants"] = json!("all");
+        jstore2.verify_and_store_fleet_grants(&blob2, &owner2.public_key_bytes(), &ME, now).unwrap();
+        assert!(!jstore2.root().join("config").exists());
+        assert_eq!(jstore2.owner_grant_policy(), OwnerGrantPolicy::Files);
+        assert!(!jstore2.fleet_grant_applies(&BRAVO, "shell", now));
+        cleanup(a, b);
+        cleanup(a2, b2);
+    }
+
+    #[test]
+    fn under_off_every_owner_set_is_refused_and_nothing_is_kept() {
+        let (owner, ostore, jstore, a, b) = fleet("pol-off");
+        let now = now_secs();
+        set_policy(&jstore, "off");
+        ostore.fleet_grant_add(&ME, &BRAVO, "transfer", 0).unwrap();
+        ostore.fleet_grant_add(&ME, &BRAVO, "mount", 0).unwrap();
+        let blob = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now).unwrap(),
+            GrantSetJudgement::Refuse(GrantSetRefusal::OwnerGrantsOff)
+        );
+        assert!(!jstore.root().join(FLEET_GRANTS_HELD_FILE).exists());
+        for c in ["transfer", "mount", "shell"] {
+            assert!(!jstore.fleet_grant_applies(&BRAVO, c, now), "{c}");
+        }
+        cleanup(a, b);
+    }
+
+    #[test]
+    fn narrowing_the_policy_applies_at_once_to_a_set_already_held() {
+        let (owner, ostore, jstore, a, b) = fleet("pol-narrow");
+        let now = now_secs();
+        set_policy(&jstore, "all");
+        ostore.fleet_grant_add(&ME, &BRAVO, "shell", 0).unwrap();
+        ostore.fleet_grant_add(&ME, &BRAVO, "mount", 0).unwrap();
+        let blob = ostore.mint_fleet_grant_set(&owner, &ME, now, 600).unwrap();
+        assert_eq!(
+            jstore.verify_and_store_fleet_grants(&blob, &owner.public_key_bytes(), &ME, now).unwrap(),
+            GrantSetJudgement::Accept
+        );
+        assert!(jstore.fleet_grant_applies(&BRAVO, "shell", now), "all: shell applies");
+        // No new set arrives; only the local setting changes.
+        set_policy(&jstore, "files");
+        assert!(!jstore.fleet_grant_applies(&BRAVO, "shell", now), "files: shell stops at once");
+        assert!(jstore.fleet_grant_applies(&BRAVO, "mount", now));
+        set_policy(&jstore, "off");
+        assert!(!jstore.fleet_grant_applies(&BRAVO, "mount", now), "off: the held set grants nothing");
+        assert!(!jstore.fleet_grant_applies(&BRAVO, "shell", now));
+        // An unreadable value is the narrowest, not the widest.
+        set_policy(&jstore, "everything");
+        assert!(!jstore.fleet_grant_applies(&BRAVO, "mount", now));
         cleanup(a, b);
     }
 

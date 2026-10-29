@@ -121,16 +121,62 @@ names the wrong target. Cross-owner isolation is the owner-key match. A local
 deny on the target outranks it. As part of this change the old `fleet-policy`
 relay, which did write owner grant ops into every joined device's cap store
 (they applied the owner's grants about the OWNER on every device, which is not
-what the owner decided), now merges revocations only. The honest cost: an owner
-key compromise can now author shell grants on fleet devices, where before it
-could only mint certificates. The containment that remains is the local deny and
-the time box.
+what the owner decided), now merges revocations only. What an owner-key
+compromise can author is bounded per device by `fleet.owner_grants` (below).
+
+### 3. `fleet.owner_grants`: each device caps what the owner may grant it
+
+`tunlion set fleet.owner_grants off|files|all` (default `files`), in the typed
+settings registry, global only, no environment override. It is enforced on the
+TARGET, when it judges a set and again at every use:
+
+| value | owner-signed set | a sibling gets |
+|---|---|---|
+| `off` | refused outright (`OwnerGrantsOff`), never kept | what its kind implies: file transfer into the inbox |
+| `files` (default) | kept whole; only `transfer` and `mount` entries apply | the kind's transfer, plus owner-granted transfer/mount |
+| `all` | kept whole; `transfer`, `mount` and `shell` apply | as `files`, plus owner-granted shell |
+
+- **Local only.** The value lives in this device's own `config` file and is
+  read from there at each decision (`DeviceStore::owner_grant_policy`). No
+  message writes it: not `fleet-grants` (extra fields are ignored; the
+  signature covers only the set's own fields), not the `fleet-policy` relay
+  (revocations only), not the roster. There is no settings sync. Pinned by
+  `an_incoming_set_cannot_set_or_widen_the_local_owner_grant_policy`.
+- **Use time as well as accept time.** A set accepted under `all` stops granting
+  shell the moment the device is set to `files`, with no new set needed
+  (`fleet_grant_applies`). A session that is ALREADY open is not re-judged: no
+  per-session withdrawal exists for owner grants (withdrawing a grant on the
+  owner does not close an open session either). Narrowing refuses every new
+  session at once; an open one ends when it ends, or when the link closes.
+- **Under `off`, nothing is kept**, so turning it back on takes effect at the
+  owner's next push (a refresh comes within half the set's validity, 7.5 min by
+  default, or at once on the next grant change).
+- **Local deny, revocation and cert expiry win in every mode**: they are
+  absolute in the gate, before any grant is read.
+- Only the distributable capabilities ever apply (`transfer`, `mount`,
+  `shell`), whatever a signed set names.
+- `tunlion devices` shows a held-but-not-applied grant as
+  `not applied: fleet.owner_grants=files` on the sibling's row, and the daemon
+  logs it at debug when the set arrives.
+
+**Threat statement.** With the default, a stolen owner key can grant file
+transfer and mount on the owner's devices, which it could already reach by
+enrolling a device of its own; it gets shell only on a device whose own owner
+set `all`. With `off`, it gets nothing beyond what any certified device of
+the fleet already has. The containment that remains in every mode is the local
+deny and the time box.
+
+This is also the hard cap the open question in section 1 asked about, applied
+to OWNER grants. A grant made on the receiver itself is a local decision and is
+not affected.
 
 Proven by `proofs/fleet_trust_model.py` (CI-gated): forged, foreign and
 misdirected sets never held; no expired set accepted or used; held epoch
 monotone, so a replay cannot resurrect a withdrawn grant; deny and known
-revocation always refuse; no trap states. Six mutants, each must fail. Live:
-`cli/tests/fleet-trust-gates.sh`.
+revocation always refuse; the `fleet.owner_grants` knob changes only by a local
+action, whatever the network delivers, and shell is never allowed unless it is
+`all` (filtered at use, so narrowing applies to a set already held); no trap
+states. Ten mutants, each must fail. Live: `cli/tests/fleet-trust-gates.sh`.
 
 ## Problem
 

@@ -358,6 +358,24 @@ pub fn registry() -> &'static [Setting] {
             daemon: false,
             help: "Default verbosity level: quiet (errors only), info (progress + results), debug (-v equivalent, route/tunnel), trace (-vv equivalent, ICE/per-frame). CLI flags override.",
         },
+        // Per-device cap on what the OWNER may grant here from elsewhere
+        // (`tunlion grant <sibling> <cap> --on <this device>`). Local only: it is
+        // read from this file at every use, and no message from any peer, the
+        // owner included, writes it. Default `files`: a stolen owner key can then
+        // grant file transfer and mount, which it could already reach by
+        // enrolling a device of its own, and shell only where this device's own
+        // owner chose `all`.
+        Setting {
+            key: filament_cap::fleet_grants::OwnerGrantPolicy::SETTING,
+            aliases: &["owner-grants"],
+            store: filament_peerloop::recv::store::OWNER_GRANT_POLICY_STORE_KEY,
+            kind: Kind::Enum(filament_cap::fleet_grants::OwnerGrantPolicy::VALUES),
+            default: "files",
+            scope: ScopeKind::GlobalOnly,
+            env: None,
+            daemon: true,
+            help: "What your owner device may grant on THIS device with `tunlion grant ... --on`: off (nothing; your other devices can only send files to the inbox), files (transfer and mount, the default), all (also shell). Set here only; never changed over the network.",
+        },
         Setting {
             key: "gate.settle_ms",
             aliases: &[],
@@ -1550,6 +1568,29 @@ mod tests {
     }
     fn rand_tag() -> u128 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    }
+
+    #[test]
+    fn fleet_owner_grants_is_a_local_enum_that_the_store_reads_from_the_same_line() {
+        let s = find("fleet.owner_grants").expect("registered");
+        assert!(find("owner-grants").is_some_and(|a| a.key == s.key));
+        assert!(s.scope == ScopeKind::GlobalOnly, "one value per device, never per peer");
+        assert!(s.env.is_none(), "no ambient override");
+        assert_eq!(s.default, filament_cap::fleet_grants::OwnerGrantPolicy::default().as_str());
+        assert_eq!(s.store, filament_peerloop::recv::store::OWNER_GRANT_POLICY_STORE_KEY);
+        assert!(canonicalize(s, "ALL").is_ok_and(|v| v == "all"));
+        assert!(canonicalize(s, "shell").is_err());
+        with_tmp_cfg(|| {
+            let store = crate::devices_store::store();
+            assert_eq!(store.owner_grant_policy().as_str(), "files");
+            for v in ["off", "all", "files"] {
+                set("fleet.owner_grants", v, None).unwrap();
+                assert_eq!(store.owner_grant_policy().as_str(), v, "the store reads what set wrote");
+            }
+            set("fleet.owner_grants", "all", None).unwrap();
+            unset("fleet.owner_grants", None).unwrap();
+            assert_eq!(store.owner_grant_policy().as_str(), "files");
+        });
     }
 
     #[test]

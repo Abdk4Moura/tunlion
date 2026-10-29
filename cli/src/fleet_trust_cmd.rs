@@ -67,7 +67,43 @@ pub(crate) fn grant_on(subject: &str, cap: &str, target: &str) -> Result<()> {
     crate::ui::say(&format!(
         "  signed with your owner key and delivered to '{target}' while this device's `tunlion up` is linked to it; a deny recorded on '{target}' still wins"
     ));
+    // This device cannot know the target's own fleet.owner_grants, so say what
+    // it takes there rather than claim the grant is in force.
+    crate::ui::say(&format!("  {}", takes_effect_note(&cap, target)));
     Ok(())
+}
+
+/// The one line `grant --on` prints about the target's `fleet.owner_grants`.
+pub(crate) fn takes_effect_note(cap: &str, target: &str) -> String {
+    if cap == "shell" {
+        format!(
+            "takes effect only if '{target}' allows owner shell grants: on '{target}', `tunlion set fleet.owner_grants all` (default: files)"
+        )
+    } else {
+        format!(
+            "takes effect only if '{target}' allows owner {cap} grants (its default, fleet.owner_grants=files, does; off refuses them)"
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::takes_effect_note;
+
+    #[test]
+    fn grant_on_says_the_target_decides_without_claiming_it_applies() {
+        let shell = takes_effect_note("shell", "charlie");
+        assert!(shell.contains("takes effect only if 'charlie' allows"));
+        assert!(shell.contains("fleet.owner_grants all"));
+        for cap in ["transfer", "mount"] {
+            let n = takes_effect_note(cap, "charlie");
+            assert!(n.contains(&format!("allows owner {cap} grants")), "{n}");
+            assert!(n.contains("fleet.owner_grants=files"));
+        }
+        for n in [shell, takes_effect_note("mount", "x")] {
+            assert!(!n.contains('\u{2014}') && !n.contains('\u{2013}'), "no dashes: {n}");
+        }
+    }
 }
 
 pub(crate) fn revoke_on(subject: &str, cap: &str, target: &str) -> Result<()> {

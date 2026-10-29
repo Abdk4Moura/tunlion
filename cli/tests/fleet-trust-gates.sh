@@ -24,6 +24,14 @@
 #   K11 while the kind's own default (transfer) needs no owner and keeps working
 #   K12 revoking charlie on the owner ends charlie's sibling access to bravo
 #
+# fleet.owner_grants (each target's LOCAL cap on owner grants, default files):
+#   KF1 under the default (files) charlie holds the owner's shell grant but does
+#       not apply it: bravo's exec is refused, `devices` says "not applied"
+#   K5b then charlie sets `all` and the same held set applies (no new set)
+#   KF2 charlie narrows back to files: refused at once, with no new set
+#   KO  bravo set to off: the owner's set is refused and not kept, exec
+#       refused, the kind's transfer still lands; then `all` and K8 onward
+#
 # Mixed mode (CHARLIE_BIN): charlie is a released 0.9.1. It does not know
 # grant sets, so K5 must REFUSE there and charlie must stay healthy; its own
 # receive policy is 0.9.1's. Everything bravo decides is asserted in full.
@@ -132,9 +140,35 @@ if [ "$MIXED" = 0 ]; then
     ok "gateK5a: charlie accepted the owner-signed set"
   else bad "gateK5a: charlie never accepted a set"; grep -i "fleet-grants" "$WORK/up-charlie.log" | tail -3; fi
   sleep 1
+  # KF1: charlie never set fleet.owner_grants, so it is the default (files):
+  # the shell grant is held (premise) but not applied.
+  if python3 - "$WORK/charlie/fleet-grants-held.json" <<'PY'
+import json,sys
+held=json.load(open(sys.argv[1]))
+assert any(g["cap"]=="shell" for g in held["grants"]), "owner shell grant not held"
+PY
+  then ok "gateKF1-premise: charlie holds the owner's shell grant, fleet.owner_grants=$(as_node charlie set fleet.owner_grants 2>/dev/null)"
+  else bad "gateKF1-premise: shell grant not held on charlie"; fi
+  exec_is bravo charlie KF1-MARK; rc=$(fs_rc)
+  if [ "$rc" = 4 ] && ! fs_out | grep -q KF1-MARK; then ok "gateKF1: files (default) refuses the owner's shell grant (exit 4)"
+  else bad "gateKF1: rc=$rc: $(fs_out | tail -3)"; fi
+  if grep -q "fleet-grants: not applied: shell (fleet.owner_grants=files)" "$WORK/up-charlie.log"; then
+    ok "gateKF1-log: charlie logged the shell entry as not applied"
+  else bad "gateKF1-log: no 'not applied' debug line"; fi
+  as_node charlie devices >"$WORK/kf1-devices.txt" 2>&1
+  if grep -E "^\s*. bravo " "$WORK/kf1-devices.txt" | grep -q "shell not applied: fleet.owner_grants=files"; then
+    ok "gateKF1-view: charlie's devices shows the shell grant as not applied"
+  else bad "gateKF1-view: $(grep bravo "$WORK/kf1-devices.txt")"; fi
+  # The knob, set explicitly for the gates that expect an owner shell grant to work.
+  as_node charlie set fleet.owner_grants all >"$WORK/kf-set.txt" 2>&1 || bad "gateK5-setup: set all on charlie: $(cat "$WORK/kf-set.txt")"
   exec_is bravo charlie K5-MARK; rc=$(fs_rc)
-  if [ "$rc" = 0 ] && fs_out | grep -q K5-MARK; then ok "gateK5b: bravo execs on charlie on the owner's grant alone"
+  if [ "$rc" = 0 ] && fs_out | grep -q K5-MARK; then ok "gateK5b: bravo execs on charlie on the owner's grant alone (charlie: fleet.owner_grants=all)"
   else bad "gateK5b: rc=$rc: $(fs_out | tail -3)"; fi
+  as_node charlie set fleet.owner_grants files >/dev/null 2>&1 || bad "gateKF2-setup: set files on charlie"
+  exec_is bravo charlie KF2-MARK; rc=$(fs_rc)
+  if [ "$rc" = 4 ] && ! fs_out | grep -q KF2-MARK; then ok "gateKF2: narrowing to files refuses the held shell grant at once (exit 4)"
+  else bad "gateKF2: rc=$rc: $(fs_out | tail -3)"; fi
+  as_node charlie set fleet.owner_grants all >/dev/null 2>&1 || bad "gateK7-setup: set all on charlie"
 else
   sleep 12
   exec_is bravo charlie K5-MARK; rc=$(fs_rc)
@@ -166,8 +200,32 @@ PY
   else bad "gateK7: rc=$rc: $(fs_out | tail -3)"; fi
 fi
 
+say "KO: fleet.owner_grants=off on bravo ignores the owner entirely"
+as_node bravo set fleet.owner_grants off >"$WORK/ko-set.txt" 2>&1 || bad "gateKO-setup: set off on bravo: $(cat "$WORK/ko-set.txt")"
+as_node alpha grant charlie shell --on bravo >"$WORK/k8-grant.txt" 2>&1 || bad "gateK8-setup: grant --on bravo failed"
+if grep -q "takes effect only if 'bravo' allows owner shell grants" "$WORK/k8-grant.txt"; then
+  ok "gateKO-msg: grant --on says it takes effect only if bravo allows it"
+else bad "gateKO-msg: $(cat "$WORK/k8-grant.txt")"; fi
+if wait_log "$WORK/up-bravo.log" "fleet-grants: epoch [0-9]+ from .*: Refuse\(OwnerGrantsOff\)" 30 \
+   && [ ! -f "$WORK/bravo/fleet-grants-held.json" ]; then
+  ok "gateKO: off refuses the owner's set and keeps nothing"
+else bad "gateKO: $(grep fleet-grants "$WORK/up-bravo.log" | tail -2); held=$(ls "$WORK/bravo" | grep fleet-grants)"; fi
+exec_is charlie bravo KO-MARK; rc=$(fs_rc)
+if [ "$rc" = 4 ] && ! fs_out | grep -q KO-MARK; then ok "gateKO-exec: off: charlie's exec on bravo refused (exit 4)"
+else bad "gateKO-exec: rc=$rc: $(fs_out | tail -3)"; fi
+if [ "$MIXED" = 0 ]; then
+  echo "ko-$$" > "$WORK/ko.txt"
+  fs_cli 90 as_node charlie send "$WORK/ko.txt" --to bravo; rc=$(fs_rc); sleep 2
+  if [ "$rc" = 0 ] && only_at bravo ko.txt; then ok "gateKO-xfer: off: the kind's transfer default still lands at bravo only"
+  else bad "gateKO-xfer: rc=$rc: $(fs_out | tail -3)"; fi
+fi
+# The knob, set explicitly for K8 onward (they expect the owner's shell grant to
+# work). Nothing was kept under off, so this waits for the owner's next push.
+n_acc=$(grep -cE "fleet-grants: epoch [0-9]+ from .*: Accept" "$WORK/up-bravo.log")
+as_node bravo set fleet.owner_grants all >/dev/null 2>&1 || bad "gateK8-setup: set all on bravo"
+for _ in $(seq 1 120); do [ "$(grep -cE "fleet-grants: epoch [0-9]+ from .*: Accept" "$WORK/up-bravo.log")" -gt "$n_acc" ] && break; sleep 0.5; done
+
 say "K8/K9: grant on bravo, then withdraw it"
-as_node alpha grant charlie shell --on bravo >/dev/null 2>&1 || bad "gateK8-setup: grant --on bravo failed"
 wait_log "$WORK/up-bravo.log" "fleet-grants: epoch [0-9]+ from .*: Accept" 30
 sleep 1
 exec_is charlie bravo K8-MARK; rc=$(fs_rc)

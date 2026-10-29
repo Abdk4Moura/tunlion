@@ -31,7 +31,7 @@
 //! only its own owner and only a set naming itself as target), and it can never
 //! outrank a local deny, revocation or expiry.
 
-use crate::capability::CAP_TRANSFER;
+use crate::capability::{CAP_MOUNT, CAP_SHELL, CAP_TRANSFER};
 
 /// The authority the `FleetSibling` kind itself implies: transfer, and only
 /// transfer. Everything else needs an explicit grant.
@@ -89,6 +89,9 @@ pub enum GrantSetRefusal {
     OtherTarget,
     /// Already past its `valid_until`.
     Expired,
+    /// This device's `fleet.owner_grants` is `off`: owner-signed sets are not
+    /// accepted at all.
+    OwnerGrantsOff,
 }
 
 /// The accept rule's verdict.
@@ -158,10 +161,106 @@ pub fn grant_set_allows(
         })
 }
 
+/// `fleet.owner_grants`: how much an owner-signed grant set may give a sibling
+/// on THIS device. A local setting of the target, read at accept time and again
+/// at every use; nothing received over the network can set or widen it.
+///
+/// * `Off`: owner-signed sets are refused outright and never kept. A sibling
+///   gets what its kind implies (file transfer into the inbox) and nothing more.
+/// * `Files` (default): `transfer` and `mount` entries apply; `shell` does not.
+/// * `All`: `transfer`, `mount` and `shell` apply.
+///
+/// Whatever the policy, only the distributable capabilities ever apply, and a
+/// local deny, revocation and certificate expiry outrank it (they are absolute
+/// in the gate, before any grant is consulted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OwnerGrantPolicy {
+    Off,
+    #[default]
+    Files,
+    All,
+}
+
+impl OwnerGrantPolicy {
+    /// The setting's name, as `tunlion set` shows it.
+    pub const SETTING: &'static str = "fleet.owner_grants";
+    /// The values `tunlion set fleet.owner_grants` accepts, narrowest first.
+    pub const VALUES: &'static [&'static str] = &["off", "files", "all"];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "files" => Some(Self::Files),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    /// The policy a stored value means: absent is the default (`Files`); a value
+    /// that is present but unreadable (a hand edit gone wrong) is `Off`, the
+    /// narrowest, rather than a guess.
+    pub fn from_stored(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).filter(|v| !v.is_empty()) {
+            None => Self::default(),
+            Some(v) => Self::parse(v).unwrap_or(Self::Off),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Files => "files",
+            Self::All => "all",
+        }
+    }
+
+    /// Does an owner-signed grant of `cap` take effect under this policy?
+    pub fn applies(self, cap: &str) -> bool {
+        let c = cap.trim();
+        let file_class = c.eq_ignore_ascii_case(CAP_TRANSFER) || c.eq_ignore_ascii_case(CAP_MOUNT);
+        match self {
+            Self::Off => false,
+            Self::Files => file_class,
+            Self::All => file_class || c.eq_ignore_ascii_case(CAP_SHELL),
+        }
+    }
+}
+
+/// [`judge_grant_set`] under the local policy: with `Off` every set is refused
+/// before anything else is looked at, so nothing is ever kept.
+pub fn judge_grant_set_under(
+    policy: OwnerGrantPolicy,
+    h: &GrantSetHeader,
+    signature_ok: bool,
+    my_owner: &[u8; 32],
+    my_device: &[u8; 32],
+    now: u64,
+    held: Option<(u64, u64)>,
+) -> GrantSetJudgement {
+    if policy == OwnerGrantPolicy::Off {
+        return GrantSetJudgement::Refuse(GrantSetRefusal::OwnerGrantsOff);
+    }
+    judge_grant_set(h, signature_ok, my_owner, my_device, now, held)
+}
+
+/// [`grant_set_allows`] under the local policy, read at USE time: a set held
+/// since before the policy narrowed grants only what the policy allows NOW.
+pub fn grant_set_allows_under(
+    policy: OwnerGrantPolicy,
+    valid_until: u64,
+    grants: &[HeldGrant],
+    subject: &[u8; 32],
+    action: &str,
+    now: u64,
+) -> bool {
+    policy.applies(action) && grant_set_allows(valid_until, grants, subject, action, now)
+}
+
 #[cfg(test)]
 mod laws {
     use super::*;
-    use crate::capability::{fleet_auto_trust, BindingStrength, CAP_MOUNT, CAP_SHELL};
+    use crate::capability::fleet_auto_trust;
+    use crate::capability::BindingStrength;
 
     const OWNER: [u8; 32] = [1; 32];
     const ME: [u8; 32] = [2; 32];
@@ -280,5 +379,94 @@ mod laws {
         assert!(grant_set_allows(100, &gs, &ME, "mount", 49));
         assert!(!grant_set_allows(100, &gs, &ME, "mount", 50), "grant expiry binds");
         assert!(!grant_set_allows(100, &gs, &OTHER, "shell", 100), "set expiry binds");
+    }
+
+    // ---- fleet.owner_grants ----
+
+    const ALL_POLICIES: [OwnerGrantPolicy; 3] =
+        [OwnerGrantPolicy::Off, OwnerGrantPolicy::Files, OwnerGrantPolicy::All];
+
+    #[test]
+    fn law_owner_grant_policy_default_is_files_and_garbage_is_off() {
+        assert_eq!(OwnerGrantPolicy::default(), OwnerGrantPolicy::Files);
+        assert_eq!(OwnerGrantPolicy::from_stored(None), OwnerGrantPolicy::Files);
+        assert_eq!(OwnerGrantPolicy::from_stored(Some("  ")), OwnerGrantPolicy::Files);
+        assert_eq!(OwnerGrantPolicy::from_stored(Some("ALL")), OwnerGrantPolicy::All);
+        assert_eq!(OwnerGrantPolicy::from_stored(Some("everything")), OwnerGrantPolicy::Off);
+        for p in ALL_POLICIES {
+            assert_eq!(OwnerGrantPolicy::parse(p.as_str()), Some(p));
+            assert!(OwnerGrantPolicy::VALUES.contains(&p.as_str()));
+        }
+    }
+
+    #[test]
+    fn law_shell_applies_only_under_all() {
+        for p in ALL_POLICIES {
+            assert_eq!(p.applies(CAP_SHELL), p == OwnerGrantPolicy::All, "{p:?}");
+            assert_eq!(p.applies("SHELL"), p == OwnerGrantPolicy::All, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn law_off_applies_nothing_files_applies_transfer_and_mount() {
+        for c in [CAP_TRANSFER, CAP_MOUNT, CAP_SHELL, "exec", "forward", "route:0.0.0.0/0", "*"] {
+            assert!(!OwnerGrantPolicy::Off.applies(c), "{c}");
+        }
+        assert!(OwnerGrantPolicy::Files.applies(CAP_TRANSFER));
+        assert!(OwnerGrantPolicy::Files.applies(CAP_MOUNT));
+        // Nothing outside the distributable set applies under any policy, so a
+        // stolen owner key cannot name a capability the CLI never distributes.
+        for p in ALL_POLICIES {
+            for c in ["exec", "forward", "route:0.0.0.0/0", "*", ""] {
+                assert!(!p.applies(c), "{p:?} {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn law_policies_are_nested() {
+        // off is inside files is inside all, for every capability.
+        for c in [CAP_TRANSFER, CAP_MOUNT, CAP_SHELL, "exec"] {
+            assert!(!OwnerGrantPolicy::Off.applies(c) || OwnerGrantPolicy::Files.applies(c));
+            assert!(!OwnerGrantPolicy::Files.applies(c) || OwnerGrantPolicy::All.applies(c));
+        }
+    }
+
+    #[test]
+    fn law_off_refuses_every_set_even_a_perfect_one() {
+        use GrantSetJudgement::*;
+        assert_eq!(judge_grant_set(&hdr(1, 100), true, &OWNER, &ME, 10, None), Accept);
+        assert_eq!(
+            judge_grant_set_under(OwnerGrantPolicy::Off, &hdr(1, 100), true, &OWNER, &ME, 10, None),
+            Refuse(GrantSetRefusal::OwnerGrantsOff)
+        );
+        for p in [OwnerGrantPolicy::Files, OwnerGrantPolicy::All] {
+            for (sig, until, held) in [(true, 100, None), (false, 100, None), (true, 5, None), (true, 100, Some((3, 200)))] {
+                assert_eq!(
+                    judge_grant_set_under(p, &hdr(1, until), sig, &OWNER, &ME, 10, held),
+                    judge_grant_set(&hdr(1, until), sig, &OWNER, &ME, 10, held),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn law_use_time_filter_follows_the_current_policy() {
+        // One held set granting shell and mount: what it grants depends on the
+        // policy at the moment of use, not on when it was accepted.
+        let gs = vec![
+            HeldGrant { subject_pub: OTHER, cap: "shell".into(), expires: 0 },
+            HeldGrant { subject_pub: OTHER, cap: "mount".into(), expires: 0 },
+        ];
+        let at = |p| (grant_set_allows_under(p, 100, &gs, &OTHER, CAP_SHELL, 10),
+                      grant_set_allows_under(p, 100, &gs, &OTHER, CAP_MOUNT, 10));
+        assert_eq!(at(OwnerGrantPolicy::All), (true, true));
+        assert_eq!(at(OwnerGrantPolicy::Files), (false, true));
+        assert_eq!(at(OwnerGrantPolicy::Off), (false, false));
+        // And the policy never widens what the set says.
+        for p in ALL_POLICIES {
+            assert!(!grant_set_allows_under(p, 100, &gs, &OTHER, CAP_TRANSFER, 10));
+            assert!(!grant_set_allows_under(p, 100, &gs, &OTHER, CAP_SHELL, 100));
+        }
     }
 }

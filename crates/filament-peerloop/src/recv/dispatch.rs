@@ -6226,6 +6226,9 @@ async fn recv_run(
                 // filament_cap::fleet_grants::judge_grant_set: the owner key we
                 // already hold, our own device key as target, unexpired, newer
                 // than what we hold. Kept apart from the capability store.
+                // This device's local fleet.owner_grants decides what applies:
+                // `off` refuses the set outright; nothing in the message can
+                // change that setting.
                 Some("fleet-grants") => {
                     if let Some(cert) = ports.identity.local_device_cert() {
                         match ports.identity.verify_and_store_fleet_grants(
@@ -6234,10 +6237,33 @@ async fn recv_run(
                             &cert.device_pub,
                             identity::now_secs(),
                         ) {
-                            Ok(j) => log.debug(&format!(
-                                "fleet-grants: epoch {} from {pid}: {j:?}",
-                                v["epoch"].as_u64().unwrap_or(0)
-                            )),
+                            Ok(j) => {
+                                log.debug(&format!(
+                                    "fleet-grants: epoch {} from {pid}: {j:?}",
+                                    v["epoch"].as_u64().unwrap_or(0)
+                                ));
+                                // The set is kept whole (its signature covers it);
+                                // entries the local fleet.owner_grants does not
+                                // allow are ignored at every use. Say which.
+                                let policy = conn.host.fleet_owner_grant_policy();
+                                let mut ignored: Vec<String> = v["grants"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|g| g["cap"].as_str())
+                                    .filter(|c| !policy.applies(c))
+                                    .map(str::to_string)
+                                    .collect();
+                                ignored.sort();
+                                ignored.dedup();
+                                if j == filament_cap::fleet_grants::GrantSetJudgement::Accept && !ignored.is_empty() {
+                                    log.debug(&format!(
+                                        "fleet-grants: not applied: {} (fleet.owner_grants={})",
+                                        ignored.join(", "),
+                                        policy.as_str()
+                                    ));
+                                }
+                            }
                             Err(e) => log.debug(&format!("fleet-grants: rejected: {e}")),
                         }
                     }

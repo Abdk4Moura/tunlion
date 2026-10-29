@@ -288,7 +288,7 @@ pub struct SiblingFacts {
     pub local_grant: bool,
     /// An owner-signed grant set held here grants the sibling's proven device
     /// key the action (`tunlion grant <sibling> <cap> --on <this device>` on the
-    /// owner).
+    /// owner), and this device's `fleet.owner_grants` lets it apply.
     pub owner_grant: bool,
     /// This machine's record DENIES the action to the sibling. Outranks both
     /// grant sources.
@@ -316,7 +316,7 @@ pub fn sibling_facts(conn: &Conn, pid: &str, action: &str) -> SiblingFacts {
         owner_grant: l
             .identity_device_pub
             .as_ref()
-            .is_some_and(|d| conn.host.fleet_grant_held(d, action)),
+            .is_some_and(|d| conn.host.fleet_grant_applies(d, action)),
         denied: name.is_some_and(|n| conn.host.device_capability_denied(n, action)),
     }
 }

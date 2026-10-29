@@ -428,8 +428,20 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
             } else if let Some(p) = sibling_pub {
                 let mut sib_caps = vec!["transfer".to_string()];
                 sib_caps.extend(caps.iter().cloned());
-                sib_caps.extend(crate::devices_store::store().fleet_grant_caps_for(&p, now));
-                format!("your device · {}", device_caps_summary(&sib_caps, tier))
+                // Owner grants: only those this device's fleet.owner_grants lets
+                // apply count; the rest are named as held but not applied.
+                let store = crate::devices_store::store();
+                let (applied, held_only) = store.fleet_grant_caps_split(&p, now);
+                sib_caps.extend(applied);
+                let mut row = format!("your device · {}", device_caps_summary(&sib_caps, tier));
+                if !held_only.is_empty() {
+                    row.push_str(&format!(
+                        " · {} not applied: fleet.owner_grants={}",
+                        held_only.join(", "),
+                        store.owner_grant_policy().as_str()
+                    ));
+                }
+                row
             } else if let Some(own) = own_ended_here {
                 own_access_expired_label(own.expires)
             } else if let Some(st) = &ended {

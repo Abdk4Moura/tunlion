@@ -594,9 +594,16 @@ pub trait HostServices: Send + Sync + 'static {
         false
     }
     /// Does an owner-signed fleet grant set held by this device grant the
-    /// sibling `device_pub` the `capability`, right now? Inert hosts hold none.
-    fn fleet_grant_held(&self, _device_pub: &[u8; 32], _capability: &str) -> bool {
+    /// sibling `device_pub` the `capability`, right now, AND does this device's
+    /// local `fleet.owner_grants` let an owner grant of that kind apply? Read at
+    /// every use. Inert hosts hold none.
+    fn fleet_grant_applies(&self, _device_pub: &[u8; 32], _capability: &str) -> bool {
         false
+    }
+    /// This device's local `fleet.owner_grants` (for logging what a held set
+    /// does not apply). Inert hosts answer the default; they hold no sets.
+    fn fleet_owner_grant_policy(&self) -> filament_cap::fleet_grants::OwnerGrantPolicy {
+        filament_cap::fleet_grants::OwnerGrantPolicy::default()
     }
     /// Is this device key present in the host's device store at all? Used by
     /// the settle-then-evaluate park: a key with no record can never become
