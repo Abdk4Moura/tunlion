@@ -2,11 +2,11 @@
 #
 #   pwsh -File cli/tests/windows-user-env-gates.ps1 -Bin <tunlion.exe> [-Python <python>]
 #
-# Hermetic: two config dirs, a local backend, reciprocal pairing; boxB serves.
-# boxB's daemon starts with one variable only it has (TUNLION_DAEMON_ONLY_PROBE).
+# Hermetic: two config dirs, a local backend, reciprocal pairing; boxb serves.
+# boxb's daemon starts with one variable only it has (TUNLION_DAEMON_ONLY_PROBE).
 # AFTER the daemon is up, a user variable is set and a new directory appended
 # to the USER PATH in HKCU\Environment (restored on exit), holding a new tool.
-# Then `exec` and a `shell` session each run one probe script on boxB.
+# Then `exec` and a `shell` session each run one probe script on boxb.
 #
 # Gates, for exec (E*) and shell (S*):
 #   1 OS and NUMBER_OF_PROCESSORS are present (the account block, not the
@@ -69,14 +69,14 @@ try {
     $da = Join-Path $work 'A'; $db = Join-Path $work 'B'; $drop = Join-Path $work 'Bdrop'
     New-Item -ItemType Directory -Force -Path $da, $db, $drop | Out-Null
     $secret = -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
-    "[{`"name`":`"boxB`",`"secret`":`"$secret`"}]" | Set-Content -LiteralPath (Join-Path $da 'devices.json') -Encoding Ascii
-    "[{`"name`":`"boxA`",`"secret`":`"$secret`"}]" | Set-Content -LiteralPath (Join-Path $db 'devices.json') -Encoding Ascii
+    "[{`"name`":`"boxb`",`"secret`":`"$secret`"}]" | Set-Content -LiteralPath (Join-Path $da 'devices.json') -Encoding Ascii
+    "[{`"name`":`"boxa`",`"secret`":`"$secret`"}]" | Set-Content -LiteralPath (Join-Path $db 'devices.json') -Encoding Ascii
 
-    # boxB's daemon, with a variable only it has.
-    $env:TUNLION_CONFIG_DIR = $db; $env:TUNLION_NAME = 'boxB'; $env:TUNLION_L2 = '1'
+    # boxb's daemon, with a variable only it has.
+    $env:TUNLION_CONFIG_DIR = $db; $env:TUNLION_NAME = 'boxb'; $env:TUNLION_L2 = '1'
     $env:TUNLION_L3_USERSPACE = '1'; $env:TUNLION_CAP_AUTHORITATIVE = '0'
     Set-Item -Path "Env:$leakVar" -Value $leakVal
-    & $Bin grant boxA shell 2>&1 | Write-Host
+    & $Bin grant boxa shell 2>&1 | Write-Host
     $procs += Start-Process -FilePath $Bin -PassThru -NoNewWindow `
         -ArgumentList "up --userspace --shell --i-know --dir `"$drop`" --server $server" `
         -RedirectStandardOutput (Join-Path $work 'upB.out') -RedirectStandardError (Join-Path $work 'upB.err')
@@ -110,7 +110,7 @@ try {
     ) -join "`r`n" | Set-Content -LiteralPath $probe -Encoding Ascii
     Write-Host ("profiles: " + (($profiles | ForEach-Object { "$_=$(Test-Path -LiteralPath $_)" }) -join '; '))
 
-    $env:TUNLION_CONFIG_DIR = $da; $env:TUNLION_NAME = 'boxA'
+    $env:TUNLION_CONFIG_DIR = $da; $env:TUNLION_NAME = 'boxa'
     function Run-Tunlion([string]$label, [string[]]$a) {
         $out = Join-Path $work "$label.out"; $err = Join-Path $work "$label.err"
         $p = Start-Process -FilePath $Bin -ArgumentList (@('--server', $server) + $a | ForEach-Object {
@@ -139,13 +139,13 @@ try {
         } else { Bad "${k}4: the daemon-only variable reached the child (or the probe did not run)" }
     }
 
-    $execText = Run-Tunlion 'exec' @('exec', 'boxB', '--', 'cmd', '/c', $probe)
+    $execText = Run-Tunlion 'exec' @('exec', 'boxb', '--', 'cmd', '/c', $probe)
     Check 'E' $execText
-    $toolText = Run-Tunlion 'exec-tool' @('exec', 'boxB', '--', $tool)
+    $toolText = Run-Tunlion 'exec-tool' @('exec', 'boxb', '--', $tool)
     if ($toolText -match [regex]::Escape($env:USERNAME)) {
         Ok 'E5: a tool installed after the daemon started runs as a bare exec argv[0]'
     } else { Bad 'E5: the late tool was not found as a bare exec argv[0]' }
-    $shellText = Run-Tunlion 'shell' @('shell', 'boxB', '--', $probe)
+    $shellText = Run-Tunlion 'shell' @('shell', 'boxb', '--', $probe)
     Check 'S' $shellText
     if ($shellText -match "PROBE-PROFILE=profile-ran-$nonce") {
         Ok 'S5: the shell is the user''s PowerShell with its profile loaded'
