@@ -21,8 +21,8 @@
 #   E4  a fleet device's list names the other fleet device (control) and
 #       never the box
 #   E5  `down` on the box removes it at the owner, within the bound
-#   E6  POSITIVE a second box from the same invitation is reachable under a
-#       suffixed name
+#   E6  POSITIVE a second box from the same invitation is reachable, under the
+#       name the first one freed when it left
 #   E7  that box's lease ends while it is still running: the owner removes it
 #       and a new exec to it is refused, nothing runs
 #   E8  the second box's certificate ends at its lease, not the invitation's
@@ -188,16 +188,20 @@ else
 fi
 
 # ==================================================================== GATE E6 ==
-say "E6: a second box from the same invitation is reachable under its own name"
+say "E6: a second box from the same invitation is reachable, under the freed name"
+# The first box departed, so its record and its name are gone: the second box,
+# a NEW key, is filed under the invitation's name again rather than worker-2.
 T2=$(now)
 start_runner "$W2" "${LEASE2}s" runner2
-for _ in $(seq 1 30); do [ -n "$(owner_record worker-2)" ] && break; sleep 1; done
+for _ in $(seq 1 30); do [ -n "$(owner_record worker)" ] && break; sleep 1; done
 sleep 2
-OUT6=$(timeout 30 "${O_ENV[@]}" "$BIN" --server "$SERVER" exec worker-2 -- /bin/echo EPH-EXEC-2 2>"$WORK/E6.err" </dev/null)
+OUT6=$(timeout 30 "${O_ENV[@]}" "$BIN" --server "$SERVER" exec worker -- /bin/echo EPH-EXEC-2 2>"$WORK/E6.err" </dev/null)
 rc6=$?
-echo "## exec rc=$rc6 out='$OUT6'"
-if [ "$rc6" = "0" ] && [ "$OUT6" = "EPH-EXEC-2" ]; then
-  ok "gateE6: exec to the second box (worker-2) ran"
+devpub() { python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['cert']['devicePub'])" "$1" 2>/dev/null; }
+K1=$(devpub "$W1/identity/device-cert.json"); K2=$(devpub "$W2/identity/device-cert.json")
+echo "## exec rc=$rc6 out='$OUT6' key1=${K1:0:12} key2=${K2:0:12}"
+if [ "$rc6" = "0" ] && [ "$OUT6" = "EPH-EXEC-2" ] && [ -n "$K2" ] && [ "$K1" != "$K2" ]; then
+  ok "gateE6: exec to the second box, filed under the freed name, ran"
 else
   cat "$WORK/E6.err"; tail -20 "$WORK/runner2.log"
   bad "gateE6: exec to the second box did not run (rc=$rc6), so E7 would prove nothing"
@@ -216,14 +220,14 @@ fi
 # ==================================================================== GATE E7 ==
 say "E7: the lease ends with the box still running: removed, and exec refused"
 sleep $(( T2 + LEASE2 - $(now) > 0 ? T2 + LEASE2 - $(now) : 0 ))
-if wait_gone worker-2 "$BOUND"; then
+if wait_gone worker "$BOUND"; then
   GONE=1
 else
   GONE=0
 fi
 kill -0 "${FIX_PIDS[-1]}" 2>/dev/null && ALIVE=1 || ALIVE=0
 rm -f "$W2-drop/E7-ran"
-OUT7=$(timeout 30 "${O_ENV[@]}" "$BIN" --server "$SERVER" exec worker-2 -- /bin/sh -c "touch '$W2-drop/E7-ran'; echo RAN" 2>"$WORK/E7.err" </dev/null)
+OUT7=$(timeout 30 "${O_ENV[@]}" "$BIN" --server "$SERVER" exec worker -- /bin/sh -c "touch '$W2-drop/E7-ran'; echo RAN" 2>"$WORK/E7.err" </dev/null)
 rc7=$?
 echo "## gone=$GONE box-alive=$ALIVE exec rc=$rc7 out='$OUT7'"; cat "$WORK/E7.err"
 if [ "$GONE" = "1" ] && [ "$ALIVE" = "1" ] && [ "$rc7" != "0" ] && [ ! -e "$W2-drop/E7-ran" ]; then
