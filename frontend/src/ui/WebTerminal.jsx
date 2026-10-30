@@ -14,6 +14,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { ClipboardAddon } from '@xterm/addon-clipboard'
 import { PredictiveEcho } from '../lib/predict.js'
 import { log } from '../lib/log.js'
 import {
@@ -63,6 +64,21 @@ function xtermTheme(T, accent) {
 const PASTE_MARKERS = /\x1b\[20[01]~/g
 // Above this many characters a paste is shown for review before it is sent.
 export const LARGE_PASTE = 4096
+
+// OSC 52 (tmux/vim yank to the terminal's clipboard) is untrusted PTY output.
+// Caps are stated in BOTH wire and decoded units so they cannot drift:
+//   - the guard rejects a base64 Pd longer than 64 KiB characters, which can
+//     decode to at most 48 KiB of bytes (4 base64 chars -> 3 bytes);
+//   - the provider re-checks the decoded UTF-8 byte count against 48 KiB;
+//   - up to 8 KiB decoded is written automatically, larger permitted yanks
+//     wait for a trusted tap (never truncated);
+//   - NUL/ESC and other C0/C1 control characters are refused, because a
+//     remote escape must not plant hidden terminal input on the clipboard.
+// Tab, LF and CR are allowed: ordinary text yanks contain them.
+export const REMOTE_COPY_MAX_B64 = 64 * 1024
+export const REMOTE_COPY_MAX_BYTES = 48 * 1024
+export const REMOTE_COPY_AUTO_BYTES = 8 * 1024
+const REMOTE_UNSAFE_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/
 export function cleanPaste(text) {
   return String(text == null ? '' : text).replace(/\r\n?/g, '\n').replace(PASTE_MARKERS, '')
 }
@@ -155,6 +171,11 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
   const [wheelRoute, setWheelRoute] = useState(SCROLL_HISTORY) // who owns a vertical wheel
   const [toast, setToast] = useState('') // brief copy/paste feedback
   const toastTimer = useRef(0)
+  // OSC 52 copy that needs a trusted tap (iOS refuses a clipboard write that
+  // happens outside a gesture). Holds the text in memory only while shown.
+  const [remoteCopyPending, setRemoteCopyPending] = useState(null)
+  const remoteCopySeqRef = useRef(0)
+  const remoteQueryCountRef = useRef(0)
   // Fallback paste sheet: some browsers (notably iOS Safari) reject a
   // programmatic clipboard read even inside a tap. A real, visible textarea
   // lets the user use the system Paste menu, then insert the text once.
@@ -228,6 +249,78 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     toastTimer.current = setTimeout(() => setToast(''), 1400)
   }, [])
   useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
+
+  // --- remote (OSC 52) copy ------------------------------------------------
+  // The only automatic clipboard writes are small, well-formed yanks. A larger
+  // permitted yank, or a browser refusal, is held in memory until a real tap.
+  // Nothing here ever reads the clipboard.
+  const remoteCopyFromRemote = useCallback((raw) => {
+    const text = typeof raw === 'string' ? raw : ''
+    // Empty Pd is an OSC 52 "clear clipboard" request. A remote escape does not
+    // get to wipe what the person already copied; malformed base64 also decodes
+    // to '' in the addon, so both are a quiet no-op.
+    if (!text) return
+    const bytes = enc.encode(text).length
+    if (bytes > REMOTE_COPY_MAX_BYTES) { showToast('remote copy too large'); return }
+    if (REMOTE_UNSAFE_CONTROLS.test(text)) { showToast('remote copy blocked: control characters'); return }
+    const seq = ++remoteCopySeqRef.current
+    // Larger yanks are never truncated: keep the whole text for the tap prompt.
+    if (bytes > REMOTE_COPY_AUTO_BYTES) { setRemoteCopyPending({ text, bytes, error: '' }); return }
+    let result
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('clipboard unavailable')
+      result = navigator.clipboard.writeText(text)
+    } catch (e) {
+      result = Promise.reject(e)
+    }
+    Promise.resolve(result).then(() => {
+      if (seq !== remoteCopySeqRef.current) return
+      setRemoteCopyPending(null)
+      haptic(); showToast('copied from remote')
+    }).catch(() => {
+      if (seq !== remoteCopySeqRef.current) return
+      // The prompt itself is the honest feedback for the automatic refusal:
+      // the browser needs a gesture, not a scary error before the tap.
+      setRemoteCopyPending({ text, bytes, error: '' })
+    })
+  }, [showToast])
+  const remoteCopyRef = useRef(remoteCopyFromRemote)
+  useEffect(() => { remoteCopyRef.current = remoteCopyFromRemote }, [remoteCopyFromRemote])
+
+  // The prompt button. writeText MUST be called synchronously in the click, so
+  // this is deliberately not an async function and does no awaited work first.
+  // If the browser refuses again, say so and keep the text; never claim success.
+  const copyPendingRemote = useCallback(() => {
+    const pending = remoteCopyPending
+    if (!pending) return undefined
+    const seq = ++remoteCopySeqRef.current
+    let result
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('clipboard unavailable')
+      result = navigator.clipboard.writeText(pending.text)
+    } catch (e) {
+      result = Promise.reject(e)
+    }
+    return Promise.resolve(result).then(() => {
+      if (seq !== remoteCopySeqRef.current) return
+      setRemoteCopyPending(null)
+      haptic(); showToast('copied from remote')
+    }).catch((e) => {
+      if (seq !== remoteCopySeqRef.current) return
+      const reason = String((e && (e.name || e.message)) || 'blocked')
+      setRemoteCopyPending({ ...pending, error: reason })
+      haptic()
+    })
+  }, [remoteCopyPending, showToast])
+
+  // A dropped link or unmount invalidates a pending remote copy: the prompt is
+  // about the current shell, and a later yank replaces it (sequence number).
+  useEffect(() => {
+    if (status === 'ready') return undefined
+    remoteCopySeqRef.current++
+    setRemoteCopyPending(null)
+    return undefined
+  }, [status])
 
   // Always send to the CURRENT link (linkRef), never a captured one, so a
   // reconnect (new link, same terminal) keeps input flowing without rebuilding
@@ -553,6 +646,41 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
+    // OSC 52 (tmux/vim yank) write path. The addon only decodes; every policy
+    // decision is ours. It has no path to readText because the guard below
+    // consumes every '?' query before the addon sees it.
+    const clipboardAddon = new ClipboardAddon(undefined, {
+      readText: () => '',
+      writeText: (selection, text) => {
+        // '' is the default/system clipboard in OSC 52, same target as 'c'.
+        if (selection === '' || selection === 'c') remoteCopyRef.current(text)
+      },
+    })
+    term.loadAddon(clipboardAddon)
+    // Registered AFTER the addon, so xterm tries it first (handlers run newest
+    // first). true consumes the escape; false falls through to the addon.
+    const osc52Guard = term.parser.registerOscHandler(52, (data) => {
+      const s = typeof data === 'string' ? data : ''
+      const args = s.split(';')
+      if (args.length < 2) return true // malformed: no side effect
+      const pc = args[0]
+      const pd = args[1]
+      if (pd === '?') {
+        // A query asks the terminal to send the device clipboard back over the
+        // PTY. That is exfiltration: consume it, never call readText, and send
+        // no OSC 52 response (the addon would otherwise report one).
+        remoteQueryCountRef.current++
+        try { log.debug('webterm: OSC 52 clipboard query ignored') } catch (e) {}
+        return true
+      }
+      // '' is the OSC 52 default clipboard, the same device clipboard as 'c'.
+      // 'p' (X11 PRIMARY) and every other target are not ours to write.
+      if (pc !== '' && pc !== 'c') return true
+      if (!pd) return true // do not let a remote escape clear the device clipboard
+      // Wire cap: 64 KiB of base64 characters (at most 48 KiB decoded bytes).
+      if (pd.length > REMOTE_COPY_MAX_B64) { showToast('remote copy too large'); return true }
+      return false // safe shape: ClipboardAddon decodes, provider applies policy
+    })
     term.open(hostRef.current)
     termRef.current = term; fitRef.current = fit
     // Predictive local echo. A pure overlay: the real key is still sent to the
@@ -942,6 +1070,8 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       host.removeEventListener('touchcancel', onTouchEnd)
       try { predict.dispose() } catch (e) {}
       predictRef.current = null
+      remoteCopySeqRef.current++ // a pending remote copy dies with this terminal
+      try { osc52Guard.dispose(); clipboardAddon.dispose() } catch (e) {}
       term.dispose()
       termRef.current = null; fitRef.current = null
     }
@@ -1017,6 +1147,9 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
         //  by freezing the render signature while bumping byteCount).
         window.__webtermThrowSyncBar = () => { throwSyncBarRef.current = true }
         window.__webtermWatchdog = wd.current
+        // Read-only counter: the OSC 52 gate asserts a query was consumed and
+        // never answered without exposing any clipboard data.
+        window.__webtermRemoteQueries = () => remoteQueryCountRef.current
       }
     } catch (e) {}
   }, [redrawRecover])
@@ -1550,6 +1683,41 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
             border: `1px solid ${T.line}`, boxShadow: '0 2px 10px rgba(0,0,0,.45)',
             whiteSpace: 'nowrap',
           }}>{toast}</div>
+        )}
+        {/* OSC 52 copy that did not land: iOS/Safari require a real gesture for
+            navigator.clipboard.writeText, so the tap is the write. The text is
+            held in memory only and is never read back from the clipboard. */}
+        {remoteCopyPending && (
+          <div data-testid="remote-copy-prompt" role="status" aria-live="polite" style={{
+            position: 'absolute', left: '50%', bottom: 56, transform: 'translateX(-50%)',
+            zIndex: 6, display: 'flex', alignItems: 'center', gap: 8,
+            maxWidth: 'calc(100% - 20px)', boxSizing: 'border-box',
+            padding: '6px 6px 6px 12px', borderRadius: 9, color: T.text,
+            background: T.panel2, border: `1px solid ${T.line}`,
+            boxShadow: '0 2px 10px rgba(0,0,0,.45)',
+          }}>
+            <div style={{ minWidth: 0, font: `12px/1.35 ${uiFont || font}` }}>
+              <div>Copied from the remote, tap to copy</div>
+              {remoteCopyPending.error && (
+                <div data-testid="remote-copy-error" style={{ marginTop: 2, color: T.bad, overflowWrap: 'anywhere' }}>
+                  Copy failed: {remoteCopyPending.error}
+                </div>
+              )}
+            </div>
+            <button type="button" data-testid="remote-copy-now" onClick={copyPendingRemote}
+              style={{
+                flex: '0 0 auto', minWidth: 48, minHeight: 40, padding: '0 12px',
+                borderRadius: 7, cursor: 'pointer', font: `600 13px ${uiFont || font}`,
+                color: T.onAccent, background: accent, border: `1px solid ${accent}`,
+              }}>Copy</button>
+            <button type="button" data-testid="remote-copy-dismiss" aria-label="dismiss remote copy"
+              onClick={() => { remoteCopySeqRef.current++; setRemoteCopyPending(null) }}
+              style={{
+                flex: '0 0 auto', minWidth: 36, minHeight: 40, padding: 0,
+                borderRadius: 7, cursor: 'pointer', font: `600 16px ${uiFont || font}`,
+                color: T.sub, background: 'transparent', border: 'none',
+              }}>{'\u00d7'}</button>
+          </div>
         )}
         {/* Select mode: the buffer as plain selectable text over the terminal.
             Press and hold (touch) or drag (mouse) uses the platform's own
