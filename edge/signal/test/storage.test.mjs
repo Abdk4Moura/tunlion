@@ -70,25 +70,41 @@ test("refresh spacing: 48 writes/day at 30 min, 4 at 6 h", () => {
 test("validity: never after last claim + TTL, accepted 18 h floor after eviction", () => {
   const t0 = 2_000_000;
   const lastClaim = t0 + 6 * 3600 - 1; // just before the next 6 h write
-  const sql = sqlite();
-  const alive = new Set(["s1"]);
-  const now = { value: t0 };
-  const reg = M(sql, alive, now, 100, 6 * 3600, 256, 64);
-  const token = reg.claimSession(null, "g1", "s1", "u1", "n1").token;
-  now.value = lastClaim;
-  assert.equal(reg.claimSession(token, "g1", "s1", "u1", "n1").status, "current");
+  // One case = seed at t0, one claim at lastClaim, then evict (fresh heap) and
+  // try to resume at `at`. No claim happens between eviction and the probe.
+  function probe(slack, at) {
+    const sql = sqlite();
+    const alive = new Set(["s1"]);
+    const now = { value: t0 };
+    const reg = M(sql, alive, now, 100, slack, 256, 64);
+    const token = reg.claimSession(null, "g1", "s1", "u1", "n1").token;
+    // A real always-on claim cadence, so the persisted write is the last one
+    // before lastClaim, not a single late refresh.
+    for (let t = t0 + 30; t <= lastClaim; t += 30) {
+      now.value = t;
+      assert.equal(reg.claimSession(token, "g1", "s1", "u1", "n1").status, "current");
+    }
+    const later = { value: at };
+    const v = M(sql, alive, later, 100, slack, 256, 64)
+      .claimSession(token, "g1", "s1", "u1", "n1");
+    return { status: v.status, token: v.token, original: token };
+  }
 
-  // Evict: a fresh Registry has no heap, only the persisted row.
-  const now2 = { value: lastClaim };
-  const reg2 = M(sql, alive, now2, 100, 6 * 3600, 256, 64);
-  const exp = now2.value + 18 * 3600; // t0 + 24 h
-  now2.value = exp - 1;
-  assert.equal(reg2.claimSession(token, "g1", "s1", "u1", "n1").status, "current");
-  now2.value = exp + 1;
-  const expired = reg2.claimSession(token, "g1", "s1", "u1", "n1");
-  assert.equal(expired.status, "new");
-  assert.notEqual(expired.token, token);
-  assert.ok(now2.value <= lastClaim + SESSION_TTL + 1, "resume never after Python cutoff");
+  // 6 h slack: persisted expiry is t0+24h, so the post-eviction floor is about
+  // 18 h. It must never resume after the Python cutoff lastClaim+24h.
+  const exp6 = t0 + SESSION_TTL;
+  assert.equal(probe(6 * 3600, exp6 - 2).status, "current");
+  const expired6 = probe(6 * 3600, exp6);
+  assert.equal(expired6.status, "new");
+  assert.notEqual(expired6.token, expired6.original);
+  assert.ok(exp6 <= lastClaim + SESSION_TTL, "new cutoff never after Python cutoff");
+
+  // 30 min slack: the same sequence resumes later (smaller shortening). Its
+  // persisted write was at lastClaim-1799, so it is still current where 6 h
+  // slack has already expired, but never after lastClaim+24h.
+  assert.equal(probe(1800, t0 + SESSION_TTL).status, "current");
+  assert.equal(probe(1800, t0 + 106_200).status, "new");
+  assert.equal(probe(1800, lastClaim + SESSION_TTL).status, "new");
 });
 
 test("same token across gen changes and retirement survives the larger spacing", () => {
