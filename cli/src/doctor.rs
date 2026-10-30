@@ -472,6 +472,21 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
             ui::paint(Tone::Ok, "reachable"),
             ui::paint(Tone::Dim, &format!("{server} ({} round trip)", fmt_ms(*ms))),
         ),
+        Err(e) if exit_codes::is_certificate_text(e) => {
+            let line = filament_signal::tls::untrusted_line_for(e);
+            let word = if line == filament_signal::tls::NO_TRUST_STORE_LINE {
+                "NO TRUST STORE"
+            } else {
+                "CERTIFICATE NOT TRUSTED"
+            };
+            crate::outln!(
+                "  {:<13} {}  {}",
+                "signaling",
+                ui::paint(Tone::Err, word),
+                ui::paint(Tone::Dim, &format!("{server}: {e}")),
+            );
+            crate::outln!("  {:<13} {}", "", ui::paint(Tone::Warn, line));
+        }
         Err(e) => crate::outln!(
             "  {:<13} {}  {}",
             "signaling",
@@ -576,11 +591,22 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
 }
 
 /// The preflight is healthy when the tunlion server answered; without it
-/// nothing else works, so that is exit 7 rather than 0.
+/// nothing else works, so that is exit 7 rather than 0 (13 when it answered
+/// with a certificate this machine does not trust).
 fn preflight_result(sig: &std::result::Result<u64, String>) -> Result<()> {
     match sig {
         Ok(_) => Ok(()),
-        Err(_) => Err(exit_codes::reported(ExitKind::Network)),
+        Err(e) => Err(exit_codes::reported(signaling_failure_kind(e))),
+    }
+}
+
+/// Why the signaling check failed: an untrusted certificate (13) or, for
+/// anything else, the network (7).
+fn signaling_failure_kind(error: &str) -> ExitKind {
+    if exit_codes::is_certificate_text(error) {
+        ExitKind::TlsCertificate
+    } else {
+        ExitKind::Network
     }
 }
 
@@ -618,7 +644,9 @@ async fn check_signaling(context: &filament_transport::TransportContext, server:
     let start = std::time::Instant::now();
     match crate::net::http_get_json(context, &url).await {
         Ok(_) => Ok(start.elapsed().as_millis() as u64),
-        Err(e) => Err(e.to_string()),
+        // The whole chain: its top is only "GET <url>", and the cause (DNS,
+        // refused, an untrusted certificate) is what decides the verdict.
+        Err(e) => Err(format!("{e:#}")),
     }
 }
 
@@ -836,7 +864,13 @@ fn preflight_json(
 ) -> Value {
     let sig_json = match sig {
         Ok(ms) => json!({ "reachable": true, "round_trip_ms": ms }),
-        Err(e) => json!({ "reachable": false, "error": e }),
+        // `tls_certificate_trusted` is false when the server answered with a
+        // certificate this machine refused, null when it was never reached.
+        Err(e) => json!({
+            "reachable": false,
+            "error": e,
+            "tls_certificate_trusted": if exit_codes::is_certificate_text(e) { json!(false) } else { Value::Null },
+        }),
     };
     let ice_json = match ice {
         IceResult::Ok { srflx, class, ms } => json!({ "works": true, "srflx": srflx, "class": class, "round_trip_ms": ms }),
@@ -871,7 +905,7 @@ fn preflight_json(
         },
     });
     if let Err(e) = sig {
-        v["error"] = verb_error(ExitKind::Network, Some(e));
+        v["error"] = verb_error(signaling_failure_kind(e), Some(e));
     }
     v
 }
@@ -880,9 +914,9 @@ fn preflight_json(
 /// `{"code","exit","message"}`, plus `detail` with the raw cause when there is
 /// one. `doctor` used to put a bare string here.
 fn verb_error(kind: ExitKind, raw: Option<&str>) -> Value {
-    let message = match kind {
-        ExitKind::Network => exit_codes::NETWORK_LINE.to_string(),
-        _ => raw.unwrap_or("the peer did not answer").to_string(),
+    let message = match exit_codes::summary_line(kind, raw.unwrap_or_default()) {
+        Some(line) => line.to_string(),
+        None => raw.unwrap_or("the peer did not answer").to_string(),
     };
     let mut e = json!({ "code": kind.token(), "exit": kind.code(), "message": message });
     if let Some(d) = raw.filter(|d| *d != e["message"].as_str().unwrap_or_default()) {
@@ -984,6 +1018,29 @@ mod tests {
         assert_eq!(single_json("laptop", &up)["error"], Value::Null);
         let v = repeat_json("laptop", &[up, o]);
         assert_eq!(v["error"]["exit"], json!(6));
+    }
+
+    /// Behind a TLS-inspecting proxy, doctor said "UNREACHABLE" and exit 7
+    /// ("no internet or DNS?"). The server answered; its certificate was
+    /// refused. That is 13 with the certificate sentence, for the preflight
+    /// and for a device probe whose signaling step hit it.
+    #[test]
+    fn an_untrusted_certificate_is_its_own_verdict() {
+        let raw = "GET https://x/api/config: error sending request for url (https://x/api/config): client error (Connect): invalid peer certificate: UnknownIssuer";
+        assert_eq!(signaling_failure_kind(raw), ExitKind::TlsCertificate);
+        assert_eq!(signaling_failure_kind("GET https://x/api/config: dns error: failed to lookup address information"), ExitKind::Network);
+        let err = preflight_result(&Err(raw.to_string())).unwrap_err();
+        assert_eq!(exit_codes::classify(&err).code(), 13);
+        let e = verb_error(ExitKind::TlsCertificate, Some(raw));
+        assert_eq!(e["code"], json!("tls_certificate"));
+        assert_eq!(e["exit"], json!(13));
+        assert_eq!(e["message"], json!(exit_codes::CERT_LINE));
+        assert_eq!(e["detail"], json!(raw));
+
+        let mut o = offline("signaling connect to https://x: websocket connect to wss://x: IO error: invalid peer certificate: UnknownIssuer");
+        o.failed_phase = Some(Phase::Signaling);
+        assert_eq!(probe_failure_kind(std::slice::from_ref(&o)), Some(ExitKind::TlsCertificate));
+        assert_eq!(single_json("laptop", &o)["error"]["message"], json!(exit_codes::CERT_LINE));
     }
 
     #[test]

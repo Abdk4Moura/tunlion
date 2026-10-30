@@ -89,6 +89,9 @@ pub(crate) fn more_actions(owner: bool) -> Vec<(&'static str, &'static str)> {
             // An unattended runner is a THIRD thing, not pairing: nobody is there
             // to consent live, so it gets a temporary key.
             ("Key for a CI runner or borrowed machine", "add --for runner"),
+            // The way back from the two entries above: an invitation file that
+            // leaked stays claimable until it runs out, unless withdrawn.
+            ("Withdraw an invitation", "add --withdraw"),
             ("Keep running in the background", "up --install"),
             ("Show this device's identity", "id"),
         ]

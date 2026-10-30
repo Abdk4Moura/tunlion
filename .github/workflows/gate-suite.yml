@@ -309,8 +309,9 @@ jobs:
             # 5: P1 library delivery, P2 CLI receiver exit, P3 inbox bytes,
             # P4 code not logged by the library sender, P5 code path ran.
             [cli/tests/core-send-e2e-gates.sh]=5
-            # 9: H O S A W I G C X (feat/dashboard).
-            [cli/tests/dashboard-gates.sh]=9
+            # 10: H O S A W I G C C2 X (feat/dashboard; C2: the owner holds a
+            # code claimer's certificate).
+            [cli/tests/dashboard-gates.sh]=10
             # 6: A T I C N Z (feat/demo-command: the offline guided tour).
             [cli/tests/demo-gates.sh]=6
             # 3: P1 P2 P3 (fix/pair-ceremony-bystander: a bystander in the room links first).

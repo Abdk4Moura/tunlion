@@ -202,6 +202,98 @@ fn render_device_row(d: &DeviceEntry) -> String {
     line
 }
 
+/// What an invitation was made for, in the words `add` uses. Pure.
+pub fn invitation_kind_word(kind: Option<&str>) -> &'static str {
+    match kind {
+        Some("device") => "your device",
+        Some("person") => "a person",
+        Some("runner") => "runner, temporary",
+        _ => "invitation",
+    }
+}
+
+/// One INVITATIONS row: name, kind, ceiling, uses left, expiry, age. Pure but
+/// for paint.
+pub fn render_invitation_row(o: &crate::armed::Outstanding, now: u64) -> String {
+    format!(
+        "     {} {}",
+        ui::paint(Tone::Warn, ui::glyph_echo()),
+        invitation_row_text(o, now)
+    )
+}
+
+/// The row's text without its indent and glyph, for a picker. Pure but for
+/// paint.
+pub fn invitation_row_text(o: &crate::armed::Outstanding, now: u64) -> String {
+    let allow = match &o.allow {
+        Some(a) if a.is_empty() => "nothing".to_string(),
+        Some(a) => a
+            .iter()
+            .map(|c| if c == "shell" { "OWNER-EQUIVALENT shell".to_string() } else { c.clone() })
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => "ceiling not recorded".to_string(),
+    };
+    let ends = format!(
+        "expires in {}",
+        crate::device_view::remaining_span(o.expires.saturating_sub(now))
+    );
+    let mut line = format!(
+        "{:<16} {:<18} {:<22} {:<22} {}",
+        o.label(),
+        invitation_kind_word(o.kind.as_deref()),
+        allow,
+        o.uses_phrase(),
+        ends
+    );
+    if let Some(made) = o.created {
+        line.push_str(&format!(
+            "  {}",
+            ui::paint(Tone::Dim, &format!("(made {})", crate::reset_hints::ago(now.saturating_sub(made))))
+        ));
+    }
+    line
+}
+
+/// The INVITATIONS section of `devices`: every invitation that can still be
+/// claimed, and the one command that withdraws one. `None` when there are
+/// none, so the section is omitted rather than shown empty. Pure but for
+/// paint.
+pub fn render_invitations(list: &[crate::armed::Outstanding], now: u64) -> Option<String> {
+    if list.is_empty() {
+        return None;
+    }
+    let mut lines = vec![format!(
+        "  {} {}",
+        ui::paint(Tone::Warn, ui::glyph_echo()),
+        ui::header(
+            Tone::Warn,
+            Tone::Dim,
+            "INVITATIONS  /  not used up yet: anyone holding the file can still join"
+        )
+    )];
+    for o in list {
+        lines.push(render_invitation_row(o, now));
+    }
+    lines.push(ui::paint(
+        Tone::Dim,
+        "       withdraw one so it can never be claimed: tunlion add --withdraw <name>",
+    ));
+    lines.push(String::new());
+    Some(lines.join("\n"))
+}
+
+/// Put the INVITATIONS block into a rendered device list: above the closing
+/// "local index" note when the list has one, after it otherwise. Pure.
+pub fn with_invitations(rendered: &str, block: &str) -> String {
+    match rendered.rsplit_once('\n') {
+        Some((body, last)) if last.contains("This is a local index") => {
+            format!("{body}\n{block}\n{last}")
+        }
+        _ => format!("{rendered}\n\n{block}"),
+    }
+}
+
 /// Render the empty devices list.
 pub fn render_empty() -> String {
     format!(
@@ -363,6 +455,63 @@ mod tests {
         assert!(s.contains("PAIRED  /  you can send each other files"), "{s}");
         assert!(!s.contains("EXTERNAL") && !s.contains("other people"), "{s}");
         assert!(s.contains("dovm"), "{s}");
+    }
+
+    fn invitation(name: Option<&str>, kind: &str, total: Option<Option<u64>>, uses: u64) -> crate::armed::Outstanding {
+        crate::armed::Outstanding {
+            key_id: "0123456789abcdef".repeat(4),
+            name: name.map(str::to_string),
+            kind: Some(kind.to_string()),
+            allow: Some(vec!["transfer".into(), "shell".into()]),
+            uses,
+            total,
+            expires: 10_000 + 30 * 86_400,
+            created: Some(10_000 - 3_600),
+        }
+    }
+
+    /// "We need to see all our invites": every outstanding invitation gets a
+    /// row naming who it was for, what it allows, uses left, expiry and age,
+    /// with the one command that takes it back.
+    #[test]
+    fn outstanding_invitations_are_listed_with_the_way_to_withdraw_them() {
+        let list = vec![
+            invitation(Some("ci"), "device", Some(Some(20)), 1),
+            invitation(Some("alice"), "person", Some(None), 0),
+            invitation(None, "runner", None, 2),
+        ];
+        let s = ui::strip_ansi(&render_invitations(&list, 10_000).unwrap());
+        assert!(s.contains("INVITATIONS"), "{s}");
+        let ci = s.lines().find(|l| l.contains(" ci ")).expect("ci row");
+        assert!(ci.contains("your device") && ci.contains("19 of 20 left"), "{ci}");
+        assert!(ci.contains("transfer") && ci.contains("OWNER-EQUIVALENT shell"), "{ci}");
+        assert!(ci.contains("expires in 30d") && ci.contains("made 1h ago"), "{ci}");
+        assert!(s.contains("alice") && s.contains("any number, not used yet"), "{s}");
+        // Unnamed: listed by its id, which `add --withdraw` accepts.
+        assert!(s.contains("(0123456789ab)") && s.contains("2 used"), "{s}");
+        assert!(s.contains("tunlion add --withdraw <name>"), "{s}");
+        assert!(!s.contains('\u{2014}') && !s.contains('\u{2013}'), "no em or en dash: {s}");
+        assert_eq!(render_invitations(&[], 1_000), None, "no section when there are none");
+    }
+
+    #[test]
+    fn the_invitations_block_sits_above_the_closing_note() {
+        let devices = vec![DeviceEntry {
+            name: "laptop".into(),
+            tier: DeviceTier::Fleet,
+            online: Some(true),
+            caps_summary: "files".into(),
+            countdown: String::new(),
+            last_seen: None,
+        }];
+        let list = render_devices(&devices, 0, None);
+        let out = with_invitations(&list, "BLOCK");
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.last().unwrap().contains("This is a local index"), "{out}");
+        assert_eq!(lines[lines.len() - 2], "BLOCK", "{out}");
+        // The empty list has no closing note: the block follows it.
+        let empty = with_invitations(&render_empty(), "BLOCK");
+        assert!(empty.starts_with("No devices yet.") && empty.ends_with("BLOCK"), "{empty}");
     }
 
     #[test]

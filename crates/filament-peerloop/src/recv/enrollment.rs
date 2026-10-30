@@ -21,7 +21,7 @@ use crate::conn::Conn;
 use crate::host::{LogSink, Tone};
 use crate::recv::identity::local_device_cert;
 use crate::recv::store::{
-    sanitize_device_name, DeviceStore, OverlayKey, PRINCIPAL_STATE_LAPSED,
+    sanitize_device_name, DeviceStore, InvitationRefusal, OverlayKey, PRINCIPAL_STATE_LAPSED,
     PRINCIPAL_STATE_REVOKED,
 };
 use anyhow::Result;
@@ -134,6 +134,19 @@ impl EnrollmentService {
                 if now_secs() >= inv.expires {
                     self.log.debug("enroll request auth-key expired");
                     self.deny(&t, "enrollment denied").await;
+                    return;
+                }
+                // Refuse a withdrawn invitation at the first message, so the
+                // joiner hears why without a challenge round. This is the
+                // early answer only; the response handler re-checks under the
+                // use-file lock, which is the decision.
+                if self
+                    .store
+                    .invitation_withdrawn(&hex::encode(inv.enroll_pub), now_secs())
+                    == Ok(true)
+                {
+                    self.log.debug("enroll request refused: invitation withdrawn");
+                    self.deny(&t, InvitationRefusal::Withdrawn.wire_reason()).await;
                     return;
                 }
                 inv.to_auth_key(&owner_pub)
@@ -319,6 +332,30 @@ impl EnrollmentService {
                     }
                 };
 
+                // A claim in flight when the owner withdrew the invitation must
+                // not complete. The use was counted above, under the use-file
+                // lock; a withdrawal that landed after that count is seen here,
+                // before anything is stored or sent. An unreadable file refuses.
+                match self
+                    .store
+                    .invitation_withdrawn(&hex::encode(enroll_pub), now_secs())
+                {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        self.log.debug(
+                            "enroll response refused: invitation withdrawn while the claim was in flight",
+                        );
+                        self.deny(&t, InvitationRefusal::Withdrawn.wire_reason()).await;
+                        return;
+                    }
+                    Err(refusal) => {
+                        self.log.debug(&format!(
+                            "enroll response refused: withdrawal state unreadable ({refusal:?})"
+                        ));
+                        self.deny(&t, refusal.wire_reason()).await;
+                        return;
+                    }
+                }
                 let stored_name = if persistent {
                     match self.store.devices_upsert_atomic(
                         &requested_name,
@@ -500,6 +537,13 @@ mod tests {
         assert_eq!(
             InvitationRefusal::Unverifiable.wire_reason(),
             "enrollment denied"
+        );
+        // PROTOCOL LITERAL. A 0.9.1 joiner prints an unknown reason verbatim
+        // after "enrollment denied: ", so this must stay a sentence that names
+        // the withdrawal; the current joiner matches it exactly.
+        assert_eq!(
+            InvitationRefusal::Withdrawn.wire_reason(),
+            "the owner withdrew this invitation"
         );
     }
 }

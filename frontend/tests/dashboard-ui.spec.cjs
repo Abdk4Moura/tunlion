@@ -16,6 +16,8 @@
 //   9. any screen shows an em dash;
 //  11. the device ladder does not mark the current rung, offers an illegal
 //      move, skips the confirm for a cut off, or omits the undo;
+//  12. an open invitation is not listed with its uses left, or Withdraw
+//      takes effect without a confirm, or sends anything but its id;
 //  10. a paired-but-uncertified device is not named "paired, not yet one of
 //      your devices" with the CLI's one-line fix, or a PAIRED row on a device
 //      with no identity is flagged as if it needed review.
@@ -76,6 +78,10 @@ function seed() {
         moves: [
           { to: 'device', label: 'your device', meaning: '', dir: 'promote', confirm: false, says: [], needs_terminal: true, undo: 'tunlion demote pop-os' },
           { to: 'cut', label: 'cut off', meaning: 'refused on every connection', dir: 'demote', confirm: true, says: ['pop-os is refused on every connection; its open sessions end'], needs_terminal: false, undo: 'tunlion promote pop-os --to paired' }] },
+    ],
+    invitations: [
+      { id: '0123456789ab', name: 'ci', kind: 'device', allow: ['transfer'], uses: 1, maxUses: 20, usesLeft: 19, expires: NOW + 30 * 86400, created: NOW - 3600 },
+      { id: 'abcdef012345', name: 'alice', kind: 'person', allow: ['transfer'], uses: 0, maxUses: 'forever', usesLeft: null, expires: NOW + 86400, created: NOW - 60 },
     ],
     requests: [{ id: 7, peer: 'jane-phone', capability: 'shell', ago: '3m ago' }],
     history: ['2026-10-14 07:13:37 web-vps opened a shell', '2026-10-14 08:15:02 received notes.txt from jane-phone'],
@@ -227,6 +233,27 @@ function startServer() {
   state.data = saved;
   await p.reload();
   await p.getByRole('heading', { name: 'Overview', exact: true }).waitFor({ timeout: 15000 });
+
+  // 12. open invitations: listed with uses left; Withdraw confirms, then
+  // sends the invitation's id and nothing else.
+  await p.getByRole('button', { name: 'Codes and invitations', exact: true }).click();
+  await p.getByTestId('open-invitations').waitFor();
+  const invRows = await p.getByTestId('invitation-row').count();
+  if (invRows !== 2) fail(`open invitations listed ${invRows} rows, want 2`);
+  if (!(await p.getByTestId('open-invitations').getByText('19 of 20 left').count())) fail('an open invitation does not show its uses left');
+  if (!(await p.getByTestId('open-invitations').getByText('any number, not used yet').count())) fail('a reusable invitation does not say it has no count');
+  const n12 = state.acts.length;
+  await p.getByTestId('withdraw').first().click();
+  await p.waitForTimeout(200);
+  if (state.acts.length !== n12) fail('Withdraw took effect without a confirm');
+  if (!(await p.getByText(/Already joined devices are not affected/).count())) fail('the withdraw confirm does not say joined devices are unaffected');
+  await shot('withdraw-confirm'); await noEmDash('withdraw confirm');
+  await p.getByTestId('withdraw-yes').click();
+  await p.waitForTimeout(300);
+  const wd = state.acts[state.acts.length - 1];
+  if (!(wd.verb === 'withdraw' && wd.invite === '0123456789ab' && Object.keys(wd).length === 2)) fail(`withdraw sent ${JSON.stringify(wd)}`);
+  ok('open invitations list uses left; Withdraw confirms and sends only the id');
+  await p.getByRole('button', { name: 'Overview', exact: true }).click();
 
   // 6. invitation shown once
   await p.getByRole('button', { name: 'Codes and invitations', exact: true }).click();

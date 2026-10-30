@@ -305,7 +305,17 @@ pub(crate) async fn add_for_cmd(
     // no bind race, no platform branch, no control channel. The only thing the
     // mint cannot guarantee is that a RECEIVER is actually running to pick the
     // key up - check that, and offer to start one.
-    crate::armed::arm(hex::encode(inv.enroll_pub), inv.expires, _invitee_name.clone(), Some(kind.clone()));
+    crate::armed::arm(
+        hex::encode(inv.enroll_pub),
+        inv.expires,
+        crate::armed::ArmMeta {
+            name: _invitee_name.clone(),
+            kind: Some(kind.clone()),
+            allow: ceiling.clone(),
+            reuse: Some(mint_reuse.clone()),
+            created: identity::now_secs(),
+        },
+    );
     // Make the daemon subscribe the enrollment channel NOW rather than on its next
     // idle tick, so a joiner that arrives within a second (a QR scan, a script) is
     // not left waiting on an empty channel. Measured: ~1.0-1.2 s back-to-back vs
@@ -428,6 +438,16 @@ pub(crate) async fn add_for_cmd(
                 claim_window(&mint_reuse)
             ),
         ));
+        // The way back, said where the risk is said: a leaked file stays
+        // claimable until it runs out unless the owner withdraws it.
+        let who = _invitee_name
+            .as_deref()
+            .map(crate::refusal::word)
+            .unwrap_or_else(|| hex::encode(inv.enroll_pub)[..12].to_string());
+        ui::say(&ui::paint(
+            ui::Tone::Dim,
+            &format!("  To take it back before then:  tunlion add --withdraw {who}"),
+        ));
         // The step a first-time user could not find: they had a file and two
         // machines that share nothing. `join` takes the path positionally.
         let file_name = path
@@ -444,6 +464,148 @@ pub(crate) async fn add_for_cmd(
             ui::Tone::Warn,
             &receiver_not_running_note(crate::platform::ServiceHost::detect().supports_install()),
         ));
+    }
+    Ok(())
+}
+
+/// Devices on record that joined with the invitation ending at `expires`. The
+/// daemon copies the invitation's absolute expiry verbatim into the record's
+/// `principalExpires` (the same match `report_invitation_uptake` uses), so
+/// this names who came in on it. A temporary runner keeps no record, so it is
+/// never listed here.
+pub(crate) fn joined_with(expires: u64) -> Vec<String> {
+    std::fs::read_to_string(devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| d["principalExpires"].as_u64() == Some(expires))
+        .filter_map(|d| d["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// What `add --withdraw` says after a withdrawal. Pure.
+pub(crate) fn withdrawn_lines(o: &crate::armed::Outstanding, joined: &[String]) -> Vec<String> {
+    let used = match o.uses {
+        0 => "never used".to_string(),
+        1 => "used once".to_string(),
+        n => format!("used {n} times"),
+    };
+    let mut lines = vec![format!(
+        "  {} withdrew the invitation for {} ({used}): its key is refused from now on, by the running receiver too",
+        ui::glyph_ok(),
+        o.label(),
+    )];
+    if joined.is_empty() {
+        lines.push("  nothing that joined with it is on record here".to_string());
+    } else {
+        let names = joined.join(", ");
+        lines.push(format!(
+            "  already joined with it, and NOT affected: {names}"
+        ));
+        let first = crate::refusal::word(&joined[0]);
+        lines.push(format!("  to cut one off as well:  tunlion demote {first} --to cut"));
+    }
+    lines
+}
+
+/// `tunlion add --withdraw [NAME|ID]`: disarm outstanding invitations so they
+/// can never be claimed again. Durable and immediate: the refusal lives in the
+/// owner's use file, which every claim reads under its lock, so a running
+/// receiver refuses the next claim without a restart and a restart does not
+/// undo it. Devices that already joined keep their access.
+pub(crate) fn withdraw_cmd(caps: &UiCapability, selector: &str) -> Result<()> {
+    let all = crate::armed::outstanding();
+    let names = || {
+        all.iter().map(|o| o.label()).collect::<Vec<_>>().join(", ")
+    };
+    let picked: Vec<crate::armed::Outstanding> = if selector.trim().is_empty() {
+        if all.is_empty() {
+            if caps.json {
+                ui::json_out(&json!({"ok": true, "verb": "add", "action": "withdraw", "withdrawn": [], "joined": []}));
+            } else {
+                ui::say("  no outstanding invitations here; `tunlion devices` lists them when there are");
+            }
+            return Ok(());
+        }
+        if !caps.interactive {
+            return Err(crate::exit_codes::err(
+                crate::exit_codes::ExitKind::Usage,
+                format!(
+                    "name the invitation to withdraw: `tunlion add --withdraw <name>`. Outstanding: {}",
+                    names()
+                ),
+            ));
+        }
+        let now = identity::now_secs();
+        let rows: Vec<String> = all
+            .iter()
+            .map(|o| crate::fleet_ui::devices::invitation_row_text(o, now))
+            .collect();
+        match codeentry::pick_opts(
+            "WITHDRAW AN INVITATION",
+            &rows,
+            codeentry::PickOpts { collapse: Some(codeentry::Collapse::Erase), ..Default::default() },
+        )? {
+            codeentry::Picked::Item(i) => vec![all[i].clone()],
+            codeentry::Picked::Interrupted => {
+                crate::exit_codes::interrupted_exit(crate::exit_codes::INTERRUPTED)
+            }
+            // Esc backs out with nothing changed, as the promote picker does.
+            _ => return Ok(()),
+        }
+    } else {
+        let hits: Vec<_> = crate::armed::select(&all, selector).into_iter().cloned().collect();
+        if hits.is_empty() {
+            let known = if all.is_empty() {
+                "there are none outstanding".to_string()
+            } else {
+                format!("outstanding: {}", names())
+            };
+            return Err(crate::exit_codes::err(
+                crate::exit_codes::ExitKind::UnknownDevice,
+                format!(
+                    "no outstanding invitation named '{selector}' ({known}). A used-up or expired one cannot be claimed anyway; to cut off a device that joined, `tunlion demote <device> --to cut`."
+                ),
+            ));
+        }
+        hits
+    };
+    let what = if picked.len() == 1 {
+        format!("withdraw the invitation for {} (it can never be claimed again)", picked[0].label())
+    } else {
+        format!(
+            "withdraw {} invitations for {} (none can ever be claimed again)",
+            picked.len(),
+            picked[0].label()
+        )
+    };
+    caps.confirm(&what)?;
+    let mut done = Vec::new();
+    let mut joined_all: Vec<String> = Vec::new();
+    for o in &picked {
+        crate::armed::withdraw(o)?;
+        let joined = joined_with(o.expires);
+        if !caps.json {
+            for line in withdrawn_lines(o, &joined) {
+                ui::say(&line);
+            }
+        }
+        for j in &joined {
+            if !joined_all.contains(j) {
+                joined_all.push(j.clone());
+            }
+        }
+        done.push(o.to_json());
+    }
+    if caps.json {
+        ui::json_out(&json!({
+            "ok": true,
+            "verb": "add",
+            "action": "withdraw",
+            "withdrawn": done,
+            "joined": joined_all,
+        }));
     }
     Ok(())
 }
@@ -899,5 +1061,39 @@ mod reuse_tests {
             "a prompt cancelled before the mint must leave no invitation file"
         );
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod withdraw_tests {
+    use super::withdrawn_lines;
+
+    fn ci() -> crate::armed::Outstanding {
+        crate::armed::Outstanding {
+            key_id: "ab".repeat(32),
+            name: Some("ci".into()),
+            kind: Some("device".into()),
+            allow: Some(vec!["transfer".into()]),
+            uses: 2,
+            total: Some(Some(20)),
+            expires: 10_000,
+            created: Some(1),
+        }
+    }
+
+    /// The withdrawal says what it did, that it holds for the running
+    /// receiver, and that devices already in are NOT cut off, with the
+    /// command that does that.
+    #[test]
+    fn the_withdrawal_names_who_already_joined_and_the_way_to_cut_them_off() {
+        let lines = withdrawn_lines(&ci(), &["ci".into(), "ci-2".into()]).join("\n");
+        let plain = crate::ui::strip_ansi(&lines);
+        assert!(plain.contains("withdrew the invitation for ci (used 2 times)"), "{plain}");
+        assert!(plain.contains("running receiver"), "{plain}");
+        assert!(plain.contains("already joined with it, and NOT affected: ci, ci-2"), "{plain}");
+        assert!(plain.contains("tunlion demote ci --to cut"), "{plain}");
+        assert!(!plain.contains('\u{2014}'), "{plain}");
+        let none = withdrawn_lines(&ci(), &[]).join("\n");
+        assert!(none.contains("nothing that joined with it is on record here"), "{none}");
     }
 }

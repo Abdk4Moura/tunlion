@@ -225,6 +225,17 @@ pub(crate) fn vouch_needs_consent_msg(who: &str, a: &str, b: &str) -> String {
     )
 }
 
+/// The line for [`VouchDecision::Introduce`]. Pure. Two certified devices of
+/// one owner already find and verify each other over the fleet channel (fleet
+/// auto-mesh); the introduction only adds a pair secret between them, so it
+/// must not read as what connects them or what makes them yours.
+pub(crate) fn vouch_introduce_msg(a: &str, b: &str) -> String {
+    format!(
+        "  {a} and {b} are both your devices, so they already connect through the fleet mesh. \
+         This adds a direct pairing between them (files); their certificates stay what makes them yours"
+    )
+}
+
 pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()> {
     match vouch_decision(crate::ladder::facts_for(a).as_ref(), crate::ladder::facts_for(b).as_ref()) {
         VouchDecision::NeedsConsent(who) => {
@@ -236,7 +247,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         VouchDecision::Introduce => {
             ui::say(&ui::paint(
                 ui::Tone::Dim,
-                &format!("  {a} and {b} are both your devices; this gives them a direct pairing (files), their certificates stay what makes them yours"),
+                &vouch_introduce_msg(a, b),
             ));
         }
     }
@@ -579,7 +590,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
 
 #[cfg(test)]
 mod depart_tests {
-    use super::{vouch_decision, vouch_needs_consent_msg, VouchDecision};
+    use super::{vouch_decision, vouch_introduce_msg, vouch_needs_consent_msg, VouchDecision};
 
     fn f(name: &str, kind: crate::ladder::Kind, certified: bool) -> crate::ladder::Facts {
         crate::ladder::Facts {
@@ -610,6 +621,9 @@ mod depart_tests {
         assert_eq!(vouch_decision(Some(&cut), Some(&mine)), VouchDecision::NeedsConsent("old".into()));
         // An unknown name decides nothing here (the lookup below says so).
         assert_eq!(vouch_decision(None, Some(&mine)), VouchDecision::Introduce);
+        let msg = vouch_introduce_msg("laptop", "desk");
+        assert!(msg.contains("already connect through the fleet mesh"), "{msg}");
+        assert!(msg.contains("certificates stay what makes them yours"), "{msg}");
         let msg = vouch_needs_consent_msg("carol", "laptop", "carol");
         assert!(msg.contains("tunlion add --for person --name carol"), "{msg}");
         assert!(msg.contains("tunlion promote carol"), "{msg}");

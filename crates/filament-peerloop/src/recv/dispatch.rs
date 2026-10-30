@@ -1194,6 +1194,9 @@ async fn recv_run(
     // C24: at most one typed claim in flight, a second typed code while one
     // is pending was silently dropped in live use; now it queues a message.
     let mut claim_in_flight = false;
+    // The listening room, released while a typed claim is in flight (see
+    // `Session::release_room_for_claim`) and restored if the claim fails.
+    let mut claim_held_room: Option<String> = None;
     // C29's in-session pairing ceremony (a code typed into, or minted by, the
     // interactive `up` console) is GONE. It claimed a v1 code (`pair-claim`
     // without `v:2`) and then handed a fresh pair secret over a DataChannel
@@ -3075,6 +3078,21 @@ async fn recv_run(
                         // C30: a fresh sid voids everything the server held,
                         // re-assert room + channels on the next tick. Re-fire
                         // the fast-path join/subscribe immediately too.
+                        // A claim sent on the old socket died with it: its
+                        // reply goes to a sid that no longer exists. Take the
+                        // listening room back so this session stays visible,
+                        // and say the code has to be typed again.
+                        if claim_in_flight {
+                            if let Some(held) = claim_held_room.take() {
+                                sess.resume_room(Some(held));
+                                claim_in_flight = false;
+                                paired = false;
+                                log.say(&log.paint(
+                                    Tone::Dim,
+                                    "  the connection to the server dropped while claiming that code; type it again",
+                                ));
+                            }
+                        }
                         sess.invalidate();
                         // The re-subscribe below (and the `sync` emitted by
                         // `sess.tick`) puts every known-device channel back on
@@ -4006,6 +4024,7 @@ async fn recv_run(
             }
             Ev::PairMatched(v) => {
                 claim_in_flight = false;
+                claim_held_room = None; // the desire moves to the matched room
                 let room = v["room"].as_str().unwrap_or_default().to_string();
                 log.say(&format!(
                     "  {} code accepted, joining sender",
@@ -4276,6 +4295,8 @@ async fn recv_run(
                 // a TYPED claim failing must not kill a listening session
                 paired = false;
                 claim_in_flight = false;
+                // Listening again: assert the room released for the claim.
+                sess.resume_room(claim_held_room.take());
                 log.say(&format!(
                     "  {} code rejected: {hint}; still listening",
                     log.paint(Tone::Err, log.glyph_err()),
@@ -9072,6 +9093,11 @@ async fn recv_run(
                         log.say(&format!("  claiming {}...", log.paint(Tone::Brand, &line)));
                         paired = true;
                         claim_in_flight = true;
+                        // Same race #599 fixed for the `join` claimer: assert
+                        // no room we are about to leave. A cadence `sync`
+                        // naming the listening room, handled after the join of
+                        // the matched room, would move us back out.
+                        claim_held_room = sess.release_room_for_claim();
                         sio.emit("pair-claim", json!({ "code": line.to_lowercase() }))
                             .await
                             .ok();

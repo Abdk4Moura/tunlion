@@ -47,9 +47,11 @@ That works today. The rest of this file is what it costs.
    what arrived".
 5. **A way to wait for a peer.** The owner cannot say "block until the runner
    joins". It polls `tunlion devices --json`. That is a loop in every script.
-6. **Cleanup.** A dead box leaves a record the owner must forget, and an
-   invitation cohort has no single "retire this file and stop its renewals"
-   action.
+6. **Cleanup.** A dead box leaves a record the owner must forget. A pool
+   invitation can now be retired in one step: `tunlion devices` lists it with
+   its uses left, and `tunlion add --withdraw <name> -y` makes the file
+   unclaimable at once (the boxes that already joined are unaffected; cut each
+   off with `tunlion demote <box> --to cut -y`).
 7. **Error text for machines.** The exit-code table in
    `cli/skills/tunlion/SKILL.md` is good. What is missing is an exit code for
    "nobody arrived before the deadline" distinct from "the peer went away".

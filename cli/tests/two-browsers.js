@@ -18,10 +18,14 @@ const { chromium } = require('playwright');
     console.log(`[pw] page ${i}: no tiles stuck at connecting`);
   }
   // first browser accepts the CLI's offer
-  const accept = pages[0].getByText('accept', { exact: true }).first();
+  // The offer row's Accept and Save buttons (TransferRow in
+  // frontend/src/ui/Tunlion.jsx), by role and exact label: `exact: true` is
+  // case-sensitive, so the old lowercase 'accept' never matched and the gate
+  // could only time out.
+  const accept = pages[0].getByRole('button', { name: 'Accept', exact: true }).first();
   await accept.waitFor({ timeout: 30000 });
   await accept.click();
-  await pages[0].getByText('save', { exact: true }).first().waitFor({ timeout: 60000 });
+  await pages[0].getByRole('button', { name: 'Save', exact: true }).first().waitFor({ timeout: 60000 });
   console.log('[pw] C18 PASS: transfer completed with a bystander browser present');
   await browser.close();
 })().catch(e => { console.error('[pw] FAILED:', String(e).slice(0,200)); process.exit(1); });

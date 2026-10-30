@@ -6,20 +6,32 @@ for these clients, even if a different provider policy is already installed.
 The CLI's provider installation remains for unrelated dependencies; this is not
 an audit of WebRTC's internal TLS behavior.
 
-Trust is unchanged:
+Trust is one decision, `filament_signal::tls::client_config()`, used by the
+signaling websocket, every HTTPS client (`http::client_builder`) and the
+TURN-over-TLS bridge (`http::turn_tls_config`), so a certificate one of them
+accepts the others accept too. Before this, signaling trusted only the Mozilla
+roots while HTTPS used the platform verifier, so behind a TLS-inspecting proxy
+whose CA was in the OS store the API worked and signaling failed.
 
-* Desktop HTTP uses `rustls-platform-verifier` 0.7.0, the same constructor as
-  reqwest 0.13.4. Android HTTP retains Mozilla roots without needing a Java VM.
-* Signaling uses the same webpki-roots 0.26.11 root set as
-  tokio-tungstenite 0.28.0 (which re-exports the locked 1.0.9 roots).
+* Linux and other non-Apple Unix: `rustls-platform-verifier` 0.7.0 (the
+  system store via rustls-native-certs). `SSL_CERT_FILE` / `SSL_CERT_DIR`
+  replace the default locations, OpenSSL's semantics. With neither set and no
+  system store at all, the Mozilla roots (webpki-roots 1) are used. A set
+  variable that loads nothing fails closed.
+* macOS and Windows: the platform verifier with the certificates from
+  `SSL_CERT_FILE` / `SSL_CERT_DIR` added (`new_with_extra_roots`).
+* Android: the Mozilla roots plus `SSL_CERT_FILE` / `SSL_CERT_DIR`, without
+  needing a Java VM.
 * Certificate/hostname verification and SNI remain enabled. HTTP advertises
   `h2` and `http/1.1`; signaling retains empty ALPN and ordinary plaintext `ws`.
 * Signaling's 20-second budget still wraps the entire TCP/TLS, websocket,
   Engine.IO and Socket.IO sequence.
 
 `http::client_builder()` returns `Result<reqwest::ClientBuilder, rustls::Error>`.
-Failure to initialize the platform verifier is propagated without panicking,
-installing a provider, or substituting a trust/verification fallback. Repository
+Failure to initialize the platform verifier is propagated without panicking or
+installing a provider. The only substitution is the Mozilla roots on a Unix
+machine with no system store and no `SSL_CERT_*` configuration; verification
+itself is never relaxed. Repository
 callers handle both factory and reqwest `build()` errors: public-IP discovery
 returns `None`, telemetry skips its best-effort request, updates propagate the
 error, and configuration fetching retains retries and the TLS error as its cause.
@@ -57,7 +69,14 @@ both absent and distinct installed providers. The HTTPS fixture requires a
 typed rustls certificate-validation source, specifically `UnknownIssuer` on
 Linux/Android; connection resets/refusals are not accepted as certificate errors.
 
+`filament-signal`'s `tls_trust_tests.rs` covers the trust decision end to end:
+a local WSS server with a certificate signed by a private CA is refused as a
+certificate error without configuration, and completes the full Socket.IO
+handshake with `SSL_CERT_FILE` or `SSL_CERT_DIR` naming the CA, each in a fresh
+process. It also covers the `SSL_CERT_*` loader and the classification of
+certificate failures (`tls::certificate_error`, `tls::is_certificate_text`)
+that the CLI turns into exit 13.
+
 The fixtures do not positively validate a publicly trusted WSS chain or
 OS-specific trust-store customization/revocation behavior. Android runtime trust
 requires device coverage; existing Android compilation gates remain unchanged.
-No local Rust compilation, tests or binding generation are part of this change.

@@ -945,11 +945,13 @@ fn strip_ansi(s: &str) -> String {
 }
 
 /// The exit kind for a daemon that died during `up --detach`, read from what
-/// it printed: the network if that is what it said, otherwise "other".
+/// it printed: the network or an untrusted server certificate if that is what
+/// it said, otherwise "other".
 pub(crate) fn detach_failure_kind(tail: &[String]) -> crate::exit_codes::ExitKind {
     let text = tail.join("\n");
     match crate::exit_codes::classify_text(&text) {
         crate::exit_codes::ExitKind::Network => crate::exit_codes::ExitKind::Network,
+        crate::exit_codes::ExitKind::TlsCertificate => crate::exit_codes::ExitKind::TlsCertificate,
         _ => crate::exit_codes::ExitKind::Other,
     }
 }

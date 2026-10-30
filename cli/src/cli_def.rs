@@ -87,6 +87,8 @@ EXIT CODES
   10   up: a daemon is already running with different settings (not applied)
   11   status: no daemon is running for this config directory
   12   a resource on this machine ran out (disk full, quota, open files, memory)
+  13   the tunlion server's TLS certificate was not trusted (a TLS-inspecting
+       proxy, or a missing CA: set SSL_CERT_FILE to your CA bundle)
   130  interrupted (SIGINT); 143 terminated (SIGTERM)
   exec passes the remote command's own exit status through; 127 when the
   command is not on the remote PATH, 126 when it cannot be executed there,
@@ -308,8 +310,10 @@ pub(crate) enum Cmd {
         tunlion add --for runner --out ci.key             one CI box claims it, then it is spent\n  \
         tunlion add --for runner --reuse 5 --out ci.key   up to five boxes claim it\n  \
         tunlion add --for device --out laptop.key         a lasting device; one claim by default\n  \
-        tunlion add --for person --reuse forever --out alice.key  claimable until it expires\n\n\
-        The claiming side always runs:  tunlion join <file>"
+        tunlion add --for person --reuse forever --out alice.key  claimable until it expires\n  \
+        tunlion add --withdraw ci                         the ci invitation can never be claimed again\n\n\
+        The claiming side always runs:  tunlion join <file>\n\
+        Outstanding invitations are listed by:  tunlion devices"
     )]
     Add {
         /// Who you are adding: a name for the device or person. `tunlion add
@@ -371,6 +375,19 @@ pub(crate) enum Cmd {
         /// modes do not diverge.
         #[arg(long, value_name = "WAY")]
         via: Option<String>,
+        /// Withdraw an outstanding invitation so it can never be claimed
+        /// again, here or by the running receiver: the name it was made for,
+        /// or its id from `tunlion devices --json`. At a terminal with no name,
+        /// pick one. Devices that already joined with it keep their access;
+        /// cut one off with `tunlion demote <device> --to cut`.
+        #[arg(
+            long,
+            value_name = "NAME",
+            num_args = 0..=1,
+            default_missing_value = "",
+            conflicts_with_all = ["who", "name", "word", "for_", "allow", "expires", "reuse", "out", "via"]
+        )]
+        withdraw: Option<String>,
     },
     /// Accept: claim a pairing code, or a bounded invitation file.
     ///

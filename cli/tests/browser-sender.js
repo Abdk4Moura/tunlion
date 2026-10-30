@@ -23,8 +23,10 @@ const { chromium } = require('playwright');
 
   await input.setInputFiles(fileA);
   console.log('[pw] sent file A');
-  // First transfer reaches 'complete' in the transfers panel.
-  await page.getByText('complete', { exact: true }).first().waitFor({ timeout: 120000 });
+  // First transfer reaches 'complete' in the transfers panel, which labels
+  // that status 'done' (STATUS_LABEL in frontend/src/ui/Tunlion.jsx). The old
+  // 'complete' text is never rendered, so this step could only time out.
+  await page.getByText('done', { exact: true }).first().waitFor({ timeout: 120000 });
   console.log('[pw] file A complete in browser');
 
   // Human-paced gap — longer than any receiver idle-exit heuristic.
@@ -32,7 +34,7 @@ const { chromium } = require('playwright');
 
   await input.setInputFiles(fileB);
   console.log('[pw] sent file B');
-  await page.getByText('complete', { exact: true }).nth(1).waitFor({ timeout: 120000 });
+  await page.getByText('done', { exact: true }).nth(1).waitFor({ timeout: 120000 });
   console.log('[pw] file B complete in browser');
 
   await browser.close(); // peer-left lets the CLI receiver finish cleanly

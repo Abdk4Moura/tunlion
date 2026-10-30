@@ -76,7 +76,15 @@ pub enum InvitationRefusal {
     AlreadyUsed,
     UseLimitReached,
     Unverifiable,
+    /// The owner withdrew the invitation (`tunlion add --withdraw`). Durable:
+    /// it lives in the same locked file as the use count.
+    Withdrawn,
 }
+
+/// The wire reason for a withdrawn invitation. A 0.9.1 joiner prints any
+/// reason it does not know as `enrollment denied: <reason>`, so this is a
+/// whole sentence that reads correctly there too.
+pub const WITHDRAWN_WIRE_REASON: &str = "the owner withdrew this invitation";
 
 impl InvitationRefusal {
     pub fn wire_reason(self) -> &'static str {
@@ -84,8 +92,19 @@ impl InvitationRefusal {
             InvitationRefusal::AlreadyUsed => "already used",
             InvitationRefusal::UseLimitReached => "use limit reached",
             InvitationRefusal::Unverifiable => "enrollment denied",
+            InvitationRefusal::Withdrawn => WITHDRAWN_WIRE_REASON,
         }
     }
+}
+
+/// One invitation's line in the durable use file, as the owner's listing
+/// needs it: how many claims were admitted and whether it was withdrawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvitationLedgerEntry {
+    pub key_id: String,
+    pub uses: u64,
+    pub expires: u64,
+    pub withdrawn: bool,
 }
 
 /// Terminal principal states written to `principalState` on a device record.
@@ -330,6 +349,29 @@ fn keep_backup(path: &Path) {
     }
 }
 
+/// `keep_backup` for `devices.json`, minus every pair secret this write
+/// removes. The backup is the last good copy for recovering a damaged store,
+/// not an undo: a secret the write drops (a declined remember, a forgotten or
+/// re-keyed device) must not survive beside it in `.bak`, or "nothing stored"
+/// and "forgot" are untrue on disk. A record keeps its place in the backup
+/// while its secret is still held (a rename keeps it), and a record that holds
+/// no secret is kept as it was.
+fn keep_devices_backup(path: &Path, next: &[Value]) {
+    let Ok(raw) = std::fs::read_to_string(path) else { return };
+    let Ok(prev) = serde_json::from_str::<Vec<Value>>(&raw) else { return keep_backup(path) };
+    if prev.is_empty() {
+        return;
+    }
+    let held: std::collections::HashSet<&str> = next.iter().filter_map(|d| d["secret"].as_str()).collect();
+    let kept: Vec<&Value> = prev
+        .iter()
+        .filter(|d| d["secret"].as_str().is_none_or(|s| held.contains(s)))
+        .collect();
+    if let Ok(text) = serde_json::to_string_pretty(&kept) {
+        let _ = secret_write::SecretFile::write_str(&backup_path(path), &text);
+    }
+}
+
 /// Refuse to overwrite a JSON array that no longer parses, then keep a backup.
 fn before_write_json_array(path: &Path) -> io::Result<()> {
     match std::fs::read_to_string(path) {
@@ -569,7 +611,7 @@ impl DeviceStore {
             Err(e) => return Err(anyhow::anyhow!("read devices.json: {e}")),
         };
         let out = f(&mut arr)?;
-        keep_backup(&p);
+        keep_devices_backup(&p, &arr);
         secret_write::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
             .context("atomic write devices.json")?;
         Ok(out)
@@ -1268,6 +1310,34 @@ impl DeviceStore {
         )
     }
 
+    /// Withdraw an outstanding invitation so it can never be claimed again.
+    /// See [`withdraw_invitation_at`].
+    pub fn withdraw_invitation(
+        &self,
+        key_id: &str,
+        expires: u64,
+        now: u64,
+    ) -> std::result::Result<(), InvitationRefusal> {
+        withdraw_invitation_at(&self.root.join(USED_INVITATIONS_FILE), key_id, expires, now)
+    }
+
+    /// Is this invitation withdrawn? `Err` when the file cannot be read: the
+    /// caller decides how to fail (the enrolment path refuses).
+    pub fn invitation_withdrawn(
+        &self,
+        key_id: &str,
+        now: u64,
+    ) -> std::result::Result<bool, InvitationRefusal> {
+        invitation_withdrawn_at(&self.root.join(USED_INVITATIONS_FILE), key_id, now)
+    }
+
+    /// Every unexpired line of the durable use file, for the owner's listing.
+    /// An unreadable file lists nothing (the listing is advisory; admission
+    /// fails closed on its own).
+    pub fn invitation_ledger(&self, now: u64) -> Vec<InvitationLedgerEntry> {
+        invitation_ledger_at(&self.root.join(USED_INVITATIONS_FILE), now).unwrap_or_default()
+    }
+
     /// What to re-invite an expired delegated device with: the ceiling it was
     /// admitted with and the lifetime its invitation granted. Pure over the
     /// record, so the refusal text and the re-invitation cannot drift.
@@ -1458,6 +1528,12 @@ fn parse_invitation_uses(raw: &str) -> std::result::Result<Vec<Value>, Invitatio
                 .get("expires")
                 .and_then(Value::as_u64)
                 .ok_or(InvitationRefusal::Unverifiable)?;
+            // `withdrawn` is optional (older files never wrote it), but when it
+            // is present it must be a boolean: a value this store cannot read
+            // must not be taken as "not withdrawn".
+            if object.get("withdrawn").is_some_and(|w| !w.is_boolean()) {
+                return Err(InvitationRefusal::Unverifiable);
+            }
             if !key_ids.insert(key_id) {
                 // Two counts for one invitation are ambiguous. Refusing is safer
                 // than picking one and overwriting the other (which could reset a
@@ -1501,11 +1577,14 @@ pub fn record_invitation_use_at(
         Err(_) => return Err(InvitationRefusal::Unverifiable),
     };
     entries.retain(|e| e["expires"].as_u64().map_or(true, |x| x > now));
-    let uses = entries
-        .iter()
-        .find(|e| e["keyId"].as_str() == Some(key_id))
-        .and_then(|e| e["uses"].as_u64())
-        .unwrap_or(0);
+    let existing = entries.iter().find(|e| e["keyId"].as_str() == Some(key_id));
+    // A withdrawn invitation is refused before its count is even consulted:
+    // `--reuse forever` has no count to run out, and a bounded one may have
+    // uses left. Withdrawal is the owner's word that none of them remain.
+    if existing.is_some_and(|e| e["withdrawn"].as_bool() == Some(true)) {
+        return Err(InvitationRefusal::Withdrawn);
+    }
+    let uses = existing.and_then(|e| e["uses"].as_u64()).unwrap_or(0);
     admit_invitation_use(uses, reuse)?;
     let next = uses.checked_add(1).ok_or(InvitationRefusal::Unverifiable)?;
     entries.retain(|e| e["keyId"].as_str() != Some(key_id));
@@ -1521,6 +1600,102 @@ pub fn record_invitation_use_at(
     secret_write::SecretFile::write_str(path, &body)
         .map_err(|_| InvitationRefusal::Unverifiable)?;
     Ok(())
+}
+
+fn read_invitation_uses(path: &Path) -> std::result::Result<Vec<Value>, InvitationRefusal> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => parse_invitation_uses(&raw),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(_) => Err(InvitationRefusal::Unverifiable),
+    }
+}
+
+/// Withdraw `key_id` at an explicit path: from now on every claim of it is
+/// refused with [`InvitationRefusal::Withdrawn`], by any process over this
+/// root, across restarts, until the invitation's own expiry (after which it
+/// cannot verify at all, so the line is pruned like a use count).
+///
+/// Runs under the same sidecar lock as [`record_invitation_use_at`], so a
+/// claim and a withdrawal are ordered: a claim either counted before the
+/// withdrawal (and the enrolment path re-checks before it admits anything), or
+/// it reads the withdrawal and is refused. The use count already recorded is
+/// kept, and `expires` is never shortened. An unreadable file is
+/// `Unverifiable` and is left untouched, so the caller can say the withdrawal
+/// did NOT happen rather than overwrite a count.
+pub fn withdraw_invitation_at(
+    path: &Path,
+    key_id: &str,
+    expires: u64,
+    now: u64,
+) -> std::result::Result<(), InvitationRefusal> {
+    if let Some(dir) = path.parent() {
+        create_private_dir_all(dir).map_err(|_| InvitationRefusal::Unverifiable)?;
+    }
+    let _lock = StoreLock::acquire(&invitation_use_lock_path(path))
+        .map_err(|_| InvitationRefusal::Unverifiable)?;
+    let mut entries = read_invitation_uses(path)?;
+    entries.retain(|e| e["expires"].as_u64().map_or(true, |x| x > now));
+    let (uses, kept_expires) = entries
+        .iter()
+        .find(|e| e["keyId"].as_str() == Some(key_id))
+        .map(|e| (e["uses"].as_u64().unwrap_or(0), e["expires"].as_u64().unwrap_or(0)))
+        .unwrap_or((0, 0));
+    entries.retain(|e| e["keyId"].as_str() != Some(key_id));
+    entries.push(json!({
+        "keyId": key_id,
+        "uses": uses,
+        "expires": expires.max(kept_expires),
+        "withdrawn": true,
+        "withdrawnAt": now,
+    }));
+    let body =
+        serde_json::to_string_pretty(&entries).map_err(|_| InvitationRefusal::Unverifiable)?;
+    keep_backup(path);
+    secret_write::SecretFile::write_str(path, &body)
+        .map_err(|_| InvitationRefusal::Unverifiable)?;
+    Ok(())
+}
+
+/// Is `key_id` withdrawn at an explicit path? Read under the same lock as the
+/// writers, so the answer is ordered against a withdrawal in progress.
+pub fn invitation_withdrawn_at(
+    path: &Path,
+    key_id: &str,
+    now: u64,
+) -> std::result::Result<bool, InvitationRefusal> {
+    let _lock = match StoreLock::acquire(&invitation_use_lock_path(path)) {
+        Ok(lock) => lock,
+        // No directory yet means no file: nothing was ever withdrawn here.
+        Err(_) if !path.exists() && path.parent().is_some_and(|d| !d.exists()) => {
+            return Ok(false)
+        }
+        Err(_) => return Err(InvitationRefusal::Unverifiable),
+    };
+    let entries = read_invitation_uses(path)?;
+    Ok(entries.iter().any(|e| {
+        e["keyId"].as_str() == Some(key_id)
+            && e["expires"].as_u64().is_some_and(|x| x > now)
+            && e["withdrawn"].as_bool() == Some(true)
+    }))
+}
+
+/// Every unexpired line of the use file at an explicit path. Read-only.
+pub fn invitation_ledger_at(
+    path: &Path,
+    now: u64,
+) -> std::result::Result<Vec<InvitationLedgerEntry>, InvitationRefusal> {
+    Ok(read_invitation_uses(path)?
+        .iter()
+        .filter_map(|e| {
+            let expires = e["expires"].as_u64()?;
+            (expires > now).then(|| InvitationLedgerEntry {
+                key_id: e["keyId"].as_str().unwrap_or_default().to_string(),
+                uses: e["uses"].as_u64().unwrap_or(0),
+                expires,
+                withdrawn: e["withdrawn"].as_bool() == Some(true),
+            })
+        })
+        .collect())
 }
 
 /// Strip terminal escape sequences and control characters from a device
@@ -2581,6 +2756,32 @@ mod store_guards {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A declined `--remember` and `devices forget` both remove a record; the
+    /// backup written beside that removal held the removed secret, so the
+    /// known-device gate's "nothing stored" was false on disk.
+    #[test]
+    fn a_removed_secret_does_not_survive_in_the_devices_backup() {
+        let root = unique("devbak");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DeviceStore::open(&root);
+        let p = store.devices_path();
+        let (gone, kept) = ("ab".repeat(32), "cd".repeat(32));
+        std::fs::write(&p, serde_json::to_string(&json!([
+            {"name": "declinedev", "secret": gone},
+            {"name": "laptop", "secret": kept},
+            {"name": "browser-only"},
+        ])).unwrap()).unwrap();
+        store.devices_remove("declinedev").unwrap();
+        let bak = std::fs::read_to_string(backup_path(&p)).unwrap();
+        assert!(!bak.contains(&gone) && !bak.contains("declinedev"), "{bak}");
+        assert!(bak.contains(&kept) && bak.contains("browser-only"), "the rest is still the last good copy: {bak}");
+        // A rename keeps the secret, so the record stays restorable.
+        store.with_devices_mut(|arr| { arr[0]["name"] = json!("laptop-2"); Ok(()) }).unwrap();
+        let bak = std::fs::read_to_string(backup_path(&p)).unwrap();
+        assert!(bak.contains(&kept) && bak.contains("\"laptop\""), "{bak}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn cap_store_keeps_a_backup_and_refuses_to_write_over_damage() {
         let root = unique("caps");
@@ -2703,6 +2904,170 @@ mod store_guards {
         assert_eq!(
             store.record_invitation_use("key", &Reuse::Once, 1_000, 10),
             Err(InvitationRefusal::Unverifiable)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ------------------------------------------------ invitation withdrawal --
+
+    #[test]
+    fn a_withdrawn_reusable_invitation_is_refused_and_stays_refused_after_a_restart() {
+        let root = unique("withdraw-reusable");
+        let store = DeviceStore::open(&root);
+        // `--reuse forever`: no count can ever run out, so only withdrawal
+        // stops it. One claim first, the shape the owner reported.
+        assert_eq!(store.record_invitation_use("k", &Reuse::Reusable, 10_000, 100), Ok(()));
+        assert_eq!(store.withdraw_invitation("k", 10_000, 101), Ok(()));
+        assert_eq!(
+            store.record_invitation_use("k", &Reuse::Reusable, 10_000, 102),
+            Err(InvitationRefusal::Withdrawn)
+        );
+        // A restart is a fresh store over the same root: nothing in memory.
+        let reopened = DeviceStore::open(&root);
+        assert_eq!(reopened.invitation_withdrawn("k", 103), Ok(true));
+        assert_eq!(
+            reopened.record_invitation_use("k", &Reuse::Reusable, 10_000, 103),
+            Err(InvitationRefusal::Withdrawn)
+        );
+        // The use already counted is kept, not reset by the withdrawal.
+        let ledger = reopened.invitation_ledger(104);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].uses, 1);
+        assert!(ledger[0].withdrawn);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_withdrawn_bounded_invitation_is_refused_with_uses_left_and_before_any_use() {
+        let root = unique("withdraw-bounded");
+        let store = DeviceStore::open(&root);
+        assert_eq!(store.record_invitation_use("n", &Reuse::N(20), 10_000, 100), Ok(()));
+        assert_eq!(store.withdraw_invitation("n", 10_000, 101), Ok(()));
+        assert_eq!(
+            store.record_invitation_use("n", &Reuse::N(20), 10_000, 102),
+            Err(InvitationRefusal::Withdrawn)
+        );
+        // Never claimed at all: the withdrawal writes a line of its own.
+        assert_eq!(store.invitation_withdrawn("fresh", 100), Ok(false));
+        assert_eq!(store.withdraw_invitation("fresh", 10_000, 100), Ok(()));
+        assert_eq!(
+            store.record_invitation_use("fresh", &Reuse::Once, 10_000, 101),
+            Err(InvitationRefusal::Withdrawn)
+        );
+        // Another invitation is unaffected.
+        assert_eq!(store.record_invitation_use("other", &Reuse::Once, 10_000, 101), Ok(()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_withdrawal_lasts_to_the_signed_end_and_is_never_shortened() {
+        let root = unique("withdraw-expiry");
+        let store = DeviceStore::open(&root);
+        // A use recorded with the signed expiry, then a withdrawal that names a
+        // SHORTER one (a stale or wrong local copy): the line keeps the later
+        // end, so the refusal cannot lapse while the invitation still verifies.
+        assert_eq!(store.record_invitation_use("k", &Reuse::Reusable, 5_000, 100), Ok(()));
+        assert_eq!(store.withdraw_invitation("k", 1_000, 101), Ok(()));
+        assert_eq!(
+            store.record_invitation_use("k", &Reuse::Reusable, 5_000, 4_999),
+            Err(InvitationRefusal::Withdrawn),
+            "one second before the signed end it is still refused"
+        );
+        assert_eq!(store.invitation_withdrawn("k", 4_999), Ok(true));
+        // At the end the invitation itself no longer verifies (the enrolment
+        // path checks that first), and the line is pruned like a count.
+        assert_eq!(store.invitation_withdrawn("k", 5_000), Ok(false));
+        assert!(store.invitation_ledger(5_000).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn counting_another_invitation_keeps_a_withdrawal() {
+        let root = unique("withdraw-keep");
+        let store = DeviceStore::open(&root);
+        assert_eq!(store.withdraw_invitation("gone", 10_000, 100), Ok(()));
+        // Every use rewrites the file; the rewrite must carry the flag along.
+        for t in 0..3 {
+            assert_eq!(store.record_invitation_use("live", &Reuse::Reusable, 10_000, 101 + t), Ok(()));
+        }
+        assert_eq!(
+            store.record_invitation_use("gone", &Reuse::Reusable, 10_000, 200),
+            Err(InvitationRefusal::Withdrawn)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn withdrawal_fails_closed_on_an_unreadable_file() {
+        let root = unique("withdraw-corrupt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(USED_INVITATIONS_FILE), b"{garbage").unwrap();
+        let store = DeviceStore::open(&root);
+        // The withdrawal says it did not happen and leaves the file alone.
+        assert_eq!(
+            store.withdraw_invitation("k", 10_000, 100),
+            Err(InvitationRefusal::Unverifiable)
+        );
+        assert_eq!(
+            std::fs::read(root.join(USED_INVITATIONS_FILE)).unwrap(),
+            b"{garbage"
+        );
+        // And the in-flight check refuses rather than admits.
+        assert_eq!(
+            store.invitation_withdrawn("k", 100),
+            Err(InvitationRefusal::Unverifiable)
+        );
+        // A `withdrawn` this store cannot read is not "not withdrawn".
+        std::fs::write(
+            root.join(USED_INVITATIONS_FILE),
+            br#"[{"keyId":"k","uses":0,"expires":10000,"withdrawn":"yes"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            store.record_invitation_use("k", &Reuse::Reusable, 10_000, 100),
+            Err(InvitationRefusal::Unverifiable)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_root_has_nothing_withdrawn() {
+        let root = unique("withdraw-none");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(DeviceStore::open(&root).invitation_withdrawn("k", 1), Ok(false));
+    }
+
+    #[test]
+    fn a_withdrawal_racing_claims_is_ordered_by_the_lock() {
+        // Many claimers over separate stores on one root (separate processes
+        // in production), one withdrawal in the middle. Every claim that
+        // returned Ok counted BEFORE the withdrawal: none is admitted after it.
+        let root = unique("withdraw-race");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut handles = Vec::new();
+        for i in 0..16u64 {
+            let root = root.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = DeviceStore::open(&root);
+                store.record_invitation_use("race", &Reuse::Reusable, 10_000, 100 + i)
+            }));
+        }
+        {
+            let store = DeviceStore::open(&root);
+            store.withdraw_invitation("race", 10_000, 100).unwrap();
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok = results.iter().filter(|r| r.is_ok()).count() as u64;
+        let ledger = DeviceStore::open(&root).invitation_ledger(0);
+        assert_eq!(ledger.len(), 1);
+        assert!(ledger[0].withdrawn);
+        assert_eq!(ledger[0].uses, ok, "every admitted claim is counted, and none after the withdrawal");
+        for r in &results {
+            assert!(matches!(r, Ok(()) | Err(InvitationRefusal::Withdrawn)), "{r:?}");
+        }
+        assert_eq!(
+            DeviceStore::open(&root).record_invitation_use("race", &Reuse::Reusable, 10_000, 500),
+            Err(InvitationRefusal::Withdrawn)
         );
         let _ = std::fs::remove_dir_all(&root);
     }

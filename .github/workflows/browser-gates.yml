@@ -23,14 +23,71 @@ on:
       - "backend/**"
       - "cli/dashboard-dist/**"
       - ".github/workflows/browser-gates.yml"
+      - "cli/tests/known-device*"
   pull_request:
     paths:
       - "frontend/**"
       - "backend/**"
       - "cli/dashboard-dist/**"
       - ".github/workflows/browser-gates.yml"
+      - "cli/tests/known-device*"
 
 jobs:
+  # Gate 16 of cli/tests/gates.sh: a real Chromium tab consents to remember a
+  # CLI sender and is then found by `send --to` with no code. gates-core runs
+  # gates.sh with SKIP_BROWSER=1, so this gate ran nowhere, and it drove screens
+  # the web app no longer has. It runs here against the CLI main last
+  # published (publish-edge), downloaded and hash-checked, not built: this
+  # workflow does not start for CLI-only changes (scripts/check_ci_paths.py),
+  # and a frontend change is what can break the browser half.
+  known-device:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: The published CLI (no build)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="repos/${GITHUB_REPOSITORY}/actions"
+          run=$(gh api "$api/workflows/publish-edge.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].id')
+          id=$(gh api "$api/runs/${run}/artifacts" --jq '[.artifacts[] | select(.name=="tunlion-edge")][0].id')
+          gh api "$api/artifacts/${id}/zip" > "$RUNNER_TEMP/tunlion.zip"
+          mkdir -p "$RUNNER_TEMP/bin" && unzip -oq "$RUNNER_TEMP/tunlion.zip" -d "$RUNNER_TEMP/bin"
+          ( cd "$RUNNER_TEMP/bin" && sha256sum -c SHA256SUMS )
+          chmod +x "$RUNNER_TEMP/bin/tunlion" && "$RUNNER_TEMP/bin/tunlion" --version
+          echo "TUNLION_BIN=$RUNNER_TEMP/bin/tunlion" >> "$GITHUB_ENV"
+
+      - name: Backend deps
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+
+      # The backend serves frontend/dist to the tab, so it must signal to its
+      # own origin, not production.
+      - name: Same-origin app
+        working-directory: frontend
+        env:
+          VITE_TUNLION_API: ""
+        run: npm ci --no-audit --no-fund && npm run build
+
+      - name: Playwright for the gate
+        working-directory: cli/tests
+        run: npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
+
+      - name: known-device (gate 16)
+        env:
+          TUNLION_TEST_VENV: python3
+        run: bash cli/tests/known-device-gates.sh
+
   gates:
     runs-on: ubuntu-latest
     timeout-minutes: 20

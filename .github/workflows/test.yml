@@ -244,6 +244,12 @@ jobs:
       - name: Test exec child environment (Windows baseline + Node)
         shell: bash
         run: cargo test --release --manifest-path crates/filament-peerloop/Cargo.toml 'shell::exec_server::tests::'
+      # Windows trusts SSL_CERT_FILE / SSL_CERT_DIR by ADDING them to the OS
+      # store (Linux replaces the default locations), so the private-CA
+      # signaling test has a Windows-only arm that runs nowhere else.
+      - name: Test TLS trust (OS store plus SSL_CERT_FILE / SSL_CERT_DIR)
+        shell: bash
+        run: cargo test --release --manifest-path crates/filament-signal/Cargo.toml 'tls::'
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats

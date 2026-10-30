@@ -187,11 +187,41 @@ impl Session {
         let _ = sio.emit(event, payload).await;
     }
 
-    /// Called every loop iteration; cheap no-op most ticks.
-    pub async fn tick(&mut self, sio: &Client) {
-        let Some(room) = self.room.clone() else { return };
-        let now = Instant::now();
-        let due = match (&self.confirmed, &self.last_attempt) {
+    /// A code typed into a listening session is being claimed: stop asserting
+    /// the listening room until the server names the room to join
+    /// (`pair-matched`) or refuses the claim. Returns the room to hand back to
+    /// [`Session::resume_room`] if the claim fails.
+    ///
+    /// While the claim is in flight the next cadence `sync` would still name
+    /// the listening room. The server does not handle one socket's events in a
+    /// guaranteed order, so a `sync` sent just before `pair-matched` arrived
+    /// could be handled AFTER the `join` of the matched room and move the
+    /// claimer back out. Its `synced` ack then confirms the NEW desire, so the
+    /// claimer believes it is in the right room while the sender sees it leave,
+    /// until the next 30 s re-assertion. This is the same race #599 fixed for
+    /// the `join` claimer: assert no room you are about to leave.
+    pub fn release_room_for_claim(&mut self) -> Option<String> {
+        self.touch();
+        self.room.take()
+    }
+
+    /// The claim failed (or the socket was replaced under it): assert the
+    /// listening room again, immediately. A `pair-matched` that already set a
+    /// new room wins; this never overwrites it.
+    pub fn resume_room(&mut self, room: Option<String>) {
+        if self.room.is_none() && room.is_some() {
+            self.room = room;
+            self.touch();
+        }
+    }
+
+    /// Whether the next `tick` puts a `sync` on the wire. A session with no
+    /// desired room sends nothing.
+    fn sync_due(&self, now: Instant) -> bool {
+        if self.room.is_none() {
+            return false;
+        }
+        match (&self.confirmed, &self.last_attempt) {
             // never confirmed: retry on the attempt cadence
             (None, Some(at)) => now.duration_since(*at) >= SYNC_MIN_INTERVAL,
             (None, None) => true,
@@ -204,12 +234,16 @@ impl Session {
                         .map(|a| now.duration_since(a) >= SYNC_MIN_INTERVAL)
                         .unwrap_or(true)
             }
-        };
-        if !due {
+        }
+    }
+
+    /// Called every loop iteration; cheap no-op most ticks.
+    pub async fn tick(&mut self, sio: &Client) {
+        let now = Instant::now();
+        if !self.sync_due(now) {
             return;
         }
         self.last_attempt = Some(now);
-        let _ = room;
         self.emit(sio, "sync", self.sync_payload()).await;
     }
 }
@@ -237,6 +271,38 @@ mod tests {
         let ra: Vec<u64> = (0..8).map(|_| (a.roll() * 1e9) as u64).collect();
         let rb: Vec<u64> = (0..8).map(|_| (b.roll() * 1e9) as u64).collect();
         assert_eq!(ra, rb, "same seed must replay the same drop pattern");
+    }
+
+    /// A typed claim releases the listening room: while it is in flight no
+    /// cadence `sync` can name the room the claimer is about to leave, even
+    /// when that room's confirmation is stale and would otherwise be
+    /// re-asserted. A refused claim brings the room back at once; a
+    /// `pair-matched` room set in the meantime is never overwritten.
+    #[test]
+    fn a_claim_in_flight_asserts_no_room() {
+        let mut s = Session::new("n", "u");
+        s.room = Some("listen".into());
+        assert!(s.sync_due(Instant::now()), "a fresh desire syncs");
+        // Confirmed long ago: the TTL re-assertion is due.
+        s.confirmed = Some((s.desired_digest(), Instant::now() - CONFIRM_TTL * 2));
+        s.last_attempt = Some(Instant::now() - SYNC_MIN_INTERVAL * 2);
+        assert!(s.sync_due(Instant::now()), "a stale confirmation is re-asserted");
+
+        let held = s.release_room_for_claim();
+        assert_eq!(held.as_deref(), Some("listen"));
+        assert!(!s.sync_due(Instant::now()), "no sync may name the room while a claim is in flight");
+        assert_eq!(s.sync_payload()["room"], Value::Null);
+
+        // Refused: the listening room comes back and is asserted immediately.
+        s.resume_room(held.clone());
+        assert_eq!(s.room.as_deref(), Some("listen"));
+        assert!(s.sync_due(Instant::now()));
+
+        // Matched: pair-matched set the new room first; a late resume is a no-op.
+        let held = s.release_room_for_claim();
+        s.room = Some("matched".into());
+        s.resume_room(held);
+        assert_eq!(s.room.as_deref(), Some("matched"));
     }
 
     #[test]

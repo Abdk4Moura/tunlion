@@ -1,11 +1,10 @@
 //! One place every HTTP client is built, so TLS trust is decided once.
 //!
-//! reqwest's rustls backend verifies against the platform's trust store. On
-//! Android that verifier needs a Java VM handed to it at startup, which a plain
-//! executable (what the Android app wraps) does not have, and it panics on the
-//! first HTTPS request. On Android the client therefore carries the Mozilla root
-//! set (webpki-roots) instead, the same roots the signaling websocket already
-//! uses. Every other platform keeps the platform verifier.
+//! The trust itself lives in `filament_signal::tls`, shared with the signaling
+//! websocket and the TURN-over-TLS bridge, so all three accept exactly the same
+//! certificates: the OS trust store plus `SSL_CERT_FILE` / `SSL_CERT_DIR`, and
+//! the Mozilla roots on Android (where the platform verifier needs a Java VM
+//! that a plain executable does not have). See that module for the details.
 
 /// A `reqwest::ClientBuilder` with this platform's TLS trust configured.
 ///
@@ -22,7 +21,7 @@ pub fn client_builder() -> Result<reqwest::ClientBuilder, rustls::Error> {
 }
 
 fn tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
-    let mut cfg = trusted_tls_config()?;
+    let mut cfg = filament_signal::tls::client_config()?;
     // reqwest preserves preconfigured ALPN. Match its default HTTP/2 + HTTP/1.1
     // configuration rather than silently losing HTTP/2 on desktop.
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -32,26 +31,7 @@ fn tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
 /// The same trust decision as every HTTPS client, with no ALPN: for the
 /// TURN-over-TLS bridge (`turn_bridge`), which speaks STUN framing, not HTTP.
 pub(crate) fn turn_tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
-    trusted_tls_config()
-}
-
-fn trusted_tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()?;
-    #[cfg(target_os = "android")]
-    let builder = builder.with_root_certificates(rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    });
-    // This is the same verifier (and constructor) used by reqwest 0.13.4.
-    // `dangerous` selects a custom verifier API, not relaxed verification.
-    #[cfg(not(target_os = "android"))]
-    let builder = builder
-        .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(
-            rustls_platform_verifier::Verifier::new(provider)?,
-        ));
-    Ok(builder.with_no_client_auth())
+    filament_signal::tls::client_config()
 }
 
 #[cfg(test)]

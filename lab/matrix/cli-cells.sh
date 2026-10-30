@@ -86,10 +86,15 @@ c_pair_invite() {  # laptop invites server into its devices with a file
 c_pair_code() {    # laptop offers a spoken code at a TTY; third claims it
   tm_new mxa $L
   tm_keys mxa 'tunlion add third' Enter; sleep 3; tm_keys mxa Enter
-  tm_wait mxa 'one claim' 20 || return 1
+  # The code screen's last line (pair_cmd.rs, PairOk): "works once · 10 min".
+  tm_wait mxa 'works once' 20 || return 1
   local code; code=$(tm_cap mxa | code_in); echo "code=$code"; [ -n "$code" ] || return 1
   x $T <<<"tunlion join $code" || { tm_cap mxa; return 1; }
-  tm_wait mxa 'remembered|verified end-to-end' 30 || return 1
+  # `add third` names one of this owner's devices, so the ceremony must end
+  # enrolled (enrolled_final_line), not as a plain pairing ("remembered on both
+  # devices") and not merely at "Verified end to end", which is a step, not
+  # the end.
+  tm_wait mxa 'Done\. third is one of your devices' 30 || return 1
   x $T <<<'tunlion up --detach'
   sleep 3; x $L <<<'tunlion devices --json' | keep '"third"' || return 1
   x $T <<<'tunlion devices --json' | keep '"laptop"'
@@ -249,9 +254,14 @@ c_forget_readd() {
   x $T <<<'tunlion send rv.txt --to laptop'; local rc=$?; [ $rc -ne 0 ] || { echo "forgotten device still accepted"; return 1; }
   tm_new mxa $L
   tm_keys mxa 'tunlion add third' Enter; sleep 3; tm_keys mxa Enter
-  tm_wait mxa 'one claim' 20 || return 1
+  tm_wait mxa 'works once' 20 || return 1
   local code; code=$(tm_cap mxa | code_in | tail -1); echo "code=$code"
   x $T <<<"tunlion join $code"; want_exit 0 $? "re-add after forget" || { tm_cap mxa; return 1; }
+  # third still holds this owner's certificate, so the owner re-admits it as
+  # one of its devices (render_same_person_success: "third connected · your
+  # devices"), after saying the forget's block on its key was lifted.
+  tm_wait mxa 'this pairing re-admits it' 30 || return 1
+  tm_wait mxa 'third connected .{1,3} your devices' 5 || return 1
   sleep 4; x $T <<<'tunlion send rv.txt --to laptop'; want_exit 0 $? "send after re-add"
 }
 c_invite_expiry() {  # a person with transfer+shell for 2 minutes: cut off on time, live session included

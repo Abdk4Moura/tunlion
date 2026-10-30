@@ -47,6 +47,7 @@ the exit codes that command can return.
 | 10 | | `up`: a daemon already runs with different settings | run `tunlion down -y` first only if the user wants the new settings |
 | 11 | | `status`: no daemon running | start one with `tunlion up --detach` if the task needs it |
 | 12 | `local_resource` | disk, quota, open files or memory ran out here | stop and report |
+| 13 | `tls_certificate` | the tunlion server's TLS certificate was not trusted (a TLS-inspecting proxy, or a missing CA) | stop; tell the user to set `SSL_CERT_FILE` to their CA bundle |
 | 126 / 127 | | `exec`: remote command not executable / not on PATH | fix the command name or path |
 | 130 / 143 | | interrupted / terminated | report; do not retry automatically |
 | 141 | | output closed early (`| head`) | expected for piped reads |
@@ -73,12 +74,18 @@ history. `TUNLION_INVITE` is accepted as a second environment name. Without an
 identity and without a key, `up` still exits 9.
 
 To mint the key on the owner, see `tunlion add --for runner --reuse N --out`.
+Every invitation that can still be claimed is listed by `tunlion devices --json`
+under `data.invitations` (name, kind, allow, uses, usesLeft, maxUses, expires,
+id). `tunlion add --withdraw <name> -y` takes one back: from then on the owner
+refuses every claim with it (`--json` reports what was withdrawn). Devices
+that already joined with it keep their access; cut one off with
+`tunlion demote <device> --to cut -y`.
 
 ### Check what is available
 
 ```bash
 tunlion status --json           # is the daemon up on this machine (exit 11 if not)
-tunlion devices --json          # paired devices and their names
+tunlion devices --json          # paired devices, their names, open invitations
 tunlion reach <device> --json   # reachable? direct or relay, and rtt
 ```
 
