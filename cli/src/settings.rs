@@ -1081,7 +1081,8 @@ pub async fn run_set(
     match (key, value) {
         (None, _) => {
             if crate::set_menu::opens_menu(peers.is_empty(), json_out, crate::set_menu::Terminal::now()) {
-                crate::set_menu::run(dry_run).await
+                // Boxed: the menu applies changes through run_set again.
+                Box::pin(crate::set_menu::run(dry_run)).await
             } else {
                 readout(json_out)
             }
@@ -1100,7 +1101,7 @@ pub async fn run_set(
                 _ => bail!("read one device's value at a time: tunlion set {} --peer <device>", s.key),
             };
             if crate::set_menu::opens_menu(peer.is_none(), json_out, crate::set_menu::Terminal::now()) {
-                crate::set_menu::edit_one(s, dry_run).await
+                Box::pin(crate::set_menu::edit_one(s, dry_run)).await
             } else {
                 run_get(s.key, peer, false, None, json_out)
             }
