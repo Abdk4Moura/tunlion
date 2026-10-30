@@ -112,7 +112,12 @@ topo_lan() {
   nsx lanB ip addr add 10.77.0.2/24 dev lB; nsx lanB ip link set lB up
   nsx lanM ip addr add 10.77.0.3/24 dev lM; nsx lanM ip link set lM up
 }
-move_lan() { nsx lanB ip addr del 10.77.0.2/24 dev lB; nsx lanB ip addr add 10.77.0.9/24 dev lB; }
+# Both sides move: no remembered address on the switch is right any more, so
+# only a beacon can bring them together.
+move_lan() {
+  nsx lanA ip addr del 10.77.0.1/24 dev lA; nsx lanA ip addr add 10.77.0.8/24 dev lA
+  nsx lanB ip addr del 10.77.0.2/24 dev lB; nsx lanB ip addr add 10.77.0.9/24 dev lB
+}
 
 TUNNEL=""
 topo_wg() {
@@ -134,7 +139,12 @@ topo_wg() {
   nsx lanB ip addr add 10.99.0.2/24 dev wg0; nsx lanB ip link set wg0 up
   echo "tunnel: $TUNNEL"
 }
-move_wg() { nsx lanB ip addr del 10.99.0.2/24 dev wg0; nsx lanB ip addr add 10.99.0.7/24 dev wg0; }
+# Both ends renumber: only the unicast sweep of the tunnel prefix can find
+# the peer (no multicast, no ARP on a point-to-point tunnel).
+move_wg() {
+  nsx lanA ip addr del 10.99.0.1/24 dev wg0; nsx lanA ip addr add 10.99.0.6/24 dev wg0
+  nsx lanB ip addr del 10.99.0.2/24 dev wg0; nsx lanB ip addr add 10.99.0.7/24 dev wg0
+}
 
 topo_routed() { forward_all; }
 move_routed() { :; }
@@ -252,6 +262,8 @@ run_scenario() {
   [ "$name" = lan ] && capture_start 100
   start_daemons
   if line=$(reach_lan 90); then ok "$name/reach-lan: $line"; else bad "$name/reach-lan: no lan link with the server blocked ($line)"; fi
+  # Evidence of how they met: the daemons' own lines.
+  grep -h "lan: \(linked to\|accepted\)" "$WORK/upA.log" "$WORK/upB.log" | sed 's/^/  evidence: /' | head -4
   head -c 300000 /dev/urandom > "$WORK/payload-$name.bin"
   chmod a+r "$WORK/payload-$name.bin"
   out=$(asA timeout 90 "$BIN" --server "http://10.88.1.254:$PORT" send "$WORK/payload-$name.bin" --to boxb --timeout 60 2>&1); rc=$?

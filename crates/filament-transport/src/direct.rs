@@ -1521,7 +1521,10 @@ impl Transport for DirectTransport {
     fn remote_addr(&self) -> Option<std::net::SocketAddr> {
         // The actual UDP 5-tuple this direct link is pinned to (post hole-punch
         // this is the punched peer address, like what `tailscale ping` prints).
-        Some(self.conn.remote_address())
+        // Canonical: a dual-stack endpoint (the lan listener) sees IPv4 peers
+        // as `::ffff:a.b.c.d`, which would read as an IPv6 path.
+        let a = self.conn.remote_address();
+        Some(std::net::SocketAddr::new(a.ip().to_canonical(), a.port()))
     }
 
     fn rtt_ms(&self) -> Option<u64> {
