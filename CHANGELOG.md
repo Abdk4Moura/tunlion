@@ -13,7 +13,7 @@ release build failed and nothing was published under it.
 
 ## [Unreleased]
 
-## [0.9.2] - 2026-10-29
+## [0.9.2] - 2026-10-30
 
 ### Added
 
@@ -35,7 +35,6 @@ release build failed and nothing was published under it.
   dashboard. Someone claiming a withdrawn invitation is told the owner
   withdrew it; a 0.9.1 joiner sees `enrollment denied: the owner withdrew
   this invitation`.
-
 - Devices certified by your owner key now reach each other without pairing.
   `tunlion reach <device>` works between two of your devices that were each
   added to your mesh but never paired with each other, over the link their
@@ -66,13 +65,6 @@ release build failed and nothing was published under it.
 - The CLI relays over TURN on TCP and on TLS port 443 when UDP is blocked, as
   the browser already did, so a CLI behind a UDP-blocking firewall still
   connects.
-- `tunlion devices` lists every invitation that can still be claimed (who it
-  is for, what it allows, uses left, when it expires), and `devices --json`
-  has them as `data.invitations`. `tunlion add --withdraw <name|id>` takes one
-  back at once, also across restarts and for a claim already in flight;
-  devices that already joined are not affected. With no name at a terminal it
-  opens a picker; it is also under More, in the promote picker and on the
-  dashboard ("Open invitations").
 
 ### Changed
 
@@ -103,11 +95,6 @@ release build failed and nothing was published under it.
   running the old binary, matched to how it was started, on Windows too.
   `status` and `down` keep recognising that service after the update.
 - Installer and CLI output no longer use em dashes.
-- Signaling and TURN over TLS trust the operating system's certificate store
-  and `SSL_CERT_FILE` / `SSL_CERT_DIR`, as the other HTTPS requests already
-  did, so a TLS-inspecting proxy whose CA is installed no longer breaks
-  pairing. An untrusted certificate exits 13 with its own message instead of
-  "no internet or DNS?".
 
 ### Fixed
 
@@ -138,9 +125,6 @@ release build failed and nothing was published under it.
   report the real state.
 - Windows: `install.ps1` installs over a running `tunlion.exe` and restarts the
   background service it stopped.
-
-### Fixed
-
 - Behind a proxy that inspects TLS, signaling now trusts the same certificates
   as tunlion's other connections: the operating system's trust store, plus
   `SSL_CERT_FILE` / `SSL_CERT_DIR`. Previously only the built-in Mozilla roots
