@@ -28,6 +28,14 @@
 # wedged after this gate exits. The wrapper/parent keeps its own copy.
 exec 3>&- 2>/dev/null || true
 
+# Same launcher helper as main a2b18cb0 (vendored byte-for-byte; provenance in
+# the commit message). The top-level fd 3 close above is retained from #642 for
+# the worker lease boundary; the helper closes fd 3/fd 9 for the backend child.
+FIXTURE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=cli/tests/lib/backend.sh
+source "$FIXTURE_LIB_DIR/backend.sh"
+unset FIXTURE_LIB_DIR
+
 # --- assertion bookkeeping ---
 PASS=0; FAIL=0; FAILED=""
 say() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
@@ -97,6 +105,7 @@ declare_known_red_summary() {
 FIX_PIDS=()
 fixture_cleanup() {
   local p
+  backend_stop "${BACKEND_PID:-}"
   for p in "${FIX_PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
   for p in "${FIX_PIDS[@]:-}"; do
     for _ in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
@@ -106,17 +115,17 @@ fixture_cleanup() {
 }
 
 # Start the fixture signaling backend on $PORT and block until healthy.
-# `exec` makes the recorded PID the backend itself, not the wrapping subshell:
-# killing the subshell used to leave python app.py running. The two known
-# inherited lock descriptors are closed for the backend (fd 3 worker wrapper,
-# fd 9 cargo-locked) so it cannot keep the build queue wedged.
+# backend_start execs the interpreter, so the recorded PID is the backend
+# itself; killing the old wrapper subshell left python app.py running. The
+# backend child closes fd 3 (worker wrapper) and fd 9 (cargo-locked); the gate
+# keeps its own descriptors and #642's lease boundary above.
 start_backend() {
   for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
   sleep 1
-  ( cd "$CLI_DIR/../backend" && exec env PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
-      FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
-      "$PYV" app.py ) >"$WORK/backend.log" 2>&1 3>&- 9>&- &
-  FIX_PIDS+=($!)
+  backend_start "$CLI_DIR/../backend" "$PYV" "$WORK/backend.log" \
+    PORT="$PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+    FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25
+  FIX_PIDS+=("$BACKEND_PID")
   for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
   curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat "$WORK/backend.log"; exit 2; }
   [ -x "$BIN" ] || { echo "build first: (cd $CLI_DIR && cargo build --release)"; exit 2; }

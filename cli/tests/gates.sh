@@ -24,6 +24,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
+# shellcheck source=cli/tests/lib/backend.sh
+source "$HERE/lib/backend.sh"
 # Correctness gates build DEBUG by default (~20s incremental) instead of the LTO
 # release build (~4min) -- these gates verify BEHAVIOUR via the TUNLION_TEST_*
 # hooks, not throughput, so they don't need release codegen. Set
@@ -138,7 +140,7 @@ wait_code() {
   return 1
 }
 pids=()
-cleanup() { for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null; done; [ -n "${OWN_BACKEND:-}" ] && kill "$OWN_BACKEND" 2>/dev/null; }
+cleanup() { backend_stop "${BACKEND_PID:-}"; for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null; done; [ -n "${OWN_BACKEND:-}" ] && kill "$OWN_BACKEND" 2>/dev/null; }
 trap cleanup EXIT
 
 # Determinism: the suite owns its OWN fixture backend with the claim
@@ -169,9 +171,10 @@ if [ -z "${TUNLION_TEST_SERVER:-}" ] && [ -x "$PYV0" ]; then
   sleep 1
   # FIL_PING_TIMEOUT high: a CPU-starved headless browser stays connected
   # instead of dropping → reconnecting → triggering the stale-answer glare.
-  ( cd "$CLI_DIR/../backend" && PORT=8077 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 FIL_CLAIM_LIMIT=1000000 \
-      FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 "$PYV0" app.py >"$WORK/fixture-backend.log" 2>&1 ) &
-  OWN_BACKEND=$!
+  backend_start "$CLI_DIR/../backend" "$PYV0" "$WORK/fixture-backend.log" \
+    PORT=8077 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+    FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25
+  OWN_BACKEND=$BACKEND_PID
   for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
 fi
 curl -fsS "$SERVER/api/health" >/dev/null || {
@@ -543,9 +546,10 @@ VENV_PY="$PYV0"
 say "12: browser with 64 KiB prod framing -> CLI (C1)"
 if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ] && [ -x "$VENV_PY" ]; then
   kill_port 8079; sleep 1
-  ( cd "$CLI_DIR/../backend" && PORT=8079 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 FIL_CHUNK_SIZE=65536 FIL_CLAIM_LIMIT=1000000 \
-      FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 "$VENV_PY" app.py >"$WORK/g12-backend.log" 2>&1 ) &
-  BK12=$!; pids+=($BK12); sleep 4
+  backend_start "$CLI_DIR/../backend" "$VENV_PY" "$WORK/g12-backend.log" \
+    PORT=8079 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 FIL_CHUNK_SIZE=65536 \
+    FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25
+  BK12=$BACKEND_PID; pids+=($BK12); sleep 4
   D="$WORK/g12"; mkdir -p "$D"
   FA="$WORK/g12-a.bin"; FB="$WORK/g12-b.bin"
   head -c $((4 * 1024 * 1024)) /dev/urandom > "$FA"; head -c $((1024 * 1024)) /dev/urandom > "$FB"
@@ -579,9 +583,9 @@ if [ $WITH_RELAY -eq 1 ] && [ -x "$PYV0" ] && command -v docker >/dev/null 2>&1;
         --static-auth-secret="$TS" --realm=tunlion.test --no-tls --no-dtls \
         --allow-loopback-peers --cli-password=x 2>/dev/null)
   VENV_PY="$PYV0"
-  ( cd "$CLI_DIR/../backend" && PORT=8078 FIL_TURN_HOST="turn:127.0.0.1:3478" FIL_TURN_SECRET="$TS" \
-      "$VENV_PY" app.py >"$WORK/g10-backend.log" 2>&1 ) &
-  BK=$!; pids+=($BK); sleep 4
+  backend_start "$CLI_DIR/../backend" "$VENV_PY" "$WORK/g10-backend.log" \
+    PORT=8078 FIL_TURN_HOST="turn:127.0.0.1:3478" FIL_TURN_SECRET="$TS"
+  BK=$BACKEND_PID; pids+=($BK); sleep 4
   # A TURN server that is not running makes every relay assertion below
   # meaningless, so say that instead of blaming the product.
   [ -n "$CT" ] && [ "$(docker inspect -f '{{.State.Running}}' "$CT" 2>/dev/null)" = "true" ] \

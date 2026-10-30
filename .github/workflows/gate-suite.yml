@@ -130,6 +130,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'cli/tests/lib/fixture.sh'
+      - 'cli/tests/lib/backend.sh'
+      - 'cli/tests/fixture-cleanup-gates.sh'
       - 'cli/tests/cap-verbs-gates.sh'
       - 'cli/tests/devices-write-race-gates.sh'
       - 'cli/tests/roster-gates.sh'
@@ -271,6 +273,9 @@ jobs:
             [cli/tests/net-blockers-gates.sh]=14
             [cli/tests/daemon-path-gates.sh]=7
             [cli/tests/worker-lifecycle-gates.sh]=17
+            # 14: cache cleanup regressions: central fixture normal/failure,
+            # a real inline gate normal/failure, cargo-locked fd 9, PID reuse.
+            [cli/tests/fixture-cleanup-gates.sh]=14
             # 7: R1 R2 K F1 P F2 X (fix/state-ux-blockers).
             [cli/tests/state-ux-gates.sh]=7
             # 6: U N A M R S (fix/rc-polish, the RC lab verification).
@@ -304,6 +309,7 @@ jobs:
           # (`bash x`, `python3 x`) -- this precheck is stricter than the registry.
           rc=0
           for g in cli/tests/cap-verbs-gates.sh \
+                   cli/tests/fixture-cleanup-gates.sh \
                    cli/tests/devices-write-race-gates.sh \
                    cli/tests/roster-gates.sh \
                    cli/tests/shell-gates.sh \
