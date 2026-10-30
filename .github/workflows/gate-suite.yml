@@ -68,6 +68,11 @@
 #                              exec and refuses a send as "not recognized"
 #                              (exit 4) instead of "link died" / 60 s of waiting
 #                              (iptables + a small tmpfs, so it uses sudo)
+#   worker-lifecycle-gates.sh  a bounded worker lease notices a dead daemon with
+#                              three bounded status probes, an idle lease stays
+#                              up to its deadline, and a gate backend records
+#                              its own PID, does not inherit the build lock, and
+#                              is gone after cleanup (a later flock -n succeeds)
 #   state-ux-gates.sh          --remember is refused where it cannot apply, a
 #                              runner key has one claim verb, a forgotten device
 #                              added again is re-admitted and told so, restore
@@ -140,6 +145,10 @@ on:
       - 'cli/tests/scripting-contract-gates.sh'
       - 'cli/tests/net-blockers-gates.sh'
       - 'cli/tests/daemon-path-gates.sh'
+      - 'cli/tests/worker-lifecycle-gates.sh'
+      - 'scripts/ci-worker-liveness.sh'
+      - 'scripts/cargo-locked.sh'
+      - '.github/workflows/ci-dogfood.yml'
       - 'cli/tests/state-ux-gates.sh'
       - 'cli/tests/rc-polish-gates.sh'
       - 'cli/tests/concurrent-code-gates.sh'
@@ -261,6 +270,7 @@ jobs:
             [cli/tests/scripting-contract-gates.sh]=11
             [cli/tests/net-blockers-gates.sh]=14
             [cli/tests/daemon-path-gates.sh]=7
+            [cli/tests/worker-lifecycle-gates.sh]=17
             # 7: R1 R2 K F1 P F2 X (fix/state-ux-blockers).
             [cli/tests/state-ux-gates.sh]=7
             # 6: U N A M R S (fix/rc-polish, the RC lab verification).
@@ -280,6 +290,7 @@ jobs:
           declare -A BOUND=(
             [cli/tests/warm-hold-idle-gates.sh]=420
             [cli/tests/daemon-path-gates.sh]=420
+            [cli/tests/worker-lifecycle-gates.sh]=180
           )
           # MODE MATTERS HERE, and it is not a formality: `[ -x "$g" ]` below
           # fails the gate when the file is not executable, which is how this
@@ -307,6 +318,7 @@ jobs:
                    cli/tests/scripting-contract-gates.sh \
                    cli/tests/net-blockers-gates.sh \
                    cli/tests/daemon-path-gates.sh \
+                   cli/tests/worker-lifecycle-gates.sh \
                    cli/tests/state-ux-gates.sh \
                    cli/tests/rc-polish-gates.sh \
                    cli/tests/concurrent-code-gates.sh \
