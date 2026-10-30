@@ -1,6 +1,10 @@
 // Local SQLite benchmark for the storage defaults. Not part of npm test:
 //   node test/storage_bench.mjs [sessions]
 // Counts are local statement/row counts, not Cloudflare billed analytics.
+// Cascade uses Registry.unsubscribeAll/remove, the same methods the hub calls,
+// so it includes the cold-heap loadSubs/loadMembers reads on the first evicted
+// sid. Subscriptions per sid is a benchmark parameter, not a bound: the hub
+// unions across calls and does not cap a sid's total fan-out.
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import ts from "typescript";
@@ -38,7 +42,7 @@ function counted(db) {
   };
 }
 
-function seed(n) {
+function seed(n, subsPerSid = 2) {
   const db = new DatabaseSync(":memory:");
   db.exec("CREATE TABLE sessions (token TEXT PRIMARY KEY, sid TEXT, gen TEXT, uid TEXT, name TEXT, last_seen REAL NOT NULL, exp REAL NOT NULL)");
   db.exec("CREATE INDEX sessions_exp ON sessions (exp)");
@@ -54,7 +58,7 @@ function seed(n) {
   for (let i = 0; i < n; i++) {
     ins.run(`tok${i}`, `sid${i}`, "g", "u", "n", 1_000, 1_000 + 3600);
     mem.run(`sid${i}`, `room${i}`, "n", "u", "g");
-    sub.run(`ch${i}`, `sid${i}`);
+    for (let c = 0; c < subsPerSid; c++) sub.run(`ch${i}-${c}`, `sid${i}`);
   }
   db.exec("COMMIT");
   return db;
@@ -74,10 +78,12 @@ for (const batch of [64, 256, 1024]) {
   const pruneWritten = sql.c.rowsWritten;
   const pruneRead = sql.c.rowsRead;
   const pruneStatements = sql.c.statements;
-  // What the hub does for each evicted sid, with the same counting wrapper.
+  // The actual hub cleanup: channelGoodbye -> unsubscribeAll (PK deletes per
+  // channel, plus the cold-heap loadSubs read) then leaveRoom -> remove
+  // (member delete, plus the cold-heap loadMembers read).
   for (const sid of v.evicted) {
-    sql.exec("DELETE FROM members WHERE sid = ?", sid);
-    sql.exec("DELETE FROM subs WHERE sid = ?", sid);
+    reg.unsubscribeAll(sid);
+    reg.remove(sid);
   }
   const plan = db
     .prepare("EXPLAIN QUERY PLAN SELECT token, sid FROM sessions WHERE exp <= ? ORDER BY exp LIMIT ?")
@@ -90,7 +96,33 @@ for (const batch of [64, 256, 1024]) {
     pruneRowsRead: pruneRead, pruneRowsWritten: pruneWritten, pruneStatements,
     cascadeRowsWritten: sql.c.rowsWritten - pruneWritten,
     cascadeStatements: sql.c.statements - pruneStatements,
-    evicted: v.evicted.length, plan,
+    subscriptionsPerSid: subsPerSid, evicted: v.evicted.length, plan,
+  });
+  db.close();
+}
+// One example of a large per-sid fan-out, not a worst-case bound: the hub
+// unions subscriptions across calls and MAX_CHANNELS does not cap the total.
+{
+  const fan = 64;
+  const n = 1000;
+  const db = seed(n, fan);
+  const alive = new Set();
+  const now = { value: 1000 + 7200 };
+  const sql = counted(db);
+  const reg = new Registry(sql, (s) => alive.has(s), "", () => now.value, n + 10, 6 * 3600, 64, 64);
+  sql.c.rowsRead = sql.c.rowsWritten = sql.c.statements = 0;
+  const t = performance.now();
+  const v = reg.claimSession(null, "gx", "new", "u", "n");
+  const pruneWritten = sql.c.rowsWritten;
+  for (const sid of v.evicted) {
+    reg.unsubscribeAll(sid);
+    reg.remove(sid);
+  }
+  out.push({
+    kind: "prune-fanout", subscriptionsPerSid: fan, sessions: n, batch: 64,
+    ms: +(performance.now() - t).toFixed(2), rowsRead: sql.c.rowsRead,
+    rowsWritten: sql.c.rowsWritten, registryRowsWritten: pruneWritten,
+    cascadeRowsWritten: sql.c.rowsWritten - pruneWritten, evicted: v.evicted.length,
   });
   db.close();
 }
@@ -122,8 +154,8 @@ for (const scan of [64]) {
   const beforeCascade = sql.c.rowsWritten;
   const beforeStatements = sql.c.statements;
   for (const sid of v.evicted) {
-    sql.exec("DELETE FROM members WHERE sid = ?", sid);
-    sql.exec("DELETE FROM subs WHERE sid = ?", sid);
+    reg.unsubscribeAll(sid);
+    reg.remove(sid);
   }
   out.push({
     kind: "capacity-dead", scan, sessions: N, status: v.status, ms: +(performance.now() - t).toFixed(2),

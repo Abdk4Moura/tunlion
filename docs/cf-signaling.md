@@ -78,7 +78,7 @@ distinct; only the latter decides when a refresh is written.
 
 Pruning is different from validity. It is claim-triggered, at most once per
 `PRUNE_INTERVAL` (30 s) while claims keep arriving, and each pass deletes at
-most `FIL_SESSION_PRUNE_BATCH` expired sessions (default 256) and the same
+most `FIL_SESSION_PRUNE_BATCH` expired sessions (default 64) and the same
 number of expired retired tombstones. The total number of deletes does not
 change; batching only spreads them. A dead row can therefore remain
 indefinitely if no later claim arrives: there is no scheduled sweep and no
@@ -93,6 +93,11 @@ at the end. A closed but unexpired row beyond the page can delay a new
 session until cursor progress or expiry; that availability tradeoff is
 deliberate. The existing over-cap `capRetired()` path stays unbounded because
 bounding it would weaken the tombstone cap; it normally removes one row.
+Residuals kept explicit: `pruneRetired` still runs `COUNT(*)` over `retired`
+on every pass (pre-existing, not changed here); the capacity cursor is
+heap-only, so after hibernation it starts again at the first page; and a sid's
+subscription fan-out is not globally capped, so the hub cascade is not bounded
+by `FIL_SESSION_PRUNE_BATCH`.
 
 Polling sessions live in memory only: if the object is evicted mid-session,
 the client gets `Session ID unknown` and reconnects, as it would after a
@@ -466,16 +471,20 @@ passed, so an always-on daemon is about 4 session rows a day instead of 48;
 at 4,000 always-on devices that is 16k rather than 192k rows a day. Each
 connect measured 9 rows (15 in one run with an extra sync) and a pairing about
 15 ("Hub load test" above). A first claim after a stale day can still find a
-backlog, but it now deletes at most `FIL_SESSION_PRUNE_BATCH` (256) expired
+backlog, but it now deletes at most `FIL_SESSION_PRUNE_BATCH` (64) expired
 sessions and retired rows per pass, so the 14,337-row burst above becomes
 about 224 batches over later claims; the total rows are unchanged and a row can
 remain longer if claims stop. Local SQLite at 50k sessions measured inclusive of the hub cascade, per
-batch: 64 -> 193 rows written and about 118 ms, 256 -> 769 rows and about
-466 ms, 1,024 -> 3,073 rows and about 1.8 s. The 64 default is chosen for the
-worst-case per-claim burst, not throughput. A capacity page of 64 measured
-about 130 rows read and 1.6 ms, with no writes when every row is live. These
-are local counts, not Cloudflare billed analytics. Reads otherwise come from
-memory, a few rows per claim.
+batch, modeled at one member and two subscriptions per sid: 64 -> 193 rows
+written and about 118 ms, 256 -> 769 rows and about 466 ms, 1,024 -> 3,073
+rows and about 1.8 s. Those are example totals, not a worst-case bound: a sid
+can hold more than two subscriptions and the hub unions them without a global
+cap, so the cascade can be larger. A capacity page of 64 measured about 130
+rows read and 1.6 ms, with no writes when every row is live. These are local
+counts, not Cloudflare billed analytics or a production CPU bound. After a
+cold heap the first evicted sid also loads the full members and subs tables;
+that read is in the numbers above and can be tens of thousands of rows, not a
+few.
 
 What that means:
 

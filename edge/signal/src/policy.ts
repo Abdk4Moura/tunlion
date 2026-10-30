@@ -23,9 +23,10 @@ export const PRUNE_INTERVAL = 30;
  * an eviction, never later. */
 export const SESSION_PERSIST_S = 6 * 3600;
 /** Most expired rows one prune may delete. Pruning is claim-triggered, so this
- * bounds the burst, not the total; a backlog drains over later claims. 64 keeps
- * the worst-case inclusive cascade (one member and subscription delete per
- * evicted sid) under about 200 local rows per claim. */
+ * bounds the session rows per pass, not total rows: the hub also deletes one
+ * member and every subscription for each evicted sid, and a sid's subscription
+ * count is not globally capped. 64 is a session-row bound, not a total-write
+ * or CPU bound. */
 export const SESSION_PRUNE_BATCH = 64;
 /** Most rows one capacity scan may inspect when no expired row is found. */
 export const CAPACITY_SCAN = 64;

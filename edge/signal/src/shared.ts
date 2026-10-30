@@ -27,7 +27,7 @@ export interface Env {
   FIL_PING_SLICE_AT?: string;
   /** Session refresh write spacing in seconds (default 21600, 6 h). */
   FIL_SESSION_PERSIST_S?: string;
-  /** Expired session/retired rows one prune may delete (default 256). */
+  /** Expired session/retired rows one prune may delete (default 64). */
   FIL_SESSION_PRUNE_BATCH?: string;
   /** Rows one capacity scan may inspect (default 64). */
   FIL_CAPACITY_SCAN?: string;

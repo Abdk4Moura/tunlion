@@ -171,9 +171,11 @@ test("expired prune deletes one batch at a time and drains the same total", () =
   let deleted = 0;
   for (let i = 0; i < 12; i++) {
     reg.claimSession(null, "gx", `x${i}`, `ux${i}`, `nx${i}`);
-    deleted += sql.log
+    const pass = sql.log
       .filter((e) => /^DELETE FROM sessions/.test(e.query))
       .reduce((n, e) => n + e.changes, 0);
+    assert.ok(pass <= 10, `pass ${i} deleted ${pass}, batch is 10`);
+    deleted += pass;
     sql.log.length = 0;
     now.value += 31;
   }
@@ -253,12 +255,16 @@ test("an expired row is found directly even when the first page is all live", ()
   const sql = sqlite();
   const alive = new Set(["s1"]);
   const now = { value: 9_000_000 };
-  const reg = M(sql, alive, now, 2, 6 * 3600, 256, 1);
+  // Routine prune is disabled so it cannot consume the fixture first; this
+  // leaves the expired capacity fast path as the only route.
+  const reg = M(sql, alive, now, 2, 6 * 3600, 0, 1);
   reg.claimSession(null, "g1", "s1", "u", "n");
   now.value += 100;
   reg.claimSession(null, "g2", "s2", "u", "n"); // second row, unexpired
   now.value += SESSION_TTL + 1; // both expired
+  sql.log.length = 0;
   const got = reg.claimSession(null, "g3", "s3", "u", "n");
   assert.equal(got.status, "new");
-  assert.ok(got.evicted.length >= 1);
+  assert.deepEqual(got.evicted, ["s1"]);
+  assert.ok(sql.log.some((e) => /SELECT token, sid FROM sessions WHERE exp <= \? ORDER BY exp LIMIT 1/.test(e.query)));
 });
