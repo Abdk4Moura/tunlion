@@ -4004,6 +4004,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunlion-lan"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "tunlion-overlay"
 version = "0.1.0"
 dependencies = [

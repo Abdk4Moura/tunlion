@@ -963,6 +963,17 @@
           "topology": "local-fixture"
         }
       ]
+    },
+    {
+      "path": "proofs/lan_discovery_model.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/lan_discovery_model.py --self-test",
+      "matrix": [
+        {
+          "platform": "portable",
+          "topology": "model-checker"
+        }
+      ]
     }
   ],
   "verdict_debt": [
