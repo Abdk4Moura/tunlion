@@ -90,7 +90,8 @@ jobs:
 
   gates:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 40: the same-room pairing gate runs 40 real pairings.
+    timeout-minutes: 40
     # The Redis registry is the multi-replica path; exercise its atomic Lua
     # alongside the in-memory registry so the two ownership implementations
     # cannot silently drift apart.
@@ -232,15 +233,34 @@ jobs:
           TUNLION_TEST_VENV: python3
         run: node frontend/tests/polling-liveness.spec.cjs
 
-      # A re-pair used to append a second known-device record for the same local
-      # petname, so both the iPad and Pixel showed two rows for one peer. Seed
-      # the broken localStorage shape, prove load migration leaves ONE online
-      # row backed by the newest secret, and Forget removes only that peer.
+      # Identity is the pairing secret, never the name. Old storage with one
+      # petname over two secrets keeps both devices (the newest keeps the
+      # name, the older one reads "<name> 2"), only same-secret copies
+      # collapse, the live secret's row is online, a rename onto a taken name
+      # is refused, and Forget removes only the chosen record.
       # Real Flask relay + Chromium and WebKit iPad.
       - name: known-device dedupe
         env:
           TUNLION_TEST_VENV: python3
         run: node frontend/tests/known-devices-dedupe.spec.cjs
+
+      # A real pairing next to a different remembered device of the same name:
+      # the new one is stored as "<name> 2" (the old one was deleted), a
+      # one-sided Remember reads online with "not remembered on their side"
+      # (it read offline), and renames are by record. Chromium + WebKit iPad.
+      - name: pair identity
+        env:
+          TUNLION_TEST_VENV: python3
+        run: node frontend/tests/pair-identity.spec.cjs
+
+      # Pairing two browsers already in one room (same network), by a typed
+      # code and by a #code link, 10 runs each per engine, zero failures: the
+      # claimer's no-op rejoin aborted the creator's ceremony 3 runs in 4.
+      - name: same-room pairing
+        env:
+          TUNLION_TEST_VENV: python3
+          PSR_RUNS: "10"
+        run: node frontend/tests/pair-same-room.spec.cjs
 
       # The relay's generation/rename/close semantics, independent of a browser.
       - name: backend session generation

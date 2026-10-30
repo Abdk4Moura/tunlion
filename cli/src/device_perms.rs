@@ -181,7 +181,7 @@ pub(crate) fn perms_for(
     match cert.as_ref() {
         None => caveats.push(format!(
             "uncertified: pairing permissions only, not yet one of your devices. If it is yours: `tunlion add {}` on your owner device, then `tunlion join <code>` on {name}",
-            crate::refusal::word(name)
+            crate::refusal::word(&name)
         )),
         Some(c) if c.expires <= now => caveats.push(format!("cert expired {}", when(c.expires, now))),
         Some(_) => {}
