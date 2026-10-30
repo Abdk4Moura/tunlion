@@ -47,7 +47,13 @@ That works today. The rest of this file is what it costs.
    what arrived".
 5. **A way to wait for a peer.** The owner cannot say "block until the runner
    joins". It polls `tunlion devices --json`. That is a loop in every script.
-6. **Cleanup.** A dead box leaves a record the owner must forget. A pool
+6. **Cleanup.** A box joined with a runner invitation is an ephemeral device:
+   the owner lists it under EPHEMERAL (never on its other devices), its access
+   ends at its lease (`TUNLION_LEASE=120m` on the box, default 6h, never past
+   the invitation), and the owner removes its record when it departs (`down`
+   on the box says goodbye first) or after 15 minutes without a live link. A
+   box joined with a `--for device` invitation is a permanent fleet member
+   instead, and leaves a record the owner must forget. A pool
    invitation can now be retired in one step: `tunlion devices` lists it with
    its uses left, and `tunlion add --withdraw <name> -y` makes the file
    unclaimable at once (the boxes that already joined are unaffected; cut each

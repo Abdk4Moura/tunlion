@@ -336,7 +336,7 @@ pub(crate) fn fit_steer(steer: &str, preview: Option<&str>, room: usize) -> (Str
 /// redraw then rewinds the wrong number of lines and eats the scrollback.
 ///
 /// Returns `(first, view, above, below)`.
-fn viewport_window(sel: usize, len: usize, max: usize) -> (usize, usize, usize, usize) {
+pub(crate) fn viewport_window(sel: usize, len: usize, max: usize) -> (usize, usize, usize, usize) {
     let view = max.min(len);
     if view == 0 {
         return (0, 0, 0, 0);
@@ -347,7 +347,7 @@ fn viewport_window(sel: usize, len: usize, max: usize) -> (usize, usize, usize, 
 }
 
 /// How many list rows a picker shows at once before it starts scrolling.
-const VIEWPORT: usize = 7;
+pub(crate) const VIEWPORT: usize = 7;
 
 // --------------------------------------------------------------------------
 // The one picker. Every interactive choice in the CLI draws through here, so a
@@ -421,7 +421,7 @@ pub(crate) fn hint_line(len: usize, hints: &[(char, &str)]) -> String {
 
 /// Clip a label to the terminal width so a long path never wraps: a wrapped row
 /// makes the in-place redraw rewind the wrong number of lines.
-fn fit(s: &str, width: usize) -> String {
+pub(crate) fn fit(s: &str, width: usize) -> String {
     let n = s.chars().count();
     if width < 8 || n <= width {
         return s.to_string();
@@ -431,7 +431,7 @@ fn fit(s: &str, width: usize) -> String {
     out
 }
 
-fn term_width() -> usize {
+pub(crate) fn term_width() -> usize {
     crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
 }
 
@@ -485,7 +485,7 @@ fn render_picker(header: &str, items: &[String], sel: usize, prev: usize, hints:
 }
 
 /// One write, one flush: the unit a terminal can show without tearing.
-fn write_frame(frame: &str) {
+pub(crate) fn write_frame(frame: &str) {
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(frame.as_bytes());
     let _ = err.flush();

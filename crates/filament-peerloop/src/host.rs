@@ -210,12 +210,17 @@ pub struct LiveCut {
     pub reason: String,
 }
 
-/// The two decisions a live re-check can reach. The words differ because the
-/// remedy differs: a revocation cannot be repaired by a grant, an expiry can.
+/// The decisions a live re-check can reach. The words differ because the
+/// remedy differs: a revocation cannot be repaired by a grant, an expiry can,
+/// and a forget means we no longer know the device at all (only a fresh
+/// pairing or enrolment lets it back in).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiveCutCause {
     Revoked,
     Expired,
+    /// Forgotten here: the record is gone (or going) and its key is on the
+    /// forget block. Reads as "not recognized", never as "device revoked".
+    Forgotten,
 }
 
 /// A local storage failure a receiver reports to the sender as a typed refusal
@@ -565,6 +570,14 @@ pub trait HostServices: Send + Sync + 'static {
     /// the resolved device key, never by a display name. An inert host records
     /// no revocations, so it answers no.
     fn cert_revoked_for(&self, _device_pub: Option<&[u8; 32]>) -> bool {
+        false
+    }
+    /// Is this device FORGOTTEN in the host's own store (its key is on the
+    /// forget block)? Distinct from `cert_revoked_for`, which folds the block
+    /// in so an open is denied either way. The refusal the peer is told must
+    /// name the right cause: forgotten reads "not recognized", revoked reads
+    /// "device revoked". An inert host forgets no one, so it answers no.
+    fn cert_forgotten_for(&self, _device_pub: Option<&[u8; 32]>) -> bool {
         false
     }
     /// The delegated access this host's device record grants, read fresh at the

@@ -1269,6 +1269,21 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Status { json } => status_cmd(json || ui_caps.json).await,
         Cmd::Down => {
             ui_caps.confirm("shut down the daemon")?;
+            // An ephemeral box (joined with a runner invitation) that stops is
+            // gone for good: its daemon tells the owner first, over the link
+            // it already holds, so the owner removes it now rather than when
+            // the offline budget runs out. Asked over the control socket
+            // because a stop signal drops the daemon loop at once. Advisory:
+            // a box that cannot say goodbye still stops.
+            if crate::enrollment::joined_ephemeral() {
+                if let Some(reply) = crate::ctl::try_depart().await {
+                    if reply["told"].as_u64().unwrap_or(0) > 0 {
+                        crate::ui::say("  told the owner this ephemeral device is leaving");
+                        // Let the goodbye leave before the links close.
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
             down_cmd()
         }
         Cmd::Logs { follow, tail } => logs_cmd(follow, tail).await,
@@ -1726,20 +1741,17 @@ pub(crate) async fn async_main() -> Result<()> {
                     ui_caps.confirm(&format!(
                         "forget {name} (delete its record; its key stays refused)"
                     ))?;
-                    let report = crate::fleet_support::forget_device(&name, identity::now_secs())?;
-                    crate::outln!("{report}");
+                    let outcome = crate::fleet_support::forget_device(&name, identity::now_secs())?;
                     // Its pending access requests cannot be approved into
                     // anything any more; drop them with the record.
                     crate::withdraw_requests_for(&name);
                     // The store is written; the RUNNING daemon must act on it too
-                    // (revocation_live.rs). Say only what it confirmed. The old
-                    // line here promised the forgotten device would hear "never
-                    // met you": it does not, because this machine stops answering
-                    // it at all, so from its side we look offline.
+                    // (revocation_live.rs). Render only after it answers, so an
+                    // unconfirmed daemon never leaves a success line behind.
                     let answer = crate::revocation_live::tell_daemon().await;
-                    match crate::revocation_live::daemon_line(&name, &answer, true) {
-                        Ok(line) => ui::say(&line),
-                        Err(e) => bail!(e),
+                    match crate::revocation_live::forget_line(&outcome, &answer) {
+                        Ok(line) => crate::outln!("{line}"),
+                        Err(e) => return Err(crate::revocation_live::unconfirmed_exit(e)),
                     }
                 }
                 Some(DevicesAction::Rename { old, new }) => {
@@ -2738,10 +2750,14 @@ pub(crate) async fn revoke_cmd(
     if capability == "shell" {
         sshkeys::remove_authorized_key(&device)?;
         crate::outln!(
-            "revoked 'shell' from '{device}' and removed its tunlion-managed authorized_keys block."
+            "{}",
+            crate::revocation_live::capability_revoke_line(&device, &capability, true)
         );
     } else {
-        crate::outln!("revoked '{capability}' from '{device}'.");
+        crate::outln!(
+            "{}",
+            crate::revocation_live::capability_revoke_line(&device, &capability, false)
+        );
     }
     if capability == "shell" && crate::daemon_alive().is_some() {
         ui::say(&ui::paint(
@@ -2826,8 +2842,13 @@ pub(crate) async fn devices_json_rows(all: &[(String, String)]) -> Vec<Value> {
             // `caps` IS the effective set: empty once the
             // device expired, lapsed or was revoked.
             let caps = access["effectiveCaps"].clone();
+            let ephemeral = records
+                .iter()
+                .find(|r| r["name"].as_str() == Some(n.as_str()))
+                .is_some_and(filament_peerloop::recv::store::record_is_ephemeral);
             json!({
                 "name": n,
+                "ephemeral": ephemeral,
                 "channel": channel_of(s),
                 "caps": caps,
                 "grantedCaps": access["grantedCaps"].clone(),

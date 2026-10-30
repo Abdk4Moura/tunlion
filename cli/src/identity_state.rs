@@ -149,6 +149,17 @@ pub(crate) fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
     idev.map(device_cert_revoked).unwrap_or(false)
 }
 
+/// Is this device FORGOTTEN here: its key is on `revoked-keys.json`, the block
+/// `devices forget` writes and an explicit re-add or `promote` lifts?
+/// Deliberately separate from [`cert_revoked_for`], which folds the block in so
+/// an open is denied either way: the CAUSE decides the words the peer hears,
+/// and a forgotten device must read "not recognized", not "device revoked".
+/// The block has exactly one writer (`forget_device`); a future second-purpose
+/// writer would have to carry its own reason rather than reuse this list.
+pub(crate) fn cert_forgotten_for(idev: Option<&[u8; 32]>) -> bool {
+    idev.is_some_and(|p| crate::fleet_support::device_key_revoked(p, crate::identity::now_secs()))
+}
+
 /// The revocation re-check interval, overridable for tests. Clamped so a
 /// misconfiguration cannot make the re-check effectively never run, or spin on a
 /// read-heavy stream by re-reading the device store every operation.
@@ -422,10 +433,15 @@ pub(crate) const DEVICE_REVOKED_REASON: &str = "device revoked";
 /// Why a LIVE session (exec, pty, forward, mount) must end now, if it must.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveCut {
-    /// The device was revoked here.
+    /// The device was revoked here (in place: its record stays).
     Revoked,
     /// The invitation that admitted it ended at this time (UTC seconds).
     Expired(u64),
+    /// The device was FORGOTTEN here: its record is gone (or is being
+    /// dropped) and its key is on the forget block. It must read as "not
+    /// recognized", the same words a later open meets, never as a revocation
+    /// of a device we still know.
+    Forgotten,
 }
 
 impl LiveCut {
@@ -438,6 +454,9 @@ impl LiveCut {
             // It said "access revoked" here, so a revoke read two ways.
             LiveCut::Revoked => DEVICE_REVOKED_REASON.to_string(),
             LiveCut::Expired(at) => crate::capability::expired_reason(at),
+            // The words a forgotten device's next open meets (gate R): the
+            // record is gone, so there is nothing to "revoke".
+            LiveCut::Forgotten => filament_peerloop::refusal::UNRECOGNIZED_REASON.to_string(),
         }
     }
 
@@ -446,18 +465,25 @@ impl LiveCut {
     /// refusal at open (`capability::expired_reason_for`).
     pub(crate) fn reason_for(self, idev: Option<&[u8; 32]>) -> String {
         match self {
-            LiveCut::Revoked => self.reason(),
+            LiveCut::Revoked | LiveCut::Forgotten => self.reason(),
             LiveCut::Expired(at) => crate::capability::expired_reason_for(at, idev),
         }
     }
 }
 
-/// The one live re-check every serving loop asks. Revocation first (it is the
-/// decision a person made), then the delegated deadline. An unidentified peer
-/// has no opinion here: its opens were judged by the gate.
+/// The one live re-check every serving loop asks. Forget and revocation first
+/// (they are the decisions a person made), then the delegated deadline. An
+/// unidentified peer has no opinion here: its opens were judged by the gate.
 pub(crate) fn live_session_cut(idev: Option<&[u8; 32]>) -> Option<LiveCut> {
     let idev = idev?;
-    if cert_revoked_for(Some(idev)) {
+    // The forget block is consulted FIRST. `device_cert_revoked` folds it in
+    // (a forgotten key must not pass fleet-hello either), so asking it first
+    // would report a forgotten device as revoked: the wrong promise, and the
+    // wrong remedy for the person on the other side.
+    if cert_forgotten_for(Some(&idev)) {
+        return Some(LiveCut::Forgotten);
+    }
+    if cert_revoked_for(Some(&idev)) {
         return Some(LiveCut::Revoked);
     }
     match delegated_access_for(idev) {
@@ -646,5 +672,120 @@ mod live_cut_wording_tests {
             crate::refusal::Refusal::new(crate::refusal::Code::CertRevoked, None).reason,
             super::LiveCut::Revoked.reason()
         );
+    }
+
+    /// A forget that cuts a live session must read exactly like the refusal
+    /// its next open meets ("not recognized"), and must map back to that code
+    /// rather than to the revocation one. The key block makes
+    /// `device_cert_revoked` true too, so the two causes are one `if` apart.
+    #[test]
+    fn a_forgotten_live_cut_reads_like_the_refusal_at_open() {
+        let reason = super::LiveCut::Forgotten.reason();
+        assert_eq!(
+            reason,
+            crate::refusal::Refusal::new(crate::refusal::Code::Unrecognized, None).reason
+        );
+        assert!(reason.contains("not recognized"), "{reason}");
+        assert_eq!(
+            crate::refusal::code_from_reason(&reason),
+            Some(crate::refusal::Code::Unrecognized),
+            "{reason}"
+        );
+        assert_ne!(
+            crate::refusal::code_from_reason(&reason),
+            Some(crate::refusal::Code::CertRevoked),
+            "{reason}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod forgotten_admission_tests {
+    //! The real-store admission seam: a fixture on disk, read through the same
+    //! production functions the daemon uses (`cert_forgotten_for`,
+    //! `cert_revoked_for`), and the refusal built by the real classifier. This
+    //! is the forget write window as a forget leaves it: the key block is
+    //! already written, the record is still there.
+    use crate::refusal::{Code, Refusal};
+
+    #[test]
+    fn a_key_block_with_the_record_still_present_is_unrecognized_through_the_production_apis() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!(
+            "tunlion-forget-admit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prior = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+
+        let key = [0x5bu8; 32];
+        let hex = hex::encode(key);
+        let now = crate::identity::now_secs();
+        std::fs::write(
+            dir.join("devices.json"),
+            serde_json::to_string(&serde_json::json!([
+                {"name": "guest", "deviceCert": {"devicePub": hex}, "caps": []},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(crate::fleet_support::KEY_REVOCATIONS_FILE),
+            serde_json::to_string(&serde_json::json!([
+                {"devicePub": hex, "certExpires": now + 3600, "revokedAt": now, "name": "guest"},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // What admission and the live re-check read, from the real files.
+        let forgotten = super::cert_forgotten_for(Some(&key));
+        let revoked = super::cert_revoked_for(Some(&key));
+        assert!(forgotten, "the key block names the device");
+        assert!(revoked, "the open is still denied: the block folds into revoked");
+        let r = Refusal::from_shell_gate(forgotten, revoked, false, None, Some("guest".into()));
+        assert_eq!(
+            r.code,
+            Code::Unrecognized,
+            "a forget must not read as a revocation: {}",
+            r.reason
+        );
+        assert!(r.reason.contains("not recognized"), "{}", r.reason);
+
+        // Ordinary `devices revoke` / `demote --to cut`: the record stays,
+        // marked certRevoked, and no key block is written.
+        std::fs::remove_file(dir.join(crate::fleet_support::KEY_REVOCATIONS_FILE)).unwrap();
+        std::fs::write(
+            dir.join("devices.json"),
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "name": "guest",
+                    "deviceCert": {"devicePub": hex},
+                    "certRevoked": true,
+                    "caps": [],
+                },
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let forgotten = super::cert_forgotten_for(Some(&key));
+        let revoked = super::cert_revoked_for(Some(&key));
+        assert!(!forgotten, "no block was written");
+        assert!(revoked, "the kept record is marked revoked");
+        let r = Refusal::from_shell_gate(forgotten, revoked, false, None, Some("guest".into()));
+        assert_eq!(r.code, Code::CertRevoked);
+        assert_eq!(r.reason, "device revoked");
+
+        match prior {
+            Some(v) => unsafe { std::env::set_var("TUNLION_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

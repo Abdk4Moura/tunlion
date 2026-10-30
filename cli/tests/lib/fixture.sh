@@ -8,6 +8,14 @@
 # caller, because pty-open / mount-open / l2-open are all gated on `l2_enabled`
 # and a plain `up` leaves it off with a failure that is silent on both sides.
 
+# The backend launcher records the real child PID and closes the inherited build
+# lock descriptors for that child only. Sourced by absolute path so a gate that
+# changes directory still gets this file, not a copy.
+FIXTURE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=cli/tests/lib/backend.sh
+source "$FIXTURE_LIB_DIR/backend.sh"
+unset FIXTURE_LIB_DIR
+
 # --- Preconditions and refusal ---
 # A HARNESS THAT CANNOT DISTINGUISH "the code is broken" from "the box cannot
 # hold the build" MUST REFUSE TO REPORT, with an exit code distinct from both
@@ -90,20 +98,30 @@ declare_known_red_summary() {
 
 FIX_PIDS=()
 fixture_cleanup() {
+  local p
+  backend_stop "${BACKEND_PID:-}"
   for p in "${FIX_PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+  for p in "${FIX_PIDS[@]:-}"; do
+    for _ in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
+    kill -9 "$p" 2>/dev/null || true
+    wait "$p" 2>/dev/null || true
+  done
 }
 
 # Start the fixture signaling backend on $PORT and block until healthy.
+# backend_start uses `exec`, so the recorded PID is `python app.py` itself and
+# backend_stop can kill and reap that process, not a wrapper. The caller keeps
+# fd 3/fd 9 and its build lock; only the backend child closes them.
 start_backend() {
   for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
   sleep 1
-  # `exec`, so the recorded pid IS the backend: killing a subshell left the
-  # python process running, holding the port and any inherited descriptor
-  # (a build lock taken with flock around the gate run stayed held).
-  ( cd "$CLI_DIR/../backend" && exec env PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
-      FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
-      "$PYV" app.py >"$WORK/backend.log" 2>&1 ) &
-  FIX_PIDS+=($!)
+  # backend_start uses `exec`, so the recorded PID is `python app.py` itself
+  # and cleanup kills the process that owns the port and any inherited build
+  # lock descriptor (the helper also closes fd 3/fd 9 for the child only).
+  backend_start "$CLI_DIR/../backend" "$PYV" "$WORK/backend.log" \
+    PORT="$PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+    FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25
+  FIX_PIDS+=("$BACKEND_PID")
   for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
   curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat "$WORK/backend.log"; exit 2; }
   [ -x "$BIN" ] || { echo "build first: (cd $CLI_DIR && cargo build --release)"; exit 2; }

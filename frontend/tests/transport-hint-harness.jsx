@@ -1,7 +1,9 @@
 // Harness: construct the REAL PeerLink in Chromium and capture every signal it
 // emits. The point is ordering and immediacy, not a network path: the browser
 // must announce `direct:false` synchronously, before any SDP, so a direct-first
-// CLI never waits out its QUIC budget for a peer that cannot speak QUIC.
+// CLI never waits out its QUIC budget for a peer that cannot speak QUIC. The
+// hint also names the device kind (`client:"browser"`) so the CLI can explain a
+// completed browser pairing without treating it as a failed fleet enrolment.
 //
 // It also runs a real two-peer WebRTC negotiation against a "CLI" that models
 // the direct-first wait: without the hint it waits DELAY_MS before creating its

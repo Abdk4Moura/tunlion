@@ -30,7 +30,12 @@ fn self_pub() -> Option<[u8; 32]> {
 }
 
 pub fn owner_snapshot(owner_pub: &[u8; 32]) -> Vec<RosterDevice> {
-    filament_peerloop::recv::roster::owner_snapshot(&store(), owner_pub, self_pub().as_ref())
+    filament_peerloop::recv::roster::owner_snapshot(
+        &store(),
+        owner_pub,
+        self_pub().as_ref(),
+        crate::identity::now_secs(),
+    )
 }
 
 pub fn mint_roster(owner: &UserKey, now: u64) -> Result<(Value, bool)> {

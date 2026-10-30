@@ -19,6 +19,8 @@
 //              the same names, so a Python change maps to one function here
 
 import { DurableObject } from "cloudflare:workers";
+import { pingPlan } from "./heartbeat";
+import { pollAlive, wsAlive } from "./liveness";
 import {
   CF_EIO_PREFIX,
   CF_TOKEN_PREFIX,
@@ -31,6 +33,7 @@ import {
   limitsFrom,
   maxDecodePackets,
   pingFrom,
+  pingSliceAt,
   validId,
 } from "./policy";
 import { MemLimiter, ipBucket } from "./ratelimit";
@@ -39,8 +42,6 @@ import { originAllowed, type Env } from "./shared";
 
 const SEP = "\x1e"; // engine.io v4 polling payload record separator
 const SWEEP_EVERY_MS = 5 * 60 * 1000;
-/** Websocket pings go out in at most this many slices per interval (one a second at 25 s). */
-const PING_SLICES_MAX = 25;
 
 /** What a hibernatable websocket carries across hibernation (< 2 KiB). */
 interface WsAttachment {
@@ -101,11 +102,18 @@ export class SignalHub extends DurableObject<Env> {
   private closeLimiter: MemLimiter;
   private nextSweep = 0;
   private pingGen = 0;
+  private sliceAt: number;
+  // Local instrumentation only: these reset on every wake and are not the
+  // billed totals. /__hub/stats exposes them so a local or loadtest run can
+  // say what the code did; Cloudflare's GraphQL analytics remains the source
+  // for billed requests, rows and active time.
+  private counts = { alarms: 0, pings: 0, inbound: 0, pollPosts: 0, setAlarms: 0, sliceTimers: 0 };
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.reg = new Registry(ctx.storage.sql, (sid) => this.alive(sid), CF_TOKEN_PREFIX);
     this.ping = pingFrom(env as unknown as Record<string, unknown>);
+    this.sliceAt = pingSliceAt(env as unknown as Record<string, unknown>);
     const lim = limitsFrom(env as unknown as Record<string, unknown>);
     this.sessionClaimLimiter = new MemLimiter(lim.sessionClaim, lim.window);
     this.claimLimiter = new MemLimiter(lim.pairClaim, lim.window);
@@ -246,6 +254,7 @@ export class SignalHub extends DurableObject<Env> {
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
     const att = ws.deserializeAttachment() as WsAttachment | null;
     if (!att) return;
+    this.counts.inbound += 1;
     this.lastSeen.set(att.eid, Date.now());
     if (typeof message !== "string") {
       // No binary attachments in this protocol (the Rust client refuses them
@@ -364,6 +373,7 @@ export class SignalHub extends DurableObject<Env> {
   }
 
   private async pollPost(sess: PollSession, request: Request, cors: Record<string, string>): Promise<Response> {
+    this.counts.pollPosts += 1;
     const headers = { ...cors, "content-type": "text/html; charset=UTF-8" };
     const body = await request.text();
     if (body.length > MAX_PAYLOAD) return this.badRequest("Payload too large", cors);
@@ -479,12 +489,21 @@ export class SignalHub extends DurableObject<Env> {
   }
 
   /** Liveness ground truth (#10): this sid's engine.io transport is open and
-   * its socket.io namespace is connected. Every roster filter goes through it. */
+   * its socket.io namespace is connected. Every roster filter goes through it.
+   *
+   * A websocket is asked directly: wsFor() already requires OPEN, an
+   * attachment and no in-flight upgrade probe, and hibernation restores the
+   * attachment. A polling session lives in memory with no transport object, so
+   * its last request must be inside the engine.io dead window; an `ns` flag
+   * left behind by a frozen page is not liveness. */
   private alive(sid: string): boolean {
     const p = this.pollFor(sid);
-    if (p) return p.ns;
+    if (p) {
+      const deadAfter = (this.ping.interval + this.ping.timeout) * 1000;
+      return pollAlive(p.ns, p.lastSeen, Date.now(), deadAfter);
+    }
     const w = this.wsFor(sid);
-    return !!w && w.att.ns;
+    return !!w && wsAlive(w.ws.readyState === WebSocket.OPEN, true, false, w.att.ns);
   }
 
   private sendRaw(sid: string, packet: string) {
@@ -562,28 +581,37 @@ export class SignalHub extends DurableObject<Env> {
 
   private async ensureAlarm() {
     const cur = await this.ctx.storage.getAlarm();
-    if (cur === null) await this.ctx.storage.setAlarm(Date.now() + this.ping.interval * 1000);
+    if (cur === null) {
+      this.counts.setAlarms += 1;
+      await this.ctx.storage.setAlarm(Date.now() + this.ping.interval * 1000);
+    }
   }
 
   async alarm() {
     const now = Date.now();
-    // Websocket pings are spread over the interval, one slice a second, not
-    // sent to every socket at once. python-engineio pings each socket on its
-    // own timer, so its pongs arrive spread out; one alarm pinging N sockets
-    // brings N pongs back inside one round trip, and the hub load test
-    // (docs/cf-signaling.md, "Hub load test") showed that burst closing the
-    // whole population with 1013 at 4,000 devices. Each socket is still
-    // checked and pinged once per interval. The slices run on in-memory
-    // timers, so this is still one alarm (one billed request) per interval.
+    this.counts.alarms += 1;
+    // Small populations get one batch; large ones keep the bounded slices.
+    // Spreading pings over in-memory timers was added after the 2026-10-29
+    // load test (one batch at 4,000 closed the population with 1013). But a
+    // pending setTimeout makes the object non-hibernatable (Cloudflare
+    // lifecycle rules), so slicing keeps a single hub duration-billed for the
+    // whole interval. pingPlan() chooses the batch below a conservative cap
+    // and never schedules more than PING_SLICES_MAX timers. Each socket is
+    // still checked and pinged once per interval, and it is still one alarm
+    // (one billed request) per interval.
     const sockets = this.ctx.getWebSockets();
-    const slices = Math.max(1, Math.min(PING_SLICES_MAX, Math.floor(this.ping.interval)));
-    const per = Math.ceil(sockets.length / slices);
+    const plan = pingPlan(sockets.length, this.ping.interval, this.sliceAt);
     const gen = ++this.pingGen;
-    this.pingSlice(sockets, 0, per);
-    for (let k = 1; k < slices && k * per < sockets.length; k++) {
-      setTimeout(() => {
-        if (gen === this.pingGen) this.pingSlice(sockets, k * per, per);
-      }, (k * this.ping.interval * 1000) / slices);
+    if (plan.slices === 1) {
+      this.pingSlice(sockets, 0, plan.batch);
+    } else {
+      this.pingSlice(sockets, 0, plan.batch);
+      for (let k = 1; k < plan.slices && k * plan.batch < sockets.length; k++) {
+        this.counts.sliceTimers += 1;
+        setTimeout(() => {
+          if (gen === this.pingGen) this.pingSlice(sockets, k * plan.batch, plan.batch);
+        }, k * plan.delayMs);
+      }
     }
     const deadAfter = (this.ping.interval + this.ping.timeout) * 1000;
     for (const sess of [...this.polls.values()]) {
@@ -600,6 +628,7 @@ export class SignalHub extends DurableObject<Env> {
       this.sweepDead();
     }
     if (sockets.length || this.polls.size) {
+      this.counts.setAlarms += 1;
       await this.ctx.storage.setAlarm(Date.now() + this.ping.interval * 1000);
     }
   }
@@ -625,6 +654,7 @@ export class SignalHub extends DurableObject<Env> {
         continue;
       }
       if (!att.probing) {
+        this.counts.pings += 1;
         try {
           ws.send("2");
         } catch {}
@@ -657,7 +687,11 @@ export class SignalHub extends DurableObject<Env> {
   }
 
   private connCounts() {
-    return { websockets: this.ctx.getWebSockets().length, polling: this.polls.size };
+    return {
+      websockets: this.ctx.getWebSockets().length,
+      polling: this.polls.size,
+      local: { ...this.counts, sliceAt: this.sliceAt },
+    };
   }
 
   /** Failback: close every transport WITHOUT a socket.io DISCONNECT, so each

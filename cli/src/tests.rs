@@ -4221,7 +4221,7 @@ fn capability_revoke_warning_only_live_same_owner_cert() {
 // from the record, so forget both cuts the device off and frees the name.
 #[test]
 fn forget_of_a_live_fleet_certificate_revokes_the_key_and_says_so() {
-    use crate::fleet_support::{forget_report, forget_verdict, ForgetVerdict};
+    use crate::fleet_support::{forget_verdict, ForgetVerdict};
     let cert = identity::DeviceCert::from_json(&serde_json::json!({
         "devicePub": hex::encode([0x11u8; 32]),
         "userPub": hex::encode([0x22u8; 32]),
@@ -4234,14 +4234,11 @@ fn forget_of_a_live_fleet_certificate_revokes_the_key_and_says_so() {
 
     let live = forget_verdict(Some(&cert), false, owner, 100);
     assert_eq!(live, ForgetVerdict::RevokeThenRemove { days_left: 3 });
-    let msg = forget_report("laptop", &live);
+    let detail = live.detail().expect("a live certificate keeps a key block");
+    assert_eq!(detail, "key refused for 3 days");
     assert!(
-        msg.contains("revoked its fleet certificate") && msg.contains("3 more day(s)"),
-        "{msg}"
-    );
-    assert!(
-        !msg.contains("can no longer find"),
-        "a live certificate must not be reported as plain removal: {msg}"
+        !detail.contains("can no longer find"),
+        "a live certificate must not be reported as plain removal: {detail}"
     );
 
     let revoked = forget_verdict(Some(&cert), true, owner, 100);
@@ -4249,7 +4246,8 @@ fn forget_of_a_live_fleet_certificate_revokes_the_key_and_says_so() {
         revoked,
         ForgetVerdict::KeepRevocationThenRemove { days_left: 3 }
     );
-    assert!(forget_report("laptop", &revoked).contains("revocation stays in force"));
+    assert_eq!(revoked.detail().as_deref(), Some("key refused for 3 days"));
+    assert_eq!(ForgetVerdict::Remove.detail(), None);
 
     // Plain removal when no live certificate from us exists.
     assert_eq!(

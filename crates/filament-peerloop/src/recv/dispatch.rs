@@ -2287,6 +2287,28 @@ async fn recv_run(
                             // same iteration, so the reply means it is done.
                             revocation_sweep_now = true;
                             revocation_waiters.push(req);
+                        } else if matches!(&req.kind, ReqKind::Depart) {
+                            // `down` on an ephemeral device: tell the owner it
+                            // is leaving over the links held here, so the owner
+                            // removes it now instead of at the end of its
+                            // offline budget. Bounded per link.
+                            let mut told = 0usize;
+                            if let Some(frame) = ports.identity.ephemeral_depart_frame() {
+                                for l in conn.links.values() {
+                                    let Some(t) = l.transport.as_ref().filter(|t| t.is_alive()) else {
+                                        continue;
+                                    };
+                                    let sent = tokio::time::timeout(Duration::from_secs(2), async {
+                                        let ok = t.send_control(&frame).await.is_ok();
+                                        let _ = t.flush().await;
+                                        ok
+                                    })
+                                    .await
+                                    .unwrap_or(false);
+                                    told += usize::from(sent);
+                                }
+                            }
+                            req.reply(&json!({ "ok": true, "told": told })).await;
                         } else if matches!(&req.kind, ReqKind::Wake) {
                             // Nothing to do here: receiving this event IS the point.
                             // The loop now runs its top-level arm gate this same
@@ -3300,13 +3322,15 @@ async fn recv_run(
 
         // SWEEP: mark lapsed delegated records whose effective deadline has
         // passed and which no observation revived. Runs every 30s; keeps the
-        // record as evidence (option b, decided deliberately).
+        // record as evidence (option b, decided deliberately), EXCEPT an
+        // ephemeral device's and an ended fleet sibling's, which are removed
+        // (DeviceStore::devices_sweep_lapsed).
         if daemon && last_sweep.elapsed() >= Duration::from_secs(30) {
             last_sweep = Instant::now();
             let lapsed = ports.store.devices_sweep_lapsed(filament_id::now_secs());
             if lapsed > 0 {
                 log.say(&format!(
-                    "{} {lapsed} device(s) lapsed (offline past their budget)",
+                    "{} {lapsed} device(s) lapsed or ended (offline past their budget, lease over, or removed by the owner)",
                     log.paint(Tone::Warn, log.glyph_warn())
                 ));
             }
@@ -3517,16 +3541,24 @@ async fn recv_run(
                         }
                     }
                     let mut doomed: Vec<(String, String)> = Vec::new();
-                    // Doomed links whose device KEY is revoked in place (its
-                    // pair secret still held): told "device revoked", not
-                    // "not recognized".
-                    let mut key_revoked: std::collections::HashSet<String> = Default::default();
+                    // Doomed links whose device is still KNOWN and was revoked
+                    // (the owner's signed roster delisted the sibling, or its
+                    // certificate ran out): told "device revoked". A link cut
+                    // by a forget is "not recognized" even while the record is
+                    // still visible mid-write (see `link_cut_reason`).
+                    let mut cut_as_revoked: std::collections::HashSet<String> = Default::default();
                     let mut unrouted: Vec<String> = Vec::new();
                     for (pid, l) in &conn.links {
                         let facts = crate::recv::revocation::LinkFacts {
                             secret: l.expected_secret.as_ref().map(|(_, s)| s.as_str()),
                             device_pub: l.identity_device_pub,
                         };
+                        // Is this peer's key on the forget block? Read once:
+                        // `forget` writes it before it drops the record.
+                        let key_forgotten = l
+                            .identity_device_pub
+                            .as_ref()
+                            .is_some_and(|p| ports.daemon.key_listed(p));
                         // Fleet auto-mesh: a sibling link is closed, not merely
                         // refused, when the owner withdrew the device (its
                         // roster no longer lists it) or its certificate ran
@@ -3539,25 +3571,21 @@ async fn recv_run(
                             identity::now_secs(),
                             &|p: &[u8; 32]| ports.identity.device_cert_revoked(p),
                         );
-                        if sibling_cut {
-                            key_revoked.insert(pid.clone());
-                            doomed.push((pid.clone(), l.shown().to_string()));
-                        } else if crate::recv::revocation::link_must_close(
-                            &facts,
-                            &revoked_secrets,
-                            &|p: &[u8; 32]| ports.daemon.key_listed(p),
-                        ) {
-                            // Forgotten (its secret removed) reads "not
-                            // recognized", as every later open is answered;
-                            // "device revoked" only for a key revoked in place.
-                            let secret_gone =
+                        let close = sibling_cut
+                            || crate::recv::revocation::link_must_close(
+                                &facts,
+                                &revoked_secrets,
+                                &|p: &[u8; 32]| ports.daemon.key_listed(p),
+                            );
+                        if close {
+                            let secret_forgotten =
                                 facts.secret.is_some_and(|s| revoked_secrets.contains(s));
-                            if !secret_gone
-                                && l.identity_device_pub
-                                    .as_ref()
-                                    .is_some_and(|p| ports.daemon.key_listed(p))
+                            if crate::recv::revocation::link_cut_reason(
+                                secret_forgotten,
+                                key_forgotten,
+                            ) == crate::recv::revocation::LinkCut::Revoked
                             {
-                                key_revoked.insert(pid.clone());
+                                cut_as_revoked.insert(pid.clone());
                             }
                             doomed.push((pid.clone(), l.shown().to_string()));
                         } else if crate::recv::revocation::route_must_withdraw(
@@ -3580,7 +3608,7 @@ async fn recv_run(
                     // this frame leaves first.
                     for (pid, _) in &doomed {
                         if let Some(t) = conn.transport_of(pid) {
-                            let code = if key_revoked.contains(pid) {
+                            let code = if cut_as_revoked.contains(pid) {
                                 crate::refusal::Code::CertRevoked
                             } else {
                                 crate::refusal::Code::Unrecognized
@@ -4687,6 +4715,30 @@ async fn recv_run(
                         });
                         if let Some((name, secret)) = known {
                             conn.start_direct(&from, &name, &secret).await;
+                        }
+                        // A one-shot dialer on our FLEET channel (`tunlion
+                        // shell/exec/reach <sibling>` from a device with no daemon
+                        // broker, e.g. Windows). Daemons pick ONE dialer by sid
+                        // (the fleet adoption arm), so when our sid is the higher
+                        // one we never armed a pending for it and its offer sat
+                        // here forever: it then had only a WebRTC link, which
+                        // cannot carry the certificate proof, and reported "can't
+                        // reach". A one-shot never dials on presence, only answers
+                        // offers, so answering it cannot glare. Its offer is the
+                        // one without `ch` (every daemon offer names its meeting
+                        // place, conn.rs start_direct_inner). The link it gets is
+                        // fleet-pending and authorizes nothing until fleet-hello
+                        // verifies, exactly like a daemon's.
+                        if !conn.direct_pending.contains_key(&from)
+                            && fleet_pending.contains(&from)
+                            && data["ch"].is_null()
+                        {
+                            if let Some(rv) = ports.identity.fleet_rv() {
+                                log.debug(&format!(
+                                    "fleet: answering a one-shot dialer's transport-offer from {from}"
+                                ));
+                                conn.start_direct_fleet(&from, &rv).await;
+                            }
                         }
                         if conn.direct_pending.contains_key(&from) {
                             // Re-arm succeeded — process the offer now.
@@ -6798,8 +6850,10 @@ async fn recv_run(
                         ));
                         host.enqueue_request_if_requestable(who, "shell");
                         let cap_reason = granted.deny_reason("");
+                        let peer_dev = conn.link(&pid).and_then(|l| l.identity_device_pub);
                         let refusal = crate::refusal::Refusal::from_shell_gate(
-                            false,
+                            host.cert_forgotten_for(peer_dev.as_ref()),
+                            host.cert_revoked_for(peer_dev.as_ref()),
                             dev.as_deref()
                                 .map(|n| host.device_capability_denied(n, "shell"))
                                 .unwrap_or(false),

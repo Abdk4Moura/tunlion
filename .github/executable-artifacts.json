@@ -306,6 +306,28 @@
       ]
     },
     {
+      "path": "cli/tests/ephemeral-runner-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/ephemeral-runner-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
+      "path": "cli/tests/sibling-shell-refusal-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/sibling-shell-refusal-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/expiry-race-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/expiry-race-gates.sh",
@@ -481,6 +503,7 @@
       "disposition": "support",
       "invoked_by": [
         "cli/tests/devices-write-race-gates.sh",
+        "cli/tests/ephemeral-runner-gates.sh",
         "cli/tests/expiry-race-gates.sh",
         "cli/tests/fleet-automesh-gates.sh",
         "cli/tests/fleet-cert-gates.sh",
@@ -497,8 +520,50 @@
         "cli/tests/revocation-live-gates.sh",
         "cli/tests/roster-gates.sh",
         "cli/tests/shell-posture-gates.sh",
+        "cli/tests/sibling-shell-refusal-gates.sh",
         "cli/tests/term-restore-gates.sh",
         "cli/tests/warm-hold-idle-gates.sh"
+      ]
+    },
+    {
+      "path": "cli/tests/lib/backend.sh",
+      "disposition": "support",
+      "invoked_by": [
+        "cli/tests/ack-loss-repro.sh",
+        "cli/tests/cap-verbs-gates.sh",
+        "cli/tests/config-scope-gates.sh",
+        "cli/tests/core-receive-relay-nat-gates.sh",
+        "cli/tests/daemon-path-gates.sh",
+        "cli/tests/daemon-stop-gates.sh",
+        "cli/tests/exec-gates.sh",
+        "cli/tests/fixture-cleanup-gates.sh",
+        "cli/tests/gates.sh",
+        "cli/tests/hostile-env-gates.sh",
+        "cli/tests/identity-relink-gates.sh",
+        "cli/tests/l1a/gate6_downgrade.sh",
+        "cli/tests/l2-gates.sh",
+        "cli/tests/lib/fixture.sh",
+        "cli/tests/live-pairing-gate.sh",
+        "cli/tests/live-wire-check.sh",
+        "cli/tests/mount-gates.sh",
+        "cli/tests/scripting-contract-gates.sh",
+        "cli/tests/shell-gates.sh",
+        "cli/tests/signaling-freeze-gates.sh",
+        "cli/tests/ssh-ca-gates.sh",
+        "cli/tests/ssh-gates.sh",
+        "cli/tests/state-ux-gates.sh",
+        "cli/tests/transport-gates.sh"
+      ]
+    },
+    {
+      "path": "cli/tests/fixture-cleanup-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/fixture-cleanup-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
       ]
     },
     {

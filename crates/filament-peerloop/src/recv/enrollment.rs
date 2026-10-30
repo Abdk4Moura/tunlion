@@ -262,6 +262,16 @@ impl EnrollmentService {
                 }
 
                 let persistent = !ak.ephemeral;
+                // An ephemeral device's access ends at its LEASE, not at the
+                // invitation's end: one reusable runner invitation lives for
+                // weeks, each box it admits for hours. The box may ask for a
+                // shorter lease (it only ever narrows), else a default that
+                // covers the longest hosted CI job.
+                let access_end = if persistent {
+                    ak.expires
+                } else {
+                    ephemeral_lease_end(now_secs(), ak.expires, v["lease"].as_u64())
+                };
                 let mut requested_name = conn
                     .link(&pid)
                     .map(|link| link.name.clone())
@@ -323,7 +333,7 @@ impl EnrollmentService {
                 let requested_name = candidate;
                 let secret = crate::secret::fresh_secret();
                 let (device_cert, enrolment) = match self
-                    .build_enrolment(&owner_key, device_pub, &ak.caps, ak.expires, persistent)
+                    .build_enrolment(&owner_key, device_pub, &ak.caps, access_end, persistent)
                 {
                     Ok(pair) => pair,
                     Err(error) => {
@@ -358,28 +368,40 @@ impl EnrollmentService {
                         return;
                     }
                 }
-                let stored_name = if persistent {
-                    match self.store.devices_upsert_atomic(
-                        &requested_name,
-                        Some(&secret),
-                        Some(&device_cert),
-                        Some(&ak.caps),
-                        Some(IntroScope::Device.to_byte()),
-                        None,
-                        Some((&ak.caps, ak.expires, ak.max_offline, ak.max_offline)),
-                        allow_reanchor,
-                    ) {
-                        Ok(name) => name,
-                        Err(error) => {
-                            self.log
-                                .debug(&format!("enroll response persistence failed: {error}"));
-                            self.deny(&t, "enrollment denied").await;
-                            return;
-                        }
+                // An ephemeral device is recorded too, so the owner can reach
+                // it by name (`exec ci-worker-3`) for as long as it is present.
+                // The record is marked ephemeral: it holds no fleet meeting
+                // point, siblings never list it, nothing renews it past its
+                // lease, and it is REMOVED (not kept as evidence) once the
+                // lease or the offline budget ends or the box departs.
+                let stored_name = match self.store.devices_upsert_atomic(
+                    &requested_name,
+                    Some(&secret),
+                    Some(&device_cert),
+                    Some(&ak.caps),
+                    Some(IntroScope::Device.to_byte()),
+                    None,
+                    Some((&ak.caps, access_end, ak.max_offline, ak.max_offline)),
+                    allow_reanchor,
+                ) {
+                    Ok(name) => name,
+                    Err(error) => {
+                        self.log
+                            .debug(&format!("enroll response persistence failed: {error}"));
+                        self.deny(&t, "enrollment denied").await;
+                        return;
                     }
-                } else {
-                    requested_name
                 };
+                if !persistent {
+                    if let Err(error) = self.store.devices_mark_ephemeral(&stored_name, now_secs()) {
+                        self.log.debug(&format!(
+                            "enroll response: could not mark the record ephemeral: {error}"
+                        ));
+                        let _ = self.store.devices_remove(&stored_name);
+                        self.deny(&t, "enrollment denied").await;
+                        return;
+                    }
+                }
                 if persistent
                     && self.store.invitee_kind(&hex::encode(enroll_pub)).as_deref()
                         == Some("person")
@@ -392,7 +414,7 @@ impl EnrollmentService {
                 }
                 if let Some(link) = conn.link_mut(&pid) {
                     link.verified_name = Some(stored_name.clone());
-                    link.admit_delegated(owner_pub, device_pub, ak.expires, ak.caps.clone());
+                    link.admit_delegated(owner_pub, device_pub, access_end, ak.caps.clone());
                 }
                 let mut ack = enrolment;
                 ack["type"] = json!("identity-auth-key-enroll-ack");
@@ -407,13 +429,13 @@ impl EnrollmentService {
                 } else {
                     "ephemeral device"
                 };
-                let who = if persistent {
-                    stored_name.as_str()
+                let until = if persistent {
+                    String::new()
                 } else {
-                    pid.as_str()
+                    format!(", until it leaves or in {}", short_secs(access_end.saturating_sub(now_secs())))
                 };
                 self.log.say(&format!(
-                    "  {} {kind} {who} enrolled (caps: {})",
+                    "  {} {kind} {stored_name} enrolled (caps: {}{until})",
                     self.log.paint(Tone::Ok, self.log.glyph_ok()),
                     capability_summary(&ak.caps)
                 ));
@@ -494,6 +516,31 @@ pub fn build_enrolment(
     Ok((cert, payload))
 }
 
+/// The default lease of an ephemeral device that did not ask for one: the
+/// longest a hosted CI job can run (GitHub Actions: 6 hours).
+pub const EPHEMERAL_DEFAULT_LEASE_SECS: u64 = 6 * 3600;
+
+/// When an ephemeral device's access ends: `now` plus the lease it asked for
+/// (or the default), never past the invitation's own end. A lease of 0 or none
+/// means the default. Pure.
+pub fn ephemeral_lease_end(now: u64, invitation_end: u64, requested: Option<u64>) -> u64 {
+    let lease = requested
+        .filter(|l| *l > 0)
+        .unwrap_or(EPHEMERAL_DEFAULT_LEASE_SECS);
+    now.saturating_add(lease).min(invitation_end)
+}
+
+/// `90s`, `45m`, `5h`: the lease in one word for the owner's log line. Pure.
+fn short_secs(s: u64) -> String {
+    if s < 120 {
+        format!("{s}s")
+    } else if s < 2 * 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h", s / 3600)
+    }
+}
+
 /// The one refusal wording for a device record that cannot re-enroll.
 pub fn enrollment_refusal(prior: &Value) -> Option<String> {
     let revoked = prior["certRevoked"].as_bool() == Some(true)
@@ -518,6 +565,25 @@ fn capability_summary(caps: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::recv::store::InvitationRefusal;
+
+    #[test]
+    fn an_ephemeral_lease_only_narrows_and_never_outlives_the_invitation() {
+        let now = 1_000_000;
+        // No lease asked for: the default, which covers a hosted CI job.
+        assert_eq!(
+            ephemeral_lease_end(now, now + 30 * 86400, None),
+            now + EPHEMERAL_DEFAULT_LEASE_SECS
+        );
+        assert_eq!(
+            ephemeral_lease_end(now, now + 30 * 86400, Some(0)),
+            now + EPHEMERAL_DEFAULT_LEASE_SECS
+        );
+        // A two hour lease ends in two hours, not at the invitation's end.
+        assert_eq!(ephemeral_lease_end(now, now + 30 * 86400, Some(7200)), now + 7200);
+        // Never past the invitation, however long the box asks for.
+        assert_eq!(ephemeral_lease_end(now, now + 600, Some(7200)), now + 600);
+        assert_eq!(ephemeral_lease_end(now, now + 600, None), now + 600);
+    }
 
     #[test]
     fn a_revoked_record_is_refused_in_the_old_words() {

@@ -334,6 +334,9 @@ impl HostServices for CliHost {
     fn cert_revoked_for(&self, device_pub: Option<&[u8; 32]>) -> bool {
         crate::identity_state::cert_revoked_for(device_pub)
     }
+    fn cert_forgotten_for(&self, device_pub: Option<&[u8; 32]>) -> bool {
+        crate::identity_state::cert_forgotten_for(device_pub)
+    }
     fn delegated_access_for(&self, device_pub: &[u8; 32]) -> Option<DelegatedAccess> {
         crate::identity_state::delegated_access_for(device_pub).map(|a| DelegatedAccess {
             ceiling: a.ceiling,
@@ -471,6 +474,7 @@ impl HostServices for CliHost {
         let (cause, expires_at) = match cut {
             crate::identity_state::LiveCut::Revoked => (LiveCutCause::Revoked, None),
             crate::identity_state::LiveCut::Expired(at) => (LiveCutCause::Expired, Some(at)),
+            crate::identity_state::LiveCut::Forgotten => (LiveCutCause::Forgotten, None),
         };
         Some(LiveCut {
             cause,

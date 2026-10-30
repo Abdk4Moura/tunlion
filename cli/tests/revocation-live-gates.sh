@@ -29,7 +29,7 @@
 #   LA   POSITIVE send   -- before the forget, the spoke's file is delivered
 #   LA2  POSITIVE exec   -- and its exec runs
 #   LP   PREMISE: the owner's daemon holds a direct link to the spoke now
-#   LB   the forget says the RUNNING daemon applied it ("in effect now", at
+#   LB   the forget says the RUNNING daemon applied it ("Forgot ...", at
 #        least one link closed) and does not promise "never met you"
 #   LC   the forgotten spoke's send is refused within seconds, nothing lands,
 #        and the owner daemon is the SAME process (no restart did this)
@@ -132,9 +132,11 @@ LOG_MARK=$(wc -l <"$WORK/up.log")
 rcLB=$?
 echo "## (forget) rc=$rcLB"; cat "$WORK/forget.log"
 if [ "$rcLB" = "0" ] \
-   && grep -q "in effect now" "$WORK/forget.log" \
+   && grep -q "Forgot $SPOKE" "$WORK/forget.log" \
    && grep -qE "closed [1-9][0-9]* link" "$WORK/forget.log" \
-   && ! grep -q "never met you" "$WORK/forget.log"; then
+   && grep -qE "key refused for [0-9]+ days?" "$WORK/forget.log" \
+   && ! grep -q "never met you" "$WORK/forget.log" \
+   && ! grep -q "looks offline" "$WORK/forget.log"; then
   ok "gateLB: the forget was applied by the running daemon and says what the device will see"
 else
   bad "gateLB: the forget did not report the running daemon applying it (rc=$rcLB)"

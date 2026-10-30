@@ -23,6 +23,8 @@ export interface Env {
   FIL_CHUNK_SIZE?: string;
   FIL_PING_INTERVAL?: string;
   FIL_PING_TIMEOUT?: string;
+  /** Population at or below which an alarm pings in one batch (default 512). */
+  FIL_PING_SLICE_AT?: string;
   FIL_MAX_DECODE_PACKETS?: string;
   FIL_SESSION_CLAIM_LIMIT?: string;
   FIL_CLAIM_LIMIT?: string;

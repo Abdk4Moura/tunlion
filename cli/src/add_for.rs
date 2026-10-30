@@ -77,6 +77,12 @@ fn report_invitation_uptake(ttl_abs: u64) {
     }
 }
 
+
+/// How long a runner (an ephemeral CI or borrowed box) may be unreachable
+/// before the owner forgets it: long enough for a daemon restart or a network
+/// blip, short enough that a cancelled job does not linger in device lists.
+pub(crate) const RUNNER_MAX_OFFLINE_SECS: u64 = 15 * 60;
+
 pub(crate) async fn add_for_cmd(
     caps: &UiCapability,
     for_: Option<String>,
@@ -277,12 +283,21 @@ pub(crate) async fn add_for_cmd(
     // removed on disconnect, no persistent record, which is exactly what an
     // unattended CI box should leave behind.
     let ephemeral = kind == "runner";
+    // The offline budget is what removes a runner that vanished without a
+    // goodbye (a cancelled job, a killed VM): its record lapses this long after
+    // its last live link, and a lapsed ephemeral record is deleted. A runner
+    // has no laptop lid to close, so the budget is short.
+    let max_offline = if ephemeral {
+        RUNNER_MAX_OFFLINE_SECS
+    } else {
+        30 * 24 * 3600
+    };
     let inv = crate::ephemeral::Invitation::mint(
         owner_key.keypair(),
         enroll_seed,
         ceiling.clone(),
         ttl_abs,
-        30 * 24 * 3600,
+        max_offline,
         mint_reuse.clone(),
         ephemeral,
         display_name(),

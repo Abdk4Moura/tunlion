@@ -1557,6 +1557,73 @@ fn shell_owner_gate_refuses_real_spawn() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// The scripted `set` contract on the smoke matrix. `set` at a terminal is a
+/// menu, but a pipe is not a terminal: every stream here is captured, which is
+/// exactly a CI caller. The readout must stay TSV with one row per setting,
+/// `set <key>` must stay the bare value, and no menu frame or ANSI may appear.
+/// This runs in the per-OS smoke job so Windows proves the noninteractive path
+/// itself, not just the Linux unit tests that gate it.
+#[test]
+fn set_with_piped_streams_keeps_the_scripted_contract() {
+    let root = std::env::temp_dir().join(format!("filament-set-pipe-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("create isolated config dir");
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tunlion"));
+        cmd.args(args)
+            .env("TUNLION_CONFIG_DIR", &root)
+            .env("HOME", &root)
+            .env("USERPROFILE", &root)
+            .env("TUNLION_NO_WARM_REUSE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for var in [
+            "TUNLION_NAME",
+            "TUNLION_SERVER",
+            "TUNLION_SHELL",
+            "TUNLION_WARM_PEERS",
+            "TUNLION_AUTO_WARM",
+            "TUNLION_WARM_MAX",
+            "TUNLION_AUTO_PROXY",
+            "TUNLION_LOG",
+            "TUNLION_GATE_SETTLE_MS",
+            "TUNLION_SSH_CERT_TTL",
+            "TUNLION_NONINTERACTIVE",
+        ] {
+            cmd.env_remove(var);
+        }
+        cmd.output().expect("run tunlion set")
+    };
+
+    let listed = run(&["set"]);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    let stderr = String::from_utf8_lossy(&listed.stderr);
+    assert_eq!(listed.status.code(), Some(0), "stdout={stdout} stderr={stderr}");
+    assert!(!stdout.contains("SETTINGS") && !stderr.contains("SETTINGS"), "a pipe opened the menu: {stdout}{stderr}");
+    assert!(!stdout.contains('\u{1b}') && !stderr.contains('\u{1b}'), "a pipe got terminal control codes: {stdout:?} {stderr:?}");
+    let rows: Vec<&str> = stdout.lines().collect();
+    assert!(rows.len() >= 20, "one row per setting: {stdout}");
+    for row in &rows {
+        assert_eq!(row.split('\t').count(), 4, "key<TAB>value<TAB>scope<TAB>help: {row:?}");
+    }
+    assert!(rows.iter().any(|r| r.starts_with("relay\tauto\tglobal\t")), "{stdout}");
+
+    let read = run(&["set", "relay"]);
+    assert_eq!(read.status.code(), Some(0), "{}", String::from_utf8_lossy(&read.stderr));
+    assert_eq!(String::from_utf8_lossy(&read.stdout), "auto\n", "set <key> must stay the bare value in a pipe");
+
+    let wrote = run(&["set", "relay", "never"]);
+    assert_eq!(wrote.status.code(), Some(0), "{}", String::from_utf8_lossy(&wrote.stderr));
+    assert_eq!(String::from_utf8_lossy(&run(&["set", "relay"]).stdout), "never\n");
+
+    let json = run(&["set", "--json"]);
+    assert_eq!(json.status.code(), Some(0), "{}", String::from_utf8_lossy(&json.stderr));
+    let parsed: Value = serde_json::from_slice(&json.stdout).expect("set --json is an array");
+    assert!(parsed.as_array().is_some_and(|rows| !rows.is_empty()), "{parsed}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 #[cfg_attr(any(windows, target_os = "macos"), ignore = "cold establish not yet verified on this platform")]
 fn shell_daemon_live_pairing_no_restart() {

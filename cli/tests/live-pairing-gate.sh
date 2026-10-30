@@ -34,6 +34,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
+# shellcheck source=cli/tests/lib/backend.sh
+source "$HERE/lib/backend.sh"
 BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 SERVER="${TUNLION_TEST_SERVER:-}"
 WORK="$(mktemp -d /tmp/filament-livepair.XXXXXX)"
@@ -48,6 +50,7 @@ seed_store() { printf '%s\n' "$2" > "$1/devices.json"; chmod 600 "$1/devices.jso
 
 PIDS=(); OWN_BACKEND=""
 cleanup() {
+  backend_stop "${BACKEND_PID:-}"
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
   [ -n "$OWN_BACKEND" ] && kill "$OWN_BACKEND" 2>/dev/null
   rm -rf "$WORK" 2>/dev/null
@@ -77,10 +80,10 @@ if [ -z "$SERVER" ]; then
   PORT="$(free_port)"
   SERVER="http://127.0.0.1:$PORT"
   [ -x "$PYV" ] || { echo "no test venv python at $PYV (set TUNLION_TEST_VENV)"; exit 2; }
-  ( cd "$CLI_DIR/../backend" && PORT="$PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
-      FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
-      "$PYV" app.py >"$WORK/backend.log" 2>&1 ) &
-  OWN_BACKEND=$!
+  backend_start "$CLI_DIR/../backend" "$PYV" "$WORK/backend.log" \
+    PORT="$PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+    FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25
+  OWN_BACKEND=$BACKEND_PID
   for _ in $(seq 1 80); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.25; done
 fi
 curl -fsS "$SERVER/api/health" >/dev/null 2>&1 || { echo "no backend at $SERVER"; exit 2; }

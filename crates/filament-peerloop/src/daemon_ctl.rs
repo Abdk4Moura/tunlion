@@ -542,6 +542,7 @@ pub async fn handle_warm_req(
             req.reject("approve-request not handled here").await
         }
         control::ReqKind::DenyRequest { .. } => req.reject("deny-request not handled here").await,
+        control::ReqKind::Depart => req.reply(&json!({ "ok": false, "told": 0 })).await,
     }
 }
 

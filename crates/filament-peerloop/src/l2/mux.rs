@@ -821,6 +821,9 @@ pub async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         LiveCutCause::Expired => {
                             hooks::critical("l2: peer access expired, closing the live stream")
                         }
+                        LiveCutCause::Forgotten => {
+                            hooks::critical("l2: peer forgotten, closing the live stream")
+                        }
                     }
                     revoked_reason = Some(cut.reason);
                     if let Some(r) = reader.take() { r.abort(); }

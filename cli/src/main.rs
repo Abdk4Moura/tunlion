@@ -282,6 +282,7 @@ use conn::{
     active_binding_matches, link_dead_for, link_has_live_for, match_adoption_source,
     upgrade_principal,
 };
+mod set_menu;
 mod settings;
 mod transport_context;
 /// L3 TUN data plane (serve_tun). Linux-only: it uses /dev/net/tun + TUNSETIFF,
