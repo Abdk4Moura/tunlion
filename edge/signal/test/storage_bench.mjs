@@ -133,8 +133,6 @@ for (const scan of [64]) {
   });
   db.close();
 }
-for (const line of out) console.log(JSON.stringify(line));
-
 // Late cursor: a fresh Registry only exercises the first page. Compare the
 // row-value seek with the old OR predicate near the end of the index.
 {
@@ -175,3 +173,5 @@ for (const line of out) console.log(JSON.stringify(line));
   });
   db.close();
 }
+
+for (const line of out) console.log(JSON.stringify(line));
