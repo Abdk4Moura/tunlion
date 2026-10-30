@@ -34,6 +34,9 @@ release build failed and nothing was published under it.
 - Pairing a browser through `tunlion add`, "Another device I own", now ends
   with one line saying a browser cannot join your fleet, and exits 0 when the
   pairing itself worked.
+- `devices forget`, `revoke` and `demote --to cut` print one short line per
+  device (what happened, links closed, how long the key stays refused)
+  instead of two paragraphs. `--json` and exit codes are unchanged.
 - Device names in printed commands are quoted for the shell, apostrophes
   included.
 - Your other devices drop entries for devices whose certificate expired or
