@@ -34,7 +34,8 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const RUNS = Number(process.env.PSR_RUNS || 10);
 
 let backend = null;
-let backendLog = '';
+const LOG = path.join(require('os').tmpdir(), `same-room-relay-${PORT}-${process.pid}.log`);
+fs.mkdirSync(path.dirname(LOG), { recursive: true });
 function fail(msg) { console.error('[same-room] FAIL:', msg); cleanup(); process.exit(1); }
 function ok(msg) { console.log('[same-room] OK:', msg); }
 function note(msg) { console.log('[same-room]', msg); }
@@ -51,11 +52,12 @@ function startBackend() {
       FIL_CLAIM_LIMIT: '1000000', FIL_PING_TIMEOUT: '120', FIL_PING_INTERVAL: '25',
       FIL_SECRET: 'same-room-test-secret',
     },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    // To a file, not a pipe: the parent blocks in spawnSync while the
+    // engine children run, and a full pipe would stall the relay.
+    stdio: ['ignore', fs.openSync(LOG, 'w'), fs.openSync(LOG, 'a')],
   });
-  backend.stdout.on('data', (d) => { backendLog += d; });
-  backend.stderr.on('data', (d) => { backendLog += d; });
 }
+const relayLog = () => { try { return fs.readFileSync(LOG, 'utf8'); } catch { return ''; } };
 
 async function waitHealth(timeoutMs) {
   const t0 = Date.now();
@@ -174,14 +176,14 @@ async function runEngine(engine) {
     process.exit(0);
   }
   startBackend();
-  if (!(await waitHealth(30000))) fail('backend never healthy:\n' + backendLog.slice(-2000));
+  if (!(await waitHealth(30000))) fail('backend never healthy:\n' + relayLog().slice(-2000));
   ok('relay up');
   let bad = 0;
   for (const engine of (process.env.PSR_ENGINES || 'chromium,webkit').split(',').map((s) => s.trim())) {
     const r = spawnSync(process.execPath, [__filename], { env: { ...process.env, PSR_CHILD: engine }, stdio: 'inherit', timeout: 30 * 60 * 1000 });
     if (r.status !== 0) bad++;
   }
-  const relayFails = backendLog.split('\n').filter((l) => /pake-failed/.test(l));
+  const relayFails = relayLog().split('\n').filter((l) => /pake-failed/.test(l));
   if (relayFails.length) console.log('[same-room] relay saw:\n' + relayFails.slice(-20).join('\n'));
   if (bad) fail(`${bad} engine(s) had failed runs`);
   if (relayFails.length) fail(`relay logged ${relayFails.length} pake-failed event(s)`);
