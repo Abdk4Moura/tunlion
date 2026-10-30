@@ -698,3 +698,94 @@ mod live_cut_wording_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod forgotten_admission_tests {
+    //! The real-store admission seam: a fixture on disk, read through the same
+    //! production functions the daemon uses (`cert_forgotten_for`,
+    //! `cert_revoked_for`), and the refusal built by the real classifier. This
+    //! is the forget write window as a forget leaves it: the key block is
+    //! already written, the record is still there.
+    use crate::refusal::{Code, Refusal};
+
+    #[test]
+    fn a_key_block_with_the_record_still_present_is_unrecognized_through_the_production_apis() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!(
+            "tunlion-forget-admit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prior = std::env::var_os("TUNLION_CONFIG_DIR");
+        unsafe { std::env::set_var("TUNLION_CONFIG_DIR", &dir) };
+
+        let key = [0x5bu8; 32];
+        let hex = hex::encode(key);
+        let now = crate::identity::now_secs();
+        std::fs::write(
+            dir.join("devices.json"),
+            serde_json::to_string(&serde_json::json!([
+                {"name": "guest", "deviceCert": {"devicePub": hex}, "caps": []},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(crate::fleet_support::KEY_REVOCATIONS_FILE),
+            serde_json::to_string(&serde_json::json!([
+                {"devicePub": hex, "certExpires": now + 3600, "revokedAt": now, "name": "guest"},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // What admission and the live re-check read, from the real files.
+        let forgotten = super::cert_forgotten_for(Some(&key));
+        let revoked = super::cert_revoked_for(Some(&key));
+        assert!(forgotten, "the key block names the device");
+        assert!(revoked, "the open is still denied: the block folds into revoked");
+        let r = Refusal::from_shell_gate(forgotten, revoked, false, None, Some("guest".into()));
+        assert_eq!(
+            r.code,
+            Code::Unrecognized,
+            "a forget must not read as a revocation: {}",
+            r.reason
+        );
+        assert!(r.reason.contains("not recognized"), "{}", r.reason);
+
+        // Ordinary `devices revoke` / `demote --to cut`: the record stays,
+        // marked certRevoked, and no key block is written.
+        std::fs::remove_file(dir.join(crate::fleet_support::KEY_REVOCATIONS_FILE)).unwrap();
+        std::fs::write(
+            dir.join("devices.json"),
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "name": "guest",
+                    "deviceCert": {"devicePub": hex},
+                    "certRevoked": true,
+                    "caps": [],
+                },
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let forgotten = super::cert_forgotten_for(Some(&key));
+        let revoked = super::cert_revoked_for(Some(&key));
+        assert!(!forgotten, "no block was written");
+        assert!(revoked, "the kept record is marked revoked");
+        let r = Refusal::from_shell_gate(forgotten, revoked, false, None, Some("guest".into()));
+        assert_eq!(r.code, Code::CertRevoked);
+        assert_eq!(r.reason, "device revoked");
+
+        match prior {
+            Some(v) => unsafe { std::env::set_var("TUNLION_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("TUNLION_CONFIG_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
