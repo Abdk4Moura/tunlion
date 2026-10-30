@@ -83,9 +83,13 @@ The spec (`docs/protocol/local-discovery.md`) is normative; this is the why.
 peers link, by any route, each sends a `lan-hello` over the authenticated
 link: its presence key, its listener port, and every unicast address on every
 interface with its class. Each side keeps the other's addresses (per peer,
-with class and last-success time) and, at start and whenever the server is
-unreachable, dials them directly with the existing authenticated direct-QUIC
-handshake. This makes any overlay or private network work without knowing
+with class and last-success time) and, whenever the server is unreachable,
+dials them directly with the existing authenticated direct-QUIC handshake.
+Beside a working server the daemon gives signaling an 8 s grace at start and
+then dials only the devices signaling has not linked; a one-shot command uses
+local discovery only when the server is unreachable. (Dialing both at once
+was measured: the warm-hold gate saw duplicate links and a peer dialing a
+one-shot's session that never answered.) This makes any overlay or private network work without knowing
 what it is.
 
 **Presence key.** Each device holds a random 32-byte presence key `P`, sent
