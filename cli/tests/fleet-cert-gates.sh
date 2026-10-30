@@ -398,7 +398,8 @@ FG_REINDEXED=$(python3 -c "import json;print(1 if any(d.get('deviceCert',{}).get
 FG_LISTED=$(python3 -c "import json;print(1 if any(e.get('devicePub')=='$FG_PUB' for e in json.load(open('$DA/revoked-keys.json'))) else 0)" 2>/dev/null)
 echo "## forget rc=$rcFG key=${FG_PUB:0:16}... on key list=$FG_LISTED re-indexed after a fresh hello=$FG_REINDEXED (hello attempted=$FG_HELLO)"
 if [ "$rcFG" = "0" ] && [ -n "$FG_PUB" ] \
-   && grep -q "revoked its fleet certificate" "$WORK/forget.log" \
+   && grep -q "Forgot $FORGOTTEN" "$WORK/forget.log" \
+   && grep -qE "key refused for [0-9]+ days?" "$WORK/forget.log" \
    && [ "$FG_LISTED" = "1" ] && [ "$FG_REINDEXED" = "0" ] && [ "$FG_HELLO" = "1" ]; then
   ok "gateFORGET-REVOKES: forget revoked the live key, freed the name, and fleet-hello did not re-admit it"
 else

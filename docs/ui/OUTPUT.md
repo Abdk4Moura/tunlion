@@ -169,6 +169,12 @@ Style goes *inside* a `ui::` call, never around a bare print. `ui::paint` inside
 `eprintln!` gets the colour and loses the verbosity gate, which is the trap: it
 looks like it went through the UI layer.
 
+A mutation's result is one line: glyph, past-tense verb, name, then only the
+facts that change what the reader does next (`closed 1 link`, `key refused for
+21 days`, the next `tunlion up` start). An unconfirmed daemon is the one red
+line, naming the restart and keeping the nonzero exit. The paragraph that
+explains why the action is safe belongs in `--help`, not after every success.
+
 **ASCII terminals get ASCII.** The terminal is Unicode only when the first
 non-empty of LC_ALL, LC_CTYPE, LANG names UTF-8 AND `TERM` is not `dumb`. On
 any other terminal every human line is passed through `ui::ascii_glyphs`

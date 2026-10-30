@@ -28,6 +28,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::fleet_support::ForgetOutcome;
+use crate::ui;
+
 /// The store as raw text: devices.json and revoked-keys.json. The daemon keeps
 /// the last one it acted on and sweeps when this differs. `None` when either
 /// exists but cannot be read, or devices.json is not a JSON array: a half
@@ -206,40 +209,117 @@ pub(crate) async fn tell_daemon() -> DaemonAnswer {
     }
 }
 
-/// The line `forget` / `revoke` prints about the running daemon. Err for
-/// `Unconfirmed`: the store is written, but the claim "refused here" is not yet
-/// true in the daemon that is accepting connections, so the command must not
-/// exit 0 as if it were. `forgotten` is a forget (the device is no longer
-/// answered at all, so it sees this machine as offline) rather than a revoke in
-/// place (its opens are refused with the reason). Pure.
-pub(crate) fn daemon_line(
-    name: &str,
-    answer: &DaemonAnswer,
-    forgotten: bool,
-) -> Result<String, String> {
-    let untold = if forgotten {
-        format!(" '{name}' is not told: from its side this machine looks offline.")
-    } else {
-        String::new()
-    };
-    match answer {
-        // A revoke in place closes nothing on purpose (the refusal reaching
-        // the device is worth keeping), so "closed 0 link(s)" was true and
-        // misleading while live links existed. Say what happened to them.
-        DaemonAnswer::Applied { closed, refused } if !forgotten && *refused > 0 => Ok(format!(
-            "in effect now: the running daemon refuses '{name}' from here on. It holds {refused} live link(s) to it, kept up only to carry that refusal: every new open on them is refused, and any session or stream already open ends within a few seconds.{}",
-            if *closed > 0 { format!(" It also closed {closed} link(s).") } else { String::new() }
-        )),
-        DaemonAnswer::Applied { closed, .. } => Ok(format!(
-            "in effect now: the running daemon closed {closed} link(s) to '{name}' and refuses it from here on.{untold}"
-        )),
-        DaemonAnswer::NoDaemon => Ok(format!(
-            "no running daemon answered: if `tunlion up` is running here it applies this within a few seconds, otherwise from its next start.{untold}"
-        )),
-        DaemonAnswer::Unconfirmed => Err(format!(
-            "recorded, but the running daemon did not confirm it, so '{name}' may still be connected.\n  Restart it to apply now: tunlion down -y && tunlion up --detach"
-        )),
+/// One result line: the success glyph, the past-tense verb, the name, then any
+/// short retained facts. Pure, but for paint.
+fn result_line(verb: &str, name: &str, details: &[String]) -> String {
+    let mut line = format!(
+        "{} {} {}",
+        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+        verb,
+        ui::paint(ui::Tone::Bold, name),
+    );
+    if !details.is_empty() {
+        line.push_str(&ui::paint(
+            ui::Tone::Dim,
+            &format!(" \u{b7} {}", details.join(" \u{b7} ")),
+        ));
     }
+    line
+}
+
+/// `1 link` / `2 links`, so counted facts read correctly.
+fn links(n: u64) -> String {
+    if n == 1 { "1 link".to_string() } else { format!("{n} links") }
+}
+
+/// The one line `devices forget` prints after the daemon answered. The store is
+/// already written; this says what is true now, and nothing it cannot know.
+/// `Unconfirmed` is an error: the command must not exit 0 while the daemon that
+/// is accepting connections has not applied it. Pure.
+pub(crate) fn forget_line(
+    outcome: &ForgetOutcome,
+    answer: &DaemonAnswer,
+) -> Result<String, String> {
+    let mut details = Vec::new();
+    match answer {
+        DaemonAnswer::Applied { closed, .. } => {
+            if *closed > 0 {
+                details.push(format!("closed {}", links(*closed)));
+            }
+        }
+        DaemonAnswer::NoDaemon => {
+            details.push("applies when `tunlion up` next starts".to_string());
+        }
+        DaemonAnswer::Unconfirmed => {
+            return Err(unconfirmed("Forgot", &outcome.name));
+        }
+    }
+    if let Some(detail) = outcome.verdict.detail() {
+        details.push(detail);
+    }
+    Ok(result_line("Forgot", &outcome.name, &details))
+}
+
+/// The one line a durable revoke prints (`demote --to cut`). Unlike a forget,
+/// a revoke in place keeps live links up on purpose so the device is told why
+/// it is refused; the count is a fact, not a "closed 0 links" success. Pure.
+pub(crate) fn revoke_line(name: &str, answer: &DaemonAnswer) -> Result<String, String> {
+    let mut details = Vec::new();
+    match answer {
+        DaemonAnswer::Applied { closed, refused } => {
+            if *closed > 0 {
+                details.push(format!("closed {}", links(*closed)));
+            }
+            if *refused > 0 {
+                details.push(format!(
+                    "{} kept for the refusal",
+                    links(*refused)
+                ));
+            }
+        }
+        DaemonAnswer::NoDaemon => {
+            details.push("applies when `tunlion up` next starts".to_string());
+        }
+        DaemonAnswer::Unconfirmed => {
+            return Err(unconfirmed("Revoked", name));
+        }
+    }
+    Ok(result_line("Revoked", name, &details))
+}
+
+/// `revoke <device> <capability>` uses the same success shape as the ladder's
+/// cut off. `shell_key_removed` is the fact the old sentence carried.
+pub(crate) fn capability_revoke_line(
+    name: &str,
+    capability: &str,
+    shell_key_removed: bool,
+) -> String {
+    let mut details = Vec::new();
+    if shell_key_removed {
+        details.push("removed its managed shell key".to_string());
+    }
+    let verb = format!("Revoked {capability} from");
+    result_line(&verb, name, &details)
+}
+
+/// The single red outcome for an unconfirmed daemon, with the command that
+/// applies it now. The caller returns it as an error so the exit stays nonzero
+/// and nothing success-shaped was printed first.
+fn unconfirmed(verb: &str, name: &str) -> String {
+    format!(
+        "{verb} {name}, but the running service didn't confirm \u{b7} restart it: tunlion down -y && tunlion up --detach"
+    )
+}
+
+/// Print an unconfirmed outcome as the command's only feedback and return the
+/// existing nonzero error for it. `reported_because` keeps `main` from printing
+/// the same sentence a second time.
+pub(crate) fn unconfirmed_exit(message: String) -> anyhow::Error {
+    ui::critical(&format!(
+        "{} {message}",
+        ui::paint(ui::Tone::Err, ui::glyph_err())
+    ));
+    crate::exit_codes::reported_because(crate::exit_codes::ExitKind::Other, message)
 }
 
 #[cfg(test)]
@@ -336,22 +416,74 @@ mod tests {
     }
 
     #[test]
-    fn the_daemon_line_never_claims_what_it_cannot_know() {
-        let applied = daemon_line("beta", &DaemonAnswer::Applied { closed: 2, refused: 0 }, true).unwrap();
-        assert!(applied.contains("in effect now") && applied.contains("closed 2 link(s)"));
-        assert!(applied.contains("looks offline"), "a forget says what the device sees: {applied}");
-        let none = daemon_line("beta", &DaemonAnswer::NoDaemon, true).unwrap();
+    fn a_forget_line_keeps_only_facts_it_can_stand_behind() {
+        use crate::fleet_support::ForgetVerdict;
+
+        let outcome = |verdict| ForgetOutcome { name: "beta".to_string(), verdict };
+        let revoked = outcome(ForgetVerdict::RevokeThenRemove { days_left: 21 });
+
+        let applied = forget_line(&revoked, &DaemonAnswer::Applied { closed: 1, refused: 0 })
+            .unwrap();
+        assert!(applied.contains("Forgot beta"), "{applied}");
+        assert!(applied.contains("closed 1 link"), "{applied}");
+        assert!(applied.contains("key refused for 21 days"), "{applied}");
+        assert!(!applied.contains("is free now"), "{applied}");
+        assert!(!applied.contains("looks offline"), "{applied}");
+        assert!(!applied.contains("valid for"), "{applied}");
+
+        let none = forget_line(&revoked, &DaemonAnswer::NoDaemon).unwrap();
+        assert!(none.contains("applies when `tunlion up` next starts"), "{none}");
+        assert!(none.contains("key refused for 21 days"), "{none}");
         assert!(!none.contains("in effect now"), "{none}");
-        assert!(none.contains("next start"), "{none}");
-        assert!(!none.contains("never met you"), "the forgotten side is not told: {none}");
-        let in_place = daemon_line("beta", &DaemonAnswer::Applied { closed: 0, refused: 0 }, false).unwrap();
-        assert!(!in_place.contains("offline"), "a revoked device is refused with a reason: {in_place}");
-        // Live links kept up for the refusal are counted, never reported as
-        // "closed 0 link(s)".
-        let live = daemon_line("beta", &DaemonAnswer::Applied { closed: 0, refused: 2 }, false).unwrap();
-        assert!(live.contains("2 live link(s)") && !live.contains("closed 0"), "{live}");
-        assert!(!live.contains("offline"), "{live}");
-        let unconfirmed = daemon_line("beta", &DaemonAnswer::Unconfirmed, true).unwrap_err();
+        assert!(!none.contains("never met you"), "{none}");
+
+        let plain = ForgetOutcome { name: "beta".to_string(), verdict: ForgetVerdict::Remove };
+        assert_eq!(
+            forget_line(&plain, &DaemonAnswer::Applied { closed: 0, refused: 0 }).unwrap(),
+            format!("{} Forgot beta", ui::paint(ui::Tone::Ok, ui::glyph_ok()))
+        );
+        assert!(!forget_line(&plain, &DaemonAnswer::Applied { closed: 0, refused: 0 })
+            .unwrap()
+            .contains("key refused"));
+
+        // Counting is part of the line, in the plural the count calls for.
+        let one_day = outcome(ForgetVerdict::KeepRevocationThenRemove { days_left: 1 });
+        let one = forget_line(&one_day, &DaemonAnswer::Applied { closed: 2, refused: 0 })
+            .unwrap();
+        assert!(one.contains("closed 2 links") && one.contains("key refused for 1 day"), "{one}");
+
+        let unconfirmed =
+            forget_line(&revoked, &DaemonAnswer::Unconfirmed).unwrap_err();
+        assert!(unconfirmed.starts_with("Forgot beta, but the running service didn't confirm"), "{unconfirmed}");
         assert!(unconfirmed.contains("tunlion down -y && tunlion up --detach"), "{unconfirmed}");
+        assert_eq!(
+            crate::exit_codes::classify(&unconfirmed_exit(unconfirmed)).code(),
+            1,
+            "an unconfirmed daemon must keep the nonzero exit"
+        );
+    }
+
+    #[test]
+    fn a_revoke_line_counts_closed_and_kept_links() {
+        let applied = revoke_line("beta", &DaemonAnswer::Applied { closed: 2, refused: 0 }).unwrap();
+        assert!(applied.contains("Revoked beta") && applied.contains("closed 2 links"), "{applied}");
+
+        // A revoke in place keeps live links up to carry the refusal; that is a
+        // count, never reported as "closed 0 links".
+        let live = revoke_line("beta", &DaemonAnswer::Applied { closed: 0, refused: 2 }).unwrap();
+        assert!(live.contains("2 links kept for the refusal") && !live.contains("closed 0"), "{live}");
+        assert!(!live.contains("offline"), "{live}");
+
+        let none = revoke_line("beta", &DaemonAnswer::NoDaemon).unwrap();
+        assert!(none.contains("applies when `tunlion up` next starts"), "{none}");
+
+        let unconfirmed = revoke_line("beta", &DaemonAnswer::Unconfirmed).unwrap_err();
+        assert!(unconfirmed.starts_with("Revoked beta, but the running service didn't confirm"), "{unconfirmed}");
+        assert!(unconfirmed.contains("tunlion down -y && tunlion up --detach"), "{unconfirmed}");
+
+        let shell = capability_revoke_line("beta", "shell", true);
+        assert!(shell.contains("Revoked shell from beta") && shell.contains("managed shell key"), "{shell}");
+        let mount = capability_revoke_line("beta", "mount", false);
+        assert!(mount.contains("Revoked mount from beta") && !mount.contains("shell key"), "{mount}");
     }
 }
