@@ -117,7 +117,7 @@ ratio. Batching does not reduce requests or rows, and this sample did not:
 connect-path writes dominate a short run. A second workload, W2, kept the
 real 30 s daemon sync: after was 2,332 requests, 597 rows and 2.3 active s
 with one client transport drop. A complete before W2 run is still missing
-(the worker link died mid-run), so no before/after claim is made for it.
+(the shared worker lease expired mid-run), so no before/after claim is made for it.
 
 The first claim after an idle day can write far more than one connect: in this
 measurement the 19:30 minute wrote 14,337 rows once, then zero rows in every
