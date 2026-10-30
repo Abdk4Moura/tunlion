@@ -405,6 +405,12 @@ impl HostServices for CoreHost {
             .unwrap_or(false)
     }
 
+    fn cert_forgotten_for(&self, device_pub: Option<&[u8; 32]>) -> bool {
+        device_pub
+            .map(|p| self.store.device_key_revoked(p, now_secs()))
+            .unwrap_or(false)
+    }
+
     fn delegated_access_for(&self, device_pub: &[u8; 32]) -> Option<DelegatedAccess> {
         delegated_access_for(&self.store, device_pub)
     }

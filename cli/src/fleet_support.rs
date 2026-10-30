@@ -126,6 +126,14 @@ pub(crate) fn forget_report(name: &str, verdict: &ForgetVerdict) -> String {
 }
 
 /// The file that holds revocations by device key, apart from any name.
+///
+/// PROVENANCE IS PART OF THE FORMAT: an entry here means "FORGOTTEN", and
+/// nothing else. It is written only by `forget_device` (see
+/// [`record_key_revocation_at`]) and lifted by an explicit re-add or
+/// `promote`. Every peer-facing path reads a hit as `Code::Unrecognized`
+/// ("not recognized"), on admission and mid-session alike. A future writer
+/// with any other meaning must carry its own reason; it must not reuse this
+/// list, or a revoke would start reading as a forget (or the reverse).
 pub(crate) const KEY_REVOCATIONS_FILE: &str = "revoked-keys.json";
 
 fn key_revocations_path() -> PathBuf {
@@ -166,6 +174,11 @@ pub(crate) fn device_key_revoked(device_pub: &[u8; 32], now: u64) -> bool {
 /// Record `cert`'s key as revoked until the certificate expires, pruning
 /// entries that have run out. `name` is kept for the reader only; nothing
 /// matches on it.
+///
+/// THE ONLY MEANING OF AN ENTRY IS "FORGOTTEN" (see [`KEY_REVOCATIONS_FILE`]),
+/// and `forget_device` is the only production caller. Do not call this for a
+/// revoke, a demote or an expiry: those keep their record and carry their own
+/// reason, and reusing this list would make them read "not recognized".
 pub(crate) fn record_key_revocation_at(
     path: &Path,
     cert: &identity::DeviceCert,

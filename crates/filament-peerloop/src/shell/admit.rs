@@ -185,6 +185,7 @@ pub async fn admit_pty_open(
             .unwrap_or("no shell cap / untrusted")
             .to_string();
         let refusal = Refusal::from_shell_gate(
+            host.cert_forgotten_for(gate_inputs.idev.as_ref()),
             gate_inputs.cert_revoked,
             gate_inputs.denied,
             cap_reason.as_deref(),
@@ -289,6 +290,7 @@ pub async fn admit_exec_open(
     let (device, gate_inputs) = gather_shell_gate_inputs(conn, pid, cfg.policy, cap::CAP_SHELL);
     if let Err(cap_reason) = exec_gate_decision(&gate_inputs, host.as_ref()) {
         let refusal = Refusal::from_shell_gate(
+            host.cert_forgotten_for(gate_inputs.idev.as_ref()),
             gate_inputs.cert_revoked,
             gate_inputs.denied,
             cap_reason.as_deref(),

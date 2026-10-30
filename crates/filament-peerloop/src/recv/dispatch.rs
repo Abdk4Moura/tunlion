@@ -6696,7 +6696,8 @@ async fn recv_run(
                         host.enqueue_request_if_requestable(who, "shell");
                         let cap_reason = granted.deny_reason("");
                         let refusal = crate::refusal::Refusal::from_shell_gate(
-                            false,
+                            host.cert_forgotten_for(idev.as_ref()),
+                            cert_revoked,
                             dev.as_deref()
                                 .map(|n| host.device_capability_denied(n, "shell"))
                                 .unwrap_or(false),

@@ -149,6 +149,17 @@ pub(crate) fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
     idev.map(device_cert_revoked).unwrap_or(false)
 }
 
+/// Is this device FORGOTTEN here: its key is on `revoked-keys.json`, the block
+/// `devices forget` writes and an explicit re-add or `promote` lifts?
+/// Deliberately separate from [`cert_revoked_for`], which folds the block in so
+/// an open is denied either way: the CAUSE decides the words the peer hears,
+/// and a forgotten device must read "not recognized", not "device revoked".
+/// The block has exactly one writer (`forget_device`); a future second-purpose
+/// writer would have to carry its own reason rather than reuse this list.
+pub(crate) fn cert_forgotten_for(idev: Option<&[u8; 32]>) -> bool {
+    idev.is_some_and(|p| crate::fleet_support::device_key_revoked(p, crate::identity::now_secs()))
+}
+
 /// The revocation re-check interval, overridable for tests. Clamped so a
 /// misconfiguration cannot make the re-check effectively never run, or spin on a
 /// read-heavy stream by re-reading the device store every operation.
@@ -469,7 +480,7 @@ pub(crate) fn live_session_cut(idev: Option<&[u8; 32]>) -> Option<LiveCut> {
     // (a forgotten key must not pass fleet-hello either), so asking it first
     // would report a forgotten device as revoked: the wrong promise, and the
     // wrong remedy for the person on the other side.
-    if crate::fleet_support::device_key_revoked(&idev, crate::identity::now_secs()) {
+    if cert_forgotten_for(Some(&idev)) {
         return Some(LiveCut::Forgotten);
     }
     if cert_revoked_for(Some(&idev)) {

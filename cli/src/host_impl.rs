@@ -334,6 +334,9 @@ impl HostServices for CliHost {
     fn cert_revoked_for(&self, device_pub: Option<&[u8; 32]>) -> bool {
         crate::identity_state::cert_revoked_for(device_pub)
     }
+    fn cert_forgotten_for(&self, device_pub: Option<&[u8; 32]>) -> bool {
+        crate::identity_state::cert_forgotten_for(device_pub)
+    }
     fn delegated_access_for(&self, device_pub: &[u8; 32]) -> Option<DelegatedAccess> {
         crate::identity_state::delegated_access_for(device_pub).map(|a| DelegatedAccess {
             ceiling: a.ceiling,

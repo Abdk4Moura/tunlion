@@ -572,6 +572,14 @@ pub trait HostServices: Send + Sync + 'static {
     fn cert_revoked_for(&self, _device_pub: Option<&[u8; 32]>) -> bool {
         false
     }
+    /// Is this device FORGOTTEN in the host's own store (its key is on the
+    /// forget block)? Distinct from `cert_revoked_for`, which folds the block
+    /// in so an open is denied either way. The refusal the peer is told must
+    /// name the right cause: forgotten reads "not recognized", revoked reads
+    /// "device revoked". An inert host forgets no one, so it answers no.
+    fn cert_forgotten_for(&self, _device_pub: Option<&[u8; 32]>) -> bool {
+        false
+    }
     /// The delegated access this host's device record grants, read fresh at the
     /// gate. `None` means the record is not a delegated principal, which is
     /// also the inert answer: a host with no device store has admitted no

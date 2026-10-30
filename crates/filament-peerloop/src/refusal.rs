@@ -313,13 +313,22 @@ impl Refusal {
     }
 
     /// Classify a shell-gate denial. `cap_reason` is the engine's reason when
-    /// it named one; `cert_revoked`/`denied` are the gate inputs.
+    /// it named one; `forgotten`/`cert_revoked`/`denied` are the gate inputs.
+    ///
+    /// `forgotten` is asked FIRST because `cert_revoked` folds the forget block
+    /// in (a forgotten key must not pass fleet-hello either). A forget is not a
+    /// revocation of a device we still know: the peer is told "not recognized",
+    /// the same words its next open meets, never "device revoked".
     pub fn from_shell_gate(
+        forgotten: bool,
         cert_revoked: bool,
         denied: bool,
         cap_reason: Option<&str>,
         as_name: Option<String>,
     ) -> Refusal {
+        if forgotten {
+            return Refusal::new(Code::Unrecognized, as_name);
+        }
         if !cert_revoked {
             if let Some(r) = Refusal::final_cause(cap_reason, as_name.clone()) {
                 return r;
@@ -501,6 +510,7 @@ mod tests {
         let r = Refusal::from_shell_gate(
             false,
             false,
+            false,
             Some(&expired_reason(at)),
             Some("guest-b".into()),
         );
@@ -515,5 +525,32 @@ mod tests {
         // A hostile ceiling never survives the parse.
         f["ceiling"] = serde_json::json!(["shell; rm -rf /"]);
         assert_eq!(reinvite_from_frame(&f), None);
+    }
+
+    /// Admission precedence. A key on the forget block is a FORGET even while
+    /// `cert_revoked` is true: `cert_revoked` folds the block in (a forgotten
+    /// key must not pass fleet-hello either), and `forget` writes the block
+    /// before it drops the record, so the daemon can see exactly that pair.
+    /// A kept record marked certRevoked, with no block, is still a revocation
+    /// (`devices revoke`, `demote --to cut`), and a withdrawn grant still
+    /// reads as a revoke. Nothing here loosens a denial: every input still
+    /// refuses, only the words differ.
+    #[test]
+    fn a_forgotten_key_reads_not_recognized_even_with_cert_revoked_set() {
+        let name = Some("guest-b".to_string());
+        let forgotten =
+            Refusal::from_shell_gate(true, true, false, Some("device revoked"), name.clone());
+        assert_eq!(forgotten.code, Code::Unrecognized);
+        assert!(forgotten.reason.contains("not recognized"), "{}", forgotten.reason);
+
+        // Ordinary revoke / demote --to cut: the record stays, no block is
+        // written, `cert_revoked` alone.
+        let revoked = Refusal::from_shell_gate(false, true, false, None, name.clone());
+        assert_eq!(revoked.code, Code::CertRevoked);
+        assert_eq!(revoked.reason, "device revoked");
+
+        // An explicit grant withdrawal is its own cause (`denied`).
+        let denied = Refusal::from_shell_gate(false, false, true, None, name.clone());
+        assert_eq!(denied.code, Code::Revoked);
     }
 }
