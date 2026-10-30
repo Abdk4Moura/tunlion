@@ -14,6 +14,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { ClipboardAddon } from '@xterm/addon-clipboard'
 import { PredictiveEcho } from '../lib/predict.js'
 import { log } from '../lib/log.js'
 import {
@@ -57,6 +58,36 @@ function xtermTheme(T, accent) {
     brightBlack: T.dim, brightRed: T.bad, brightGreen: T.ok, brightYellow: T.warn,
     brightBlue: T.recv, brightMagenta: '#FF8AD6', brightCyan: '#5BE7FF', brightWhite: T.text,
   }
+}
+// Bracketed-paste markers. Removed from pasted text so a paste can never end
+// the bracket early (the classic paste-injection that runs the tail as input).
+const PASTE_MARKERS = /\x1b\[20[01]~/g
+// Above this many characters a paste is shown for review before it is sent.
+export const LARGE_PASTE = 4096
+
+// OSC 52 (tmux/vim yank to the terminal's clipboard) is untrusted PTY output.
+// Caps are stated in BOTH wire and decoded units so they cannot drift:
+//   - the guard rejects a base64 Pd longer than 64 KiB characters, which can
+//     decode to at most 48 KiB of bytes (4 base64 chars -> 3 bytes);
+//   - the provider re-checks the decoded UTF-8 byte count against 48 KiB;
+//   - up to 8 KiB decoded is written automatically, larger permitted yanks
+//     wait for a trusted tap (never truncated);
+//   - NUL/ESC and other C0/C1 control characters are refused, because a
+//     remote escape must not plant hidden terminal input on the clipboard.
+// Tab, LF and CR are allowed: ordinary text yanks contain them.
+export const REMOTE_COPY_MAX_B64 = 64 * 1024
+export const REMOTE_COPY_MAX_BYTES = 48 * 1024
+export const REMOTE_COPY_AUTO_BYTES = 8 * 1024
+const REMOTE_UNSAFE_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/
+export function cleanPaste(text) {
+  return String(text == null ? '' : text).replace(/\r\n?/g, '\n').replace(PASTE_MARKERS, '')
+}
+// Review first when the text holds more than one line and the app did NOT ask
+// for bracketed paste (each line would run as its own command), or when it is
+// large. One line plus a trailing newline is a single command, not a review.
+export function pasteNeedsReview(text, bracketed) {
+  if (text.length > LARGE_PASTE) return true
+  return !bracketed && text.replace(/\n$/, '').includes('\n')
 }
 const haptic = (ms = 8) => { try { navigator.vibrate && navigator.vibrate(ms) } catch (e) {} } // Android only
 
@@ -140,12 +171,27 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
   const [wheelRoute, setWheelRoute] = useState(SCROLL_HISTORY) // who owns a vertical wheel
   const [toast, setToast] = useState('') // brief copy/paste feedback
   const toastTimer = useRef(0)
+  // OSC 52 copy that needs a trusted tap (iOS refuses a clipboard write that
+  // happens outside a gesture). Holds the text in memory only while shown.
+  const [remoteCopyPending, setRemoteCopyPending] = useState(null)
+  const remoteCopySeqRef = useRef(0)
+  const remoteQueryCountRef = useRef(0)
   // Fallback paste sheet: some browsers (notably iOS Safari) reject a
   // programmatic clipboard read even inside a tap. A real, visible textarea
   // lets the user use the system Paste menu, then insert the text once.
   const [pasteOpen, setPasteOpen] = useState(false)
   const [pasteDraft, setPasteDraft] = useState('')
   const pasteRef = useRef(null)
+  // 'fallback': the browser refused a direct read, the user pastes into the
+  // sheet. 'review': we HAVE the text but it should be looked at first (many
+  // lines into a shell that will run each one, or a very large paste).
+  const [pasteMode, setPasteMode] = useState('fallback')
+  const pastingRef = useRef(false) // true while term.paste() emits our paste
+  // Select mode: the buffer as real DOM text so the OS's own long-press
+  // selection, handles and Copy menu work (xterm has no touch selection).
+  const [selectText, setSelectText] = useState(null) // null = closed
+  const selectRef = useRef(null)
+  const selectScrollRef = useRef(0)
   const sessionIdRef = useRef(makeSessionId(instanceId))
   // The hidden xterm textarea is the only editable target the soft keyboard can
   // attach to. A <label for=this-id> lets the browser focus it as the label's
@@ -203,6 +249,78 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     toastTimer.current = setTimeout(() => setToast(''), 1400)
   }, [])
   useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
+
+  // --- remote (OSC 52) copy ------------------------------------------------
+  // The only automatic clipboard writes are small, well-formed yanks. A larger
+  // permitted yank, or a browser refusal, is held in memory until a real tap.
+  // Nothing here ever reads the clipboard.
+  const remoteCopyFromRemote = useCallback((raw) => {
+    const text = typeof raw === 'string' ? raw : ''
+    // Empty Pd is an OSC 52 "clear clipboard" request. A remote escape does not
+    // get to wipe what the person already copied; malformed base64 also decodes
+    // to '' in the addon, so both are a quiet no-op.
+    if (!text) return
+    const bytes = enc.encode(text).length
+    if (bytes > REMOTE_COPY_MAX_BYTES) { showToast('remote copy too large'); return }
+    if (REMOTE_UNSAFE_CONTROLS.test(text)) { showToast('remote copy blocked: control characters'); return }
+    const seq = ++remoteCopySeqRef.current
+    // Larger yanks are never truncated: keep the whole text for the tap prompt.
+    if (bytes > REMOTE_COPY_AUTO_BYTES) { setRemoteCopyPending({ text, bytes, error: '' }); return }
+    let result
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('clipboard unavailable')
+      result = navigator.clipboard.writeText(text)
+    } catch (e) {
+      result = Promise.reject(e)
+    }
+    Promise.resolve(result).then(() => {
+      if (seq !== remoteCopySeqRef.current) return
+      setRemoteCopyPending(null)
+      haptic(); showToast('copied from remote')
+    }).catch(() => {
+      if (seq !== remoteCopySeqRef.current) return
+      // The prompt itself is the honest feedback for the automatic refusal:
+      // the browser needs a gesture, not a scary error before the tap.
+      setRemoteCopyPending({ text, bytes, error: '' })
+    })
+  }, [showToast])
+  const remoteCopyRef = useRef(remoteCopyFromRemote)
+  useEffect(() => { remoteCopyRef.current = remoteCopyFromRemote }, [remoteCopyFromRemote])
+
+  // The prompt button. writeText MUST be called synchronously in the click, so
+  // this is deliberately not an async function and does no awaited work first.
+  // If the browser refuses again, say so and keep the text; never claim success.
+  const copyPendingRemote = useCallback(() => {
+    const pending = remoteCopyPending
+    if (!pending) return undefined
+    const seq = ++remoteCopySeqRef.current
+    let result
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('clipboard unavailable')
+      result = navigator.clipboard.writeText(pending.text)
+    } catch (e) {
+      result = Promise.reject(e)
+    }
+    return Promise.resolve(result).then(() => {
+      if (seq !== remoteCopySeqRef.current) return
+      setRemoteCopyPending(null)
+      haptic(); showToast('copied from remote')
+    }).catch((e) => {
+      if (seq !== remoteCopySeqRef.current) return
+      const reason = String((e && (e.name || e.message)) || 'blocked')
+      setRemoteCopyPending({ ...pending, error: reason })
+      haptic()
+    })
+  }, [remoteCopyPending, showToast])
+
+  // A dropped link or unmount invalidates a pending remote copy: the prompt is
+  // about the current shell, and a later yank replaces it (sequence number).
+  useEffect(() => {
+    if (status === 'ready') return undefined
+    remoteCopySeqRef.current++
+    setRemoteCopyPending(null)
+    return undefined
+  }, [status])
 
   // Always send to the CURRENT link (linkRef), never a captured one, so a
   // reconnect (new link, same terminal) keeps input flowing without rebuilding
@@ -528,6 +646,41 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
+    // OSC 52 (tmux/vim yank) write path. The addon only decodes; every policy
+    // decision is ours. It has no path to readText because the guard below
+    // consumes every '?' query before the addon sees it.
+    const clipboardAddon = new ClipboardAddon(undefined, {
+      readText: () => '',
+      writeText: (selection, text) => {
+        // '' is the default/system clipboard in OSC 52, same target as 'c'.
+        if (selection === '' || selection === 'c') remoteCopyRef.current(text)
+      },
+    })
+    term.loadAddon(clipboardAddon)
+    // Registered AFTER the addon, so xterm tries it first (handlers run newest
+    // first). true consumes the escape; false falls through to the addon.
+    const osc52Guard = term.parser.registerOscHandler(52, (data) => {
+      const s = typeof data === 'string' ? data : ''
+      const args = s.split(';')
+      if (args.length < 2) return true // malformed: no side effect
+      const pc = args[0]
+      const pd = args[1]
+      if (pd === '?') {
+        // A query asks the terminal to send the device clipboard back over the
+        // PTY. That is exfiltration: consume it, never call readText, and send
+        // no OSC 52 response (the addon would otherwise report one).
+        remoteQueryCountRef.current++
+        try { log.debug('webterm: OSC 52 clipboard query ignored') } catch (e) {}
+        return true
+      }
+      // '' is the OSC 52 default clipboard, the same device clipboard as 'c'.
+      // 'p' (X11 PRIMARY) and every other target are not ours to write.
+      if (pc !== '' && pc !== 'c') return true
+      if (!pd) return true // do not let a remote escape clear the device clipboard
+      // Wire cap: 64 KiB of base64 characters (at most 48 KiB decoded bytes).
+      if (pd.length > REMOTE_COPY_MAX_B64) { showToast('remote copy too large'); return true }
+      return false // safe shape: ClipboardAddon decodes, provider applies policy
+    })
     term.open(hostRef.current)
     termRef.current = term; fitRef.current = fit
     // Predictive local echo. A pure overlay: the real key is still sent to the
@@ -750,6 +903,13 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     // guarded so a predict/write throw can never wedge typing. predict.onUserKey
     // is itself fail-safe; this is belt-and-suspenders and protects write().
     const dataSub = term.onData((d) => {
+      // A paste we routed through term.paste() (deliverPaste) arrives here
+      // synchronously. It is text, not a keystroke: never prefix it with an
+      // armed Ctrl/Alt and never feed it to the keystroke predictor.
+      if (pastingRef.current) {
+        guarded('onData.paste', () => write(d))
+        return
+      }
       // SGR/SGR-pixel mouse reports arrive on onData, but they are generated
       // application input: sticky Ctrl/Alt must not prefix them or be consumed.
       // Ordinary typed/accessory input keeps the existing modifier semantics.
@@ -910,6 +1070,8 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       host.removeEventListener('touchcancel', onTouchEnd)
       try { predict.dispose() } catch (e) {}
       predictRef.current = null
+      remoteCopySeqRef.current++ // a pending remote copy dies with this terminal
+      try { osc52Guard.dispose(); clipboardAddon.dispose() } catch (e) {}
       term.dispose()
       termRef.current = null; fitRef.current = null
     }
@@ -985,6 +1147,9 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
         //  by freezing the render signature while bumping byteCount).
         window.__webtermThrowSyncBar = () => { throwSyncBarRef.current = true }
         window.__webtermWatchdog = wd.current
+        // Read-only counter: the OSC 52 gate asserts a query was consumed and
+        // never answered without exposing any clipboard data.
+        window.__webtermRemoteQueries = () => remoteQueryCountRef.current
       }
     } catch (e) {}
   }, [redrawRecover])
@@ -1133,11 +1298,27 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     return ok
   }, [writeClipboard, showToast])
 
-  const insertPaste = useCallback((text) => {
-    if (!text) return false
-    // Normalize line endings so Chromium's textarea (LF) and WebKit's (CR) send
-    // the same bytes for the same paste.
-    write(String(text).replace(/\r\n?/g, '\n')) // the PTY/app decides how to treat it
+  // --- paste pipeline ------------------------------------------------------
+  // Every paste (Paste button, the fallback sheet, a native Cmd+V / Edit menu /
+  // long-press Paste on the terminal) goes through deliverPaste, so all of
+  // them get the same three guarantees:
+  //   1. term.paste(): xterm turns newlines into CR (Enter) and wraps the text
+  //      in bracketed-paste markers when the app asked for them (bash 5.1+,
+  //      zsh, vim, opencode), so a TUI sees one paste, not N submitted lines.
+  //   2. Any bracket marker INSIDE the text is removed, so a pasted string can
+  //      never close the bracket early and have the rest run as typed input.
+  //   3. Multi-line text into a shell that did not ask for bracketed paste (so
+  //      each line would run as a command), or a very large paste, opens the
+  //      sheet in review mode first instead of going straight in.
+  const sendPaste = useCallback((text) => {
+    const clean = cleanPaste(text)
+    if (!clean) return false
+    const term = termRef.current
+    pastingRef.current = true
+    try {
+      if (term) term.paste(clean)
+      else write(clean.replace(/\n/g, '\r'))
+    } finally { pastingRef.current = false }
     setPasteOpen(false)
     setPasteDraft('')
     haptic(); showToast('pasted')
@@ -1145,24 +1326,44 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     return true
   }, [write, showToast, focusTerminal])
 
+  const deliverPaste = useCallback((raw) => {
+    const text = cleanPaste(raw)
+    if (!text) { showToast('clipboard is empty'); return false }
+    const term = termRef.current
+    let bracketed = false
+    try { bracketed = !!(term && term.modes.bracketedPasteMode) } catch (e) {}
+    if (pasteNeedsReview(text, bracketed)) {
+      setPasteDraft(text)
+      setPasteMode('review')
+      setPasteOpen(true)
+      return false
+    }
+    return sendPaste(text)
+  }, [sendPaste, showToast])
+
+  const openPasteFallback = useCallback(() => {
+    setPasteDraft('')
+    setPasteMode('fallback')
+    setPasteOpen(true)
+  }, [])
+
+  // The Paste button. readText() is called synchronously inside the tap, which
+  // is what Safari needs: on iOS/iPadOS it shows the system "Paste" bubble and
+  // resolves when the user taps it. If the browser refuses (bubble dismissed,
+  // permission denied, insecure context, no Clipboard API) the user gets the
+  // sheet: one real textarea, press and hold, Paste, and it goes straight in.
   const pasteClipboard = useCallback(async () => {
     let text = ''
-    try { text = await navigator.clipboard.readText() } catch (e) {
-      // The browser refused the direct read. Do not dead-end the user: open a
-      // real textarea where the system Paste menu is available.
-      setPasteDraft('')
-      setPasteOpen(true)
-      showToast('paste below')
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.readText) throw new Error('no clipboard read')
+      text = await navigator.clipboard.readText()
+    } catch (e) {
+      openPasteFallback()
       return false
     }
-    if (!text) {
-      setPasteDraft('')
-      setPasteOpen(true)
-      showToast('paste below')
-      return false
-    }
-    return insertPaste(text)
-  }, [insertPaste, showToast])
+    if (!text) { openPasteFallback(); return false }
+    return deliverPaste(text)
+  }, [deliverPaste, openPasteFallback])
 
   // Focus the fallback field when the sheet opens. This is a visible field, so
   // a tap (or this focus) is a normal editable target, not a hidden IME trick.
@@ -1171,6 +1372,25 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     const t = setTimeout(() => { try { pasteRef.current?.focus() } catch (e) {} }, 30)
     return () => clearTimeout(t)
   }, [pasteOpen])
+
+  // Native paste anywhere in the terminal (desktop Cmd/Ctrl+V, a hardware
+  // keyboard on a tablet, a system Edit menu). Captured on the host BEFORE
+  // xterm's own textarea/element paste listeners so it takes the same path as
+  // the Paste button. Without clipboardData we leave it to xterm.
+  const restoreReadOnlyRef = useRef(() => {})
+  useEffect(() => {
+    const host = hostRef.current
+    if (!host) return undefined
+    const onPaste = (e) => {
+      const dt = e.clipboardData
+      if (!dt) return
+      e.preventDefault(); e.stopPropagation()
+      try { restoreReadOnlyRef.current() } catch (err) {}
+      deliverPaste(dt.getData('text/plain'))
+    }
+    host.addEventListener('paste', onPaste, true)
+    return () => host.removeEventListener('paste', onPaste, true)
+  }, [deliverPaste])
 
   // Auto-copy on selection (desktop): mirrors a normal terminal's behavior and
   // gives mobile a no-op-safe path. Wired once per mounted terminal.
@@ -1182,19 +1402,120 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
       const sel = term.getSelection()
       if (sel && sel.length) navigator.clipboard && navigator.clipboard.writeText(sel).catch(() => {})
     })
+    let roTimer = 0
+    restoreReadOnlyRef.current = () => {
+      if (roTimer) { clearTimeout(roTimer); roTimer = 0 }
+      const ta = hostRef.current && hostRef.current.querySelector('textarea')
+      if (ta && isTouch && !keyboardOpenRef.current) { ta.readOnly = true; ta.setAttribute('readonly', '') }
+    }
     // Ctrl/Cmd+Shift+C copy, Ctrl/Cmd+Shift+V / Ctrl+Cmd+V paste. We attach a
     // key handler that returns false to let xterm forward keys we don't claim.
-    const keySub = term.attachCustomKeyEventHandler((e) => {
+    term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true
       const mod = e.ctrlKey || e.metaKey
       if (mod && e.shiftKey && (e.key === 'C' || e.key === 'c')) { copySelection(); return false }
       if (mod && e.shiftKey && (e.key === 'V' || e.key === 'v')) { pasteClipboard(); return false }
+      // Cmd+V from a hardware keyboard on an iPad while the soft keyboard is
+      // hidden: the helper textarea is readonly then, and iOS only performs
+      // the system paste action into an EDITABLE field, so Cmd+V did nothing.
+      // Lift readonly for this one keystroke (inputmode stays "none", so no
+      // soft keyboard) and put it back once the paste lands or soon after.
+      if (e.metaKey && !e.shiftKey && !e.altKey && (e.key === 'v' || e.key === 'V') && isTouch && !keyboardOpenRef.current) {
+        const ta = hostRef.current && hostRef.current.querySelector('textarea')
+        if (ta && ta.readOnly) {
+          ta.readOnly = false; ta.removeAttribute('readonly')
+          if (roTimer) clearTimeout(roTimer)
+          roTimer = setTimeout(() => restoreReadOnlyRef.current(), 1000)
+        }
+      }
       return true
     })
-    return () => { try { sub.dispose() } catch (e) {} }
-    // attachCustomKeyEventHandler has no disposer; replaced on remount. keySub unused.
+    return () => {
+      try { sub.dispose() } catch (e) {}
+      if (roTimer) clearTimeout(roTimer)
+      restoreReadOnlyRef.current = () => {}
+    }
+    // attachCustomKeyEventHandler has no disposer; replaced on remount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [copySelection, pasteClipboard])
+
+  // --- Select mode --------------------------------------------------------
+  // xterm draws its own selection from mouse events and marks the screen
+  // user-select:none, so a finger can never select terminal output and the
+  // system Copy menu never appears. Select mode lays the buffer (scrollback
+  // + screen) over the terminal as ordinary text, scrolled to what was on
+  // screen, so the platform's own press-and-hold selection, handles and Copy
+  // menu work. Copy here copies the selection, or the visible screen if
+  // nothing is selected. Soft-wrapped rows are joined, so a long command
+  // copies as one line.
+  const openSelect = useCallback(() => {
+    const term = termRef.current
+    if (!term) return
+    const b = term.buffer.active
+    const before = []
+    const after = []
+    let cur = null
+    for (let i = 0; i < b.length; i++) {
+      const ln = b.getLine(i)
+      const str = ln ? ln.translateToString(true) : ''
+      if (cur && ln && ln.isWrapped) { cur.text += str; continue }
+      cur = { text: str }
+      ;(i < b.viewportY ? before : after).push(cur)
+    }
+    const trimEnd = (xs) => { while (xs.length && !xs[xs.length - 1].text) xs.pop(); return xs }
+    trimEnd(after)
+    const fontSize = term.options.fontSize || 14
+    let lineH = Math.round(fontSize * 1.25)
+    try {
+      const screen = hostRef.current && hostRef.current.querySelector('.xterm-screen')
+      if (screen && term.rows) lineH = Math.max(8, screen.getBoundingClientRect().height / term.rows)
+    } catch (e) {}
+    setSelectText({
+      before: before.map((l) => l.text + '\n').join(''),
+      after: after.map((l) => l.text).join('\n'),
+      fontSize, lineH, fontFamily: term.options.fontFamily || font,
+    })
+    try { hostRef.current?.querySelector('textarea')?.blur() } catch (e) {}
+    haptic()
+  }, [font])
+  const closeSelect = useCallback(() => {
+    setSelectText(null)
+    try { window.getSelection()?.removeAllRanges() } catch (e) {}
+    focusTerminal()
+  }, [focusTerminal])
+  // Land on the lines that were on screen, not the top of the scrollback.
+  useEffect(() => {
+    if (!selectText) return
+    const pre = selectRef.current
+    const anchor = pre && pre.querySelector('[data-select-anchor]')
+    if (pre && anchor) pre.scrollTop = Math.max(0, anchor.offsetTop - pre.offsetTop - 8)
+  }, [selectText])
+  const copyFromSelect = useCallback(async () => {
+    const pre = selectRef.current
+    let text = ''
+    try {
+      const sel = window.getSelection()
+      if (sel && !sel.isCollapsed && pre && pre.contains(sel.anchorNode)) text = sel.toString()
+    } catch (e) {}
+    const scope = text ? 'selection' : 'screen'
+    if (!text) {
+      const term = termRef.current
+      try {
+        const b = term.buffer.active
+        const lines = []
+        for (let i = 0; i < term.rows; i++) {
+          const ln = b.getLine(b.viewportY + i)
+          if (ln) lines.push(ln.translateToString(true))
+        }
+        text = lines.join('\n').replace(/\n+$/, '')
+      } catch (e) {}
+    }
+    if (!text) { showToast('nothing to copy'); return false }
+    const ok = await writeClipboard(text)
+    haptic(); showToast(ok ? `copied ${scope}` : 'copy blocked')
+    if (ok) closeSelect()
+    return ok
+  }, [writeClipboard, showToast, closeSelect])
 
   const sendKey = (label) => {
     haptic()
@@ -1214,8 +1535,8 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     return `scroll terminal history ${verb}`
   }
 
-  // accessory bar key spec (default row). Copy/Paste live at the end so they are
-  // always reachable on touch (issue #3).
+  // accessory bar key spec (scrolling row). Copy stays at the end: on desktop
+  // it copies the mouse selection; Paste/Select are pinned (PINNED below).
   const ROW = [
     { l: 'Esc' }, { l: 'Tab' }, { l: 'ctrl', on: ctrlOn, fn: toggleCtrl }, { l: 'alt', on: altOn, fn: toggleAlt },
     { l: 'Up', g: '↑' }, { l: 'Down', g: '↓' }, { l: 'Left', g: '←' }, { l: 'Right', g: '→' },
@@ -1228,7 +1549,12 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
     // No-reload recovery: repaint + reattach if the screen ever freezes after a
     // flaky reconnect, so the user never has to reload the page.
     { l: 'Redraw', g: '⟳', fn: redrawRecover },
-    { l: 'Copy', g: 'copy', fn: copySelection }, { l: 'Paste', g: 'paste', fn: pasteClipboard },
+    { l: 'Copy', g: 'copy', fn: copySelection, title: 'copy the selection, or the visible screen' },
+  ]
+  // Always-visible clipboard controls (pinned left of the scrolling keys).
+  const PINNED = [
+    { l: 'Paste', fn: pasteClipboard, title: 'paste from the clipboard' },
+    { l: 'Select', fn: openSelect, title: 'select terminal text to copy' },
   ]
 
   return (
@@ -1358,11 +1684,88 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
             whiteSpace: 'nowrap',
           }}>{toast}</div>
         )}
-        {/* Fallback paste sheet. Direct clipboard reads are frequently blocked
-            on iOS Safari; a visible textarea makes the system Paste menu
-            reachable without pretending the read succeeded. */}
-        {pasteOpen && (
-          <div data-testid="paste-sheet" role="dialog" aria-modal="true" aria-label="Paste into terminal"
+        {/* OSC 52 copy that did not land: iOS/Safari require a real gesture for
+            navigator.clipboard.writeText, so the tap is the write. The text is
+            held in memory only and is never read back from the clipboard. */}
+        {remoteCopyPending && (
+          <div data-testid="remote-copy-prompt" role="status" aria-live="polite" style={{
+            position: 'absolute', left: '50%', bottom: 56, transform: 'translateX(-50%)',
+            zIndex: 6, display: 'flex', alignItems: 'center', gap: 8,
+            maxWidth: 'calc(100% - 20px)', boxSizing: 'border-box',
+            padding: '6px 6px 6px 12px', borderRadius: 9, color: T.text,
+            background: T.panel2, border: `1px solid ${T.line}`,
+            boxShadow: '0 2px 10px rgba(0,0,0,.45)',
+          }}>
+            <div style={{ minWidth: 0, font: `12px/1.35 ${uiFont || font}` }}>
+              <div>Copied from the remote, tap to copy</div>
+              {remoteCopyPending.error && (
+                <div data-testid="remote-copy-error" style={{ marginTop: 2, color: T.bad, overflowWrap: 'anywhere' }}>
+                  Copy failed: {remoteCopyPending.error}
+                </div>
+              )}
+            </div>
+            <button type="button" data-testid="remote-copy-now" onClick={copyPendingRemote}
+              style={{
+                flex: '0 0 auto', minWidth: 48, minHeight: 40, padding: '0 12px',
+                borderRadius: 7, cursor: 'pointer', font: `600 13px ${uiFont || font}`,
+                color: T.onAccent, background: accent, border: `1px solid ${accent}`,
+              }}>Copy</button>
+            <button type="button" data-testid="remote-copy-dismiss" aria-label="dismiss remote copy"
+              onClick={() => { remoteCopySeqRef.current++; setRemoteCopyPending(null) }}
+              style={{
+                flex: '0 0 auto', minWidth: 36, minHeight: 40, padding: 0,
+                borderRadius: 7, cursor: 'pointer', font: `600 16px ${uiFont || font}`,
+                color: T.sub, background: 'transparent', border: 'none',
+              }}>{'\u00d7'}</button>
+          </div>
+        )}
+        {/* Select mode: the buffer as plain selectable text over the terminal.
+            Press and hold (touch) or drag (mouse) uses the platform's own
+            selection and Copy menu; the Copy button copies the selection or,
+            with none, the visible screen. */}
+        {selectText && (
+          <div data-testid="select-layer" role="dialog" aria-label="Select terminal text"
+            onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); closeSelect() } }}
+            style={{ position: 'absolute', inset: 0, zIndex: 7, display: 'flex', flexDirection: 'column', background: T.bg }}>
+            <div style={{ flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', borderBottom: `1px solid ${T.line}`, background: T.panel2 }}>
+              <span style={{ flex: 1, minWidth: 0, font: `12.5px/1.35 ${uiFont || font}`, color: T.sub }}>
+                {isTouch ? 'Press and hold to select, then Copy.' : 'Drag to select, then Copy.'} Nothing selected copies the screen.
+              </span>
+              <button type="button" data-testid="select-copy"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={copyFromSelect}
+                style={{ minHeight: 40, padding: '0 14px', borderRadius: 7, cursor: 'pointer', font: `600 13px ${uiFont || font}`, color: T.onAccent, background: accent, border: `1px solid ${accent}` }}>Copy</button>
+              <button type="button" data-testid="select-done" onClick={closeSelect}
+                style={{ minHeight: 40, padding: '0 14px', borderRadius: 7, cursor: 'pointer', font: `600 13px ${uiFont || font}`, color: T.text, background: 'transparent', border: `1.5px solid ${T.line}` }}>Done</button>
+            </div>
+            <pre ref={selectRef} data-testid="select-text"
+              style={{
+                flex: 1, minHeight: 0, margin: 0, overflow: 'auto', padding: '8px 10px',
+                whiteSpace: 'pre-wrap', wordBreak: 'break-all', overflowWrap: 'anywhere',
+                font: `${selectText.fontSize}px/${selectText.lineH}px ${selectText.fontFamily}`,
+                color: T.text, background: T.bg, cursor: 'text',
+                userSelect: 'text', WebkitUserSelect: 'text', WebkitTouchCallout: 'default',
+                touchAction: 'auto', WebkitOverflowScrolling: 'touch',
+              }}><span>{selectText.before}</span><span data-select-anchor="">{selectText.after}</span></pre>
+          </div>
+        )}
+        {/* Paste sheet. 'fallback': the browser refused a direct clipboard read
+            (common on iOS Safari), so a real textarea makes the system Paste
+            menu reachable; pasting into it sends at once. 'review': the text is
+            multi-line for a shell that would run each line, or large, so it is
+            shown first and sent only on an explicit tap. */}
+        {pasteOpen && (() => {
+          const review = pasteMode === 'review'
+          const nLines = pasteDraft ? pasteDraft.replace(/\n$/, '').split('\n').length : 0
+          const big = pasteDraft.length > LARGE_PASTE
+          const title = review ? `Paste ${nLines} line${nLines === 1 ? '' : 's'}?` : 'Paste into terminal'
+          const body = review
+            ? (big && nLines < 2
+              ? `This is a large paste (${Math.round(pasteDraft.length / 1024)} KB). Check it, then send.`
+              : 'The shell will likely run each line as a separate command. Check it, then send.')
+            : 'This browser did not hand over the clipboard directly. Press and hold in the box and choose Paste; it goes straight in.'
+          return (
+          <div data-testid="paste-sheet" data-mode={pasteMode} role="dialog" aria-modal="true" aria-label={title}
             onKeyDown={(e) => {
               if (e.key !== 'Escape') return
               e.stopPropagation()
@@ -1377,36 +1780,43 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
               padding: 14, borderRadius: 10, background: T.panel, border: `1px solid ${T.line}`,
               boxShadow: '0 10px 36px rgba(0,0,0,.55)',
             }}>
-              <div style={{ font: `600 14px ${uiFont || font}`, color: T.text }}>Paste into terminal</div>
-              <div style={{ font: `12.5px/1.45 ${uiFont || font}`, color: T.sub }}>
-                The browser blocked direct clipboard access. Tap the box and use Paste from the system menu, then Insert.
-              </div>
+              <div style={{ font: `600 14px ${uiFont || font}`, color: T.text }}>{title}</div>
+              <div style={{ font: `12.5px/1.45 ${uiFont || font}`, color: review ? T.warn : T.sub }}>{body}</div>
               <textarea ref={pasteRef} data-testid="paste-input" value={pasteDraft}
                 onChange={(e) => setPasteDraft(e.target.value)}
-                rows={5} spellCheck={false} autoCapitalize="off" autoCorrect="off" placeholder="Paste here"
+                onPaste={(e) => {
+                  // In the fallback sheet a system Paste IS the user's intent:
+                  // send it now (deliverPaste still reviews multi-line text).
+                  if (review) return
+                  const t = e.clipboardData && e.clipboardData.getData('text/plain')
+                  if (!t) return // no data exposed: let it fill the box, Insert sends
+                  e.preventDefault()
+                  deliverPaste(t)
+                }}
+                rows={review ? 8 : 4} spellCheck={false} autoCapitalize="off" autoCorrect="off" placeholder="Press and hold, then Paste"
                 style={{
                   width: '100%', boxSizing: 'border-box', resize: 'vertical', padding: 8,
                   font: `13px/1.4 ${font}`, color: T.text, background: T.bg,
-                  border: `1px solid ${T.line}`, borderRadius: 6,
+                  border: `1px solid ${T.line}`, borderRadius: 6, whiteSpace: 'pre', overflowX: 'auto',
                 }} />
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
                 <button type="button" data-testid="paste-cancel"
                   onClick={() => { setPasteOpen(false); setPasteDraft('') }}
                   style={{ minHeight: 40, padding: '0 14px', borderRadius: 7, cursor: 'pointer', font: `600 13px ${uiFont || font}`, color: T.text, background: 'transparent', border: `1.5px solid ${T.line}` }}>Cancel</button>
                 <button type="button" data-testid="paste-insert" disabled={!pasteDraft}
-                  onClick={() => insertPaste(pasteDraft)}
-                  style={{ minHeight: 40, padding: '0 14px', borderRadius: 7, cursor: pasteDraft ? 'pointer' : 'default', font: `600 13px ${uiFont || font}`, color: T.onAccent, background: accent, border: `1px solid ${accent}`, opacity: pasteDraft ? 1 : 0.5 }}>Insert</button>
+                  onClick={() => sendPaste(pasteDraft)}
+                  style={{ minHeight: 40, padding: '0 14px', borderRadius: 7, cursor: pasteDraft ? 'pointer' : 'default', font: `600 13px ${uiFont || font}`, color: T.onAccent, background: accent, border: `1px solid ${accent}`, opacity: pasteDraft ? 1 : 0.5 }}>{review ? 'Send' : 'Insert'}</button>
               </div>
             </div>
           </div>
-        )}
+          )
+        })()}
       </div>
-      {/* accessory key bar (always on touch; handy on desktop too) */}
-      <div style={{
-        flex: '0 0 auto', display: 'flex', gap: 6, padding: '7px 10px', borderTop: `1px solid ${T.line}`,
-        overflowX: 'auto', background: T.panel2, marginBottom: kbInset, WebkitOverflowScrolling: 'touch',
-      }}>
-        {ROW.map((k, i) => {
+      {/* accessory key bar (always on touch; handy on desktop too). Paste and
+          Select are PINNED at the left so they never scroll off a phone or
+          tablet screen; the keys scroll beside them. */}
+      {(() => {
+        const keyBtn = (k, i) => {
           const active = k.on
           return (
             <button key={i} data-key={k.l} aria-label={k.label || k.l} title={k.title} aria-pressed={k.on === undefined ? undefined : !!k.on} onClick={k.fn || (() => sendKey(k.l))} style={{
@@ -1416,8 +1826,18 @@ export default function WebTerminal({ link, peerName, route, relation, relayExpl
               background: active ? accent : 'transparent',
             }}>{k.g || k.l}</button>
           )
-        })}
-      </div>
+        }
+        return (
+          <div style={{ flex: '0 0 auto', display: 'flex', borderTop: `1px solid ${T.line}`, background: T.panel2, marginBottom: kbInset }}>
+            <div data-testid="bar-pinned" style={{ flex: '0 0 auto', display: 'flex', gap: 6, padding: '7px 6px 7px 10px', borderRight: `1px solid ${T.line}` }}>
+              {PINNED.map(keyBtn)}
+            </div>
+            <div style={{ flex: 1, minWidth: 0, display: 'flex', gap: 6, padding: '7px 10px 7px 6px', overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+              {ROW.map(keyBtn)}
+            </div>
+          </div>
+        )
+      })()}
     </div>
   )
 }
