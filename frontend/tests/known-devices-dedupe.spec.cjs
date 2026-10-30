@@ -1,10 +1,13 @@
-// Browser gate: duplicate known-device records migrate to one row and the
-// surviving (newest) secret actually reconnects, against the REAL app + relay.
+// Browser gate: old storage with one petname over two DIFFERENT secrets (the
+// state the re-pairing bug left) migrates without losing a device, against
+// the REAL app + relay. Identity is the secret, never the name.
 //
-// Seeds localStorage with two records for the same local petname, exactly the
-// state left by the re-pairing bug. On load devicesLoad must keep the newest
-// record, write the clean list back, render ONE Devices row, light it online
-// from the real known-peer/WebRTC path, and let Forget remove only that peer.
+// Seeds two records for the same petname with different secrets plus an exact
+// same-secret copy. On load devicesLoad must collapse only the same-secret
+// copy, keep both secrets, give the newest the name and the older one a unique
+// label ("<name> 2"), write that back, light the newest online from the real
+// known-peer/WebRTC path while the older reads offline, refuse a rename onto a
+// taken name, and let Forget remove only the chosen record.
 //
 // Runs Chromium and WebKit iPad. No Rust build needed.
 //
@@ -157,20 +160,23 @@ async function runEngine(engine, browser, contextOptions) {
   const spare = crypto.randomBytes(32).toString('hex');
   const spareName = 'spare-' + engine;
   await seed(peer, [{ name: devName, secret: newest, addedAt: 3000 }]);
+  const olderName = `${peerName} 2`;
   await seed(dev, [
     { name: peerName, secret: oldSecret, addedAt: 1000 },
+    { name: peerName, secret: newest, addedAt: 1500 },
     { name: peerName, secret: newest, addedAt: 2000 },
     { name: spareName, secret: spare, addedAt: 2500 },
   ]);
 
-  const migrated = await dev.evaluate(({ key, name }) => {
-    const all = JSON.parse(localStorage.getItem(key) || '[]');
-    return { all, same: all.filter((d) => d.name === name) };
-  }, { key: KEY, name: peerName });
-  if (migrated.same.length !== 1) fail(`${tag} storage still has ${migrated.same.length} records for ${peerName}`);
-  if (migrated.same[0].secret !== newest) fail(`${tag} storage kept the wrong (older) secret`);
-  if (!migrated.all.some((d) => d.name === spareName)) fail(`${tag} migration dropped a distinct device`);
-  ok(`${tag} load migrated duplicate "${peerName}" records to one, keeping the newest secret`);
+  const migrated = await dev.evaluate(({ key }) => JSON.parse(localStorage.getItem(key) || '[]'), { key: KEY });
+  const bySecret = (s) => migrated.filter((d) => d.secret === s);
+  if (bySecret(newest).length !== 1) fail(`${tag} same-secret copies did not collapse: ${bySecret(newest).length}`);
+  if (bySecret(oldSecret).length !== 1) fail(`${tag} migration DELETED a different-secret device`);
+  if (bySecret(spare).length !== 1) fail(`${tag} migration dropped a distinct device`);
+  if (bySecret(newest)[0].name !== peerName) fail(`${tag} the newest record lost its name: ${bySecret(newest)[0].name}`);
+  if (bySecret(oldSecret)[0].name !== olderName) fail(`${tag} the older record was not relabeled uniquely: ${bySecret(oldSecret)[0].name}`);
+  if (new Set(migrated.map((d) => d.id)).size !== migrated.length || migrated.some((d) => !d.id)) fail(`${tag} records lack unique ids`);
+  ok(`${tag} load kept both "${peerName}" secrets (newest keeps the name, older is "${olderName}") and collapsed only the same-secret copy`);
 
   await waitOnline(peer);
   await waitOnline(dev);
@@ -186,7 +192,27 @@ async function runEngine(engine, browser, contextOptions) {
   }, 60000, `one online Devices row for ${peerName}`);
   if ((await deviceRows(dev, peerName).count()) !== 1) fail(`${tag} expected exactly one row, got ${await deviceRows(dev, peerName).count()}`);
   if ((await deviceRows(dev, spareName).count()) !== 1) fail(`${tag} distinct remembered device is missing`);
-  ok(`${tag} seeded duplicates render ONE online row; the distinct device remains`);
+  if ((await deviceRows(dev, olderName).count()) !== 1) fail(`${tag} the older, different device has no row`);
+  if (!/offline$/.test(await deviceRows(dev, olderName).getAttribute('aria-label'))) fail(`${tag} the older record reads online: it holds a secret nobody answers`);
+  ok(`${tag} the newest secret's row is online; the older device is a separate offline row; the distinct device remains`);
+
+  // A rename onto a name another device uses is refused, in the sheet.
+  await deviceRows(dev, olderName).click();
+  const sheet0 = dev.getByRole('dialog');
+  await sheet0.waitFor({ timeout: 5000 });
+  await sheet0.getByText('Rename', { exact: true }).click();
+  const nameInput = dev.getByLabel('device name', { exact: true });
+  await nameInput.fill(peerName);
+  await nameInput.press('Enter');
+  const err = dev.getByTestId('rename-error');
+  await err.waitFor({ timeout: 5000 }).catch(() => fail(`${tag} a rename onto a taken name showed no refusal`));
+  if (!/already called/.test(await err.innerText())) fail(`${tag} unclear rename refusal: ${await err.innerText()}`);
+  const afterRefuse = await dev.evaluate(({ key }) => JSON.parse(localStorage.getItem(key) || '[]'), { key: KEY });
+  if (afterRefuse.length !== migrated.length || afterRefuse.filter((d) => d.name === peerName).length !== 1) fail(`${tag} a refused rename changed storage`);
+  await nameInput.press('Escape');
+  await dev.keyboard.press('Escape');
+  await waitFor(async () => (await dev.getByRole('dialog').count()) === 0, 5000, 'the sheet to close');
+  ok(`${tag} rename onto a taken name is refused with a clear message; storage unchanged`);
 
   await deviceRows(dev, peerName).click();
   const dialog = dev.getByRole('dialog');
@@ -201,7 +227,8 @@ async function runEngine(engine, browser, contextOptions) {
   await dialog.getByText('Forget device', { exact: true }).click();
   await waitFor(async () => (await deviceRows(dev, peerName).count()) === 0, 10000, 'the forgotten row to disappear');
   if ((await deviceRows(dev, spareName).count()) !== 1) fail(`${tag} Forget removed a different device`);
-  const afterForget = await dev.evaluate(({ key, name }) => JSON.parse(localStorage.getItem(key) || '[]').filter((d) => d.name === name), { key: KEY, name: peerName });
+  if ((await deviceRows(dev, olderName).count()) !== 1) fail(`${tag} Forget removed the other "${peerName}" device`);
+  const afterForget = await dev.evaluate(({ key, s }) => JSON.parse(localStorage.getItem(key) || '[]').filter((d) => d.secret === s), { key: KEY, s: newest });
   if (afterForget.length !== 0) fail(`${tag} Forget left ${afterForget.length} records for the peer`);
   ok(`${tag} Forget removed only that peer; the other remembered device remains`);
 

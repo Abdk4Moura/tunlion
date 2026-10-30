@@ -21,27 +21,86 @@ const recordAge = (d) => {
   const n = Number(d && d.addedAt)
   return Number.isFinite(n) ? n : 0 // missing/invalid addedAt = oldest
 }
+/// Names collide when they read the same to a person: trimmed, any case.
+const nameKey = (n) => String(n || '').trim().toLowerCase()
+const MAX_NAME = 48
 
-/// One petname = one device. Re-pairing used to append a second record for
-/// the same name; the UI then rendered two identical rows and Forget removed
-/// both. Keep the newest VALID record per name (missing addedAt is oldest) and
-/// preserve the first-seen name order. Distinct names are untouched.
-export function devicesDedupe(list) {
-  const best = new Map()
-  const order = []
-  for (const d of Array.isArray(list) ? list : []) {
-    if (!validRecord(d)) continue
-    if (!best.has(d.name)) order.push(d.name)
-    const cur = best.get(d.name)
-    if (!cur || recordAge(d) >= recordAge(cur)) best.set(d.name, d)
+/// A fresh, non-secret, stable handle for a record (rows, rename, forget).
+function newId() {
+  try {
+    const b = new Uint8Array(8)
+    crypto.getRandomValues(b)
+    return 'd' + [...b].map((x) => x.toString(16).padStart(2, '0')).join('')
+  } catch {
+    return 'd' + Date.now().toString(16) + Math.random().toString(16).slice(2, 10)
   }
-  return order.map((name) => best.get(name))
 }
 
-/// Stable, non-secret key for React rows. Dedupe guarantees name uniqueness;
-/// addedAt keeps the key stable across live status changes and renders.
+/// `name`, or "name 2", "name 3", ... : the first that no record in `list`
+/// (other than the ids in `except`) already uses.
+export function uniqueName(list, name, except = []) {
+  const base = String(name || '').trim().slice(0, MAX_NAME) || 'device'
+  const skip = new Set(except)
+  const taken = new Set((list || []).filter((d) => !skip.has(d.id)).map((d) => nameKey(d.name)))
+  if (!taken.has(nameKey(base))) return base
+  for (let i = 2; ; i++) {
+    const cand = `${base} ${i}`
+    if (!taken.has(nameKey(cand))) return cand
+  }
+}
+
+/// Identity is the SECRET, never the name. Two records with different
+/// secrets are two devices, however they are labeled, and neither is ever
+/// dropped. Only same-secret records collapse (the newest wins: a re-store of
+/// one pairing). Then names are made unique so every row, rename and forget
+/// is unambiguous: on a clash the newest record keeps the name and older ones
+/// read "name 2", "name 3". Records also get a stable non-secret `id`; a
+/// missing one is derived from the record's position in the stored list, so
+/// two tabs migrating the same storage agree on it. Order is preserved.
+export function devicesDedupe(list) {
+  const raw = Array.isArray(list) ? list : []
+  const bySecret = new Map()
+  const order = []
+  raw.forEach((d, i) => {
+    if (!validRecord(d)) return
+    const rec = d.id ? d : { ...d, id: `d${recordAge(d).toString(16)}-${i}` }
+    const cur = bySecret.get(d.secret)
+    if (!cur) {
+      order.push(d.secret)
+      bySecret.set(d.secret, rec)
+    } else if (recordAge(rec) >= recordAge(cur)) {
+      bySecret.set(d.secret, { ...rec, id: cur.id })
+    }
+  })
+  const out = order.map((sec) => bySecret.get(sec))
+  // ids must be unique too (hand-edited or merged storage).
+  const ids = new Set()
+  out.forEach((d, i) => {
+    if (ids.has(d.id)) out[i] = { ...d, id: `${d.id}-${i}` }
+    ids.add(out[i].id)
+  })
+  // Unique names, newest first so the live pairing keeps its label.
+  const byAge = out.map((d, i) => [d, i]).sort((a, b) => recordAge(b[0]) - recordAge(a[0]) || a[1] - b[1])
+  const kept = []
+  for (const [d, i] of byAge) {
+    const name = uniqueName(kept, d.name)
+    const rec = name === d.name ? d : { ...d, name }
+    kept.push(rec)
+    out[i] = rec
+  }
+  return out
+}
+
+/// Stable, non-secret key for React rows.
 export function deviceRowKey(d) {
-  return `${d.name}:${recordAge(d)}`
+  return d.id || `${d.name}:${recordAge(d)}`
+}
+
+/// The record a UI handle names: its id, or (older callers) its name. Names
+/// are unique after devicesDedupe, so the name fallback is unambiguous.
+export function findDevice(list, key) {
+  if (!key) return null
+  return (list || []).find((d) => d.id === key) || (list || []).find((d) => d.name === key) || null
 }
 
 function persist(list) {
@@ -64,7 +123,8 @@ export function devicesLoad() {
     raw = []
   }
   const list = devicesDedupe(raw)
-  // Migrate existing duplicates on load (no reset/clear-data path needed).
+  // Migrate on load (ids, same-secret duplicates, clashing names); no
+  // reset/clear-data path needed.
   try {
     const serialized = JSON.stringify(list)
     if (localStorage.getItem(KEY) !== serialized) localStorage.setItem(KEY, serialized)
@@ -72,59 +132,92 @@ export function devicesLoad() {
   return list
 }
 
-export function devicesStore(name, secret) {
-  // A fresh pairing supersedes BOTH a same-name record and a same-secret
-  // record (the latter covers a rename/pairing under another label).
-  const list = devicesLoad().filter((d) => d.name !== name && d.secret !== secret)
-  list.push({ name, secret, addedAt: Date.now() })
+/// Store a pairing. The record with the SAME secret is superseded (a re-store
+/// of one pairing); so are the records in `opts.replaces`, which the caller
+/// passes only when the new pairing is PROVABLY the same peer (it proved it
+/// holds that record's secret on the very link the new pairing ran on, or the
+/// record carries the same peer uid). Nothing else is ever dropped: a name
+/// already used by a different device makes the new one unique ("Kabir
+/// Laptop 2"). `opts.peerUid` is kept on the record as the peer's identity.
+function storeRecord(rec, opts = {}) {
+  const replaces = new Set(opts.replaces || [])
+  const prev = devicesLoad()
+  const same = prev.filter((d) => d.secret === rec.secret || replaces.has(d.id) || (opts.peerUid && d.peerUid && d.peerUid === opts.peerUid))
+  const list = prev.filter((d) => !same.includes(d))
+  const name = uniqueName(list, rec.name)
+  const out = { ...rec, name, id: (same.find((d) => d.secret === rec.secret) || {}).id || newId(), addedAt: Date.now() }
+  if (opts.peerUid) out.peerUid = opts.peerUid
+  list.push(out)
   return persist(list)
+}
+
+export function devicesStore(name, secret, opts) {
+  return storeRecord({ name, secret }, opts)
 }
 
 /// L1-a (spec §8): store a v2 device record with its agreed capability set.
 /// Grows the record with `v` and `caps` (deny-by-default; "transfer" is the L0
 /// baseline). The {name, secret} fields are unchanged so the reconnect path
 /// (devicesLoad / channelOf / proofFor) keeps working byte-for-byte.
-export function devicesStoreV2(name, secret, caps) {
-  const list = devicesLoad().filter((d) => d.name !== name && d.secret !== secret)
-  list.push({ name, secret, v: 2, caps: caps || ['transfer'], addedAt: Date.now() })
-  return persist(list)
+export function devicesStoreV2(name, secret, caps, opts) {
+  return storeRecord({ name, secret, v: 2, caps: caps || ['transfer'] }, opts)
 }
 
 /// L1-a (spec §8): a device's granted capabilities. v1 records (no caps) read
 /// as ["transfer"] for back-compat. Returns null if the device isn't known.
-export function deviceCaps(name) {
-  const d = devicesLoad().find((x) => x.name === name)
+export function deviceCaps(key) {
+  const d = findDevice(devicesLoad(), key)
   if (!d) return null
   return Array.isArray(d.caps) ? d.caps : ['transfer']
 }
 
 /// L1-a (spec §8 / gate 5): deny-by-default capability check. "transfer" is the
 /// always-allowed L0 baseline; future caps must be explicitly granted.
-export function deviceAllows(name, capability) {
+export function deviceAllows(key, capability) {
   if (capability === 'transfer') return true
-  const caps = deviceCaps(name)
+  const caps = deviceCaps(key)
   return !!caps && caps.includes(capability)
+}
+
+/// Why `newName` cannot be the label of record `key`, or null if it can. A
+/// rename never moves a label onto a different device.
+export function devicesRenameError(list, key, newName) {
+  const next = String(newName || '').trim()
+  if (!next) return 'Enter a name.'
+  const self = findDevice(list, key)
+  if (!self) return 'That device is no longer remembered.'
+  const other = (list || []).find((d) => d.id !== self.id && nameKey(d.name) === nameKey(next))
+  if (other) return `Another remembered device is already called "${other.name}". Pick a different name, or forget that one first.`
+  return null
 }
 
 /// Rename a device's LOCAL petname: pure client-side relabel. The `secret`
 /// (and thus the meeting-point channel + every proof) is untouched, so the
 /// reconnect identity is byte-stable; only the human-facing label changes.
-/// Renames the FIRST record matching `oldName`; a no-op if it isn't found or
-/// the new name is blank/unchanged. Returns the fresh list.
-export function devicesRename(oldName, newName) {
-  const next = String(newName || '').trim()
-  if (!next || next === oldName) return devicesLoad()
-  const list = devicesDedupe(devicesLoad().map((d) => (d.name === oldName ? { ...d, name: next } : d)))
-  try {
-    localStorage.setItem(KEY, JSON.stringify(list))
-  } catch (e) {
-    dlog.warn('could not persist device rename (private browsing?)', e)
-  }
-  return list
+/// `key` is the record id (or its unique name). Refused, list unchanged, when
+/// the name is blank or another device already uses it. Returns
+/// {list, error, device}.
+export function devicesRenameResult(key, newName) {
+  const list = devicesLoad()
+  const next = String(newName || '').trim().slice(0, MAX_NAME)
+  const self = findDevice(list, key)
+  if (self && next === self.name) return { list, error: null, device: self }
+  const error = devicesRenameError(list, key, next)
+  if (error) return { list, error, device: self }
+  const renamed = list.map((d) => (d.id === self.id ? { ...d, name: next } : d))
+  persist(renamed)
+  return { list: renamed, error: null, device: { ...self, name: next } }
 }
 
-export function devicesForget(name) {
-  return persist(devicesLoad().filter((d) => d.name !== name))
+/// The list after a rename (refused renames return it unchanged).
+export function devicesRename(key, newName) {
+  return devicesRenameResult(key, newName).list
+}
+
+export function devicesForget(key) {
+  const list = devicesLoad()
+  const d = findDevice(list, key)
+  return persist(d ? list.filter((x) => x.id !== d.id) : list)
 }
 
 const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')

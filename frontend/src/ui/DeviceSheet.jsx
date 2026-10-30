@@ -86,19 +86,30 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
   const known = !!peer.known
   const displayName = peer.known || peer.verified || peer.name
   const showShell = ready && known && peer.shell && onOpenShell
-  const canForget = !!peer.known && !!onForget // forget is keyed by the stored petname
-  // Rename edits the stored petname, keyed by peer.known (the current label),
-  // so it's offered only for a remembered device with a rename handler wired.
+  // Forget and rename act on the stored record, keyed by its id (identity is
+  // the pairing secret, never the label); older callers pass the label.
+  const recordKey = peer.knownId || peer.known
+  const canForget = !!peer.known && !!onForget
+  // Rename edits the stored petname, offered only for a remembered device
+  // with a rename handler wired.
   const canRename = !!peer.known && !!onRename
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(displayName)
+  const [renameError, setRenameError] = useState(null)
   const nameInp = useRef(null)
   useEffect(() => { if (editing && nameInp.current) { nameInp.current.focus(); nameInp.current.select() } }, [editing])
+  // A name another remembered device already uses is refused: the handler
+  // returns why, and the field stays open with that message.
   const commitRename = () => {
     const next = draft.trim()
-    if (next && next !== peer.known) onRename(peer.known, next)
+    if (next && next !== peer.known) {
+      const err = onRename(recordKey, next)
+      if (err) { setRenameError(err); return }
+    }
+    setRenameError(null)
     setEditing(false)
   }
+  const cancelRename = () => { setDraft(displayName); setRenameError(null); setEditing(false) }
   const sc = ready ? T.ok : peer.status === 'connecting' || peer.status === 'away' ? T.warn : T.bad
   const rm = routeMeta(peer.route, T)
 
@@ -128,6 +139,9 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
         <span style={{ color: sc }}>{PEER_STATUS_LABEL[peer.status] || peer.status}</span>
         {peer.lastSeen && <span style={{ marginLeft: 'auto', color: T.faint }}>{peer.lastSeen}</span>}
       </div>
+      {known && ready && peer.oneSided && (
+        <div data-testid="one-sided-note" style={{ marginTop: 7, fontSize: 13, color: T.dim }}>Connected. Not remembered on their side yet.</div>
+      )}
     </div>
   )
 
@@ -190,18 +204,20 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
       )}
       {canRename && (
         editing ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 4px' }}>
+          <div style={{ display: 'grid', gap: 6, padding: '6px 4px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
             <input
               ref={nameInp}
               value={draft}
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => { setDraft(e.target.value); if (renameError) setRenameError(null) }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') { e.preventDefault(); commitRename() }
                 // swallow Esc so the sheet's document-level listener doesn't close
                 // the whole sheet; Esc just cancels the rename.
-                if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setDraft(displayName); setEditing(false) }
+                if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancelRename() }
               }}
-              placeholder="device name" aria-label="device name"
+              placeholder="device name" aria-label="device name" aria-invalid={renameError ? 'true' : undefined}
+              aria-describedby={renameError ? 'tl-rename-error' : undefined}
               style={{
                 flex: 1, minWidth: 0, font: 'inherit', fontSize: 15, padding: '0 10px', minHeight: 44, borderRadius: 7,
                 background: T.bg, color: T.text, border: '1.5px solid ' + accent,
@@ -210,9 +226,13 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
             <button onClick={commitRename} title="save name" style={{
               flexShrink: 0, font: 'inherit', fontSize: 14, padding: '0 12px', minHeight: 44, borderRadius: 7, cursor: 'pointer',
               background: accent, color: T.onAccent, border: '1px solid ' + accent }}>Save</button>
-            <button onClick={() => { setDraft(displayName); setEditing(false) }} title="cancel" aria-label="cancel rename" style={{
+            <button onClick={cancelRename} title="cancel" aria-label="cancel rename" style={{
               flexShrink: 0, font: 'inherit', fontSize: 14, padding: '0 11px', minHeight: 44, minWidth: 44, borderRadius: 7, cursor: 'pointer',
               background: 'transparent', color: T.dim, border: '1px solid ' + T.line }}>✕</button>
+          </div>
+          {renameError && (
+            <div id="tl-rename-error" role="alert" data-testid="rename-error" style={{ fontSize: 13, lineHeight: 1.4, color: T.bad || T.text }}>{renameError}</div>
+          )}
           </div>
         ) : (
           <ActionRow glyph="✎" label="Rename" hint="edit this device's name" accent={accent} T={T}
@@ -221,7 +241,7 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
       )}
       {canForget && (
         <ActionRow glyph="⊘" label="Forget device" hint="stop auto-reconnecting" danger accent={accent} T={T}
-          onClick={() => { onForget(peer.known); onClose() }} />
+          onClick={() => { onForget(recordKey); onClose() }} />
       )}
     </div>
   )

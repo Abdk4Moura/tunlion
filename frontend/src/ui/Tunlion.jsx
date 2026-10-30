@@ -842,7 +842,16 @@ export default function Tunlion(props) {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
   // Keep the open sheet's peer fresh as the roster updates (status/route/shell).
-  const sheetPeer = sheet ? (peers.find((p) => p.id === sheet.peer.id) || sheet.peer) : null
+  // A remembered device's sheet also follows its record (a rename relabels it,
+  // a forget closes the remembered half).
+  const sheetPeer = (() => {
+    if (!sheet) return null
+    const p = peers.find((x) => x.id === sheet.peer.id) || sheet.peer
+    const rid = p.knownId || sheet.peer.knownId
+    if (!rid) return p
+    const rec = knownDevices.find((d) => d.id === rid)
+    return rec ? { ...p, known: rec.name, knownId: rec.id } : { ...p, known: null, knownId: null }
+  })()
 
   // Files picked from the drop zone before choosing who gets them.
   const [staged, setStaged] = useState([])
@@ -1084,9 +1093,13 @@ export default function Tunlion(props) {
 
   // ---- Devices --------------------------------------------------------------
   const deviceRows = knownDevices.map((d) => {
-    const live = peers.find((p) => p.known === d.name)
+    // Matched by the record's id, which a live peer carries only when it is
+    // tied to this pairing's SECRET (its channel, its proof, or the pairing
+    // that just ran on its link), never by a display name.
+    const live = peers.find((p) => p.knownId && p.knownId === d.id)
     const online = !!live && live.status === 'ready'
-    const peerForSheet = live || { id: 'known:' + d.name, name: d.name, known: d.name, status: 'failed' }
+    const oneSided = online && !!live.oneSided
+    const peerForSheet = live ? { ...live, known: d.name, knownId: d.id } : { id: 'known:' + d.id, name: d.name, known: d.name, knownId: d.id, status: 'failed' }
     // The stored record holds what was agreed at pairing; a shell the device
     // granted later is only known live (its caps advert). Show both, so the row
     // does not read "files" beside a Shell button.
@@ -1102,6 +1115,7 @@ export default function Tunlion(props) {
         <span style={{ display: 'grid', gap: 3, minWidth: 0 }}>
           <b style={{ fontSize: 15, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.name}</b>
           <span style={{ fontSize: 13, color: T.sub }}>remembered · {what}{d.addedAt ? ' · since ' + new Date(d.addedAt).toLocaleDateString() : ''}</span>
+          {oneSided && <span data-testid="one-sided-note" style={{ fontSize: 13, color: T.sub }}>not remembered on their side</span>}
         </span>
         <span style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
           {online && live.shell && <Btn small T={T} narrow={narrow} onClick={() => openSession(live)} ariaLabel={`open a shell on ${d.name}`}>Shell</Btn>}

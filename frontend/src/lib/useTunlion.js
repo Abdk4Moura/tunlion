@@ -14,7 +14,7 @@ import { api } from './api.js'
 import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
 import * as linkdiag from './linkdiag.js'
 import { log } from './log.js'
-import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRename, channelOf, proofFor } from './devices.js'
+import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRenameResult, uniqueName, channelOf, proofFor } from './devices.js'
 import { mintWords, mintCreatedNameplate } from './words.js'
 import { loadDeviceName, saveDeviceName, loadOwnerToken, tabUid, currentGeneration, rotateGeneration } from './identity.js'
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
@@ -24,6 +24,7 @@ import { shouldAutoAccept, offersCoveredNow } from '../net/app/accept.js'
 import { codeStatusAfterTransfer } from '../net/app/codeStatus.js'
 import { localHelperEnabled } from '../net/app/localHelper.js'
 import { pakePartnerFor } from '../net/app/pakePartner.js'
+import { shouldRejoinOnPairMatched, isSamePeerBack, PEER_LEFT_GRACE_MS } from '../net/app/pairRejoin.js'
 // APPLICATION/state-reducer — pure peer/transfer list transforms (Phase 2).
 import { addPeerToList, patchPeerInList, removePeerFromList, upsertTransferInList } from '../net/app/state.js'
 
@@ -166,6 +167,10 @@ export function useTunlion() {
   const channelMapRef = useRef(new Map()) // channel -> {name, secret}
   const expectedSecretRef = useRef(new Map()) // peerId -> {name, secret} (matched via known-peer)
   const digestAbsentRef = useRef(new Map()) // peerId -> consecutive digests it was absent from (C30 ph2)
+  // peerId -> record id this peer PROVED (C20 proof on its link) it holds the
+  // secret of. The only evidence that lets a fresh pairing replace an old
+  // record: same link, provably the same device.
+  const provenRef = useRef(new Map())
 
   /// (Re)derive our known-device channels and hand them to the convergent
   /// session (C30). The session's level-triggered loop owns the repair: the
@@ -187,9 +192,16 @@ export function useTunlion() {
     }
   }, [])
 
-  const forgetDevice = useCallback((name) => {
-    setKnownDevices(devicesForget(name))
-  }, [])
+  // `key` is the record id (or its unique name).
+  const forgetDevice = useCallback((key) => {
+    const before = devicesLoad()
+    const gone = before.find((d) => d.id === key) || before.find((d) => d.name === key)
+    setKnownDevices(devicesForget(key))
+    if (gone) {
+      setPeers((prev) => prev.map((p) => (p.knownId === gone.id ? { ...p, known: null, knownId: null, oneSided: false } : p)))
+      subscribeKnown()
+    }
+  }, [subscribeKnown])
 
   // Rename a remembered device's LOCAL petname (no backend, no wire). The secret
   // is unchanged, so the meeting-point channel and every proof stay byte-stable,
@@ -197,21 +209,25 @@ export function useTunlion() {
   // (2) re-derive channels so channelMapRef/expectedSecretRef carry the new name
   // (their `dev.name` is what lights up a tile's `known`), and (3) patch any live
   // tile whose `known`/`verified` still shows the old label so it updates at once.
-  const renameDevice = useCallback((oldName, newName) => {
+  // `key` is the record id (or its unique name). Returns null on success, or
+  // the reason the rename was refused (another device already has the name).
+  const renameDevice = useCallback((key, newName) => {
     const next = String(newName || '').trim()
-    if (!next || next === oldName) return
-    setKnownDevices(devicesRename(oldName, next))
+    if (!next) return 'Enter a name.'
+    const { list, error, device } = devicesRenameResult(key, next)
+    if (error) return error
+    setKnownDevices(list)
+    if (!device) return null
     for (const [pid, dev] of expectedSecretRef.current) {
-      if (dev?.name === oldName) expectedSecretRef.current.set(pid, { ...dev, name: next })
+      if (dev?.id === device.id) expectedSecretRef.current.set(pid, { ...dev, name: device.name })
     }
     subscribeKnown() // re-key channelMapRef → new dev.name
     setPeers((prev) =>
-      prev.map((p) => ({
-        ...p,
-        ...(p.known === oldName ? { known: next } : null),
-        ...(p.verified === oldName ? { verified: next } : null),
-      })),
+      prev.map((p) => (p.knownId === device.id
+        ? { ...p, ...(p.known ? { known: device.name } : null), ...(p.verified ? { verified: device.name } : null) }
+        : p)),
     )
+    return null
   }, [subscribeKnown])
 
   // Rename THIS browser. The uid and session generation are untouched, so
@@ -280,6 +296,9 @@ export function useTunlion() {
   const pendingPakeRef = useRef(null) // { nameplate, password } awaiting a peer
   const pakeRef = useRef(null) // active PakePairing for the current peer
   const pakePeerRef = useRef(null) // peer sid we run the PAKE with
+  // The ceremony's partner left mid-ceremony: {id, uid, at, timer}. A prompt
+  // rejoin of the same peer cancels the timer; otherwise it fails the pairing.
+  const pakeLeftRef = useRef(null)
   // The last CONFIRMED ceremony, kept to answer its peer's re-sent
   // confirmation should ours have been lost: { peerId, pairing }.
   const pakeDoneRef = useRef(null)
@@ -303,6 +322,24 @@ export function useTunlion() {
   // confirm once K + fingerprints exist; finalize on success/abort.
   const drivePakeRef = useRef(() => {})
 
+  // What a fresh pairing with `peerId` may replace: only records this very
+  // peer PROVED (C20, on this link) it holds, plus the peer's uid so a record
+  // carrying the same uid is recognized as the same device. Never by name.
+  const storeOptsFor = useCallback((peerId) => {
+    const proven = provenRef.current.get(peerId)
+    return { replaces: proven ? [proven] : [], peerUid: linksRef.current.get(peerId)?.peerUid || undefined }
+  }, [])
+
+  // The peer we just paired with is live, and the pairing itself proved it
+  // holds this secret: show it as the remembered device right away. Until its
+  // side raises the same channel (known-peer), it has not remembered us.
+  const markRemembered = useCallback((peerId, rec) => {
+    if (!rec) return
+    setPeers((prev) => prev.map((p) => (p.id === peerId
+      ? { ...p, known: rec.name, knownId: rec.id, oneSided: !(p.knownId === rec.id && (p.oneSided === false || !!p.verified)) }
+      : p)))
+  }, [])
+
   // L1-a: the human chose to remember this v2-paired device. v2 keeps are
   // LOCAL-ONLY: both sides hold K independently, so there's no wire ack and no
   // half to discard (unlike v1's sendPairKeepAck). Store under the chosen name.
@@ -311,13 +348,15 @@ export function useTunlion() {
       const k = prev.find((x) => x.peerId === peerId)
       if (k) {
         const name = (chosenName && String(chosenName).trim()) || k.name
-        setKnownDevices(devicesStoreV2(name, k.secret, k.caps))
+        const list = devicesStoreV2(name, k.secret, k.caps, storeOptsFor(peerId))
+        setKnownDevices(list)
+        markRemembered(peerId, list.find((d) => d.secret === k.secret))
         tel('pake-paired-stored', { peer: String(peerId).slice(-6) })
         subscribeKnown()
       }
       return prev.filter((x) => x.peerId !== peerId)
     })
-  }, [subscribeKnown])
+  }, [subscribeKnown, storeOptsFor, markRemembered])
 
   // L1-a: declined remembering. K stays agreed (fine, the device just isn't
   // remembered); nothing to undo locally, just drop the prompt.
@@ -332,14 +371,16 @@ export function useTunlion() {
     setPendingKeeps((prev) => {
       const k = prev.find((x) => x.peerId === peerId)
       if (k) {
-        setKnownDevices(devicesStore(k.name, k.secret))
+        const list = devicesStore(k.name, k.secret, storeOptsFor(peerId))
+        setKnownDevices(list)
+        markRemembered(peerId, list.find((d) => d.secret === k.secret))
         tel('pair-keep-stored', { peer: peerId.slice(-6) })
         subscribeKnown()
         linksRef.current.get(peerId)?.sendPairKeepAck(true)
       }
       return prev.filter((x) => x.peerId !== peerId)
     })
-  }, [subscribeKnown])
+  }, [subscribeKnown, storeOptsFor, markRemembered])
 
   const declineKeep = useCallback((peerId) => {
     setPendingKeeps((prev) => {
@@ -492,7 +533,8 @@ export function useTunlion() {
           for (const d of devicesLoad()) {
             try {
               if ((await proofFor(d.secret, theirUid, theirUid, uidRef.current, fps.mine, fps.theirs)) === mac) {
-                updatePeer(id, { verified: d.name })
+                updatePeer(id, { verified: d.name, knownId: d.id })
+                provenRef.current.set(id, d.id)
                 link._verified = true // C30 ph3: the link's state ping carries this
                 tel('proof-ok', { peer: id.slice(-6) })
                 link.sendPairProofAck(true)
@@ -528,7 +570,8 @@ export function useTunlion() {
         onPairProofAck: (ok) => {
           if (!ok) {
             expectedSecretRef.current.delete(id)
-            updatePeer(id, { verified: null, known: null }) // drop the badge too
+            provenRef.current.delete(id)
+            updatePeer(id, { verified: null, known: null, knownId: null, oneSided: false }) // drop the badge too
             tel('proof-rejected', { peer: id.slice(-6) })
           }
         },
@@ -737,6 +780,16 @@ export function useTunlion() {
       })
       sig.on('peer-joined', ({ id, name, uid }) => {
         if (uid && uid === uidRef.current) return
+        // The ceremony's partner left a moment ago and is back (a rejoin of
+        // the room, possibly under a fresh sid): keep the ceremony, rebound
+        // to this sid; the fresh link carries the confirmation.
+        const gone = pakeLeftRef.current
+        if (gone && isSamePeerBack(gone, { id, uid }) && pakeRef.current && !pakeRef.current.secret) {
+          clearTimeout(gone.timer)
+          pakeLeftRef.current = null
+          if (pakePeerRef.current !== id) pakePeerRef.current = id
+          tel('pake-peer-back', { peer: id.slice(-6), after: Date.now() - gone.at })
+        }
         const existing = linksRef.current.get(id)
         if (existing) {
           // A re-announce (e.g. a name change on rejoin) must relabel the row,
@@ -750,9 +803,21 @@ export function useTunlion() {
       sig.on('peer-left', ({ id }) => {
         // The CLI ends a ceremony it refuses (wrong code, failed confirmation)
         // by leaving. Without this the browser would sit on "paired" forever.
+        // But a peer that leaves and promptly rejoins (a room re-join on the
+        // same network) has not refused anything: wait PEER_LEFT_GRACE_MS for
+        // it to come back before failing.
         if (id && id === pakePeerRef.current && pakeRef.current && !pakeRef.current.secret) {
-          failPairingRef.current?.('the other device ended the pairing before it finished. Usually the code was mistyped or already used. Nothing was stored; ask for a fresh code.', 'peer-left')
+          if (pakeLeftRef.current) clearTimeout(pakeLeftRef.current.timer)
+          const gone = { id, uid: linksRef.current.get(id)?.peerUid || null, at: Date.now(), timer: null }
+          gone.timer = setTimeout(() => {
+            if (pakeLeftRef.current !== gone) return
+            pakeLeftRef.current = null
+            failPairingRef.current?.('the other device ended the pairing before it finished. Usually the code was mistyped or already used. Nothing was stored; ask for a fresh code.', 'peer-left')
+          }, PEER_LEFT_GRACE_MS)
+          pakeLeftRef.current = gone
+          tel('pake-peer-left-grace', { peer: id.slice(-6) })
         }
+        provenRef.current.delete(id)
         linksRef.current.get(id)?.close()
         linksRef.current.delete(id)
         removePeer(id)
@@ -816,7 +881,7 @@ export function useTunlion() {
         if (!linksRef.current.has(id)) makeLink({ id, name: name || dev.name, uid })
         // Mark the tile as a remembered device: the UI renders it distinctly
         // (room-independent: it's here because of the pairing, not the room).
-        updatePeer(id, { known: dev.name })
+        updatePeer(id, { known: dev.name, knownId: dev.id, oneSided: false })
       })
       sig.on('known-peer-left', ({ id }) => {
         expectedSecretRef.current.delete(id)
@@ -877,8 +942,17 @@ export function useTunlion() {
       // One-time pairing (#11): the server matched us with the code's other
       // party; the code is burned; move both into the private room.
       sig.on('pair-matched', ({ room }) => {
-        log.debug('pair matched, joining room')
         setRoomCode(null)
+        // The claimer joins the creator's CURRENT room. On the same network
+        // that is the room we are already in: leaving and re-joining it only
+        // tears down the link the ceremony runs on, and the creator saw our
+        // peer-left mid-ceremony and failed it (3 runs in 4). Nothing to do.
+        if (!shouldRejoinOnPairMatched(roomIdRef.current, room)) {
+          log.debug('pair matched in the room we are already in; staying')
+          tel('pair-matched-same-room', {})
+          return
+        }
+        log.debug('pair matched, joining room')
         rejoinRef.current?.(room, 'pair')
       })
       sig.on('pair-used', () => {
@@ -1055,7 +1129,11 @@ export function useTunlion() {
       // trust grant (C27): queue a consent prompt instead of storing silently.
       // Capture secret/caps/name NOW, before we null pakeRef below. Dedup by
       // peerId so the per-tick drivePake doesn't enqueue twice.
-      setPendingPakeKeep((prev) => (prev.some((k) => k.peerId === peerId) ? prev : [...prev, { peerId, name, secret: p.secret, caps: p.caps }]))
+      // Suggest a name no other remembered device uses (identity is the
+      // secret; two devices may share a display name).
+      const proven = provenRef.current.get(peerId)
+      const suggested = uniqueName(devicesLoad(), name, proven ? [proven] : [])
+      setPendingPakeKeep((prev) => (prev.some((k) => k.peerId === peerId) ? prev : [...prev, { peerId, name: suggested, secret: p.secret, caps: p.caps }]))
       tel('pake-paired', { peer: String(peerId).slice(-6) })
       setPairStatus('paired')
       pakeRef.current = null
@@ -1080,8 +1158,10 @@ export function useTunlion() {
       nameplate: cfg.nameplate,
       password: cfg.password,
       caps: PAIR_V2_CAPS,
-      sendSignal: (payload) => sigRef.current?.signal(peerId, payload),
-      getFingerprints: () => linksRef.current.get(peerId)?.fingerprints() || null,
+      // Read the bound sid at call time: a partner that rejoined under a
+      // fresh sid is rebound in peer-joined, and the ceremony follows it.
+      sendSignal: (payload) => sigRef.current?.signal(pakePeerRef.current || peerId, payload),
+      getFingerprints: () => linksRef.current.get(pakePeerRef.current || peerId)?.fingerprints() || null,
     })
     // C30: a lost element or confirmation is re-sent on backoff by the
     // ceremony; this tick gives it the chance. It stops with the ceremony.
@@ -1132,6 +1212,8 @@ export function useTunlion() {
     if (!pendingPakeRef.current && !pakeRef.current) return
     if (pakeRef.current?.secret) return
     tel('pake-failed', { why })
+    if (pakeLeftRef.current) clearTimeout(pakeLeftRef.current.timer)
+    pakeLeftRef.current = null
     setPairStatus(msg)
     pakeRef.current = null
     pakePeerRef.current = null
