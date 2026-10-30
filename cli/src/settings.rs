@@ -1149,9 +1149,10 @@ pub async fn run_set(
                         "{} {}: {} {} {}{strength_note} ({})",
                         ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()),
                         c.key,
-                        ui::paint_when(color, ui::Tone::Dim, &c.old),
+                        // An empty side reads as "(none)", not as a double space.
+                        ui::paint_when(color, ui::Tone::Dim, crate::set_menu::shown(&c.old)),
                         ui::glyph_arrow(),
-                        c.new,
+                        crate::set_menu::shown(&c.new),
                         c.scope
                     );
                 }
