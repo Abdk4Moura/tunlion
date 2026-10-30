@@ -317,6 +317,17 @@
       ]
     },
     {
+      "path": "cli/tests/sibling-shell-refusal-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/sibling-shell-refusal-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/expiry-race-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/expiry-race-gates.sh",
@@ -509,6 +520,7 @@
         "cli/tests/revocation-live-gates.sh",
         "cli/tests/roster-gates.sh",
         "cli/tests/shell-posture-gates.sh",
+        "cli/tests/sibling-shell-refusal-gates.sh",
         "cli/tests/term-restore-gates.sh",
         "cli/tests/warm-hold-idle-gates.sh"
       ]

@@ -116,7 +116,7 @@ CAUTION='still has shell access'
 # ABSENCE of the caution, and a revoke that failed outright (unknown device,
 # store error, usage error) prints no caution either, so without this they
 # would score a crashed revoke as "no false alarm".
-REVOKED="revoked 'shell' from '$DEV'"
+REVOKED="Revoked shell from $DEV"
 
 revoke_succeeded() {  # $1 = rc, $2 = output
   [ "$1" = "0" ] && printf '%s\n' "$2" | grep -qF "$REVOKED"

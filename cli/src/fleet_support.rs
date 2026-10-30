@@ -107,22 +107,33 @@ pub(crate) fn forget_verdict(
     }
 }
 
-/// What `devices forget` prints once it has done what the verdict says. Pure.
-pub(crate) fn forget_report(name: &str, verdict: &ForgetVerdict) -> String {
-    match verdict {
-        ForgetVerdict::Remove => {
-            format!("forgot '{name}', it can no longer find or auto-connect to this machine")
+impl ForgetVerdict {
+    /// The one factual detail a forget keeps for its result line: the key block
+    /// outlives the record, and for how long is the part a person acts on.
+    /// `None` for a plain removal, where there is nothing else to say. Pure.
+    pub(crate) fn detail(&self) -> Option<String> {
+        match self {
+            ForgetVerdict::Remove => None,
+            ForgetVerdict::RevokeThenRemove { days_left }
+            | ForgetVerdict::KeepRevocationThenRemove { days_left } => {
+                Some(format!("key refused for {}", days(*days_left)))
+            }
         }
-        ForgetVerdict::RevokeThenRemove { days_left } => format!(
-            "forgot '{name}' and revoked its fleet certificate (valid for {days_left} more day(s)): \
-             that device key is refused here until the certificate expires, so it cannot reconnect \
-             through fleet auto-mesh. The name '{name}' is free now."
-        ),
-        ForgetVerdict::KeepRevocationThenRemove { days_left } => format!(
-            "forgot '{name}'; its revocation stays in force for that device key until its certificate \
-             expires in {days_left} day(s). The name '{name}' is free now."
-        ),
     }
+}
+
+/// `n day` / `n days`, so a one-day certificate does not read "1 days".
+fn days(n: u64) -> String {
+    if n == 1 { "1 day".to_string() } else { format!("{n} days") }
+}
+
+/// What `devices forget` did: the local store is already written when this is
+/// returned, and the daemon has not been asked yet. The caller renders it with
+/// the daemon's answer so success is never printed before an unconfirmed one.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ForgetOutcome {
+    pub name: String,
+    pub verdict: ForgetVerdict,
 }
 
 /// The file that holds revocations by device key, apart from any name.
@@ -355,8 +366,8 @@ mod key_revocation_lift_tests {
 
 /// `devices forget <name>`: carry out the verdict, revocation FIRST, so a
 /// failure to record it leaves the record (and with it the revocation or the
-/// live certificate) exactly where it was. Returns the line to print.
-pub(crate) fn forget_device(name: &str, now: u64) -> Result<String> {
+/// live certificate) exactly where it was. Returns the facts to print.
+pub(crate) fn forget_device(name: &str, now: u64) -> Result<ForgetOutcome> {
     if !crate::device_record_exists(name) {
         anyhow::bail!("no device named '{name}', see `tunlion devices`");
     }
@@ -388,7 +399,7 @@ pub(crate) fn forget_device(name: &str, now: u64) -> Result<String> {
         crate::sshkeys::remove_authorized_key(name)?;
     }
     crate::device_caps::devices_remove(name)?;
-    Ok(forget_report(name, &verdict))
+    Ok(ForgetOutcome { name: name.to_string(), verdict })
 }
 
 /// `devices rename <old> <new>`: in place on the raw record, so caps and v2

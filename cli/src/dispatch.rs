@@ -1741,20 +1741,17 @@ pub(crate) async fn async_main() -> Result<()> {
                     ui_caps.confirm(&format!(
                         "forget {name} (delete its record; its key stays refused)"
                     ))?;
-                    let report = crate::fleet_support::forget_device(&name, identity::now_secs())?;
-                    crate::outln!("{report}");
+                    let outcome = crate::fleet_support::forget_device(&name, identity::now_secs())?;
                     // Its pending access requests cannot be approved into
                     // anything any more; drop them with the record.
                     crate::withdraw_requests_for(&name);
                     // The store is written; the RUNNING daemon must act on it too
-                    // (revocation_live.rs). Say only what it confirmed. The old
-                    // line here promised the forgotten device would hear "never
-                    // met you": it does not, because this machine stops answering
-                    // it at all, so from its side we look offline.
+                    // (revocation_live.rs). Render only after it answers, so an
+                    // unconfirmed daemon never leaves a success line behind.
                     let answer = crate::revocation_live::tell_daemon().await;
-                    match crate::revocation_live::daemon_line(&name, &answer, true) {
-                        Ok(line) => ui::say(&line),
-                        Err(e) => bail!(e),
+                    match crate::revocation_live::forget_line(&outcome, &answer) {
+                        Ok(line) => crate::outln!("{line}"),
+                        Err(e) => return Err(crate::revocation_live::unconfirmed_exit(e)),
                     }
                 }
                 Some(DevicesAction::Rename { old, new }) => {
@@ -2753,10 +2750,14 @@ pub(crate) async fn revoke_cmd(
     if capability == "shell" {
         sshkeys::remove_authorized_key(&device)?;
         crate::outln!(
-            "revoked 'shell' from '{device}' and removed its tunlion-managed authorized_keys block."
+            "{}",
+            crate::revocation_live::capability_revoke_line(&device, &capability, true)
         );
     } else {
-        crate::outln!("revoked '{capability}' from '{device}'.");
+        crate::outln!(
+            "{}",
+            crate::revocation_live::capability_revoke_line(&device, &capability, false)
+        );
     }
     if capability == "shell" && crate::daemon_alive().is_some() {
         ui::say(&ui::paint(
