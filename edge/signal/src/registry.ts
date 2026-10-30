@@ -301,10 +301,11 @@ export class Registry {
         .toArray() as unknown as Array<{ rid: number; token: string; sid: string | null; exp: number }>;
     }
     const c = this.capacityCursor;
+    // Row-value seek, so a late cursor seeks into sessions_exp instead of
+    // re-examining the prefix with an OR predicate.
     return this.sql
       .exec(
-        `SELECT ${cols} WHERE exp > ? OR (exp = ? AND rowid > ?) ORDER BY exp, rowid LIMIT ?`,
-        c.exp,
+        `SELECT ${cols} WHERE (exp, rowid) > (?, ?) ORDER BY exp, rowid LIMIT ?`,
         c.exp,
         c.rid,
         limit,
@@ -355,8 +356,10 @@ export class Registry {
   /** Global (token, gen) tombstones: 24h TTL + hard total cap (oldest first). */
   private pruneRetired(now: number) {
     if (this.pruneBatch > 0) {
+      // Order by the indexed expiry, with seq only as a stable tie-break.
+      // ORDER BY seq alone forced a full scan when nothing was expired.
       this.sql.exec(
-        "DELETE FROM retired WHERE seq IN (SELECT seq FROM retired WHERE exp <= ? ORDER BY seq LIMIT ?)",
+        "DELETE FROM retired WHERE seq IN (SELECT seq FROM retired WHERE exp <= ? ORDER BY exp, seq LIMIT ?)",
         now,
         this.pruneBatch,
       );

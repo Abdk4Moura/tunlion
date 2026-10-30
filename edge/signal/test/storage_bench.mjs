@@ -134,3 +134,44 @@ for (const scan of [64]) {
   db.close();
 }
 for (const line of out) console.log(JSON.stringify(line));
+
+// Late cursor: a fresh Registry only exercises the first page. Compare the
+// row-value seek with the old OR predicate near the end of the index.
+{
+  const db = seed(N);
+  const lateExp = 1000 + 3600 - 1;
+  const lateRid = N - 50;
+  const cols = "rowid AS rid, token, sid, exp FROM sessions";
+  const rv = db.prepare(`EXPLAIN QUERY PLAN SELECT ${cols} WHERE (exp, rowid) > (?, ?) ORDER BY exp, rowid LIMIT ?`).all(lateExp, lateRid, 64).map((r) => r.detail).join("; ");
+  const or = db.prepare(`EXPLAIN QUERY PLAN SELECT ${cols} WHERE exp > ? OR (exp = ? AND rowid > ?) ORDER BY exp, rowid LIMIT ?`).all(lateExp, lateExp, lateRid, 64).map((r) => r.detail).join("; ");
+  const t0 = performance.now();
+  const rows = db.prepare(`SELECT ${cols} WHERE (exp, rowid) > (?, ?) ORDER BY exp, rowid LIMIT ?`).all(lateExp, lateRid, 64);
+  out.push({ kind: "capacity-late", rowsReturned: rows.length, ms: +(performance.now() - t0).toFixed(2), planRowValue: rv, planOr: or });
+  db.close();
+}
+
+// Retired steady state: 100k live tombstones, nothing expired. The old
+// ORDER BY seq subquery scanned the table; the indexed expiry order should not.
+{
+  const db = seed(1);
+  const ins = db.prepare("INSERT INTO retired (token, gen, exp) VALUES (?,?,?)");
+  db.exec("BEGIN");
+  for (let i = 0; i < 100000; i++) ins.run(`rtok${i}`, "g", 9_000_000);
+  db.exec("COMMIT");
+  const oldPlan = db.prepare("EXPLAIN QUERY PLAN SELECT seq FROM retired WHERE exp <= ? ORDER BY seq LIMIT ?").all(5000, 64).map((r) => r.detail).join("; ");
+  const newPlan = db.prepare("EXPLAIN QUERY PLAN SELECT seq FROM retired WHERE exp <= ? ORDER BY exp, seq LIMIT ?").all(5000, 64).map((r) => r.detail).join("; ");
+  const c = counted(db);
+  c.c.rowsRead = 0;
+  const t = performance.now();
+  const oldRows = c.exec("SELECT seq FROM retired WHERE exp <= ? ORDER BY seq LIMIT ?", 5000, 64).toArray().length;
+  const oldMs = +(performance.now() - t).toFixed(2);
+  c.c.rowsRead = 0;
+  const t2 = performance.now();
+  const newRows = c.exec("SELECT seq FROM retired WHERE exp <= ? ORDER BY exp, seq LIMIT ?", 5000, 64).toArray().length;
+  out.push({
+    kind: "retired-empty", tombstones: 100000, oldRows, oldRowsRead: oldRows === 0 ? c.c.rowsRead : null,
+    newRows, newRowsRead: c.c.rowsRead, oldMs, newMs: +(performance.now() - t2).toFixed(2),
+    oldPlan, newPlan,
+  });
+  db.close();
+}

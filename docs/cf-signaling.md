@@ -260,11 +260,11 @@ Known differences, all deliberate:
   stale after hibernation. Capacity frees one dead slot per new claim in both.
 - Python's in-memory session expires at exactly `last_claim + 24 h`. The hub's
   persisted row can expire up to `FIL_SESSION_PERSIST_S` earlier after an
-  eviction (18 h floor at 6 h spacing), never later, and its expired rows are
-  pruned only when a later claim runs, not by a scheduler. `FIL_SESSION_PERSIST_S=1800`
-  restores the old 30 min spacing and a 23.5 h floor if needed.
-- After an eviction a session's stored expiry can be up to 30 minutes older
-  than in memory (the write-through slack). It still lasts a day after use.
+  eviction, never later: the default 6 h spacing gives an 18 h floor, 30 min
+  spacing gives about 23.5 h, and a value clamped to the 24 h TTL gives no
+  guaranteed post-eviction floor beyond the persisted row. Expired rows are
+  pruned only when a later claim runs, not by a scheduler.
+
 
 ## Conformance suite
 
