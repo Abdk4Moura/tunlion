@@ -2649,7 +2649,7 @@ impl InstallSource {
             InstallSource::Homebrew => "brew upgrade tunlion",
             InstallSource::Winget => "winget upgrade Abdk4Moura.Tunlion",
             InstallSource::Scoop => "scoop update tunlion",
-            InstallSource::Cargo => "cargo install filament-cli",
+            InstallSource::Cargo => "cargo install --locked tunlion",
             InstallSource::SelfInstalled => "",
         }
     }
@@ -3096,7 +3096,7 @@ mod tests {
     fn install_source_upgrade_hints() {
         assert_eq!(InstallSource::Homebrew.upgrade_hint(), "brew upgrade tunlion");
         assert_eq!(InstallSource::Winget.upgrade_hint(), "winget upgrade Abdk4Moura.Tunlion");
-        assert_eq!(InstallSource::Cargo.upgrade_hint(), "cargo install filament-cli");
+        assert_eq!(InstallSource::Cargo.upgrade_hint(), "cargo install --locked tunlion");
         assert_eq!(InstallSource::SelfInstalled.upgrade_hint(), "");
     }
 

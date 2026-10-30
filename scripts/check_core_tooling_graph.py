@@ -30,7 +30,7 @@ FORBIDDEN_PEERLOOP_FEATURES = {
     "ssh-sign",
     "ssh-bootstrap",
 }
-FORBIDDEN_REDUCED_PACKAGES = {"filament-overlay", "filament-fleet", "filament-cli"}
+FORBIDDEN_REDUCED_PACKAGES = {"tunlion-overlay", "tunlion-fleet", "tunlion"}
 # `authkeys-managed` is now optional behind `ssh-bootstrap`, which the reduced
 # Core does not enable. The reduced graph has nothing inert to allow here.
 INERT_REDUCED_PACKAGES = set()
@@ -53,10 +53,10 @@ def check_fleet_graph():
             raise RuntimeError(f"Unexpected cargo tree output: {line}")
         name, features = match.groups()
         packages.add(name)
-        if name == "filament-peerloop":
+        if name == "tunlion-peerloop":
             peerloop_features.update(filter(None, features.split(",")))
     required_features = {"dispatch", "mesh", "fleet"}
-    required_packages = {"filament-overlay", "filament-fleet"}
+    required_packages = {"tunlion-overlay", "tunlion-fleet"}
     if not required_features <= peerloop_features:
         raise RuntimeError(
             "host fleet: missing peerloop features: "
@@ -94,7 +94,7 @@ def check_graph(target, cli):
         packages.add(name)
         if name == "uniffi":
             uniffi_features.update(filter(None, features.split(",")))
-        if name == "filament-peerloop":
+        if name == "tunlion-peerloop":
             peerloop_features.update(filter(None, features.split(",")))
     label = f"{target or 'host'} {'cli' if cli else 'library'}"
     required = {"tunlion-core", "uniffi", "uniffi_core", "uniffi_macros"}
