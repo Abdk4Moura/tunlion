@@ -170,7 +170,7 @@ for (const scan of [64]) {
 // row-value seek with the old OR predicate near the end of the index.
 {
   const db = seed(N);
-  const lateExp = 1000 + 3600 - 1;
+  const lateExp = 1000 + 3600; // the seeded expiry; rowid chooses the tail
   const lateRid = N - 50;
   const cols = "rowid AS rid, token, sid, exp FROM sessions";
   const rv = db.prepare(`EXPLAIN QUERY PLAN SELECT ${cols} WHERE (exp, rowid) > (?, ?) ORDER BY exp, rowid LIMIT ?`).all(lateExp, lateRid, 64).map((r) => r.detail).join("; ");
