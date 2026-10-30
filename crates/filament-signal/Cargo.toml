@@ -9,7 +9,7 @@ description = "Minimal Engine.IO v4 / Socket.IO v5 websocket client for tunlion'
 anyhow = "1.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["rt", "time", "sync", "macros", "net"] }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros", "net", "io-util"] }
 # rustls, deliberately: replacing rust_socketio's hard native-tls dependency is
 # the entire point of this crate, so the binary does not link system
 # libssl/libcrypto. The connector is always built by `tls::client_config()`;

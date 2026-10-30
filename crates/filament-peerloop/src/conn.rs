@@ -472,6 +472,10 @@ pub fn label_is_raw_id(label: &str, id: &str, uid: Option<&str>) -> bool {
 pub fn shown_direct_route(label: &str, t: &Arc<dyn Transport>) -> String {
     match (label, t.remote_addr()) {
         ("direct-quic", Some(remote)) => filament_transport::net::direct_route_label(remote),
+        // Met by local discovery, no server: "lan (direct over wlan0)".
+        (filament_transport::lan::ROUTE_LAN, Some(remote)) => {
+            format!("lan ({})", filament_transport::net::direct_route_label(remote))
+        }
         _ => label.to_string(),
     }
 }
@@ -747,6 +751,9 @@ pub struct Conn {
     pub to_filter: Option<String>,
     pub links: HashMap<String, Link>,
     pub roster: HashMap<String, Value>, // sid -> {id,name,uid} from welcome/peer-joined
+    /// Local discovery (`filament_transport::lan`), when it is on for this
+    /// session. Set by the loop after construction.
+    pub lan: Option<filament_transport::lan::LanService>,
     /// Peer IDs whose exhausted stall ladder deliberately gave up. Contact
     /// clears these; digest reconciliation skips them.
     pub suppressed_digest_adoptions: HashSet<String>,
@@ -1045,6 +1052,7 @@ impl Conn {
             room_digest_absent: HashMap::new(),
             recv_done: false,
             direct_pending: HashMap::new(),
+            lan: None,
             webrtc_only: HashSet::new(),
             buffered_offers: HashMap::new(),
             promotions: HashMap::new(),

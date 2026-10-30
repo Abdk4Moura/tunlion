@@ -376,6 +376,34 @@ pub fn registry() -> &'static [Setting] {
             daemon: true,
             help: "What your owner device may grant on THIS device with `tunlion grant ... --on`: off (nothing; your other devices can only send files to the inbox), files (transfer and mount, the default), all (also shell). Set here only; never changed over the network.",
         },
+        // Local discovery (docs/protocol/local-discovery.md). `lan` is a
+        // member of the transport set the carriers design names; `auto` is
+        // every transport. Only `lan` membership is acted on today, so a pinned
+        // list must keep `direct` and `relay` (the `relay` setting still
+        // governs relay); the validator says so instead of accepting a list it
+        // would not honour.
+        Setting {
+            key: "network.transports",
+            aliases: &["transports"],
+            store: "network.transports",
+            kind: Kind::List,
+            default: "auto",
+            scope: ScopeKind::GlobalOnly,
+            env: Some("TUNLION_TRANSPORTS"),
+            daemon: true,
+            help: "Transports tunlion may use: auto (all), or a list of lan, direct, relay. Leave out lan to turn off local discovery (no beacons, no listener, no dialing remembered addresses): tunlion set network.transports direct,relay",
+        },
+        Setting {
+            key: "network.lan-skip",
+            aliases: &["lan-skip"],
+            store: "network.lan-skip",
+            kind: Kind::List,
+            default: "",
+            scope: ScopeKind::GlobalOnly,
+            env: None,
+            daemon: true,
+            help: "Interfaces where local discovery stays silent (no beacons, no probes, no replies): interface names or CIDRs, e.g. eth1,10.20.0.0/16. Remembered addresses of paired devices are still dialed.",
+        },
         Setting {
             key: "gate.settle_ms",
             aliases: &[],
@@ -746,6 +774,7 @@ fn canonicalize(s: &Setting, raw: &str) -> Result<String> {
             }
             Ok(raw.to_string())
         }
+        Kind::List if s.key == "network.transports" => validate_transports(raw),
         Kind::List => {
             // An EMPTY list is how a list setting is cleared, and clearing is
             // not an edge case: `advertise-routes ''` is how a subnet router or
@@ -755,6 +784,28 @@ fn canonicalize(s: &Setting, raw: &str) -> Result<String> {
             Ok(raw.to_string())
         }
     }
+}
+
+/// `auto`, or a list of known transports that keeps `direct` and `relay`
+/// (only `lan` membership is enforced so far; see the registry entry).
+pub(crate) fn validate_transports(raw: &str) -> Result<String> {
+    const KNOWN: &[&str] = &["lan", "direct", "relay"];
+    let v = raw.trim().to_ascii_lowercase();
+    if v.is_empty() || v == "auto" {
+        return Ok("auto".to_string());
+    }
+    let items: Vec<&str> = v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    for i in &items {
+        if !KNOWN.contains(i) {
+            bail!("unknown transport '{i}': use auto, or a list of lan, direct, relay");
+        }
+    }
+    for need in ["direct", "relay"] {
+        if !items.contains(&need) {
+            bail!("leaving out {need} is not supported yet: only lan can be turned off here (use `tunlion set relay never` to avoid the relay)");
+        }
+    }
+    Ok(items.join(","))
 }
 
 fn expand_tilde(p: &str) -> PathBuf {
@@ -1923,5 +1974,21 @@ mod tests {
         assert!(parse(&["set", "prefer", "wl1", "--hard"]).is_ok());
         let cli = parse(&["set", "--reset", "--yes", "--json"]).unwrap();
         assert!(cli.yes && cli.json, "set no longer shadows the global --yes/--json");
+    }
+}
+
+#[cfg(test)]
+mod transports_tests {
+    use super::validate_transports;
+
+    #[test]
+    fn transports_accepts_auto_and_lists_with_direct_and_relay() {
+        assert_eq!(validate_transports("auto").unwrap(), "auto");
+        assert_eq!(validate_transports("").unwrap(), "auto");
+        assert_eq!(validate_transports(" Direct, relay ").unwrap(), "direct,relay");
+        assert_eq!(validate_transports("lan,direct,relay").unwrap(), "lan,direct,relay");
+        assert!(validate_transports("lan,direct").is_err(), "relay may not be dropped here");
+        assert!(validate_transports("lan,relay").is_err(), "direct may not be dropped here");
+        assert!(validate_transports("lan,direct,relay,bluetooth").is_err());
     }
 }

@@ -399,12 +399,49 @@ pub(crate) async fn send_cmd(
     // is unchanged.
     let send_log = crate::host_impl::cli_log();
     let send_present = crate::host_impl::cli_screen();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    // Local discovery (docs/protocol/local-discovery.md): a send to a paired
+    // device dials its remembered addresses at once, beside signaling, and
+    // does not give up when the server is unreachable.
+    let lan_target: Option<(String, String)> = to
+        .as_deref()
+        .and_then(|t| devices_load().into_iter().find(|(n, _)| n.eq_ignore_ascii_case(t)))
+        .filter(|_| filament_transport::lan::enabled(&transport_context));
+    let lan_svc = match &lan_target {
+        Some((n, sec)) => match crate::lan_send::start(&transport_context, tx.clone()).await {
+            Ok(svc) => {
+                crate::lan_send::dial_now(&svc, n, sec);
+                Some(svc)
+            }
+            Err(e) => {
+                ui::debug(&format!("lan: local discovery unavailable for this send: {e:#}"));
+                None
+            }
+        },
+        None => None,
+    };
+    let bounded = |d: u64| Duration::from_secs(if lan_svc.is_some() { d } else { 3600 });
     let room = match room {
         Some(r) => r,
-        None => net::fetch_auto_room(&transport_context, server).await?,
+        None => match tokio::time::timeout(bounded(5), net::fetch_auto_room(&transport_context, server)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) | Err(_) if lan_svc.is_some() => {
+                ui::debug("lan: no room from the server; sending over the local network only");
+                String::new()
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!("the tunlion server did not answer"),
+        },
     };
-    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
+    let sio = match tokio::time::timeout(bounded(5), net::connect_signaling(&transport_context, server, tx.clone())).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(_)) | Err(_) if lan_svc.is_some() => {
+            ui::say("can't reach the tunlion server; looking on the local network");
+            filament_signal::Client::offline().await?
+        }
+        Ok(Err(e)) => return Err(e),
+        Err(_) => anyhow::bail!("the tunlion server did not answer"),
+    };
     // C30: the convergent session repairs room/channel/lease state the
     // one-shot emits lose (the fast path stays for old servers + latency);
     // under gate L these initial emits are exactly what the shim drops.
@@ -653,6 +690,7 @@ pub(crate) async fn send_cmd(
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
     }
+    conn.lan = lan_svc;
     let mut code_used = !use_code && known_target.is_none();
     // L1-a ephemeral PAKE on the transfer path. When `--code` is used, run the
     // SAME SPAKE2 ceremony `pair` runs, then DISCARD the secret (auth only). The
@@ -1300,6 +1338,12 @@ pub(crate) async fn send_cmd(
                 if let Some((n, sec)) = &known_target {
                     if v["channel"].as_str() == Some(channel_of(sec).as_str()) {
                         let pid = v["id"].as_str().unwrap_or_default().to_string();
+                        // Already linked over local discovery: one link per
+                        // send, or the file could be offered twice.
+                        if conn.has_link_to(n) {
+                            saw_known_peer.insert(n.clone());
+                            continue;
+                        }
                         // Liveness-aware: skip only if a healthy link already exists.
                         // If the link is dead or absent, re-establish (reconnect-after-loss).
                         let link_alive = conn
@@ -1555,11 +1599,30 @@ pub(crate) async fn send_cmd(
                     .get(&pid)
                     .map(|p| direct::transport_key(&p.secret.1));
                 conn.adopt_direct(&pid, t.clone(), route);
-                if let Some(k) = tkey {
+                if let Some(k) = tkey.filter(|_| route != filament_transport::lan::ROUTE_LAN) {
                     conn.spawn_direct_workers(&pid, &t, k);
                 }
                 let _ = tx.send(Ev::ChannelReady(pid, t));
             }
+            Ev::Lan(e) => match e {
+                filament_transport::lan::LanEvent::Found { name, addr } => {
+                    if let Some((n, sec)) = lan_target.as_ref().filter(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                        if !conn.has_link_to(n) {
+                            conn.lan_dial(n, sec, false, &[addr], &crate::lan_send::ownership(n));
+                        }
+                    }
+                }
+                e @ filament_transport::lan::LanEvent::Linked { .. } => {
+                    // A one-shot send links only to its target: anything else
+                    // that answered is dropped.
+                    let ours = matches!(&e, filament_transport::lan::LanEvent::Linked { name, .. }
+                        if lan_target.as_ref().is_some_and(|(n, _)| n.eq_ignore_ascii_case(name)));
+                    if ours && !lan_target.as_ref().is_some_and(|(n, _)| conn.has_link_to(n)) {
+                        filament_peerloop::lan_glue::on_linked(&mut conn, &tx, e, send_log.as_ref());
+                    }
+                }
+                filament_transport::lan::LanEvent::PairingNearby { .. } => {}
+            },
             Ev::DirectWorkersReady(pid, workers) => {
                 if let Some(link) = conn.link_mut(&pid) {
                     link.workers = workers;

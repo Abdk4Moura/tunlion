@@ -488,6 +488,7 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
                 // `warm` is None and the row omits the status instead of
                 // rendering "offline" for every device always.
                 online: warm.map(|_| warm_names.contains(&name)),
+                route: crate::warm_device_route(warm, &name),
                 caps_summary,
                 countdown: match delegated_device_state(&name, cert.as_ref(), now, &records) {
                     Some((text, tone)) => ui::paint(tone, &text),
@@ -532,6 +533,7 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
                                 name,
                                 tier: fleet_ui::devices::DeviceTier::MeshRoster,
                                 online: None, // unknown liveness (#217), never idle/offline
+                                route: None,
                                 caps_summary,
                                 countdown: String::new(),
                                 last_seen: None,

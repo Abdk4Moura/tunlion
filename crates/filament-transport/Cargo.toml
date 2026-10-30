@@ -72,5 +72,10 @@ sha2 = "0.11.0"
 quinn-proto = "0.11"
 socket2 = { version = "0.5", features = ["all"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider", "http2", "charset", "system-proxy"] }
+tunlion-lan = { path = "../tunlion-lan", version = "0.1.0" }
+filament-overlay = { path = "../filament-overlay", version = "0.1.0" }
 rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "pem"] }
 
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
