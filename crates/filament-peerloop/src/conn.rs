@@ -217,6 +217,14 @@ fn stun_only_ice_config() -> net::ServerConfig {
 }
 /// Ceiling on building a WebRTC peer connection inside an establish.
 const PEER_BUILD_BUDGET: Duration = Duration::from_secs(5);
+/// Direct attempts that expired at the same time are handed to the caller one
+/// per call, not as a batch. The fallback caller awaits a full WebRTC establish
+/// for each entry, and that establish can take up to the ICE config budget plus
+/// [`PEER_BUILD_BUDGET`]. A fleet join starts one attempt per sibling, so they
+/// expire together; draining the batch in one daemon-loop iteration made N
+/// joins add up to a stall longer than the 20 s loop watchdog. The caller runs
+/// this once per iteration, so the remaining peers fall back on later ticks.
+const DIRECT_FALLBACKS_PER_CALL: usize = 1;
 /// How long `drop_link` lets a dropped link's last frames reach the peer
 /// before it closes the QUIC connection under them.
 const DROP_CLOSE_GRACE: Duration = Duration::from_secs(2);
@@ -3255,8 +3263,10 @@ impl Conn {
 
     /// Per-tick: a direct attempt whose budget expired without an authenticated
     /// connection falls back to the WebRTC `establish` (unchanged). Returns the
-    /// list of (pid, info) to establish, caller awaits establish outside the
-    /// borrow. Also drops any pending whose Link already exists.
+    /// one (pid, info) to establish, caller awaits establish outside the borrow,
+    /// so one loop iteration pays for at most ONE establish. Remaining expired
+    /// attempts stay pending and are returned by the next call. Also drops any
+    /// pending whose Link already exists.
     pub fn expired_direct(&mut self) -> Vec<(String, Value, (String, String))> {
         let now = Instant::now();
         let mut fell_back = Vec::new();
@@ -3283,7 +3293,7 @@ impl Conn {
             ));
             self.mark_probe_failed(&pid);
         }
-        let expired: Vec<String> = self
+        let mut expired: Vec<String> = self
             .direct_pending
             .iter()
             .filter(|(pid, p)| {
@@ -3294,7 +3304,10 @@ impl Conn {
             })
             .map(|(pid, _)| pid.clone())
             .collect();
-        for pid in expired {
+        // Earliest deadline first, so a steady stream of newly expired attempts
+        // can never starve one that has waited longer.
+        expired.sort_by_key(|pid| self.direct_pending.get(pid).map(|p| p.deadline));
+        for pid in expired.into_iter().take(DIRECT_FALLBACKS_PER_CALL) {
             if let Some(p) = self.direct_pending.remove(&pid) {
                 let info = self
                     .roster
@@ -7019,6 +7032,28 @@ mod warm_identity_tests {
         Instant::now() + Duration::from_secs(30)
     }
 
+    /// A direct attempt that lost its race, without the network: the deadline
+    /// is already past, so the next reaper call returns it.
+    fn expired_direct_pending(conn: &mut Conn, pid: &str, deadline: Instant) {
+        conn.direct_pending.insert(
+            pid.to_string(),
+            DirectPending {
+                secret: (pid.to_string(), "fleet".into()),
+                fleet: true,
+                ephemeral: false,
+                deadline,
+                racing: false,
+                endpoint: None,
+                punch_sock: None,
+                my_srflx: None,
+                peer_server_public: None,
+                server_public_dialed: Arc::new(AtomicBool::new(false)),
+                probe: false,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
     /// THE latency fix. The promotion used to tear the authenticated WebRTC
     /// link down here and make the transfer wait for QUIC. It must keep the
     /// link, put the transfer's gate around it, and leave it to be announced
@@ -7096,6 +7131,89 @@ mod warm_identity_tests {
         let t = conn.transport_of(pid).unwrap();
         t.send_frame(1, 0, b"x").await.unwrap();
         assert_eq!(rec_log(&log), vec!["webrtc:@0"], "the transfer did not stay on WebRTC");
+    }
+
+    /// A fleet join starts one direct attempt per sibling, so the attempts that
+    /// lose their race expire together. Each fallback is a full WebRTC establish
+    /// awaited inline by the daemon loop, so the reaper must hand them over one
+    /// at a time: draining the whole batch in one loop turn added N establishes
+    /// to one iteration and exceeded the 20 s loop watchdog. Deferring must not
+    /// drop a peer: every pending is returned on a later call.
+    #[tokio::test]
+    async fn expired_direct_returns_one_fallback_per_call() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        for pid in ["sid-a", "sid-b", "sid-c"] {
+            expired_direct_pending(&mut conn, pid, Instant::now() - Duration::from_millis(1));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let batch = conn.expired_direct();
+            assert_eq!(batch.len(), 1, "more than one fallback in a single loop turn");
+            seen.insert(batch[0].0.clone());
+        }
+        assert_eq!(seen.len(), 3, "a peer was dropped instead of deferred: {seen:?}");
+        assert!(conn.direct_pending.is_empty(), "deferred fallbacks were not drained");
+        assert!(conn.expired_direct().is_empty());
+    }
+
+    /// The dispatch loop's shape: one reaper call and one awaited establish per
+    /// iteration, with the watchdog heartbeat stamped at the top. An establish
+    /// stand-in is awaited for each fallback; with the batch capped, the
+    /// heartbeat advances between them instead of only after all of them.
+    /// Before the cap, the first iteration returned every expired attempt, so
+    /// N establishes ran against ONE heartbeat.
+    #[tokio::test]
+    async fn expired_direct_keeps_the_loop_heartbeat_between_fallbacks() {
+        const PEERS: usize = 4;
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        for n in 0..PEERS {
+            expired_direct_pending(
+                &mut conn,
+                &format!("sid-{n}"),
+                Instant::now() - Duration::from_millis(1),
+            );
+        }
+        let mut beats = 0usize;
+        let mut fallbacks = 0usize;
+        let mut largest_batch = 0usize;
+        // Bounded by PEERS: one fallback per iteration, so the loop above
+        // drains every peer in exactly PEERS turns.
+        for _ in 0..PEERS {
+            beats += 1; // top-of-iteration watchdog tick
+            let batch = conn.expired_direct();
+            largest_batch = largest_batch.max(batch.len());
+            for (_pid, _info, _secret) in batch {
+                // Stands in for the awaited WebRTC establish. Its real ceiling
+                // is ICE_CONFIG_BUDGET + PEER_BUILD_BUDGET (8 s cold).
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                fallbacks += 1;
+            }
+        }
+        assert_eq!(largest_batch, 1, "one loop turn drained more than one fallback");
+        assert_eq!(fallbacks, PEERS, "a deferred fallback was never established");
+        assert_eq!(beats, PEERS, "the loop advanced one heartbeat per fallback");
+        assert!(conn.direct_pending.is_empty(), "a deferred fallback was left pending");
+    }
+
+    /// Deferring one per call must not starve a long-expired attempt. The
+    /// earliest deadline is always the one returned next.
+    #[tokio::test]
+    async fn expired_direct_falls_back_earliest_deadline_first() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let now = Instant::now();
+        expired_direct_pending(&mut conn, "sid-new", now - Duration::from_secs(1));
+        expired_direct_pending(&mut conn, "sid-old", now - Duration::from_secs(3));
+        expired_direct_pending(&mut conn, "sid-mid", now - Duration::from_secs(2));
+        let order: Vec<String> = std::iter::from_fn(|| conn.expired_direct().pop())
+            .map(|(pid, _, _)| pid)
+            .collect();
+        assert_eq!(
+            order,
+            vec!["sid-old".to_string(), "sid-mid".to_string(), "sid-new".to_string()]
+        );
     }
 
     /// A race that won must not be expired or reaped while it waits beside the
