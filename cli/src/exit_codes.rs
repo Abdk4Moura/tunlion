@@ -62,6 +62,12 @@ pub(crate) enum ExitKind {
     Unreachable,
     /// The tunlion server cannot be reached (no internet, DNS, captive portal).
     Network,
+    /// The tunlion server answered, but its TLS certificate was not trusted
+    /// here: a proxy that inspects TLS and re-signs with its own CA, or a
+    /// configured `SSL_CERT_FILE` / `SSL_CERT_DIR` that loads nothing. Not 7,
+    /// because the network works and "check your internet" sends a person
+    /// the wrong way.
+    TlsCertificate,
     /// Some of the work landed and some did not.
     Partial,
     /// This device has no identity yet (`tunlion init` or `tunlion join`).
@@ -76,7 +82,7 @@ pub(crate) enum ExitKind {
 
 impl ExitKind {
     #[cfg(test)]
-    pub(crate) const ALL: [ExitKind; 10] = [
+    pub(crate) const ALL: [ExitKind; 11] = [
         ExitKind::Other,
         ExitKind::Usage,
         ExitKind::UnknownDevice,
@@ -87,6 +93,7 @@ impl ExitKind {
         ExitKind::Partial,
         ExitKind::NoIdentity,
         ExitKind::LocalResource,
+        ExitKind::TlsCertificate,
     ];
 
     pub(crate) fn code(self) -> i32 {
@@ -101,6 +108,7 @@ impl ExitKind {
             ExitKind::Partial => 8,
             ExitKind::NoIdentity => 9,
             ExitKind::LocalResource => 12,
+            ExitKind::TlsCertificate => 13,
         }
     }
 
@@ -117,6 +125,7 @@ impl ExitKind {
             ExitKind::Partial => "partial",
             ExitKind::NoIdentity => "no_identity",
             ExitKind::LocalResource => "local_resource",
+            ExitKind::TlsCertificate => "tls_certificate",
         }
     }
 }
@@ -233,6 +242,9 @@ pub(crate) fn classify(e: &anyhow::Error) -> ExitKind {
         if is_corrupt_state(cause) {
             return ExitKind::Usage;
         }
+        if filament_signal::tls::certificate_error(cause).is_some() {
+            return ExitKind::TlsCertificate;
+        }
     }
     classify_text(&format!("{e:#}"))
 }
@@ -261,9 +273,20 @@ pub(crate) fn is_network_text(s: &str) -> bool {
     PATTERNS.iter().any(|p| s.contains(p))
 }
 
+/// The text of a TLS trust failure on a connection to tunlion's servers (see
+/// [`ExitKind::TlsCertificate`]). The same test the transport uses.
+pub(crate) fn is_certificate_text(s: &str) -> bool {
+    filament_signal::tls::is_certificate_text(s)
+}
+
 /// Classify a failure from its text. Order matters: a network failure often
-/// also says "timed out", and it is the network a person has to fix.
+/// also says "timed out", and it is the network a person has to fix. An
+/// untrusted certificate comes first of all, because its chain also names the
+/// connect it broke ("signaling connect to ..."), and it is not the network.
 pub(crate) fn classify_text(s: &str) -> ExitKind {
+    if is_certificate_text(s) {
+        return ExitKind::TlsCertificate;
+    }
     if is_network_text(s) {
         return ExitKind::Network;
     }
@@ -367,25 +390,25 @@ pub(crate) const EXEC_CANNOT_RUN: i32 = 126;
 /// what a shell reports for a process killed by SIGPIPE (`set -o pipefail`).
 pub(crate) const OUTPUT_CLOSED: i32 = 141;
 
-const SEND_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 8, 9, 12, 130, 141, 143];
-const RECEIVE_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 8, 9, 12, 130, 141, 143];
-const SYNC_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 8, 9, 12, 130, 141, 143];
-const EXEC_CODES: &[i32] = &[1, 2, 3, 4, 6, 7, 9, 126, 127, 130, 141, 143];
-const REACH_CODES: &[i32] = &[0, 1, 2, 3, 5, 6, 7, 9, 130, 143];
+const SEND_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 8, 9, 12, 13, 130, 141, 143];
+const RECEIVE_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 8, 9, 12, 13, 130, 141, 143];
+const SYNC_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 8, 9, 12, 13, 130, 141, 143];
+const EXEC_CODES: &[i32] = &[1, 2, 3, 4, 6, 7, 9, 13, 126, 127, 130, 141, 143];
+const REACH_CODES: &[i32] = &[0, 1, 2, 3, 5, 6, 7, 9, 13, 130, 143];
 const STATUS_CODES: &[i32] = &[0, 1, 2, 6, 9, 11, 130, 143];
 const DEVICES_CODES: &[i32] = &[0, 1, 2, 3, 9, 12];
-const DOCTOR_CODES: &[i32] = &[0, 1, 2, 3, 6, 7, 9, 130, 143];
-const UP_CODES: &[i32] = &[0, 1, 2, 4, 7, 9, 10, 12, 130, 143];
+const DOCTOR_CODES: &[i32] = &[0, 1, 2, 3, 6, 7, 9, 13, 130, 143];
+const UP_CODES: &[i32] = &[0, 1, 2, 4, 7, 9, 10, 12, 13, 130, 143];
 const LOGS_CODES: &[i32] = &[0, 1, 2, 130, 143];
 const DOWN_CODES: &[i32] = &[0, 1, 2, 6];
-const PAIRING_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 9, 12, 130, 143];
+const PAIRING_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 9, 12, 13, 130, 143];
 const LOCAL_CODES: &[i32] = &[0, 1, 2, 3, 9, 12];
 /// `skill`: a refused or unresolvable target is 2, a full disk 12.
 const SKILL_CODES: &[i32] = &[0, 1, 2, 12];
 /// `demo`: no terminal (without --auto) or a bad --step/--speed is 2.
 const DEMO_CODES: &[i32] = &[0, 1, 2, 130, 143];
 /// Verbs not listed above: the codes any command can produce.
-const DEFAULT_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 9, 12, 130, 143];
+const DEFAULT_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 9, 12, 13, 130, 143];
 
 /// The exit codes `verb` can return.
 pub(crate) fn verb_exit_codes(verb: &str) -> &'static [i32] {
@@ -433,6 +456,7 @@ fn code_meaning(verb: &str, code: i32) -> &'static str {
         (_, 10) => "a daemon is already running with different settings (not applied)",
         (_, 11) => "no daemon is running for this config directory",
         (_, 12) => "a resource on this machine ran out (disk full, quota, open files, memory)",
+        (_, 13) => "the tunlion server's TLS certificate was not trusted (a TLS-inspecting proxy, or a missing CA: set SSL_CERT_FILE)",
         (_, EXEC_CANNOT_RUN) => "the remote command was found but cannot be executed there",
         (_, EXEC_NOT_FOUND) => "the remote command is not on the remote daemon's PATH",
         (_, INTERRUPTED) => "interrupted (SIGINT); with --json the failure object is still printed",
@@ -476,6 +500,25 @@ pub(crate) fn with_exit_code_help(cmd: clap::Command) -> clap::Command {
 /// What a person sees for a network failure instead of the raw error chain.
 pub(crate) const NETWORK_LINE: &str =
     "Can't reach the tunlion server (no internet or DNS?). Run `tunlion doctor` for details.";
+
+/// What a person sees for an untrusted server certificate instead of the raw
+/// error chain (exit 13). Shared with the daemon log and the TURN bridge;
+/// [`summary_line`] picks it, so only the tests name it.
+#[cfg(test)]
+pub(crate) const CERT_LINE: &str = filament_signal::tls::UNTRUSTED_LINE;
+
+/// The one human line that replaces the raw chain for `kind`, when it has
+/// one: the network (7) and a TLS trust failure (13). `raw` is the failure's
+/// text, which says whether a certificate was refused (the shared
+/// `filament_signal::tls::UNTRUSTED_LINE`) or no
+/// trust store loaded at all.
+pub(crate) fn summary_line(kind: ExitKind, raw: &str) -> Option<&'static str> {
+    match kind {
+        ExitKind::Network => Some(NETWORK_LINE),
+        ExitKind::TlsCertificate => Some(filament_signal::tls::untrusted_line_for(raw)),
+        _ => None,
+    }
+}
 
 // ------------------------------------------------------------- json mode ---
 
@@ -629,10 +672,20 @@ pub(crate) fn json_error(kind: ExitKind, message: &str, detail: Option<&str>) ->
 /// The message a person (or a `--json` reader) gets for this error: the one
 /// human line for a network failure, the error's own text otherwise.
 pub(crate) fn human_message(e: &anyhow::Error) -> String {
-    if classify(e) == ExitKind::Network && is_network_text(&format!("{e:#}")) {
-        NETWORK_LINE.to_string()
-    } else {
-        e.to_string()
+    match one_line(e) {
+        Some(line) => line.to_string(),
+        None => e.to_string(),
+    }
+}
+
+/// [`summary_line`] for an error, when its chain really is that failure (an
+/// explicit `Network` with its own sentence keeps the sentence).
+fn one_line(e: &anyhow::Error) -> Option<&'static str> {
+    let raw = format!("{e:#}");
+    match classify(e) {
+        ExitKind::Network if is_network_text(&raw) => Some(NETWORK_LINE),
+        ExitKind::TlsCertificate => Some(filament_signal::tls::untrusted_line_for(&raw)),
+        _ => None,
     }
 }
 
@@ -664,7 +717,8 @@ pub(crate) fn error_with_causes(e: &anyhow::Error) -> String {
 ///
 /// Human output keeps the exact shape Rust's default `main -> Result` printed
 /// (`Error: <message>` plus the cause chain) for everything except a network
-/// failure, which becomes one plain line; its raw chain is shown under `-v`.
+/// failure or an untrusted server certificate, each of which becomes one plain
+/// line ([`summary_line`]); the raw chain is shown under `-v`.
 /// Under `--json` the envelope goes to stdout as well, so stdout is always one
 /// JSON document and stderr still carries the reason for a log.
 pub(crate) fn report(e: &anyhow::Error) -> i32 {
@@ -673,15 +727,15 @@ pub(crate) fn report(e: &anyhow::Error) -> i32 {
         return kind.code();
     }
     let raw = format!("{e:#}");
-    let network = kind == ExitKind::Network && is_network_text(&raw);
+    let line = one_line(e);
     let message = human_message(e);
     if json_mode() && !JSON_ANSWERED.swap(true, Ordering::SeqCst) {
         let mut v = json_error(kind, &message, Some(&raw));
         v["error"]["code"] = json!(json_code(e));
         ui::json_out(&v);
     }
-    if network {
-        ui::critical(&format!("{} {NETWORK_LINE}", ui::error_label()));
+    if let Some(line) = line {
+        ui::critical(&format!("{} {line}", ui::error_label()));
         ui::debug(&format!("  cause: {raw}"));
     } else {
         ui::critical(&format!("{} {}", ui::error_label(), error_with_causes(e)));
@@ -735,6 +789,63 @@ mod tests {
         assert_eq!(classify(&e), ExitKind::Network);
         assert_eq!(human_message(&e), NETWORK_LINE);
         assert!(!human_message(&e).contains("lookup"), "the raw chain is for -v only");
+    }
+
+    /// The reported case: behind a TLS-inspecting proxy, signaling refused the
+    /// proxy's certificate and the CLI said "Can't reach the tunlion server
+    /// (no internet or DNS?)", exit 7. An untrusted certificate is 13 with its
+    /// own sentence, typed or as text, even though its chain also names the
+    /// signaling connect that matched the network patterns. DNS stays 7.
+    #[test]
+    fn an_untrusted_certificate_is_13_not_the_network() {
+        assert_eq!(ExitKind::TlsCertificate.code(), 13);
+        assert_eq!(ExitKind::TlsCertificate.token(), "tls_certificate");
+        let typed = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        ))
+        .context("websocket connect to wss://tunlion.autumated.com/socket.io/")
+        .context("signaling connect to https://tunlion.autumated.com");
+        assert_eq!(classify(&typed), ExitKind::TlsCertificate);
+        assert_eq!(human_message(&typed), CERT_LINE);
+        assert!(!human_message(&typed).contains('\u{2014}'), "no em dash in the sentence");
+        assert_eq!(json_code(&typed), "tls_certificate");
+        let v = json_error(classify(&typed), &human_message(&typed), Some(&format!("{typed:#}")));
+        assert_eq!(v["error"]["exit"], json!(13));
+        assert!(v["error"]["detail"].as_str().unwrap().contains("UnknownIssuer"), "{v}");
+
+        // Only its text survived (a daemon reply, a probe's recorded error).
+        for raw in [
+            "signaling connect to https://x: websocket connect to wss://x: IO error: invalid peer certificate: UnknownIssuer",
+            "GET https://x/api/config: error sending request for url (https://x/api/config): invalid peer certificate: NotValidForName",
+            "signaling connect to https://x: loading the TLS trust store: No CA certificates were loaded from the system",
+        ] {
+            assert_eq!(classify_text(raw), ExitKind::TlsCertificate, "{raw}");
+            assert_eq!(classify(&anyhow::anyhow!(raw.to_string())), ExitKind::TlsCertificate, "{raw}");
+        }
+        // The controls: refused, reset and DNS keep their meanings.
+        let dns = anyhow::anyhow!("failed to lookup address information: Try again")
+            .context("signaling connect to https://tunlion.autumated.com");
+        assert_eq!(classify(&dns), ExitKind::Network);
+        assert_eq!(human_message(&dns), NETWORK_LINE);
+        let reset = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            .context("signaling connect to https://x");
+        assert_eq!(classify(&reset), ExitKind::Network);
+        assert_eq!(
+            classify_text("tcp connect to 127.0.0.1:22: Connection refused (os error 111)"),
+            ExitKind::Unreachable
+        );
+        assert_eq!(summary_line(ExitKind::TlsCertificate, "invalid peer certificate: Expired"), Some(CERT_LINE));
+        assert_eq!(summary_line(ExitKind::Network, ""), Some(NETWORK_LINE));
+        assert_eq!(summary_line(ExitKind::Unreachable, ""), None);
+        // No store loaded at all: no certificate was looked at, so say that.
+        let store = anyhow::anyhow!("No CA certificates were loaded from the system")
+            .context("GET https://x/api/config");
+        assert_eq!(classify(&store), ExitKind::TlsCertificate);
+        assert_eq!(human_message(&store), filament_signal::tls::NO_TRUST_STORE_LINE);
+        for line in [CERT_LINE, filament_signal::tls::NO_TRUST_STORE_LINE] {
+            assert!(!line.contains('\u{2014}'), "no em dash: {line}");
+        }
     }
 
     #[test]
@@ -887,7 +998,7 @@ mod tests {
         let kinds = [
             ("Other", 1), ("Usage", 2), ("UnknownDevice", 3), ("Denied", 4),
             ("StillRelayed", 5), ("Unreachable", 6), ("Network", 7), ("Partial", 8),
-            ("NoIdentity", 9), ("LocalResource", 12),
+            ("NoIdentity", 9), ("LocalResource", 12), ("TlsCertificate", 13),
         ];
         assert_eq!(kinds.len(), ExitKind::ALL.len(), "a new kind needs a row here");
         // status_cmd.rs is not scanned: it also holds `up --detach`'s helpers

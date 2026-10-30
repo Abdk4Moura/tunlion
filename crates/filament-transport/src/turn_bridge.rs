@@ -465,6 +465,17 @@ async fn session(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             crate::hooks::debug(&format!("tunlion: {up}: {e}"));
+            // An untrusted certificate is not a flaky relay: say why, once,
+            // instead of leaving it to a debug line nobody sees.
+            if filament_signal::tls::certificate_error(&e).is_some() {
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::hooks::say(&format!(
+                        "  ! relay {up}: {}",
+                        filament_signal::tls::UNTRUSTED_LINE
+                    ));
+                }
+            }
             shared.note_failed(&up);
             return refuse(&sock, src, held, rx).await;
         }

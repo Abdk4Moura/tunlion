@@ -11,14 +11,24 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 serde_json = "1.0"
 tokio = { version = "1", features = ["rt", "time", "sync", "macros", "net"] }
 # rustls, deliberately: replacing rust_socketio's hard native-tls dependency is
-# the entire point of this crate. webpki-roots rather than the platform store so
-# the binary is self-contained and does not link system libssl/libcrypto.
+# the entire point of this crate, so the binary does not link system
+# libssl/libcrypto. The connector is always built by `tls::client_config()`;
+# tungstenite's own root feature is only what its rustls backend requires.
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 url = "2"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-webpki-roots = "0.26.11"
+# Trust for tunlion's servers (src/tls.rs): the Mozilla roots are Android's
+# store and the fallback where a Unix machine has no system store at all.
+webpki-roots = "1"
+
+# The OS trust store everywhere but Android (see src/tls.rs). Pure Rust on
+# Linux, so the static musl build is unaffected.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rustls-platform-verifier = "0.7.0"
 
 [dev-dependencies]
 rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "pem"] }
 # Server-side local websocket fixtures only; production stays connect-only.
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+# The TLS side of the private-CA signaling fixture (src/tls_trust_tests.rs).
+tokio-rustls = { version = "0.26.4", default-features = false }

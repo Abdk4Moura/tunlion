@@ -54,6 +54,16 @@ release build failed and nothing was published under it.
   daemon now ignores an introduction from a device that is not its own
   owner's.
 
+### Fixed
+
+- Behind a proxy that inspects TLS, signaling now trusts the same certificates
+  as tunlion's other connections: the operating system's trust store, plus
+  `SSL_CERT_FILE` / `SSL_CERT_DIR`. Previously only the built-in Mozilla roots
+  were trusted there, so commands failed even with your company's CA installed.
+  An untrusted server certificate is now reported as such, with its own exit
+  code 13 (`tls_certificate` under `--json`) and in `tunlion doctor`, instead
+  of "Can't reach the tunlion server (no internet or DNS?)".
+
 ### Security
 
 - Revoking a device on your owner device now cuts it off from your other
