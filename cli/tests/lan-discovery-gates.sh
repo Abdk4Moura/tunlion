@@ -158,7 +158,7 @@ stop_daemons() {
 reach_lan() {
   local deadline=$(( $(date +%s) + ${1:-75} )) out
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    out=$(timeout 15 asA "$BIN" reach boxb --timeout 5 2>&1)
+    out=$(asA timeout 15 "$BIN" reach boxb --timeout 5 2>&1)
     if printf '%s\n' "$out" | grep -q "pong via .*(lan"; then echo "$out" | grep "pong via"; return 0; fi
     sleep 3
   done
@@ -254,12 +254,12 @@ run_scenario() {
   if line=$(reach_lan 90); then ok "$name/reach-lan: $line"; else bad "$name/reach-lan: no lan link with the server blocked ($line)"; fi
   head -c 300000 /dev/urandom > "$WORK/payload-$name.bin"
   chmod a+r "$WORK/payload-$name.bin"
-  out=$(timeout 90 asA "$BIN" --server "http://10.88.1.254:$PORT" send "$WORK/payload-$name.bin" --to boxb --timeout 60 2>&1); rc=$?
+  out=$(asA timeout 90 "$BIN" --server "http://10.88.1.254:$PORT" send "$WORK/payload-$name.bin" --to boxb --timeout 60 2>&1); rc=$?
   got="$WORK/Bdrop/payload-$name.bin"
   if [ -f "$got" ] && cmp -s "$got" "$WORK/payload-$name.bin"; then ok "$name/send-lan: file delivered byte exact, server blocked"
   else bad "$name/send-lan: rc=$rc, not delivered: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"; fi
   if [ "$name" = wg ]; then
-    cls=$(asA "$BIN" doctor --json 2>/dev/null | "$PYV" -I -c 'import json,sys; v=json.load(sys.stdin); print([i["class"] for i in v["lan"]["interfaces"] if i["name"]=="wg0"])' 2>&1)
+    cls=$(asA timeout 30 "$BIN" doctor --json 2>/dev/null | "$PYV" -I -c 'import json,sys; v=json.load(sys.stdin); print([i["class"] for i in v["lan"]["interfaces"] if i["name"]=="wg0"])' 2>&1)
     if [ "$cls" = "['p2p']" ]; then ok "wg/p2p-class: doctor classes the $TUNNEL tunnel p2p by its flags"; else bad "wg/p2p-class: doctor said $cls"; fi
   fi
   if [ "$name" = lan ]; then
@@ -272,10 +272,14 @@ run_scenario() {
   rm -f "$WORK/Bdrop/"*
   start_daemons TUNLION_TRANSPORTS=direct,relay
   sleep 25
-  out=$(timeout 20 asA "$BIN" reach boxb --timeout 5 2>&1)
+  out=$(asA timeout 20 "$BIN" reach boxb --timeout 5 2>&1); rrc=$?
   denied_reach=1; printf '%s\n' "$out" | grep -q "pong via" && denied_reach=0
-  timeout 40 asA env TUNLION_TRANSPORTS=direct,relay "$BIN" --server "http://10.88.1.254:$PORT" send "$WORK/payload-$name.bin" --to boxb --timeout 15 >/dev/null 2>&1; rc=$?
-  if [ "$denied_reach" = 1 ] && [ "$rc" != 0 ] && [ ! -f "$WORK/Bdrop/payload-$name.bin" ]; then
+  asA env TUNLION_TRANSPORTS=direct,relay timeout 40 "$BIN" --server "http://10.88.1.254:$PORT" send "$WORK/payload-$name.bin" --to boxb --timeout 15 >/dev/null 2>&1; rc=$?
+  # A denied arm is only evidence if the commands RAN: 126/127 is "could not
+  # execute", which would make this pass vacuously.
+  if [ "$rc" = 126 ] || [ "$rc" = 127 ] || [ "$rrc" = 126 ] || [ "$rrc" = 127 ]; then
+    bad "$name/denied: the denied-arm commands did not run (reach rc=$rrc, send rc=$rc)"
+  elif [ "$denied_reach" = 1 ] && [ "$rc" != 0 ] && [ ! -f "$WORK/Bdrop/payload-$name.bin" ]; then
     ok "$name/denied: with lan off nothing reached boxb (send rc=$rc)"
   else
     bad "$name/denied: lan off but reach answered ($denied_reach=0 means it did) or send delivered (rc=$rc)"
