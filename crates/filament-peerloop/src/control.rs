@@ -127,6 +127,12 @@ pub enum ReqKind {
     ApproveRequest { id: u64, allow: String, expires: u64 },
     /// Deny a pending request by id.
     DenyRequest { id: u64 },
+    /// `down` on an ephemeral device (joined with a runner invitation): send
+    /// the signed goodbye to the owner over the links this daemon holds, so the
+    /// owner removes the box now. Replies `{"ok":true,"told":<n>}`. Handled
+    /// inline in the daemon loop, which owns the links; a stop signal cannot
+    /// do this, because it drops the loop at once.
+    Depart,
 }
 
 /// A parsed request handed to the daemon's event loop, which owns the link

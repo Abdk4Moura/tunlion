@@ -1269,8 +1269,21 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Status { json } => status_cmd(json || ui_caps.json).await,
         Cmd::Down => {
             ui_caps.confirm("shut down the daemon")?;
-            // An ephemeral box's daemon tells its owner it is leaving as it
-            // stops (recv dispatch, Ev::Interrupted), over the link it holds.
+            // An ephemeral box (joined with a runner invitation) that stops is
+            // gone for good: its daemon tells the owner first, over the link
+            // it already holds, so the owner removes it now rather than when
+            // the offline budget runs out. Asked over the control socket
+            // because a stop signal drops the daemon loop at once. Advisory:
+            // a box that cannot say goodbye still stops.
+            if crate::enrollment::joined_ephemeral() {
+                if let Some(reply) = crate::ctl::try_depart().await {
+                    if reply["told"].as_u64().unwrap_or(0) > 0 {
+                        crate::ui::say("  told the owner this ephemeral device is leaving");
+                        // Let the goodbye leave before the links close.
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
             down_cmd()
         }
         Cmd::Logs { follow, tail } => logs_cmd(follow, tail).await,

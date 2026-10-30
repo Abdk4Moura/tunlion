@@ -873,6 +873,15 @@ pub(crate) fn parse_lease(raw: &str) -> Result<u64> {
     Ok(secs)
 }
 
+/// Did this device join with an ephemeral (runner) invitation? Read from the
+/// local certificate record `persist_join_ack` wrote.
+pub(crate) fn joined_ephemeral() -> bool {
+    std::fs::read_to_string(local_device_cert_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .is_some_and(|record| record["ephemeral"].as_bool() == Some(true))
+}
+
 /// The enrolment timeout message, said once.
 ///
 /// It was said three times and had already drifted into three different

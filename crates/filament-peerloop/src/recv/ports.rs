@@ -146,7 +146,7 @@ pub trait RecvIdentity: Send + Sync {
     ) -> bool;
     fn device_name_for_pub(&self, device_pub: &[u8; 32]) -> Option<String>;
     /// On a device that joined with a runner (ephemeral) invitation: the
-    /// signed `depart` frame its daemon sends to its owner when it stops, so
+    /// signed `depart` frame its daemon sends to its owner on `down`, so
     /// the owner removes it at once. None everywhere else.
     fn ephemeral_depart_frame(&self) -> Option<Value> {
         None

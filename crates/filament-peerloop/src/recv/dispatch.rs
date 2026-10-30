@@ -2234,6 +2234,28 @@ async fn recv_run(
                             // same iteration, so the reply means it is done.
                             revocation_sweep_now = true;
                             revocation_waiters.push(req);
+                        } else if matches!(&req.kind, ReqKind::Depart) {
+                            // `down` on an ephemeral device: tell the owner it
+                            // is leaving over the links held here, so the owner
+                            // removes it now instead of at the end of its
+                            // offline budget. Bounded per link.
+                            let mut told = 0usize;
+                            if let Some(frame) = ports.identity.ephemeral_depart_frame() {
+                                for l in conn.links.values() {
+                                    let Some(t) = l.transport.as_ref().filter(|t| t.is_alive()) else {
+                                        continue;
+                                    };
+                                    let sent = tokio::time::timeout(Duration::from_secs(2), async {
+                                        let ok = t.send_control(&frame).await.is_ok();
+                                        let _ = t.flush().await;
+                                        ok
+                                    })
+                                    .await
+                                    .unwrap_or(false);
+                                    told += usize::from(sent);
+                                }
+                            }
+                            req.reply(&json!({ "ok": true, "told": told })).await;
                         } else if matches!(&req.kind, ReqKind::Wake) {
                             // Nothing to do here: receiving this event IS the point.
                             // The loop now runs its top-level arm gate this same
@@ -9112,32 +9134,6 @@ async fn recv_run(
                 }
             }
             Ev::Interrupted => {
-                // An ephemeral device (a CI lease) that stops is gone for
-                // good: tell the owner over the link already up, so it removes
-                // the box now instead of when the offline budget runs out.
-                // Bounded; a box that cannot say it still stops.
-                if daemon {
-                    if let Some(frame) = ports.identity.ephemeral_depart_frame() {
-                        let mut told = false;
-                        for l in conn.links.values() {
-                            if let Some(t) = l.transport.as_ref().filter(|t| t.is_alive()) {
-                                let sent = tokio::time::timeout(Duration::from_secs(2), async {
-                                    let ok = t.send_control(&frame).await.is_ok();
-                                    let _ = t.flush().await;
-                                    ok
-                                })
-                                .await
-                                .unwrap_or(false);
-                                told |= sent;
-                            }
-                        }
-                        if told {
-                            // Let the frame leave before the links close.
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            log.say("  told the owner this ephemeral device is leaving");
-                        }
-                    }
-                }
                 stop.cancel();
                 // Let the supervisor drop this future, then run the SAME
                 // cleanup epilogue as ordinary return and setup failure.
