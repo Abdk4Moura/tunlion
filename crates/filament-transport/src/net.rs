@@ -606,6 +606,43 @@ pub const L3_DATAGRAM_SID: u32 = u32::MAX;
 /// strictly worse than losing it.
 const L3_QUEUE: usize = 256;
 
+/// Serialize the writes of ONE ordered data channel.
+///
+/// `webrtc-sctp` 0.17 stamps each fragment of an ordered message with
+/// `Stream::sequence_number` via a `load()` and a separate `fetch_add()`, with
+/// no lock between them. Two overlapping `write_data_channel` calls can
+/// therefore be stamped with the SAME stream sequence number, and the peer's
+/// reassembly queue, which keys chunk sets by SSN, merges both user messages
+/// into one. For control frames that merge arrives as `{...}{...}`; a
+/// single-document decoder rejects it, so BOTH controls vanish and the sender
+/// waits out a timeout that looks like an unresponsive peer. Holding this gate
+/// across the whole awaited write gives every message its own SSN. It is per
+/// channel, so separate links keep writing in parallel.
+struct WriteGate(tokio::sync::Mutex<()>);
+
+impl WriteGate {
+    fn new() -> Self {
+        Self(tokio::sync::Mutex::new(()))
+    }
+
+    async fn write<R>(&self, write: impl std::future::Future<Output = R>) -> R {
+        let _open = self.0.lock().await;
+        write.await
+    }
+}
+
+/// Run one gated write with acquisition and the write itself under `stall`.
+/// A wedged producer holding the gate must not park every later write: after
+/// `stall` this returns `None` and the caller tears its producer down, the same
+/// outcome the flat `DC_WRITE_STALL` timeout already gives a stuck write.
+async fn write_within<R>(
+    gate: &WriteGate,
+    stall: std::time::Duration,
+    write: impl std::future::Future<Output = R>,
+) -> Option<R> {
+    tokio::time::timeout(stall, gate.write(write)).await.ok()
+}
+
 pub struct DataChannelTransport {
     raw: Arc<RawDataChannel>,
     drained: Arc<Notify>,
@@ -626,6 +663,16 @@ pub struct DataChannelTransport {
     // half of the L2 sid space this end allocates from, so the two ends never
     // collide (Transport::sid_answerer).
     answerer: bool,
+    // Every `write_data_channel` is one SCTP user message, and webrtc-sctp
+    // 0.17 allocates the ordered stream sequence number with a `load()` then
+    // `fetch_add()` pair that is not atomic across tasks. Two writes started
+    // together can therefore be stamped with the SAME SSN, and the peer's
+    // reassembly queue merges both into one message: two JSON controls arrive
+    // as `{...}{...}`, the single-document decoder rejects the frame, and both
+    // controls are silently lost. This gate makes one message per write
+    // without changing what is written. It covers control, frame, keepalive
+    // and L3 writes because they all share this one ordered stream.
+    write_gate: Arc<WriteGate>,
     // L3-over-relay: inbound IP packets the read loop pulled off the sentinel
     // sid, and the outbound queue drained by a writer task. `send_datagram` is
     // SYNCHRONOUS in the trait (quinn's is non-blocking) while the DataChannel
@@ -692,10 +739,16 @@ impl Transport for DataChannelTransport {
             return Err(anyhow!("channel closed"));
         }
         let data = Bytes::from(msg.to_string());
-        self.bounded("control write", async {
-            self.raw.write_data_channel(&data, true).await?;
-            Ok::<(), anyhow::Error>(())
-        })
+        // The gate is INSIDE `bounded`: a wait for another writer is covered by
+        // the same no-acknowledgement deadline as the write itself, so a wedged
+        // producer cannot park this control forever.
+        self.bounded(
+            "control write",
+            self.write_gate.write(async {
+                self.raw.write_data_channel(&data, true).await?;
+                Ok::<(), anyhow::Error>(())
+            }),
+        )
         .await
     }
 
@@ -740,10 +793,13 @@ impl Transport for DataChannelTransport {
         let bp_us = t_bp.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         let t_write = if trace { Some(std::time::Instant::now()) } else { None };
         let framed = Bytes::from(framed);
-        self.bounded("write", async {
-            self.raw.write_data_channel(&framed, false).await?;
-            Ok::<(), anyhow::Error>(())
-        })
+        self.bounded(
+            "write",
+            self.write_gate.write(async {
+                self.raw.write_data_channel(&framed, false).await?;
+                Ok::<(), anyhow::Error>(())
+            }),
+        )
         .await?;
         let write_us = t_write.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         if trace {
@@ -2429,6 +2485,7 @@ async fn wire_channel(
             };
 
             let mut ready = None;
+            let write_gate = Arc::new(WriteGate::new());
             if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                 // Relay/DataChannel links have NO QUIC keepalive, so an idle one
                 // on a container/DERP path is silently evicted in ~10s, after which
@@ -2442,6 +2499,7 @@ async fn wire_channel(
                     let raw_k = raw.clone();
                     let dead_k = dead.clone();
                     let act_k = last_activity.clone();
+                    let gate_k = write_gate.clone();
                     tokio::spawn(async move {
                         let frame = Bytes::from(json!({ "type": "ping", "reason": "keepalive" }).to_string());
                         loop {
@@ -2453,8 +2511,8 @@ async fn wire_channel(
                             // association this write never returns (see
                             // DC_WRITE_STALL), and a parked keepalive is a task
                             // that outlives its link.
-                            match tokio::time::timeout(DC_WRITE_STALL, raw_k.write_data_channel(&frame, true)).await {
-                                Ok(Ok(_)) => {}
+                            match write_within(&gate_k, DC_WRITE_STALL, raw_k.write_data_channel(&frame, true)).await {
+                                Some(Ok(_)) => {}
                                 _ => break,
                             }
                             act_k.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
@@ -2467,6 +2525,7 @@ async fn wire_channel(
                 {
                     let raw_d = raw.clone();
                     let dead_d = dead.clone();
+                    let gate_d = write_gate.clone();
                     tokio::spawn(async move {
                         while let Some(pkt) = l3_out_rx.recv().await {
                             if dead_d.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2479,7 +2538,11 @@ async fn wire_channel(
                             // Deliberately NO backpressure park here: an IP packet
                             // that cannot go now is dropped by the queue bound, and
                             // parking would let the tunnel stall file transfer.
-                            if raw_d.write_data_channel(&Bytes::from(framed), false).await.is_err() {
+                            let packet = Bytes::from(framed);
+                            if !matches!(
+                                write_within(&gate_d, DC_WRITE_STALL, raw_d.write_data_channel(&packet, false)).await,
+                                Some(Ok(_))
+                            ) {
                                 break;
                             }
                         }
@@ -2488,6 +2551,7 @@ async fn wire_channel(
                 let transport: Arc<dyn Transport> =
                     Arc::new(DataChannelTransport {
                         raw, drained, dead, last_activity, last_heard, first_data, answerer: polite,
+                        write_gate,
                         l3_in: tokio::sync::Mutex::new(l3_in_rx),
                         l3_out: l3_out_tx,
                     });
@@ -2549,6 +2613,111 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    /// A channel that reproduces webrtc-sctp's duplicate-SSN merge: a write
+    /// that starts while another is in flight joins the open message instead
+    /// of becoming its own. The gate must prevent the overlap, so every JSON
+    /// control arrives intact and alone. Without the gate this fails exactly
+    /// the way the pty revision flow did: `{...}{...}` in one frame, both
+    /// controls dropped by the single-document decoder, then a timeout.
+    #[derive(Default)]
+    struct MergingChannel {
+        messages: std::sync::Mutex<Vec<Vec<u8>>>,
+        writing: std::sync::atomic::AtomicBool,
+    }
+
+    impl MergingChannel {
+        async fn write(&self, bytes: &[u8]) {
+            if self.writing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let mut messages = self.messages.lock().unwrap();
+                messages
+                    .last_mut()
+                    .expect("a message to merge into")
+                    .extend_from_slice(bytes);
+                self.writing.store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+            self.messages.lock().unwrap().push(bytes.to_vec());
+            tokio::task::yield_now().await;
+            self.writing.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_keep_one_control_per_message() {
+        for round in 0..100 {
+            let gate = Arc::new(WriteGate::new());
+            let channel = Arc::new(MergingChannel::default());
+            let mut writers = Vec::new();
+            for sid in 0..16u64 {
+                let gate = gate.clone();
+                let channel = channel.clone();
+                writers.push(tokio::spawn(async move {
+                    let frame = json!({"type":"l2-open-ack","sid":sid,"credit":0}).to_string();
+                    gate.write(channel.write(frame.as_bytes())).await;
+                }));
+            }
+            for writer in writers {
+                writer.await.unwrap();
+            }
+            let messages = channel.messages.lock().unwrap();
+            assert_eq!(messages.len(), 16, "round {round}: two writes shared one message");
+            let mut sids: Vec<u64> = messages
+                .iter()
+                .map(|message| {
+                    let frame = crate::control_limits::decode_control(message)
+                        .unwrap_or_else(|| panic!(
+                            "round {round}: merged frame is not one control: {}",
+                            String::from_utf8_lossy(message)
+                        ));
+                    frame["sid"].as_u64().expect("ack sid")
+                })
+                .collect();
+            sids.sort_unstable();
+            assert_eq!(sids, (0..16).collect::<Vec<_>>(), "round {round}: acks lost or reordered");
+            drop(messages);
+        }
+    }
+
+    /// A wedged producer holding the gate must not park every later write. The
+    /// bounded callers give up inside their stall and tear the producer down;
+    /// this pins that a later write can never wait forever, and that releasing
+    /// the holder lets the next write proceed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_writer_cannot_park_a_later_write_past_the_bound() {
+        let gate = Arc::new(WriteGate::new());
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let holder = {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                let _open = gate.0.lock().await;
+                let _ = held_tx.send(());
+                let _ = release_rx.await;
+            })
+        };
+        held_rx.await.expect("holder took the gate");
+
+        let started = std::time::Instant::now();
+        let stalled = write_within(
+            &gate,
+            std::time::Duration::from_millis(100),
+            std::future::ready(Ok::<u8, std::io::Error>(1)),
+        )
+        .await;
+        assert!(stalled.is_none(), "a later write waited out a stalled holder instead of its bound");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "the bound did not fire");
+
+        let _ = release_tx.send(());
+        holder.await.unwrap();
+        assert!(
+            matches!(
+                write_within(&gate, std::time::Duration::from_secs(1), std::future::ready(Ok::<u8, std::io::Error>(1))).await,
+                Some(Ok(1))
+            ),
+            "the gate stayed locked after its holder finished"
+        );
     }
 
     /// The join hang: a frame the peer wrote the instant ITS side opened is
