@@ -4621,6 +4621,30 @@ async fn recv_run(
                         if let Some((name, secret)) = known {
                             conn.start_direct(&from, &name, &secret).await;
                         }
+                        // A one-shot dialer on our FLEET channel (`tunlion
+                        // shell/exec/reach <sibling>` from a device with no daemon
+                        // broker, e.g. Windows). Daemons pick ONE dialer by sid
+                        // (the fleet adoption arm), so when our sid is the higher
+                        // one we never armed a pending for it and its offer sat
+                        // here forever: it then had only a WebRTC link, which
+                        // cannot carry the certificate proof, and reported "can't
+                        // reach". A one-shot never dials on presence, only answers
+                        // offers, so answering it cannot glare. Its offer is the
+                        // one without `ch` (every daemon offer names its meeting
+                        // place, conn.rs start_direct_inner). The link it gets is
+                        // fleet-pending and authorizes nothing until fleet-hello
+                        // verifies, exactly like a daemon's.
+                        if !conn.direct_pending.contains_key(&from)
+                            && fleet_pending.contains(&from)
+                            && data["ch"].is_null()
+                        {
+                            if let Some(rv) = ports.identity.fleet_rv() {
+                                log.debug(&format!(
+                                    "fleet: answering a one-shot dialer's transport-offer from {from}"
+                                ));
+                                conn.start_direct_fleet(&from, &rv).await;
+                            }
+                        }
                         if conn.direct_pending.contains_key(&from) {
                             // Re-arm succeeded — process the offer now.
                             conn.on_transport_offer(
