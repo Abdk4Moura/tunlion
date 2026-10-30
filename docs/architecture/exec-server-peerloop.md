@@ -32,7 +32,7 @@ New Cargo features:
 - `filament-peerloop/exec-server` (default on) implies `dispatch`, because the
   exec module imports `recv::dispatch`; `--no-default-features --features
   exec-server` is therefore also a valid compile profile.
-- `filament-cli/exec-server` (default on), which also compiles the CLI adapter.
+- `tunlion/exec-server` (default on), which also compiles the CLI adapter.
 
 Reduced profiles that explicitly omit defaults (`--no-default-features
 --features dispatch`, or the CLI's `mesh,mount-server` check) leave
@@ -86,12 +86,12 @@ Tested source `afb631e5df240660eed73caf115c2509c87c79f3`, tarball
 `exec-server-afb631e5df24.tar.gz` (sha256
 `71469b442b95d40d06c032ef02ec190c01bfa6997b03ec4cdfc1ac360a08cff7`).
 
-- `cargo test -p filament-peerloop --lib --locked` — 372 passed.
-- `cargo test -p filament-peerloop --lib --locked --no-default-features
+- `cargo test -p tunlion-peerloop --lib --locked` — 372 passed.
+- `cargo test -p tunlion-peerloop --lib --locked --no-default-features
   --features exec-server` — 281 passed (proves `exec-server` implies `dispatch`).
-- `cargo test -p filament-peerloop --lib --locked --no-default-features
+- `cargo test -p tunlion-peerloop --lib --locked --no-default-features
   --features dispatch` — 277 passed, including both reduced-refusal tests.
-- `cargo check -p filament-cli --locked --no-default-features --features
+- `cargo check -p tunlion --locked --no-default-features --features
   mesh,mount-server` — passed.
 - Release binary from the same source + `cli/tests/exec-gates.sh` — **21/21
   passed** (argv/streams/stdin/EPIPE/exit/signal/bulk/rsync/initiator death/

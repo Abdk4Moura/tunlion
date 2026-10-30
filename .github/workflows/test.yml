@@ -92,7 +92,7 @@ jobs:
           set -euo pipefail
           cargo package --list --allow-dirty > "$RUNNER_TEMP/package-list.txt"
           if ! grep -qx 'skills/tunlion/SKILL.md' "$RUNNER_TEMP/package-list.txt"; then
-            echo "::error::cargo package for filament-cli does not include skills/tunlion/SKILL.md"
+            echo "::error::cargo package for tunlion does not include skills/tunlion/SKILL.md"
             cat "$RUNNER_TEMP/package-list.txt"
             exit 1
           fi
@@ -100,7 +100,7 @@ jobs:
           # `tunlion dashboard` embeds its built page with include_bytes!.
           for f in dashboard-dist/dashboard.html dashboard-dist/dashboard.js dashboard-dist/dashboard.css; do
             if ! grep -qx "$f" "$RUNNER_TEMP/package-list.txt"; then
-              echo "::error::cargo package for filament-cli does not include $f"
+              echo "::error::cargo package for tunlion does not include $f"
               exit 1
             fi
           done
@@ -159,7 +159,7 @@ jobs:
       # resolution through PeerLink, kernel-start honesty and the moved route /
       # exit-route tests. This is the exact-head gate for the library API.
       - name: L3 overlay library (feature l3, no TUN)
-        run: cargo test --release -p filament-peerloop --features l3
+        run: cargo test --release -p tunlion-peerloop --features l3
         env:
           CMAKE_C_COMPILER_LAUNCHER: sccache
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
@@ -169,7 +169,7 @@ jobs:
       # test binary. `cargo test` in cli/ runs it too, but naming it here makes
       # the exact-head gate explicit and keeps it from silently filtering out.
       - name: L3 CLI state (no-endpoint expose/addr)
-        run: cargo test --release -p filament-cli --test l3_state_cli
+        run: cargo test --release -p tunlion --test l3_state_cli
 
       # The loop above is hand-maintained on purpose (its own comment says so),
       # and that is how two crates fell out of it: filament-transport (23 tests,

@@ -2263,10 +2263,21 @@ impl Conn {
     /// any SDP is handled, so the offer/answer starts at once instead of after
     /// the direct budget expires.
     pub async fn accept_transport_hint(&mut self, pid: &str, data: &Value) -> bool {
+        // The hint cancels a direct attempt that was armed because we KNOW this
+        // device (the pair (name, secret) lives only in that pending while no
+        // Link exists). Read it BEFORE the cancel, so the WebRTC link built
+        // below can inherit the binding. Without this the link is born
+        // `expected_secret: None`: its ChannelReady cannot prove it is the
+        // target we asked for, so it never becomes active, and the sender waits
+        // out its whole establishment window as "no peer connected" while the
+        // data channel is up and authenticated (gate 16, phase 2). This is the
+        // same carry-forward `expired_direct`'s fallback caller does by hand.
+        let carried = self.direct_pending.get(pid).map(|p| p.secret.clone());
         if !self.note_transport_hint(pid, data) {
             return false;
         }
         if self.links.contains_key(pid) || self.links.len() >= MAX_LINKS {
+            self.carry_pending_secret(pid, carried);
             self.webrtc_only.insert(pid.to_string());
             return true;
         }
@@ -2290,10 +2301,24 @@ impl Conn {
                 .debug(&format!("tunlion: WebRTC establish after transport hint failed for {pid}: {e}"));
         }
         // Establish has finished (and may have called drop_link, which clears
-        // per-link facts), so install the fact now. It is scoped to this sid and
-        // dropped by drop_link/peer-left.
+        // per-link facts), so install the facts now. Both are scoped to this sid
+        // and cleared by drop_link/peer-left.
+        self.carry_pending_secret(pid, carried);
         self.webrtc_only.insert(pid.to_string());
         true
+    }
+
+    /// Put the secret of a just-cancelled direct attempt back on the peer's
+    /// link, if that link does not already have one. A rebuild must never lose
+    /// the only binding to the device we asked for: `expected_secret` is what
+    /// lets the link's ChannelReady prove it is the target, and what keys the
+    /// post-channel pair-proof. `get_or_insert` keeps a binding already carried
+    /// from a previous link authoritative.
+    fn carry_pending_secret(&mut self, pid: &str, carried: Option<(String, String)>) {
+        let Some(secret) = carried else { return };
+        if let Some(link) = self.link_mut(pid) {
+            link.expected_secret.get_or_insert(secret);
+        }
     }
 
     /// Begin a direct attempt against `pid`: bind a quinn endpoint, advertise our
@@ -6686,6 +6711,16 @@ mod warm_identity_tests {
             "establish waited {}ms after the hint",
             t0.elapsed().as_millis()
         );
+        // The link built as the direct attempt's fallback must keep that
+        // attempt's binding: its ChannelReady proves the target with it, and the
+        // post-channel pair-proof is keyed by it. A rebuild that drops it leaves
+        // a live, authenticated channel that the sender never treats as the
+        // peer it asked for (gate 16 phase 2: "no peer connected within 60s").
+        assert_eq!(
+            conn.links[pid].expected_secret,
+            Some(("web".to_string(), "00".to_string())),
+            "the fallback link lost the cancelled direct attempt's pair binding"
+        );
         assert!(conn.webrtc_only.contains(pid));
 
         // The periodic KnownPeer push replaces the roster entry and has no
@@ -6706,6 +6741,106 @@ mod warm_identity_tests {
         assert!(
             conn.direct_pending.is_empty(),
             "a re-announce re-armed the direct wait for a browser peer"
+        );
+    }
+
+    /// The carry-forward above is scoped to the hint's own peer and to a direct
+    /// attempt that actually exists: a hint must never invent a pair binding,
+    /// and one peer's pending secret must never be attached to another peer.
+    #[tokio::test]
+    async fn a_transport_hint_binds_nothing_without_its_own_pending() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let cancel = Arc::new(AtomicBool::new(false));
+        conn.direct_pending.insert(
+            "sid-someone-else".into(),
+            DirectPending {
+                secret: ("other".into(), "11".into()),
+                fleet: false,
+                ephemeral: false,
+                deadline: Instant::now() + Duration::from_secs(30),
+                racing: false,
+                endpoint: None,
+                punch_sock: None,
+                my_srflx: None,
+                peer_server_public: None,
+                server_public_dialed: Arc::new(AtomicBool::new(false)),
+                probe: false,
+                cancel,
+            },
+        );
+        let pid = "sid-no-direct-attempt";
+        assert!(
+            conn.accept_transport_hint(pid, &json!({ "direct": false }))
+                .await
+        );
+        assert_eq!(
+            conn.links[pid].expected_secret, None,
+            "a hint invented a pair binding with no direct attempt of its own"
+        );
+        assert_eq!(
+            conn.direct_pending["sid-someone-else"].secret,
+            ("other".to_string(), "11".to_string()),
+            "another peer's direct attempt was consumed by this hint"
+        );
+    }
+
+    /// A hint can cancel a direct attempt while a link already exists (an ICE
+    /// agent still gathering has no transport yet, so `start_direct` legitimately
+    /// armed one alongside it). Then the hint takes the early "link present"
+    /// return: an EMPTY binding is filled from the cancelled attempt, and a
+    /// binding that is already established is never overwritten by it.
+    #[tokio::test]
+    async fn a_hint_fills_an_empty_binding_and_never_overwrites_one() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let pid = "sid-existing-link";
+        let hint = json!({ "direct": false });
+        assert!(conn.accept_transport_hint(pid, &hint).await);
+        assert!(conn.links.contains_key(pid));
+
+        let arm = |conn: &mut Conn, secret: (&str, &str)| {
+            conn.direct_pending.insert(
+                pid.into(),
+                DirectPending {
+                    secret: (secret.0.into(), secret.1.into()),
+                    fleet: false,
+                    ephemeral: false,
+                    deadline: Instant::now() + Duration::from_secs(30),
+                    racing: false,
+                    endpoint: None,
+                    punch_sock: None,
+                    my_srflx: None,
+                    peer_server_public: None,
+                    server_public_dialed: Arc::new(AtomicBool::new(false)),
+                    probe: false,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        };
+
+        // No binding yet: the cancelled attempt's own secret fills it.
+        arm(&mut conn, ("web", "00"));
+        assert!(conn.accept_transport_hint(pid, &hint).await);
+        assert_eq!(
+            conn.links[pid].expected_secret,
+            Some(("web".to_string(), "00".to_string())),
+            "an empty binding was not filled from the cancelled direct attempt"
+        );
+
+        // Bound already: the newer attempt must not replace it.
+        conn.links.get_mut(pid).unwrap().expected_secret =
+            Some(("first".into(), "22".into()));
+        arm(&mut conn, ("second", "33"));
+        assert!(conn.accept_transport_hint(pid, &hint).await);
+        assert_eq!(
+            conn.links[pid].expected_secret,
+            Some(("first".to_string(), "22".to_string())),
+            "a cancelled attempt overwrote an established pair binding"
+        );
+        assert!(
+            conn.direct_pending.is_empty(),
+            "the cancelled attempt was left armed"
         );
     }
 

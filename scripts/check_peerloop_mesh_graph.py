@@ -15,17 +15,17 @@ ROOT = Path(__file__).resolve().parents[1]
 PROFILES = {
     "minimal": ["--no-default-features"],
     "default": [],
-    "mesh": ["--no-default-features", "--features", "filament-peerloop/mesh"],
-    "dispatch": ["--no-default-features", "--features", "filament-peerloop/dispatch"],
+    "mesh": ["--no-default-features", "--features", "tunlion-peerloop/mesh"],
+    "dispatch": ["--no-default-features", "--features", "tunlion-peerloop/dispatch"],
     "mesh-nofleet": [
         "--no-default-features",
         "--features",
-        "filament-peerloop/mesh,filament-peerloop/dispatch",
+        "tunlion-peerloop/mesh,tunlion-peerloop/dispatch",
     ],
 }
 TARGETS = (None, "aarch64-linux-android", "x86_64-linux-android")
-COMMON = {"filament-peerloop", "filament-id", "filament-cap",
-          "filament-signal", "filament-transport"}
+COMMON = {"tunlion-peerloop", "filament-id", "filament-cap",
+          "tunlion-signal", "tunlion-transport"}
 
 
 def check_graph(graph, mesh):
@@ -37,15 +37,15 @@ def check_graph(graph, mesh):
             raise RuntimeError(f"Unexpected cargo tree output: {line}")
         name, features = match.groups()
         packages.add(name)
-        if name == "filament-peerloop":
+        if name == "tunlion-peerloop":
             peerloop_features.update(filter(None, features.split(",")))
     if not COMMON <= packages:
         raise RuntimeError(f"Missing common packages: {COMMON - packages}")
-    if "filament-cli" in packages:
+    if "tunlion" in packages:
         raise RuntimeError("CLI must not be selected for an exclusion proof")
     if ("mesh" in peerloop_features) != mesh:
         raise RuntimeError(f"Wrong peerloop features: {sorted(peerloop_features)}")
-    if ("filament-overlay" in packages) != mesh:
+    if ("tunlion-overlay" in packages) != mesh:
         raise RuntimeError(f"Overlay reachability must match mesh={mesh}")
     return len(packages)
 
@@ -60,7 +60,7 @@ def main():
         for profile, flags in PROFILES.items():
             command = [
                 "cargo", "tree", "--locked", "--color", "never",
-                "-p", "filament-peerloop", "--edges", "normal,build",
+                "-p", "tunlion-peerloop", "--edges", "normal,build",
                 "--prefix", "none", "--format", "{p} [{f}]", *flags,
             ]
             if target:

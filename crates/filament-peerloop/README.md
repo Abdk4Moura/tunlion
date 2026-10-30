@@ -1,4 +1,7 @@
-# filament-peerloop
+# tunlion-peerloop
+
+The Rust library name is `filament_peerloop` (the crate was renamed for
+publishing; the library name was kept).
 
 The peer loop's engine: connection state and the policy over it, moved out of the
 CLI's `cli/src/conn.rs`.

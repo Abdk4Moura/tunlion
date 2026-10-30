@@ -8,7 +8,7 @@
 
 Filament is a peer-to-peer device-connectivity system. A React/WebRTC browser peer, a Flask + Socket.IO signaling service, and the Rust CLI share the protocol. The server coordinates peers; file and interactive data are intended to travel peer-to-peer.
 
-The CLI package is `filament-cli` **0.8.5**. Its scope includes transfers, pairing, device identity and capabilities, shell/PTY, port forwarding, mounts, direct QUIC transport, and an L3 overlay. Focused Rust crates hold shared transport, protocol, transfer, pairing, identity, capability, overlay, fleet, and secure-storage code.
+The CLI package is `tunlion` **0.9.2** on crates.io (it was `filament-cli` through 0.8.5). Its scope includes transfers, pairing, device identity and capabilities, shell/PTY, port forwarding, mounts, direct QUIC transport, and an L3 overlay. Focused Rust crates hold shared transport, protocol, transfer, pairing, identity, capability, overlay, fleet, and secure-storage code.
 
 ## Recently verified changes
 

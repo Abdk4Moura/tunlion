@@ -65,6 +65,6 @@ jobs:
             flags+=(--no-default-features --features mesh,dispatch)
           fi
           echo "peerloop profile=$PROFILE flags=${flags[*]}"
-          cargo check --locked -p filament-peerloop --all-targets "${flags[@]}"
-          cargo test --locked -p filament-peerloop --lib "${flags[@]}"
-          cargo test --locked -p filament-peerloop --doc "${flags[@]}"
+          cargo check --locked -p tunlion-peerloop --all-targets "${flags[@]}"
+          cargo test --locked -p tunlion-peerloop --lib "${flags[@]}"
+          cargo test --locked -p tunlion-peerloop --doc "${flags[@]}"
