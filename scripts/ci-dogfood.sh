@@ -52,12 +52,13 @@ say() { printf '\n== %s\n' "$*"; }
 # not exist yet rather than mktemp's pre-created file.
 INV_DIR="$(mktemp -d)"
 INV="$INV_DIR/invitation"
-# A DEVICE invitation, not a runner one: the owner has to ADDRESS this box to
-# push the payload, and an ephemeral runner is deliberately not persisted, so it
-# cannot be resolved by name. The box still expires and is still forgotten at
-# the end. This is the first UX finding in docs/ci-ux.md.
-say "minting an invitation for $RUNNER (transfer only, 45m)"
-tunlion add --for device --name "$RUNNER" --allow transfer --expires 45m \
+# A RUNNER invitation: the box is an ephemeral device. The owner records it
+# under the name minted here so it can be addressed (`send --to`, `exec`), but
+# it gets no fleet membership, siblings never list it, its access ends with the
+# job's lease (TUNLION_LEASE in ci-dogfood.yml), and it is removed here when it
+# departs (`down` on the box) or after a short offline budget.
+say "minting a runner invitation for $RUNNER (transfer only, 45m)"
+tunlion add --for runner --name "$RUNNER" --allow transfer --expires 45m \
   --out "$INV" -y --no-interactive >/dev/null
 
 say "setting TUNLION_INVITE on $(repo)"

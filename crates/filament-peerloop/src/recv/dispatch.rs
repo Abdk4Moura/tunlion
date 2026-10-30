@@ -2234,6 +2234,28 @@ async fn recv_run(
                             // same iteration, so the reply means it is done.
                             revocation_sweep_now = true;
                             revocation_waiters.push(req);
+                        } else if matches!(&req.kind, ReqKind::Depart) {
+                            // `down` on an ephemeral device: tell the owner it
+                            // is leaving over the links held here, so the owner
+                            // removes it now instead of at the end of its
+                            // offline budget. Bounded per link.
+                            let mut told = 0usize;
+                            if let Some(frame) = ports.identity.ephemeral_depart_frame() {
+                                for l in conn.links.values() {
+                                    let Some(t) = l.transport.as_ref().filter(|t| t.is_alive()) else {
+                                        continue;
+                                    };
+                                    let sent = tokio::time::timeout(Duration::from_secs(2), async {
+                                        let ok = t.send_control(&frame).await.is_ok();
+                                        let _ = t.flush().await;
+                                        ok
+                                    })
+                                    .await
+                                    .unwrap_or(false);
+                                    told += usize::from(sent);
+                                }
+                            }
+                            req.reply(&json!({ "ok": true, "told": told })).await;
                         } else if matches!(&req.kind, ReqKind::Wake) {
                             // Nothing to do here: receiving this event IS the point.
                             // The loop now runs its top-level arm gate this same
@@ -3236,13 +3258,15 @@ async fn recv_run(
 
         // SWEEP: mark lapsed delegated records whose effective deadline has
         // passed and which no observation revived. Runs every 30s; keeps the
-        // record as evidence (option b, decided deliberately).
+        // record as evidence (option b, decided deliberately), EXCEPT an
+        // ephemeral device's and an ended fleet sibling's, which are removed
+        // (DeviceStore::devices_sweep_lapsed).
         if daemon && last_sweep.elapsed() >= Duration::from_secs(30) {
             last_sweep = Instant::now();
             let lapsed = ports.store.devices_sweep_lapsed(filament_id::now_secs());
             if lapsed > 0 {
                 log.say(&format!(
-                    "{} {lapsed} device(s) lapsed (offline past their budget)",
+                    "{} {lapsed} device(s) lapsed or ended (offline past their budget, lease over, or removed by the owner)",
                     log.paint(Tone::Warn, log.glyph_warn())
                 ));
             }

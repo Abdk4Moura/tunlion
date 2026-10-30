@@ -130,6 +130,15 @@ possession of `enroll_priv`. Reuse count is not one of them unless audience-pinn
 
 - Not persisted: present while connected, removed on disconnect, re-register
   (re-claim + re-prove) on return. Presence is existence; no time-ago tail.
+- As built (CLI): the owner DOES keep a record for an ephemeral device, marked
+  `ephemeral`, because the owner has to address a CI box by name (`exec`,
+  `send --to`). It is a delegated principal with the invitation's ceiling, it
+  never receives the fleet meeting point or policy, the owner's roster never
+  lists it, its certificate and access end at its lease (asked for by the box
+  with `TUNLION_LEASE`, default 6h, never past the invitation), renewal cannot
+  extend it, and the record is REMOVED (not kept as evidence) when the box
+  departs, when the lease ends, or when it lapses: a runner invitation's
+  offline budget is 15 minutes. `down` on such a box departs first.
 - NO continuity anchor and NO takeover guard: transient, and a new `device_pub`
   each life is normal and expected.
 - Namespace separation: a delegated / ephemeral principal must NOT shadow or

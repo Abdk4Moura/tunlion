@@ -306,6 +306,17 @@
       ]
     },
     {
+      "path": "cli/tests/ephemeral-runner-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/ephemeral-runner-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/expiry-race-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/expiry-race-gates.sh",
@@ -481,6 +492,7 @@
       "disposition": "support",
       "invoked_by": [
         "cli/tests/devices-write-race-gates.sh",
+        "cli/tests/ephemeral-runner-gates.sh",
         "cli/tests/expiry-race-gates.sh",
         "cli/tests/fleet-automesh-gates.sh",
         "cli/tests/fleet-cert-gates.sh",

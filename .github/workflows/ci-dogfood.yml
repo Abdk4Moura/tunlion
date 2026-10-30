@@ -70,6 +70,9 @@ jobs:
           # Read from the environment, not an argv and not a file: the key is
           # never echoed, never written by this job, and never visible in `ps`.
           TUNLION_AUTHKEY: ${{ secrets.TUNLION_INVITE }}
+          # The job's own bound (timeout-minutes). With a runner invitation the
+          # owner ends this box's access then and removes it from its devices.
+          TUNLION_LEASE: 45m
         run: |
           set -euo pipefail
           if [ -z "${TUNLION_AUTHKEY:-}" ]; then

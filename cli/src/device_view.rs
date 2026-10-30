@@ -385,7 +385,15 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
                 .iter()
                 .find(|r| r["name"].as_str() == Some(name.as_str()))
                 .is_some_and(|r| r["invitedAs"].as_str() == Some("person"));
-            let tier = list_tier(cert.as_ref(), same_owner.as_ref(), invited_as_person);
+            let ephemeral = records
+                .iter()
+                .find(|r| r["name"].as_str() == Some(name.as_str()))
+                .is_some_and(filament_peerloop::recv::store::record_is_ephemeral);
+            let tier = if ephemeral && cert.is_some() {
+                fleet_ui::devices::DeviceTier::Ephemeral
+            } else {
+                list_tier(cert.as_ref(), same_owner.as_ref(), invited_as_person)
+            };
             let caps = effective_device_caps(&name);
             let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
             let address = stored_v6.or(stored_v4);

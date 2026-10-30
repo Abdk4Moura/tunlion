@@ -67,14 +67,14 @@ pub use imp::{
     try_bootstrap, try_cap_status, try_deny_request, try_dial, try_dial_reason, try_fleet_rendezvous,
     try_l3_state, try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping,
     try_pty_reason, try_reconfigure, try_reload, try_reload_expose, try_resize,
-    try_revocation_sync, try_unmount, try_wake,
+    try_revocation_sync, try_unmount, try_wake, try_depart,
 };
 
 #[cfg(not(unix))]
 pub use stub::{
     daemon_present, daemon_responds, forward_probe, try_approve_request, try_cap_status,
     try_deny_request, try_fleet_rendezvous, try_list_pending, try_list_warm, try_ping,
-    try_reconfigure, try_reload, try_revocation_sync, try_wake,
+    try_reconfigure, try_reload, try_revocation_sync, try_wake, try_depart,
 };
 
 // --------------------------------------------------------------- unix impl ----
@@ -431,6 +431,22 @@ mod imp {
     /// `{"ok":true,"closed":<n>}` once done; `None` when no daemon answered.
     /// The daemon would notice the change on its own within a few seconds;
     /// asking is what lets the command say "in effect now" and mean it.
+    /// Ask the running daemon of an ephemeral device to tell its owner it is
+    /// leaving (ReqKind::Depart). Replies `{"ok":true,"told":<n>}`; `None`
+    /// when no daemon answered.
+    pub async fn try_depart() -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut line = serde_json::to_vec(&json!({ "op": "depart" })).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(10), read_line(&mut s, 1024))
+            .await
+            .ok()?
+            .ok()?;
+        serde_json::from_str(&reply).ok()
+    }
+
     pub async fn try_revocation_sync() -> Option<Value> {
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
         let mut line = serde_json::to_vec(&json!({ "op": "revocation-sync" })).ok()?;
@@ -805,6 +821,7 @@ mod imp {
                     Some("l3-state") => ReqKind::L3State,
                     Some("wake") => ReqKind::Wake,
                     Some("revocation-sync") => ReqKind::RevocationSync,
+                    Some("depart") => ReqKind::Depart,
                     Some("reload") => ReqKind::Reload,
                     Some("mount") => {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
@@ -1080,6 +1097,11 @@ mod stub {
     /// revocation now; `None` makes the command say it applies within a few
     /// seconds (the daemon's own store scan) or at the next start.
     pub async fn try_revocation_sync() -> Option<Value> {
+        None
+    }
+
+    /// No control socket here: the owner's offline budget removes the box.
+    pub async fn try_depart() -> Option<Value> {
         None
     }
 

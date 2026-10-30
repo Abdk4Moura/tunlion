@@ -169,12 +169,17 @@ pub(crate) fn perms_for(
 ) -> DevicePerms {
     let name = record["name"].as_str().unwrap_or("").to_string();
     let cert = identity::DeviceCert::from_json(&record["deviceCert"]);
-    let tier = match tier_for(cert.as_ref(), same_owner, record["invitedAs"].as_str() == Some("person")) {
+    let tier = if filament_peerloop::recv::store::record_is_ephemeral(record) && cert.is_some() {
+        "EPHEMERAL"
+    } else {
+        match tier_for(cert.as_ref(), same_owner, record["invitedAs"].as_str() == Some("person")) {
         DeviceTier::Fleet => "FLEET",
         DeviceTier::External => "EXTERNAL",
         DeviceTier::NeedsReview => "NEEDS REVIEW",
         DeviceTier::MeshRoster => "MESH",
         DeviceTier::Paired => "PAIRED",
+        DeviceTier::Ephemeral => "EPHEMERAL",
+        }
     };
     let state = record["principalState"].as_str();
     let mut caveats = Vec::new();

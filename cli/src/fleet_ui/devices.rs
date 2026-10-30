@@ -33,6 +33,10 @@ pub enum DeviceTier {
     /// joined anyone), so "other people" and "needs review" mean nothing here:
     /// the honest word is paired.
     Paired,
+    /// Enrolled with a runner invitation (a CI lease, a borrowed box): listed
+    /// while it exists and removed when its lease or offline budget ends or it
+    /// departs. Never a fleet member, so it is kept out of FLEET.
+    Ephemeral,
 }
 
 /// `render_devices_for` on the owner device.
@@ -85,6 +89,20 @@ pub fn render_devices_for(
             ui::header(Tone::Brand, Tone::Dim, "FLEET  /  your devices, permissive within scope")
         ));
         for d in &fleet {
+            lines.push(render_device_row(d));
+        }
+        lines.push(String::new());
+    }
+
+    // Ephemeral section: CI leases and borrowed boxes, apart from the fleet.
+    let ephemeral: Vec<_> = devices.iter().filter(|d| d.tier == DeviceTier::Ephemeral).collect();
+    if !ephemeral.is_empty() {
+        lines.push(format!(
+            "  {} {}",
+            ui::paint(Tone::Dim, ui::glyph_extern()),
+            ui::header(Tone::Bold, Tone::Dim, "EPHEMERAL  /  CI and borrowed boxes, removed when they end")
+        ));
+        for d in &ephemeral {
             lines.push(render_device_row(d));
         }
         lines.push(String::new());
@@ -179,6 +197,7 @@ fn render_device_row(d: &DeviceEntry) -> String {
         DeviceTier::NeedsReview => ui::paint(Tone::Warn, ui::glyph_review()),
         DeviceTier::MeshRoster => ui::paint(Tone::Brand, ui::glyph_mesh()),
         DeviceTier::Paired => ui::paint(Tone::Brand, ui::glyph_extern()),
+        DeviceTier::Ephemeral => ui::paint(Tone::Dim, ui::glyph_extern()),
     };
     // #217 for the mesh: a sibling we have never contacted has UNKNOWN liveness,
     // never "idle"/"offline". The roster carries name + key only, so the row says
@@ -400,6 +419,34 @@ mod tests {
         assert!(s.contains("EXTERNAL"), "must show external section");
         assert!(s.contains("pixel-7"), "must show fleet device");
         assert!(s.contains("carol"), "must show external device");
+    }
+
+    #[test]
+    fn an_ephemeral_device_is_listed_apart_from_the_fleet() {
+        let devices = vec![
+            DeviceEntry {
+                name: "laptop".into(),
+                tier: DeviceTier::Fleet,
+                online: Some(true),
+                caps_summary: "inbox mount".into(),
+                countdown: "cert expires in 80d".into(),
+                last_seen: None,
+            },
+            DeviceEntry {
+                name: "ci-worker-3".into(),
+                tier: DeviceTier::Ephemeral,
+                online: Some(true),
+                caps_summary: "inbox OWNER-EQUIVALENT shell".into(),
+                countdown: "cert expires in 2h".into(),
+                last_seen: Some("just now".into()),
+            },
+        ];
+        let s = crate::ui::strip_ansi(&render_devices(&devices, 0, None));
+        let fleet = s.find("FLEET").expect("fleet section");
+        let eph = s.find("EPHEMERAL").expect("ephemeral section");
+        let worker = s.find("ci-worker-3").expect("worker row");
+        let laptop = s.find("laptop").expect("laptop row");
+        assert!(fleet < laptop && laptop < eph && eph < worker, "{s}");
     }
 
     #[test]

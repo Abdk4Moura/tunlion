@@ -18,10 +18,16 @@
 # The invitation must carry shell in its ceiling, like the Linux worker's
 # (TUNLION_CI_WORKER_INVITE, `transfer,shell`): the owner's `exec` to a joined
 # device whose ceiling lacks shell is refused on the owner before anything is
-# sent. Mint it on the owner device and set it from a file, never argv:
+# sent. It must be a RUNNER invitation: each lease is then an ephemeral device,
+# listed under EPHEMERAL on the owner and never on its other devices, whose
+# access ends with the lease (TUNLION_LEASE below) and which is removed when it
+# leaves (`down`) or after a short offline budget. A `--for device` invitation
+# makes every lease a permanent fleet member with a certificate for the
+# invitation's whole lifetime. Mint it on the owner device and set it from a
+# file, never argv:
 #
-#   tunlion add --for device --name ci-worker-win --allow transfer,shell \
-#     --reuse 20 --expires 30d --out ci-worker-win.key -y --no-interactive
+#   tunlion add --for runner --name ci-worker-win --allow transfer,shell \
+#     --reuse 50 --expires 30d --out ci-worker-win.key -y --no-interactive
 #   gh secret set TUNLION_CI_WINDOWS_WORKER_INVITE -R Abdk4Moura/tunlion < ci-worker-win.key && rm ci-worker-win.key
 #
 # Start a lease by pushing a ci/windows-worker* branch (a new workflow cannot be
@@ -121,6 +127,9 @@ jobs:
           if (-not $env:TUNLION_AUTHKEY) { throw 'TUNLION_CI_WINDOWS_WORKER_INVITE is not set' }
           $minutes = [int]$env:WORKER_MINUTES
           if ($minutes -lt 1 -or $minutes -gt 330) { throw 'worker_minutes must be 1-330' }
+          # The lease, plus the build before it and the teardown after: the
+          # owner ends this box's access then, whatever the invitation allows.
+          $env:TUNLION_LEASE = "$($minutes + 60)m"
           $root = Join-Path $env:RUNNER_TEMP 'tunlion-work'
           $cfg = Join-Path $env:RUNNER_TEMP 'tunlion-worker-config'
           New-Item -ItemType Directory -Force -Path $root, $cfg, (Join-Path $root 'jobs') | Out-Null
