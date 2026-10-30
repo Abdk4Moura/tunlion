@@ -57,7 +57,13 @@ hibernated or evicted object keeps its sockets but loses its heap, so:
   session), the same ground truth `_eio_alive` gives the Python lease loop.
   A row whose transport vanished without a close event is cleaned up the
   next time anyone looks at its room, and by a five-minute sweep, with the
-  `peer-left` the room would have heard.
+  `peer-left` the room would have heard. Capacity eviction uses the same
+  authority: a websocket must be OPEN, accepted, past its upgrade probe and
+  namespace-connected; a polling session must have made a request inside the
+  engine.io dead window. The stored `last_seen` is only a refresh hint and is
+  not used to decide that a live token is dead, because after hibernation it
+  can be hours older than the open websocket. A capacity claim frees one
+  non-live slot, not a whole dead backlog in one request.
 
 Polling sessions live in memory only: if the object is evicted mid-session,
 the client gets `Session ID unknown` and reconnects, as it would after a
@@ -221,6 +227,10 @@ Known differences, all deliberate:
   `EX`); the hub expires them after 10 minutes, as CONTRACT.md says.
 - Python's `_do_join` drops the sid from `local_sids`, so its lease is kept
   alive only by later syncs; the hub's liveness is the transport, always.
+- Python's capacity `_session_live` also requires `last_seen` inside 120 s;
+  the hub deliberately uses the open transport and the unexpired record
+  instead, because its `last_seen` is a throttled refresh hint that can be
+  stale after hibernation. Capacity frees one dead slot per new claim in both.
 - After an eviction a session's stored expiry can be up to 30 minutes older
   than in memory (the write-through slack). It still lasts a day after use.
 

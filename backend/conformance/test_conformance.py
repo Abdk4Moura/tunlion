@@ -21,7 +21,9 @@ import threading
 import time
 import unittest
 
-from backend.conformance.wire import QUIET, WAIT, Peer, RawWs, chan, http, uniq
+import websocket
+
+from backend.conformance.wire import BASE, QUIET, WAIT, Peer, RawWs, chan, http, uniq
 
 
 class Base(unittest.TestCase):
@@ -325,6 +327,24 @@ class Generations(Base):
         second, w2 = self.joined(room, "tab", uid=uid, gen="g-same", token=w1["token"])
         self.assertEqual(w2["token"], w1["token"])
         self.assertEqual(first.wait("session-superseded"), {"reason": "newer-generation"})
+
+    def test_open_websocket_without_namespace_cannot_join(self):
+        # The transport is OPEN and accepted, but socket.io CONNECT never
+        # happened. It must not be able to join or appear in a roster: the
+        # hub's liveness is namespace-connected transport, not an open socket.
+        room = uniq()
+        watcher, _ = self.joined(room, "watcher")
+        url = BASE.replace("https://", "wss://").replace("http://", "ws://")
+        ws = websocket.create_connection(
+            url + "/socket.io/?EIO=4&transport=websocket", timeout=WAIT
+        )
+        self.addCleanup(ws.close)
+        self.assertTrue(ws.recv().startswith("0"), "expected the engine.io OPEN packet")
+        ws.send(
+            '42["join",{"room":"%s","name":"ghost","uid":"%s","gen":"%s"}]'
+            % (room, uniq("u"), uniq("g"))
+        )
+        watcher.none("peer-joined", within=QUIET)
 
     def test_unknown_token_is_a_new_session(self):
         room = uniq()
