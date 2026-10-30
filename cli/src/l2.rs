@@ -723,10 +723,22 @@ async fn verify_fleet_identity_inner(
     t.send_control(&hello).await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let ev = tokio::time::timeout_at(deadline, rx.recv())
-            .await
-            .map_err(|_| anyhow!("'{expected}' never presented a certificate"))?
-            .ok_or_else(|| anyhow!("link closed before '{expected}' presented a certificate"))?;
+        // A peer that drops the link (it bound the proof to a different
+        // connection of a simultaneous open) says so by closing, not by
+        // answering; notice that instead of waiting out the deadline.
+        if t.is_dead() {
+            bail!("link closed before '{expected}' presented a certificate");
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!("'{expected}' never presented a certificate");
+        }
+        let tick = (deadline - now).min(Duration::from_millis(250));
+        let ev = match tokio::time::timeout(tick, rx.recv()).await {
+            Err(_) => continue,
+            Ok(None) => bail!("link closed before '{expected}' presented a certificate"),
+            Ok(Some(ev)) => ev,
+        };
         let v = match &ev {
             Ev::Control(from, v) if from == link => v,
             Ev::Control(..) | Ev::Chunk(..) => continue,
@@ -741,14 +753,28 @@ async fn verify_fleet_identity_inner(
         let proven = crate::fleet::verify_hello(v, &cb, &owner, crate::identity::now_secs())?;
         let name = crate::device_name_for_pub(&proven.device_pub);
         if name.as_deref().map(|n| n.eq_ignore_ascii_case(expected)) != Some(true) {
-            bail!(
+            return Err(anyhow::Error::new(WrongFleetDevice(format!(
                 "refusing: the device answering as '{expected}' proved a different identity ({}). Nothing was sent.",
                 name.as_deref().unwrap_or("unknown device")
-            );
+            ))));
         }
         return Ok(());
     }
 }
+
+/// `verify_fleet_identity` reached a device that PROVED it is not the target.
+/// Only this rejects the candidate for the rest of the dial; any other failure
+/// (no answer, link closed) leaves it eligible for another attempt.
+#[derive(Debug)]
+struct WrongFleetDevice(String);
+
+impl std::fmt::Display for WrongFleetDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WrongFleetDevice {}
 
 /// How long `exec` waits for a single signal from the device it is reaching
 /// before saying it is offline. A live daemon answers the moment it sees us.
@@ -1409,13 +1435,20 @@ pub(crate) async fn bring_up_to_known(
                     if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name).await {
                         crate::ui::debug(&format!("fleet: {e:#}; trying the next fleet device"));
                         t.force_close();
-                        fleet.reject(&pid);
-                        queue.retain(|(q, _, _)| *q != pid);
+                        let mut uid = None;
                         if peer.as_ref().is_some_and(|p| p.id == pid) {
                             let p = peer.take().unwrap();
                             p.mark_closed();
                             tokio::spawn(async move { p.close().await });
-                            peer_uid = None;
+                            uid = peer_uid.take();
+                        }
+                        if e.downcast_ref::<WrongFleetDevice>().is_some() {
+                            fleet.reject(&pid);
+                            queue.retain(|(q, _, _)| *q != pid);
+                        } else if !queue.iter().any(|(q, _, _)| *q == pid) {
+                            // Unproven, not disproven: it may be the target on a
+                            // connection that lost a simultaneous open. Retry it.
+                            queue.push_back((pid.clone(), uid, true));
                         }
                         // The next candidate gets its own direct race.
                         direct_racing = false;
@@ -1505,13 +1538,20 @@ pub(crate) async fn bring_up_to_known(
                     if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name).await {
                         crate::ui::debug(&format!("fleet: {e:#}; trying the next fleet device"));
                         t.force_close();
-                        fleet.reject(&pid);
-                        queue.retain(|(q, _, _)| *q != pid);
+                        let mut uid = None;
                         if peer.as_ref().is_some_and(|p| p.id == pid) {
                             let p = peer.take().unwrap();
                             p.mark_closed();
                             tokio::spawn(async move { p.close().await });
-                            peer_uid = None;
+                            uid = peer_uid.take();
+                        }
+                        if e.downcast_ref::<WrongFleetDevice>().is_some() {
+                            fleet.reject(&pid);
+                            queue.retain(|(q, _, _)| *q != pid);
+                        } else if !queue.iter().any(|(q, _, _)| *q == pid) {
+                            // Unproven, not disproven: it may be the target on a
+                            // connection that lost a simultaneous open. Retry it.
+                            queue.push_back((pid.clone(), uid, true));
                         }
                         direct_racing = false;
                         continue;
