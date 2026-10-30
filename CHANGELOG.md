@@ -15,6 +15,25 @@ release build failed and nothing was published under it.
 
 ### Added
 
+- You can now see and withdraw the invitations you handed out.
+  `tunlion devices` lists every invitation that can still be claimed under
+  INVITATIONS: who it was made for, what kind (your device, a person, a
+  runner), what it allows, uses left out of its total, when it expires and
+  when it was made. `tunlion devices --json` carries the same list as
+  `data.invitations`, and the dashboard shows it under Codes and invitations.
+  Used-up, withdrawn and expired invitations are not listed.
+- `tunlion add --withdraw <name>` withdraws an invitation, so nobody can join
+  with it again, even if the file leaked and it has uses or time left. It
+  applies at once (a running receiver refuses the next claim, including one
+  already in progress) and lasts across restarts. Devices that already joined
+  with it keep their access, and the command names them with the way to cut
+  one off (`tunlion demote <device> --to cut`). Run `tunlion add --withdraw`
+  at a terminal to pick one, choose an invitation in the `tunlion promote`
+  picker, use "Withdraw an invitation" under More, or press Withdraw on the
+  dashboard. Someone claiming a withdrawn invitation is told the owner
+  withdrew it; a 0.9.1 joiner sees `enrollment denied: the owner withdrew
+  this invitation`.
+
 - Devices certified by your owner key now reach each other without pairing.
   `tunlion reach <device>` works between two of your devices that were each
   added to your mesh but never paired with each other, over the link their

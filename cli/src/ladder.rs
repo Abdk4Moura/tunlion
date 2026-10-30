@@ -603,6 +603,11 @@ pub(crate) fn picker_row(f: &Facts, online: Option<bool>) -> String {
     format!("{:<18} {}{on}", f.name, label(f.kind, current(f)))
 }
 
+/// The picker row for an outstanding invitation. Pure.
+pub(crate) fn invitation_picker_row(o: &crate::armed::Outstanding) -> String {
+    format!("{:<18} invitation \u{b7} {}", o.label(), o.uses_phrase())
+}
+
 fn interrupted() -> ! {
     crate::exit_codes::interrupted_exit(crate::exit_codes::INTERRUPTED)
 }
@@ -616,13 +621,48 @@ async fn interactive(ui_caps: &UiCapability, server: &str, relay: bool) -> Resul
     };
     'device: loop {
         let all = all_facts();
-        if all.is_empty() {
+        // Outstanding invitations are listed after the devices: what they can
+        // do is fixed at mint, so their one move is to withdraw them.
+        let invites = crate::armed::outstanding();
+        if all.is_empty() && invites.is_empty() {
             ui::say("  No devices yet. Pair one with:  tunlion add");
             return Ok(());
         }
-        let rows: Vec<String> = all.iter().map(|f| picker_row(f, online(&f.name))).collect();
+        let mut rows: Vec<String> = all.iter().map(|f| picker_row(f, online(&f.name))).collect();
+        rows.extend(invites.iter().map(invitation_picker_row));
         let f = match codeentry::pick_opts("CHANGE WHAT A DEVICE CAN DO", &rows, PickOpts { collapse: Some(codeentry::Collapse::Erase), ..Default::default() })? {
-            Picked::Item(i) => all[i].clone(),
+            Picked::Item(i) if i < all.len() => all[i].clone(),
+            Picked::Item(i) => {
+                let o = &invites[i - all.len()];
+                let confirm = ui::paint(
+                    Tone::Dim,
+                    &format!(
+                        "  {}: invitation, {}. Withdrawn, its key is refused from now on; devices that already joined with it keep their access.",
+                        ui::paint(Tone::Bold, &o.label()),
+                        o.uses_phrase()
+                    ),
+                );
+                ui::say(&confirm);
+                let yes = format!("Yes, withdraw the invitation for {}", o.label());
+                match codeentry::pick_opts("", &[yes, "No, go back".to_string()], PickOpts { collapse: Some(codeentry::Collapse::Erase), initial: 1, ..Default::default() })? {
+                    Picked::Item(0) => {}
+                    Picked::Interrupted => interrupted(),
+                    _ => {
+                        if ui::caps().live {
+                            use std::io::Write as _;
+                            let mut e = std::io::stderr();
+                            let _ = write!(e, "\x1b[{}A\r\x1b[J", confirm.lines().count());
+                            let _ = e.flush();
+                        }
+                        continue 'device;
+                    }
+                }
+                crate::armed::withdraw(o)?;
+                for line in crate::add_for::withdrawn_lines(o, &crate::add_for::joined_with(o.expires)) {
+                    ui::say(&line);
+                }
+                return Ok(());
+            }
             Picked::Interrupted => interrupted(),
             _ => return Ok(()),
         };

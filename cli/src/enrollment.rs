@@ -477,6 +477,8 @@ pub(crate) async fn enroll_cmd(
                         "already used" => "this invitation has already been used".to_string(),
                         "use limit reached" =>
                             "this invitation has reached its use limit".to_string(),
+                        filament_peerloop::recv::store::WITHDRAWN_WIRE_REASON =>
+                            "the owner withdrew this invitation, so it can no longer be used; ask them for a new one".to_string(),
                         _ => format!("enrollment denied: {reason}"),
                     });
                 }

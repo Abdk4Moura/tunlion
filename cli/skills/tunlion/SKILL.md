@@ -74,12 +74,18 @@ history. `TUNLION_INVITE` is accepted as a second environment name. Without an
 identity and without a key, `up` still exits 9.
 
 To mint the key on the owner, see `tunlion add --for runner --reuse N --out`.
+Every invitation that can still be claimed is listed by `tunlion devices --json`
+under `data.invitations` (name, kind, allow, uses, usesLeft, maxUses, expires,
+id). `tunlion add --withdraw <name> -y` takes one back: from then on the owner
+refuses every claim with it (`--json` reports what was withdrawn). Devices
+that already joined with it keep their access; cut one off with
+`tunlion demote <device> --to cut -y`.
 
 ### Check what is available
 
 ```bash
 tunlion status --json           # is the daemon up on this machine (exit 11 if not)
-tunlion devices --json          # paired devices and their names
+tunlion devices --json          # paired devices, their names, open invitations
 tunlion reach <device> --json   # reachable? direct or relay, and rtt
 ```
 

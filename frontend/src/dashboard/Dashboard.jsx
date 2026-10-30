@@ -413,7 +413,7 @@ function Codes({ A }) {
           <pre data-testid="secret" style={{ margin: 0, font: '500 12px/1.5 ' + FONT_MONO, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 200, overflow: 'auto', background: T.soft, padding: 12, borderRadius: 7 }}>{made.text}</pre>
           <div style={{ fontSize: 13.5, color: T.sub, margin: '8px 0 14px' }}>Shown once. Anyone holding it can use it once, until it expires. On their side: <code>tunlion join {made.name}.invite</code>, or paste it at "I have a code or an invitation".</div>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}><Btn kind="pri" onClick={save}>Save as a file and hide</Btn><Btn onClick={copy}>Copy and hide</Btn></div>
-        </>) : <div style={{ fontSize: 14.5 }}>{made.how}. It won't be shown again. To change it, make a new one; this one expires by itself.</div>}
+        </>) : <div style={{ fontSize: 14.5 }}>{made.how}. It won't be shown again. To change it, make a new one. Until it expires, you can withdraw it under Open invitations.</div>}
       </Card>
       <div><Btn kind="ghost" onClick={() => setMade(null)}>Back to codes</Btn></div>
     </Page>
@@ -445,8 +445,43 @@ function Codes({ A }) {
         </div>
       </Card>
       <SpokenCode A={A} />
-      <Card><Section>Open invitations</Section><div style={{ fontSize: 14, color: T.sub, padding: '8px 0' }}>Invitations are not listed yet. Each one works once and expires by itself.</div></Card>
+      <OpenInvitations A={A} />
     </Page>
+  )
+}
+
+const KIND_WORD = { device: 'your device', person: 'a person', runner: 'runner, temporary' }
+
+// Every invitation that can still be claimed, from `tunlion devices --json`
+// (`data.invitations`, the same list). Withdrawing one is `tunlion add
+// --withdraw <id>`: its key is refused from then on, and devices that already
+// joined with it keep their access.
+function OpenInvitations({ A }) {
+  const { T } = useT()
+  const [confirm, setConfirm] = React.useState(null)
+  const list = A.state.invitations || []
+  const uses = (i) => (i.maxUses === 'forever' ? (i.uses ? `any number, ${i.uses} used` : 'any number, not used yet') : i.maxUses == null ? `${i.uses} used` : `${i.usesLeft} of ${i.maxUses} left`)
+  const label = (i) => i.name || `(${i.id})`
+  const withdraw = async (i) => {
+    setConfirm(null)
+    await A.run('withdraw', { invite: i.id }, `The invitation for ${label(i)} is withdrawn. Its key is refused from now on; devices that already joined with it keep their access.`)
+  }
+  return (
+    <Card testid="open-invitations">
+      <Section>Open invitations · {list.length}</Section>
+      {!list.length && <div style={{ fontSize: 14, color: T.sub, padding: '8px 0' }}>None. An invitation is listed here until it is used up, withdrawn or expires.</div>}
+      {list.map((i) => (
+        <div key={i.id} data-testid="invitation-row" style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', padding: '12px 0', borderBottom: '1px solid ' + T.rule }}>
+          <div style={{ flex: 1, minWidth: 220, display: 'grid', gap: 4 }}>
+            <span style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}><b style={{ fontSize: 15 }}>{label(i)}</b><Tag>{KIND_WORD[i.kind] || 'invitation'}</Tag><span style={{ fontSize: 12.5, color: T.sub }}>{uses(i)}</span></span>
+            <span style={{ font: '500 12.5px/1.45 ' + FONT_MONO, color: T.sub, overflowWrap: 'anywhere' }}>may use: {i.allow ? (i.allow.length ? i.allow.map(capWord).join(', ') : 'nothing') : 'not recorded'} · ends {utc(i.expires)}{i.created ? ' · made ' + ago(A.state.now, i.created) : ''}</span>
+          </div>
+          {confirm === i.id
+            ? <span style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}><span style={{ fontSize: 13.5 }}>No one can join with it again. Already joined devices are not affected.</span><Btn kind="dan" small testid="withdraw-yes" disabled={A.busy} onClick={() => withdraw(i)}>Withdraw it</Btn><Btn kind="ghost" small onClick={() => setConfirm(null)}>Keep</Btn></span>
+            : <Btn kind="dan" small testid="withdraw" onClick={() => setConfirm(i.id)}>Withdraw</Btn>}
+        </div>
+      ))}
+    </Card>
   )
 }
 
