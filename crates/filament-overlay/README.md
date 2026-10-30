@@ -1,4 +1,7 @@
-# filament-overlay
+# tunlion-overlay
+
+The Rust library name is `filament_overlay` (the crate was renamed for
+publishing; the library name was kept).
 
 Self-certifying overlay addresses: an IPv6 address derived from an Ed25519 public
 key, plus signed claims to that address that are **bound to a specific link**.

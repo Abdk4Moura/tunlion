@@ -1,4 +1,7 @@
-# filament-fleet
+# tunlion-fleet
+
+The Rust library name is `filament_fleet` (the crate was renamed for
+publishing; the library name was kept).
 
 Same-owner device auto-mesh: devices certified by **one owner key** find each
 other on a rendezvous channel and admit each other on that **certificate**,

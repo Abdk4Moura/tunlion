@@ -15,7 +15,7 @@
 # ZERO dependencies beyond std, deliberately. This is the layer someone can build
 # on without adopting tunlion's transport, its identity model, or its CLI.
 [package]
-name = "filament-transfer"
+name = "tunlion-transfer"
 version = "0.1.0"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
@@ -25,5 +25,10 @@ description = "Out-of-order chunk reassembly and short-write-safe positional wri
 readme = "README.md"
 keywords = ["transfer", "reassembly", "chunks", "resume"]
 categories = ["filesystem", "network-programming"]
+
+# Published as tunlion-transfer. The Rust library keeps its pre-rename name, so no
+# `use` line changed.
+[lib]
+name = "filament_transfer"
 
 [dependencies]

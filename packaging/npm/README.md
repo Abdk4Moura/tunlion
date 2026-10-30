@@ -16,7 +16,7 @@ the receiving device. Pair your machines once and you can also `tunlion <device>
 
 This package downloads the prebuilt, checksum-verified binary for your platform
 (Linux x64, macOS arm64/x64, Windows x64) from the matching GitHub release on
-install. Prefer another route? `cargo install filament-cli`, `brew install
+install. Prefer another route? `cargo install --locked tunlion`, `brew install
 abdk4moura/tap/tunlion`, `winget install Abdk4Moura.Tunlion`, or
 `curl -fsSL https://tunlion.autumated.com/install | sh`.
 

@@ -93,23 +93,23 @@ On a replacement worker, first create a **job-local** Python venv from
 `backend/requirements.txt`, then point `TUNLION_TEST_VENV` to `.venv/bin/python`:
 
 ```sh
-cargo test -p filament-cli --bin tunlion access_ui::tests
-cargo test -p filament-cli --bin tunlion temporary_session::tests
-cargo test -p filament-cli --test access_bootstrap
-cargo test -p filament-cli --test pty_flows temporary_access_cancel_and_failed_connect
-CI=1 TUNLION_TEST_VENV="$PWD/.venv/bin/python" cargo test -p filament-cli \
+cargo test -p tunlion --bin tunlion access_ui::tests
+cargo test -p tunlion --bin tunlion temporary_session::tests
+cargo test -p tunlion --test access_bootstrap
+cargo test -p tunlion --test pty_flows temporary_access_cancel_and_failed_connect
+CI=1 TUNLION_TEST_VENV="$PWD/.venv/bin/python" cargo test -p tunlion \
   --test pty_flows temporary_service_pairing_uses_real_transport_and_end_closes_the_socket \
   -- --nocapture
-CI=1 TUNLION_TEST_VENV="$PWD/.venv/bin/python" cargo test -p filament-cli \
+CI=1 TUNLION_TEST_VENV="$PWD/.venv/bin/python" cargo test -p tunlion \
   --test pty_flows temporary_shell_pty_io_resize_and_end_teardown_are_scoped_and_never_use_standing_shell \
   -- --nocapture
-CI=1 TUNLION_TEST_VENV="$PWD/.venv/bin/python" cargo test -p filament-cli \
+CI=1 TUNLION_TEST_VENV="$PWD/.venv/bin/python" cargo test -p tunlion \
   --test pty_flows removing_shell_from_the_live_scope_ends_the_remote_pty_without_a_standing_session \
   -- --nocapture
-CI=1 TUNLION_TEST_VENV="$PWD/.venv/bin/python" cargo test -p filament-cli \
+CI=1 TUNLION_TEST_VENV="$PWD/.venv/bin/python" cargo test -p tunlion \
   --test pty_flows temporary_shell_expiry_tears_down_the_pty_and_the_agreement \
   -- --nocapture
-cargo test -p filament-cli --bin tunlion shell_gate::tests
+cargo test -p tunlion --bin tunlion shell_gate::tests
 ```
 
 The real PTY tests drive two isolated CLI processes through signaling, PAKE,

@@ -62,7 +62,7 @@ jobs:
           restore-keys: native-overlay-linux-
       - name: Build the CLI (debug)
         run: |
-          cargo build --locked -p filament-cli --bin tunlion
+          cargo build --locked -p tunlion --bin tunlion
           ./target/debug/tunlion --version
       - uses: actions/cache/save@v4
         with:
@@ -126,7 +126,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $env:TUNLION_BUILD_SHA = "${{ github.sha }}".Substring(0,7)
-          cargo build --locked -p filament-cli --bin tunlion
+          cargo build --locked -p tunlion --bin tunlion
           if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
       - uses: actions/cache/save@v4
         with:
@@ -153,9 +153,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cargo test --locked -p filament-cli --bin tunlion -- detach_inheritance stop_event a_stop_request l3_state --nocapture
+          cargo test --locked -p tunlion --bin tunlion -- detach_inheritance stop_event a_stop_request l3_state --nocapture
           if ($LASTEXITCODE -ne 0) { throw "cli Windows tests failed" }
-          cargo test --locked -p filament-peerloop --features l3 --lib l3::
+          cargo test --locked -p tunlion-peerloop --features l3 --lib l3::
           if ($LASTEXITCODE -ne 0) { throw "peerloop l3 tests failed" }
       - name: Acceptance evidence (always)
         if: always()

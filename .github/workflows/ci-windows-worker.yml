@@ -80,7 +80,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $env:TUNLION_BUILD_SHA = "${{ github.sha }}".Substring(0,7)
-          cargo build --locked -p filament-cli --bin tunlion
+          cargo build --locked -p tunlion --bin tunlion
           if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 
       - uses: actions/cache/save@v4
