@@ -65,9 +65,10 @@ function seed(n, subsPerSid = 2) {
 }
 
 const N = parseInt(process.argv[2] || "50000", 10);
+const SUBS_PER_SID = 2; // modeled example, not a hub-wide cap
 const out = [];
 for (const batch of [64, 256, 1024]) {
-  const db = seed(N);
+  const db = seed(N, SUBS_PER_SID);
   const alive = new Set();
   const now = { value: 1000 + 7200 }; // all seeded rows expired
   const sql = counted(db);
@@ -96,7 +97,7 @@ for (const batch of [64, 256, 1024]) {
     pruneRowsRead: pruneRead, pruneRowsWritten: pruneWritten, pruneStatements,
     cascadeRowsWritten: sql.c.rowsWritten - pruneWritten,
     cascadeStatements: sql.c.statements - pruneStatements,
-    subscriptionsPerSid: subsPerSid, evicted: v.evicted.length, plan,
+    subscriptionsPerSid: SUBS_PER_SID, evicted: v.evicted.length, plan,
   });
   db.close();
 }
