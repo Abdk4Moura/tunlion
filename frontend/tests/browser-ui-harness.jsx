@@ -55,22 +55,24 @@ const state = {
   connected: true,
   signalingKind: 'ws',
   me: { name: 'me', uid: 'meuid' },
+  // As the hook delivers them: a remembered peer carries its record's id
+  // (knownId), which is how Devices rows find it, never by name.
   peers: [
     // remembered, online, offers a shell: Shell + Send files
-    { id: 'p-vps', uid: 'u-vps', name: 'root@vps', known: 'web-vps', status: 'ready', route: 'direct', lastSeen: 'now', shell: true },
+    { id: 'p-vps', uid: 'u-vps', name: 'root@vps', known: 'web-vps', knownId: 'd-vps', status: 'ready', route: 'direct', lastSeen: 'now', shell: true },
     // remembered, online, no shell: Send files only
-    { id: 'p-laptop', uid: 'u-laptop', name: 'laptop', known: 'laptop', status: 'ready', route: 'local', lastSeen: 'now', shell: false },
+    { id: 'p-laptop', uid: 'u-laptop', name: 'laptop', known: 'laptop', knownId: 'd-laptop', status: 'ready', route: 'local', lastSeen: 'now', shell: false },
     // a stranger nearby that advertises a shell: never a Shell button (not remembered)
     { id: 'p-stranger', uid: 'u-stranger', name: 'pixel', status: 'ready', route: 'direct', lastSeen: 'now', shell: true },
     // remembered but not reachable: no buttons at all
-    { id: 'p-off', uid: 'u-off', name: 'nas', known: 'nas', status: 'failed', route: null, lastSeen: '3 h ago', shell: true },
+    { id: 'p-off', uid: 'u-off', name: 'nas', known: 'nas', knownId: 'd-nas', status: 'failed', route: null, lastSeen: '3 h ago', shell: true },
   ],
   knownDevices: [
-    { name: 'web-vps', secret: '11'.repeat(32), caps: ['transfer'], addedAt: Date.UTC(2026, 9, 1) },
-    { name: 'laptop', secret: '22'.repeat(32), caps: ['transfer'], addedAt: Date.UTC(2026, 9, 2) },
-    { name: 'nas', secret: '33'.repeat(32), caps: ['transfer'], addedAt: Date.UTC(2026, 9, 3) },
+    { id: 'd-vps', name: 'web-vps', secret: '11'.repeat(32), caps: ['transfer'], addedAt: Date.UTC(2026, 9, 1) },
+    { id: 'd-laptop', name: 'laptop', secret: '22'.repeat(32), caps: ['transfer'], addedAt: Date.UTC(2026, 9, 2) },
+    { id: 'd-nas', name: 'nas', secret: '33'.repeat(32), caps: ['transfer'], addedAt: Date.UTC(2026, 9, 3) },
     // remembered but not in the room at all
-    { name: 'old-phone', secret: '44'.repeat(32), caps: ['transfer'], addedAt: Date.UTC(2026, 8, 1) },
+    { id: 'd-old', name: 'old-phone', secret: '44'.repeat(32), caps: ['transfer'], addedAt: Date.UTC(2026, 8, 1) },
   ],
   transfers: [],
   pendingKeeps: [],

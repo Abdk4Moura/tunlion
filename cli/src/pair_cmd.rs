@@ -2480,7 +2480,8 @@ mod hint_quoting_tests {
     use super::rename_hint;
 
     /// What a POSIX shell makes of a hint line: its argv, `<name>` filled in.
-    #[cfg(unix)]
+    /// Unix only, by a runtime check (the hints use PowerShell quoting on
+    /// Windows, and platform cfg blocks belong in platform/).
     fn sh_argv(line: &str) -> Vec<String> {
         let line = line.replace("<name>", "NewName");
         let out = std::process::Command::new("sh")
@@ -2494,10 +2495,12 @@ mod hint_quoting_tests {
 
     /// The pairing's rename hint pastes as the exact stored name, one
     /// argument, for every name a browser can send, and still parses.
-    #[cfg(unix)]
     #[test]
     fn the_rename_hint_pastes_as_the_exact_name() {
         use clap::Parser;
+        if !cfg!(unix) {
+            return;
+        }
         for name in ["Abdul's iPad", "laptop", "Kabir Laptop", "it's \"x\"", "$HOME;rm"] {
             let hint = rename_hint(name);
             let argv = sh_argv(&hint);
@@ -2510,9 +2513,11 @@ mod hint_quoting_tests {
 
     /// Every other hint that prints a device name in a command keeps it
     /// intact and quoted the same way.
-    #[cfg(unix)]
     #[test]
     fn device_name_hints_quote_the_name() {
+        if !cfg!(unix) {
+            return;
+        }
         let n = "Abdul's iPad";
         let w = crate::refusal::word(n);
         let lines = [
