@@ -139,6 +139,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'cli/tests/lib/fixture.sh'
+      - 'cli/tests/lib/backend.sh'
+      - 'cli/tests/fixture-cleanup-gates.sh'
       - 'cli/tests/cap-verbs-gates.sh'
       - 'cli/tests/devices-write-race-gates.sh'
       - 'cli/tests/roster-gates.sh'
@@ -166,6 +168,7 @@ on:
       - 'cli/tests/promote-mbb-gates.sh'
       - 'cli/tests/pair-bystander.js'
       - 'backend/**'
+      - 'scripts/cargo-locked.sh'
       - '.github/workflows/gate-suite.yml'
   workflow_dispatch: {}
 
@@ -319,6 +322,9 @@ jobs:
             # 4: M1 M2 M3 M4 (fix/direct-promote-make-before-break: the code
             # transfer starts on the authenticated WebRTC link, not after QUIC).
             [cli/tests/promote-mbb-gates.sh]=4
+            # 14: central fixture normal/failure, a real inline gate
+            # normal/failure, cargo-locked fd 9, and the PID-reuse guard.
+            [cli/tests/fixture-cleanup-gates.sh]=14
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The
           # warm-hold idle gate measures a deliberate 180s idle window on top
@@ -340,6 +346,7 @@ jobs:
           # (`bash x`, `python3 x`) -- this precheck is stricter than the registry.
           rc=0
           for g in cli/tests/cap-verbs-gates.sh \
+                   cli/tests/fixture-cleanup-gates.sh \
                    cli/tests/devices-write-race-gates.sh \
                    cli/tests/roster-gates.sh \
                    cli/tests/shell-gates.sh \

@@ -22,6 +22,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
+# shellcheck source=cli/tests/lib/backend.sh
+source "$HERE/lib/backend.sh"
 BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 case "$BIN" in /*) ;; *) BIN="$(pwd)/$BIN" ;; esac
 PORT=8133
@@ -42,6 +44,7 @@ dflt() { env -u TUNLION_CONFIG_DIR -u XDG_CONFIG_HOME HOME="$HOMEA" "$@"; }
 
 pids=()
 cleanup() {
+  backend_stop "${BACKEND_PID:-}"
   for p in "${pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
   dflt timeout 10 "$BIN" down -y >/dev/null 2>&1
   [ -n "${CREATED_INBOX:-}" ] && rmdir "$CREATED_INBOX" 2>/dev/null
@@ -53,10 +56,10 @@ trap cleanup EXIT
 
 for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
 sleep 1
-( cd "$CLI_DIR/../backend" && PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
-    FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
-    "$PYV" app.py >"$WORK/backend.log" 2>&1 ) &
-pids+=($!)
+backend_start "$CLI_DIR/../backend" "$PYV" "$WORK/backend.log" \
+  PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+  FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25
+pids+=("$BACKEND_PID")
 for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat "$WORK/backend.log"; exit 2; }
 
