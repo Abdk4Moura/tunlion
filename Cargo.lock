@@ -4016,7 +4016,7 @@ dependencies = [
 
 [[package]]
 name = "tunlion-peerloop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4079,7 +4079,7 @@ version = "0.1.0"
 
 [[package]]
 name = "tunlion-transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
