@@ -93,12 +93,14 @@ pub(crate) fn more_actions(owner: bool) -> Vec<(&'static str, &'static str)> {
             // leaked stays claimable until it runs out, unless withdrawn.
             ("Withdraw an invitation", "add --withdraw"),
             ("Keep running in the background", "up --install"),
+            ("Change settings", "set"),
             ("Show this device's identity", "id"),
         ]
     } else {
         vec![
             ("Open files on another device", "mount"),
             ("Change what a device can do", "promote"),
+            ("Change settings", "set"),
             ("Show this device's identity", "id"),
         ]
     }

@@ -309,7 +309,7 @@ fn decorate(line: &str) -> String {
 
 // ------------------------------------------------------------------ paint --
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     /// The brand: the warm accent of the tunnel mark, bold. Commands to type,
     /// codes, section headings.
