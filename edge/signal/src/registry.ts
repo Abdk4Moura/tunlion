@@ -15,19 +15,28 @@
 // What is deliberately NOT written on every event: the sliding last_seen/exp
 // of a claim that is only a refresh (a daemon full-syncs every 30 s). The hot
 // value lives in memory and is written through once it has drifted
-// PERSIST_SLACK from the stored one, which keeps rows-written per device to a
-// few dozen a day. After an eviction a session can therefore look up to
-// PERSIST_SLACK older than it is; it still expires a day after real use.
+// FIL_SESSION_PERSIST_S (6 h) from the stored one, which is 4 rows a day for an
+// always-on device instead of 48. After an eviction a session can look up to
+// that much older than it is: its persisted expiry is never later than the
+// last real claim plus SESSION_TTL, but it can be up to 6 h earlier (the
+// accepted 18 h floor).
+//
+// The physical row is separate from token validity. Pruning is claim-triggered
+// and batched, so a dead row can remain until a later claim arrives; there is
+// no scheduled sweep and no TTL + constant physical-retention claim.
 //
 // Method names and return shapes follow the Python class one to one, so a
 // change on the Python side maps onto the method of the same name here.
 
 import { sessionAlive } from "./liveness";
 import {
+  CAPACITY_SCAN,
   MAX_RETIRED_TOTAL,
   MAX_SESSIONS,
   PRUNE_INTERVAL,
   RETIRED_TTL,
+  SESSION_PERSIST_S,
+  SESSION_PRUNE_BATCH,
   SESSION_TTL,
   validId,
 } from "./policy";
@@ -69,9 +78,6 @@ interface Member {
   gen: string | null;
 }
 
-/** Seconds a refresh may drift from the stored row before it is written. */
-const PERSIST_SLACK = 1800;
-
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, sid TEXT, gen TEXT,
      uid TEXT, name TEXT, last_seen REAL NOT NULL, exp REAL NOT NULL)`,
@@ -103,6 +109,8 @@ export class Registry {
   private rooms = new Map<string, Set<string>>(); // room -> sids
   private chans: Map<string, Set<string>> | null = null; // channel -> sids (_chan)
   private sidChans = new Map<string, Set<string>>(); // sid -> channels (_sidchan)
+  /** Keyset cursor for the bounded capacity scan, ordered by (exp, rowid). */
+  private capacityCursor: { exp: number; rid: number } | null = null;
 
   constructor(
     private sql: SqlLike,
@@ -113,6 +121,10 @@ export class Registry {
     private now: () => number = () => Date.now() / 1000,
     /** Capacity bound; tests inject a small value. */
     private maxSessions = MAX_SESSIONS,
+    /** Refresh write spacing and prune/scan bounds; see policy.ts. */
+    private persistSlack = SESSION_PERSIST_S,
+    private pruneBatch = SESSION_PRUNE_BATCH,
+    private capacityScan = CAPACITY_SCAN,
   ) {
     for (const q of SCHEMA) this.sql.exec(q);
   }
@@ -166,11 +178,11 @@ export class Registry {
     if (this.sessionCount !== null) this.sessionCount = Math.max(0, this.sessionCount - 1);
   }
 
-  /** Slide last_seen/exp; write through only past PERSIST_SLACK. */
+  /** Slide last_seen/exp; write through only past the configured spacing. */
   private touch(token: string, rec: SessionRec, now: number) {
     rec.last_seen = now;
     rec.exp = now + SESSION_TTL;
-    if (now - rec.stored_last_seen >= PERSIST_SLACK) this.putSession(token, rec);
+    if (now - rec.stored_last_seen >= this.persistSlack) this.putSession(token, rec);
   }
 
   claimSession(
@@ -248,10 +260,18 @@ export class Registry {
     return { status: "new", token: issued, gen, prev: null, evicted };
   }
 
-  /** Drop expired token records; return their sids for room cleanup. */
+  /** Drop expired token records, at most one prune batch; return their sids
+   *  for room cleanup. The sessions_exp index orders the candidates, and the
+   *  total is not reduced by batching: later claims continue where this one
+   *  stopped. If claims stop, the backlog stays (claim-triggered, no sweep). */
   private pruneSessions(now: number): string[] {
+    if (this.pruneBatch <= 0) return [];
     const rows = this.sql
-      .exec("SELECT token, sid FROM sessions WHERE exp <= ?", now)
+      .exec(
+        "SELECT token, sid FROM sessions WHERE exp <= ? ORDER BY exp LIMIT ?",
+        now,
+        this.pruneBatch,
+      )
       .toArray() as unknown as { token: string; sid: string | null }[];
     const out: string[] = [];
     for (const r of rows) {
@@ -265,37 +285,86 @@ export class Registry {
   }
 
   /** Transport authority, not the stored refresh hint. last_seen is written at
-   *  most every PERSIST_SLACK, so after a hibernation or eviction it can be
+   *  most every persistSlack, so after a hibernation or eviction it can be
    *  hours old while the sid's websocket is still open; judging liveness by it
    *  would let capacity evict a live token. */
   private sessionLive(rec: SessionRec, now: number): boolean {
     return sessionAlive(rec.sid, rec.exp, now, this.alive);
   }
 
+  /** One page of the capacity keyset scan, ordered by (exp, rowid). */
+  private capacityRows(limit: number, wrap: boolean): Array<{ rid: number; token: string; sid: string | null; exp: number }> {
+    const cols = "rowid AS rid, token, sid, exp FROM sessions";
+    if (wrap || !this.capacityCursor) {
+      return this.sql
+        .exec(`SELECT ${cols} ORDER BY exp, rowid LIMIT ?`, limit)
+        .toArray() as unknown as Array<{ rid: number; token: string; sid: string | null; exp: number }>;
+    }
+    const c = this.capacityCursor;
+    return this.sql
+      .exec(
+        `SELECT ${cols} WHERE exp > ? OR (exp = ? AND rowid > ?) ORDER BY exp, rowid LIMIT ?`,
+        c.exp,
+        c.exp,
+        c.rid,
+        limit,
+      )
+      .toArray() as unknown as Array<{ rid: number; token: string; sid: string | null; exp: number }>;
+  }
+
   /** Capacity is on TOKEN records only; never evict a live session. Returns
-   * evicted sids, or null when every record is live. */
+   *  evicted sids, or null when this bounded page has no dead candidate.
+   *
+   *  An expired row is found directly through sessions_exp, because expiry is
+   *  the common dead case and cannot be hidden by a live first page. Otherwise
+   *  one keyset page advances a cursor across claims; a page with no dead row
+   *  fails closed (capacity) and the next claim continues after it, wrapping
+   *  once the end is reached. A closed but unexpired row beyond the page can
+   *  therefore delay a new session until cursor progress or expiry: that is an
+   *  explicit availability tradeoff, not a promised bound. */
   private makeRoom(now: number): string[] | null {
     if (this.sessionCount === null) this.sessionCount = this.count("sessions");
     if (this.sessionCount < this.maxSessions) return [];
-    const rows = this.sql.exec("SELECT token FROM sessions").toArray() as unknown as { token: string }[];
-    const candidates: [string, SessionRec][] = [];
-    for (const { token } of rows) {
-      const rec = this.getSession(token);
-      if (rec && !this.sessionLive(rec, now)) candidates.push([token, rec]);
+    const expired = this.sql
+      .exec("SELECT token, sid FROM sessions WHERE exp <= ? ORDER BY exp LIMIT 1", now)
+      .toArray()[0] as { token: string; sid: string | null } | undefined;
+    if (expired) {
+      const hot = this.sessions.get(expired.token);
+      if (!hot || hot.exp <= now) {
+        this.dropSession(expired.token);
+        return expired.sid ? [expired.sid] : [];
+      }
+      // The in-memory refresh slid this row past now; fall through to the
+      // transport-aware page rather than deleting a live session.
     }
-    if (!candidates.length) return null;
-    // One new session needs one slot. Deleting only that deficit keeps a
-    // capacity claim from spending a whole dead backlog in one request; each
-    // later claim frees the next one.
-    const [token, rec] = candidates[0];
-    this.dropSession(token);
-    return rec.sid ? [rec.sid] : [];
+    const limit = Math.max(1, this.capacityScan);
+    let rows = this.capacityRows(limit, false);
+    if (!rows.length) rows = this.capacityRows(limit, true);
+    for (const r of rows) {
+      this.capacityCursor = { exp: r.exp, rid: r.rid };
+      const rec = this.getSession(r.token);
+      if (!rec || this.sessionLive(rec, now)) continue;
+      // One new session needs one slot. Delete only that deficit; each later
+      // claim frees the next one.
+      this.dropSession(r.token);
+      return rec.sid ? [rec.sid] : [];
+    }
+    return null;
   }
 
   /** Global (token, gen) tombstones: 24h TTL + hard total cap (oldest first). */
   private pruneRetired(now: number) {
-    this.sql.exec("DELETE FROM retired WHERE exp <= ?", now);
+    if (this.pruneBatch > 0) {
+      this.sql.exec(
+        "DELETE FROM retired WHERE seq IN (SELECT seq FROM retired WHERE exp <= ? ORDER BY seq LIMIT ?)",
+        now,
+        this.pruneBatch,
+      );
+    }
     this.retiredCount = this.count("retired");
+    // Existing path: the hard total cap may still remove its overage in one
+    // statement. It normally removes one row on the add that crosses the cap,
+    // and bounding it would weaken the tombstone cap, so it stays explicit.
     this.capRetired();
   }
 
