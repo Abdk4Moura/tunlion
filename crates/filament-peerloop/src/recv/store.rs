@@ -880,10 +880,58 @@ impl DeviceStore {
     }
 
     /// Sweep the device store for lapsed delegated records. Returns how many
-    /// records newly lapsed.
+    /// records newly lapsed, plus how many ended records were removed: an
+    /// ephemeral device whose lease or offline budget is over, and (on a
+    /// joined device) a fleet sibling whose certificate expired or that the
+    /// owner's roster no longer lists. Those are not evidence worth keeping,
+    /// they are the stale rows a device list should not show.
     pub fn devices_sweep_lapsed(&self, now: u64) -> usize {
-        self.with_devices_mut(|arr| Ok(sweep_lapsed(arr, now)))
-            .unwrap_or(0)
+        // On a joined device: the owner whose siblings we index, and whether
+        // we hold a roster from it (no roster means we cannot tell a delisted
+        // sibling from one we simply have not heard about, so nothing is
+        // pruned for delisting). Read outside the devices lock.
+        let sibling_owner = if self.owner_pub_from_keystore().is_none() {
+            self.owner_pub_for_resources(None)
+        } else {
+            None
+        };
+        let roster_held = sibling_owner.is_some_and(|o| self.owner_roster_held(&o));
+        self.with_devices_mut(|arr| {
+            let lapsed = sweep_lapsed(arr, now);
+            let before = arr.len();
+            arr.retain(|record| {
+                if record_is_ephemeral(record) {
+                    return !ephemeral_record_ended(record, now);
+                }
+                let Some(owner) = sibling_owner else { return true };
+                !sibling_record_ended(record, &owner, now, |device_pub| {
+                    roster_held && !self.owner_roster_lists(device_pub, &owner)
+                })
+            });
+            Ok(lapsed + (before - arr.len()))
+        })
+        .unwrap_or(0)
+    }
+
+    /// Mark a record as an ephemeral device (a CI lease, a borrowed box) and
+    /// stamp it seen now: it exists while it is present and is removed, not
+    /// kept, once its lease or offline budget ends or it departs.
+    pub fn devices_mark_ephemeral(&self, name: &str, now: u64) -> Result<()> {
+        self.with_devices_mut(|arr| {
+            if let Some(rec) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) {
+                rec["ephemeral"] = json!(true);
+                rec["lastSeen"] = json!(now);
+            }
+            Ok(())
+        })
+    }
+
+    /// Do we hold a roster signed by `owner` at all?
+    fn owner_roster_held(&self, owner: &[u8; 32]) -> bool {
+        std::fs::read_to_string(self.root.join("roster.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .is_some_and(|r| r["owner_pub"].as_str() == Some(hex::encode(owner).as_str()))
     }
 
     pub fn devices_remove(&self, name: &str) -> Result<()> {
@@ -1050,6 +1098,15 @@ impl DeviceStore {
                 .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
                 .and_then(|d| d["name"].as_str().map(str::to_string))
                 .ok_or_else(|| anyhow::anyhow!("device not in the store"))?;
+            // An ephemeral device that departs is gone: drop the record, so
+            // nothing renews it, nothing lists it, and its key is refused.
+            if arr
+                .iter()
+                .any(|d| d["name"].as_str() == Some(&name) && record_is_ephemeral(d))
+            {
+                arr.retain(|d| d["name"].as_str() != Some(&name));
+                return Ok(name);
+            }
             for d in arr.iter_mut() {
                 if d["name"].as_str() == Some(&name) {
                     d["principalState"] = json!(PRINCIPAL_STATE_LAPSED);
@@ -1864,6 +1921,57 @@ pub fn sweep_lapsed(records: &mut Vec<Value>, now: u64) -> usize {
         }
     }
     changed
+}
+
+/// Is this record an ephemeral device (enrolled with a runner invitation)?
+/// Pure.
+pub fn record_is_ephemeral(record: &Value) -> bool {
+    record["ephemeral"].as_bool() == Some(true)
+}
+
+/// Has this ephemeral record ended: lapsed (offline past its budget, or
+/// departed), or past its lease or certificate end? A revoked ephemeral record
+/// is kept, because revoking is the owner's own explicit decision. Pure.
+pub fn ephemeral_record_ended(record: &Value, now: u64) -> bool {
+    if record_is_revoked(record) {
+        return false;
+    }
+    if record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED) {
+        return true;
+    }
+    let Some(cert) = DeviceCert::from_json(&record["deviceCert"]) else {
+        return true;
+    };
+    let (deadline, _) = effective_principal_deadline(
+        cert.expires,
+        record["principalExpires"].as_u64(),
+        record["lastSeen"].as_u64(),
+        record["principalMaxOffline"].as_u64(),
+    );
+    deadline <= now
+}
+
+/// On a joined device: has this fleet-sibling index record ended? A sibling
+/// record is one we hold no pair secret for, certified by `owner`. It ends when
+/// its certificate expired or `delisted` says the owner's roster dropped it. A
+/// record carrying a local revoke is kept (that is this device's own decision),
+/// and so is anything we paired with ourselves. Pure but for `delisted`.
+pub fn sibling_record_ended(
+    record: &Value,
+    owner: &[u8; 32],
+    now: u64,
+    delisted: impl Fn(&[u8; 32]) -> bool,
+) -> bool {
+    if record["secret"].as_str().is_some_and(|s| !s.is_empty()) || record_is_revoked(record) {
+        return false;
+    }
+    let Some(cert) = DeviceCert::from_json(&record["deviceCert"]) else {
+        return false;
+    };
+    if cert.user_pub != *owner {
+        return false;
+    }
+    cert.expires <= now || delisted(&cert.device_pub)
 }
 
 /// Is this device record revoked (the certificate marker, or a durable device
@@ -3687,6 +3795,77 @@ mod sibling_roster_revocation {
         let _ = std::fs::remove_dir_all(&j.root);
     }
 
+    fn names(store: &DeviceStore) -> Vec<String> {
+        store
+            .devices_records()
+            .iter()
+            .filter_map(|r| r["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn a_sibling_the_owner_delisted_is_removed_from_the_list() {
+        let j = joined("prune-delisted");
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32]]);
+        assert_eq!(j.store.devices_sweep_lapsed(now_secs()), 1);
+        assert!(names(&j.store).is_empty(), "a delisted sibling must not stay listed");
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn a_listed_sibling_stays_and_one_whose_cert_expired_goes() {
+        let j = joined("prune-expired");
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32], j.sib]);
+        let now = now_secs();
+        // The positive control: listed and certified, so it stays.
+        assert_eq!(j.store.devices_sweep_lapsed(now), 0);
+        assert_eq!(names(&j.store), vec!["sib"]);
+        // Its certificate (3600 s) has run out: listed or not, it is gone.
+        assert_eq!(j.store.devices_sweep_lapsed(now + 3601), 1);
+        assert!(names(&j.store).is_empty());
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn without_a_roster_nothing_is_pruned_for_delisting() {
+        // No roster means "not heard yet", not "delisted": keep the record.
+        let j = joined("prune-noroster");
+        assert_eq!(j.store.devices_sweep_lapsed(now_secs()), 0);
+        assert_eq!(names(&j.store), vec!["sib"]);
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn paired_revoked_and_owner_side_records_are_never_pruned_as_siblings() {
+        let j = joined("prune-exempt");
+        write_roster(&j, j.owner.public_key_bytes(), &[]);
+        let now = now_secs();
+        let paired = DeviceCert::certify(&j.owner, [3u8; 32], now, 3600).unwrap();
+        let revoked = DeviceCert::certify(&j.owner, [5u8; 32], now, 3600).unwrap();
+        std::fs::write(
+            j.store.devices_path(),
+            serde_json::to_string(&json!([
+                {"name": "paired", "secret": "ab".repeat(32), "deviceCert": paired.to_json()},
+                {"name": "revoked", "deviceCert": revoked.to_json(), "certRevoked": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(j.store.devices_sweep_lapsed(now), 0);
+        assert_eq!(names(&j.store), vec!["paired", "revoked"]);
+        // On the OWNER device its own records decide; nothing is a sibling.
+        UserKey::generate(&j.store.keystore()).unwrap();
+        let sib = DeviceCert::certify(&j.owner, j.sib, now, 3600).unwrap();
+        std::fs::write(
+            j.store.devices_path(),
+            serde_json::to_string(&json!([{"name": "sib", "deviceCert": sib.to_json()}])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(j.store.devices_sweep_lapsed(now), 0);
+        assert_eq!(names(&j.store), vec!["sib"]);
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
     #[test]
     fn the_roster_file_name_matches_the_roster_module() {
         #[cfg(feature = "dispatch")]
@@ -4037,5 +4216,135 @@ mod fleet_grant_set_security {
         assert_eq!(store.merge_owner_cap_ops(&[op.to_json()]), 0);
         assert!(store.load_cap_store().is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_records {
+    //! An ephemeral device (runner invitation) exists while it is present: the
+    //! owner removes its record, rather than keeping it as evidence, once its
+    //! lease or offline budget ends or it departs.
+    use super::*;
+    use filament_id::{DeviceCert, UserKey};
+    use serde_json::json;
+
+    fn owner_store(tag: &str) -> (PathBuf, DeviceStore, UserKey) {
+        let root = std::env::temp_dir().join(format!(
+            "fil-eph-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DeviceStore::open(&root);
+        let owner = UserKey::generate(&store.keystore()).unwrap();
+        (root, store, owner)
+    }
+
+    /// Enrol `name` the way the enrolment handler records a runner: delegated,
+    /// access ending at `lease_end`, offline budget `max_offline`, marked
+    /// ephemeral. With `ephemeral` false it is the same record for a device.
+    #[allow(clippy::too_many_arguments)]
+    fn enrol(
+        store: &DeviceStore,
+        owner: &UserKey,
+        name: &str,
+        key: u8,
+        now: u64,
+        lease_end: u64,
+        max_offline: u64,
+        ephemeral: bool,
+    ) -> [u8; 32] {
+        let device_pub = [key; 32];
+        let cert = DeviceCert::certify(owner, device_pub, now, lease_end - now).unwrap();
+        let caps = vec!["transfer".to_string(), "shell".to_string()];
+        store
+            .devices_upsert_atomic(
+                name,
+                Some(&"cd".repeat(32)),
+                Some(&cert),
+                Some(&caps),
+                Some(0x01),
+                None,
+                Some((&caps, lease_end, max_offline, max_offline)),
+                false,
+            )
+            .unwrap();
+        if ephemeral {
+            store.devices_mark_ephemeral(name, now).unwrap();
+        }
+        device_pub
+    }
+
+    fn names(store: &DeviceStore) -> Vec<String> {
+        store
+            .devices_records()
+            .iter()
+            .filter_map(|r| r["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn an_ephemeral_device_is_removed_when_its_lease_ends_and_kept_before() {
+        let (root, store, owner) = owner_store("lease");
+        let now = now_secs();
+        enrol(&store, &owner, "worker", 7, now, now + 600, 900, true);
+        // The same shape for a persistent device: lapses, but is KEPT.
+        enrol(&store, &owner, "laptop", 8, now, now + 600, 900, false);
+        assert_eq!(store.devices_sweep_lapsed(now + 599), 0);
+        assert_eq!(names(&store), vec!["worker", "laptop"]);
+        store.devices_sweep_lapsed(now + 601);
+        assert_eq!(names(&store), vec!["laptop"], "the lease is over: the worker is gone");
+        let laptop = store.devices_records().into_iter().next().unwrap();
+        assert_eq!(laptop["principalState"].as_str(), Some(PRINCIPAL_STATE_LAPSED));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_ephemeral_device_offline_past_its_budget_is_removed() {
+        let (root, store, owner) = owner_store("budget");
+        let now = now_secs();
+        enrol(&store, &owner, "worker", 7, now, now + 6 * 3600, 900, true);
+        // Seen 10 minutes ago: inside the 15 minute budget.
+        store.devices_touch_at("worker", None, None, now).unwrap();
+        assert_eq!(store.devices_sweep_lapsed(now + 600), 0);
+        assert_eq!(names(&store), vec!["worker"]);
+        // Unseen for 15 minutes: the cancelled job is forgotten.
+        store.devices_sweep_lapsed(now + 901);
+        assert!(names(&store).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_departing_ephemeral_device_is_removed_and_a_persistent_one_kept() {
+        let (root, store, owner) = owner_store("depart");
+        let now = now_secs();
+        let worker = enrol(&store, &owner, "worker", 7, now, now + 600, 900, true);
+        let laptop = enrol(&store, &owner, "laptop", 8, now, now + 600, 900, false);
+        assert_eq!(store.mark_lapsed_now(&worker).as_deref(), Some("worker"));
+        assert_eq!(store.mark_lapsed_now(&laptop).as_deref(), Some("laptop"));
+        assert_eq!(names(&store), vec!["laptop"]);
+        // Removal is "stop renewing": no record, no renewal.
+        assert!(store.devices_find_by_device_pub(&worker).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_revoked_ephemeral_record_is_the_owners_decision_and_stays() {
+        let (root, store, owner) = owner_store("revoked");
+        let now = now_secs();
+        enrol(&store, &owner, "worker", 7, now, now + 600, 900, true);
+        store
+            .with_devices_mut(|arr| {
+                arr[0]["certRevoked"] = json!(true);
+                Ok(())
+            })
+            .unwrap();
+        store.devices_sweep_lapsed(now + 601);
+        assert_eq!(names(&store), vec!["worker"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

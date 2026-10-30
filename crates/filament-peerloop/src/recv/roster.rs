@@ -20,7 +20,10 @@ use filament_id::{DeviceCert, MeshRoster, RosterDevice, UserKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::recv::store::{record_is_revoked, DeviceStore, PRINCIPAL_STATE_REVOKED};
+use crate::recv::store::{
+    record_is_ephemeral, record_is_revoked, DeviceStore, PRINCIPAL_STATE_LAPSED,
+    PRINCIPAL_STATE_REVOKED,
+};
 
 pub const ROSTER_STATE_FILE: &str = "roster-state.json";
 pub const ROSTER_FILE: &str = "roster.json";
@@ -75,22 +78,30 @@ fn snapshot_hash(devices: &[RosterDevice]) -> String {
 }
 
 /// The owner's other devices: every record with a device cert chaining to the
-/// owner key, excluding the owner's own device and any revoked record. Sorted by
-/// device key so the snapshot is a set, not an ordering.
+/// owner key and still valid at `now`, excluding the owner's own device, any
+/// revoked or lapsed record, and ephemeral devices. Sorted by device key so the
+/// snapshot is a set, not an ordering.
 pub fn owner_snapshot(
     store: &DeviceStore,
     owner_pub: &[u8; 32],
     self_pub: Option<&[u8; 32]>,
+    now: u64,
 ) -> Vec<RosterDevice> {
     let mut out = Vec::new();
     for d in store.devices_records() {
-        if record_is_revoked(&d) {
+        // Revoked, lapsed, or an ephemeral device (a CI lease or a borrowed
+        // box, never a fleet member: it holds no fleet meeting point) is not
+        // one of the owner's devices as far as its siblings are concerned.
+        if record_is_revoked(&d)
+            || record_is_ephemeral(&d)
+            || d["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED)
+        {
             continue;
         }
         let Some(cert) = DeviceCert::from_json(&d["deviceCert"]) else {
             continue;
         };
-        if cert.user_pub != *owner_pub {
+        if cert.user_pub != *owner_pub || cert.expires <= now {
             continue;
         }
         if self_pub == Some(&cert.device_pub) {
@@ -115,7 +126,7 @@ pub fn mint_roster(
     ttl_secs: u64,
 ) -> Result<(Value, bool)> {
     let owner_pub = owner.public_key_bytes();
-    let devices = owner_snapshot(store, &owner_pub, self_pub);
+    let devices = owner_snapshot(store, &owner_pub, self_pub, now);
     let hash = snapshot_hash(&devices);
     let state = load_owner_state(store);
 
@@ -390,7 +401,56 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let names: Vec<String> = owner_snapshot(&store, &owner.public_key_bytes(), None)
+        let names: Vec<String> = owner_snapshot(&store, &owner.public_key_bytes(), None, 100)
+            .into_iter()
+            .map(|d| d.petname)
+            .collect();
+        assert_eq!(names, vec!["active"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_snapshot_lists_no_ephemeral_lapsed_or_expired_device() {
+        // Siblings learn the fleet from this roster. A CI lease is not a
+        // member, and neither is a device that lapsed or whose certificate
+        // ran out; listing them is how stale workers showed up under MESH.
+        let dir = temp("ended-filter");
+        let store = DeviceStore::open(&dir);
+        let owner = owner();
+        let now = 10_000;
+        let certs = [
+            ("active", DeviceCert::certify(&owner, [1u8; 32], now, 900).unwrap()),
+            ("ephemeral", DeviceCert::certify(&owner, [2u8; 32], now, 900).unwrap()),
+            ("lapsed", DeviceCert::certify(&owner, [3u8; 32], now, 900).unwrap()),
+            ("expired", DeviceCert::certify(&owner, [4u8; 32], now - 1000, 900).unwrap()),
+        ];
+        for (name, cert) in &certs {
+            store
+                .devices_upsert_atomic(
+                    name,
+                    None,
+                    Some(cert),
+                    Some(&["transfer".to_string()]),
+                    Some(0x01),
+                    None,
+                    None,
+                    true,
+                )
+                .unwrap();
+        }
+        store
+            .with_devices_mut(|arr| {
+                for d in arr.iter_mut() {
+                    match d["name"].as_str() {
+                        Some("ephemeral") => d["ephemeral"] = json!(true),
+                        Some("lapsed") => d["principalState"] = json!(PRINCIPAL_STATE_LAPSED),
+                        _ => {}
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        let names: Vec<String> = owner_snapshot(&store, &owner.public_key_bytes(), None, now)
             .into_iter()
             .map(|d| d.petname)
             .collect();

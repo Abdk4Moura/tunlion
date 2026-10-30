@@ -1269,6 +1269,16 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Status { json } => status_cmd(json || ui_caps.json).await,
         Cmd::Down => {
             ui_caps.confirm("shut down the daemon")?;
+            // An ephemeral box (joined with a runner invitation) that stops is
+            // gone for good: say goodbye first, so the owner removes it now
+            // rather than when its offline budget runs out. Advisory and
+            // bounded; a box that cannot reach its owner still stops, and the
+            // budget still removes it.
+            if crate::enrollment::joined_ephemeral() {
+                if let Err(e) = depart_cmd(&server, relay).await {
+                    crate::ui::debug(&format!("down: depart before stopping failed: {e}"));
+                }
+            }
             down_cmd()
         }
         Cmd::Logs { follow, tail } => logs_cmd(follow, tail).await,
@@ -2826,8 +2836,13 @@ pub(crate) async fn devices_json_rows(all: &[(String, String)]) -> Vec<Value> {
             // `caps` IS the effective set: empty once the
             // device expired, lapsed or was revoked.
             let caps = access["effectiveCaps"].clone();
+            let ephemeral = records
+                .iter()
+                .find(|r| r["name"].as_str() == Some(n.as_str()))
+                .is_some_and(filament_peerloop::recv::store::record_is_ephemeral);
             json!({
                 "name": n,
+                "ephemeral": ephemeral,
                 "channel": channel_of(s),
                 "caps": caps,
                 "grantedCaps": access["grantedCaps"].clone(),

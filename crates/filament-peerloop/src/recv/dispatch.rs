@@ -3236,13 +3236,15 @@ async fn recv_run(
 
         // SWEEP: mark lapsed delegated records whose effective deadline has
         // passed and which no observation revived. Runs every 30s; keeps the
-        // record as evidence (option b, decided deliberately).
+        // record as evidence (option b, decided deliberately), EXCEPT an
+        // ephemeral device's and an ended fleet sibling's, which are removed
+        // (DeviceStore::devices_sweep_lapsed).
         if daemon && last_sweep.elapsed() >= Duration::from_secs(30) {
             last_sweep = Instant::now();
             let lapsed = ports.store.devices_sweep_lapsed(filament_id::now_secs());
             if lapsed > 0 {
                 log.say(&format!(
-                    "{} {lapsed} device(s) lapsed (offline past their budget)",
+                    "{} {lapsed} device(s) lapsed or ended (offline past their budget, lease over, or removed by the owner)",
                     log.paint(Tone::Warn, log.glyph_warn())
                 ));
             }

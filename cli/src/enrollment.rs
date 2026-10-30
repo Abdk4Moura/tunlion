@@ -92,7 +92,15 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
         .as_u64()
         .ok_or_else(|| anyhow!("join acknowledgement omitted its offline budget ceiling"))?;
     let persistent = v["persistent"].as_bool().unwrap_or(false);
-    if expires != inv.expires
+    // An ephemeral device's access ends at its lease, which the owner may set
+    // EARLIER than the invitation's end, never later. A persistent device's
+    // end is the invitation's, exactly.
+    let expires_ok = if inv.ephemeral {
+        expires <= inv.expires
+    } else {
+        expires == inv.expires
+    };
+    if !expires_ok
         || ceiling != inv.caps
         || max_offline != inv.max_offline
         || persistent != !inv.ephemeral
@@ -120,9 +128,14 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
     let cert_path = local_device_cert_path();
     crate::platform::SecretFile::write_str(
         &cert_path,
-        &serde_json::to_string_pretty(
-            &json!({ "name": assigned_name, "cert": local_cert.to_json() }),
-        )?,
+        &serde_json::to_string_pretty(&if inv.ephemeral {
+            // `down` reads this: an ephemeral device departs (and so is
+            // removed at the owner) when it stops, instead of waiting out
+            // its offline budget.
+            json!({ "name": assigned_name, "cert": local_cert.to_json(), "ephemeral": true })
+        } else {
+            json!({ "name": assigned_name, "cert": local_cert.to_json() })
+        })?,
     )?;
     let transfer_caps = vec!["transfer".to_string()];
     // The invitation names the fleet, but the name is presentation: it must
@@ -206,6 +219,7 @@ pub(crate) async fn enroll_cmd(
     use base64::Engine;
     let enroll_seed = inv.enroll_private_key;
     let device_pub = crate::overlay::overlay_pubkey_bytes()?;
+    let lease = lease_from_env()?;
 
     if !json_output {
         ui::say(&format!(
@@ -428,6 +442,12 @@ pub(crate) async fn enroll_cmd(
                                             msg[k] = v.clone();
                                         }
                                     }
+                                    // A lease only narrows an ephemeral
+                                    // device's access; the owner ignores it
+                                    // for anything else.
+                                    if let Some(lease) = lease {
+                                        msg["lease"] = json!(lease);
+                                    }
                                     let _ = t.send_control(&msg).await;
                                 }
                             }
@@ -446,7 +466,8 @@ pub(crate) async fn enroll_cmd(
                                 "name": name,
                                 "devicePub": hex::encode(device_pub),
                                 "ceiling": inv.caps,
-                                "expires": inv.expires,
+                                "expires": v["expires"].as_u64().unwrap_or(inv.expires),
+                                "ephemeral": inv.ephemeral,
                                 "persistsAcrossReconnect": true,
                             }))?
                         );
@@ -829,6 +850,38 @@ pub(crate) async fn enroll_and_send_cmd(
     Ok(())
 }
 
+/// `TUNLION_LEASE` (e.g. `120m`, `2h`): how long this box will exist, for a
+/// CI job that joins with a runner invitation. The owner ends the box's access
+/// at that point (or at the invitation's end, whichever is first) and removes
+/// it from its device list. Unset means the owner's default lease.
+pub(crate) const LEASE_ENV: &str = "TUNLION_LEASE";
+
+fn lease_from_env() -> Result<Option<u64>> {
+    match std::env::var(LEASE_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => parse_lease(raw.trim()).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Parse a lease. Bounded like an invitation's own lifetime. Pure.
+pub(crate) fn parse_lease(raw: &str) -> Result<u64> {
+    let secs = crate::file_io::parse_mint_ttl(raw)
+        .map_err(|e| anyhow!("{LEASE_ENV}={raw}: {e}"))?;
+    if secs == 0 || secs > 30 * 24 * 3600 {
+        bail!("{LEASE_ENV}={raw}: a lease must be between 1 second and 30 days");
+    }
+    Ok(secs)
+}
+
+/// Did this device join with an ephemeral (runner) invitation? Read from the
+/// local certificate record `persist_join_ack` wrote.
+pub(crate) fn joined_ephemeral() -> bool {
+    std::fs::read_to_string(local_device_cert_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .is_some_and(|record| record["ephemeral"].as_bool() == Some(true))
+}
+
 /// The enrolment timeout message, said once.
 ///
 /// It was said three times and had already drifted into three different
@@ -839,4 +892,19 @@ pub(crate) async fn enroll_and_send_cmd(
 /// hit, where there is nobody watching to fill in the gap.
 fn enrollment_timeout(secs: u64) -> anyhow::Error {
     anyhow!("enrollment timed out after {secs}s (no response from peer)")
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::parse_lease;
+
+    #[test]
+    fn a_lease_is_a_bounded_duration() {
+        assert_eq!(parse_lease("120m").unwrap(), 7200);
+        assert_eq!(parse_lease("2h").unwrap(), 7200);
+        assert!(parse_lease("0s").is_err());
+        assert!(parse_lease("31d").is_err());
+        let err = parse_lease("soon").unwrap_err().to_string();
+        assert!(err.contains("TUNLION_LEASE"), "{err}");
+    }
 }
