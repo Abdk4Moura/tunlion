@@ -293,6 +293,19 @@ jobs:
           WEBSHELL_BROWSER: webkit
         run: node frontend/tests/webshell-scroll.spec.cjs
 
+      # Clipboard: pinned Paste/Select, xterm paste semantics (CR, bracketed
+      # paste), bracket-marker stripping, review of multi-line/large pastes,
+      # the refused-read paste sheet, native paste on the terminal, the iPad
+      # hardware Cmd+V readonly lift, and Select mode copy. Chromium runs the
+      # Android + desktop profiles, WebKit the iPad + iPhone + desktop ones.
+      - name: webshell-clipboard (Chromium / Android + desktop)
+        run: node frontend/tests/webshell-clipboard.spec.cjs
+
+      - name: webshell-clipboard (WebKit / iPad + iPhone + desktop)
+        env:
+          WEBSHELL_BROWSER: webkit
+        run: node frontend/tests/webshell-clipboard.spec.cjs
+
       # Screenshots are the evidence a browser actually rendered, rather than the
       # harness reporting on itself. Keep them when a gate fails.
       #
