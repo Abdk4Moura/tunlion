@@ -47,6 +47,9 @@ release build failed and nothing was published under it.
 - A remembered browser sending to a CLI device no longer waits 60 s and fails
   with "no peer connected": the link kept the device's pairing binding when a
   browser's channel replaced the direct attempt.
+- `tunlion shell` (and exec) from one of your devices to another that has not
+  granted it shell is refused within about 2 s, naming the
+  `tunlion grant <device> shell` to run, instead of timing out after 45 s.
 - A forgotten device is always told "not recognized", never "device revoked",
   whatever the timing.
 - Two control messages sent at the same moment over a data channel could
