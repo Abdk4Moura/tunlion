@@ -317,6 +317,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         room_digest_absent: HashMap::new(),
         recv_done: false,
         direct_pending: HashMap::new(),
+        lan: None,
         webrtc_only: std::collections::HashSet::new(),
         buffered_offers: HashMap::new(),
         promotions: HashMap::new(),
