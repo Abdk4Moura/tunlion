@@ -78,6 +78,14 @@ jobs:
           if [ "$WORKER_MODE" != 0 ]; then
             lock=$(gh api "repos/${GITHUB_REPOSITORY}/contents/Cargo.lock?ref=main" --jq '.sha')
             echo "CARGO_CACHE_KEY=$lock" >> "$GITHUB_ENV"
+            # The liveness probe is fetched from THIS commit and sourced below,
+            # so the gate suite executes the exact file the workflow runs. The
+            # job still needs no checkout.
+            liveness="$RUNNER_TEMP/ci-worker-liveness.sh"
+            gh api -H 'Accept: application/vnd.github.raw' \
+              "repos/${GITHUB_REPOSITORY}/contents/scripts/ci-worker-liveness.sh?ref=${GITHUB_SHA}" \
+              > "$liveness"
+            echo "CI_WORKER_LIVENESS=$liveness" >> "$GITHUB_ENV"
           fi
 
       - name: Restore the reusable worker's Cargo cache
@@ -151,11 +159,24 @@ jobs:
           else
             "$TUNLION_BIN" up --detach --dir "$WORK" --no-interactive
           fi
-          for i in $(seq 1 30); do
-            if "$TUNLION_BIN" status --json >/dev/null 2>&1; then break; fi
-            sleep 1
-          done
-          "$TUNLION_BIN" status --json
+          if (( WORKER_MINUTES > 0 )); then
+            # A lease that joins but never serves must fail HERE, not sleep for
+            # two hours. status --json exits 0 only while the daemon answers;
+            # the helper also requires ok:true/running:true in the object.
+            # shellcheck source=scripts/ci-worker-liveness.sh
+            . "$CI_WORKER_LIVENESS"
+            if ! ci_require_daemon 60; then
+              ci_worker_diagnostics
+              echo "::error::the worker daemon did not become live within 60s; ending the lease"
+              exit 7
+            fi
+          else
+            for i in $(seq 1 30); do
+              if "$TUNLION_BIN" status --json >/dev/null 2>&1; then break; fi
+              sleep 1
+            done
+            "$TUNLION_BIN" status --json
+          fi
 
       - name: Serve multiple jobs on this one worker
         if: inputs.worker_minutes != '0'
@@ -165,6 +186,15 @@ jobs:
           HOST_NAME: ${{ inputs.host_name }}
         run: |
           set -euo pipefail
+          # shellcheck source=scripts/ci-worker-liveness.sh
+          . "$CI_WORKER_LIVENESS"
+          # On an abnormal exit the hosted runner is about to disappear, so its
+          # daemon log is the only evidence left. Print it while we still can.
+          worker_teardown() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then ci_worker_diagnostics >&2 || true; fi
+          }
+          trap worker_teardown EXIT
           mkdir -p "$WORK/jobs" "$WORK/cargo-target" "$WORK/results"
           cat > "$WORK/worker.env" <<EOF
           export CARGO_BUILD_JOBS=2
@@ -177,11 +207,16 @@ jobs:
           printf 'Caller: %s; bounded session: %s minutes\n' "$HOST_NAME" "$WORKER_MINUTES"
           printf 'Reuse this box with tunlion exec/send; serialize builds with flock.\n'
           end=$(( $(date +%s) + WORKER_MINUTES * 60 ))
-          while (( $(date +%s) < end )); do
-            # A trusted caller can end the session without cancelling a run.
-            [ ! -f "$WORK/STOP" ] || break
-            sleep 10
-          done
+          # A trusted caller can end the session without cancelling a run, and
+          # an idle worker (nobody using it) is legitimate: only a daemon that
+          # is actually gone ends the step early. Three consecutive bounded
+          # status probes are required, so one slow read does not tear it down.
+          rc=0
+          ci_serve_until "$end" 10 3 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the worker daemon is gone (3 consecutive status probes failed); ending the lease instead of sleeping until the deadline"
+            exit "$rc"
+          fi
 
       - name: Wait for the job payload
         if: inputs.worker_minutes == '0'

@@ -22,6 +22,12 @@
 # failures that looked like product defects, with the only tell a single
 # `No space left on device` line nothing was watching for.
 
+# A shared worker wrapper can hold the build lock on fd 3 (see
+# core-receive-relay-nat-gates.sh), and scripts/cargo-locked.sh holds it on fd 9.
+# Drop those inherited descriptors here so no fixture child can keep the lock
+# wedged after this gate exits. The wrapper/parent keeps its own copy.
+exec 3>&- 2>/dev/null || true
+
 # --- assertion bookkeeping ---
 PASS=0; FAIL=0; FAILED=""
 say() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
@@ -90,16 +96,26 @@ declare_known_red_summary() {
 
 FIX_PIDS=()
 fixture_cleanup() {
+  local p
   for p in "${FIX_PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+  for p in "${FIX_PIDS[@]:-}"; do
+    for _ in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
+    kill -9 "$p" 2>/dev/null || true
+    wait "$p" 2>/dev/null || true
+  done
 }
 
 # Start the fixture signaling backend on $PORT and block until healthy.
+# `exec` makes the recorded PID the backend itself, not the wrapping subshell:
+# killing the subshell used to leave python app.py running. The two known
+# inherited lock descriptors are closed for the backend (fd 3 worker wrapper,
+# fd 9 cargo-locked) so it cannot keep the build queue wedged.
 start_backend() {
   for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
   sleep 1
-  ( cd "$CLI_DIR/../backend" && PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+  ( cd "$CLI_DIR/../backend" && exec env PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
       FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
-      "$PYV" app.py >"$WORK/backend.log" 2>&1 ) &
+      "$PYV" app.py ) >"$WORK/backend.log" 2>&1 3>&- 9>&- &
   FIX_PIDS+=($!)
   for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
   curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat "$WORK/backend.log"; exit 2; }
