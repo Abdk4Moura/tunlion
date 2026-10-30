@@ -214,6 +214,18 @@ pub struct Ceremony {
     /// (`handoff`, the make-before-break promotion). An older CLI advertises
     /// `direct` without this and still tears its WebRTC link down at confirm.
     peer_handoff: bool,
+    /// This side will send a pairing `identity-expose` (it holds a device
+    /// certificate) and re-send it until it is acknowledged. Advertised as
+    /// `exposes: true` next to `expose_ack: 1` on our PAKE payloads.
+    exposes: bool,
+    /// The peer acknowledges a pairing `identity-expose` (`expose_ack: 1`).
+    /// A 0.9.1 CLI and the browser do not: facing them the frame is sent the
+    /// old way, once, and nothing waits for an answer they never send.
+    peer_expose_ack: bool,
+    /// The peer said it will send an `identity-expose` (`exposes: true`), so
+    /// a pairing that ends without its certificate is a failure, not a
+    /// pairing with an uncertified device.
+    peer_exposes: bool,
 }
 
 /// Who a pairing ceremony should run with, given one inbound PAKE payload.
@@ -292,7 +304,41 @@ impl Ceremony {
             nameplate: nameplate.to_string(),
             peer_direct: false,
             peer_handoff: false,
+            exposes: false,
+            peer_expose_ack: false,
+            peer_exposes: false,
         }
+    }
+
+    /// Say, on our PAKE payloads, whether this side will send a pairing
+    /// `identity-expose`. Set before the first payload goes out; every copy of
+    /// a payload is then the same bytes. Not used by a temporary ceremony.
+    pub fn set_exposes(&mut self, exposes: bool) {
+        self.exposes = exposes;
+    }
+
+    /// Whether the peer acknowledges a pairing `identity-expose`.
+    pub fn peer_acks_expose(&self) -> bool {
+        self.peer_expose_ack
+    }
+
+    /// Whether the peer acknowledges `identity-expose` AND said it will send
+    /// one: its certificate must arrive before this pairing can succeed.
+    pub fn peer_will_expose(&self) -> bool {
+        self.peer_expose_ack && self.peer_exposes
+    }
+
+    /// The identity-expose advertisement (`expose_ack`, `exposes`) on a
+    /// standing pairing's PAKE payloads. A temporary ceremony refuses
+    /// identity frames, so it advertises nothing.
+    fn advertise_expose(&self, mut payload: Value) -> Value {
+        if self.temporary.is_none() {
+            payload["expose_ack"] = json!(1);
+            if self.exposes {
+                payload["exposes"] = json!(true);
+            }
+        }
+        payload
     }
 
     /// Explicit opt-in. No temporary-to-standing fallback is possible: purpose
@@ -443,13 +489,13 @@ impl Ceremony {
     /// claimer offering it to every peer that comes up in the room before the
     /// creator has spoken (only the creator, who holds the code, can use it).
     pub fn msg_payload(&self) -> Value {
-        self.decorate(json!({
+        self.advertise_expose(self.decorate(json!({
             "type": "pake-msg", "v": 2,
             "msg": b64_encode(&self.msg),
             "np": self.nameplate,
             "direct": true,
             "handoff": 1,
-        }))
+        })))
     }
 
     /// Send our element again, to a new partner: the peer it went to was a
@@ -527,14 +573,14 @@ impl Ceremony {
         // introduction token (or the fixed convention for plain pair).
         let canon = self.confirm_canon(my_fp, their_fp);
         let mac = filament_pair::our_confirm(k, my_fp, their_fp, &canon, self.scope);
-        Some(self.decorate(json!({
+        Some(self.advertise_expose(self.decorate(json!({
             "type": "pake-confirm", "v": 2,
             "mac": b64_encode(&mac),
             "msg": b64_encode(&self.msg),
             "caps": self.caps.clone(),
             "scope": self.scope,
             "np": self.nameplate,
-        })))
+        }))))
     }
 
     /// Whether K has been derived (the peer's element was consumed).
@@ -595,6 +641,17 @@ impl Ceremony {
             self.peer_direct = true;
             if data["handoff"].as_u64() == Some(1) {
                 self.peer_handoff = true;
+            }
+        }
+        // Read from either payload: the confirmation is re-sent until it
+        // verifies, so by the time a secret is agreed a copy carrying the
+        // advertisement has arrived even if every element copy was lost.
+        if self.temporary.is_none() && matches!(data["type"].as_str(), Some("pake-msg") | Some("pake-confirm")) {
+            if data["expose_ack"].as_u64() == Some(1) {
+                self.peer_expose_ack = true;
+                if data["exposes"].as_bool() == Some(true) {
+                    self.peer_exposes = true;
+                }
             }
         }
         match data["type"].as_str() {
@@ -1266,5 +1323,39 @@ mod tests {
         assert!(matches!(new_cli.on_signal(&from_old, None), Inbound::Consumed));
         assert!(new_cli.peer_supports_direct(), "0.9.1 still goes direct");
         assert!(!new_cli.peer_supports_handoff(), "0.9.1 cannot answer path-promote");
+    }
+
+    /// A current CLI advertises that it acknowledges identity-expose, and
+    /// whether it will send one; both payloads carry it, so a peer that lost
+    /// every element copy still learns it from the confirmation. A 0.9.1 CLI
+    /// sends neither field: facing it nothing waits for an acknowledgement.
+    #[test]
+    fn the_expose_advertisement_rides_both_payloads_and_0_9_1_sends_none() {
+        let scope = filament_id::IntroScope::Device.to_byte();
+        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut b = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        a.set_exposes(true);
+        let am = a.take_msg_payload().unwrap();
+        let bm = b.take_msg_payload().unwrap();
+        assert_eq!(am["expose_ack"], json!(1));
+        assert_eq!(am["exposes"], json!(true));
+        assert_eq!(bm["expose_ack"], json!(1));
+        assert!(bm.get("exposes").is_none(), "a side with no certificate says nothing about one");
+        // b loses a's element: the confirmation alone carries the advertisement.
+        a.on_signal(&bm, None);
+        let ac = a.take_confirm_payload(A_FPS.0, A_FPS.1).unwrap();
+        assert_eq!(ac["expose_ack"], json!(1));
+        assert_eq!(ac["exposes"], json!(true));
+        assert!(matches!(b.on_signal(&ac, Some(B_FPS)), Inbound::Consumed));
+        assert!(b.peer_acks_expose() && b.peer_will_expose());
+        assert!(!a.peer_will_expose() && a.peer_acks_expose());
+
+        // 0.9.1: the same payload without the two new fields.
+        let mut new_cli = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut old = am.clone();
+        old.as_object_mut().unwrap().remove("expose_ack");
+        new_cli.on_signal(&old, None);
+        assert!(!new_cli.peer_acks_expose() && !new_cli.peer_will_expose(),
+            "`exposes` without `expose_ack` is not the new protocol");
     }
 }

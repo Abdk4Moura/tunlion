@@ -532,6 +532,124 @@ pub(crate) fn open_identity_expose(
     }
 }
 
+/// Our sealed `identity-expose`: this device's certificate and a possession
+/// signature over this ceremony's confirmation MAC, sealed under the PAKE key.
+/// `sign` signs with the device key. Pure over its inputs; the caller builds it
+/// once and every copy it sends is these bytes.
+pub(crate) fn build_identity_expose(
+    k: &[u8],
+    my_fp: &str,
+    their_fp: &str,
+    caps_canon: &str,
+    scope: u8,
+    cert: &identity::DeviceCert,
+    sign: &dyn Fn(&[u8]) -> Option<[u8; 64]>,
+) -> Option<Value> {
+    let cmv: [u8; 32] = crate::pake::our_confirm(k, my_fp, their_fp, caps_canon, scope).try_into().ok()?;
+    let dpub = cert.device_pub;
+    let pmsg = identity::possession_msg(
+        0x01,
+        &cmv,
+        scope,
+        &identity::caps_digest(caps_canon),
+        &identity::cert_hash(cert),
+        &dpub,
+        &[0u8; 32],
+    );
+    let psig = sign(&pmsg)?;
+    let inner = json!({"cert": cert.to_json(), "possession_sig": hex::encode(psig), "device_pub": hex::encode(dpub)});
+    let (n, sealed) = identity::seal_plaintext(&identity::sealing_key_from_k(k), inner.to_string().as_bytes()).ok()?;
+    Some(json!({"type": "identity-expose", "v": 2, "nonce": hex::encode(n), "sealed": hex::encode(sealed)}))
+}
+
+// PROTOCOL LITERAL: frozen, do not rename (sealed body of identity-expose-ack).
+const EXPOSE_ACK_PLAIN: &str = "tunlion-identity-expose-ack-v1:";
+
+/// The acknowledgement of the peer's `identity-expose` whose nonce is `of`,
+/// sealed under this ceremony's key so only the peer can read it and the
+/// server cannot make one up. Built once per pairing.
+pub(crate) fn seal_expose_ack(k: &[u8], of: &str) -> Option<Value> {
+    let (n, sealed) = identity::seal_plaintext(
+        &identity::sealing_key_from_k(k),
+        format!("{EXPOSE_ACK_PLAIN}{of}").as_bytes(),
+    )
+    .ok()?;
+    Some(json!({
+        "type": filament_peerloop::expose::ACK_TYPE,
+        "v": 1,
+        "nonce": hex::encode(n),
+        "sealed": hex::encode(sealed),
+    }))
+}
+
+/// Open an `identity-expose-ack`: the nonce of the frame it acknowledges, or
+/// `None` when it does not open under this ceremony's key.
+pub(crate) fn open_expose_ack(k: &[u8], data: &Value) -> Option<String> {
+    let nonce: [u8; 12] = hex::decode(data["nonce"].as_str()?).ok()?.as_slice().try_into().ok()?;
+    let sealed = hex::decode(data["sealed"].as_str()?).ok()?;
+    let plain = identity::open_sealed(&identity::sealing_key_from_k(k), &nonce, &sealed).ok()?;
+    String::from_utf8(plain).ok()?.strip_prefix(EXPOSE_ACK_PLAIN).map(str::to_string)
+}
+
+/// A refusal from [`open_identity_expose`] as the exchange sees it: the two
+/// that only mean "not yet" are checked again on a later copy; every other
+/// one would refuse every copy, since every copy is the same bytes.
+pub(crate) fn expose_verdict_for_refusal(why: &str) -> filament_peerloop::expose::Verdict {
+    use filament_peerloop::expose::Verdict;
+    match why {
+        "no key exchange yet" | "this link's fingerprints are not known" => Verdict::NotYet,
+        other => Verdict::Refused(other.to_string()),
+    }
+}
+
+/// What a pairing that could not deliver or receive a certificate says. It
+/// failed, on this side: nothing was stored here.
+pub(crate) fn expose_unmet_msg(unmet: &filament_peerloop::expose::Unmet, peer: &str) -> String {
+    use filament_peerloop::expose::Unmet;
+    match unmet {
+        Unmet::CertMissing => format!(
+            "pairing did not finish: {peer} said it would send its device certificate, and it never arrived. \
+             Nothing was stored; run the pairing again with a FRESH code"
+        ),
+        Unmet::CertRefused(why) => format!(
+            "pairing REFUSED: {peer}'s device certificate did not verify ({why}). \
+             Nothing was stored; ask for a FRESH code"
+        ),
+        Unmet::NotAcknowledged => format!(
+            "pairing did not finish: {peer} never confirmed it received this device's certificate. \
+             Nothing was stored here; run the pairing again with a FRESH code"
+        ),
+    }
+}
+
+/// After a pairing succeeded on this side, keep answering the peer's re-sent
+/// `identity-expose` with the same acknowledgement: our first answer may have
+/// been lost, and without it the peer fails at its deadline. Ends when the peer
+/// leaves, or after a quiet spell with no copy (see `expose::LINGER_QUIET`).
+async fn linger_answering_expose(
+    sio: &filament_signal::Client,
+    rx: &mut mpsc::UnboundedReceiver<Ev>,
+    x: &mut filament_peerloop::expose::ExposeExchange,
+    peer: Option<&str>,
+    ack: Option<&Value>,
+) {
+    let (Some(peer), Some(ack)) = (peer, ack) else { return };
+    let since = Instant::now();
+    while !x.linger_over(Instant::now(), since) {
+        match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+            Ok(Some(Ev::Signal(v))) => {
+                if v["from"].as_str() == Some(peer) && v["data"]["type"].as_str() == Some("identity-expose") {
+                    x.note_copy(Instant::now());
+                    sio.emit("signal", json!({ "to": peer, "data": ack })).await.ok();
+                }
+            }
+            Ok(Some(Ev::PeerLeft(v))) if v["id"].as_str() == Some(peer) => break,
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => break,
+        }
+    }
+}
+
 /// Certify `dpub` with the owner key and seal the grant under this ceremony's
 /// key, ready to send as the `data` of a signal.
 fn seal_enrol_grant(
@@ -1039,7 +1157,11 @@ async fn pair_with_purpose(
     let mut grant_refused: Option<String> = None;
     // "Verified end to end" is printed once, when key confirmation passes.
     let mut verified_shown = false;
-    let mut sent_identity: bool = false;
+    // Delivery of our identity-expose and receipt of the peer's (see
+    // `filament_peerloop::expose`), and our acknowledgement of the peer's,
+    // built once so every copy is the same bytes.
+    let mut expose_x = filament_peerloop::expose::ExposeExchange::new();
+    let mut expose_ack: Option<Value> = None;
     let mut identity_exchange_window: Option<std::time::Instant> = None;
     // Peer signaling sid we run the PAKE with (set when the link is adopted).
     let mut pake_peer: Option<String> = None;
@@ -1053,6 +1175,13 @@ async fn pair_with_purpose(
         Some(session) => session.ceremony(&my_words, &my_nameplate),
         None => Ceremony::new(&my_words, &my_nameplate, caps.clone(), scope),
     };
+    // Say in our PAKE payloads whether we will send a certificate, so a peer
+    // that acknowledges identity-expose knows to wait for it.
+    let exposes_at_start = temporary.is_none() && local_device_cert().is_some();
+    cer.set_exposes(exposes_at_start);
+    if exposes_at_start {
+        expose_x.promise();
+    }
     // A joining client waits for the host's first element so the authenticated
     // purpose can choose temporary access without ever entering permanent pairing.
     let mut host_element_received = creator;
@@ -1162,68 +1291,23 @@ async fn pair_with_purpose(
         if temporary.is_none() {
         if let Some(n) = petname.clone() {
             if let Some(sec) = agreed_secret.clone() {
-                if identity_exchange_window.map_or(false, |dl| std::time::Instant::now() < dl)
-                    && peer_identity_cert.is_none()
-                {
-                    // A device that holds NO certificate yet still has a device
-                    // key, and that key is the thing an owner must certify. The
-                    // exchange below is gated on having a cert to present, so a
-                    // fresh machine said nothing at all and the owner had nothing
-                    // to sign. That is why `add` could never enrol anybody.
-                    //
-                    // Expose the key alone, sealed under the PAKE key and proven
-                    // by possession. It confers nothing by itself: the owner still
-                    // has to decide to certify it, and only does so when the
-                    // operator asked for --internal.
-                    // The certless device's key offer is sent (and re-sent) by the
-                    // block above, outside this short window.
-                    if !sent_identity {
-                        if let Some(local_cert) = local_device_cert() {
-                            if let Some(ref pid2) = pake_peer {
-                                if let Some(k) = cer.k() {
-                                    if let Some(l) = conn.link(pid2) {
-                                        if let Some((my_fp, their_fp)) = match &l.peer {
-                                            Some(p) => p.fingerprints().await,
-                                            None => None,
-                                        } {
-                                            let cmv = crate::pake::our_confirm(
-                                                k,
-                                                &my_fp,
-                                                &their_fp,
-                                                cer.caps_canon(),
-                                                cer.scope(),
-                                            );
-                                            let mut cmv_arr = [0u8; 32];
-                                            cmv_arr.copy_from_slice(&cmv);
-                                            let dpub = local_cert.device_pub;
-                                            let scope_b = cer.scope();
-                                            let caps_d =
-                                                crate::identity::caps_digest(cer.caps_canon());
-                                            let ch = crate::identity::cert_hash(&local_cert);
-                                            let rz = [0u8; 32];
-                                            let pmsg = crate::identity::possession_msg(
-                                                0x01, &cmv_arr, scope_b, &caps_d, &ch, &dpub, &rz,
-                                            );
-                                            if let Ok(psig) =
-                                                crate::overlay::overlay_sign_possession(&pmsg)
-                                            {
-                                                let inner = serde_json::json!({"cert":local_cert.to_json(),"possession_sig":hex::encode(psig),"device_pub":hex::encode(dpub)});
-                                                let sk = crate::identity::sealing_key_from_k(k);
-                                                if let Ok((n, s)) = crate::identity::seal_plaintext(
-                                                    &sk,
-                                                    inner.to_string().as_bytes(),
-                                                ) {
-                                                    sio.emit("signal", serde_json::json!({"to":pid2,"data":{"type":"identity-expose","v":2,"nonce":hex::encode(n),"sealed":hex::encode(s)}})).await.ok();
-                                                    sent_identity = true;
-                                                    ui::debug(&format!("pair: identity-expose sent to {pid2}"));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                // The peer's certificate, and the acknowledgement of ours, are
+                // waited for here. A peer that acknowledges identity-expose
+                // (`expose_ack`) said whether it will send one, so the wait is
+                // exact: until its certificate verified and ours was
+                // acknowledged, bounded by the ceremony deadline below. A peer
+                // that does not (0.9.1, the browser) gets the old short window.
+                //
+                // A device that holds NO certificate yet still has a device key,
+                // and that key is the thing an owner must certify: the
+                // certless device's key offer is sent (and re-sent) by the
+                // block at the top of the loop, outside this wait.
+                let legacy_window = !cer.peer_acks_expose()
+                    && identity_exchange_window.map_or(false, |dl| std::time::Instant::now() < dl)
+                    && peer_identity_cert.is_none();
+                if legacy_window || expose_x.waiting(cer.peer_acks_expose(), cer.peer_will_expose()) {
+                    // Fall through to the event loop: the frames being waited
+                    // for are read there.
                 } else {
                     // We offered our device key and the owner has not answered yet.
                     // Wait, bounded: if no grant arrives we finish as an ordinary
@@ -1258,6 +1342,12 @@ async fn pair_with_purpose(
                         }
                     };
                     if !awaiting_enrolment {
+                        // The peer said it would send its certificate and the
+                        // one that came did not verify: never a pairing with an
+                        // uncertified device. Nothing has been stored yet.
+                        if let Some(unmet) = expose_x.unmet(cer.peer_acks_expose(), cer.peer_will_expose()) {
+                            bail!("{}", expose_unmet_msg(&unmet, &n));
+                        }
                         let same_person = peer_identity_cert
                             .as_ref()
                             .and_then(|cert| {
@@ -1482,7 +1572,14 @@ async fn pair_with_purpose(
                             grant_refused: grant_refused.clone(),
                         });
                         let failed = report_enrolment_outcome(&outcome, &n);
-                        tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
+                        if expose_x.should_linger() {
+                            // We acknowledged the peer's certificate, and that
+                            // acknowledgement may be lost: answer re-sent copies
+                            // until the peer leaves or stops sending.
+                            linger_answering_expose(&sio, &mut rx, &mut expose_x, pake_peer.as_deref(), expose_ack.as_ref()).await;
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
+                        }
                         let _ = sio.disconnect().await;
                         if let Some(e) = failed {
                             return Err(e);
@@ -1514,6 +1611,12 @@ async fn pair_with_purpose(
             && (own_prompt.is_some() || pending_offer.is_some() || ack_deadline.is_some() || (got_hold && !enrol_settled));
         if let Some(dl) = ceremony_deadline.filter(|_| !person_deciding && !active_temporary && !(temporary.is_some() && cer.secret().is_some())) {
             if Instant::now() > dl {
+                if agreed_secret.is_some() {
+                    if let Some(unmet) = expose_x.unmet(cer.peer_acks_expose(), cer.peer_will_expose()) {
+                        let who = petname.clone().unwrap_or_else(|| "the other device".into());
+                        bail!("{}", expose_unmet_msg(&unmet, &who));
+                    }
+                }
                 bail!(
                     "the other device disconnected before setup finished; keep `tunlion add` running on one device while the other runs `tunlion join <code>`, then try again"
                 );
@@ -1561,73 +1664,41 @@ async fn pair_with_purpose(
             // device cert, send EXACTLY ONE device + its cert sealed under K-derived key
             // with possession signature, inside the authed channel. Server never sees
             // user key (sealed) and cannot substitute (possession sig binds to session).
-            if temporary.is_none() && !sent_identity {
-                if agreed_secret.is_some() {
-                    if let Some(local_cert) = local_device_cert() {
-                        if let Some(pid2) = pake_peer.clone() {
-                            if let Some(k) = cer.k() {
-                                if let Some(l) = conn.link(&pid2) {
-                                    if let Some((my_fp, their_fp)) = match &l.peer {
-                                        Some(p) => p.fingerprints().await,
-                                        None => None,
-                                    } {
-                                        // Confirm MAC that we sent (session-bound, already binds K+fps+caps+scope)
-                                        let confirm_mac_vec = crate::pake::our_confirm(
-                                            k,
-                                            &my_fp,
-                                            &their_fp,
-                                            cer.caps_canon(),
-                                            cer.scope(),
-                                        );
-                                        let mut cmv_arr = [0u8; 32];
-                                        cmv_arr.copy_from_slice(&confirm_mac_vec);
-                                        let device_pub = local_cert.device_pub;
-                                        let scope_byte = cer.scope();
-                                        let caps_digest =
-                                            crate::identity::caps_digest(cer.caps_canon());
-                                        let chash = crate::identity::cert_hash(&local_cert);
-                                        let receiver_zero = [0u8; 32];
-                                        let possession_msg = crate::identity::possession_msg(
-                                            0x01,
-                                            &cmv_arr,
-                                            scope_byte,
-                                            &caps_digest,
-                                            &chash,
-                                            &device_pub,
-                                            &receiver_zero,
-                                        );
-                                        if let Ok(possession_sig) =
-                                            crate::overlay::overlay_sign_possession(&possession_msg)
-                                        {
-                                            let inner = serde_json::json!({
-                                                "cert": local_cert.to_json(),
-                                                "possession_sig": hex::encode(possession_sig),
-                                                "device_pub": hex::encode(device_pub)
-                                            });
-                                            let sealing_key =
-                                                crate::identity::sealing_key_from_k(k);
-                                            if let Ok((nonce, sealed)) =
-                                                crate::identity::seal_plaintext(
-                                                    &sealing_key,
-                                                    inner.to_string().as_bytes(),
-                                                )
-                                            {
-                                                let payload = serde_json::json!({
-                                                    "type": "identity-expose",
-                                                    "v": 2,
-                                                    "nonce": hex::encode(nonce),
-                                                    "sealed": hex::encode(sealed)
-                                                });
-                                                sio.emit("signal", serde_json::json!({"to": pid2, "data": payload})).await.ok();
-                                                sent_identity = true;
-                                                ui::debug(&format!("pair: identity-expose sent to {pid2}"));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+            // Built once; a peer that acknowledges it gets the same frame again on the
+            // #597 backoff until it does (see `filament_peerloop::expose`). Facing such
+            // a peer only a certificate advertised at the start is sent: a device
+            // certified during this ceremony was certified BY the peer, which holds it.
+            if temporary.is_none()
+                && agreed_secret.is_some()
+                && !expose_x.offered()
+                && (exposes_at_start || !cer.peer_acks_expose())
+            {
+                if let (Some(local_cert), Some(k)) = (local_device_cert(), cer.k()) {
+                    let fps = match conn.link(&pid) {
+                        Some(l) => match &l.peer {
+                            Some(p) => p.fingerprints().await,
+                            None => None,
+                        },
+                        None => None,
+                    };
+                    if let Some((my_fp, their_fp)) = fps {
+                        let sign = |m: &[u8]| crate::overlay::overlay_sign_possession(m).ok();
+                        if let Some(payload) =
+                            build_identity_expose(k, &my_fp, &their_fp, cer.caps_canon(), cer.scope(), &local_cert, &sign)
+                        {
+                            expose_x.offer(payload);
                         }
                     }
+                }
+            }
+            let peer_acks = cer.peer_acks_expose();
+            if let Some(payload) = expose_x.take_due(Instant::now(), peer_acks) {
+                let ack_note = if peer_acks { "" } else { " (peer does not acknowledge)" };
+                if test_hooks::drop_identity_expose() {
+                    ui::debug(&format!("pair: identity-expose to {pid} dropped by the test hook{ack_note}"));
+                } else {
+                    sio.emit("signal", json!({"to": pid, "data": payload})).await.ok();
+                    ui::debug(&format!("pair: identity-expose sent to {pid}{ack_note}"));
                 }
             }
         }
@@ -1635,7 +1706,8 @@ async fn pair_with_purpose(
         let poll_interval = temporary.as_ref().map_or(Duration::from_secs(2), |session| session.poll_interval());
         // A ceremony in flight re-sends its current message on a sub-second
         // backoff from the progression block above, so tick at that cadence.
-        let poll_interval = if (pake_peer.is_some() && agreed_secret.is_none()) || own_prompt.is_some() || ack_deadline.is_some() {
+        let expose_pending = expose_x.waiting(cer.peer_acks_expose(), cer.peer_will_expose());
+        let poll_interval = if (pake_peer.is_some() && agreed_secret.is_none()) || own_prompt.is_some() || ack_deadline.is_some() || expose_pending {
             poll_interval.min(Duration::from_millis(100))
         } else {
             poll_interval
@@ -1817,6 +1889,8 @@ async fn pair_with_purpose(
                             let session = crate::temporary_session::Session::recipient(binding);
                             cer = session.ceremony(&my_words, &my_nameplate);
                             temporary = Some(session);
+                            // Temporary access sends and expects no identity frames.
+                            expose_x = filament_peerloop::expose::ExposeExchange::new();
                         }
                         host_element_received = true;
                     }
@@ -2081,12 +2155,39 @@ async fn pair_with_purpose(
                         ),
                         None => Err("no key exchange yet"),
                     };
-                    match opened {
+                    let verdict = match opened {
                         Ok(cert) => {
                             ui::debug(&format!("pair: identity-expose from {from} accepted"));
                             peer_identity_cert = Some(cert);
+                            filament_peerloop::expose::Verdict::Accepted
                         }
-                        Err(why) => ui::debug(&format!("pair: identity-expose from {from} refused: {why}")),
+                        Err(why) => {
+                            ui::debug(&format!("pair: identity-expose from {from} refused: {why}"));
+                            expose_verdict_for_refusal(why)
+                        }
+                    };
+                    // Only the ceremony's partner is answered, and only a peer
+                    // that acknowledges (a 0.9.1 CLI would misroute the type).
+                    let partner = pake_peer.as_deref() == Some(from.as_str());
+                    if partner && expose_x.on_peer_frame(Instant::now(), verdict, cer.peer_acks_expose()) {
+                        if expose_ack.is_none() {
+                            expose_ack = cer.k().and_then(|k| data["nonce"].as_str().and_then(|of| seal_expose_ack(k, of)));
+                        }
+                        if let Some(ack) = expose_ack.clone() {
+                            sio.emit("signal", json!({ "to": from, "data": ack })).await.ok();
+                        }
+                    }
+                    continue;
+                }
+                // The peer says our certificate arrived. Sealed under K, so the
+                // server cannot claim it for the peer. Never answered.
+                if data["type"].as_str() == Some(filament_peerloop::expose::ACK_TYPE) {
+                    if pake_peer.as_deref() == Some(from.as_str()) {
+                        if let Some(of) = cer.k().and_then(|k| open_expose_ack(k, &data)) {
+                            if expose_x.on_ack(&of) {
+                                ui::debug(&format!("pair: identity-expose acknowledged by {from}"));
+                            }
+                        }
                     }
                     continue;
                 }
@@ -2663,5 +2764,117 @@ mod identity_expose_tests {
         let mut torn = frame.clone();
         torn["nonce"] = json!("00");
         assert_eq!(why(open_identity_expose(&torn, &k, Some((b, a)), "transfer", 0x01, mine, now)), "nonce is not 12 bytes");
+    }
+
+    /// The frame the ceremony now builds (`build_identity_expose`) is the one
+    /// the receiver opens; the acknowledgement opens only under the same K.
+    #[test]
+    fn the_built_frame_opens_and_the_ack_is_bound_to_k() {
+        let k = [5u8; 32];
+        let (a, b) = ("AA:11", "BB:22");
+        let dev = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[9u8; 32]).unwrap();
+        let dpub: [u8; 32] = dev.public_key().as_ref().try_into().unwrap();
+        let owner = identity::UserKey::from_seed(&[3u8; 32]).unwrap();
+        let cert = identity::DeviceCert::certify(&owner, dpub, identity::now_secs(), identity::CERT_TTL_SECS).unwrap();
+        let sign = |m: &[u8]| dev.sign(m).as_ref().try_into().ok();
+        let frame = build_identity_expose(&k, a, b, "transfer", 0x01, &cert, &sign).unwrap();
+        let got = open_identity_expose(&frame, &k, Some((b, a)), "transfer", 0x01, Some([1u8; 32]), identity::now_secs()).unwrap();
+        assert_eq!(got.device_pub, dpub);
+        let of = frame["nonce"].as_str().unwrap();
+        let ack = seal_expose_ack(&k, of).unwrap();
+        assert_eq!(ack["type"], json!("identity-expose-ack"));
+        assert_eq!(open_expose_ack(&k, &ack).as_deref(), Some(of));
+        assert_eq!(open_expose_ack(&[6u8; 32], &ack), None, "the server cannot make one up");
+        let mut forged = ack.clone();
+        forged["sealed"] = json!("00");
+        assert_eq!(open_expose_ack(&k, &forged), None);
+        assert!(!ack.to_string().contains(of), "the acknowledged nonce rides sealed");
+    }
+
+    /// Both sides of a pairing where `a` holds a certificate, over a signaling
+    /// relay that drops the first `drop` copies of a's identity-expose (all of
+    /// them for usize::MAX) and the first `drop_acks` acknowledgements. Real
+    /// frames, real checks, real acknowledgements; only the wire is simulated.
+    /// Returns what each side still lacks at the deadline, and whether b holds
+    /// a's certificate.
+    fn pair_over_lossy_relay(drop: usize, drop_acks: usize) -> (Option<filament_peerloop::expose::Unmet>, Option<filament_peerloop::expose::Unmet>, bool) {
+        use filament_peerloop::expose::ExposeExchange;
+        let k = [5u8; 32];
+        let (a_fp, b_fp) = ("AA:11", "BB:22");
+        let dev = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[9u8; 32]).unwrap();
+        let dpub: [u8; 32] = dev.public_key().as_ref().try_into().unwrap();
+        let owner = identity::UserKey::from_seed(&[3u8; 32]).unwrap();
+        let cert = identity::DeviceCert::certify(&owner, dpub, identity::now_secs(), identity::CERT_TTL_SECS).unwrap();
+        let sign = |m: &[u8]| dev.sign(m).as_ref().try_into().ok();
+        // a advertised `exposes: true`, b did not; both acknowledge.
+        let (peer_acks, a_will, b_will) = (true, true, false);
+        let mut ax = ExposeExchange::new();
+        let mut bx = ExposeExchange::new();
+        ax.offer(build_identity_expose(&k, a_fp, b_fp, "transfer", 0x01, &cert, &sign).unwrap());
+        let mut b_cert = None;
+        let mut b_ack: Option<Value> = None;
+        let (mut copies, mut acks) = (0usize, 0usize);
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_secs(60);
+        let mut t = t0;
+        while t < deadline && (ax.waiting(peer_acks, b_will) || bx.waiting(peer_acks, a_will)) {
+            if let Some(f) = ax.take_due(t, peer_acks) {
+                copies += 1;
+                if copies > drop {
+                    let opened = open_identity_expose(&f, &k, Some((b_fp, a_fp)), "transfer", 0x01, Some([1u8; 32]), identity::now_secs());
+                    let verdict = match opened {
+                        Ok(c) => {
+                            b_cert = Some(c);
+                            filament_peerloop::expose::Verdict::Accepted
+                        }
+                        Err(why) => expose_verdict_for_refusal(why),
+                    };
+                    if bx.on_peer_frame(t, verdict, peer_acks) {
+                        let ack = b_ack.get_or_insert_with(|| seal_expose_ack(&k, f["nonce"].as_str().unwrap()).unwrap()).clone();
+                        acks += 1;
+                        if acks > drop_acks {
+                            if let Some(of) = open_expose_ack(&k, &ack) {
+                                ax.on_ack(&of);
+                            }
+                        }
+                    }
+                }
+            }
+            t += Duration::from_millis(10);
+        }
+        (ax.unmet(peer_acks, b_will), bx.unmet(peer_acks, a_will), b_cert.is_some_and(|c| c.device_pub == dpub))
+    }
+
+    #[test]
+    fn the_certificate_lands_when_the_first_identity_expose_frames_are_lost() {
+        for drop in [0, 1, 2, 3, 5, 10] {
+            assert_eq!(pair_over_lossy_relay(drop, 0), (None, None, true), "first {drop} frames lost");
+        }
+        // The acknowledgement lost too: the next copy is answered again.
+        assert_eq!(pair_over_lossy_relay(2, 3), (None, None, true));
+    }
+
+    #[test]
+    fn every_identity_expose_frame_lost_fails_both_sides() {
+        use filament_peerloop::expose::Unmet;
+        let (a, b, landed) = pair_over_lossy_relay(usize::MAX, 0);
+        assert_eq!(a, Some(Unmet::NotAcknowledged), "the sender must not report success");
+        assert_eq!(b, Some(Unmet::CertMissing), "the receiver must not report success");
+        assert!(!landed);
+        let said = expose_unmet_msg(&Unmet::CertMissing, "laptop");
+        assert!(said.contains("laptop said it would send its device certificate") && said.contains("Nothing was stored"), "{said}");
+        let said = expose_unmet_msg(&Unmet::NotAcknowledged, "laptop");
+        assert!(said.contains("never confirmed it received"), "{said}");
+    }
+
+    #[test]
+    fn only_a_transient_refusal_waits_for_another_copy() {
+        use filament_peerloop::expose::Verdict;
+        assert_eq!(expose_verdict_for_refusal("no key exchange yet"), Verdict::NotYet);
+        assert_eq!(expose_verdict_for_refusal("this link's fingerprints are not known"), Verdict::NotYet);
+        assert_eq!(
+            expose_verdict_for_refusal("seal does not open under this ceremony's key"),
+            Verdict::Refused("seal does not open under this ceremony's key".into())
+        );
     }
 }

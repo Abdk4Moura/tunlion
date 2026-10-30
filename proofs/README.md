@@ -428,6 +428,36 @@ Mutants that must fail: `no-sig`, `no-target` (P1), `no-monotone` (P6),
 the first version of this model, because the use-time expiry check masked it;
 acceptance is now checked on the transition itself.
 
+## Companion: the pairing certificate delivery model
+
+`identity_expose_model.py` checks the delivery of a code pairing's device
+certificate (`identity-expose`, CONTRACT.md "Pairing certificates"). Sender A
+holds a certificate, receiver B does not (a mutual pairing is two independent
+instances), each side is 0.9.2 or 0.9.1, the relay loses up to F frames and
+reorders the rest, and A sends at most R copies before its deadline. It proves,
+for every version mix and F in 0..R+1: no side reports success unless B holds
+the certificate (new/new); no deadlock; GoodNet ends with both OK and the
+certificate delivered; with F < R the certificate always lands, and A fails
+only when a copy was lost while B lingered (it cannot know it landed); a 0.9.1
+peer never fails from this machinery and never receives an acknowledgement.
+Mutants that must be caught: send-once (the 0.9.1 behaviour), no-wait,
+ack-once, no-linger, ack-to-old, no-promise (the sender completing before its
+promised frame went out, which CI found in the first push).
+
+| model | code |
+|---|---|
+| A `copies`, re-send while `peer_acks and not acked` | `ExposeExchange::take_due` (crates/filament-peerloop/src/expose.rs), called each tick in `pair_with_purpose` |
+| `peer_acks` / `b_expects` | `Ceremony::peer_acks_expose` / `peer_will_expose` (`expose_ack`, `exposes` on pake-msg and pake-confirm) |
+| B acknowledges every accepted copy | `ExposeExchange::on_peer_frame` + `seal_expose_ack` (cli/src/pair_cmd.rs) |
+| B waits for the certificate, A for the acknowledgement | `ExposeExchange::waiting`, the completion gate in `pair_with_purpose` |
+| deadline FAIL | `ExposeExchange::unmet` at the ceremony deadline (`expose_unmet_msg`) |
+| LINGER | `linger_answering_expose`, `expose::LINGER_QUIET` |
+
+Boundary: the deadline is a copy count, not a clock; the linger's quiet timer is
+modelled as firing only after a copy was lost during it (the sender's widest
+re-send gap is inside the quiet window). Timing is covered by the unit tests in
+expose.rs and the live gates in cli/tests/identity-expose-gates.sh.
+
 ## Companion: the bootstrap card reference codec
 
 `card_vectors.py` is not a model checker; it is the other kind of evidence.
