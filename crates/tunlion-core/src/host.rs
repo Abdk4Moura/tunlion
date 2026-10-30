@@ -405,6 +405,12 @@ impl HostServices for CoreHost {
             .unwrap_or(false)
     }
 
+    fn cert_forgotten_for(&self, device_pub: Option<&[u8; 32]>) -> bool {
+        device_pub
+            .map(|p| self.store.device_key_revoked(p, now_secs()))
+            .unwrap_or(false)
+    }
+
     fn delegated_access_for(&self, device_pub: &[u8; 32]) -> Option<DelegatedAccess> {
         delegated_access_for(&self.store, device_pub)
     }
@@ -466,6 +472,15 @@ impl HostServices for CoreHost {
 
     fn live_session_cut(&self, idev: Option<&[u8; 32]>) -> Option<LiveCut> {
         let idev = idev?;
+        // The forget block first: `device_cert_revoked` folds it in, and a
+        // forgotten device must read "not recognized", not "device revoked".
+        if self.store.device_key_revoked(idev, now_secs()) {
+            return Some(LiveCut {
+                cause: LiveCutCause::Forgotten,
+                expires_at: None,
+                reason: filament_peerloop::refusal::UNRECOGNIZED_REASON.to_string(),
+            });
+        }
         if self.store.device_cert_revoked(idev) {
             return Some(LiveCut {
                 cause: LiveCutCause::Revoked,

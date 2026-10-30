@@ -77,6 +77,47 @@ pub fn sibling_link_must_close(
     revoked(dev) || cert_expires.is_some_and(|exp| exp <= now)
 }
 
+/// What the peer on a link the sweep is about to close is told, in the
+/// product's two words for "this ended".
+///
+/// `forget` and `revoke` are different promises: one says "I no longer
+/// recognize this device" (`Code::Unrecognized`, "not recognized"), the other
+/// "I still know it and cut it off" (`Code::CertRevoked`, "device revoked").
+/// The peer must hear which one it met.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkCut {
+    /// The device is not recognized here any more (or never was).
+    Forgotten,
+    /// The device is still known, and its access was revoked.
+    Revoked,
+}
+
+/// Classify a link the sweep is closing.
+///
+/// A link is FORGOTTEN when the store no longer holds the pair secret that
+/// proves it (`secret_forgotten`), or when its device key is on the forget
+/// block in `revoked-keys.json` (`key_on_forget_block`). `devices forget` is
+/// the only writer of that block, and an explicit re-add or `promote` lifts it,
+/// so it means exactly "forgotten", never an in-place revoke or an expiry.
+///
+/// The key block wins even while the record is still visible: `forget` writes
+/// the block FIRST and drops the record after (revocation-first, so there is no
+/// window in which fleet-hello re-admits the key), and the daemon's store poll
+/// can land between the two writes. Reading that instant as "revoked" made the
+/// same forget answer differently from run to run, and a fleet-only link (no
+/// pair secret, so no secret to see removed) answer "revoked" every time.
+///
+/// Everything else the sweep closes - a sibling the owner's signed roster no
+/// longer lists, or whose certificate ran out - is a genuine revocation and
+/// stays [`LinkCut::Revoked`]. Pure.
+pub fn link_cut_reason(secret_forgotten: bool, key_on_forget_block: bool) -> LinkCut {
+    if secret_forgotten || key_on_forget_block {
+        LinkCut::Forgotten
+    } else {
+        LinkCut::Revoked
+    }
+}
+
 /// Must this link lose its overlay route?
 pub fn route_must_withdraw(
     device_pub: Option<&[u8; 32]>,
@@ -118,5 +159,43 @@ mod sibling_cut_tests {
         // whatever the other inputs say. Pairwise links keep their own rules.
         assert!(!sibling_link_must_close(false, Some(&dev), Some(1), 100, &always));
         assert!(!sibling_link_must_close(false, None, None, 100, &always));
+    }
+}
+
+#[cfg(test)]
+mod link_cut_tests {
+    use super::{LinkCut, link_cut_reason};
+
+    /// A paired device whose secret left the store was forgotten: every later
+    /// open is refused as unrecognized, and the running exec must hear the same.
+    #[test]
+    fn a_removed_pair_secret_is_a_forget() {
+        assert_eq!(link_cut_reason(true, false), LinkCut::Forgotten);
+    }
+
+    /// A fleet-only link carries no pair secret, so nothing in the link shows
+    /// the removal. The forget block does, and it is the only signal there is.
+    #[test]
+    fn a_fleet_only_link_cut_by_the_forget_block_is_a_forget() {
+        assert_eq!(link_cut_reason(false, true), LinkCut::Forgotten);
+    }
+
+    /// `forget` writes the key block BEFORE it drops the record. The daemon's
+    /// store poll can see exactly that instant: the record is still listed, so
+    /// no secret looks removed, but the block already names the key. It must
+    /// read as forgotten, or the same forget answers differently run to run.
+    #[test]
+    fn the_forgets_pre_removal_instant_is_still_a_forget() {
+        assert_eq!(link_cut_reason(false, true), LinkCut::Forgotten);
+        // And once the record is gone too.
+        assert_eq!(link_cut_reason(true, true), LinkCut::Forgotten);
+    }
+
+    /// The genuine revocations keep their word: a sibling the owner's signed
+    /// roster delisted, or whose certificate ran out, is still known to us and
+    /// was cut off. Neither path writes the forget block.
+    #[test]
+    fn a_delisted_or_expired_sibling_is_still_a_revocation() {
+        assert_eq!(link_cut_reason(false, false), LinkCut::Revoked);
     }
 }

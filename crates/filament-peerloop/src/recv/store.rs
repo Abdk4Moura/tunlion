@@ -4348,3 +4348,95 @@ mod ephemeral_records {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod forget_admission_precedence {
+    //! The admission side of the forget write window, against a REAL store.
+    //! `forget` writes the key block before it drops the record, so an open can
+    //! meet both at once. The block is FORGOTTEN even though
+    //! `device_cert_revoked` folds it in and still denies the open; a kept
+    //! record marked certRevoked (ordinary `devices revoke` / `demote --to cut`)
+    //! stays a revocation.
+    use super::*;
+    use crate::refusal::{Code, Refusal};
+    use serde_json::json;
+
+    fn unique(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fil-forget-admit-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_forget_block_with_the_record_still_present_is_unrecognized_at_admission() {
+        let root = unique("window");
+        let store = DeviceStore::open(&root);
+        let key = [0x5au8; 32];
+        let now = now_secs();
+        std::fs::write(
+            store.devices_path(),
+            serde_json::to_string(&json!([
+                {"name": "guest", "deviceCert": {"devicePub": hex::encode(key)}, "caps": []},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            store.key_revocations_path(),
+            serde_json::to_string(&json!([
+                {"devicePub": hex::encode(key), "certExpires": now + 3600, "revokedAt": now, "name": "guest"},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let forgotten = store.device_key_revoked(&key, now);
+        let revoked = store.device_cert_revoked(&key);
+        assert!(forgotten, "the block names the key");
+        assert!(
+            revoked,
+            "the record is still present and the block folds in, so the open is still denied"
+        );
+        let r = Refusal::from_shell_gate(forgotten, revoked, false, None, Some("guest".into()));
+        assert_eq!(
+            r.code,
+            Code::Unrecognized,
+            "the block is a forget, even mid-write: {}",
+            r.reason
+        );
+        assert!(r.reason.contains("not recognized"), "{}", r.reason);
+
+        // Ordinary revoke / demote --to cut: the record stays, marked
+        // certRevoked, and no block is written. That is still a revocation.
+        std::fs::remove_file(store.key_revocations_path()).unwrap();
+        std::fs::write(
+            store.devices_path(),
+            serde_json::to_string(&json!([
+                {
+                    "name": "guest",
+                    "deviceCert": {"devicePub": hex::encode(key)},
+                    "certRevoked": true,
+                    "caps": [],
+                },
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let forgotten = store.device_key_revoked(&key, now);
+        let revoked = store.device_cert_revoked(&key);
+        assert!(!forgotten, "no block was written");
+        assert!(revoked, "the kept record is marked revoked");
+        let r = Refusal::from_shell_gate(forgotten, revoked, false, None, Some("guest".into()));
+        assert_eq!(r.code, Code::CertRevoked);
+        assert_eq!(r.reason, "device revoked");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

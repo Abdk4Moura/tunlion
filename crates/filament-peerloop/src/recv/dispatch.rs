@@ -3446,16 +3446,24 @@ async fn recv_run(
                         }
                     }
                     let mut doomed: Vec<(String, String)> = Vec::new();
-                    // Doomed links whose device KEY is revoked in place (its
-                    // pair secret still held): told "device revoked", not
-                    // "not recognized".
-                    let mut key_revoked: std::collections::HashSet<String> = Default::default();
+                    // Doomed links whose device is still KNOWN and was revoked
+                    // (the owner's signed roster delisted the sibling, or its
+                    // certificate ran out): told "device revoked". A link cut
+                    // by a forget is "not recognized" even while the record is
+                    // still visible mid-write (see `link_cut_reason`).
+                    let mut cut_as_revoked: std::collections::HashSet<String> = Default::default();
                     let mut unrouted: Vec<String> = Vec::new();
                     for (pid, l) in &conn.links {
                         let facts = crate::recv::revocation::LinkFacts {
                             secret: l.expected_secret.as_ref().map(|(_, s)| s.as_str()),
                             device_pub: l.identity_device_pub,
                         };
+                        // Is this peer's key on the forget block? Read once:
+                        // `forget` writes it before it drops the record.
+                        let key_forgotten = l
+                            .identity_device_pub
+                            .as_ref()
+                            .is_some_and(|p| ports.daemon.key_listed(p));
                         // Fleet auto-mesh: a sibling link is closed, not merely
                         // refused, when the owner withdrew the device (its
                         // roster no longer lists it) or its certificate ran
@@ -3468,25 +3476,21 @@ async fn recv_run(
                             identity::now_secs(),
                             &|p: &[u8; 32]| ports.identity.device_cert_revoked(p),
                         );
-                        if sibling_cut {
-                            key_revoked.insert(pid.clone());
-                            doomed.push((pid.clone(), l.shown().to_string()));
-                        } else if crate::recv::revocation::link_must_close(
-                            &facts,
-                            &revoked_secrets,
-                            &|p: &[u8; 32]| ports.daemon.key_listed(p),
-                        ) {
-                            // Forgotten (its secret removed) reads "not
-                            // recognized", as every later open is answered;
-                            // "device revoked" only for a key revoked in place.
-                            let secret_gone =
+                        let close = sibling_cut
+                            || crate::recv::revocation::link_must_close(
+                                &facts,
+                                &revoked_secrets,
+                                &|p: &[u8; 32]| ports.daemon.key_listed(p),
+                            );
+                        if close {
+                            let secret_forgotten =
                                 facts.secret.is_some_and(|s| revoked_secrets.contains(s));
-                            if !secret_gone
-                                && l.identity_device_pub
-                                    .as_ref()
-                                    .is_some_and(|p| ports.daemon.key_listed(p))
+                            if crate::recv::revocation::link_cut_reason(
+                                secret_forgotten,
+                                key_forgotten,
+                            ) == crate::recv::revocation::LinkCut::Revoked
                             {
-                                key_revoked.insert(pid.clone());
+                                cut_as_revoked.insert(pid.clone());
                             }
                             doomed.push((pid.clone(), l.shown().to_string()));
                         } else if crate::recv::revocation::route_must_withdraw(
@@ -3509,7 +3513,7 @@ async fn recv_run(
                     // this frame leaves first.
                     for (pid, _) in &doomed {
                         if let Some(t) = conn.transport_of(pid) {
-                            let code = if key_revoked.contains(pid) {
+                            let code = if cut_as_revoked.contains(pid) {
                                 crate::refusal::Code::CertRevoked
                             } else {
                                 crate::refusal::Code::Unrecognized
@@ -6691,8 +6695,10 @@ async fn recv_run(
                         ));
                         host.enqueue_request_if_requestable(who, "shell");
                         let cap_reason = granted.deny_reason("");
+                        let peer_dev = conn.link(&pid).and_then(|l| l.identity_device_pub);
                         let refusal = crate::refusal::Refusal::from_shell_gate(
-                            false,
+                            host.cert_forgotten_for(peer_dev.as_ref()),
+                            host.cert_revoked_for(peer_dev.as_ref()),
                             dev.as_deref()
                                 .map(|n| host.device_capability_denied(n, "shell"))
                                 .unwrap_or(false),

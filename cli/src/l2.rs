@@ -506,6 +506,8 @@ pub async fn spawn_pty_session(
                         };
                         if matches!(cut, Some(crate::identity_state::LiveCut::Expired(_))) {
                             crate::ui::critical("pty: peer access expired, closing the live session");
+                        } else if matches!(cut, Some(crate::identity_state::LiveCut::Forgotten)) {
+                            crate::ui::critical("pty: peer forgotten, closing the live session");
                         } else {
                             crate::ui::critical("pty: peer revoked, closing the live session");
                         }

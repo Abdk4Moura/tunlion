@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn a_missing_grant_is_not_reported_as_serving_off() {
-        let r = Refusal::from_shell_gate(false, false, None, Some("p1-b".into()));
+        let r = Refusal::from_shell_gate(false, false, false, None, Some("p1-b".into()));
         assert_eq!(r.code, Code::NotGranted);
         assert!(!r.reason.contains("serving is off"), "{}", r.reason);
         assert!(r.reason.contains("not granted"), "{}", r.reason);
@@ -290,17 +290,17 @@ mod tests {
 
     #[test]
     fn gate_inputs_classify_precisely() {
-        assert_eq!(Refusal::from_shell_gate(true, false, None, None).code, Code::CertRevoked);
+        assert_eq!(Refusal::from_shell_gate(false, true, false, None, None).code, Code::CertRevoked);
         assert_eq!(
-            Refusal::from_shell_gate(false, false, Some("device revoked"), None).code,
+            Refusal::from_shell_gate(false, false, false, Some("device revoked"), None).code,
             Code::CertRevoked
         );
         assert_eq!(
-            Refusal::from_shell_gate(false, false, Some(crate::capability::CEILING_REASON), None).code,
+            Refusal::from_shell_gate(false, false, false, Some(crate::capability::CEILING_REASON), None).code,
             Code::Ceiling
         );
-        assert_eq!(Refusal::from_shell_gate(false, true, None, None).code, Code::Revoked);
-        assert_eq!(Refusal::from_shell_gate(false, false, None, None).code, Code::NotGranted);
+        assert_eq!(Refusal::from_shell_gate(false, false, true, None, None).code, Code::Revoked);
+        assert_eq!(Refusal::from_shell_gate(false, false, false, None, None).code, Code::NotGranted);
     }
 
     /// E3: "refused exec: shell serving is off there; run `tunlion up --shell`
@@ -380,6 +380,7 @@ mod tests {
         use clap::Parser;
         let at = 1_760_384_363; // 2025-10-13 19:39:23 UTC
         let r = Refusal::from_shell_gate(
+            false,
             false,
             false,
             Some(&crate::capability::expired_reason(at)),
