@@ -13,6 +13,47 @@ release build failed and nothing was published under it.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-30
+
+### Added
+
+- `tunlion set` with no arguments at a terminal opens a settings menu: groups,
+  each setting's value and where it comes from, and the right control for its
+  kind (toggle, picker, checklist, ordered list, checked text). Changes apply
+  to a running background service as `set <key> <value>` does. Piped, with
+  `--json` or `--no-interactive`, `set` behaves exactly as before.
+- CI and other short-lived machines can join as ephemeral runners
+  (`tunlion add --for runner`): reachable by name, listed under EPHEMERAL,
+  never shown on your other devices, with a certificate that ends with the
+  lease (`TUNLION_LEASE`, 6 hours by default). The owner removes a runner when
+  its lease ends, after 15 minutes offline, or when it runs `tunlion down`.
+- crates.io: `cargo install --locked tunlion`.
+
+### Changed
+
+- Pairing a browser through `tunlion add`, "Another device I own", now ends
+  with one line saying a browser cannot join your fleet, and exits 0 when the
+  pairing itself worked.
+- Device names in printed commands are quoted for the shell, apostrophes
+  included.
+- Your other devices drop entries for devices whose certificate expired or
+  that the owner no longer lists.
+
+### Fixed
+
+- A remembered browser sending to a CLI device no longer waits 60 s and fails
+  with "no peer connected": the link kept the device's pairing binding when a
+  browser's channel replaced the direct attempt.
+- A forgotten device is always told "not recognized", never "device revoked",
+  whatever the timing.
+- Two control messages sent at the same moment over a data channel could
+  arrive glued together and be dropped, making a shell or service open time
+  out after 10 s. Writes on a channel now go one at a time, with a bound.
+- The web app: a name already used by another remembered device no longer
+  deletes that device; a device connected but not yet remembered on its side
+  shows online; same-network pairing no longer fails with "That code didn't
+  work" when the joining side re-entered the room.
+
 ## [0.9.2] - 2026-10-30
 
 ### Added
