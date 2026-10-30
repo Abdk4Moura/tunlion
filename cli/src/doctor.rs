@@ -452,10 +452,12 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     // re-dialing the server passed every check above while no peer could reach
     // it. See daemon_health.
     let daemon = crate::daemon_health::inspect().await;
+    let lan = crate::lan_doctor::facts(&context);
 
     if json_out {
         let mut v = preflight_json(server, &sig, &ice, &ifaces, &history, &sshca);
         v["daemon"] = daemon.to_json();
+        v["lan"] = lan;
         ui::json_out(&v);
         return preflight_result(&sig);
     }
@@ -560,6 +562,15 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
             ui::paint(Tone::Warn, "unconfigured"),
             ui::paint(Tone::Dim, e),
         )),
+    }
+
+    // Local discovery.
+    {
+        let (tone, word, detail, cause) = crate::lan_doctor::row(&lan);
+        crate::outln!("  {:<13} {}  {}", "lan", ui::paint(tone, &word), ui::paint(Tone::Dim, &detail));
+        if let Some(c) = cause {
+            crate::outln!("  {:<13} {}", "", ui::paint(Tone::Warn, &c));
+        }
     }
 
     // Interfaces.

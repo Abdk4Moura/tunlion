@@ -412,6 +412,9 @@ impl RecvStore for CliRecv {
     fn devices_path(&self) -> PathBuf {
         crate::devices_store::devices_path()
     }
+    fn devices_overlay(&self, name: &str) -> (Option<String>, Option<String>) {
+        crate::device_view::devices_info(name).map(|(_, v6, v4)| (v6, v4)).unwrap_or((None, None))
+    }
     fn devices_touch(
         &self,
         name: &str,

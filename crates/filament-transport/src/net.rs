@@ -279,6 +279,9 @@ pub fn upgrade_verify_idle_ms() -> u64 {
 
 #[derive(Debug)]
 pub enum Ev {
+    /// Local discovery (`crate::lan`): a found peer, or an authenticated
+    /// server-free link. The loop decides what to do with it.
+    Lan(crate::lan::LanEvent),
     Welcome(Value),
     PeerJoined(Value),
     PeerLeft(Value),

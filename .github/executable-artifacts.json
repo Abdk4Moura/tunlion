@@ -965,6 +965,17 @@
       ]
     },
     {
+      "path": "cli/tests/lan-discovery-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/lan-discovery-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "linux-netns"
+        }
+      ]
+    },
+    {
       "path": "proofs/lan_discovery_model.py",
       "disposition": "required",
       "entrypoint": "python3 proofs/lan_discovery_model.py --self-test",

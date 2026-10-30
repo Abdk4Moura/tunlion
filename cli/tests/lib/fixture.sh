@@ -97,7 +97,10 @@ fixture_cleanup() {
 start_backend() {
   for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
   sleep 1
-  ( cd "$CLI_DIR/../backend" && PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+  # `exec`, so the recorded pid IS the backend: killing a subshell left the
+  # python process running, holding the port and any inherited descriptor
+  # (a build lock taken with flock around the gate run stayed held).
+  ( cd "$CLI_DIR/../backend" && exec env PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
       FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
       "$PYV" app.py >"$WORK/backend.log" 2>&1 ) &
   FIX_PIDS+=($!)
