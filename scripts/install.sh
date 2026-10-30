@@ -43,7 +43,7 @@ ARCH=$(uname -m)
 case "$OS" in
   Linux)  case "$ARCH" in
             x86_64|amd64) TARGET="x86_64-unknown-linux-musl" ;;
-            *) die "no prebuilt binary for Linux/$ARCH yet; build from source: cargo install filament-cli" ;;
+            *) die "no prebuilt binary for Linux/$ARCH yet; build from source: cargo install --locked tunlion" ;;
           esac ;;
   Darwin) case "$ARCH" in
             arm64)  TARGET="aarch64-apple-darwin" ;;

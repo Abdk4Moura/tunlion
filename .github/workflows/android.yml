@@ -54,30 +54,30 @@ jobs:
       - name: Compile isolated reduced peerloop root
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p filament-peerloop --no-default-features
+          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p tunlion-peerloop --no-default-features
       - name: Compile without forward-server (mesh + mount-server on)
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p filament-peerloop \
+          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p tunlion-peerloop \
             --no-default-features --features mesh,mount-server
       - name: Compile without mount-server (mesh + forward-server on)
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p filament-peerloop \
+          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p tunlion-peerloop \
             --no-default-features --features mesh,forward-server
       - name: Compile dispatch only (no overlay, TUN or server backends)
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           echo "dispatch-only target=${{ matrix.target }} abi=${{ matrix.abi }} flags=--no-default-features --features dispatch"
-          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p filament-peerloop \
+          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p tunlion-peerloop \
             --no-default-features --features dispatch
       - name: Compile CLI without forward-server (mesh + mount-server on)
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p filament-cli \
+          cargo ndk --platform 26 -t ${{ matrix.abi }} check --locked -p tunlion \
             --no-default-features --features mesh,mount-server
       - name: Compile default compatibility profile
-        run: cargo test --locked -p filament-peerloop
+        run: cargo test --locked -p tunlion-peerloop
 
   core-tooling-graph:
     name: core tooling dependency split
@@ -137,8 +137,8 @@ jobs:
                   cwd="cli",
               )
           )
-          wanted = {"filament-cli": {"mesh", "mount-server"},
-                    "filament-peerloop": {"mesh", "mount-server", "dispatch"}}
+          wanted = {"tunlion": {"mesh", "mount-server"},
+                    "tunlion-peerloop": {"mesh", "mount-server", "dispatch"}}
           forbidden = {"forward-server", "pty-server", "exec-server"}
           package_names = {p["id"]: p["name"] for p in meta["packages"]}
           seen = set()
@@ -316,7 +316,7 @@ jobs:
           key: android-core-host-${{ hashFiles('Cargo.lock') }}
           restore-keys: android-core-host-
       - name: Build host sender (not installed on Android)
-        run: cargo build --release --locked -p filament-cli --bin tunlion
+        run: cargo build --release --locked -p tunlion --bin tunlion
       - name: Assemble APKs with the downloaded library and bindings
         run: gradle -p lab/android-core-smoke --console plain assembleDebug assembleDebugAndroidTest
       - name: Enable KVM

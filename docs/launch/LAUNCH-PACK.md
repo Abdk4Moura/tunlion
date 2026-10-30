@@ -13,7 +13,8 @@ and a code pairing between two browsers on tunlion.autumated.com):
 - winget: `Abdk4Moura.Tunlion` is in review (microsoft/winget-pkgs#466106 for
   0.9.2, #462262 for 0.9.1).
   Do not lead with winget until that PR merges.
-- crates.io is not published; Cargo installs from git.
+- crates.io: `cargo install --locked tunlion` builds 0.9.2 from crates.io
+  (the package was `filament-cli` through 0.8.5).
 - Web app: https://tunlion.autumated.com. Source: https://github.com/Abdk4Moura/tunlion (MIT).
 - Prod signaling was load-tested at 4,000 concurrent devices on 1 CPU and
   512 MB (54% CPU) and about 60 new pairings per second.
@@ -79,7 +80,8 @@ resume needs the sending tab to stay open. iOS Safari in the background is
 still the hardest environment.
 
 Install: curl -fsSL https://tunlion.autumated.com/install | sh, npm i -g
-tunlion, or brew install abdk4moura/tap/tunlion. Code (MIT):
+tunlion, brew install abdk4moura/tap/tunlion, or cargo install --locked
+tunlion. Code (MIT):
 https://github.com/Abdk4Moura/tunlion
 ```
 
@@ -217,6 +219,7 @@ No registration, No file size limit, Peer-to-peer, Encrypted transfer, Self-host
       gives 0.9.2.
 - [ ] `npm i -g tunlion` gives 0.9.2.
 - [ ] `brew install abdk4moura/tap/tunlion` gives 0.9.2.
+- [ ] `cargo install --locked tunlion` in a clean CARGO_HOME gives 0.9.2.
 - [ ] Two of your devices added to the mesh but never paired reach each
       other (`tunlion reach <device>`).
 - [ ] `https://api.filament.autumated.com/health` returns `{"ok":true,...}`.
@@ -227,6 +230,8 @@ No registration, No file size limit, Peer-to-peer, Encrypted transfer, Self-host
 
 ## 5. What changed from the previous pack
 
+- crates.io: tunlion 0.9.2 is published as the `tunlion` crate, so Cargo
+  installs from crates.io instead of git.
 - 0.9.2: the fleet mesh (your devices reach each other without pairing each
   pair), fleet-wide revoke, listing and withdrawing invitations, and CLI TURN
   over TCP/TLS. The load-test number is unchanged: it is the prod Flask

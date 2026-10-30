@@ -3,12 +3,18 @@ name: publish-registries
 # Publish ONE package to crates.io (and, for the CLI, npm) per tag.
 #
 # Each package has its own tag namespace, and a tag publishes ONLY that package:
-#   cli-v<ver>               -> filament-cli   (crates.io + npm)
+#   cli-v<ver>               -> tunlion        (crates.io) + @abdk4moura/filament-cli (npm)
 #   filament-cap-v<ver>      -> filament-cap   (crates.io)
 #   filament-id-v<ver>       -> filament-id    (crates.io)
 #   filament-pair-v<ver>     -> filament-pair  (crates.io)
 #   secret-write-v<ver>      -> secret-write   (crates.io)
 #   authkeys-managed-v<ver>  -> authkeys-managed (crates.io)
+#   tunlion-<x>-v<ver>       -> tunlion-<x>    (crates.io), from crates/filament-<x>
+#
+# The CLI package was renamed from filament-cli to tunlion at 0.9.2, and the
+# later carves publish as tunlion-* (filament-transport on crates.io belongs to
+# someone else). Their directories and Rust library names keep the filament-*
+# spelling, so the tag prefix names the PACKAGE and `dir` names the directory.
 #
 # So bumping and releasing one crate does NOT attempt to publish the others. The
 # CLI depends on the extracted crates by version, so when a dependency changes,
@@ -32,6 +38,13 @@ on:
       - "filament-pair-v*"
       - "secret-write-v*"
       - "authkeys-managed-v*"
+      - "tunlion-fleet-v*"
+      - "tunlion-overlay-v*"
+      - "tunlion-peerloop-v*"
+      - "tunlion-proto-v*"
+      - "tunlion-signal-v*"
+      - "tunlion-transfer-v*"
+      - "tunlion-transport-v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -58,25 +71,25 @@ jobs:
         run: |
           set -euo pipefail
           tag="$TAG"
-          # <prefix>-v<version>. `cli` maps to the filament-cli crate in cli/;
-          # every other prefix is an extracted crate under crates/<name>.
+          # <prefix>-v<version>. `cli` maps to the tunlion crate in cli/;
+          # every other prefix is an extracted crate under crates/.
           case "$tag" in
-            cli-v*)              name="filament-cli";     dir="cli" ;;
+            cli-v*)              name="tunlion";          dir="cli" ;;
             filament-cap-v*)     name="filament-cap";     dir="crates/filament-cap" ;;
             filament-id-v*)      name="filament-id";      dir="crates/filament-id" ;;
             filament-pair-v*)    name="filament-pair";    dir="crates/filament-pair" ;;
             secret-write-v*)     name="secret-write";     dir="crates/secret-write" ;;
             authkeys-managed-v*) name="authkeys-managed"; dir="crates/authkeys-managed" ;;
-            # The later carves. They build standalone and carry the same
-            # README/licence/description metadata as the five above; they were
-            # simply never added here, so tagging one failed with "does not map
-            # to a known package". Listing them does NOT publish anything: a tag
-            # still has to be pushed deliberately.
-            filament-fleet-v*)     name="filament-fleet";     dir="crates/filament-fleet" ;;
-            filament-overlay-v*)   name="filament-overlay";   dir="crates/filament-overlay" ;;
-            filament-proto-v*)     name="filament-proto";     dir="crates/filament-proto" ;;
-            filament-transfer-v*)  name="filament-transfer";  dir="crates/filament-transfer" ;;
-            filament-transport-v*) name="filament-transport"; dir="crates/filament-transport" ;;
+            # The later carves, published under tunlion-* from their
+            # crates/filament-* directories. Listing them does NOT publish
+            # anything: a tag still has to be pushed deliberately.
+            tunlion-fleet-v*)     name="tunlion-fleet";     dir="crates/filament-fleet" ;;
+            tunlion-overlay-v*)   name="tunlion-overlay";   dir="crates/filament-overlay" ;;
+            tunlion-peerloop-v*)  name="tunlion-peerloop";  dir="crates/filament-peerloop" ;;
+            tunlion-proto-v*)     name="tunlion-proto";     dir="crates/filament-proto" ;;
+            tunlion-signal-v*)    name="tunlion-signal";    dir="crates/filament-signal" ;;
+            tunlion-transfer-v*)  name="tunlion-transfer";  dir="crates/filament-transfer" ;;
+            tunlion-transport-v*) name="tunlion-transport"; dir="crates/filament-transport" ;;
             *) echo "::error::tag '$tag' does not map to a known package"; exit 1 ;;
           esac
           # The tag version MUST match the crate's Cargo.toml version, so a tag can

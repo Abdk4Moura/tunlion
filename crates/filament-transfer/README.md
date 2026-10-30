@@ -1,4 +1,7 @@
-# filament-transfer
+# tunlion-transfer
+
+The Rust library name is `filament_transfer` (the crate was renamed for
+publishing; the library name was kept).
 
 Out-of-order chunk reassembly and short-write-safe positional writes, with no
 opinion about how a peer was found, authenticated, or displayed.

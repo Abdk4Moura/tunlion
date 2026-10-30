@@ -9,7 +9,7 @@
 # and passes it to `UserKey::generate` / `UserKey::load`.
 [package]
 name = "filament-id"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
 license = "MIT"
@@ -36,5 +36,5 @@ zeroize = "1.8"
 [dev-dependencies]
 # The identity tests exercise the PAKE confirm-MAC / capability-digest helpers
 # (the CLI reaches them as `crate::pake::…`, an alias of this crate).
-filament-pair = { path = "../filament-pair", version = "0.1.0" }
+filament-pair = { path = "../filament-pair", version = "0.1.3" }
 tempfile = "3"

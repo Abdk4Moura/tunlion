@@ -52,7 +52,13 @@ GROUP_RE = re.compile(r"::group::\s*([A-Za-z0-9_.-]+)")
 
 
 def discover(root: pathlib.Path) -> dict[str, int]:
-    """{package name: number of test-carrying files} for every crate under crates/."""
+    """{crate directory: number of test-carrying files} for every crate under crates/.
+
+    Keyed by DIRECTORY, not package name: test.yml's loop runs
+    `--manifest-path crates/$c/Cargo.toml`, so the directory is what it names.
+    The two differ since the crates.io rename (crates/filament-transport is the
+    package tunlion-transport).
+    """
     found: dict[str, int] = {}
     crates = root / "crates"
     if not crates.is_dir():
@@ -62,7 +68,7 @@ def discover(root: pathlib.Path) -> dict[str, int]:
         m = re.search(r'^name\s*=\s*"([^"]+)"', text, re.M)
         if not m:
             continue
-        name = m.group(1)
+        name = manifest.parent.name
         carrying = 0
         for rs in sorted(manifest.parent.rglob("*.rs")):
             body = rs.read_text(encoding="utf-8", errors="replace")
@@ -108,7 +114,7 @@ def static_check(root: pathlib.Path) -> tuple[list[str], str]:
         if name not in discovered:
             errors.append(
                 f"{name}: named in test.yml's loop but no package under crates/ "
-                "has that name. The loop's `[ -f ... ]` guard skips a stale name "
+                "has that directory name. The loop's `[ -f ... ]` guard skips a stale name "
                 "SILENTLY, so this is a test that quietly stopped running. Fix: "
                 f"remove `{name}` from the list, or add the crate back.")
     return errors, "\n".join(rows)
