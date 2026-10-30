@@ -26,6 +26,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
+# shellcheck source=cli/tests/lib/backend.sh
+source "$HERE/lib/backend.sh"
 REPO="$(dirname "$CLI_DIR")"
 BIN="$CLI_DIR/target/release/tunlion"
 PORT="${PORT:-8077}"
@@ -50,16 +52,17 @@ ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 
 pids=(); OWN_BACKEND=""
-cleanup() { for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null; done; [ -n "$OWN_BACKEND" ] && kill "$OWN_BACKEND" 2>/dev/null; }
+cleanup() { backend_stop "${BACKEND_PID:-}"; for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null; done; [ -n "$OWN_BACKEND" ] && kill "$OWN_BACKEND" 2>/dev/null; }
 trap cleanup EXIT
 
 # --- backend (serves frontend/dist same-origin) ---
 if ! curl -fsS "$SERVER/api/health" >/dev/null 2>&1; then
   for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
   sleep 1
-  ( cd "$REPO/backend" && PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 FIL_CLAIM_LIMIT=1000000 \
-      FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 "$PYV" app.py >"$WORK/backend.log" 2>&1 ) &
-  OWN_BACKEND=$!
+  backend_start "$REPO/backend" "$PYV" "$WORK/backend.log" \
+    PORT="$PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+    FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25
+  OWN_BACKEND=$BACKEND_PID
   for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
 fi
 curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat "$WORK/backend.log" 2>/dev/null; exit 2; }

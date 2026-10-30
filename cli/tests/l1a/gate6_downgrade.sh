@@ -16,6 +16,8 @@ set -uo pipefail
 #   MAIN    cli/src/pair_cmd.rs for the structural (source) assertions
 #           (pair_cmd lived in main.rs until the 2026-09-12 decomposition)
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=cli/tests/lib/backend.sh
+source "$HERE/../lib/backend.sh"
 BIN=${BIN:-$HERE/../../target/release/tunlion}
 PY=${PY:-${TUNLION_TEST_VENV:-python3}}
 MAIN=${MAIN:-$HERE/../../src/pair_cmd.rs}
@@ -26,8 +28,10 @@ rm -rf "$T/g6"; mkdir -p "$T/g6/cfg"
 # Stop our own 8093 listener and restart it with the v2-stripping flag.
 for pid in $(ss -tlnp 2>/dev/null | grep ":8093 " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
 sleep 1
-( cd "$BACKEND_DIR" && PORT=8093 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
-    FIL_CLAIM_LIMIT=1000000 FIL_FORCE_V1=1 nohup "$PY" app.py >"$T/g6/backend-forcev1.log" 2>&1 & )
+backend_start "$BACKEND_DIR" "$PY" "$T/g6/backend-forcev1.log" \
+  PORT=8093 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+  FIL_CLAIM_LIMIT=1000000 FIL_FORCE_V1=1
+printf '%s\n' "$BACKEND_PID" > "$T/g6/backend-forcev1.pid"
 for i in $(seq 1 20); do curl -s http://127.0.0.1:8093/api/config >/dev/null 2>&1 && break; sleep 0.3; done
 
 # A v2 creator against the stripping server.
@@ -48,8 +52,12 @@ echo "secret stored         : $STORED (want 0)"
 # Restore the normal 8093 backend for the remaining gates.
 for pid in $(ss -tlnp 2>/dev/null | grep ":8093 " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
 sleep 1
-( cd "$BACKEND_DIR" && PORT=8093 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
-    FIL_CLAIM_LIMIT=1000000 nohup "$PY" app.py >"$T/backend-8093.log" 2>&1 & )
+backend_start "$BACKEND_DIR" "$PY" "$T/backend-8093.log" \
+  PORT=8093 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+  FIL_CLAIM_LIMIT=1000000
+# Persistent standalone l1a fixture by design. The PID file lets the owner stop
+# exactly this process; the child still closes fd3/fd9.
+printf '%s\n' "$BACKEND_PID" > "$T/backend-8093.pid"
 for i in $(seq 1 20); do curl -s http://127.0.0.1:8093/api/config >/dev/null 2>&1 && break; sleep 0.3; done
 
 # Part B: structural assertions on the v2 pair_cmd.
