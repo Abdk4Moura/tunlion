@@ -474,17 +474,24 @@ connect measured 9 rows (15 in one run with an extra sync) and a pairing about
 backlog, but it now deletes at most `FIL_SESSION_PRUNE_BATCH` (64) expired
 sessions and retired rows per pass, so the 14,337-row burst above becomes
 about 224 batches over later claims; the total rows are unchanged and a row can
-remain longer if claims stop. Local SQLite at 50k sessions measured inclusive of the hub cascade, per
-batch, modeled at one member and two subscriptions per sid: 64 -> 193 rows
-written and about 118 ms, 256 -> 769 rows and about 466 ms, 1,024 -> 3,073
-rows and about 1.8 s. Those are example totals, not a worst-case bound: a sid
-can hold more than two subscriptions and the hub unions them without a global
-cap, so the cascade can be larger. A capacity page of 64 measured about 130
-rows read and 1.6 ms, with no writes when every row is live. These are local
-counts, not Cloudflare billed analytics or a production CPU bound. After a
-cold heap the first evicted sid also loads the full members and subs tables;
-that read is in the numbers above and can be tens of thousands of rows, not a
-few.
+remain longer if claims stop. Local SQLite at 50k sessions measured with the real hub cleanup
+(`unsubscribeAll` plus `remove`) and a cold heap, modeled at one member and two
+subscriptions per sid: batch 64 -> 257 rows written (65 registry + 192
+cascade), 150,066 rows read and about 364 ms; batch 256 -> 1,025 written,
+150,258 read, about 344 ms; batch 1,024 -> 4,097 written, 151,026 read, about
+385 ms. The read count is the cold `SELECT members` plus `SELECT subs` scan,
+not per-session work. A 1,000-session example with 64 subscriptions per sid
+wrote 4,225 rows (65 registry + 4,160 cascade) and read 65,066 in about 140 ms.
+These are examples, not worst-case bounds: a sid can hold more subscriptions
+and the hub unions them without a global cap. The batch bounds session rows
+per pass, not total writes, reads or CPU. A capacity page of 64 measured about
+130 rows read and 1.5 ms when every row is live; a dead row with a cold heap
+read 150,067 rows and wrote 5. A late row-value cursor returned 64 rows in
+0.09 ms and planned `SEARCH ... USING INDEX sessions_exp (exp>?)`; the old OR
+predicate planned `SCAN`. With 100k live tombstones and none expired, the new
+retired subquery planned `SEARCH retired USING COVERING INDEX retired_exp
+(exp<?)` in 0.05 ms; `ORDER BY seq` planned `SCAN retired` in 3.7 ms. These are
+local counts, not Cloudflare billed analytics or a production CPU bound.
 
 What that means:
 
