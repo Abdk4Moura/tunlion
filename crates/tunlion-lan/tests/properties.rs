@@ -274,7 +274,9 @@ fn remembered_addresses_rank_and_expire() {
     assert_eq!(r.dial_order()[0], "10.8.0.2:47821".parse::<SocketAddr>().unwrap());
     let back = Record::from_json(&r.to_json()).unwrap();
     assert_eq!(back, r);
-    r.prune(2000 + record::FORGET_SECS + 1);
+    // Past the unused address's 30 days (learned at 1000) but within the
+    // used one's (ok at 2000).
+    r.prune(1000 + record::FORGET_SECS + 1);
     assert_eq!(r.addrs.len(), 1, "the unused address is forgotten, the used one kept");
     for i in 0..40u8 {
         r.learn(&Hello { presence_key: [3; 32], port: 47821, addrs: vec![HelloAddr { ip: IpAddr::V4(Ipv4Addr::new(10, 9, 0, i)), class: Class::Shared }] }, 5000 + i as u64);
