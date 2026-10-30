@@ -296,7 +296,8 @@ pub async fn mount_cmd(
             crate::ui::say(&format!(
                 "  note: `tunlion mount` currently rides sshfs and needs an sshd on '{peer}'. \
                  A no-sshd mesh-native mount is in progress; for now run an sshd there, set \
-                 TUNLION_SSH_PORT, or use `tunlion shell {peer}` for a shell."
+                 TUNLION_SSH_PORT, or use `tunlion shell {}` for a shell.",
+                crate::refusal::word(&peer)
             ));
             return Err(e);
         }

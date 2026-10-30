@@ -256,14 +256,15 @@ pub(crate) fn reenrol_steps(device: &str, owner: &str, capability: &str, ceiling
     let on_device = format!("on {device}:");
     let w = on_owner.len().max(on_device.len());
     let pad = " ".repeat(w);
+    let (dw, iw) = (crate::refusal::word(device), crate::refusal::word(&invite));
     format!(
         "To give {device} {capability}, enrol it again with {capability} in its invitation:\n  \
-         {on_owner:<w$}  tunlion devices forget {device} -y\n  \
-         {pad}  tunlion add --for {device} --allow {caps} --out {invite} --yes\n  \
+         {on_owner:<w$}  tunlion devices forget {dw} -y\n  \
+         {pad}  tunlion add --for {dw} --allow {caps} --out {iw} --yes\n  \
          {pad}  (copy {invite} to {device})\n  \
          {on_device:<w$}  tunlion down -y\n  \
          {pad}  tunlion reset -y\n  \
-         {pad}  tunlion join --invite-file {invite} --name {device}\n  \
+         {pad}  tunlion join --invite-file {iw} --name {dw}\n  \
          {pad}  tunlion up --detach\n  \
          (reset clears {device}'s local tunlion state; the forget freed its name, so it rejoins as {device})"
     )

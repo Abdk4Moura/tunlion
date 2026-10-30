@@ -313,8 +313,10 @@ impl EnrollmentService {
                     }
                     if candidate != base {
                         self.log.say(&format!(
-                            "  {} a new device asked to be called {base}, a name another key holds, so it was stored as {candidate}. If {base} was reset and this is the same machine: `tunlion devices forget {base} -y` then `tunlion devices rename {candidate} {base}`.",
-                            self.log.paint(Tone::Warn, self.log.glyph_warn())
+                            "  {} a new device asked to be called {base}, a name another key holds, so it was stored as {candidate}. If {base} was reset and this is the same machine: `tunlion devices forget {bw} -y` then `tunlion devices rename {cw} {bw}`.",
+                            self.log.paint(Tone::Warn, self.log.glyph_warn()),
+                            bw = crate::consent::word(&base),
+                            cw = crate::consent::word(&candidate),
                         ));
                     }
                 }

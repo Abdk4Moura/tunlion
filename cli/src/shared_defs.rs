@@ -73,7 +73,8 @@ pub(crate) fn remember_not_stored_msg(name: &str, sending: bool, has_identity: b
     };
     format!(
         "--remember {name}: nothing was remembered. Both sides must pass --remember on the same code transfer, \
-         and the {other} did not. To pair this device for good:  {first}tunlion add {name}  (and `tunlion join <code>` on the other side)"
+         and the {other} did not. To pair this device for good:  {first}tunlion add {}  (and `tunlion join <code>` on the other side)",
+        crate::refusal::word(name)
     )
 }
 

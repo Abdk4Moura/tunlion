@@ -170,17 +170,18 @@ pub(crate) fn remedy_with(
 /// is in parentheses. cli/tests/reenrol-advice-gates.sh runs these lines.
 pub(crate) fn ceiling_steps(peer: &str, me: &str) -> Vec<String> {
     let invite = format!("{me}-invite.txt");
+    let (mw, iw) = (word(me), word(&invite));
     let owner = format!("on '{peer}':");
     let here = "on this device:".to_string();
     let w = owner.len().max(here.len());
     let pad = " ".repeat(w);
     vec![
-        format!("{owner:<w$}  tunlion devices forget {me} -y"),
-        format!("{pad}  tunlion add --for {me} --allow transfer,mount,shell --out {invite} --yes"),
+        format!("{owner:<w$}  tunlion devices forget {mw} -y"),
+        format!("{pad}  tunlion add --for {mw} --allow transfer,mount,shell --out {iw} --yes"),
         format!("{pad}  (copy {invite} to this device)"),
         format!("{here:<w$}  tunlion down -y"),
         format!("{pad}  tunlion reset -y"),
-        format!("{pad}  tunlion join --invite-file {invite} --name {me}"),
+        format!("{pad}  tunlion join --invite-file {iw} --name {mw}"),
         format!("{pad}  tunlion up --detach"),
     ]
 }
@@ -195,6 +196,7 @@ pub(crate) fn ceiling_steps(peer: &str, me: &str) -> Vec<String> {
 /// the add line keeps its defaults rather than guessing the capabilities.
 pub(crate) fn reinvite_steps(peer: &str, me: &str, r: Option<&Reinvite>) -> Vec<String> {
     let invite = format!("{me}-invite.txt");
+    let (mw, iw) = (word(me), word(&invite));
     let owner = format!("on '{peer}':");
     let here = "on this device:".to_string();
     let w = owner.len().max(here.len());
@@ -203,12 +205,12 @@ pub(crate) fn reinvite_steps(peer: &str, me: &str, r: Option<&Reinvite>) -> Vec<
         .map(|r| format!(" --allow {} --expires {}", r.ceiling.join(","), expires_text(r.lifetime)))
         .unwrap_or_default();
     vec![
-        format!("{owner:<w$}  tunlion devices forget {me} -y"),
-        format!("{pad}  tunlion add --for {me}{same} --out {invite} --yes"),
+        format!("{owner:<w$}  tunlion devices forget {mw} -y"),
+        format!("{pad}  tunlion add --for {mw}{same} --out {iw} --yes"),
         format!("{pad}  (copy {invite} to this device)"),
         format!("{here:<w$}  tunlion down -y"),
         format!("{pad}  tunlion reset -y"),
-        format!("{pad}  tunlion join --invite-file {invite} --name {me}"),
+        format!("{pad}  tunlion join --invite-file {iw} --name {mw}"),
         format!("{pad}  tunlion up --detach"),
     ]
 }

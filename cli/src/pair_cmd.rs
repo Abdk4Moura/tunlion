@@ -795,14 +795,16 @@ pub(crate) fn shell_not_granted_hint(
     match grant_vs_ceiling(ceiling, "shell", false) {
         GrantVsCeiling::AlreadyCovered => None,
         GrantVsCeiling::Proceed => Some(format!(
-            "shell was not granted; to allow a terminal later:  tunlion grant {name} shell"
+            "shell was not granted; to allow a terminal later:  tunlion grant {} shell",
+            crate::refusal::word(name)
         )),
         GrantVsCeiling::OutsideCeiling => {
             let mut allow: Vec<String> = ceiling.unwrap_or(caps).to_vec();
             allow.push("shell".to_string());
             let allow = allow.join(",");
             Some(format!(
-                "shell was not granted, and a grant cannot widen this device's ceiling; to allow a terminal later, re-add it with shell:  tunlion add {name} --allow {allow}"
+                "shell was not granted, and a grant cannot widen this device's ceiling; to allow a terminal later, re-add it with shell:  tunlion add {} --allow {allow}",
+                crate::refusal::word(name)
             ))
         }
     }
@@ -1493,7 +1495,8 @@ async fn pair_with_purpose(
                             if crate::device_view::device_record_revoked(&n) {
                                 bail!(
                                     "{n} paired, but it is REVOKED on this device, so it stays refused. \
-                                     To let it back in:  tunlion promote {n}"
+                                     To let it back in:  tunlion promote {}",
+                                    crate::refusal::word(&n)
                                 );
                             }
                         }
@@ -1540,12 +1543,12 @@ async fn pair_with_purpose(
                             if named_by_default {
                                 ui::say(&ui::paint(
                                     ui::Tone::Dim,
-                                    &format!("  saved as '{n}' \u{b7} rename any time: tunlion devices rename {n} <name>"),
+                                    &format!("  saved as '{n}' \u{b7} rename any time: {}", rename_hint(&n)),
                                 ));
                             }
                             ui::say(&ui::paint(
                                 ui::Tone::Dim,
-                                &format!("  next: tunlion send <file> --to {n}"),
+                                &format!("  next: tunlion send <file> --to {}", crate::refusal::word(&n)),
                             ));
                             // What THIS device became, said plainly: the other
                             // side holds an identity and chose a pairing.
@@ -2428,6 +2431,14 @@ mod promise_tests {
     }
 }
 
+/// The rename hint printed after a pairing saved a device under a default
+/// name, with the name quoted so it pastes as ONE argument: a browser called
+/// `Abdul's iPad` used to print `tunlion devices rename Abdul's iPad <name>`,
+/// which a shell reads as an unterminated quote. Pure.
+pub(crate) fn rename_hint(name: &str) -> String {
+    format!("tunlion devices rename {} <name>", crate::refusal::word(name))
+}
+
 /// What to say when a pairing filed the peer as EXTERNAL because the two
 /// devices already hold DIFFERENT identities. `asked_to_own` is `add <device>`
 /// (`--internal`): the operator meant "one of mine", so the steps make the PEER
@@ -2462,6 +2473,92 @@ pub(crate) fn external_pairing_notice(
         ]
     };
     (headline, detail, steps)
+}
+
+#[cfg(test)]
+mod hint_quoting_tests {
+    use super::rename_hint;
+
+    /// What a POSIX shell makes of a hint line: its argv, `<name>` filled in.
+    /// Unix only, by a runtime check (the hints use PowerShell quoting on
+    /// Windows, and platform cfg blocks belong in platform/).
+    fn sh_argv(line: &str) -> Vec<String> {
+        let line = line.replace("<name>", "NewName");
+        let out = crate::platform::command("sh")
+            .arg("-c")
+            .arg(format!("set -- {line}; for a; do printf '%s\\0' \"$a\"; done"))
+            .output()
+            .expect("sh runs");
+        assert!(out.status.success(), "sh refused: {line}");
+        String::from_utf8_lossy(&out.stdout).split('\0').filter(|a| !a.is_empty()).map(str::to_string).collect()
+    }
+
+    /// The pairing's rename hint pastes as the exact stored name, one
+    /// argument, for every name a browser can send, and still parses.
+    #[test]
+    fn the_rename_hint_pastes_as_the_exact_name() {
+        use clap::Parser;
+        if !cfg!(unix) {
+            return;
+        }
+        for name in ["Abdul's iPad", "laptop", "Kabir Laptop", "it's \"x\"", "$HOME;rm"] {
+            let hint = rename_hint(name);
+            let argv = sh_argv(&hint);
+            assert_eq!(argv, ["tunlion", "devices", "rename", name, "NewName"], "{hint}");
+            assert!(crate::Cli::try_parse_from(&argv).is_ok(), "does not parse: {hint}");
+        }
+        assert_eq!(rename_hint("laptop"), "tunlion devices rename laptop <name>");
+        assert!(!rename_hint("Abdul's iPad").contains("Abduls"));
+    }
+
+    /// The quoting rule itself: a real `sh` reads every name back intact, as
+    /// one argument, however hostile.
+    #[test]
+    fn a_quoted_name_round_trips_through_sh() {
+        if !cfg!(unix) {
+            return;
+        }
+        for name in ["Abdul's iPad", "it's", "two  spaces", "a\"b", "$HOME `x` \\ ;|&", "Zo\u{eb}'s", "''", "plain-name"] {
+            let argv = sh_argv(&format!("x {}", crate::refusal::word(name)));
+            assert_eq!(argv, ["x", name], "{name}");
+        }
+    }
+
+    /// Every other hint that prints a device name in a command keeps it
+    /// intact and quoted the same way.
+    #[test]
+    fn device_name_hints_quote_the_name() {
+        if !cfg!(unix) {
+            return;
+        }
+        let n = "Abdul's iPad";
+        let w = crate::refusal::word(n);
+        let lines = [
+            crate::reset_hints::offline_hint(n, None),
+            crate::reset_hints::offline_hint(n, Some("Abdul's iPad 2")),
+            crate::reset_hints::name_taken_note(n, None),
+            crate::enrollment::renamed_note("Abdul's Mac", "abdul-s-mac-2").unwrap_or_default(),
+        ];
+        for l in &lines {
+            assert!(!l.contains("forget Abdul's iPad -y"), "unquoted: {l}");
+            assert!(!l.contains("Abduls"), "apostrophe dropped: {l}");
+        }
+        assert!(lines[0].contains(&format!("tunlion devices forget {w} -y")), "{}", lines[0]);
+        assert!(lines[0].contains(&format!("tunlion add {w}")), "{}", lines[0]);
+        assert!(lines[1].contains(&format!("tunlion devices rename {} {w}", crate::refusal::word("Abdul's iPad 2"))), "{}", lines[1]);
+        assert!(lines[2].contains(&format!("tunlion devices forget {w} -y")), "{}", lines[2]);
+        // Each backticked command reads back as the exact name.
+        for l in &lines {
+            for (i, seg) in l.split('`').enumerate() {
+                if i % 2 == 1 && seg.starts_with("tunlion ") {
+                    for cmd in seg.split(" && ") {
+                        let argv = sh_argv(cmd);
+                        assert!(argv.iter().all(|a| !a.contains("Abduls")), "{cmd} -> {argv:?}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

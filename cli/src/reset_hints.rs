@@ -31,12 +31,16 @@ pub(crate) fn successor_of<'a>(peer: &str, names: impl IntoIterator<Item = &'a s
 /// The sentence a `send` to an offline known device ends with, before "Nothing
 /// was sent". Pure.
 pub(crate) fn offline_hint(peer: &str, successor: Option<&str>) -> String {
+    let pw = crate::refusal::word(peer);
     match successor {
-        Some(s) => format!(
-            "{s} is also paired here, under a newer key: if {peer} was reset and joined again, that is the same machine. Send to {s}, and replace the stale record with `tunlion devices forget {peer} -y` then `tunlion devices rename {s} {peer}`."
-        ),
+        Some(s) => {
+            let sw = crate::refusal::word(s);
+            format!(
+                "{s} is also paired here, under a newer key: if {peer} was reset and joined again, that is the same machine. Send to {s}, and replace the stale record with `tunlion devices forget {pw} -y` then `tunlion devices rename {sw} {pw}`."
+            )
+        }
         None => format!(
-            "If {peer} was reset (its identity wiped), this key will never come back: drop the old record with `tunlion devices forget {peer} -y`, then pair it again under the same name (`tunlion add {peer}` here, `tunlion join` there)."
+            "If {peer} was reset (its identity wiped), this key will never come back: drop the old record with `tunlion devices forget {pw} -y`, then pair it again under the same name (`tunlion add {pw}` here, `tunlion join` there)."
         ),
     }
 }
@@ -45,8 +49,9 @@ pub(crate) fn offline_hint(peer: &str, successor: Option<&str>) -> String {
 /// the invitation it mints cannot reuse the name for a new key. Pure.
 pub(crate) fn name_taken_note(name: &str, last_seen: Option<&str>) -> String {
     format!(
-        "{name} is already paired here{}. If this invitation is for the same machine after a reset, forget the old record first (`tunlion devices forget {name} -y`); otherwise the new device is stored as {name}-2.",
-        last_seen.map(|s| format!(" (last seen {s})")).unwrap_or_default()
+        "{name} is already paired here{}. If this invitation is for the same machine after a reset, forget the old record first (`tunlion devices forget {} -y`); otherwise the new device is stored as {name}-2.",
+        last_seen.map(|s| format!(" (last seen {s})")).unwrap_or_default(),
+        crate::refusal::word(name)
     )
 }
 
