@@ -466,10 +466,11 @@ connect measured 9 rows (15 in one run with an extra sync) and a pairing about
 15 ("Hub load test" above). A first claim after a stale day can still find a
 backlog, but it now deletes at most `FIL_SESSION_PRUNE_BATCH` (256) expired
 sessions and retired rows per pass, so the 14,337-row burst above becomes
-about 56 batches over later claims; the total rows are unchanged and a row can
-remain longer if claims stop. Local SQLite at 50k sessions measured, per
-batch: 64 -> 65 rows written and about 2.4 ms, 256 -> 257 rows and about
-2.8 ms, 1,024 -> 1,025 rows and about 9.2 ms. A capacity page of 64 measured
+about 224 batches over later claims; the total rows are unchanged and a row can
+remain longer if claims stop. Local SQLite at 50k sessions measured inclusive of the hub cascade, per
+batch: 64 -> 193 rows written and about 118 ms, 256 -> 769 rows and about
+466 ms, 1,024 -> 3,073 rows and about 1.8 s. The 64 default is chosen for the
+worst-case per-claim burst, not throughput. A capacity page of 64 measured
 about 130 rows read and 1.6 ms, with no writes when every row is live. These
 are local counts, not Cloudflare billed analytics. Reads otherwise come from
 memory, a few rows per claim.
