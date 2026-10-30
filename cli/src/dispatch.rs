@@ -2842,6 +2842,8 @@ pub(crate) async fn devices_json_rows(all: &[(String, String)]) -> Vec<Value> {
                 // link to it AND the device answered a
                 // liveness ping on that link just now.
                 "online": online.get(n).copied().flatten(),
+                // `lan` when the held link met by local discovery.
+                "route": crate::warm_device_route(warm.as_ref(), n),
                 // The human row's word for the same
                 // value: "idle" is online:false (no
                 // answering link right now), not a

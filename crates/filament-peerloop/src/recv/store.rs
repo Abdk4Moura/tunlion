@@ -2189,6 +2189,10 @@ mod port_impl {
             DeviceStore::devices_path(self)
         }
 
+        fn devices_overlay(&self, name: &str) -> (Option<String>, Option<String>) {
+            self.devices_info(name).map(|(_, v6, v4)| (v6, v4)).unwrap_or((None, None))
+        }
+
         fn devices_touch(
             &self,
             name: &str,

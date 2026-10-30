@@ -136,6 +136,7 @@ filament-fleet = { package = "tunlion-fleet", path = "../crates/filament-fleet",
 # moved with it.
 filament-peerloop = { package = "tunlion-peerloop", path = "../crates/filament-peerloop", version = "0.1.0", default-features = false }
 filament-transport = { package = "tunlion-transport", path = "../crates/filament-transport", version = "0.1.0" }
+tunlion-lan = { path = "../crates/tunlion-lan", version = "0.1.0" }
 hex = "0.4"
 rand_core = "0.6"
 getrandom = "0.2"

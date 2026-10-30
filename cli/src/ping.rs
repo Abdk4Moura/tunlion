@@ -77,6 +77,8 @@ fn shown_route(route: &str) -> String {
     match route {
         "direct-quic" => "direct".to_string(),
         "holepunched" => "direct, hole-punched".to_string(),
+        // Local discovery: the link met with no server.
+        "lan" => "lan, direct".to_string(),
         other => other.to_string(),
     }
 }

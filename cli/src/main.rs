@@ -19,6 +19,8 @@ mod codeentry;
 mod armed;
 mod authkey;
 mod ctl;
+mod lan_doctor;
+mod lan_send;
 mod subnet_forward;
 mod diag;
 use filament_transport::direct;
@@ -1395,6 +1397,18 @@ pub(crate) fn warm_device_names(value: Option<&Value>) -> HashSet<String> {
         .filter(|link| link["warm"].as_bool() == Some(true))
         .filter_map(|link| link["name"].as_str().map(str::to_string))
         .collect()
+}
+
+/// The route word a `devices` row shows beside "online": only `lan` (a link
+/// met by local discovery) is called out; direct and relay read as before.
+pub(crate) fn warm_device_route(value: Option<&Value>, name: &str) -> Option<String> {
+    value?
+        .get("links")?
+        .as_array()?
+        .iter()
+        .filter(|l| l["warm"].as_bool() == Some(true))
+        .filter(|l| l["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+        .find_map(|l| (l["route"].as_str() == Some("lan")).then(|| "lan".to_string()))
 }
 
 fn pending_request_count(value: Option<&Value>) -> usize {

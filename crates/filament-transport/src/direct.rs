@@ -197,7 +197,7 @@ pub const MAX_DIRECT_PAYLOAD: usize = 1024 * 1024;
 
 /// Raw-bytes HMAC-SHA256 (the in-tree `hmac_sha256` in main.rs returns hex;
 /// HKDF needs raw bytes). Same construction, raw output.
-fn hmac_sha256_raw(key: &[u8], msg: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256_raw(key: &[u8], msg: &[u8]) -> [u8; 32] {
     let mut k = [0u8; 64];
     if key.len() > 64 {
         let mut h = Sha256::new();
@@ -235,7 +235,7 @@ pub fn transport_key(secret: &str) -> [u8; 32] {
 
 /// Constant-time equality (no `subtle` dep). XOR-accumulate; the loop runs the
 /// full length regardless of where the first difference is.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -411,7 +411,7 @@ fn parse_membership(raw: &str) -> (String, String) {
 /// "connecting" UDP sockets to public anchors and reading the chosen local
 /// addr (no packets sent). This yields the primary routable v4 and v6 source
 /// addresses, the ones a peer on the same LAN / overlay can actually reach.
-fn local_ips() -> Vec<IpAddr> {
+pub(crate) fn local_ips() -> Vec<IpAddr> {
     let mut out = Vec::new();
     // v4 default route source
     if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
@@ -547,6 +547,16 @@ pub async fn warm_public_ip(context: &crate::TransportContext, server: &str) {
 }
 
 /// Format an addr as a candidate string; v6 gets brackets so `[ip]:port` parses.
+/// tunlion's overlay prefixes. They equal `filament_overlay::prefix_cidr` and
+/// `prefix_v4_cidr` (pinned by a CLI test); not a dependency, because the
+/// overlay crate must stay out of a transport graph built without the mesh.
+pub const OVERLAY_PREFIXES: [&str; 2] = ["fdf1:1af7:c30d::/48", "198.18.0.0/15"];
+
+/// Inside tunlion's overlay prefixes.
+fn in_own_overlay_range(ip: &IpAddr) -> bool {
+    OVERLAY_PREFIXES.iter().filter_map(|c| parse_cidr(c)).any(|r| ip_matches_cidr(ip, &r))
+}
+
 fn cand_str(ip: IpAddr, port: u16) -> String {
     SocketAddr::new(ip, port).to_string()
 }
@@ -623,7 +633,33 @@ pub async fn gather_candidates(context: &crate::TransportContext, server: &str, 
         let lo: IpAddr = "127.0.0.1".parse().unwrap();
         return (vec![cand_str(lo, port)], None);
     }
-    let all_local = local_ips();
+    let mut all_local = local_ips();
+    // Local discovery on: offer every interface's addresses, not only the
+    // default-route sources, so a peer on the same switch, tunnel or overlay
+    // is dialed there (docs/protocol/local-discovery.md, "candidate merge").
+    // Interfaces by capability, none by name; the membership filter below
+    // still applies.
+    if crate::lan::enabled(context) {
+        let skip = crate::lan::skip(context);
+        for i in crate::lan::interfaces() {
+            if skip.matches(&i) || i.flags.loopback {
+                continue;
+            }
+            for a in &i.addrs {
+                // The signaled race on the far end has no route-ownership
+                // guard, and our own overlay address is only reachable over
+                // our link to that peer: keep tunlion's overlay ranges out of
+                // this path. (The lan hello carries them; its receiver drops
+                // exactly the circular ones by ownership.)
+                if in_own_overlay_range(&a.ip) {
+                    continue;
+                }
+                if tunlion_lan::record::advertisable(&a.ip) && !all_local.contains(&a.ip) {
+                    all_local.insert(all_local.len().saturating_sub(1), a.ip);
+                }
+            }
+        }
+    }
     let ips = filter_local_ips(context, all_local.clone(), peer);
     let mut cands: Vec<String> = ips.into_iter().map(|ip| cand_str(ip, port)).collect();
     if cands.is_empty() && !all_local.is_empty() {
@@ -856,7 +892,7 @@ pub fn bind_endpoint() -> Result<(Endpoint, u16)> {
 /// 32-byte RFC-5705 exporter value, the session-unique channel binding. A
 /// MITM relay terminating TLS on each leg gets a DIFFERENT value, so the MAC it
 /// would have to forward cannot validate against its own peer's binding.
-fn keying_material(conn: &quinn::Connection) -> Result<[u8; 32]> {
+pub(crate) fn keying_material(conn: &quinn::Connection) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
     conn.export_keying_material(&mut out, KEYING_MATERIAL_LABEL, b"")
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
@@ -865,7 +901,7 @@ fn keying_material(conn: &quinn::Connection) -> Result<[u8; 32]> {
 
 /// Auth tag: HMAC(transport_key, keying_material || who). `who` direction-tags
 /// the tag so each side's tag differs and neither can be reflected back.
-fn auth_tag(tkey: &[u8; 32], km: &[u8; 32], who: &str) -> [u8; 32] {
+pub(crate) fn auth_tag(tkey: &[u8; 32], km: &[u8; 32], who: &str) -> [u8; 32] {
     let mut msg = Vec::with_capacity(32 + 16);
     msg.extend_from_slice(km);
     msg.push(b'|');
@@ -878,7 +914,7 @@ fn auth_tag(tkey: &[u8; 32], km: &[u8; 32], who: &str) -> [u8; 32] {
 /// reject. `is_dialer` only decides the two direction tags (so dialer-tag and
 /// acceptor-tag are distinct and can't be reflected). On success the stream is
 /// returned for reuse as the control/data stream.
-async fn authenticate(
+pub(crate) async fn authenticate(
     conn: &quinn::Connection,
     tkey: &[u8; 32],
     is_dialer: bool,
@@ -1486,7 +1522,10 @@ impl Transport for DirectTransport {
     fn remote_addr(&self) -> Option<std::net::SocketAddr> {
         // The actual UDP 5-tuple this direct link is pinned to (post hole-punch
         // this is the punched peer address, like what `tailscale ping` prints).
-        Some(self.conn.remote_address())
+        // Canonical: a dual-stack endpoint (the lan listener) sees IPv4 peers
+        // as `::ffff:a.b.c.d`, which would read as an IPv6 path.
+        let a = self.conn.remote_address();
+        Some(std::net::SocketAddr::new(a.ip().to_canonical(), a.port()))
     }
 
     fn rtt_ms(&self) -> Option<u64> {

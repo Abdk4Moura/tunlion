@@ -201,6 +201,11 @@ pub trait RecvIdentity: Send + Sync {
 #[async_trait]
 pub trait RecvStore: Send + Sync {
     fn devices_path(&self) -> PathBuf;
+    /// The overlay addresses (v6, v4) the store recorded for `name`: what the
+    /// local-discovery circular-route guard treats as carried by its link.
+    fn devices_overlay(&self, _name: &str) -> (Option<String>, Option<String>) {
+        (None, None)
+    }
     fn devices_touch(
         &self,
         name: &str,
