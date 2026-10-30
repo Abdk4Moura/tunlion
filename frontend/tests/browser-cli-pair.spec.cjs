@@ -7,6 +7,11 @@
 // Then it watches the tab's Devices row for the CLI device and the CLI's
 // `devices` view, and reports every offline sample after first online.
 //
+// The CLI asked for "Another device I own", but a browser has no device key:
+// the pairing must EXIT 0 and say plainly that it is paired for files and shell
+// and cannot join the fleet. The native enrolment failure paths are covered by
+// the pair_cmd Rust tests, not by this browser spec.
+//
 //   TUNLION_BIN=... node frontend/tests/browser-cli-pair.spec.cjs
 
 const { spawn, spawnSync } = require('child_process');
@@ -106,6 +111,20 @@ async function rows(page) {
 
   for (let i = 0; i < 150 && addExit === null; i++) await sleep(200);
   note('add exited ' + addExit);
+  // A browser pairs for files and shell but has no device key, so "Another
+  // device I own" cannot enroll it in a fleet. That is a SUCCESSFUL pairing:
+  // exit 0 and one plain note, not the native "did NOT become one of your
+  // devices" failure (which still applies to a native peer that offered no
+  // key, as the Rust unit tests pin).
+  // The pty wraps at 80 columns; collapse whitespace so a sentence split
+  // across two lines is still one assertion.
+  const addText = readOr(path.join(W, 'add.log')).replace(/\r/g, '').replace(/\s+/g, ' ');
+  if (addExit !== 0) fail('tunlion add exited ' + addExit + ' after a successful browser pairing, expected 0\n' + addText.slice(-2000));
+  if (/did NOT become one of your devices/.test(addText))
+    fail('the browser pairing still printed the native enrolment failure\n' + addText.slice(-2000));
+  if (!/browsers pair for files and shell/.test(addText) || !/cannot join your fleet/.test(addText))
+    fail('the browser pairing did not explain files/shell vs the fleet\n' + addText.slice(-2000));
+  note('OK: browser pairing exits 0 and explains it cannot join the fleet');
   note('CLI devices after add:\n' + cli(['devices']));
 
   // The machine then runs its daemon, as a person would.

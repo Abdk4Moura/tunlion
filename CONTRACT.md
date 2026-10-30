@@ -354,7 +354,22 @@ may carry direct candidates, but it never supplies that secret.
   the fallback. This is the normal second-and-later contact path, even when it is
   the first connection in a fresh process session.
 - If either peer is a browser, WebRTC remains the transport because browser peers
-  cannot participate in the CLI direct-QUIC handshake.
+  cannot participate in the CLI direct-QUIC handshake. The browser's first
+  signal is `transport-hint`, which names its kind: `{type:"transport-hint",
+  v:1, direct:false, client:"browser", uid}`. `client:"browser"` is the explicit
+  device-kind marker; `direct:false` alone is only a transport capability, and
+  a native peer may run without direct. Like `direct`, the marker is advisory
+  and unauthenticated, so it is never admission authority: a CLI uses the hint
+  from its exact PAKE partner only to explain a completed pairing. A certificate
+  or a key offer always decides fleet enrolment, and an offer that fails its
+  possession proof remains a failure. A browser that predates the marker (an
+  older cached page) sends no kind, so it keeps the old native classification
+  and warning until it reloads; `direct:false` is never used as a substitute.
+- A browser has no device key, so it cannot join a fleet. A CLI `add` that asked
+  for "another device I own" and completes with a browser is a successful
+  pairing for files and shell, not a failed enrolment: it exits 0 and says that
+  a browser cannot join the fleet. A native peer that offers no key, or offers
+  one that does not prove possession, still fails.
 
 Thus "first contact rides WebRTC" is correct for first contact with an unknown
 peer, and is required by the authentication order. It is not a statement that

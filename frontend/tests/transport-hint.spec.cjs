@@ -70,6 +70,7 @@ function startServer(bundlePath) {
   const first = out.first || {};
   if (first.type !== 'transport-hint') fail(`first signal was ${JSON.stringify(first.type)}, expected transport-hint`);
   if (first.direct !== false) fail(`transport hint did not say direct:false (got ${JSON.stringify(first.direct)})`);
+  if (first.client !== 'browser') fail(`transport hint did not identify its device kind (got ${JSON.stringify(first.client)})`);
   if (first.uid !== 'browser-uid') fail(`transport hint uid was ${JSON.stringify(first.uid)}`);
   // PeerLink.name is the REMOTE peer; it must never travel as our name, and an
   // unauthenticated hint must not be able to set a display name.
