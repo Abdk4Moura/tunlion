@@ -618,6 +618,62 @@ impl LinkGuard {
     }
 }
 
+/// Candidate bookkeeping for a dial on the shared FLEET channel.
+///
+/// Every sibling (and this device's own daemon) sits on that channel, so
+/// presence and transport-offers arrive from devices that are not the target.
+/// Each candidate's identity is proven by certificate (`verify_fleet_identity`);
+/// this only decides the ORDER candidates are tried in and remembers the ones
+/// that proved to be some other device, so one wrong answer rejects that
+/// candidate instead of ending the connect. It grants nothing: a candidate it
+/// lets through still has to pass the certificate check.
+#[derive(Default)]
+struct FleetDial {
+    /// Candidates (signaling sids) that proved a different identity.
+    rejected: std::collections::HashSet<String>,
+    /// A transport-offer from a candidate that is not the current one, held
+    /// until it is. Racing it at once ran the single direct race against
+    /// whichever sibling offered first, with the CURRENT candidate's uid.
+    held_offers: HashMap<String, Value>,
+}
+
+impl FleetDial {
+    /// A candidate appeared. `None`: skip it (already rejected). `Some(true)`:
+    /// try it first, because it CALLS itself the target (its own claim, only an
+    /// ordering hint). `Some(false)`: queue it behind the others.
+    fn presence(&self, pid: &str, asserted_name: Option<&str>, target: &str) -> Option<bool> {
+        if self.rejected.contains(pid) {
+            return None;
+        }
+        Some(asserted_name.is_some_and(|n| n.eq_ignore_ascii_case(target)))
+    }
+
+    /// A transport-offer arrived. True: race it now (it is from the candidate
+    /// being dialed). False: it was held for later or dropped.
+    fn offer(&mut self, signal: &Value, current: Option<&str>) -> bool {
+        let from = signal["from"].as_str().unwrap_or_default();
+        if self.rejected.contains(from) {
+            return false;
+        }
+        if current == Some(from) {
+            return true;
+        }
+        self.held_offers.insert(from.to_string(), signal.clone());
+        false
+    }
+
+    /// We started dialing `pid`: hand back its held offer, if any, to replay.
+    fn on_dial(&mut self, pid: &str) -> Option<Value> {
+        self.held_offers.remove(pid)
+    }
+
+    /// `pid` proved a different identity: never dial it again in this connect.
+    fn reject(&mut self, pid: &str) {
+        self.held_offers.remove(pid);
+        self.rejected.insert(pid.to_string());
+    }
+}
+
 /// Minimal identity-mode link bring-up to a *known* device, mirroring the
 /// production send/recv path but stripped to exactly what L2 needs: join a solo
 /// room, subscribe to the device's presence channel, dial it when it appears,
@@ -635,6 +691,27 @@ impl LinkGuard {
 async fn verify_fleet_identity(
     t: &Arc<dyn Transport>,
     rx: &mut mpsc::UnboundedReceiver<Ev>,
+    tx: &mpsc::UnboundedSender<Ev>,
+    link: &str,
+    expected: &str,
+) -> Result<()> {
+    // Everything that is not this link's control traffic (presence, other
+    // candidates' offers, timers) still belongs to the dial loop, which keeps
+    // going if this candidate is not the one. Swallowing it here lost the
+    // target's own transport-offer while the wrong sibling was being checked.
+    let mut deferred = Vec::new();
+    let r = verify_fleet_identity_inner(t, rx, &mut deferred, link, expected).await;
+    for ev in deferred {
+        let _ = tx.send(ev);
+    }
+    r
+}
+
+async fn verify_fleet_identity_inner(
+    t: &Arc<dyn Transport>,
+    rx: &mut mpsc::UnboundedReceiver<Ev>,
+    deferred: &mut Vec<Ev>,
+    link: &str,
     expected: &str,
 ) -> Result<()> {
     let cb = t.channel_binding().ok_or_else(|| {
@@ -646,25 +723,58 @@ async fn verify_fleet_identity(
     t.send_control(&hello).await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let ev = tokio::time::timeout_at(deadline, rx.recv())
-            .await
-            .map_err(|_| anyhow!("'{expected}' never presented a certificate"))?
-            .ok_or_else(|| anyhow!("link closed before '{expected}' presented a certificate"))?;
-        let Ev::Control(_, v) = &ev else { continue };
+        // A peer that drops the link (it bound the proof to a different
+        // connection of a simultaneous open) says so by closing, not by
+        // answering; notice that instead of waiting out the deadline.
+        if t.is_dead() {
+            bail!("link closed before '{expected}' presented a certificate");
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!("'{expected}' never presented a certificate");
+        }
+        let tick = (deadline - now).min(Duration::from_millis(250));
+        let ev = match tokio::time::timeout(tick, rx.recv()).await {
+            Err(_) => continue,
+            Ok(None) => bail!("link closed before '{expected}' presented a certificate"),
+            Ok(Some(ev)) => ev,
+        };
+        let v = match &ev {
+            Ev::Control(from, v) if from == link => v,
+            Ev::Control(..) | Ev::Chunk(..) => continue,
+            _ => {
+                deferred.push(ev);
+                continue;
+            }
+        };
         if v["type"].as_str() != Some(crate::fleet::HELLO) {
             continue;
         }
         let proven = crate::fleet::verify_hello(v, &cb, &owner, crate::identity::now_secs())?;
         let name = crate::device_name_for_pub(&proven.device_pub);
         if name.as_deref().map(|n| n.eq_ignore_ascii_case(expected)) != Some(true) {
-            bail!(
+            return Err(anyhow::Error::new(WrongFleetDevice(format!(
                 "refusing: the device answering as '{expected}' proved a different identity ({}). Nothing was sent.",
                 name.as_deref().unwrap_or("unknown device")
-            );
+            ))));
         }
         return Ok(());
     }
 }
+
+/// `verify_fleet_identity` reached a device that PROVED it is not the target.
+/// Only this rejects the candidate for the rest of the dial; any other failure
+/// (no answer, link closed) leaves it eligible for another attempt.
+#[derive(Debug)]
+struct WrongFleetDevice(String);
+
+impl std::fmt::Display for WrongFleetDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WrongFleetDevice {}
 
 /// How long `exec` waits for a single signal from the device it is reaching
 /// before saying it is offline. A live daemon answers the moment it sees us.
@@ -850,6 +960,16 @@ pub(crate) async fn bring_up_to_known(
     // The acceptor re-sends its transport-offer (a late initiator can miss the
     // first). Race only the FIRST offer we get; later re-sends are duplicates.
     let mut direct_racing = false;
+    // FLEET MODE ONLY. The fleet channel is shared by every sibling (and by our
+    // own daemon), so presence and transport-offers arrive from devices that are
+    // not the target. Each candidate's identity is proven by certificate
+    // (`verify_fleet_identity`); a candidate that proves a DIFFERENT device is
+    // remembered here and skipped, and the dial moves on to the next one. This
+    // used to end the whole connect, so `tunlion shell <sibling>` from a device
+    // without a daemon broker (Windows) failed whenever another fleet member
+    // answered first, reported as "can't reach" even when the target was online
+    // and would have refused or served the shell in milliseconds.
+    let mut fleet = FleetDial::default();
 
     let spawn_timer = |pid: String, g: u32| {
         let tx = tx.clone();
@@ -965,6 +1085,11 @@ pub(crate) async fn bring_up_to_known(
                 .await?;
                 peer_uid = uid;
                 peer = Some(p);
+                if fleet_mode {
+                    if let Some(offer) = fleet.on_dial(&pid) {
+                        let _ = tx.send(Ev::Signal(offer));
+                    }
+                }
 
                 // Item 3: also start a DIRECT-QUIC attempt racing the WebRTC
                 // dial. Bind once, advertise to whichever candidate is current
@@ -1124,7 +1249,20 @@ pub(crate) async fn bring_up_to_known(
                 {
                     continue;
                 }
-                queue.push_back((pid, v["uid"].as_str().map(|s| s.to_string()), true));
+                let front = if fleet_mode {
+                    match fleet.presence(&pid, v["name"].as_str(), peer_name) {
+                        Some(front) => front,
+                        None => continue,
+                    }
+                } else {
+                    false
+                };
+                let entry = (pid, v["uid"].as_str().map(|s| s.to_string()), true);
+                if front {
+                    queue.push_front(entry);
+                } else {
+                    queue.push_back(entry);
+                }
             }
             Ev::Signal(v) => {
                 heard_from_peer = true;
@@ -1140,6 +1278,11 @@ pub(crate) async fn bring_up_to_known(
                     // --relay hides our address from the peer: dialing its
                     // direct candidates would hand it our IP as the source.
                     if !crate::conn::direct_permitted(relay, true) {
+                        continue;
+                    }
+                    if fleet_mode
+                        && !fleet.offer(&v, peer.as_ref().map(|p| p.id.as_str()))
+                    {
                         continue;
                     }
                     if direct_racing {
@@ -1262,7 +1405,7 @@ pub(crate) async fn bring_up_to_known(
                     Err(e) => crate::ui::trace(&format!("tunlion: signal: {e}")),
                 }
             }
-            Ev::DirectReady(_pid, t, route) => {
+            Ev::DirectReady(pid, t, route) => {
                 // Item 3: the DIRECT-QUIC race won before WebRTC. The acceptor's
                 // `adopt_direct` (main.rs) is born `trusted: true` + identity-bound
                 // `verified_name`, its pair-secret MAC already proved who we are,
@@ -1280,6 +1423,38 @@ pub(crate) async fn bring_up_to_known(
                         "\rtunlion: tunnel up to '{peer_name}' (route: {route})"
                     ));
                 }
+                // The fleet secret got us CONNECTED to a fleet member. It does not
+                // say WHICH one: every sibling sits on the same channel, so a peer
+                // answering to this name merely ASSERTED it. Prove it with the
+                // certificate before the caller moves any bytes, or
+                // `send --to laptop` could hand the file to whichever fleet device
+                // answered first. Fails closed on a transport with no channel
+                // binding, because there is nothing to bind the proof to. A
+                // failed proof rejects THIS candidate, not the connect.
+                if fleet_mode {
+                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name).await {
+                        crate::ui::debug(&format!("fleet: {e:#}; trying the next fleet device"));
+                        t.force_close();
+                        let mut uid = None;
+                        if peer.as_ref().is_some_and(|p| p.id == pid) {
+                            let p = peer.take().unwrap();
+                            p.mark_closed();
+                            tokio::spawn(async move { p.close().await });
+                            uid = peer_uid.take();
+                        }
+                        if e.downcast_ref::<WrongFleetDevice>().is_some() {
+                            fleet.reject(&pid);
+                            queue.retain(|(q, _, _)| *q != pid);
+                        } else if !queue.iter().any(|(q, _, _)| *q == pid) {
+                            // Unproven, not disproven: it may be the target on a
+                            // connection that lost a simultaneous open. Retry it.
+                            queue.push_back((pid.clone(), uid, true));
+                        }
+                        // The next candidate gets its own direct race.
+                        direct_racing = false;
+                        continue;
+                    }
+                }
                 // Transport is up: the Establishing race is won. Record Ready;
                 // the caller records the L2Open round trip and the final `up`.
                 diag.enter(crate::diag::Phase::Ready);
@@ -1289,16 +1464,6 @@ pub(crate) async fn bring_up_to_known(
                     sio: Some(sio),
                     peer: peer.take(),
                 };
-                // The fleet secret got us CONNECTED to a fleet member. It does not
-                // say WHICH one: every sibling sits on the same channel, so a peer
-                // answering to this name merely ASSERTED it. Prove it with the
-                // certificate before the caller moves any bytes, or
-                // `send --to laptop` could hand the file to whichever fleet device
-                // answered first. Fails closed on a transport with no channel
-                // binding, because there is nothing to bind the proof to.
-                if fleet_mode {
-                    verify_fleet_identity(&t, &mut rx, peer_name).await?;
-                }
                 return Ok((t, rx, guard, diag));
             }
             Ev::Stuck(pid, g) => {
@@ -1316,9 +1481,28 @@ pub(crate) async fn bring_up_to_known(
                     diag.stall(crate::diag::Phase::Establishing, candidate_secs * 1000);
                     crate::ui::debug("tunlion: candidate unresponsive, rotating");
                     queue.push_back((pid, peer_uid.take(), peer_present));
+                    // On the fleet channel the next candidate may be the target,
+                    // and the direct race is the only path that can prove it
+                    // (see the ChannelReady arm), so it gets its own race. A late
+                    // win from the abandoned race is still certificate-checked.
+                    if fleet_mode {
+                        direct_racing = false;
+                    }
                 }
             }
             Ev::ChannelReady(pid, t) if peer.as_ref().is_some_and(|p| p.id == pid) => {
+                // A fleet-secret link can only be proven by a certificate bound
+                // to the link, and a WebRTC data channel exposes no binding, so
+                // it can never pass `verify_fleet_identity`. Do not let it end
+                // the connect: keep this candidate's direct-QUIC race going (it
+                // has the binding), and the per-candidate timer rotates if that
+                // never lands. Nothing is sent over the unproven channel.
+                if fleet_mode && t.channel_binding().is_none() {
+                    crate::ui::debug(&format!(
+                        "fleet: data channel to a candidate for '{peer_name}' cannot be bound to a certificate; waiting for its direct path"
+                    ));
+                    continue;
+                }
                 // Prove identity so the peer's up/recv marks this link trusted,
                 // the acceptor's capability gate keys on exactly that.
                 if let Some(p) = &peer {
@@ -1348,20 +1532,35 @@ pub(crate) async fn bring_up_to_known(
                 // Transport is up via WebRTC: Establishing race won. Record Ready;
                 // the caller records the L2Open round trip and the final `up`.
                 diag.enter(crate::diag::Phase::Ready);
+                // Same certificate proof as the direct arm above; the binding
+                // exists here (checked at the top of this arm).
+                if fleet_mode {
+                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name).await {
+                        crate::ui::debug(&format!("fleet: {e:#}; trying the next fleet device"));
+                        t.force_close();
+                        let mut uid = None;
+                        if peer.as_ref().is_some_and(|p| p.id == pid) {
+                            let p = peer.take().unwrap();
+                            p.mark_closed();
+                            tokio::spawn(async move { p.close().await });
+                            uid = peer_uid.take();
+                        }
+                        if e.downcast_ref::<WrongFleetDevice>().is_some() {
+                            fleet.reject(&pid);
+                            queue.retain(|(q, _, _)| *q != pid);
+                        } else if !queue.iter().any(|(q, _, _)| *q == pid) {
+                            // Unproven, not disproven: it may be the target on a
+                            // connection that lost a simultaneous open. Retry it.
+                            queue.push_back((pid.clone(), uid, true));
+                        }
+                        direct_racing = false;
+                        continue;
+                    }
+                }
                 let guard = LinkGuard {
                     sio: Some(sio),
                     peer: peer.take(),
                 };
-                // The fleet secret got us CONNECTED to a fleet member. It does not
-                // say WHICH one: every sibling sits on the same channel, so a peer
-                // answering to this name merely ASSERTED it. Prove it with the
-                // certificate before the caller moves any bytes, or
-                // `send --to laptop` could hand the file to whichever fleet device
-                // answered first. Fails closed on a transport with no channel
-                // binding, because there is nothing to bind the proof to.
-                if fleet_mode {
-                    verify_fleet_identity(&t, &mut rx, peer_name).await?;
-                }
                 return Ok((t, rx, guard, diag));
             }
             Ev::PcState(pid, s) if s == "failed" || s == "closed" => {
@@ -3064,6 +3263,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                         );
                         std::process::exit(1);
                     }
+                    crate::ui::debug(&format!("tunlion shell: connect failed: {e:#}"));
                     let connect_secs: u64 = std::env::var("TUNLION_CONNECT_SECS")
                         .ok()
                         .and_then(|s| s.parse().ok())
@@ -5835,6 +6035,38 @@ mod h1_tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    /// The owner-reported failure: `tunlion shell <sibling>` over the fleet
+    /// channel (no daemon broker, as on Windows) died as "can't reach" whenever
+    /// another fleet device's offer or answer came first. The dial must hold an
+    /// offer from a device it is not dialing, replay it when that device's turn
+    /// comes, and after a candidate proves to be someone else, skip it and its
+    /// offers instead of ending the connect.
+    #[test]
+    fn fleet_dial_holds_other_offers_and_skips_a_rejected_candidate() {
+        let mut f = FleetDial::default();
+        let offer = |from: &str| json!({ "from": from, "data": { "type": "transport-offer" } });
+
+        // Ordering only: the device calling itself the target goes first.
+        assert_eq!(f.presence("sid-charlie", Some("Charlie"), "charlie"), Some(true));
+        assert_eq!(f.presence("sid-alpha", Some("alpha"), "charlie"), Some(false));
+        assert_eq!(f.presence("sid-anon", None, "charlie"), Some(false));
+
+        // Dialing alpha: charlie's offer is held, not raced against alpha.
+        assert!(f.offer(&offer("sid-alpha"), Some("sid-alpha")));
+        assert!(!f.offer(&offer("sid-charlie"), Some("sid-alpha")));
+        assert!(!f.offer(&offer("sid-charlie"), None));
+
+        // alpha proved a different identity: rejected, never queued or raced again.
+        f.reject("sid-alpha");
+        assert_eq!(f.presence("sid-alpha", Some("charlie"), "charlie"), None);
+        assert!(!f.offer(&offer("sid-alpha"), Some("sid-alpha")));
+        assert_eq!(f.on_dial("sid-alpha"), None);
+
+        // charlie's turn: its held offer comes back exactly once.
+        assert_eq!(f.on_dial("sid-charlie"), Some(offer("sid-charlie")));
+        assert_eq!(f.on_dial("sid-charlie"), None);
     }
 
     /// `push_ring` keeps the buffer bounded by `cap`, evicting the OLDEST bytes,

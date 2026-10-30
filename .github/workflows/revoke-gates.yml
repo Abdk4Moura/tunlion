@@ -75,6 +75,7 @@ on:
       - 'cli/tests/invite-withdraw-gates.sh'
       - 'cli/tests/ephemeral-runner-gates.sh'
       - 'cli/tests/fleet-automesh-gates.sh'
+      - 'cli/tests/sibling-shell-refusal-gates.sh'
       - 'cli/tests/lib/fixture.sh'
       - 'backend/**'
       - '.github/workflows/revoke-gates.yml'
@@ -275,6 +276,25 @@ jobs:
           set -uo pipefail
           g=cli/tests/fleet-automesh-gates.sh
           want=33
+          echo "gate tree: $(git rev-parse HEAD) ($g)"
+          code=0
+          out="$(timeout 600 bash "$g" 2>&1)" || code=$?
+          echo "$out"
+          got=$(printf '%s\n' "$out" | grep -cE '^(PASS|KNOWN-RED):' || true)
+          if [ "$code" -eq 124 ]; then echo "::error::$g HUNG (600s)"; exit 1; fi
+          if [ "$code" -ne 0 ]; then echo "::error::$g exited $code"; exit 1; fi
+          if [ "$got" -ne "$want" ]; then echo "::error::$g passed $got gates but $want were expected"; exit 1; fi
+          echo "$g: $got/$want gates passed"
+
+      # A fleet sibling's ungranted shell is refused fast and by name, also on
+      # the fleet-secret dial a device without a daemon broker (Windows) uses.
+      - name: Run sibling shell refusal gates
+        env:
+          TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
+        run: |
+          set -uo pipefail
+          g=cli/tests/sibling-shell-refusal-gates.sh
+          want=15  # B 2, W 4x2, G1, GW x4
           echo "gate tree: $(git rev-parse HEAD) ($g)"
           code=0
           out="$(timeout 600 bash "$g" 2>&1)" || code=$?
