@@ -243,6 +243,10 @@ pub(crate) enum EnrolOutcome {
     Fine,
     /// OWNER SIDE, asked for one of its devices: the peer did not become one.
     OwnerNotEnrolled { offer_seen: bool, failed_proof: bool },
+    /// OWNER SIDE, asked for one of its devices, but the peer identified itself
+    /// as a browser: the pairing is real (files and shell), the fleet
+    /// enrolment is impossible and is not a failure.
+    OwnerBrowserNotFleet,
     /// OWNER SIDE: certified, but the device never said it stored it.
     OwnerUnconfirmed,
     /// DEVICE SIDE: offered its key, nobody answered.
@@ -257,6 +261,10 @@ pub(crate) struct EnrolOutcomeInputs {
     pub certified_here: bool,
     pub already_same_owner: bool,
     pub peer_presented_cert: bool,
+    /// The PAKE partner announced, on its transport hint, that it is a browser.
+    /// Advisory device-kind evidence only: it can explain why a pairing is not
+    /// a fleet enrolment, never admit one or excuse a failed key proof.
+    pub peer_is_browser: bool,
     pub offer_seen: bool,
     pub offer_failed_proof: bool,
     pub unconfirmed_grant: bool,
@@ -270,7 +278,17 @@ pub(crate) struct EnrolOutcomeInputs {
 /// case (`external_notice_applies`), not this one.
 pub(crate) fn enrolment_outcome(i: EnrolOutcomeInputs) -> EnrolOutcome {
     if i.owner_asked_own && !i.certified_here && !i.already_same_owner && !i.peer_presented_cert {
-        return EnrolOutcome::OwnerNotEnrolled { offer_seen: i.offer_seen, failed_proof: i.offer_failed_proof };
+        // A browser has no device key to offer, so "no offer" is its normal
+        // outcome, not a failed enrolment. Only the explicit browser marker
+        // earns this; a missing or malformed key offer from any other peer
+        // stays the failure below.
+        if i.peer_is_browser && !i.offer_seen && !i.offer_failed_proof && !i.joined_here {
+            return EnrolOutcome::OwnerBrowserNotFleet;
+        }
+        return EnrolOutcome::OwnerNotEnrolled {
+            offer_seen: i.offer_seen,
+            failed_proof: i.offer_failed_proof,
+        };
     }
     if i.certified_here && i.unconfirmed_grant {
         return EnrolOutcome::OwnerUnconfirmed;
@@ -284,6 +302,16 @@ pub(crate) fn enrolment_outcome(i: EnrolOutcomeInputs) -> EnrolOutcome {
         }
     }
     EnrolOutcome::Fine
+}
+
+/// Whether this signal is the browser's explicit device-kind hint. The hint is
+/// advisory and unauthenticated (it arrives before PAKE); it is used ONLY to
+/// word the outcome of a completed pairing, never to admit a device. `direct`
+/// alone is a transport fact, not a kind: a native peer may run without direct.
+/// Pure.
+pub(crate) fn browser_hint(data: &Value) -> bool {
+    data["type"].as_str() == Some("transport-hint")
+        && data["client"].as_str() == Some("browser")
 }
 
 /// Say the outcome. Returns the error to exit with when what was asked for
@@ -309,6 +337,14 @@ fn report_enrolment_outcome(o: &EnrolOutcome, peer: &str) -> Option<anyhow::Erro
                 crate::exit_codes::ExitKind::Other,
                 format!("{peer} is paired, but it did not become one of your devices"),
             ))
+        }
+        EnrolOutcome::OwnerBrowserNotFleet => {
+            // A browser pairing is a success. Say what it is and what it is
+            // not, in one line, instead of the native "did NOT become" failure.
+            ui::say(&format!(
+                "  {peer} is paired \u{b7} browsers pair for files and shell, but cannot join your fleet, so it is not one of your devices"
+            ));
+            None
         }
         EnrolOutcome::OwnerUnconfirmed => {
             ui::caution(
@@ -1141,6 +1177,12 @@ async fn pair_with_purpose(
     let mut ack_deadline: Option<Instant> = None;
     // OFFER SIDE: the owner said a person is deciding.
     let mut got_hold = false;
+    // Peers whose transport hint explicitly named `client: browser`, kept per
+    // sid so a bystander in the room cannot label the PAKE partner. Advisory
+    // only: the outcome below trusts it only for the exact ceremony partner,
+    // and never against a certificate or a key offer.
+    let mut browser_peers: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     // OFFER SIDE: this device holds no certificate, so it offers its key (and
     // re-sends it until answered) and waits, bounded, for the answer.
     let certless_at_start = local_device_cert().is_none();
@@ -1561,11 +1603,15 @@ async fn pair_with_purpose(
                         }
                         // Never a silent downgrade: if "one of my devices" was the
                         // intent on either side and it did not happen, say so.
+                        let peer_is_browser = pake_peer
+                            .as_deref()
+                            .is_some_and(|p| browser_peers.contains(p));
                         let outcome = enrolment_outcome(EnrolOutcomeInputs {
                             owner_asked_own: internal && load_owner_key().is_some(),
                             certified_here: issued_cert.is_some(),
                             already_same_owner: same_person || same_identity_member,
                             peer_presented_cert: peer_identity_cert.is_some(),
+                            peer_is_browser,
                             offer_seen,
                             offer_failed_proof,
                             unconfirmed_grant,
@@ -1842,6 +1888,12 @@ async fn pair_with_purpose(
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
+                // The browser names its kind on the transport hint it sends
+                // before any SDP. Record it per sid; the outcome only uses it
+                // when this sid is the PAKE partner.
+                if browser_hint(&data) {
+                    browser_peers.insert(from.clone());
+                }
                 // L1-a: PAKE messages ride the opaque `signal` relay. Branch them
                 // OUT of the WebRTC signal path (SDP/ICE) into the shared ceremony.
                 // A `pake-confirm` verify ⇒ wrong password OR a server that
@@ -2741,6 +2793,7 @@ mod enrol_flow_tests {
             certified_here: false,
             already_same_owner: false,
             peer_presented_cert: false,
+            peer_is_browser: false,
             offer_seen: false,
             offer_failed_proof: false,
             unconfirmed_grant: false,
@@ -2781,6 +2834,65 @@ mod enrol_flow_tests {
         );
         // A plain pairing nobody asked to enrol says nothing extra.
         assert_eq!(enrolment_outcome(out()), EnrolOutcome::Fine);
+    }
+
+    /// Only the explicit browser marker turns "asked for a device, no key
+    /// offer" into a successful pairing. A native peer that merely lacks the
+    /// direct transport is still a FAILED enrolment, and a browser marker never
+    /// hides an offer that arrived but did not prove its key.
+    #[test]
+    fn a_browser_pairing_exits_zero_but_a_missing_native_key_does_not() {
+        // The browser: no certificate, no key offer, explicit marker.
+        let browser = enrolment_outcome(EnrolOutcomeInputs {
+            owner_asked_own: true,
+            peer_is_browser: true,
+            ..out()
+        });
+        assert_eq!(browser, EnrolOutcome::OwnerBrowserNotFleet);
+        assert!(
+            report_enrolment_outcome(&browser, "iPad").is_none(),
+            "a browser pairing is a success (exit 0)"
+        );
+        // Native peer with no offer: still a failure (exit 1).
+        let native = enrolment_outcome(EnrolOutcomeInputs { owner_asked_own: true, ..out() });
+        assert_eq!(
+            native,
+            EnrolOutcome::OwnerNotEnrolled { offer_seen: false, failed_proof: false }
+        );
+        assert!(
+            report_enrolment_outcome(&native, "laptop").is_some(),
+            "a native device that never offered its key must still fail"
+        );
+        // A browser marker must not excuse a key offer that failed its proof.
+        let bad_offer = enrolment_outcome(EnrolOutcomeInputs {
+            owner_asked_own: true,
+            peer_is_browser: true,
+            offer_seen: true,
+            offer_failed_proof: true,
+            ..out()
+        });
+        assert_eq!(
+            bad_offer,
+            EnrolOutcome::OwnerNotEnrolled { offer_seen: true, failed_proof: true }
+        );
+        assert!(report_enrolment_outcome(&bad_offer, "iPad").is_some());
+    }
+
+    /// `direct:false` is a transport capability, not device-kind evidence.
+    #[test]
+    fn only_the_explicit_browser_marker_classifies_a_peer() {
+        assert!(browser_hint(&json!({
+            "type": "transport-hint", "direct": false, "client": "browser"
+        })));
+        assert!(!browser_hint(&json!({
+            "type": "transport-hint", "direct": false
+        })));
+        assert!(!browser_hint(&json!({
+            "type": "transport-hint", "direct": false, "client": "native"
+        })));
+        assert!(!browser_hint(&json!({
+            "type": "description", "direct": false, "client": "browser"
+        })));
     }
 
     #[test]

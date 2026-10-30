@@ -342,13 +342,19 @@ export function legacyPoliteRole({ myUid, peerUid, myId, peerId }) {
 // that ladder for this peer while keeping direct-first for CLI peers. Old CLIs
 // ignore an unknown signal type, so this is a pure latency hint, not a protocol
 // dependency (identity/PAKE still gate trust).
+//
+// `client:"browser"` is the explicit device-kind marker. It lets a CLI explain
+// a completed pairing correctly (a browser pairs for files and shell; it has no
+// device key and cannot join a fleet). It is advisory UX only: it never admits
+// a device, and only the CLI's PAKE partner's hint is considered. `direct:false`
+// alone is NOT kind evidence, because a native peer may run without direct.
 export function transportHint(uid) {
   // `name` is deliberately absent: PeerLink.name is the REMOTE peer's name, and
   // an unauthenticated hint must not be able to write a display name (or uid)
   // into the receiver's roster before pair-proof/PAKE resolves identity. The
-  // uid is used only for the symmetric politeness election; `direct:false` is
-  // the only durable fact.
-  return { type: 'transport-hint', v: 1, direct: false, uid: uid || null }
+  // uid is used only for the symmetric politeness election; `direct:false` and
+  // the kind marker are the only durable facts.
+  return { type: 'transport-hint', v: 1, direct: false, client: 'browser', uid: uid || null }
 }
 
 
