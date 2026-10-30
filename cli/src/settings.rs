@@ -551,7 +551,7 @@ pub enum Origin {
 }
 
 impl Origin {
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Origin::Env(v) => format!("env:{v}"),
             Origin::Peer(d) => format!("peer:{d}"),
@@ -561,7 +561,7 @@ impl Origin {
     }
 }
 
-fn effective_default(s: &Setting) -> String {
+pub(crate) fn effective_default(s: &Setting) -> String {
     match s.key {
         "name" => crate::default_display_name(),
         "drop-dir" => crate::default_drop_dir().display().to_string(),
@@ -741,12 +741,17 @@ fn canonicalize(s: &Setting, raw: &str) -> Result<String> {
             Ok(raw.to_string()) // store as given (keep ~ portable)
         }
         Kind::Str => {
-            if s.key == "server" && !(raw.starts_with("http://") || raw.starts_with("https://")) {
-                bail!("server must be an http(s) URL, e.g. https://api.example.com");
-            }
+            check_text(s.key, raw)?;
             Ok(raw.to_string())
         }
         Kind::List => {
+            if s.key == "advertise-routes" {
+                for item in raw.split(',').map(str::trim).filter(|i| !i.is_empty()) {
+                    if !is_cidr(item) {
+                        bail!("'{item}' is not a CIDR; advertise-routes takes prefixes like 192.168.1.0/24");
+                    }
+                }
+            }
             // An EMPTY list is how a list setting is cleared, and clearing is
             // not an edge case: `advertise-routes ''` is how a subnet router or
             // exit node WITHDRAWS what it offers. Refusing it meant a node could
@@ -755,6 +760,58 @@ fn canonicalize(s: &Setting, raw: &str) -> Result<String> {
             Ok(raw.to_string())
         }
     }
+}
+
+/// The text settings whose readers only understand one shape. Each check is
+/// the reader's own grammar, so `set` refuses what the reader would silently
+/// replace with its default (or, for ssh.cert_ttl, refuse at signing time).
+fn check_text(key: &str, raw: &str) -> Result<()> {
+    match key {
+        "server" if !(raw.starts_with("http://") || raw.starts_with("https://")) => {
+            bail!("server must be an http(s) URL, e.g. https://api.example.com")
+        }
+        "warm-max" | "gate.settle_ms" if !raw.parse::<u64>().is_ok_and(|n| n > 0) => {
+            bail!("'{key}' expects a whole number above 0")
+        }
+        "ssh.cert_ttl" => {
+            filament_peerloop::ssh_ca::parse_ttl_secs(raw)
+                .map_err(|_| anyhow::anyhow!("'ssh.cert_ttl' expects seconds or a duration like 30m, 1h, 1d"))?;
+        }
+        // The words ui.rs reads; anything else silently meant `info`.
+        "verbosity" if !VERBOSITY_WORDS.contains(&raw.to_ascii_lowercase().as_str()) => {
+            bail!("'verbosity' expects one of: quiet, info, debug, trace")
+        }
+        "tun-addr" if !(raw.is_empty() || raw == "auto" || is_cidr(raw)) => {
+            bail!("tun-addr expects IP/PREFIX (e.g. 10.9.0.1/24), auto, or empty for L3 off")
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Every spelling `ui.rs` maps to a level. The first four are the ones to offer.
+pub(crate) const VERBOSITY_WORDS: &[&str] = &["quiet", "info", "debug", "trace", "critical", "crit", "q", "v", "vv"];
+
+fn is_cidr(raw: &str) -> bool {
+    let Some((ip, prefix)) = raw.split_once('/') else { return false };
+    let Ok(ip) = ip.parse::<std::net::IpAddr>() else { return false };
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    prefix.parse::<u8>().is_ok_and(|p| p <= max)
+}
+
+/// Validate and canonicalize a value exactly as `tunlion set <key> <value>`
+/// would, without writing it. The interactive menu checks input through this.
+pub(crate) fn validate(s: &Setting, raw: &str) -> Result<String> {
+    canonicalize(s, raw)
+}
+
+/// Devices that hold their own value for this setting, sorted.
+pub(crate) fn overrides_of(s: &Setting) -> Vec<String> {
+    let mut out: Vec<String> =
+        peer_overrides(&peer_load()).into_iter().filter(|(_, ps, _)| ps.key == s.key).map(|(d, _, _)| d).collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn expand_tilde(p: &str) -> PathBuf {
@@ -1022,25 +1079,29 @@ pub async fn run_set(
         return run_unset(k, peers).await;
     }
     match (key, value) {
-        (None, _) => readout(json_out),
+        (None, _) => {
+            if crate::set_menu::opens_menu(peers.is_empty(), json_out, crate::set_menu::Terminal::now()) {
+                // Boxed: the menu applies changes through run_set again.
+                Box::pin(crate::set_menu::run(dry_run)).await
+            } else {
+                readout(json_out)
+            }
+        }
         (Some(k), None) => {
             // `set <key>` with no value READS it, as the help says: the bare
             // value on stdout for a pipe or a command substitution, JSON with
             // --json. This used to print "needs a value" and exit 2 whenever
             // stdout was not a terminal, so the documented read only worked
-            // where nobody could capture it. A terminal still gets the editor
-            // (a picker for interface lists, the value plus help otherwise).
+            // where nobody could capture it. A terminal gets the same editor
+            // the bare `set` menu opens, for this one setting.
             let s = lookup(k)?;
             let peer = match peers {
                 [] => None,
                 [one] => Some(one.as_str()),
                 _ => bail!("read one device's value at a time: tunlion set {} --peer <device>", s.key),
             };
-            let interactive = std::io::stdout().is_terminal()
-                && std::io::stdin().is_terminal()
-                && !crate::NO_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed);
-            if !json_out && interactive && peer.is_none() {
-                render_missing_interactive(s)
+            if crate::set_menu::opens_menu(peer.is_none(), json_out, crate::set_menu::Terminal::now()) {
+                Box::pin(crate::set_menu::edit_one(s, dry_run)).await
             } else {
                 run_get(s.key, peer, false, None, json_out)
             }
@@ -1088,9 +1149,10 @@ pub async fn run_set(
                         "{} {}: {} {} {}{strength_note} ({})",
                         ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()),
                         c.key,
-                        ui::paint_when(color, ui::Tone::Dim, &c.old),
+                        // An empty side reads as "(none)", not as a double space.
+                        ui::paint_when(color, ui::Tone::Dim, crate::set_menu::shown(&c.old)),
                         ui::glyph_arrow(),
-                        c.new,
+                        crate::set_menu::shown(&c.new),
                         c.scope
                     );
                 }
@@ -1163,106 +1225,6 @@ fn run_reset(dry_run: bool, yes: bool) -> Result<()> {
     let _ = std::fs::remove_file(peer_path());
     eprintln!("{} reset all settings to defaults", ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()));
     Ok(())
-}
-
-/// Store what an interactive editor chose for a List key. The SAME writer as
-/// `tunlion set <key> <value> [--hard]` (`set_with`, which encodes through
-/// `encode_for_store`), so a value picked in the checklist and the same value
-/// typed as an argument are stored byte-for-byte alike.
-fn store_interactive_choice(s: &Setting, chosen: &str, hard: bool) -> Result<Change> {
-    set_with(s.key, chosen, None, hard)
-}
-
-/// `tunlion set <key>` at a terminal: an editor for interface lists (checklist
-/// for avoid/only, reorderable list for prefer), else the value and its help.
-/// A failed write is an error, never a printed success.
-fn render_missing_interactive(s: &Setting) -> Result<()> {
-    let (cur_val, origin) = resolve(s, None);
-    let subtitle = if cur_val.is_empty() {
-        format!("(currently unset) [{}]", origin.label())
-    } else {
-        format!("currently: {}  [{}]", cur_val, origin.label())
-    };
-    let color = ui::stdout_color();
-    match s.kind {
-        Kind::List => {
-            let is_membership = s.key == "avoid" || s.key == "only";
-            let aff = build_affordance_with_current(s, &cur_val);
-            let opts = aff.options.unwrap_or_default();
-
-            if is_membership {
-                // Membership (avoid/only): multi-select checklist
-                match crate::interact::interactive_checklist(&aff.command, &subtitle, &opts) {
-                    Some(chosen) => {
-                        if chosen.is_empty() {
-                            eprintln!("{} cancelled (nothing selected)", s.key);
-                        } else {
-                            let c = store_interactive_choice(s, &chosen, false)?;
-                            eprintln!("{} {}: {} {} {} ({})", ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()), s.key, ui::paint_when(color, ui::Tone::Dim, &cur_val), ui::glyph_arrow(), c.new, c.scope);
-                        }
-                    }
-                    None => eprintln!("{} cancelled", s.key),
-                }
-            } else {
-                // Arrangement (prefer): reorderable list, starting from the
-                // strength that is stored now.
-                let start = if prefer_strength(None) == "hard" {
-                    crate::interact::Strength::Hard
-                } else {
-                    crate::interact::Strength::Soft
-                };
-                match crate::interact::interactive_reorder(&aff.command, &subtitle, &opts, start) {
-                    Some((ordered, strength)) => {
-                        let hard = strength == crate::interact::Strength::Hard;
-                        let c = store_interactive_choice(s, &ordered, hard)?;
-                        let s_label = if hard { " (hard)" } else { "" };
-                        eprintln!("{} {}: {} {} {}{s_label} ({})", ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()), s.key, ui::paint_when(color, ui::Tone::Dim, &cur_val), ui::glyph_arrow(), c.new, c.scope);
-                    }
-                    None => eprintln!("{} cancelled", s.key),
-                }
-            }
-        }
-        _ => {
-            // Non-List: show current value + help
-            println!("{} {} = {}  ({})", s.key, ui::paint_when(color, ui::Tone::Dim, &origin.label()), cur_val, s.help);
-            match s.kind {
-                Kind::Bool => println!("  on / off  (example: tunlion set {} on)", s.key),
-                Kind::Enum(vals) => println!("  values: {}  (example: tunlion set {} {})", vals.join(" / "), s.key, vals[0]),
-                Kind::Str | Kind::Path => println!("  example: tunlion set {} <value>", s.key),
-                _ => {}
-            }
-            println!();
-            println!("{}", ui::paint_when(color, ui::Tone::Dim, "set: tunlion set <key> <value> [--peer <peer>]   reset: tunlion set <key> --unset   reset all: tunlion set --reset"));
-        }
-    }
-    Ok(())
-}
-
-fn build_affordance_with_current(s: &Setting, cur_val: &str) -> crate::interact::Affordance {
-    let command = format!("set {}", s.key);
-    let options = if matches!(s.kind, Kind::List) {
-        let ifaces = crate::interact::enumerate_interfaces();
-        if ifaces.is_empty() {
-            None
-        } else {
-            // Split current value into parts for preselection
-            let current_parts: Vec<&str> = cur_val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-            Some(ifaces.iter().map(|i| {
-                let ips: Vec<String> = i.ips.iter().map(|ip| ip.to_string()).collect();
-                let is_checked = current_parts.iter().any(|p| *p == i.name);
-                crate::interact::OptionEntry {
-                    label: i.name.clone(),
-                    detail: ips.join(", "),
-                    group: i.group.clone(),
-                    checked: is_checked,
-                }
-            }).collect())
-        }
-    } else {
-        None
-    };
-
-    crate::interact::Affordance { command, options }
 }
 
 /// When avoid and prefer overlap, the latest set wins. Remove the overlapping
@@ -1865,7 +1827,8 @@ mod tests {
                 (global_get(s.store).unwrap(), resolve(s, None).0, prefer_strength(None))
             });
             let via_picker = with_tmp_cfg(|| {
-                store_interactive_choice(s, value, hard).unwrap();
+                // What the `set` menu's checklist and order editor call on save.
+                block_on(crate::set_menu::apply(s, value, None, hard, false)).unwrap();
                 (global_get(s.store).unwrap(), resolve(s, None).0, prefer_strength(None))
             });
             assert_eq!(via_flags, via_picker, "{key}: the two paths stored different values");

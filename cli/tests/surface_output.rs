@@ -49,7 +49,9 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("pair_cmd.rs", 1),
         ("recv_files.rs", 1),
         ("mount.rs", 47),
-        ("settings.rs", 36),
+        // settings.rs: 36 -> 25 when the `set <key>` editors moved to
+        // set_menu.rs, which draws through codeentry and prints nothing bare.
+        ("settings.rs", 25),
         ("direct.rs", 14),
         ("tun/linux.rs", 11),
         // interact.rs: 5 -> 0 after #391 routed its prompts through ui::.

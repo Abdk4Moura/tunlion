@@ -1390,3 +1390,52 @@ fn receive_with_an_explicit_room_skips_the_code_prompt() {
     t.send("cancel\r");
     assert!(rc_after(&t, at, 8).is_some(), "receive --room did not end on cancel; screen:\n{}", tail(&t.text()));
 }
+
+/// Bare `tunlion set` at a terminal is the settings menu: a digit opens a
+/// group, a digit opens a setting, Enter flips a toggle, and the change is
+/// stored by the same path as `tunlion set <key> <value>` (receipt and file).
+/// Esc walks back out to the shell. The same binary from a pipe still prints
+/// the TSV readout, with the new value in it.
+#[cfg(unix)]
+#[test]
+fn the_set_menu_flips_a_toggle_and_a_pipe_still_reads_rows() {
+    let (mut t, exe) = fresh_term("set-menu");
+    let dir = std::env::temp_dir().join(format!("tunlion-pty-set-menu-{}", std::process::id()));
+    let before = t.text().len();
+    t.send(&format!("\"{exe}\" set\r"));
+    assert!(t.wait_for_from(before, "This device", 20), "bare set did not open the menu; screen:\n{}", tail(&t.text()));
+    t.settle(300, 3);
+    let at = t.text().len();
+    t.send("1");
+    assert!(t.wait_for_from(at, "auto-extract", 10), "the group did not open; screen:\n{}", tail(&t.text()));
+    t.settle(300, 3);
+    let at = t.text().len();
+    t.send("3");
+    assert!(t.wait_for_from(at, "Turn on", 10), "auto-extract did not offer its toggle; screen:\n{}", tail(&t.text()));
+    t.settle(300, 3);
+    let at = t.text().len();
+    t.send("\r");
+    assert!(t.wait_for_from(at, "on (global)", 10), "no receipt for the change; screen:\n{}", tail(&t.text()));
+    let config = std::fs::read_to_string(dir.join("config")).unwrap_or_default();
+    assert!(config.lines().any(|l| l.trim() == "auto-extract on"), "not stored as `set auto-extract on` stores it: {config:?}");
+    // Back on the group's list, now showing the new value.
+    assert!(t.wait_for_from(at, "auto-extract", 10), "the list did not come back; screen:\n{}", tail(&t.text()));
+    t.settle(300, 3);
+    t.send("\u{1b}");
+    t.settle(300, 3);
+    let at = t.text().len();
+    t.send("\u{1b}");
+    assert!(t.wait_for_from(at, &format!("{MARK}> "), 10), "Esc did not leave the menu; screen:\n{}", tail(&t.text()));
+    let at = t.text().len();
+    t.send(&format!("\"{exe}\" set | cat\r"));
+    assert!(t.wait_for_from(at, "auto-warm", 20), "a pipe did not get the readout; screen:\n{}", tail(&t.text()));
+    t.settle(300, 3);
+    // A pty may expand tabs, so read the row by its fields.
+    let row: Vec<String> = t.text()[at..]
+        .lines()
+        .find(|l| l.trim_start().starts_with("auto-extract"))
+        .map(|l| l.split_whitespace().take(3).map(str::to_string).collect())
+        .unwrap_or_default();
+    assert_eq!(row, ["auto-extract", "on", "global"], "screen:\n{}", tail(&t.text()));
+    assert!(!t.text()[at..].contains("SETTINGS"), "a pipe opened the menu; screen:\n{}", tail(&t.text()));
+}
