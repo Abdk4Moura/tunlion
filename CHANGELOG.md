@@ -13,6 +13,8 @@ release build failed and nothing was published under it.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-30
+
 ### Added
 
 - You can now see and withdraw the invitations you handed out.
@@ -33,7 +35,6 @@ release build failed and nothing was published under it.
   dashboard. Someone claiming a withdrawn invitation is told the owner
   withdrew it; a 0.9.1 joiner sees `enrollment denied: the owner withdrew
   this invitation`.
-
 - Devices certified by your owner key now reach each other without pairing.
   `tunlion reach <device>` works between two of your devices that were each
   added to your mesh but never paired with each other, over the link their
@@ -45,7 +46,6 @@ release build failed and nothing was published under it.
   `--to <rung>`, `--json`, the exact undo command after every move, and an
   interactive picker at a terminal (also under More, and on the dashboard's
   device page).
-
 - `tunlion grant <device> <capability> --on <other-device>` on your owner
   device gives one of your devices `transfer`, `shell` or `mount` on another of
   your devices. It is signed with your owner key, delivered to that device, and
@@ -57,6 +57,14 @@ release build failed and nothing was published under it.
   and mount but never shell, `all` also applies shell, `off` ignores owner
   grants entirely. It is set on the device only; nothing over the network
   changes it, and narrowing it applies at once.
+- `tunlion add` for a device you own is one step: the owner side says what the
+  device will become before you confirm, the joining side says what it became,
+  and nothing silently ends up as someone else's device. Device names are
+  normalized like hostnames (`a-z`, `0-9`, `-`) and found case-insensitively.
+  The guided `tunlion join` code prompt turns spaces into dashes as you type.
+- The CLI relays over TURN on TCP and on TLS port 443 when UDP is blocked, as
+  the browser already did, so a CLI behind a UDP-blocking firewall still
+  connects.
 
 ### Changed
 
@@ -72,9 +80,51 @@ release build failed and nothing was published under it.
   for anyone else it names the code pairing their person has to accept. A
   daemon now ignores an introduction from a device that is not its own
   owner's.
+- A transfer by code starts sooner across networks: the authenticated link
+  carries the file while the direct QUIC path comes up, instead of waiting for
+  it. A peer on 0.9.1 keeps the old behaviour.
+- A send ends as soon as the receiver confirms every file, instead of waiting
+  up to a second for the network to acknowledge its last packet.
+- Pages see each other faster after a load or reload, and a reload no longer
+  makes other devices see this one leave and come back.
+- `tunlion exec` and `tunlion shell` start from the environment a new login of
+  that account gets (as sshd does), not from the background service's own
+  environment, so a tool installed after the service started is found. On
+  Windows the default shell is PowerShell, starting in your profile folder.
+- `tunlion update` says how to restart a background service that is still
+  running the old binary, matched to how it was started, on Windows too.
+  `status` and `down` keep recognising that service after the update.
+- Installer and CLI output no longer use em dashes.
 
 ### Fixed
 
+- A code ceremony message lost on the network is sent again until the next
+  step is seen, so a cross-network code transfer no longer sits at
+  "authenticating..." for 60 s or fails with "confirmation arrived before key
+  exchange".
+- A code pairing delivers each side's certificate reliably: it is sent again
+  until the other side confirms it, and if it never arrives both sides fail
+  and say why, instead of reporting success with the device left uncertified
+  ("needs review"). A peer on 0.9.1 keeps the old behaviour.
+- `tunlion join <code>` no longer drops out of the creator's room right after
+  claiming the code (a race most often seen on Windows).
+- A browser tab restored from the back/forward cache reconnects on both
+  transports, and a closed tab leaves the other devices at once.
+- A browser that dies without closing its tab (killed renderer, phone OS
+  kill) on the long-polling transport disappears from other devices in
+  seconds instead of about 85 s, and a briefly unreachable peer shows "away,
+  back soon".
+- `tunlion exec <device> -- tunlion status` reports the device's running
+  background service instead of "not running" when that service uses a custom
+  config directory.
+- `up --shell-only <device>` is honoured when that device reaches it over the
+  background service's existing link, not only over a fresh one.
+- Windows: the native overlay adapter gets its IPv4 address (it fell back to a
+  169.254 address before), `tunlion down` stops the background service,
+  `up --detach` no longer hangs a pipe, and `expose`, `status` and `init`
+  report the real state.
+- Windows: `install.ps1` installs over a running `tunlion.exe` and restarts the
+  background service it stopped.
 - Behind a proxy that inspects TLS, signaling now trusts the same certificates
   as tunlion's other connections: the operating system's trust store, plus
   `SSL_CERT_FILE` / `SSL_CERT_DIR`. Previously only the built-in Mozilla roots
@@ -85,6 +135,7 @@ release build failed and nothing was published under it.
 
 ### Security
 
+- Removing a pairing no longer leaves its secret in `devices.json.bak`.
 - Revoking a device on your owner device now cuts it off from your other
   devices too. Previously only the owner refused it; your other devices kept
   their links to it and still exchanged files with it. Each device now follows
