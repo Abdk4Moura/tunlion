@@ -556,13 +556,14 @@ pub(crate) enum Cmd {
         tail: usize,
     },
     ///
-    /// No args prints all settings with their value, scope, and where each came
-    /// from (env > peer > config > default). Strictly imperative: `set` only
+    /// No args at a terminal opens the settings menu; otherwise it prints all
+    /// settings with their value, scope, and where each came from
+    /// (env > peer > config > default). Strictly imperative: `set` only
     /// changes the key you name.
     #[command(
         hide = true,
         after_help = "\x1b[1mExamples:\x1b[0m\n  \
-        tunlion set                          show every setting + where it came from\n  \
+        tunlion set                          the settings menu (piped: every setting + where it came from)\n  \
         tunlion set auto-extract on          change one setting (partial, never resets others)\n  \
         tunlion set shell on --peer laptop   per-device override\n  \
         tunlion set drop-dir                 read one value (bare value on stdout when piped)\n  \
@@ -573,8 +574,9 @@ pub(crate) enum Cmd {
     Set {
         /// Setting name (run `tunlion set` to list them all)
         key: Option<String>,
-        /// New value. `tunlion set` with no arguments lists every setting;
-        /// `tunlion set <key>` reads one.
+        /// New value. `tunlion set` with no arguments opens the settings menu
+        /// at a terminal and lists every setting otherwise; `tunlion set <key>`
+        /// edits one at a terminal and reads it otherwise.
         value: Option<String>,
         /// Scope this change to one or more known devices (per-peer settings
         /// only). Comma-separated or repeatable: --peer a,b  or  --peer a --peer b
