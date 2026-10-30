@@ -35,6 +35,18 @@ use crate::net::{Ev, Transport};
 pub const ROUTE_LAN: &str = "lan";
 /// How long a dial of remembered/discovered addresses may take.
 pub const DIAL_BUDGET: Duration = Duration::from_secs(4);
+/// Delay between successive addresses of one dial.
+pub const DIAL_STAGGER: Duration = Duration::from_millis(250);
+/// While the server is reachable, signaling gets this long after start to
+/// link a device before local discovery dials it (no duplicate links).
+pub const ONLINE_GRACE: Duration = Duration::from_secs(8);
+
+/// May local discovery dial now? Always when the server is unreachable;
+/// beside a working server only after the grace, so the signaled link (when
+/// it forms) is the one kept and the two never race into duplicates.
+pub fn may_dial(offline: bool, since_start: Duration) -> bool {
+    offline || since_start >= ONLINE_GRACE
+}
 const ACCEPT_AUTH_BUDGET: Duration = Duration::from_secs(10);
 const MAX_INFLIGHT_ACCEPTS: usize = 32;
 
@@ -502,11 +514,16 @@ pub async fn dial(ep: Endpoint, key: LanKey, addrs: Vec<SocketAddr>, tx: Unbound
         return None;
     }
     let tkey = direct::transport_key(&key.secret);
+    // Staggered, best first (happy eyeballs): one address usually wins before
+    // the next is tried, so the far end does not authenticate several
+    // connections of which all but one are dropped at once.
     let mut set: FuturesUnordered<_> = addrs
         .into_iter()
-        .map(|a| {
+        .enumerate()
+        .map(|(i, a)| {
             let ep = ep.clone();
             async move {
+                tokio::time::sleep(DIAL_STAGGER * i as u32).await;
                 let conn = ep.connect(to_dial(a), "filament-direct")?.await.context("lan dial handshake")?;
                 let (s, r) = direct::authenticate(&conn, &tkey, true).await?;
                 Ok::<_, anyhow::Error>((a, conn, s, r))

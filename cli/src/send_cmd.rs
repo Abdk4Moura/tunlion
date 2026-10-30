@@ -407,41 +407,46 @@ pub(crate) async fn send_cmd(
         .as_deref()
         .and_then(|t| devices_load().into_iter().find(|(n, _)| n.eq_ignore_ascii_case(t)))
         .filter(|_| filament_transport::lan::enabled(&transport_context));
-    let lan_svc = match &lan_target {
-        Some((n, sec)) => match crate::lan_send::start(&transport_context, tx.clone()).await {
-            Ok(svc) => {
-                crate::lan_send::dial_now(&svc, n, sec);
-                Some(svc)
-            }
-            Err(e) => {
-                ui::debug(&format!("lan: local discovery unavailable for this send: {e:#}"));
-                None
-            }
-        },
-        None => None,
-    };
-    let bounded = |d: u64| Duration::from_secs(if lan_svc.is_some() { d } else { 3600 });
+    // Used only when the server turns out to be unreachable, so a one-shot
+    // never forms a second link beside the signaled one, and sends nothing on
+    // the local network while the server works.
+    let mut lan_svc: Option<filament_transport::lan::LanService> = None;
+    let mut lan_offline = false;
+    let bounded = |d: u64| Duration::from_secs(if lan_target.is_some() { d } else { 3600 });
     let room = match room {
         Some(r) => r,
         None => match tokio::time::timeout(bounded(5), net::fetch_auto_room(&transport_context, server)).await {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) | Err(_) if lan_svc.is_some() => {
-                ui::debug("lan: no room from the server; sending over the local network only");
+            Ok(Err(_)) | Err(_) if lan_target.is_some() => {
+                ui::debug("lan: no room from the server; trying the local network too");
+                lan_offline = true;
                 String::new()
             }
             Ok(Err(e)) => return Err(e),
             Err(_) => anyhow::bail!("the tunlion server did not answer"),
         },
     };
-    let sio = match tokio::time::timeout(bounded(5), net::connect_signaling(&transport_context, server, tx.clone())).await {
+    let sio = match tokio::time::timeout(bounded(12), net::connect_signaling(&transport_context, server, tx.clone())).await {
         Ok(Ok(c)) => c,
-        Ok(Err(_)) | Err(_) if lan_svc.is_some() => {
-            ui::say("can't reach the tunlion server; looking on the local network");
+        Ok(Err(_)) | Err(_) if lan_target.is_some() => {
+            lan_offline = true;
             filament_signal::Client::offline().await?
         }
         Ok(Err(e)) => return Err(e),
         Err(_) => anyhow::bail!("the tunlion server did not answer"),
     };
+    if lan_offline {
+        if let Some((n, sec)) = lan_target.as_ref() {
+            ui::say("can't reach the tunlion server; looking on the local network");
+            match crate::lan_send::start(&transport_context, tx.clone()).await {
+                Ok(svc) => {
+                    crate::lan_send::dial_now(&svc, n, sec);
+                    lan_svc = Some(svc);
+                }
+                Err(e) => ui::debug(&format!("lan: local discovery unavailable for this send: {e:#}")),
+            }
+        }
+    }
     // C30: the convergent session repairs room/channel/lease state the
     // one-shot emits lose (the fast path stays for old servers + latency);
     // under gate L these initial emits are exactly what the shim drops.
@@ -1606,7 +1611,7 @@ pub(crate) async fn send_cmd(
             }
             Ev::Lan(e) => match e {
                 filament_transport::lan::LanEvent::Found { name, addr } => {
-                    if let Some((n, sec)) = lan_target.as_ref().filter(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                    if let Some((n, sec)) = lan_target.as_ref().filter(|(n, _)| lan_offline && n.eq_ignore_ascii_case(&name)) {
                         if !conn.has_link_to(n) {
                             conn.lan_dial(n, sec, false, &[addr], &crate::lan_send::ownership(n));
                         }

@@ -3424,8 +3424,9 @@ async fn recv_run(
         }
 
         // Local discovery: dial remembered addresses of paired devices we have
-        // no link to, in parallel with signaling at start (the first 30 s) and
-        // for as long as the server is unreachable. Every 15 s.
+        // no link to, for as long as the server is unreachable, and at start
+        // (until 40 s) for any device signaling has not linked within the
+        // online grace. Every 15 s.
         if conn.lan.is_some()
             && last_lan_dial.map_or(lan_started.elapsed() >= Duration::from_millis(300), |t| t.elapsed() >= Duration::from_secs(15))
         {
@@ -3434,7 +3435,8 @@ async fn recv_run(
                 l.write_state(&host.config_dir());
             }
             let offline = signaling_down_since.is_some();
-            if offline || lan_started.elapsed() < Duration::from_secs(30) {
+            let since = lan_started.elapsed();
+            if filament_transport::lan::may_dial(offline, since) && (offline || since < Duration::from_secs(40)) {
                 let devices = host.devices_load();
                 let own = lan_ownership(&ports, l3.as_ref(), &devices).await;
                 let mut missing = 0;
@@ -4938,7 +4940,7 @@ async fn recv_run(
             // pre-trusted Link, then funnel into the normal ChannelReady handler.
             Ev::Lan(e) => match e {
                 filament_transport::lan::LanEvent::Found { name, addr } => {
-                    if !conn.has_link_to(&name) {
+                    if filament_transport::lan::may_dial(signaling_down_since.is_some(), lan_started.elapsed()) && !conn.has_link_to(&name) {
                         let devices = host.devices_load();
                         if let Some((n, sec)) = devices.iter().find(|(n, _)| n.eq_ignore_ascii_case(&name)).cloned() {
                             let own = lan_ownership(&ports, l3.as_ref(), &devices).await;
