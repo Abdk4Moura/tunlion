@@ -136,8 +136,10 @@ for line in text.splitlines():
     m=re.match(r'\s+\S+\s+([A-Z][A-Z ]+?)\s+/',line)
     if m: section=m.group(1).strip(); continue
     if not line.strip(): section=None; continue
+    # The DEVICE row: the first section that names it. INVITATIONS, further
+    # down, lists the invitation the box was minted from under the same name.
     for name in ('worker','laptop'):
-        if re.search(r'\s'+name+r'\s',line+' '): seen[name]=section
+        if name not in seen and re.search(r'\s'+name+r'\s',line+' '): seen[name]=section
 print(seen.get('worker'), seen.get('laptop'))
 PY
 )

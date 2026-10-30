@@ -1270,16 +1270,20 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Down => {
             ui_caps.confirm("shut down the daemon")?;
             // An ephemeral box (joined with a runner invitation) that stops is
-            // gone for good: say goodbye first, so the owner removes it now
-            // rather than when its offline budget runs out. Advisory and
-            // bounded; a box that cannot reach its owner still stops, and the
-            // budget still removes it.
+            // gone for good: once the daemon is down, say goodbye, so the owner
+            // removes it now rather than when its offline budget runs out.
+            // AFTER the stop, not before: while the daemon still holds its
+            // link to the owner, the goodbye's own link to the same owner was
+            // never adopted and the depart was never sent (measured in
+            // ephemeral-runner-gates E5). Advisory and bounded; a box that
+            // cannot reach its owner still stops, and the budget removes it.
+            let stopped = down_cmd();
             if crate::enrollment::joined_ephemeral() {
                 if let Err(e) = depart_cmd(&server, relay).await {
-                    crate::ui::debug(&format!("down: depart before stopping failed: {e}"));
+                    crate::ui::debug(&format!("down: depart after stopping failed: {e}"));
                 }
             }
-            down_cmd()
+            stopped
         }
         Cmd::Logs { follow, tail } => logs_cmd(follow, tail).await,
         Cmd::Reset => reset_cmd(&ui_caps),
