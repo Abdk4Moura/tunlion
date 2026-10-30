@@ -1,15 +1,17 @@
 # Tunlion launch pack (0.9.2, paste-ready)
 
 Everything in the paste blocks is final and contains no em dashes. Facts below
-were checked against the live 0.9.1 release on 2026-10-28; recheck the version
-lines once `cli-v0.9.2` is published (section 4):
+were checked against the live 0.9.2 release on 2026-10-30 (curl installer in a
+clean HOME, `npm i -g tunlion`, the Homebrew formula, API health, the blog URL,
+and a code pairing between two browsers on tunlion.autumated.com):
 
 - CLI `cli-v0.9.2` on GitHub Releases (Linux, macOS Intel and Apple Silicon,
   Windows; SHA256SUMS plus build-provenance attestations).
 - Installers: `curl -fsSL https://tunlion.autumated.com/install | sh` and
   `irm https://tunlion.autumated.com/install.ps1 | iex`.
 - `npm i -g tunlion` and `brew install abdk4moura/tap/tunlion` are live at 0.9.2.
-- winget: `Abdk4Moura.Tunlion` is in review (microsoft/winget-pkgs#462262).
+- winget: `Abdk4Moura.Tunlion` is in review (microsoft/winget-pkgs#466106 for
+  0.9.2, #462262 for 0.9.1).
   Do not lead with winget until that PR merges.
 - crates.io is not published; Cargo installs from git.
 - Web app: https://tunlion.autumated.com. Source: https://github.com/Abdk4Moura/tunlion (MIT).
