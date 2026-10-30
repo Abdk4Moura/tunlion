@@ -84,8 +84,10 @@ change; batching only spreads them. A dead row can therefore remain
 indefinitely if no later claim arrives: there is no scheduled sweep and no
 `TTL + constant` physical-retention claim. Capacity is separate again: one
 expired row is found directly through the `sessions_exp` index, otherwise a
-keyset page of at most `FIL_CAPACITY_SCAN` rows (default 64) advances an
-in-memory `(exp, rowid)` cursor and deletes only the one-slot deficit. A page
+row-value keyset page of at most `FIL_CAPACITY_SCAN` rows (default 64)
+advances an in-memory `(exp, rowid)` cursor and deletes only the one-slot
+deficit. The row-value seek keeps a late cursor on the index instead of
+re-scanning the prefix. A page
 with no dead row fails closed and the next claim continues after it, wrapping
 at the end. A closed but unexpired row beyond the page can delay a new
 session until cursor progress or expiry; that availability tradeoff is
