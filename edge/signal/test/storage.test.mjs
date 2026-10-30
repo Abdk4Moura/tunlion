@@ -21,7 +21,15 @@ const registryJs = transpile("../src/registry.ts")
   .replace('from "./liveness"', `from "${livenessUrl}"`)
   .replace('from "./policy"', `from "${policyUrl}"`);
 const { Registry } = await import(url(registryJs));
-const { SESSION_TTL } = await import(policyUrl);
+const {
+  SESSION_TTL,
+  SESSION_PERSIST_S,
+  SESSION_PRUNE_BATCH,
+  CAPACITY_SCAN,
+  sessionPersistFrom,
+  pruneBatchFrom,
+  capacityScanFrom,
+} = await import(policyUrl);
 
 function sqlite() {
   const db = new DatabaseSync(":memory:");
@@ -45,6 +53,23 @@ function sqlite() {
 
 const M = (sql, alive, now, max, slack, prune, scan) =>
   new Registry(sql, (s) => alive.has(s), "", () => now.value, max, slack, prune, scan);
+
+test("option parsing rejects bad values and clamps spacing to the TTL", () => {
+  assert.equal(sessionPersistFrom({}), SESSION_PERSIST_S);
+  assert.equal(sessionPersistFrom({ FIL_SESSION_PERSIST_S: "0" }), 0);
+  assert.equal(sessionPersistFrom({ FIL_SESSION_PERSIST_S: "1800" }), 1800);
+  assert.equal(sessionPersistFrom({ FIL_SESSION_PERSIST_S: "-1" }), SESSION_PERSIST_S);
+  assert.equal(sessionPersistFrom({ FIL_SESSION_PERSIST_S: "nope" }), SESSION_PERSIST_S);
+  assert.equal(sessionPersistFrom({ FIL_SESSION_PERSIST_S: "Infinity" }), SESSION_PERSIST_S);
+  assert.equal(sessionPersistFrom({ FIL_SESSION_PERSIST_S: String(SESSION_TTL + 1) }), SESSION_TTL);
+  assert.equal(pruneBatchFrom({}), SESSION_PRUNE_BATCH);
+  assert.equal(pruneBatchFrom({ FIL_SESSION_PRUNE_BATCH: "10" }), 10);
+  assert.equal(pruneBatchFrom({ FIL_SESSION_PRUNE_BATCH: "0" }), SESSION_PRUNE_BATCH);
+  assert.equal(pruneBatchFrom({ FIL_SESSION_PRUNE_BATCH: "-4" }), SESSION_PRUNE_BATCH);
+  assert.equal(capacityScanFrom({}), CAPACITY_SCAN);
+  assert.equal(capacityScanFrom({ FIL_CAPACITY_SCAN: "256" }), 256);
+  assert.equal(capacityScanFrom({ FIL_CAPACITY_SCAN: "0" }), CAPACITY_SCAN);
+});
 
 test("refresh spacing: 48 writes/day at 30 min, 4 at 6 h", () => {
   for (const [slack, want] of [[1800, 48], [6 * 3600, 4]]) {
