@@ -81,7 +81,7 @@ for (const batch of [64, 256, 1024]) {
 for (const scan of [16, 64, 256]) {
   const db = seed(N);
   const alive = new Set(Array.from({ length: N }, (_, i) => `sid${i}`));
-  const now = { value: 1000 + 3600 + 1 }; // unexpired, all live
+  const now = { value: 1000 + 1800 }; // unexpired, all live
   const sql = counted(db);
   const reg = new Registry(sql, (s) => alive.has(s), "", () => now.value, N, 6 * 3600, 256, scan);
   sql.c.rowsRead = sql.c.rowsWritten = sql.c.statements = 0;
