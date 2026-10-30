@@ -1343,9 +1343,13 @@ pub(crate) async fn send_cmd(
                 if let Some((n, sec)) = &known_target {
                     if v["channel"].as_str() == Some(channel_of(sec).as_str()) {
                         let pid = v["id"].as_str().unwrap_or_default().to_string();
-                        // Already linked over local discovery: one link per
-                        // send, or the file could be offered twice.
-                        if conn.has_link_to(n) {
+                        // Already linked over local discovery (only ever formed
+                        // when the server looked unreachable): one link per send,
+                        // or the file could be offered twice. Scoped to that
+                        // case: a name-wide check here also matched a dead
+                        // link that has not timed out yet, and swallowed the
+                        // restarted receiver's presence (gate 14b).
+                        if lan_offline && conn.has_link_to(n) {
                             saw_known_peer.insert(n.clone());
                             continue;
                         }

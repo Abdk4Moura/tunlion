@@ -1186,7 +1186,7 @@ async fn recv_run(
                     _ => "no answer in 4s".to_string(),
                 };
                 log.say(&format!(
-                    "  {} can't reach the tunlion server yet; serving paired devices on the local network and retrying",
+                    "  {} waiting for network: can't reach the tunlion server yet; retrying, and serving paired devices on the local network meanwhile",
                     log.paint(Tone::Warn, "!")
                 ));
                 log.debug(&format!("  signaling connect failed at start: {why}"));
