@@ -350,14 +350,10 @@ fn all_facts() -> Vec<Facts> {
 pub(crate) async fn cut_off(name: &str) -> Result<()> {
     crate::set_device_revoked(name, true)?;
     crate::withdraw_requests_for(name);
-    crate::outln!(
-        "revoked '{name}'; it is denied on reconnect and a fresh invitation cannot revive it (only `tunlion promote {}` can)",
-        crate::refusal::word(name)
-    );
     let answer = crate::revocation_live::tell_daemon().await;
-    match crate::revocation_live::daemon_line(name, &answer, false) {
-        Ok(line) => ui::say(&line),
-        Err(e) => anyhow::bail!(e),
+    match crate::revocation_live::revoke_line(name, &answer) {
+        Ok(line) => crate::outln!("{line}"),
+        Err(e) => return Err(crate::revocation_live::unconfirmed_exit(e)),
     }
     Ok(())
 }
