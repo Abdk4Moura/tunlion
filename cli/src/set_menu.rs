@@ -531,8 +531,10 @@ impl Checklist {
     }
 
     pub(crate) fn outcome(&self) -> Edited {
+        // Strength means nothing without an order, before or after.
         let hard = self.hard && !self.picked.is_empty();
-        if (self.value(), hard) == (self.initial.0.clone(), self.initial.1 && !self.initial.0.is_empty()) {
+        let was_hard = self.initial.1 && !self.initial.0.is_empty();
+        if self.value() == self.initial.0 && hard == was_hard {
             Edited::Unchanged
         } else {
             Edited::Value(self.value(), hard)
