@@ -30,7 +30,7 @@ Or a package manager (same release):
 |---|---|
 | **winget** (Windows) | `winget install Abdk4Moura.Tunlion` (new package, in winget review) |
 | **Homebrew** (macOS/Linux) | `brew install abdk4moura/tap/tunlion` |
-| **Cargo** (Rust, from source) | `cargo install --locked --git https://github.com/Abdk4Moura/tunlion filament-cli` |
+| **Cargo** (crates.io, builds from source) | `cargo install --locked tunlion` |
 | **npm** (Node) | `npm i -g tunlion` |
 
 Homebrew and npm install `tl` too. Homebrew reports a link conflict and leaves

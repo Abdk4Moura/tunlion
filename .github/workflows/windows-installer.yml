@@ -54,7 +54,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cargo build --locked --release -p filament-cli --bin tunlion
+          cargo build --locked --release -p tunlion --bin tunlion
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify tunlion --version (also builds the whole Clap tree)

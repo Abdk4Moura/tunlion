@@ -13,7 +13,7 @@
 # the sequence file lives, and generating the key on first use) and calls in.
 # This crate never calls back, so there is no cycle.
 [package]
-name = "filament-overlay"
+name = "tunlion-overlay"
 version = "0.1.0"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
@@ -23,6 +23,11 @@ description = "Self-certifying overlay addresses: an IPv6 address derived from a
 readme = "README.md"
 keywords = ["overlay", "ipv6", "ed25519", "self-certifying", "networking"]
 categories = ["network-programming", "cryptography"]
+
+# Published as tunlion-overlay. The Rust library keeps its pre-rename name, so no
+# `use` line changed.
+[lib]
+name = "filament_overlay"
 
 [dependencies]
 anyhow = "1.0.102"
