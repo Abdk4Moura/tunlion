@@ -1,31 +1,49 @@
 # Local discovery: find and pair nearby peers with no server
 
-Status: design, for owner review. Written against `main` at bd3928a8. A peer of
-`docs/carriers.md` (branch `work/carriers`, PRs #623, #624), not a parallel
-system: it is the "LAN, Bluetooth, mesh discovery" row of that doc's
+Status: revised after owner review (2026-10-30), for approval. Written against
+`main` at bd3928a8. A peer of `docs/carriers.md` (branch `work/carriers`, PRs
+#623, #624): it is the "LAN, Bluetooth, mesh discovery" row of that doc's
 censorship table (section 8), built now.
+
+**Protocol first.** The wire format is specified language-neutrally in
+`docs/protocol/local-discovery.md`, with test vectors produced by an
+independent Python implementation (`crates/tunlion-lan/vectors/`). The Rust
+core (`crates/tunlion-lan`) is sans-IO: pure encode, decode, derive and verify
+functions plus an engine that turns time and datagrams into actions, with no
+sockets, no async runtime and no peerloop types, so the same core serves the
+CLI daemon, Android (through the FFI) and the browser (wasm). The daemon
+integration is a thin adapter on top. Any other client conforms by
+reproducing the vectors.
+
+**Interfaces by capability, never by name.** Discovery treats every up
+interface with a unicast address the same way, from its flags: Ethernet,
+Wi-Fi, USB tethering, a Hyper-V or WSL switch, WireGuard, ZeroTier, Tailscale,
+Nebula and tunlion's own overlay (`tunlion0`) are not special cases, and no
+code keeps a list of names. There is no dependency on any VPN's API.
 
 ## 1. Goal and the gap
 
 Owner principle: tunlion connects any two peers whenever some path exists
 between them, resilient to impedance and censorship; zero config, quiet, UX
-first. Devices on one Wi-Fi, one Ethernet or one tailnet are the easiest pair
-there is, and today they depend on our server to meet:
+first. Devices on one Wi-Fi, one Ethernet, one VPN or overlay are the easiest
+pair there is, and today they depend on our server to meet:
 
 - "People near you" is the public IP the server sees: `/api/room`
   (`backend/app.py`, `api_room`, grouping by full IPv4 or IPv6 /64), used by
   the CLI via `fetch_auto_room` (`crates/filament-transport/src/net.rs`).
   Peers behind a VPN, dual WAN, or one on v4 and one on v6 land in different
   rooms and miss each other.
-- Once two peers have met, the CLI already offers host candidates on every
-  interface including `tailscale0` (`direct.rs` `gather_candidates`, the
-  `tailscale` 100.64.0.0/10 class) and dials them in `race_connect` from
-  `conn.rs` `on_transport_offer`. But the candidates travel over signaling. No
-  server, no meeting, no connection, even with the peer one metre away.
+- Once two peers have met, the CLI offers host candidates and dials them in
+  `race_connect` from `conn.rs` `on_transport_offer`. **Correction:** the
+  first draft said those candidates cover every interface. They do not:
+  `direct.rs` `local_ips` returns only the default-route source addresses, so
+  a peer reachable only over a second interface (a tunnel, a second NIC) was
+  never dialed there. And the candidates travel over signaling: no server, no
+  meeting, no connection, even with the peer one metre away.
 
-Goal: paired and fleet peers on a shared local link or tailnet find each other
-and connect with no server; two strangers in one room can pair with a code
-with no server; nothing identifying is broadcast; no new trust.
+Goal: paired peers on any shared or private network find each other and
+connect with no server; two strangers in one room can pair with a code with
+no server; nothing identifying is broadcast; no new trust.
 
 ## 2. Where it fits with carriers
 
@@ -36,9 +54,10 @@ same thing: candidates and a channel for the ceremony.
 | Rendezvous | Yields | Reached through |
 |---|---|---|
 | signaling server | room presence, offers, candidates | a carrier (direct, proxy, later PT) |
-| **lan** beacon (this doc) | address + port of a recognized peer | the local link itself |
-| **lan** tailnet list (this doc) | 100.x addresses to probe | the Tailscale local API |
-| nearby native peer (this doc) | a local signaling endpoint for browsers | HTTP on the LAN, or BLE |
+| **lan** beacon | address + port of a recognized peer | multicast, broadcast, mDNS on shared interfaces |
+| **lan** probe | the same, by unicast query | point-to-point interfaces (bounded sweep, neighbor hints) |
+| **lan** remembered address | every address the peer had when last linked | any interface, any network |
+| nearby native peer | a local signaling endpoint for browsers | HTTP on the LAN, or BLE |
 | QR / paste (carriers "serverless signaling") | an offer or an address | a camera or a clipboard |
 
 What happens after discovery is unchanged: direct QUIC with the exporter MAC
@@ -46,69 +65,72 @@ over the pair secret (`direct.rs` module header), or WebRTC with the C20
 fingerprint proof; make-before-break promotion (`CONTRACT.md`, "Post-PAKE
 promotion is make-before-break") adopts a LAN path that appears later, and the
 stall ladder (`conn.rs` `enum Rung`) still escalates to relay. When the server
-is reachable, discovered addresses are merged into the candidate set, so the
-different-public-IP case is fixed even online. Discovery never replaces the
-server; it removes the dependency on it.
+is reachable, every interface's addresses are merged into the signaled
+candidate set, so the second-interface case is fixed even online. Discovery
+never replaces the server; it removes the dependency on it.
 
-## 3. Wire design (one format, several carriers of it)
+## 3. Mechanisms, per interface by capability
 
-**Presence key.** Each device holds a random 32-byte presence key `P`. It is
-given to each paired peer inside the already authenticated session at pairing
-(and on the next connection for existing pairs), and to fleet siblings via a
-key derived from the fleet rendezvous secret (`fleet_rv.rs` `rv`), so a new
-sibling recognizes the whole fleet without per-pair exchange. Unpair or fleet
-removal rotates `P` and redelivers it to the rest.
+The spec (`docs/protocol/local-discovery.md`) is normative; this is the why.
 
-**Beacon** (about 34 bytes): `ver | kind | nonce(12) | tag(16) | port(2)`,
-`tag = HMAC(P, "tlb1" | epoch | nonce | port)`, epoch = 10 minutes, ±1
-accepted. `kind` is `presence` or `pairing`. No name, no key, no fingerprint,
-no device id. A listener tries every `P` it knows (one HMAC per known device,
-microseconds); a match yields "device D is at src:port". A stranger sees a
-random-looking tunlion beacon from an address it can already see.
+| Interface class (from flags) | Mechanisms |
+|---|---|
+| shared: not point-to-point, multicast or broadcast | presence beacons to a link-scope group and the subnet broadcast; the same beacon in a DNS-SD TXT record; queries answered by unicast |
+| p2p: point-to-point, or neither multicast nor broadcast (most VPN tunnels) | a bounded unicast sweep of small on-link prefixes and on-link routes (at most a /22 worth of hosts, 200 probes/s in total); the OS neighbor table as hints |
+| every class | remembered addresses (below) |
 
-**Query.** A device that wants a peer now (`tunlion ssh laptop` with no
-server) sends `ver | query | nonce`; devices answer with a unicast presence
-beacon, rate limited, never larger than the query by more than a few bytes (no
-amplification).
+**Remembered addresses are the generic mechanism.** Every time two paired
+peers link, by any route, each sends a `lan-hello` over the authenticated
+link: its presence key, its listener port, and every unicast address on every
+interface with its class. Each side keeps the other's addresses (per peer,
+with class and last-success time) and, at start and whenever the server is
+unreachable, dials them directly with the existing authenticated direct-QUIC
+handshake. This makes any overlay or private network work without knowing
+what it is.
+
+**Presence key.** Each device holds a random 32-byte presence key `P`, sent
+only inside the hello. **Beacon** (34 bytes, every kind): `"TL" | v1 | kind |
+nonce(12) | field(16) | port(2)`, presence field
+`HMAC(P, "tunlion-lan-v1/presence" | epoch | nonce | port)[0..16]`, epoch = 10
+minutes, ±1 accepted. A listener tries every key it holds; a match yields
+"device D is probably at src:port". A query is padded to the same 34 bytes so
+no reply is larger than what caused it.
 
 **A tag is a hint, never trust.** A replayed or forged beacon only makes us
-dial an address; the exporter MAC or PAKE confirmation fails and we drop it.
-The dialer opens with a 16-byte blinded hint
-(`HMAC(P_peer, exporter)` truncated) so the acceptor picks the right pair
-secret without a cleartext id.
+dial an address; the exporter MAC fails and the connection is dropped.
+**Correction:** the first draft had the dialer send a blinded 16-byte hint so
+the listener could pick the secret. Not needed: the listener reads the
+dialer's 32-byte MAC and tries each secret it holds (one HMAC each), so
+nothing new goes on the wire.
 
-**Carriers of the beacon**, all sent, all listened on, per interface:
-
-- DNS-SD `_tunlion._udp` with a random instance and host label per epoch and
-  the beacon in TXT. Uses the OS responder where one exists (Bonjour,
-  Windows DNS Client, Avahi, Android `NsdManager`), else our own on 5353 with
-  address reuse.
-- Raw UDP multicast (239.255.0.0/16 and `ff02::` link scope, TTL 1) and IPv4
-  subnet broadcast on a fixed port, for networks where mDNS is filtered.
-- Tailnet: the tailnet carries unicast only, so instead of beacons we read the
-  peer list (`/localapi/v0/status` on `tailscaled`'s socket, or
-  `tailscale status --json`) and send a query to each online peer's 100.x
-  address. A peer that also runs tunlion answers. Nothing is sent to non-peers
-  off the tailnet.
+**The circular-route guard.** The one guard on candidates: never dial peer X
+at an address whose route is carried by our own link to X (X's address on
+tunlion's overlay exists only while that link is up). Decided by route
+ownership (the device store's recorded overlay addresses for X and the live
+overlay table), never by interface name: an overlay address carried by a link
+to a third device, a second tunlion instance or a nested setup is a real path
+and is dialed.
 
 Same-link correlation is honestly bounded: rotation stops a stranger learning
 who you are or linking you across networks, not noticing that the same MAC
-address keeps sending beacons on this network.
+address keeps sending beacons on this network. A device that could not bind
+the default listener port sends its own port in every beacon, which links its
+beacons on that link.
 
 ## 4. Pairing nearby
 
 Opt-in "visible nearby for pairing" is exactly the time a code is on screen:
 `tunlion pair` (and the app's Add device screen) emits `pairing` beacons until
 the code is used or expires; nothing else ever does. The beacon carries no
-code-derived value (a low-entropy code must not be testable offline) and a
-random two-word label shown beside the code. The joiner types the code (or
-scans the QR, which also carries the LAN address); `join` finds pairing
-beacons, opens a local QUIC stream to each (in practice one) and runs the same
-SPAKE2 ceremony there instead of over signaling. A wrong target costs one
-online guess, counted by the existing attempt limit. In the UI the joiner sees
-"Nearby: otter-maple" matching the label on the other screen. Fleet admission
-over LAN is the existing certificate handshake (`filament-fleet`
-`verify_hello`) on the discovered link. No new trust anywhere.
+code-derived value (a low-entropy code must not be testable offline), only a
+random pairing id; both screens show a 4-digit label derived from the id
+beside the code. The joiner types the code (or scans the QR, which also
+carries the LAN address); `join` finds pairing beacons, opens a local QUIC
+stream to each (in practice one) and runs the same SPAKE2 ceremony there
+instead of over signaling. A wrong target costs one online guess, counted by
+the existing attempt limit. Fleet admission over LAN is the existing
+certificate handshake (`filament-fleet` `verify_hello`) on the discovered
+link. No new trust anywhere.
 
 ## 5. Per client
 
@@ -128,7 +150,8 @@ Terminal or SSH, but **not launchd agents** ([TN3179](https://developer.apple.co
 stick (TN3179, build-time considerations). Root installs (`/Library/LaunchDaemons`)
 never prompt. The multicast entitlement is iOS only.
 
-**Windows.** Defender Firewall prompts on the first inbound listener; the
+**Windows.** Phase 1 dials remembered addresses only (no interface
+enumeration yet, so no beacon or probe is ever sent). Then: Defender Firewall prompts on the first inbound listener; the
 installer adds rules for the **Private** profile only, and on a Public-profile
 network `lan` stays off unless the user turns it on (cafe Wi-Fi is not home).
 Prefer the system mDNS (DNS Client service, `DnsServiceRegister` /
@@ -220,45 +243,71 @@ mDNS host candidates connect them if the LAN passes multicast.
 ## 7. UX
 
 - Zero config: `lan` is on by default everywhere it is allowed; no new commands.
-- One route word: `lan`. `tunlion ping laptop` prints `laptop: lan (direct over
-  wlan0) 2.1 ms`; `devices` shows `lan` where it shows `relay`/`direct` today;
-  the web app badge maps today's `local` to `lan`. As in carriers section 7,
-  only the shown form changes in the first phase; `route()` stays (it is
-  compared in code), and the vocabulary unification is the carriers follow-up.
-- `doctor` gains one block: per interface, beacons sent and recognized, mDNS
-  owner, tailnet seen, and the one blocking cause ("multicast filtered on
-  eth0", "macOS Local Network denied for tunlion: System Settings > Privacy").
+- One route word: `lan`. `tunlion reach laptop` prints
+  `pong via 192.168.1.20:47821 (lan, direct) 2 ms`; `devices` shows
+  `online lan` for such a link; `--json` carries `"route": "lan"`. As in
+  carriers section 7, only shown forms change; the internal route labels stay
+  as they are, and the vocabulary unification is the carriers follow-up.
+- `doctor` gains one row: on/off, the listener, beacons sent and recognized,
+  devices remembered, every interface with what it does there ("eth0
+  multicast+broadcast", "wg0 probe 253 hosts", "off" when opted out), and the
+  one blocking cause when there is one.
 - Off: `network.transports` (carriers section 9) lists `lan` as a member;
-  `auto` includes it; pin a list without `lan` to turn it off. Admins disable
-  it the same way.
+  `auto` includes it; `tunlion set network.transports direct,relay` turns it
+  off (no datagram sent, no listener, no remembered dial). Per interface:
+  `tunlion set network.lan-skip eth1,10.20.0.0/16`.
 - Prompts are asked in context only: the Android permission when the service
   is first switched on, Chrome/Firefox LNA when the user picks a nearby device,
   BLE when the user taps "Bluetooth".
 
 ## 8. Security, collected
 
-1. Beacons carry no name, key or stable id; tags rotate every epoch with a
-   fresh nonce; only holders of `P` recognize them.
+1. Beacons carry no name, key or stable id; tags rotate with a fresh nonce
+   per datagram and are bound to an epoch; only holders of `P` recognize them.
 2. Pairing beacons exist only while a code is on screen, and leak nothing that
    tests the code offline.
 3. Every connection is still authenticated by SPAKE2, the pair secret
    (exporter MAC / C20), or fleet certificates. A tag never admits anything.
-4. Unpair and fleet removal rotate `P`; an ex-peer can at most notice you
-   nearby until its next miss.
-5. No amplification (query-sized replies, rate limits); listeners bound to
-   local interfaces only; Windows Public profile off by default.
-6. Proof: extend `proofs/establishment_model.py` with discovered addresses as a
-   rendezvous and add a mutant that admits on a matching tag; it must be caught.
+4. A hello is accepted only from a link whose identity is proven by its pair
+   secret; unpair forgets the record and rotates `P`.
+5. No amplification (query-sized replies, per-source and global rate limits);
+   nothing sent or answered on an opted-out interface or a Windows Public
+   network.
+6. Proof: `proofs/lan_discovery_model.py` checks ADMIT, REACH, GUARD, OFF,
+   QUIET, BLIND and HELLO over every environment and catches ten mutants
+   (among them: admit on a matching tag, dial the circular overlay address,
+   drop a third device's overlay path by name).
 
-## 9. Phases and rough effort
+## 9. Implementation plan
 
-| Phase | Contents | Effort |
-|---|---|---|
-| 1 | CLI/daemon: presence key, beacon over multicast/broadcast + DNS-SD, tailnet query, server-free direct dial for paired and fleet peers, candidate merge when online, `lan` in shown route, doctor block, `network.transports` member, two-namespace CI rig with no server (and the denied arm: `lan` off must not connect) | 2 to 3 weeks |
-| 2 | Pairing nearby: pairing beacons, SPAKE2 over local QUIC, label in UI, QR with LAN address | 1 to 2 weeks |
-| 3 | Android: NSD picker for Add device, `ACCESS_LOCAL_NETWORK` flow, MulticastLock, service integration | 1 to 2 weeks |
-| 4 | Browser: daemon HTTP signaling endpoint, LNA flow (Chrome, Edge, Firefox), served-page path (Safari, iOS) with WASM known-device crypto, cached addresses, QR offer/answer | 2 to 3 weeks |
-| 5 | BLE: Android peripheral, desktop central, Web Bluetooth signaling; then Wi-Fi Aware/Direct | 3 to 4 weeks |
+Ordered work units. Each lists what it touches, its interface to the next,
+and the test or gate that closes it. Units 1 to 7 are phase 1; 8 is phase 2.
 
-Each phase is verified on real devices on one Wi-Fi with the server blocked,
-and with differing public IPs (one peer on a VPN), before it ships.
+| # | Unit | Touches | Interface out | Closed by |
+|---|---|---|---|---|
+| 1 | Spec and vectors | `docs/protocol/local-discovery.md`, `crates/tunlion-lan/vectors/gen_vectors.py`, `v1.json` | the bytes | an independent Python implementation produces the vectors |
+| 2 | Sans-IO core | `crates/tunlion-lan` (`wire`, `mdns`, `iface`, `record`, `engine`) | `Engine::tick`/`on_datagram` returning `Action`s; `Hello`, `Record`, `RouteOwner`, `not_circular` | `tests/conformance.rs` (vectors) and `tests/properties.rs` (blind beacons across epochs, name-agnostic plans, sweep cap, opt-out/public silence, bounded replies, the circular guard) |
+| 3 | Adapter | `crates/filament-transport/src/lan.rs`: getifaddrs by flags, on-link routes, neighbors, discovery and mDNS sockets, the QUIC listener with trial-MAC, dial, `LanStore` (`lan.key`, `lan-peers.json`); `Ev::Lan` | `LanService::{start, dial, learn, hello_json, write_state}`; `LanEvent::{Linked, Found, PairingNearby}` | unit tests: a listener holding several secrets admits only a held one; the store round-trips, ranks and forgets |
+| 4 | Candidate merge | `direct.rs` `gather_candidates` | every interface's addresses in the signaled offer when lan is on | existing transport gates; the `lan`/`wg` learn phases below ride it |
+| 5 | Loops | `filament-peerloop` `lan_glue.rs` (`seed_lan`, `lan_dial`, `on_linked`, `Ownership`), `recv/dispatch.rs` (start without the server, non-blocking re-dial, periodic remembered dial, `lan-hello` send and learn), `cli/src/send_cmd.rs` + `lan_send.rs` (one-shot send dials remembered addresses beside signaling) | a LAN link is an ordinary `Ev::DirectReady` with route `lan` | `cli/tests/lan-discovery-gates.sh` |
+| 6 | Settings and surfaces | `cli/src/settings.rs` (`network.transports`, `network.lan-skip`), `ping.rs`, `devices`, `doctor.rs` + `lan_doctor.rs` | route word `lan`; doctor `lan` row and `--json` `lan` | unit tests for the validator and the doctor row |
+| 7 | Model | `proofs/lan_discovery_model.py` | | `--self-test`: every mutant caught |
+| 8 | Pairing nearby (phase 2) | `tunlion-lan` pairing beacon (in the core already), `pair_cmd.rs`/`join`, the SPAKE2 ceremony over a local QUIC stream | `LanEvent::PairingNearby` -> join dials it | gate: two namespaces, server blocked, `pair` and `join` with the code complete and then `send` works |
+
+Gates (`cli/tests/lan-discovery-gates.sh`, namespaces on one lease, server
+blocked by an iptables DROP so connects time out): **lan**, one switch, B's
+address changed after learning so only a beacon can find it, plus a stranger
+on the switch who must learn nothing identifying from the captured beacons;
+**wg**, a WireGuard tunnel (no multicast) as the only path, B's tunnel address
+changed so only the sweep can find it; **routed**, different subnets behind a
+router (the different-public-IP case), remembered addresses only. Each must
+`reach` with route `lan` and deliver a `send`; the denied arm
+(`network.transports=direct,relay`) must fail in each.
+
+Later phases, in order: Android (NSD picker for Add device,
+`ACCESS_LOCAL_NETWORK`, MulticastLock, the core through the FFI); browser
+(daemon HTTP signaling endpoint, LNA flow, served page for Safari/iOS, the
+core as wasm for cached addresses); Windows interface enumeration with the
+Public-profile check (until then Windows dials remembered addresses only and
+never sends a beacon or probe); fleet siblings over LAN (the hello waits for
+the certificate); BLE, then Wi-Fi Aware/Direct.
