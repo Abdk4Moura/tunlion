@@ -25,6 +25,11 @@
 #                              warm-hold re-dials, no reaps, no stall ladder,
 #                              while the peer runs one-shot commands at it,
 #                              and the control socket stays responsive
+#   lan-discovery-gates.sh     two paired daemons in namespaces with the
+#                              server blocked meet over one switch (beacons),
+#                              a WireGuard tunnel (sweep) and a router
+#                              (remembered addresses); a stranger learns
+#                              nothing from the beacons; lan off fails (sudo)
 #   hostile-env-gates.sh       full disk, umask 0000, a deep HOME, a stopped
 #                              daemon and concurrent starts behave as stated
 #                              (mounts small tmpfs disks, so it uses sudo)
@@ -145,6 +150,7 @@ on:
       - 'cli/tests/shell-gates.sh'
       - 'cli/tests/whoami-candidate-gates.sh'
       - 'cli/tests/warm-hold-idle-gates.sh'
+      - 'cli/tests/lan-discovery-gates.sh'
       - 'cli/tests/hostile-env-gates.sh'
       - 'cli/tests/reenrol-advice-gates.sh'
       - 'cli/tests/daemon-stop-gates.sh'
@@ -235,6 +241,11 @@ jobs:
       - name: Install FUSE
         run: sudo apt-get update && sudo apt-get install -y fuse3
 
+      # The lan gate's tunnel topology is WireGuard (it falls back to ipip and
+      # says so when wg is missing).
+      - name: Install WireGuard tools
+        run: command -v wg || sudo apt-get install -y wireguard-tools
+
       # The whoami arm proves its claim ON THE WIRE, so it needs a capture.
       # ubuntu-latest ships tcpdump; the capabilities are set explicitly rather
       # than assumed, because the script exits 2 when it cannot capture.
@@ -282,6 +293,9 @@ jobs:
             [cli/tests/shell-gates.sh]=12
             [cli/tests/whoami-candidate-gates.sh]=8
             [cli/tests/warm-hold-idle-gates.sh]=9
+            # 15: per topology learn, reach-lan, send-lan, denied; plus
+            # lan/stranger-blind, wg/on-tunnel, wg/p2p-class.
+            [cli/tests/lan-discovery-gates.sh]=15
             [cli/tests/hostile-env-gates.sh]=17
             # 4: A2 (serving off still advises the re-enrolment) joined A/B/C.
             [cli/tests/reenrol-advice-gates.sh]=4
@@ -325,6 +339,7 @@ jobs:
           # of its setup and a final round trip, so 300 would cut it short.
           declare -A BOUND=(
             [cli/tests/warm-hold-idle-gates.sh]=420
+            [cli/tests/lan-discovery-gates.sh]=900
             [cli/tests/daemon-path-gates.sh]=420
             [cli/tests/core-receive-relay-nat-gates.sh]=420
           )
@@ -345,6 +360,7 @@ jobs:
                    cli/tests/shell-gates.sh \
                    cli/tests/whoami-candidate-gates.sh \
                    cli/tests/warm-hold-idle-gates.sh \
+                   cli/tests/lan-discovery-gates.sh \
                    cli/tests/hostile-env-gates.sh \
                    cli/tests/reenrol-advice-gates.sh \
                    cli/tests/daemon-stop-gates.sh \
