@@ -50,6 +50,12 @@ fi
 
 # Keep this shell's descriptor locked for Cargo's whole lifetime. Never unlink
 # LOCK_FILE: flock is inode-based, so replacing it would permit split locks.
+#
+# Close the lock descriptor for Cargo and everything it spawns (9>&-). Bash does
+# not set CLOEXEC on `exec 9>`, so without this a test backend that outlives its
+# gate inherits the locked fd and keeps the build queue wedged long after the
+# cargo that started it has exited. The parent shell above still holds fd 9, so
+# the lock lasts exactly as long as this wrapper (kernel release on SIGKILL).
 printf 'PID %s since %s: cargo %s\n' "$$" "$(date -Is)" "$*" >"$STATUS_FILE"
 trap 'rm -f "$STATUS_FILE"' EXIT
-cargo "$@"
+cargo "$@" 9>&-

@@ -19,6 +19,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
+# shellcheck source=cli/tests/lib/backend.sh
+source "$HERE/lib/backend.sh"
 BIN="$CLI_DIR/target/release/tunlion"
 PORT=8098
 SERVER="http://127.0.0.1:$PORT"
@@ -34,6 +36,7 @@ pids=()
 OWN_BACKEND=""
 MNTS=()
 cleanup() {
+  backend_stop "${BACKEND_PID:-}"
   for m in "${MNTS[@]:-}"; do fusermount3 -u "$m" 2>/dev/null || fusermount -u "$m" 2>/dev/null; done
   for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null; done
   [ -n "$OWN_BACKEND" ] && kill "$OWN_BACKEND" 2>/dev/null
@@ -49,10 +52,10 @@ command -v fusermount3 >/dev/null || command -v fusermount >/dev/null || { echo 
 # --- own fixture backend on 8098 (kill only our own listeners on 8098) ---
 for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
 sleep 1
-( cd "$CLI_DIR/../backend" && PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
-    FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
-    "$PYV" app.py >"$WORK/backend.log" 2>&1 ) &
-OWN_BACKEND=$!
+backend_start "$CLI_DIR/../backend" "$PYV" "$WORK/backend.log" \
+  PORT=$PORT FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+  FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25
+OWN_BACKEND=$BACKEND_PID
 for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat "$WORK/backend.log"; exit 2; }
 

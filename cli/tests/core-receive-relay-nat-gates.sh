@@ -34,6 +34,8 @@ set -uo pipefail
 exec 3>&- 2>/dev/null || true
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
+# shellcheck source=cli/tests/lib/backend.sh
+source "$HERE/lib/backend.sh"
 BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
 CORE_BIN="${TUNLION_CORE_BIN:-$(dirname "$BIN")/receive-code}"
 PYV="${TUNLION_TEST_VENV:-python3}"
@@ -90,6 +92,7 @@ wait_bounded() {
   return 124
 }
 cleanup() {
+  backend_stop "${BACKEND_PID:-}"
   local p
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
   if [ -n "$CT" ]; then docker_bin stop "$CT" >/dev/null 2>&1 || true; fi
@@ -191,10 +194,11 @@ if [ "$(docker_bin inspect -f '{{.State.Running}}' "$CT" 2>/dev/null)" != "true"
   exit 2
 fi
 
-( cd "$CLI_DIR/../backend" && PORT="$PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
-    FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
-    FIL_ICE_SERVERS="$ICE_JSON" "$PYV" app.py >"$WORK/backend.log" 2>&1 ) &
-PIDS+=("$!")
+backend_start "$CLI_DIR/../backend" "$PYV" "$WORK/backend.log" \
+  PORT="$PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+  FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
+  FIL_ICE_SERVERS="$ICE_JSON"
+PIDS+=("$BACKEND_PID")
 for _ in $(seq 1 60); do curl --max-time 3 --connect-timeout 2 -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
 if ! curl --max-time 3 --connect-timeout 2 -fsS "$SERVER/api/health" >/dev/null 2>&1; then
   echo "REFUSED: backend did not become healthy at $SERVER"

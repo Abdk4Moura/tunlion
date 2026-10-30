@@ -28,6 +28,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
+# shellcheck source=cli/tests/lib/backend.sh
+source "$HERE/lib/backend.sh"
 # Ask cargo where the target dir actually IS, rather than assuming ./target.
 # This box sets a shared `target-dir` in ~/.cargo/config.toml, so the hardcoded
 # path did not exist: the script BUILT fine and then looked for the binary
@@ -46,7 +48,7 @@ WORK="$(mktemp -d /tmp/filament-ackloss.XXXXXX)"
 PYV="${TUNLION_TEST_VENV:-/root/filament-bench/venv}/bin/python"
 
 OWN_BACKEND=""
-cleanup() { [ -n "$OWN_BACKEND" ] && kill "$OWN_BACKEND" 2>/dev/null; rm -rf "$WORK"; }
+cleanup() { backend_stop "${BACKEND_PID:-}"; [ -n "$OWN_BACKEND" ] && kill "$OWN_BACKEND" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 # 0. build with the test hook (debug, fast). Skip if the binary is already built
@@ -61,10 +63,10 @@ if [ -z "${TUNLION_TEST_SERVER:-}" ]; then
   [ -x "$PYV" ] || { echo "SETUP: no venv python at $PYV (set TUNLION_TEST_SERVER or TUNLION_TEST_VENV)"; exit 2; }
   for pid in $(ss -tlnp 2>/dev/null | grep ":8077 " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
   sleep 1
-  ( cd "$CLI_DIR/../backend" && PORT=8077 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
-      FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
-      "$PYV" app.py >"$WORK/backend.log" 2>&1 ) &
-  OWN_BACKEND=$!
+  backend_start "$CLI_DIR/../backend" "$PYV" "$WORK/backend.log" \
+    PORT=8077 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+    FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25
+  OWN_BACKEND=$BACKEND_PID
 fi
 for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -fsS "$SERVER/api/health" >/dev/null || { echo "SETUP: no backend at $SERVER"; exit 2; }
