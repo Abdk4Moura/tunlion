@@ -42,6 +42,17 @@
       ]
     },
     {
+      "path": "cli/tests/known-device-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/known-device-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "browser-loopback"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/concurrent-code-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/concurrent-code-gates.sh",

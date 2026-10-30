@@ -35,6 +35,18 @@ async function cell(id, feature, fn) {
   console.log(result.padEnd(5), id.padEnd(8), feature);
 }
 const caps = (name) => dash(`tunlion devices --caps ${name} 2>&1`);
+// The owner's record of a device, parsed (null when there is none).
+const recordOf = (name) => {
+  let j; try { j = JSON.parse(dash('tunlion devices --json')); } catch { return null; }
+  const list = Array.isArray(j) ? j : ((j.data && j.data.devices) || j.devices || []);
+  return list.find((d) => d.name === name) || null;
+};
+// Debug logging on the dashboard (inherited by its `add` children) and on the
+// claiming terminal, always: a pairing that ends without the peer's certificate
+// says why only at debug level ("pair: identity-expose ... refused: <check>",
+// "pair: completing without the peer's certificate"), and the 0.9.2 run that
+// hit it once had no such evidence to read. It lands in the cell evidence only.
+const DEBUG = 'TUNLION_LOG=debug ';
 const stateOf = (name) => { const m = dash('tunlion devices --json').match(new RegExp(`"name":"${name}"[^}]*?"state":"([a-z]+)"|"state":"([a-z]+)"[^}]*?"name":"${name}"`)); return m && (m[1] || m[2]); };
 
 (async () => {
@@ -55,7 +67,7 @@ const stateOf = (name) => { const m = dash('tunlion devices --json').match(new R
     ? cp.spawn('gh', ['codespace', 'ssh', '-c', process.env.CODESPACE, '--', '-N', '-o', 'ExitOnForwardFailure=yes', '-L', `${PORT}:127.0.0.1:${PORT}`], { stdio: 'ignore' })
     : null;
   await new Promise(r => setTimeout(r, fwd ? 8000 : 1000));
-  dash(`(nohup tunlion dashboard --no-open --port ${PORT} > dash.out 2>&1 &) ; sleep 3; cat dash.out`);
+  dash(`(${DEBUG}nohup tunlion dashboard --no-open --port ${PORT} > dash.out 2>&1 &) ; sleep 3; cat dash.out`);
   const url = (dash('cat dash.out').match(/http:\/\/127\.0\.0\.1:\d+\/#k=[0-9a-f]+/) || [])[0];
   const b = await chromium.launch();
   const ctx = await b.newContext({ viewport: { width: 1280, height: 860 } });
@@ -112,17 +124,60 @@ const stateOf = (name) => { const m = dash('tunlion devices --json').match(new R
     say('state', st); assert(st === 'active', 'the CLI shows dinv active again');
   });
 
-  await cell('D05', 'a pairing code from the dashboard, joined from a terminal', async () => {
+  // One dashboard code, claimed by `tunlion join` on box `c` (which holds its
+  // own identity, so the owner must end up holding its certificate: EXTERNAL
+  // with a cert, never NEEDS REVIEW / no certificate).
+  const dashCode = async (name, c, shotName) => {
     await nav('Codes and invitations');
-    await p.getByLabel('Name').last().fill('dcode');
+    await p.getByLabel('Name').last().fill(name);
     await p.getByTestId('show-code').click();
     await p.getByTestId('code').waitFor({ timeout: 20000 });
     const code = ((await p.getByTestId('code').innerText()).match(CODE) || [])[0]; say('code', code); assert(code, 'a code is shown');
-    await shot(p, 'd05-code');
-    const r = tryDc(`timeout 90 tunlion join ${code}; echo JOIN=$?`, { timeout: 120000 }); say(r.out);
+    if (shotName) await shot(p, shotName);
+    const t0 = Date.now();
+    const r = tryOn(c)(`${DEBUG}timeout 90 tunlion join ${code} 2>&1; echo JOIN=$?`, { timeout: 120000 }); say(r.out);
+    say(`join took ${((Date.now() - t0) / 1000).toFixed(1)} s`);
     assert(/JOIN=0/.test(r.out), 'the terminal joined with the code');
-    const inNow = await p.getByText(/dcode is in/).waitFor({ timeout: 20000 }).then(() => true, () => false);
+    const inNow = await p.getByText(new RegExp(`${name} is in`)).waitFor({ timeout: 20000 }).then(() => true, () => false);
+    // What the dashboard's own `add` said: the owner half of the ceremony.
+    const st = await p.evaluate(async () => (await (await fetch('/api/code')).json()));
+    say('owner side said:', (st && st.done && st.done.message) || JSON.stringify(st).slice(0, 400));
     assert(inNow, 'the dashboard says it is in');
+    const rec = recordOf(name); say('owner record:', JSON.stringify(rec));
+    assert(rec && rec.certExpires, `the owner holds ${name}'s certificate (not "no certificate")`);
+    const again = p.getByRole('button', { name: 'Another code' });
+    if (await again.count()) await again.first().click();
+  };
+
+  await cell('D05', 'a pairing code from the dashboard, joined from a terminal', async () => {
+    await dashCode('dcode', CODE_BOX, 'd05-code');
+  });
+
+  // MX_DASH_REPEATS=N: N more dashboard codes, each claimed by a fresh box
+  // with its own identity. The cell fails if any claim leaves the owner
+  // without that box's certificate.
+  const repeats = Number(process.env.MX_DASH_REPEATS || 0);
+  if (repeats > 0) await cell('D05r', `${repeats} more dashboard codes, each claimed by a fresh machine`, async () => {
+    const box = 'mx-dcode-r'; let bad = 0;
+    for (let i = 1; i <= repeats; i++) {
+      say(`--- round ${i}`);
+      lab(`~/matrix/box.sh up ${box}`);
+      on(box)(`tunlion init --name dr${i} --no-background --recovery-file ~/.r -y >/dev/null && tunlion up --detach >/dev/null && echo ok`);
+      // MX_DASH_NETEM (e.g. "delay 200ms 150ms loss 8%"): impair the claimer's
+      // link (its host-side veth, so signaling and WebRTC both) to reach the
+      // slow-ceremony timings a busy production run sees. Needs sudo on the lab host.
+      if (process.env.MX_DASH_NETEM) {
+        const idx = lab(`docker exec ${box} cat /sys/class/net/eth0/iflink`).trim();
+        const veth = (lab('ip -o link').split('\n').find((l) => l.startsWith(idx + ': ')) || '').split(': ')[1].split('@')[0];
+        say('netem on', veth, lab(`sudo tc qdisc replace dev ${veth} root netem ${process.env.MX_DASH_NETEM} && tc qdisc show dev ${veth}`).trim());
+      }
+      try { await dashCode(`dr${i}`, box); say(`round ${i} pass`); }
+      catch (e) { bad++; say(`round ${i} FAIL ${e.message}`); const again = p.getByRole('button', { name: /Another code|Cancel this code/ }); if (await again.count()) await again.first().click().catch(() => {}); }
+      if (process.env.MX_DASH_SPACING) await p.waitForTimeout(Number(process.env.MX_DASH_SPACING) * 1000);
+    }
+    lab(`~/matrix/box.sh down ${box}`);
+    say(`${repeats - bad}/${repeats} rounds left the owner holding the certificate`);
+    assert(bad === 0, 'every round left the owner holding the claimer\'s certificate');
   });
 
   await cell('D03', 'grant shell (confirmed), then remove it (device paired by code)', async () => {

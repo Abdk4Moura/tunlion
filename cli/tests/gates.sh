@@ -923,36 +923,15 @@ if [ $RC -ne 0 ] && grep -qE "(holding the line|waiting) up to 8s" "$WORK/g15-re
 else bad "stepped-away wait"; tail -n 3 "$WORK/g15-recv.log"; fi
 
 say "16: known-device rendezvous + remember consent (C12/C20/C27 web)"
+# The gate lives in known-device-gates.sh so browser-gates.yml can run it on its
+# own: this suite's CI job runs with SKIP_BROWSER=1, and a browser gate that only
+# runs here ran nowhere.
 if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ]; then
-  G16=0
-  C16="$WORK/g16cfg"; mkdir -p "$C16"
-  # phase 1 sender: mints the code (a valid 2-word phrase + machine nameplate),
-  # offers a pair-keep secret (the browser must NOT store it until the human
-  # clicks 'remember', C27). The browser must claim the FULL minted code.
-  TUNLION_CONFIG_DIR="$C16" "$BIN" send "$SMALL" --word "$CODE_WORD" --remember pwdev --server "$SERVER" >"$WORK/g16-s1.log" 2>&1 &
-  S16=$!; pids+=($S16)
-  W16=$(wait_code "$WORK/g16-s1.log") || { bad "known-device (no code minted)"; tail -n 3 "$WORK/g16-s1.log"; }
-  # phase 3's decline sender is started later (below); the harness polls its log
-  # for the minted code via the `@<logfile>` form once it reaches phase 3.
-  ( cd "$HERE" && node known-device.js "$SERVER" "$W16" "@$WORK/g16-s3.log" >"$WORK/g16-pw.log" 2>&1 ) &
-  PW16=$!; pids+=($PW16)
-  wait $S16 || G16=1   # phase 1 transfer done; browser must now hold the secret
-  # phase 2: fresh session, ISOLATED room, no code — only the secret-derived
-  # channel can find the browser. The same config dir holds 'pwdev'.
-  TUNLION_CONFIG_DIR="$C16" timeout 120 "$BIN" send "$SMALL" --to pwdev --room "g16iso$$" --server "$SERVER" >"$WORK/g16-s2.log" 2>&1 || G16=1
-  # phase 3 (C27 decline): a new sender offers; the browser clicks 'not now';
-  # the ack must make this sender DISCARD its stored half.
-  TUNLION_CONFIG_DIR="$C16" timeout 60 "$BIN" send "$SMALL" --word "$CODE_WORD" --remember declinedev --server "$SERVER" >"$WORK/g16-s3.log" 2>&1 &
-  S16B=$!; pids+=($S16B)
-  wait $PW16 || G16=1
-  kill $S16B 2>/dev/null; wait $S16B 2>/dev/null
-  if [ $G16 -eq 0 ] && grep -q "SECRET STORED" "$WORK/g16-pw.log" \
-     && grep -q "PHASE2 COMPLETE" "$WORK/g16-pw.log" \
-     && grep -q "PHASE3 DECLINED" "$WORK/g16-pw.log" \
-     && grep -q "declined to be remembered" "$WORK/g16-s3.log" \
-     && ! grep -rq "declinedev" "$C16"; then
-    ok "consent-gated store; --to found it cross-room; decline purged the sender's half"
-  else bad "known-device"; tail -n 4 "$WORK/g16-pw.log" "$WORK/g16-s1.log" "$WORK/g16-s2.log" "$WORK/g16-s3.log"; fi
+  TUNLION_BIN="$BIN" TUNLION_TEST_SERVER="$SERVER" KD_WORK="$WORK/g16" \
+    bash "$HERE/known-device-gates.sh" >"$WORK/g16.log" 2>&1
+  if [ $? -eq 0 ]; then
+    ok "consent-gated store; --to found it cross-room as the one known device; decline purged the sender's half"
+  else bad "known-device"; tail -n 12 "$WORK/g16.log"; fi
 else
   echo "SKIP (run: cd $HERE && npm i playwright && npx playwright install chromium)"
 fi
