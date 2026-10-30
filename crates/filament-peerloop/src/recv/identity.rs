@@ -600,6 +600,28 @@ impl IdentityService {
         self.store.device_name_for_pub(device_pub)
     }
 
+    /// The signed goodbye an ephemeral device's daemon sends its owner when
+    /// it stops. Only on a joined device (no owner key here) whose local
+    /// certificate record says it joined with a runner invitation.
+    pub fn ephemeral_depart_frame(&self) -> Option<Value> {
+        if self.store.owner_pub_from_keystore().is_some() {
+            return None;
+        }
+        let record = self.store.local_device_cert_record()?;
+        if record["ephemeral"].as_bool() != Some(true) {
+            return None;
+        }
+        let device_pub = self.overlay.public_key_bytes().ok()?;
+        let msg = crate::recv::membership::depart_message(&device_pub);
+        let sig = self.overlay.sign(msg.as_bytes()).ok()?;
+        Some(json!({
+            "type": "depart",
+            "device_pub": hex::encode(device_pub),
+            "msg": msg,
+            "sig": hex::encode(sig),
+        }))
+    }
+
     pub fn device_cert_revoked(&self, device_pub: &[u8; 32]) -> bool {
         self.store.device_cert_revoked(device_pub)
     }

@@ -599,6 +599,9 @@ impl RecvIdentity for CoreIdentity {
     fn local_device_cert(&self) -> Option<DeviceCert> {
         self.identity.local_device_cert()
     }
+    fn ephemeral_depart_frame(&self) -> Option<serde_json::Value> {
+        self.identity.ephemeral_depart_frame()
+    }
     async fn maybe_request_cert_renewal(&self, conn: &Conn, pid: &str) {
         self.identity.maybe_request_cert_renewal(conn, pid).await
     }

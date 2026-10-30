@@ -129,7 +129,7 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
     crate::platform::SecretFile::write_str(
         &cert_path,
         &serde_json::to_string_pretty(&if inv.ephemeral {
-            // `down` reads this: an ephemeral device departs (and so is
+            // The daemon reads this: an ephemeral device departs (and so is
             // removed at the owner) when it stops, instead of waiting out
             // its offline budget.
             json!({ "name": assigned_name, "cert": local_cert.to_json(), "ephemeral": true })
@@ -871,15 +871,6 @@ pub(crate) fn parse_lease(raw: &str) -> Result<u64> {
         bail!("{LEASE_ENV}={raw}: a lease must be between 1 second and 30 days");
     }
     Ok(secs)
-}
-
-/// Did this device join with an ephemeral (runner) invitation? Read from the
-/// local certificate record `persist_join_ack` wrote.
-pub(crate) fn joined_ephemeral() -> bool {
-    std::fs::read_to_string(local_device_cert_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .is_some_and(|record| record["ephemeral"].as_bool() == Some(true))
 }
 
 /// The enrolment timeout message, said once.
