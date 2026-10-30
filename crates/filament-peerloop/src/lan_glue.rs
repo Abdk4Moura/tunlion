@@ -103,8 +103,9 @@ impl Conn {
     }
 }
 
-/// Handle `Ev::Lan(Linked)` the same way in every loop: seed, then hand the
-/// transport to the loop's own `Ev::DirectReady` arm.
+/// Handle `Ev::Lan(Linked)` the same way in every loop: seed, then announce
+/// the transport as `Ev::DirectReady`, which starts its reader only after the
+/// ready event is queued (the order `UnreadTransport` exists to keep).
 pub fn on_linked(conn: &mut Conn, tx: &UnboundedSender<Ev>, ev: LanEvent, log: &dyn crate::host::LogSink) {
     if let LanEvent::Linked { pid, name, secret, fleet, transport, remote, dialer } = ev {
         log.debug(&format!(
@@ -112,7 +113,7 @@ pub fn on_linked(conn: &mut Conn, tx: &UnboundedSender<Ev>, ev: LanEvent, log: &
             if dialer { "linked to" } else { "accepted" }
         ));
         conn.seed_lan(&pid, &name, &secret, fleet);
-        let _ = tx.send(Ev::DirectReady(pid, transport, lan::ROUTE_LAN));
+        transport.announce(tx, |t| Ev::DirectReady(pid, t, lan::ROUTE_LAN));
     }
 }
 
