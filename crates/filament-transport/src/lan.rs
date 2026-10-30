@@ -77,7 +77,6 @@ fn fresh_pid() -> String {
 fn getrandom_fill(b: &mut [u8]) -> Result<()> {
     // ring is already in the graph through rustls/quinn.
     use rustls::crypto::ring::default_provider;
-    use rustls::crypto::SecureRandom as _;
     default_provider().secure_random.fill(b).map_err(|_| anyhow!("no secure random"))
 }
 
