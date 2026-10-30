@@ -95,7 +95,10 @@ forward_all()    { $SUDO iptables -F LANGATE; $SUDO iptables -A LANGATE -s 10.88
 forward_udp()    { $SUDO iptables -F LANGATE
                    $SUDO iptables -A LANGATE -s 10.88.0.0/16 -d 10.88.0.0/16 -p udp --dport "$1" -j ACCEPT
                    $SUDO iptables -A LANGATE -s 10.88.0.0/16 -d 10.88.0.0/16 -p udp --sport "$1" -j ACCEPT
-                   $SUDO iptables -A LANGATE -s 10.88.0.0/16 -d 10.88.0.0/16 -p "${2:-udp}" -j ACCEPT 2>/dev/null
+                   # $2: an extra IP protocol the tunnel needs (4 for ipip). Never
+                   # all of UDP: then QUIC would cross the underlay and the gate
+                   # would not be testing the tunnel at all.
+                   [ -n "${2:-}" ] && $SUDO iptables -A LANGATE -s 10.88.0.0/16 -d 10.88.0.0/16 -p "$2" -j ACCEPT
                    $SUDO iptables -A LANGATE -s 10.88.0.0/16 -d 10.88.0.0/16 -j DROP; }
 block_server()   { nsx lanA iptables -A OUTPUT -p tcp --dport "$PORT" -j DROP; nsx lanB iptables -A OUTPUT -p tcp --dport "$PORT" -j DROP; }
 unblock_server() { nsx lanA iptables -F OUTPUT; nsx lanB iptables -F OUTPUT; }
@@ -262,6 +265,11 @@ run_scenario() {
   [ "$name" = lan ] && capture_start 100
   start_daemons
   if line=$(reach_lan 90); then ok "$name/reach-lan: $line"; else bad "$name/reach-lan: no lan link with the server blocked ($line)"; fi
+  # On the tunnel topology the link must ride the tunnel, nothing else.
+  if [ "$name" = wg ]; then
+    if printf '%s' "$line" | grep -q "pong via 10\.99\.0\."; then ok "wg/on-tunnel: the lan link rides the $TUNNEL tunnel"
+    else bad "wg/on-tunnel: the link did not ride the tunnel ($line)"; fi
+  fi
   # Evidence of how they met: the daemons' own lines.
   grep -h "lan: \(linked to\|accepted\)" "$WORK/upA.log" "$WORK/upB.log" | sed 's/^/  evidence: /' | head -4
   head -c 300000 /dev/urandom > "$WORK/payload-$name.bin"
