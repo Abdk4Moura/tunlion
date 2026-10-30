@@ -20,6 +20,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { pingPlan } from "./heartbeat";
+import { pollAlive, wsAlive } from "./liveness";
 import {
   CF_EIO_PREFIX,
   CF_TOKEN_PREFIX,
@@ -488,12 +489,21 @@ export class SignalHub extends DurableObject<Env> {
   }
 
   /** Liveness ground truth (#10): this sid's engine.io transport is open and
-   * its socket.io namespace is connected. Every roster filter goes through it. */
+   * its socket.io namespace is connected. Every roster filter goes through it.
+   *
+   * A websocket is asked directly: wsFor() already requires OPEN, an
+   * attachment and no in-flight upgrade probe, and hibernation restores the
+   * attachment. A polling session lives in memory with no transport object, so
+   * its last request must be inside the engine.io dead window; an `ns` flag
+   * left behind by a frozen page is not liveness. */
   private alive(sid: string): boolean {
     const p = this.pollFor(sid);
-    if (p) return p.ns;
+    if (p) {
+      const deadAfter = (this.ping.interval + this.ping.timeout) * 1000;
+      return pollAlive(p.ns, p.lastSeen, Date.now(), deadAfter);
+    }
     const w = this.wsFor(sid);
-    return !!w && w.att.ns;
+    return !!w && wsAlive(w.ws.readyState === WebSocket.OPEN, true, false, w.att.ns);
   }
 
   private sendRaw(sid: string, packet: string) {

@@ -22,12 +22,12 @@
 // Method names and return shapes follow the Python class one to one, so a
 // change on the Python side maps onto the method of the same name here.
 
+import { sessionAlive } from "./liveness";
 import {
   MAX_RETIRED_TOTAL,
   MAX_SESSIONS,
   PRUNE_INTERVAL,
   RETIRED_TTL,
-  SESSION_LIVE_WINDOW,
   SESSION_TTL,
   validId,
 } from "./policy";
@@ -111,6 +111,8 @@ export class Registry {
     /** Prefix for minted tokens, so the router can tell whose token it is. */
     private tokenPrefix = "",
     private now: () => number = () => Date.now() / 1000,
+    /** Capacity bound; tests inject a small value. */
+    private maxSessions = MAX_SESSIONS,
   ) {
     for (const q of SCHEMA) this.sql.exec(q);
   }
@@ -262,16 +264,19 @@ export class Registry {
     return out;
   }
 
+  /** Transport authority, not the stored refresh hint. last_seen is written at
+   *  most every PERSIST_SLACK, so after a hibernation or eviction it can be
+   *  hours old while the sid's websocket is still open; judging liveness by it
+   *  would let capacity evict a live token. */
   private sessionLive(rec: SessionRec, now: number): boolean {
-    if (!rec.sid || !this.alive(rec.sid)) return false;
-    return now - rec.last_seen <= SESSION_LIVE_WINDOW;
+    return sessionAlive(rec.sid, rec.exp, now, this.alive);
   }
 
   /** Capacity is on TOKEN records only; never evict a live session. Returns
    * evicted sids, or null when every record is live. */
   private makeRoom(now: number): string[] | null {
     if (this.sessionCount === null) this.sessionCount = this.count("sessions");
-    if (this.sessionCount < MAX_SESSIONS) return [];
+    if (this.sessionCount < this.maxSessions) return [];
     const rows = this.sql.exec("SELECT token FROM sessions").toArray() as unknown as { token: string }[];
     const candidates: [string, SessionRec][] = [];
     for (const { token } of rows) {
@@ -279,12 +284,12 @@ export class Registry {
       if (rec && !this.sessionLive(rec, now)) candidates.push([token, rec]);
     }
     if (!candidates.length) return null;
-    const out: string[] = [];
-    for (const [token, rec] of candidates) {
-      this.dropSession(token);
-      if (rec.sid) out.push(rec.sid);
-    }
-    return out;
+    // One new session needs one slot. Deleting only that deficit keeps a
+    // capacity claim from spending a whole dead backlog in one request; each
+    // later claim frees the next one.
+    const [token, rec] = candidates[0];
+    this.dropSession(token);
+    return rec.sid ? [rec.sid] : [];
   }
 
   /** Global (token, gen) tombstones: 24h TTL + hard total cap (oldest first). */
