@@ -486,9 +486,9 @@ These are examples, not worst-case bounds: a sid can hold more subscriptions
 and the hub unions them without a global cap. The batch bounds session rows
 per pass, not total writes, reads or CPU. A capacity page of 64 measured about
 130 rows read and 1.5 ms when every row is live; a dead row with a cold heap
-read 150,067 rows and wrote 5. A late row-value cursor returned 64 rows in
-0.09 ms and planned `SEARCH ... USING INDEX sessions_exp (exp>?)`; the old OR
-predicate planned `SCAN`. With 100k live tombstones and none expired, the new
+read 150,067 rows and wrote 5. A late row-value cursor started at rowid 49,950 of 50,000 and returned the
+50 remaining rows in about 3.5 ms, planning `SEARCH ... USING INDEX
+sessions_exp (exp>?)`; the old OR predicate planned `SCAN`. With 100k live tombstones and none expired, the new
 retired subquery planned `SEARCH retired USING COVERING INDEX retired_exp
 (exp<?)` in 0.05 ms; `ORDER BY seq` planned `SCAN retired` in 3.7 ms. These are
 local counts, not Cloudflare billed analytics or a production CPU bound.
