@@ -45,7 +45,9 @@ function startBackend() {
   backend = spawn(PY, ['app.py'], {
     cwd: BACKEND,
     env: {
-      ...process.env, PORT: String(PORT), FIL_ASYNC_MODE: 'threading',
+      // eventlet, as in prod: the threading dev server stops serving after a
+      // few dozen browser sessions, and this gate opens 80.
+      ...process.env, PORT: String(PORT), FIL_ASYNC_MODE: 'eventlet', FIL_SELF_MONKEYPATCH: '1',
       FIL_CLAIM_LIMIT: '1000000', FIL_PING_TIMEOUT: '120', FIL_PING_INTERVAL: '25',
       FIL_SECRET: 'same-room-test-secret',
     },
@@ -139,7 +141,7 @@ async function oneRun(browser, engine, mode, i) {
     note(`${tag} paired in ${Date.now() - t0} ms`);
     return null;
   } catch (e) {
-    const tail = (d) => d.logs.filter((x) => /pake|pair|peer-left|rejoin|leave/i.test(x)).slice(-25).join('\n');
+    const tail = (d) => d.logs.slice(-25).join('\n');
     return `${tag} ${e.message}\nA:\n${tail(A)}\nB:\n${tail(B)}`;
   } finally {
     await A.ctx.close().catch(() => {});

@@ -64,15 +64,40 @@ pub fn request_bar_refusal(id: u64, peer: &str, bar: RequestBar) -> String {
     }
 }
 
-/// A name as a command word: quoted when it contains whitespace or a quote, so
-/// a petname copied into `tunlion promote ...` stays one argument.
-/// Pure. Moved here from `cli::refusal` so the two sentences that quote a peer
-/// use one rule.
+/// A name as a command word the person can paste: unchanged when every
+/// character is shell-safe, else quoted so it stays ONE argument with every
+/// character intact (`Abdul's iPad` must not become `Abduls iPad`, which names
+/// no device). POSIX shells get single quotes with `'\''` for a quote inside;
+/// Windows (PowerShell, where the hints are pasted) gets single quotes with
+/// the quote doubled. Pure. The one rule every hint that prints a device name
+/// uses (re-exported as `cli::refusal::word`).
 pub fn word(s: &str) -> String {
-    if s.chars().any(|c| c.is_whitespace() || c == '\'' || c == '"') {
-        format!("'{}'", s.replace('\'', ""))
+    if cfg!(windows) {
+        word_powershell(s)
     } else {
+        word_posix(s)
+    }
+}
+
+fn shell_safe(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'))
+}
+
+/// POSIX sh quoting: `it's` -> `'it'\''s'`. Pure.
+pub fn word_posix(s: &str) -> String {
+    if shell_safe(s) {
         s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// PowerShell quoting: `it's` -> `'it''s'`. Pure.
+pub fn word_powershell(s: &str) -> String {
+    if shell_safe(s) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "''"))
     }
 }
 
@@ -152,13 +177,44 @@ mod tests {
         assert!(f.contains("no longer paired") && f.contains("tunlion add"), "{f}");
     }
 
-    /// A petname with a space or a quote becomes one shell word; a plain name
-    /// is unchanged. The rule is the one the refusal sentences relied on.
+    /// A petname with a space or a quote becomes one shell word with every
+    /// character kept; a plain name is unchanged.
     #[test]
     fn a_name_is_quoted_only_when_it_needs_to_be() {
         assert_eq!(word("alpha"), "alpha");
+        assert_eq!(word("pop-os.mesh"), "pop-os.mesh");
         assert_eq!(word("two words"), "'two words'");
-        assert_eq!(word("it's"), "'its'");
+        assert_eq!(word_posix("Abdul's iPad"), r"'Abdul'\''s iPad'");
+        assert_eq!(word_posix("it's"), r"'it'\''s'");
+        assert_eq!(word_posix(""), "''");
+        assert_eq!(word_posix("a\"b"), "'a\"b'");
+        assert_eq!(word_posix("$(rm -rf ~)"), "'$(rm -rf ~)'");
+        assert_eq!(word_powershell("Abdul's iPad"), "'Abdul''s iPad'");
+        assert_eq!(word_powershell("two words"), "'two words'");
+        assert_eq!(word_powershell("alpha"), "alpha");
+    }
+
+    /// The POSIX form is what a real `sh` reads back as the original name,
+    /// as one argument.
+    #[cfg(unix)]
+    #[test]
+    fn the_posix_word_round_trips_through_sh() {
+        for name in ["Abdul's iPad", "it's", "two  spaces", "a\"b", "$HOME `x` \\ ;|&", "Zo\u{eb}'s", "''"] {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s|' {}", word_posix(name)))
+                .output()
+                .expect("sh runs");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{name}|"), "{name}");
+        }
+    }
+
+    /// The bar refusal names a device with an apostrophe so it can be pasted.
+    #[test]
+    fn a_refusal_quotes_an_apostrophe_name_intact() {
+        let r = request_bar_refusal(3, "Abdul's iPad", RequestBar::Revoked);
+        assert!(r.contains(&format!("tunlion promote {}", word("Abdul's iPad"))), "{r}");
+        assert!(!r.contains("Abduls"), "{r}");
     }
 
     /// The stored shape uses the same JSON keys the CLI always wrote.

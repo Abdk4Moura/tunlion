@@ -3266,8 +3266,9 @@ pub(crate) fn revoked_send_refusal(name: &str, records: &[serde_json::Value]) ->
     let revoked = record["certRevoked"].as_bool() == Some(true)
         || record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_REVOKED);
     revoked.then(|| {
+        let w = crate::refusal::word(name);
         format!(
-            "'{name}' is revoked on this device, so nothing is sent to it. To let it back in: `tunlion promote {name}`; to drop it: `tunlion devices forget {name} -y`"
+            "'{name}' is revoked on this device, so nothing is sent to it. To let it back in: `tunlion promote {w}`; to drop it: `tunlion devices forget {w} -y`"
         )
     })
 }

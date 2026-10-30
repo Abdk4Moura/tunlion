@@ -333,10 +333,12 @@ export function useTunlion() {
   // The peer we just paired with is live, and the pairing itself proved it
   // holds this secret: show it as the remembered device right away. Until its
   // side raises the same channel (known-peer), it has not remembered us.
-  const markRemembered = useCallback((peerId, rec) => {
+  // `theirsToo`: the peer asked to be remembered (v1 pair-keep), so it holds
+  // the secret on its side as soon as our ack lands.
+  const markRemembered = useCallback((peerId, rec, theirsToo = false) => {
     if (!rec) return
     setPeers((prev) => prev.map((p) => (p.id === peerId
-      ? { ...p, known: rec.name, knownId: rec.id, oneSided: !(p.knownId === rec.id && (p.oneSided === false || !!p.verified)) }
+      ? { ...p, known: rec.name, knownId: rec.id, oneSided: !theirsToo && !(p.knownId === rec.id && (p.oneSided === false || !!p.verified)) }
       : p)))
   }, [])
 
@@ -373,7 +375,7 @@ export function useTunlion() {
       if (k) {
         const list = devicesStore(k.name, k.secret, storeOptsFor(peerId))
         setKnownDevices(list)
-        markRemembered(peerId, list.find((d) => d.secret === k.secret))
+        markRemembered(peerId, list.find((d) => d.secret === k.secret), true)
         tel('pair-keep-stored', { peer: peerId.slice(-6) })
         subscribeKnown()
         linksRef.current.get(peerId)?.sendPairKeepAck(true)

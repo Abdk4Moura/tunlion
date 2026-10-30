@@ -136,7 +136,7 @@ pub(crate) fn grant_operands(
         (Some(t), None, _) => crate::bail_usage!("missing the capability: tunlion grant --tag {t} <capability>"),
         (None, Some(dev), Some(cap)) => Ok((Some(dev), cap)),
         (None, Some(dev), None) => {
-            crate::bail_usage!("missing the capability: tunlion grant {dev} <capability> (e.g. shell)")
+            crate::bail_usage!("missing the capability: tunlion grant {} <capability> (e.g. shell)", crate::refusal::word(&dev))
         }
         (None, None, _) => crate::bail_usage!(
             "name a device or a tag: tunlion grant <device> <capability>, or tunlion grant --tag <tag> <capability>"
@@ -354,8 +354,8 @@ pub(crate) async fn async_main() -> Result<()> {
                 BareTarget::AmbiguousFileDevice => {
                     // The token is both a file and a known device. Refuse to guess
                     // which the user meant; naming both readings lets them pick.
-                    let send_cmd = format!("tunlion send {first}");
-                    let shell_cmd = format!("tunlion shell {first}");
+                    let send_cmd = format!("tunlion send {}", crate::refusal::word(&first));
+                    let shell_cmd = format!("tunlion shell {}", crate::refusal::word(&first));
                     let width = send_cmd.len().max(shell_cmd.len());
                     eprintln!(
                         "{} \"{first}\" is both a file here and a device you know. Say which:",
@@ -714,7 +714,8 @@ pub(crate) async fn async_main() -> Result<()> {
                         crate::exit_codes::ExitKind::Usage,
                         format!(
                             "--remember {r} names the device you pair with over a code, and this send has none. \
-                             Add --code (the receiver passes --remember too), or pair for good with:  tunlion add {r}"
+                             Add --code (the receiver passes --remember too), or pair for good with:  tunlion add {}",
+                            crate::refusal::word(r)
                         ),
                     ));
                 }
@@ -2325,7 +2326,8 @@ pub(crate) async fn grant_cmd(
                     bail!(
                         "'{spec}' must be granted by the fleet owner. This is a joined device, \
                          which holds no owner signing key and so cannot issue an owner-signed \
-                         grant. Run this on the owner's machine:\n  tunlion grant {device} {spec}"
+                         grant. Run this on the owner's machine:\n  tunlion grant {} {spec}",
+                        crate::refusal::word(&device)
                     );
                 }
                 // U1: not joined and no key, so this is the first use;
@@ -2396,7 +2398,8 @@ pub(crate) async fn grant_cmd(
     }
     if user && owner_pk.is_none() {
         bail!(
-            "a user-wide grant (--user) is an owner-signed grant to a user key, and this device holds no owner signing key. Run it on the owner's machine, or grant to the device:\n  tunlion grant {device} {spec}"
+            "a user-wide grant (--user) is an owner-signed grant to a user key, and this device holds no owner signing key. Run it on the owner's machine, or grant to the device:\n  tunlion grant {} {spec}",
+            crate::refusal::word(&device)
         );
     }
     // A device with no certified identity (a browser, which pairs by
@@ -2410,7 +2413,8 @@ pub(crate) async fn grant_cmd(
     let peer_cert = device_cert_for(&device);
     if signing_key.is_some() && peer_cert.is_none() && user {
         bail!(
-            "'{device}' has no certified identity (a browser, or a device paired by code only), so there is no user key to grant to. Grant to the device instead:\n  tunlion grant {device} {spec}"
+            "'{device}' has no certified identity (a browser, or a device paired by code only), so there is no user key to grant to. Grant to the device instead:\n  tunlion grant {} {spec}",
+            crate::refusal::word(&device)
         );
     }
     device_set_cap(&device, &capability, true, None)?;

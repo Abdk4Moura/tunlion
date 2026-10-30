@@ -47,8 +47,9 @@ pub(crate) fn renamed_note(asked: &str, stored: &str) -> Option<String> {
     if asked.is_empty() || asked == stored {
         return None;
     }
+    let (aw, sw) = (crate::refusal::word(&asked), crate::refusal::word(stored));
     Some(format!(
-        "! asked to join as '{asked}', but the owner already holds another key under that name, so it filed this device as '{stored}'. If '{asked}' is this machine's old record, on the owner run: tunlion devices forget {asked} -y && tunlion devices rename {stored} {asked}"
+        "! asked to join as '{asked}', but the owner already holds another key under that name, so it filed this device as '{stored}'. If '{asked}' is this machine's old record, on the owner run: tunlion devices forget {aw} -y && tunlion devices rename {sw} {aw}"
     ))
 }
 

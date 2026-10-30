@@ -136,7 +136,28 @@ async function rows(page) {
   note("CLI send --to Abdul's iPad (before rename):\n" + cli(['send', path.join(W, 'before.txt'), '--to', "Abdul's iPad", '--server', BASE, '--timeout', '15']).split('\n').slice(-8).join('\n'));
   await watch('after-send-before', 10000);
   const NO_RENAME = process.env.BCP_NO_RENAME === '1';
-  if (!NO_RENAME) note('CLI rename:\n' + cli(['devices', 'rename', "Abdul's iPad", 'iPad']));
+  // The rename hint `add` printed must paste into a shell as the exact stored
+  // name: it used to print `tunlion devices rename Abdul's iPad <name>`, an
+  // unterminated quote. When it was printed, the rename below IS that line,
+  // pasted into sh (only `<name>` filled in, and the binary path).
+  const addLog = readOr(path.join(W, 'add.log')).replace(/\r/g, '');
+  const hint = (/rename any time: (tunlion devices rename .*<name>)/.exec(addLog) || [])[1] || null;
+  if (hint) {
+    note('add printed rename hint: ' + hint);
+    if (/Abduls/.test(hint)) fail('the rename hint dropped the apostrophe: ' + hint);
+    const argv = spawnSync('sh', ['-c', `set -- ${hint.replace('<name>', 'iPad')}; for a; do printf '%s\\0' "$a"; done`], { encoding: 'utf8' });
+    const got = (argv.stdout || '').split('\0').filter(Boolean);
+    if (JSON.stringify(got) !== JSON.stringify(['tunlion', 'devices', 'rename', "Abdul's iPad", 'iPad'])) fail('the rename hint does not paste as one exact name: ' + JSON.stringify(got) + ' ' + (argv.stderr || ''));
+    note('OK: the rename hint pastes as ["tunlion","devices","rename","Abdul\'s iPad","iPad"]');
+  } else {
+    note('add printed no rename hint (named explicitly)');
+  }
+  if (!NO_RENAME && hint) {
+    const pasted = hint.replace('<name>', 'iPad').replace(/^tunlion /, '"$TUNLION_BIN_PATH" ');
+    const r = spawnSync('sh', ['-c', pasted], { env: { ...CLI_ENV, TUNLION_BIN_PATH: BIN }, encoding: 'utf8', timeout: 25000 });
+    note('CLI rename (the pasted hint, exit ' + r.status + '):\n' + (r.stdout || '') + (r.stderr || ''));
+    if (r.status !== 0) fail('the pasted rename hint failed');
+  } else if (!NO_RENAME) note('CLI rename:\n' + cli(['devices', 'rename', "Abdul's iPad", 'iPad']));
   note('CLI devices after rename:\n' + cli(['devices']));
   await watch('after-cli-rename', 45000);
   fs.writeFileSync(path.join(W, 'hello.txt'), 'hello');

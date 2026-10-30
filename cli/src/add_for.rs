@@ -238,7 +238,8 @@ pub(crate) async fn add_for_cmd(
         // replaced dragged its source indentation into the output.
         let suggested = invite_path_for(_invitee_name.as_deref(), &kind);
         let who = _invitee_name
-            .clone()
+            .as_deref()
+            .map(crate::refusal::word)
             .unwrap_or_else(|| format!("--for {kind}"));
         bail!(
             "{}",
@@ -813,7 +814,8 @@ pub(crate) fn join_next_step(file_name: &str, invitee: Option<&str>) -> String {
     };
     match invitee.filter(|n| !n.chars().any(char::is_whitespace) && !n.is_empty()) {
         Some(n) => format!(
-            "  next: copy it to the other device, then run there:  tunlion join {file} --name {n}"
+            "  next: copy it to the other device, then run there:  tunlion join {file} --name {}",
+            crate::refusal::word(n)
         ),
         None => format!("  next: copy it to the other device, then run there:  tunlion join {file}"),
     }

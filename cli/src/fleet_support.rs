@@ -283,8 +283,9 @@ pub(crate) fn restore_report(name: &str, record: bool, revoked: bool, lifted: &[
         ),
         (false, _, false) => format!(
             "lifted the block on '{name}' (forgotten on {}). It has no record here any more, so it cannot connect yet: \
-             re-add it with  tunlion add {name}  (and `tunlion join <code>` on it)",
-            revoked_on(lifted[0].1)
+             re-add it with  tunlion add {}  (and `tunlion join <code>` on it)",
+            revoked_on(lifted[0].1),
+            crate::refusal::word(name)
         ),
         (false, _, true) => format!("no device named '{name}', and no forgotten device by that name"),
     }
