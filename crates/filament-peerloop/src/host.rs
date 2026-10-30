@@ -210,12 +210,17 @@ pub struct LiveCut {
     pub reason: String,
 }
 
-/// The two decisions a live re-check can reach. The words differ because the
-/// remedy differs: a revocation cannot be repaired by a grant, an expiry can.
+/// The decisions a live re-check can reach. The words differ because the
+/// remedy differs: a revocation cannot be repaired by a grant, an expiry can,
+/// and a forget means we no longer know the device at all (only a fresh
+/// pairing or enrolment lets it back in).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiveCutCause {
     Revoked,
     Expired,
+    /// Forgotten here: the record is gone (or going) and its key is on the
+    /// forget block. Reads as "not recognized", never as "device revoked".
+    Forgotten,
 }
 
 /// A local storage failure a receiver reports to the sender as a typed refusal

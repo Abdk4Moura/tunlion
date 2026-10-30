@@ -466,6 +466,15 @@ impl HostServices for CoreHost {
 
     fn live_session_cut(&self, idev: Option<&[u8; 32]>) -> Option<LiveCut> {
         let idev = idev?;
+        // The forget block first: `device_cert_revoked` folds it in, and a
+        // forgotten device must read "not recognized", not "device revoked".
+        if self.store.device_key_revoked(idev, now_secs()) {
+            return Some(LiveCut {
+                cause: LiveCutCause::Forgotten,
+                expires_at: None,
+                reason: filament_peerloop::refusal::UNRECOGNIZED_REASON.to_string(),
+            });
+        }
         if self.store.device_cert_revoked(idev) {
             return Some(LiveCut {
                 cause: LiveCutCause::Revoked,

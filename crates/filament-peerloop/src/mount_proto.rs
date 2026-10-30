@@ -1044,6 +1044,7 @@ fn spawn_mount_server_root(
                         match cut.cause {
                             LiveCutCause::Revoked => "revoked",
                             LiveCutCause::Expired => "access expired",
+                            LiveCutCause::Forgotten => "not recognized",
                         }
                     ));
                     // Answer the in-flight request before tearing the stream

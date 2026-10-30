@@ -471,6 +471,7 @@ impl HostServices for CliHost {
         let (cause, expires_at) = match cut {
             crate::identity_state::LiveCut::Revoked => (LiveCutCause::Revoked, None),
             crate::identity_state::LiveCut::Expired(at) => (LiveCutCause::Expired, Some(at)),
+            crate::identity_state::LiveCut::Forgotten => (LiveCutCause::Forgotten, None),
         };
         Some(LiveCut {
             cause,

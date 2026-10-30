@@ -663,6 +663,8 @@ pub async fn serve_exec(
                     };
                     if matches!(&cut, Some(c) if c.cause == crate::host::LiveCutCause::Expired) {
                         log.critical("exec: peer access expired, closing live session");
+                    } else if matches!(&cut, Some(c) if c.cause == crate::host::LiveCutCause::Forgotten) {
+                        log.critical("exec: peer forgotten, closing live session");
                     } else {
                         log.critical("exec: peer access revoked, closing live session");
                     }
@@ -694,6 +696,12 @@ pub async fn serve_exec(
                         "sid": sid,
                         "err": reason,
                     });
+                    if matches!(&cut, Some(c) if c.cause == crate::host::LiveCutCause::Forgotten) {
+                        // Typed, so the initiator prints "not recognized" and
+                        // its remedy without parsing the sentence.
+                        let r = Refusal::new(Code::Unrecognized, authz.dev_name.clone());
+                        r.annotate(&mut close);
+                    }
                     if matches!(&cut, Some(c) if c.cause == crate::host::LiveCutCause::Expired) {
                         // The host carries the invitation end as a typed fact;
                         // parsing the reason is only the compatibility fallback

@@ -422,10 +422,15 @@ pub(crate) const DEVICE_REVOKED_REASON: &str = "device revoked";
 /// Why a LIVE session (exec, pty, forward, mount) must end now, if it must.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveCut {
-    /// The device was revoked here.
+    /// The device was revoked here (in place: its record stays).
     Revoked,
     /// The invitation that admitted it ended at this time (UTC seconds).
     Expired(u64),
+    /// The device was FORGOTTEN here: its record is gone (or is being
+    /// dropped) and its key is on the forget block. It must read as "not
+    /// recognized", the same words a later open meets, never as a revocation
+    /// of a device we still know.
+    Forgotten,
 }
 
 impl LiveCut {
@@ -438,6 +443,9 @@ impl LiveCut {
             // It said "access revoked" here, so a revoke read two ways.
             LiveCut::Revoked => DEVICE_REVOKED_REASON.to_string(),
             LiveCut::Expired(at) => crate::capability::expired_reason(at),
+            // The words a forgotten device's next open meets (gate R): the
+            // record is gone, so there is nothing to "revoke".
+            LiveCut::Forgotten => filament_peerloop::refusal::UNRECOGNIZED_REASON.to_string(),
         }
     }
 
@@ -446,18 +454,25 @@ impl LiveCut {
     /// refusal at open (`capability::expired_reason_for`).
     pub(crate) fn reason_for(self, idev: Option<&[u8; 32]>) -> String {
         match self {
-            LiveCut::Revoked => self.reason(),
+            LiveCut::Revoked | LiveCut::Forgotten => self.reason(),
             LiveCut::Expired(at) => crate::capability::expired_reason_for(at, idev),
         }
     }
 }
 
-/// The one live re-check every serving loop asks. Revocation first (it is the
-/// decision a person made), then the delegated deadline. An unidentified peer
-/// has no opinion here: its opens were judged by the gate.
+/// The one live re-check every serving loop asks. Forget and revocation first
+/// (they are the decisions a person made), then the delegated deadline. An
+/// unidentified peer has no opinion here: its opens were judged by the gate.
 pub(crate) fn live_session_cut(idev: Option<&[u8; 32]>) -> Option<LiveCut> {
     let idev = idev?;
-    if cert_revoked_for(Some(idev)) {
+    // The forget block is consulted FIRST. `device_cert_revoked` folds it in
+    // (a forgotten key must not pass fleet-hello either), so asking it first
+    // would report a forgotten device as revoked: the wrong promise, and the
+    // wrong remedy for the person on the other side.
+    if crate::fleet_support::device_key_revoked(&idev, crate::identity::now_secs()) {
+        return Some(LiveCut::Forgotten);
+    }
+    if cert_revoked_for(Some(&idev)) {
         return Some(LiveCut::Revoked);
     }
     match delegated_access_for(idev) {
@@ -645,6 +660,30 @@ mod live_cut_wording_tests {
         assert_eq!(
             crate::refusal::Refusal::new(crate::refusal::Code::CertRevoked, None).reason,
             super::LiveCut::Revoked.reason()
+        );
+    }
+
+    /// A forget that cuts a live session must read exactly like the refusal
+    /// its next open meets ("not recognized"), and must map back to that code
+    /// rather than to the revocation one. The key block makes
+    /// `device_cert_revoked` true too, so the two causes are one `if` apart.
+    #[test]
+    fn a_forgotten_live_cut_reads_like_the_refusal_at_open() {
+        let reason = super::LiveCut::Forgotten.reason();
+        assert_eq!(
+            reason,
+            crate::refusal::Refusal::new(crate::refusal::Code::Unrecognized, None).reason
+        );
+        assert!(reason.contains("not recognized"), "{reason}");
+        assert_eq!(
+            crate::refusal::code_from_reason(&reason),
+            Some(crate::refusal::Code::Unrecognized),
+            "{reason}"
+        );
+        assert_ne!(
+            crate::refusal::code_from_reason(&reason),
+            Some(crate::refusal::Code::CertRevoked),
+            "{reason}"
         );
     }
 }
