@@ -391,7 +391,7 @@ pub fn registry() -> &'static [Setting] {
             scope: ScopeKind::GlobalOnly,
             env: Some("TUNLION_TRANSPORTS"),
             daemon: true,
-            help: "Transports tunlion may use: auto (all), or a list of lan, direct, relay. Leave out lan to turn off local discovery (no beacons, no listener, no dialing remembered addresses): tunlion set network.transports direct,relay",
+            help: "Which transports to use: auto (all), or a list of lan, direct, relay. Leave out lan to turn off local discovery (no beacons, no listener, no dialing remembered addresses): tunlion set network.transports direct,relay",
         },
         Setting {
             key: "network.lan-skip",
