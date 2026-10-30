@@ -24,7 +24,7 @@ tokio = { version = "1", features = ["rt", "time", "sync", "macros", "net"] }
 # the entire point of this crate, so the binary does not link system
 # libssl/libcrypto. The connector is always built by `tls::client_config()`;
 # tungstenite's own root feature is only what its rustls backend requires.
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 url = "2"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # Trust for tunlion's servers (src/tls.rs): the Mozilla roots are Android's
@@ -39,6 +39,6 @@ rustls-platform-verifier = "0.7.0"
 [dev-dependencies]
 rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "pem"] }
 # Server-side local websocket fixtures only; production stays connect-only.
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # The TLS side of the private-CA signaling fixture (src/tls_trust_tests.rs).
 tokio-rustls = { version = "0.26.4", default-features = false }
