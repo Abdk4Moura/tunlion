@@ -16,7 +16,7 @@
 # the shapes must stay in one place: a divergence here is a silent interop break
 # with the browser peer.
 [package]
-name = "filament-proto"
+name = "tunlion-proto"
 version = "0.1.0"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
@@ -26,6 +26,11 @@ description = "Wire vocabulary and pure ceremony decisions for peer-to-peer file
 readme = "README.md"
 keywords = ["protocol", "transfer", "p2p", "wire-format"]
 categories = ["network-programming", "encoding"]
+
+# Published as tunlion-proto. The Rust library keeps its pre-rename name, so no
+# `use` line changed.
+[lib]
+name = "filament_proto"
 
 [dependencies]
 serde_json = "1.0.150"

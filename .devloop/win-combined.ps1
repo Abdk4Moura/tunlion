@@ -24,19 +24,19 @@ cargo --version
 rustc --version
 
 Step 'cargo check (combined CLI)' {
-    cargo check --locked -p filament-cli --bin tunlion
+    cargo check --locked -p tunlion --bin tunlion
 }
 
 Step 'win_pty policy tests' {
-    cargo test --locked -p filament-cli --bin tunlion win_pty -- --nocapture
+    cargo test --locked -p tunlion --bin tunlion win_pty -- --nocapture
 }
 
 Step 'interactive menu in a real ConPTY' {
-    cargo test --locked -p filament-cli --test windows_menu_smoke -- --nocapture
+    cargo test --locked -p tunlion --test windows_menu_smoke -- --nocapture
 }
 
 Step 'build test-hooks binary' {
-    cargo build --locked -p filament-cli --bin tunlion --features test-hooks
+    cargo build --locked -p tunlion --bin tunlion --features test-hooks
 }
 
 Step 'tunlion --version (full Clap tree)' {
@@ -70,11 +70,11 @@ Step 'shell relay smoke (standard / linked-medium plane)' {
 }
 
 Step 'cargo check peerloop (Windows all-targets)' {
-    cargo check --locked -p filament-peerloop --all-targets
+    cargo check --locked -p tunlion-peerloop --all-targets
 }
 
 Step 'peerloop Windows library tests' {
-    cargo test --locked -p filament-peerloop --lib
+    cargo test --locked -p tunlion-peerloop --lib
 }
 
 Write-Host ""

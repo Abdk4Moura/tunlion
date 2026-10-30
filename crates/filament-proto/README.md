@@ -1,4 +1,7 @@
-# filament-proto
+# tunlion-proto
+
+The Rust library name is `filament_proto` (the crate was renamed for
+publishing; the library name was kept).
 
 The file-transfer wire vocabulary and its pure ceremony decisions, carved out of
 the [tunlion](https://github.com/Abdk4Moura/tunlion) CLI.

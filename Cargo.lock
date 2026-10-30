@@ -252,7 +252,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "authkeys-managed"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "secret-write",
@@ -1170,7 +1170,7 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "filament-cap"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1180,80 +1180,11 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sha2 0.11.0",
-]
-
-[[package]]
-name = "filament-cli"
-version = "0.9.2"
-dependencies = [
- "anyhow",
- "async-trait",
- "authkeys-managed",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "clap_complete",
- "clap_mangen",
- "crossterm",
- "directories",
- "filament-cap",
- "filament-fleet",
- "filament-id",
- "filament-overlay",
- "filament-pair",
- "filament-peerloop",
- "filament-proto",
- "filament-signal",
- "filament-transfer",
- "filament-transport",
- "flate2",
- "fuser",
- "futures-util",
- "getrandom 0.2.17",
- "hex",
- "hkdf",
- "hmac",
- "libc",
- "portable-pty",
- "qrcode",
- "quinn",
- "quinn-proto",
- "rand_core 0.6.4",
- "rcgen",
- "reqwest",
- "ring",
- "rustls",
- "secret-write",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sha2 0.11.0",
- "socket2 0.5.10",
- "spake2",
- "tar",
- "tokio",
- "webrtc",
- "windows-sys 0.59.0",
- "winfsp",
- "winfsp-sys",
- "zeroize",
- "zip",
-]
-
-[[package]]
-name = "filament-fleet"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "filament-id",
- "filament-overlay",
- "serde_json",
 ]
 
 [[package]]
 name = "filament-id"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "bip39",
@@ -1268,19 +1199,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "filament-overlay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "ring",
- "serde_json",
- "sha2 0.11.0",
-]
-
-[[package]]
 name = "filament-pair"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
@@ -1290,91 +1210,6 @@ dependencies = [
  "sha2 0.10.9",
  "spake2",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "filament-peerloop"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "authkeys-managed",
- "base64",
- "bytes",
- "chrono",
- "filament-cap",
- "filament-fleet",
- "filament-id",
- "filament-overlay",
- "filament-pair",
- "filament-proto",
- "filament-signal",
- "filament-transfer",
- "filament-transport",
- "getrandom 0.2.17",
- "hex",
- "libc",
- "quinn",
- "ring",
- "secret-write",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "smoltcp",
- "tokio",
- "webrtc",
- "windows-sys 0.59.0",
- "wintun",
-]
-
-[[package]]
-name = "filament-proto"
-version = "0.1.0"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
-name = "filament-signal"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "futures-util",
- "rcgen",
- "rustls",
- "rustls-platform-verifier",
- "serde_json",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "url",
- "webpki-roots 1.0.9",
-]
-
-[[package]]
-name = "filament-transfer"
-version = "0.1.0"
-
-[[package]]
-name = "filament-transport"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "filament-signal",
- "futures-util",
- "quinn",
- "quinn-proto",
- "rcgen",
- "reqwest",
- "rustls",
- "serde_json",
- "sha2 0.11.0",
- "socket2 0.5.10",
- "tokio",
- "tokio-rustls",
- "webrtc",
 ]
 
 [[package]]
@@ -3257,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "secret-write"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
 ]
@@ -4076,6 +3911,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunlion"
+version = "0.9.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "authkeys-managed",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "clap_mangen",
+ "crossterm",
+ "directories",
+ "filament-cap",
+ "filament-id",
+ "filament-pair",
+ "flate2",
+ "fuser",
+ "futures-util",
+ "getrandom 0.2.17",
+ "hex",
+ "hkdf",
+ "hmac",
+ "libc",
+ "portable-pty",
+ "qrcode",
+ "quinn",
+ "quinn-proto",
+ "rand_core 0.6.4",
+ "rcgen",
+ "reqwest",
+ "ring",
+ "rustls",
+ "secret-write",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha2 0.11.0",
+ "socket2 0.5.10",
+ "spake2",
+ "tar",
+ "tokio",
+ "tunlion-fleet",
+ "tunlion-overlay",
+ "tunlion-peerloop",
+ "tunlion-proto",
+ "tunlion-signal",
+ "tunlion-transfer",
+ "tunlion-transport",
+ "webrtc",
+ "windows-sys 0.59.0",
+ "winfsp",
+ "winfsp-sys",
+ "zeroize",
+ "zip",
+]
+
+[[package]]
 name = "tunlion-core"
 version = "0.1.0"
 dependencies = [
@@ -4084,9 +3978,6 @@ dependencies = [
  "filament-cap",
  "filament-id",
  "filament-pair",
- "filament-peerloop",
- "filament-signal",
- "filament-transport",
  "futures-util",
  "hex",
  "ring",
@@ -4096,7 +3987,116 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
+ "tunlion-peerloop",
+ "tunlion-signal",
+ "tunlion-transport",
  "uniffi",
+]
+
+[[package]]
+name = "tunlion-fleet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "filament-id",
+ "serde_json",
+ "tunlion-overlay",
+]
+
+[[package]]
+name = "tunlion-overlay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ring",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "tunlion-peerloop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "authkeys-managed",
+ "base64",
+ "bytes",
+ "chrono",
+ "filament-cap",
+ "filament-id",
+ "filament-pair",
+ "getrandom 0.2.17",
+ "hex",
+ "libc",
+ "quinn",
+ "ring",
+ "secret-write",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "smoltcp",
+ "tokio",
+ "tunlion-fleet",
+ "tunlion-overlay",
+ "tunlion-proto",
+ "tunlion-signal",
+ "tunlion-transfer",
+ "tunlion-transport",
+ "webrtc",
+ "windows-sys 0.59.0",
+ "wintun",
+]
+
+[[package]]
+name = "tunlion-proto"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "tunlion-signal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "rcgen",
+ "rustls",
+ "rustls-platform-verifier",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "url",
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "tunlion-transfer"
+version = "0.1.0"
+
+[[package]]
+name = "tunlion-transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "quinn",
+ "quinn-proto",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "sha2 0.11.0",
+ "socket2 0.5.10",
+ "tokio",
+ "tokio-rustls",
+ "tunlion-signal",
+ "webrtc",
 ]
 
 [[package]]

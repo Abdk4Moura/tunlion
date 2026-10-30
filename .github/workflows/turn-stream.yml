@@ -68,10 +68,10 @@ jobs:
       # The bridge unit tests include a real webrtc-rs TURN client and server
       # allocating and relaying through the TCP bridge.
       - name: Bridge unit tests
-        run: cargo test -p filament-transport --lib turn_bridge
+        run: cargo test -p tunlion-transport --lib turn_bridge
 
       - name: Build the CLI
-        run: cargo build --release -p filament-cli --bin tunlion
+        run: cargo build --release -p tunlion --bin tunlion
 
       - name: TURN TCP/TLS gates
         env:

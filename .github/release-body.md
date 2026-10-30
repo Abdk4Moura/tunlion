@@ -10,7 +10,7 @@ curl -fsSL https://tunlion.autumated.com/install | sh
 winget install Abdk4Moura.Tunlion
 ```
 
-**Homebrew:** `brew install abdk4moura/tap/tunlion` · **Cargo:** `cargo install filament-cli`
+**Homebrew:** `brew install abdk4moura/tap/tunlion` · **Cargo:** `cargo install --locked tunlion`
 
 Already installed? `tunlion update`
 

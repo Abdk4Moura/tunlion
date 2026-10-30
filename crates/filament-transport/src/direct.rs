@@ -547,13 +547,14 @@ pub async fn warm_public_ip(context: &crate::TransportContext, server: &str) {
 }
 
 /// Format an addr as a candidate string; v6 gets brackets so `[ip]:port` parses.
-/// Inside tunlion's overlay prefixes (`filament_overlay::prefix_cidr`,
-/// `prefix_v4_cidr`).
+/// tunlion's overlay prefixes. They equal `filament_overlay::prefix_cidr` and
+/// `prefix_v4_cidr` (pinned by a CLI test); not a dependency, because the
+/// overlay crate must stay out of a transport graph built without the mesh.
+pub const OVERLAY_PREFIXES: [&str; 2] = ["fdf1:1af7:c30d::/48", "198.18.0.0/15"];
+
+/// Inside tunlion's overlay prefixes.
 fn in_own_overlay_range(ip: &IpAddr) -> bool {
-    [filament_overlay::prefix_cidr(), filament_overlay::prefix_v4_cidr()]
-        .iter()
-        .filter_map(|c| parse_cidr(c))
-        .any(|r| ip_matches_cidr(ip, &r))
+    OVERLAY_PREFIXES.iter().filter_map(|c| parse_cidr(c)).any(|r| ip_matches_cidr(ip, &r))
 }
 
 fn cand_str(ip: IpAddr, port: u16) -> String {

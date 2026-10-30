@@ -1,9 +1,19 @@
 [package]
-name = "filament-signal"
+name = "tunlion-signal"
 version = "0.1.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/Abdk4Moura/tunlion"
+readme = "README.md"
+keywords = ["socketio", "engineio", "websocket", "signaling", "rustls"]
+categories = ["network-programming"]
 description = "Minimal Engine.IO v4 / Socket.IO v5 websocket client for tunlion's signaling, on rustls."
+
+# Published as tunlion-signal. The Rust library keeps its pre-rename name, so no
+# `use` line changed.
+[lib]
+name = "filament_signal"
 
 [dependencies]
 anyhow = "1.0"

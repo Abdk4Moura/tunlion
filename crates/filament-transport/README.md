@@ -1,4 +1,7 @@
-# filament-transport
+# tunlion-transport
+
+The Rust library name is `filament_transport` (the crate was renamed for
+publishing; the library name was kept).
 
 The transport ladder for [tunlion](https://github.com/Abdk4Moura/tunlion).
 

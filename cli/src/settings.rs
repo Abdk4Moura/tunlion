@@ -1991,4 +1991,14 @@ mod transports_tests {
         assert!(validate_transports("lan,relay").is_err(), "direct may not be dropped here");
         assert!(validate_transports("lan,direct,relay,bluetooth").is_err());
     }
+
+    /// The transport keeps tunlion's overlay ranges out of signaled candidates
+    /// by a copy of the prefixes; this pins the copy to the source.
+    #[test]
+    fn transport_overlay_prefixes_match_the_overlay_crate() {
+        assert_eq!(
+            filament_transport::direct::OVERLAY_PREFIXES,
+            [filament_overlay::prefix_cidr().as_str(), filament_overlay::prefix_v4_cidr().as_str()]
+        );
+    }
 }

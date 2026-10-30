@@ -53,7 +53,7 @@ winget install Abdk4Moura.Tunlion
 
 # Homebrew / Cargo / npm
 brew install abdk4moura/tap/tunlion
-cargo install filament-cli
+cargo install --locked tunlion
 npm i -g @abdk4moura/filament-cli
 ```
 

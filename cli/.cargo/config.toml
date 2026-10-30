@@ -1,4 +1,4 @@
-# Local dev build configuration for filament-cli.
+# Local dev build configuration for the tunlion CLI.
 #
 # The default `bfd` linker relinks the entire ~30k-line binary on every
 # rebuild, which dominates edit/build/test cycle time. A faster linker (lld or
