@@ -209,10 +209,13 @@ Recommended JSON (the CLI's `lan-peers.json` maps device name to this):
  "addrs":[{"ip":"10.8.0.2","port":47821,"class":"p2p","seen":1800000000,"ok":1800000100}]}
 ```
 
-Dialing: when the signaling server is unreachable, and in parallel at start, a
-device dials the best 8 remembered addresses of each peer it wants (highest
-`ok`, then highest `seen`) concurrently, plus any address discovered from a
-beacon.
+Dialing: a device dials the best 8 remembered addresses of each peer it wants
+(highest `ok`, then highest `seen`), plus any address discovered from a beacon,
+staggered 250 ms apart, the first to authenticate winning. It does so whenever
+the signaling server is unreachable. Beside a working server it SHOULD first
+give signaling a short grace (the CLI uses 8 s after start) and then dial only
+the peers signaling has not linked, so the two paths do not race into
+duplicate links.
 
 ### 9.3 The circular-route guard
 
