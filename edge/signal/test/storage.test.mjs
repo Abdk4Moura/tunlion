@@ -231,6 +231,24 @@ test("capacity wraps after the end and keeps failing closed when all rows are li
   assert.equal(sql.db.prepare("SELECT COUNT(*) AS n FROM sessions").get().n, 3);
 });
 
+test("cursor tolerates a row deleted between capacity requests", () => {
+  const sql = sqlite();
+  const alive = new Set(["s1", "s2", "s3"]);
+  const now = { value: 8_500_000 };
+  const reg = M(sql, alive, now, 3, 6 * 3600, 256, 1);
+  for (const sid of ["s1", "s2", "s3"]) reg.claimSession(null, "g1", sid, "u", "n");
+  assert.equal(reg.claimSession(null, "g2", "n1", "u", "n").status, "capacity"); // cursor s1
+  // Another cleanup removes s2 between requests, and s2 is no longer live.
+  sql.db.prepare("DELETE FROM sessions WHERE sid = ?").run("s2");
+  alive.delete("s2");
+  assert.equal(reg.claimSession(null, "g3", "n2", "u", "n").status, "capacity"); // s3
+  assert.equal(reg.claimSession(null, "g4", "n3", "u", "n").status, "capacity"); // wraps to s1
+  alive.delete("s3");
+  const got = reg.claimSession(null, "g5", "n4", "u", "n");
+  assert.equal(got.status, "new");
+  assert.deepEqual(got.evicted, ["s3"]);
+});
+
 test("an expired row is found directly even when the first page is all live", () => {
   const sql = sqlite();
   const alive = new Set(["s1"]);

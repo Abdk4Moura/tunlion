@@ -70,11 +70,27 @@ for (const batch of [64, 256, 1024]) {
   const reg = new Registry(sql, (s) => alive.has(s), "", () => now.value, N + 10, 6 * 3600, batch, 64);
   sql.c.rowsRead = sql.c.rowsWritten = sql.c.statements = 0;
   const t = performance.now();
-  reg.claimSession(null, "gx", "new", "u", "n");
+  const v = reg.claimSession(null, "gx", "new", "u", "n");
+  const pruneWritten = sql.c.rowsWritten;
+  const pruneRead = sql.c.rowsRead;
+  const pruneStatements = sql.c.statements;
+  // What the hub does for each evicted sid, with the same counting wrapper.
+  for (const sid of v.evicted) {
+    sql.exec("DELETE FROM members WHERE sid = ?", sid);
+    sql.exec("DELETE FROM subs WHERE sid = ?", sid);
+  }
+  const plan = db
+    .prepare("EXPLAIN QUERY PLAN SELECT token, sid FROM sessions WHERE exp <= ? ORDER BY exp LIMIT ?")
+    .all(now.value, batch)
+    .map((r) => r.detail)
+    .join("; ");
   out.push({
     kind: "prune", batch, sessions: N, ms: +(performance.now() - t).toFixed(2),
     rowsRead: sql.c.rowsRead, rowsWritten: sql.c.rowsWritten, statements: sql.c.statements,
-    cascadeRowsIfHubRuns: 2 * Math.min(batch, N),
+    pruneRowsRead: pruneRead, pruneRowsWritten: pruneWritten, pruneStatements,
+    cascadeRowsWritten: sql.c.rowsWritten - pruneWritten,
+    cascadeStatements: sql.c.statements - pruneStatements,
+    evicted: v.evicted.length, plan,
   });
   db.close();
 }
@@ -90,6 +106,30 @@ for (const scan of [16, 64, 256]) {
   out.push({
     kind: "capacity", scan, sessions: N, status: v.status, ms: +(performance.now() - t).toFixed(2),
     rowsRead: sql.c.rowsRead, rowsWritten: sql.c.rowsWritten, statements: sql.c.statements,
+    evicted: v.evicted.length,
+  });
+  db.close();
+}
+for (const scan of [64]) {
+  const db = seed(N);
+  const alive = new Set(Array.from({ length: N }, (_, i) => (i === 0 ? null : `sid${i}`)).filter(Boolean));
+  const now = { value: 1000 + 1800 }; // unexpired, one dead transport
+  const sql = counted(db);
+  const reg = new Registry(sql, (s) => alive.has(s), "", () => now.value, N, 6 * 3600, 256, scan);
+  sql.c.rowsRead = sql.c.rowsWritten = sql.c.statements = 0;
+  const t = performance.now();
+  const v = reg.claimSession(null, "gx", "new", "u", "n");
+  const beforeCascade = sql.c.rowsWritten;
+  const beforeStatements = sql.c.statements;
+  for (const sid of v.evicted) {
+    sql.exec("DELETE FROM members WHERE sid = ?", sid);
+    sql.exec("DELETE FROM subs WHERE sid = ?", sid);
+  }
+  out.push({
+    kind: "capacity-dead", scan, sessions: N, status: v.status, ms: +(performance.now() - t).toFixed(2),
+    rowsRead: sql.c.rowsRead, rowsWritten: sql.c.rowsWritten, statements: sql.c.statements,
+    registryRowsWritten: beforeCascade, cascadeRowsWritten: sql.c.rowsWritten - beforeCascade,
+    cascadeStatements: sql.c.statements - beforeStatements, evicted: v.evicted.length,
   });
   db.close();
 }
