@@ -22,19 +22,19 @@ test("no sockets: no slices and no timer", () => {
   assert.deepEqual(pingPlan(0, 25, 512), { batch: 0, slices: 0, delayMs: 0 });
 });
 
-test("default cap sends one batch at or below 512", () => {
-  assert.equal(PING_SLICE_AT, 512);
-  for (const n of [1, 40, 500, 512]) {
+test("default cap sends one batch at or below 40", () => {
+  assert.equal(PING_SLICE_AT, 40);
+  for (const n of [1, 20, 40]) {
     assert.deepEqual(pingPlan(n, 25), { batch: n, slices: 1, delayMs: 0 }, `n=${n}`);
   }
 });
 
 test("one above the cap returns to bounded slices", () => {
-  const p = pingPlan(513, 25);
+  const p = pingPlan(41, 25);
   assert.equal(p.slices, PING_SLICES_MAX);
-  assert.equal(p.batch, 21);
+  assert.equal(p.batch, 2);
   assert.equal(p.delayMs, 1000);
-  assert.ok(p.batch * p.slices >= 513);
+  assert.ok(p.batch * p.slices >= 41);
 });
 
 test("4,000 sockets keep the load-test slicing shape", () => {
@@ -55,9 +55,9 @@ test("a configured cap is honoured and a bad value falls back", () => {
   assert.equal(pingPlan(1, 25, 0).slices, 25);
   assert.equal(pingSliceAt({ FIL_PING_SLICE_AT: "64" }), 64);
   assert.equal(pingSliceAt({ FIL_PING_SLICE_AT: "0" }), 0);
-  assert.equal(pingSliceAt({ FIL_PING_SLICE_AT: "-1" }), 512);
-  assert.equal(pingSliceAt({ FIL_PING_SLICE_AT: "nope" }), 512);
-  assert.equal(pingSliceAt({}), 512);
+  assert.equal(pingSliceAt({ FIL_PING_SLICE_AT: "-1" }), 40);
+  assert.equal(pingSliceAt({ FIL_PING_SLICE_AT: "nope" }), 40);
+  assert.equal(pingSliceAt({}), 40);
 });
 
 test("every plan covers every socket exactly once", () => {

@@ -59,7 +59,7 @@ export function limitsFrom(env: Record<string, unknown>): Limits {
 export function pingSliceAt(env: Record<string, unknown>): number {
   const v = env["FIL_PING_SLICE_AT"];
   const parsed = typeof v === "string" && v.trim() !== "" ? parseInt(v, 10) : NaN;
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 512;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 40;
 }
 
 /** engine.io timing. Production compose sets 25 s / 60 s (FIL_PING_INTERVAL,

@@ -21,11 +21,12 @@
 export const PING_SLICES_MAX = 25;
 
 /** Default population at or below which pings are sent in one batch.
- *  512 is half of the 1,000-device step that passed the 2026-10-29 load test
- *  with zero drops, and an eighth of the 4,000 step that collapsed. It is a
- *  cap, not a claim that the boundary is exact: FIL_PING_SLICE_AT can lower
- *  it without a code change. */
-export const PING_SLICE_AT = 512;
+ *  40 is the largest population this branch measured end to end (40/40
+ *  connected, 0 drops, 460 s idle). It is deliberately conservative: the
+ *  2026-10-29 data only shows that one batch at 1,000 passed and at 2,000
+ *  shed 8%, so nothing above 40 is claimed as safe until a bounded burst is
+ *  run. FIL_PING_SLICE_AT can raise or lower it without a code change. */
+export const PING_SLICE_AT = 40;
 
 export interface PingPlan {
   /** Sockets per slice. */
