@@ -175,6 +175,8 @@ async function runEngine(engine) {
     console.log(`[same-room] ${process.env.PSR_CHILD} PASSED`);
     process.exit(0);
   }
+  // A stale relay left on this port would serve the gate instead of ours.
+  if (await waitHealth(1000)) fail(`port ${PORT} already serves a relay; stop it or set PSR_PORT`);
   startBackend();
   if (!(await waitHealth(30000))) fail('backend never healthy:\n' + relayLog().slice(-2000));
   ok('relay up');
