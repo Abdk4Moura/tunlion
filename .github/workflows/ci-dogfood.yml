@@ -36,7 +36,9 @@ permissions:
   actions: read
 
 concurrency:
-  group: ${{ inputs.worker_minutes != '0' && 'tunlion-ci-worker' || format('ci-dogfood-{0}', inputs.runner_name) }}
+  # Worker leases run side by side (each joins under its own ci-worker-dovm-N
+  # name), so each gets its own group; one-shot runs still share per runner.
+  group: ${{ inputs.worker_minutes != '0' && format('tunlion-ci-worker-{0}', github.run_id) || format('ci-dogfood-{0}', inputs.runner_name) }}
   cancel-in-progress: ${{ inputs.worker_minutes == '0' }}
 
 jobs:
