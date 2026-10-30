@@ -91,6 +91,48 @@ any socket is open and closes a transport silent for interval plus timeout.
 Defaults are production's 25 s / 60 s (`deploy/docker-compose.yml`), not the
 app's 5 s / 10 s: every pong is a billed inbound message here.
 
+Ping batching. Cloudflare's lifecycle rules make any pending `setTimeout`
+prevent hibernation, so the old path that spread one alarm's pings over 25
+one-second timers kept the single hub duration-billed for the whole interval.
+`heartbeat.ts` now sends one batch when the population is at or below
+`FIL_PING_SLICE_AT` (default 40) and keeps the bounded slices above it. The
+default is the largest population measured in this change, not a claim about
+the boundary: the 2026-10-29 data only shows one batch at 1,000 passing and
+2,000 shedding 8%. Raise the cap only with a bounded burst.
+
+Measured on `tunlion-signal-loadtest`, both runs 40 devices for 460 s with no
+application sync (W1 "idle heartbeat"), values from `durableObjectsPeriodicGroups`
+per-minute buckets. "Before" is `49f2dba72`, "after" is `cc441eae2` with the
+then-default cap 512 (the code default is now 40):
+
+| W1 | object-active s | duty | apportioned s/device-hour | requests (actual) | rows written | client drops |
+|---|---|---|---|---|---|---|
+| before | 410.5 | 89% | 80.3 | 965 | 498 | 0 (4 lost at stop) |
+| after | 2.1 | 0.46% | 0.41 | ~1,038 | 360 | 0 |
+
+The active seconds are the object's wall clock divided over N device-hours,
+not per-device billed seconds; Cloudflare bills the object. Requests are the
+analytics counts (actual messages and connections), not the 20:1 billing
+ratio. Batching does not reduce requests or rows, and this sample did not:
+connect-path writes dominate a short run. A second workload, W2, kept the
+real 30 s daemon sync: after was 2,332 requests, 597 rows and 2.3 active s
+with one client transport drop. A complete before W2 run is still missing
+(the shared worker lease expired mid-run), so no before/after claim is made for it.
+
+The first claim after an idle day can write far more than one connect: in this
+measurement the 19:30 minute wrote 14,337 rows once, then zero rows in every
+later minute despite alarms. That was `pruneSessions` deleting the ~16k
+session records the 2026-10-29 load test had left to expire after 24 h
+(`registry.ts`, `claimSession` -> `pruneSessions`), not schema creation or a
+version migration. Batching those deletes would smooth the burst but not
+reduce the total rows; any change must keep expired rows from filling
+capacity or blocking claims.
+
+The `setAlarm()` row-write footnote in Cloudflare's pricing docs did not show
+up in these metrics: idle minutes with two or three alarm requests recorded
+zero rows written. Treat any alarm-row saving as unmeasured until a dedicated
+test shows it.
+
 Engine.io ids minted by the hub start with `cf.` and so do its session
 tokens. Python's are base64url and never contain a dot. The router uses the
 prefix to keep every request of a session on the backend that minted it.
@@ -366,15 +408,23 @@ Per-client cost on the hub (measured shapes, 25 s pings):
 | browser on long-polling, per hour (PollWatch 2 s hold) | n/a | ~2,000/h | ~2,000/h |
 | the same with `FIL_POLL_GRACE_S=0` (25 s holds) | n/a | ~410/h | ~410/h |
 
-Duration: the one hub is awake while any socket is open, about
-0.125 GB x 86,400 s = 10,800 GB-s/day, inside 13,000. HealthState wakes
-only for probes.
+Duration: batching pings at or below `FIL_PING_SLICE_AT` lets the hub
+hibernate between alarms, so duration is handler time rather than wall clock
+(W1 above: 2.1 s for 460 s with 40 devices). Above the cap the old slicing
+still keeps it awake for the interval, and one legacy socket above the cap is
+enough; the default of 40 is deliberately conservative, so this is not a
+claim for a large always-on population. At the old continuous rate the one
+hub is about 0.125 GB x 86,400 s = 10,800 GB-s/day, inside 13,000.
+HealthState wakes only for probes.
 
-Rows: a refresh writes nothing; a session row is rewritten at most every 30
-minutes, so an always-on daemon is about 50 rows written a day plus one per
-join or leave; the load test measured about 9 rows per
-connect and 15 per pairing ("Hub load test" above). Reads come from memory,
-a few rows per claim.
+Rows: a refresh writes nothing until `PERSIST_SLACK` (30 minutes) has passed,
+so an always-on daemon is about 48 session rows a day, not the "few dozen"
+the first estimate guessed; that alone is 192k rows/day at 4,000 always-on
+devices and needs a larger slack before such a population is claimed to fit.
+Each connect measured 9 rows (15 in one run with an extra sync), a pairing
+about 15 ("Hub load test" above), and a 24 h-idle prune can delete a whole
+stale session backlog in one minute (14,337 rows above). Reads come from
+memory, a few rows per claim.
 
 What that means:
 

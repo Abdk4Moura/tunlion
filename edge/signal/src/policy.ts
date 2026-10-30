@@ -54,6 +54,14 @@ export function limitsFrom(env: Record<string, unknown>): Limits {
   };
 }
 
+/** Population at or below which the hub sends one batch of pings per alarm
+ * instead of spreading them over timers. See heartbeat.ts for why. */
+export function pingSliceAt(env: Record<string, unknown>): number {
+  const v = env["FIL_PING_SLICE_AT"];
+  const parsed = typeof v === "string" && v.trim() !== "" ? parseInt(v, 10) : NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 40;
+}
+
 /** engine.io timing. Production compose sets 25 s / 60 s (FIL_PING_INTERVAL,
  * FIL_PING_TIMEOUT); the app defaults are 5 / 10. This port defaults to the
  * production values because a ping is also a billed inbound message here. */
