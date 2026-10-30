@@ -95,6 +95,21 @@ jobs:
         env:
           # Read from the environment, not an argv and not a file: the key is
           # never echoed, never written by this job, and never visible in `ps`.
+          #
+          # TUNLION_CI_WORKER_INVITE should be a RUNNER invitation, minted on
+          # the owner device (dovm) and set from a file, never argv:
+          #
+          #   tunlion add --for runner --name ci-worker-dovm --allow transfer,shell \
+          #     --reuse 50 --expires 30d --out ci-worker.key -y --no-interactive
+          #   gh secret set TUNLION_CI_WORKER_INVITE -R Abdk4Moura/tunlion < ci-worker.key && rm ci-worker.key
+          #
+          # Each lease is then an ephemeral device: the owner lists it under
+          # EPHEMERAL (no other device lists it), its access ends with the
+          # lease below, and it is removed when it leaves (`down`) or after 15
+          # minutes unreachable. A `--for device` invitation instead made every
+          # lease a permanent fleet member with a certificate for the whole
+          # invitation lifetime. Needs an owner and worker binary with the
+          # ephemeral-worker change; an older one ignores TUNLION_LEASE.
           WORKER_INVITE: ${{ secrets.TUNLION_CI_WORKER_INVITE }}
           LEGACY_INVITE: ${{ secrets.TUNLION_INVITE }}
           WORKER_MINUTES: ${{ inputs.worker_minutes }}
@@ -103,8 +118,12 @@ jobs:
           set -euo pipefail
           if [ "$WORKER_MINUTES" != 0 ]; then
             export TUNLION_AUTHKEY="$WORKER_INVITE"
+            # The lease plus the teardown after it: the owner ends this box's
+            # access then, whatever the invitation allows.
+            export TUNLION_LEASE="$(( WORKER_MINUTES + 30 ))m"
           else
             export TUNLION_AUTHKEY="$LEGACY_INVITE"
+            export TUNLION_LEASE=45m
           fi
           unset WORKER_INVITE LEGACY_INVITE
           if [ -z "${TUNLION_AUTHKEY:-}" ]; then
