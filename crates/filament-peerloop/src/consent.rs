@@ -194,21 +194,6 @@ mod tests {
         assert_eq!(word_powershell("alpha"), "alpha");
     }
 
-    /// The POSIX form is what a real `sh` reads back as the original name,
-    /// as one argument.
-    #[cfg(unix)]
-    #[test]
-    fn the_posix_word_round_trips_through_sh() {
-        for name in ["Abdul's iPad", "it's", "two  spaces", "a\"b", "$HOME `x` \\ ;|&", "Zo\u{eb}'s", "''"] {
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("printf '%s|' {}", word_posix(name)))
-                .output()
-                .expect("sh runs");
-            assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{name}|"), "{name}");
-        }
-    }
-
     /// The bar refusal names a device with an apostrophe so it can be pasted.
     #[test]
     fn a_refusal_quotes_an_apostrophe_name_intact() {

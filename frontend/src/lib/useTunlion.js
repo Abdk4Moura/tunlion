@@ -24,7 +24,7 @@ import { shouldAutoAccept, offersCoveredNow } from '../net/app/accept.js'
 import { codeStatusAfterTransfer } from '../net/app/codeStatus.js'
 import { localHelperEnabled } from '../net/app/localHelper.js'
 import { pakePartnerFor } from '../net/app/pakePartner.js'
-import { shouldRejoinOnPairMatched, isSamePeerBack, PEER_LEFT_GRACE_MS } from '../net/app/pairRejoin.js'
+import { isSamePeerBack, PEER_LEFT_GRACE_MS } from '../net/app/pairRejoin.js'
 // APPLICATION/state-reducer — pure peer/transfer list transforms (Phase 2).
 import { addPeerToList, patchPeerInList, removePeerFromList, upsertTransferInList } from '../net/app/state.js'
 
@@ -944,17 +944,12 @@ export function useTunlion() {
       // One-time pairing (#11): the server matched us with the code's other
       // party; the code is burned; move both into the private room.
       sig.on('pair-matched', ({ room }) => {
-        setRoomCode(null)
-        // The claimer joins the creator's CURRENT room. On the same network
-        // that is the room we are already in: leaving and re-joining it only
-        // tears down the link the ceremony runs on, and the creator saw our
-        // peer-left mid-ceremony and failed it (3 runs in 4). Nothing to do.
-        if (!shouldRejoinOnPairMatched(roomIdRef.current, room)) {
-          log.debug('pair matched in the room we are already in; staying')
-          tel('pair-matched-same-room', {})
-          return
-        }
         log.debug('pair matched, joining room')
+        setRoomCode(null)
+        // Re-join even when `room` is the one we are in (same network): a CLI
+        // creator takes the peer that JOINS after its code was claimed as the
+        // claimer, so skipping this no-op move strands it. The creator side
+        // instead tolerates the leave + join (PEER_LEFT_GRACE_MS).
         rejoinRef.current?.(room, 'pair')
       })
       sig.on('pair-used', () => {

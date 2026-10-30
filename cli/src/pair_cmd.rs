@@ -2484,7 +2484,7 @@ mod hint_quoting_tests {
     /// Windows, and platform cfg blocks belong in platform/).
     fn sh_argv(line: &str) -> Vec<String> {
         let line = line.replace("<name>", "NewName");
-        let out = std::process::Command::new("sh")
+        let out = crate::platform::command("sh")
             .arg("-c")
             .arg(format!("set -- {line}; for a; do printf '%s\\0' \"$a\"; done"))
             .output()
@@ -2509,6 +2509,19 @@ mod hint_quoting_tests {
         }
         assert_eq!(rename_hint("laptop"), "tunlion devices rename laptop <name>");
         assert!(!rename_hint("Abdul's iPad").contains("Abduls"));
+    }
+
+    /// The quoting rule itself: a real `sh` reads every name back intact, as
+    /// one argument, however hostile.
+    #[test]
+    fn a_quoted_name_round_trips_through_sh() {
+        if !cfg!(unix) {
+            return;
+        }
+        for name in ["Abdul's iPad", "it's", "two  spaces", "a\"b", "$HOME `x` \\ ;|&", "Zo\u{eb}'s", "''", "plain-name"] {
+            let argv = sh_argv(&format!("x {}", crate::refusal::word(name)));
+            assert_eq!(argv, ["x", name], "{name}");
+        }
     }
 
     /// Every other hint that prints a device name in a command keeps it

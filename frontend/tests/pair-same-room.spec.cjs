@@ -1,11 +1,12 @@
 // Browser gate: pairing two browsers that are ALREADY in the same room (the
 // same network, the common home case) must never abort.
 //
-// The defect this pins: the claimer's pair-matched handler left and re-joined
-// the room it was already in, and the creator's peer-left handler failed the
+// The defect this pins: the claimer's pair-matched handler leaves and re-joins
+// the room it is already in, and the creator's peer-left handler failed the
 // running ceremony 2 ms later (relay: web:pake-failed why=peer-left), in 3 of
-// 4 runs. Either half of the fix alone is enough: the claimer skips a no-op
-// rejoin, and the creator tolerates a prompt rejoin of the same peer.
+// 4 runs. The creator now tolerates a prompt rejoin of the same peer. (The
+// claimer keeps re-joining: a CLI creator recognizes its claimer by that join.)
+// pair-same-room-mutants.sh shows the gate fails with the fix reverted.
 //
 // Each run: fresh contexts A and B at "/" (one auto room, one IP), A creates a
 // code, B enters it in "Remember a device" mode right away. Two entry paths:
