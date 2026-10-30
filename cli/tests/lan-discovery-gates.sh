@@ -127,9 +127,13 @@ topo_wg() {
   if nsx lanA ip link add wg0 type wireguard 2>/dev/null && command -v wg >/dev/null; then
     TUNNEL=wireguard
     nsx lanB ip link add wg0 type wireguard
-    local ka kb; ka=$(wg genkey); kb=$(wg genkey)
-    nsx lanA wg set wg0 listen-port 51820 private-key <(echo "$ka") peer "$(echo "$kb" | wg pubkey)" endpoint 10.88.2.1:51820 allowed-ips 10.99.0.0/24 persistent-keepalive 5
-    nsx lanB wg set wg0 listen-port 51820 private-key <(echo "$kb") peer "$(echo "$ka" | wg pubkey)" endpoint 10.88.1.1:51820 allowed-ips 10.99.0.0/24 persistent-keepalive 5
+    # Key FILES: sudo closes inherited descriptors, so <(...) would hand wg
+    # an unreadable path and leave the tunnel keyless (and silent).
+    (umask 077; wg genkey > "$WORK/wg-a.key"; wg genkey > "$WORK/wg-b.key")
+    nsx lanA wg set wg0 listen-port 51820 private-key "$WORK/wg-a.key" peer "$(wg pubkey < "$WORK/wg-b.key")" endpoint 10.88.2.1:51820 allowed-ips 10.99.0.0/24 persistent-keepalive 5 \
+      || refuse "wg set failed on A"
+    nsx lanB wg set wg0 listen-port 51820 private-key "$WORK/wg-b.key" peer "$(wg pubkey < "$WORK/wg-a.key")" endpoint 10.88.1.1:51820 allowed-ips 10.99.0.0/24 persistent-keepalive 5 \
+      || refuse "wg set failed on B"
     forward_udp 51820
   else
     nsx lanA ip link del wg0 2>/dev/null
@@ -140,7 +144,13 @@ topo_wg() {
   fi
   nsx lanA ip addr add 10.99.0.1/24 dev wg0; nsx lanA ip link set wg0 up
   nsx lanB ip addr add 10.99.0.2/24 dev wg0; nsx lanB ip link set wg0 up
-  echo "tunnel: $TUNNEL"
+  # The instrument must be present: a tunnel that carries nothing would make
+  # every result below about something else.
+  local i; for i in 1 2 3 4 5; do nsx lanA ping -c1 -W2 10.99.0.2 >/dev/null 2>&1 && break; sleep 1; done
+  nsx lanA ping -c1 -W2 10.99.0.2 >/dev/null 2>&1 || refuse "the $TUNNEL tunnel does not carry packets"
+  # And the underlay must not: only UDP 51820 crosses it.
+  if nsx lanA ping -c1 -W2 10.88.2.1 >/dev/null 2>&1; then refuse "the underlay passes more than the tunnel"; fi
+  echo "tunnel: $TUNNEL (carries packets; underlay closed to everything else)"
 }
 # Both ends renumber: only the unicast sweep of the tunnel prefix can find
 # the peer (no multicast, no ARP on a point-to-point tunnel).
