@@ -288,7 +288,7 @@ impl Drop for HostHandle {
 /// printed by the caller, which owns the code screen.
 pub async fn spawn_host(code: PairCode, words: String, nameplate: String) -> Result<HostHandle> {
     let id = code.pairing_id();
-    let (pair_tx, mut pair_rx) = mpsc::unbounded_channel::<PairLink>();
+    let (pair_tx, mut pair_rx) = mpsc::channel::<PairLink>(2);
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<crate::net::Ev>();
     spawn_ev_drain(ev_rx);
     let svc = LanService::start(
@@ -301,23 +301,26 @@ pub async fn spawn_host(code: PairCode, words: String, nameplate: String) -> Res
     .await?;
     let (out_tx, out_rx) = mpsc::unbounded_channel::<HostEvent>();
     let task = tokio::spawn(async move {
-        let Some(mut link) = pair_rx.recv().await else { return };
-        let now = Instant::now();
-        let token = match code.begin(Carrier::Lan, now) {
-            Begin::Started(t) => t,
-            Begin::Busy => {
-                let _ = out_tx.send(HostEvent::Failed { token: 0, why: "another ceremony is active".into() });
-                return;
-            }
-            Begin::Closed => return,
-        };
-        match run_ceremony(&mut link, &words, &nameplate, "host").await {
-            Ok((peer_name, secret, cert)) => {
-                let _ = out_tx.send(HostEvent::Outcome(Outcome { token, peer_name, secret, cert }));
-            }
-            Err(e) => {
-                code.fail(token, Instant::now());
-                let _ = out_tx.send(HostEvent::Failed { token, why: format!("{e:#}") });
+        while !code.is_closed() {
+            let Some(mut link) = pair_rx.recv().await else { return };
+            let now = Instant::now();
+            let token = match code.begin(Carrier::Lan, now) {
+                Begin::Started(t) => t,
+                Begin::Busy => {
+                    ui::debug("lan pairing: another ceremony is active; refusing this connection");
+                    continue;
+                }
+                Begin::Closed => return,
+            };
+            match run_ceremony(&mut link, &words, &nameplate, "host").await {
+                Ok((peer_name, secret, cert)) => {
+                    let _ = out_tx.send(HostEvent::Outcome(Outcome { token, peer_name, secret, cert }));
+                    return;
+                }
+                Err(e) => {
+                    code.fail(token, Instant::now());
+                    let _ = out_tx.send(HostEvent::Failed { token, why: format!("{e:#}") });
+                }
             }
         }
     });
@@ -334,7 +337,7 @@ pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
     ui::say(&format!("  nearby: {}  (compare with the other screen)", code.label()));
     ui::say(&ui::paint(ui::Tone::Dim, "  waiting for the other device... Ctrl-C cancels"));
 
-    let (pair_tx, mut pair_rx) = mpsc::unbounded_channel::<PairLink>();
+    let (pair_tx, mut pair_rx) = mpsc::channel::<PairLink>(2);
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<crate::net::Ev>();
     spawn_ev_drain(ev_rx);
     let svc = LanService::start(

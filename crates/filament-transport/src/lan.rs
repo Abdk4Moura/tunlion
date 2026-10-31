@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use quinn::{Endpoint, RecvStream, SendStream};
 use serde_json::{json, Value};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -537,8 +537,9 @@ async fn accept_auth(conn: &quinn::Connection, keys: &[LanKey]) -> Result<(LanKe
 pub fn spawn_accept(
     ep: Endpoint,
     keys: Arc<dyn Fn() -> Vec<LanKey> + Send + Sync>,
-    pair: Option<UnboundedSender<PairLink>>,
+    pair: Option<Sender<PairLink>>,
     shutdown: Shutdown,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     tx: UnboundedSender<Ev>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -557,7 +558,8 @@ pub fn spawn_accept(
             let pair = pair.clone();
             let ep2 = ep.clone();
             let shutdown2 = shutdown.clone();
-            tokio::spawn(async move {
+            let tasks2 = tasks.clone();
+            let h = tokio::spawn(async move {
                 let _permit = permit;
                 let r = tokio::time::timeout(ACCEPT_AUTH_BUDGET, async {
                     let conn = incoming.await.context("lan accept handshake")?;
@@ -569,14 +571,16 @@ pub fn spawn_accept(
                         let (send, recv) = conn.accept_bi().await.context("accept pairing stream")?;
                         let keying_material = direct::pairing_keying_material(&conn)?;
                         let remote = canonical(conn.remote_address());
-                        let _ = pair.send(PairLink {
+                        if pair.try_send(PairLink {
                             conn,
                             send,
                             recv,
                             keying_material,
                             remote,
                             dialer: false,
-                        });
+                        }).is_err() {
+                            return Ok(None);
+                        }
                         return Ok(None);
                     }
                     let (k, send, recv) = accept_auth(&conn, &keys()).await?;
@@ -596,6 +600,11 @@ pub fn spawn_accept(
                     Err(_) => crate::hooks::debug("lan: inbound did not authenticate in time"),
                 }
             });
+            if shutdown.is_stopped() {
+                h.abort();
+            } else {
+                tasks2.lock().unwrap().push(h);
+            }
         }
     })
 }
@@ -855,7 +864,7 @@ impl LanService {
         config_dir: &Path,
         opts: Options,
         keys: Arc<dyn Fn() -> Vec<LanKey> + Send + Sync>,
-        pair_tx: Option<UnboundedSender<PairLink>>,
+        pair_tx: Option<Sender<PairLink>>,
         tx: UnboundedSender<Ev>,
     ) -> Result<LanService> {
         let store = LanStore::new(config_dir);
@@ -877,7 +886,7 @@ impl LanService {
         let shutdown = Shutdown::new();
         let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         if let Some(ep) = listen_ep.clone() {
-            let h = spawn_accept(ep, keys, pair_tx, shutdown.clone(), tx.clone());
+            let h = spawn_accept(ep, keys, pair_tx, shutdown.clone(), tasks.clone(), tx.clone());
             tasks.lock().unwrap().push(h);
         }
         let mut engine = Engine::new(pk, port);
@@ -1166,7 +1175,7 @@ mod tests {
             ]
         });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_accept(lep, held, None, Shutdown::new(), tx.clone());
+        spawn_accept(lep, held, None, Shutdown::new(), Arc::new(Mutex::new(Vec::new())), tx.clone());
         let target: SocketAddr = format!("127.0.0.1:{lport}").parse().unwrap();
 
         let (dep, _) = bind(0).unwrap();
@@ -1204,7 +1213,7 @@ mod tests {
         let held: Arc<dyn Fn() -> Vec<LanKey> + Send + Sync> =
             Arc::new(|| vec![LanKey { name: "desk".into(), secret: "44".repeat(32), fleet: false }]);
         let (atx, mut arx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_accept(lep, held, None, Shutdown::new(), atx.clone());
+        spawn_accept(lep, held, None, Shutdown::new(), Arc::new(Mutex::new(Vec::new())), atx.clone());
         let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
         let (dep, _) = bind(0).unwrap();
         let target: SocketAddr = format!("127.0.0.1:{lport}").parse().unwrap();
