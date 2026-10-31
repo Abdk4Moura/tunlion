@@ -771,7 +771,12 @@ async fn a_bad_candidate_is_retried_then_the_right_host_succeeds() {
     )
     .await;
     match second {
-        JoinCandidate::Paired { secret, .. } => assert!(!secret.is_empty()),
+        JoinCandidate::Paired { secret, .. } => {
+            assert!(!secret.is_empty());
+            // The production caller persists and then acknowledges; the host
+            // ceremony waits for that acknowledgement before returning.
+            let _ = stored_ack(&mut peer).await;
+        }
         JoinCandidate::Retry(reason) => panic!("the right host was retried away: {reason}"),
     }
     let host_result = tokio::time::timeout(Duration::from_secs(15), host_task)
