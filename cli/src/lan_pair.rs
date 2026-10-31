@@ -608,7 +608,7 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
             };
             let crate::net::Ev::Lan(filament_transport::lan::LanEvent::PairingNearby { addr, label }) = ev else { continue };
             let key = format!("{addr}|{label}");
-            if !seen.insert(key) {
+            if !seen.insert(key.clone()) {
                 continue;
             }
             if seen.len() >= 64 {
