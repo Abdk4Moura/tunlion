@@ -570,7 +570,13 @@ async fn a_cancelled_host_closes_its_listener_and_joins_its_ceremony_task() {
         HostEvent::Failed { why, .. } => {
             assert!(why.contains("before key confirmation"), "got: {why}");
         }
-        other => panic!("expected a failed ceremony, got {other:?}"),
+        HostEvent::Stored(acked) => {
+            panic!("expected a failed ceremony, got Stored({acked})")
+        }
+        // Never format the Outcome: it carries the pair secret.
+        HostEvent::Outcome(_) => {
+            panic!("expected a failed ceremony, got a successful Outcome")
+        }
     }
 
     // The production cancellation path (`pair_cmd`'s finally block) calls this.
