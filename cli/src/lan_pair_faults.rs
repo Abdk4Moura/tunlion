@@ -744,8 +744,11 @@ async fn a_bad_candidate_is_retried_then_the_right_host_succeeds() {
         .pair_dial(vec![(Ipv4Addr::LOCALHOST, port).into()])
         .await
         .expect("dial the right host");
-    let peer_hello = peer_service.hello_json();
-    let host_hello = host_service.hello_json();
+    // `hello_json` advertises port 0 on a non-serving dialer, and a
+    // `lan-hello` with port 0 is malformed. Production uses `pair_hello`, which
+    // fills in the daemon/default port; mirror that on both fixture sides.
+    let peer_hello = pair_hello(&peer_service);
+    let host_hello = pair_hello(&host_service);
     let host_task = tokio::spawn(async move {
         let mut host = tokio::time::timeout(Duration::from_secs(10), host_pair_rx.recv())
             .await
@@ -902,7 +905,7 @@ async fn join_loop_retries_a_bad_notice_and_persists_the_right_host() {
     let good_port = good_service.hello_json()["port"]
         .as_u64()
         .expect("good notice host advertises its port") as u16;
-    let good_hello = good_service.hello_json();
+    let good_hello = pair_hello(&good_service);
     let good_order = order.clone();
     let good_task = tokio::spawn(async move {
         let mut host = tokio::time::timeout(Duration::from_secs(10), good_pair_rx.recv())
@@ -910,7 +913,7 @@ async fn join_loop_retries_a_bad_notice_and_persists_the_right_host() {
             .expect("good notice host accepted a stream")
             .expect("good notice host pair channel is open");
         good_order.lock().unwrap().push("good");
-        let ceremony = run_ceremony(&mut host, "brave otter", "3141", "host", &good_hello).await;
+        let ceremony = run_ceremony(&mut host, "brave-otter", "3141", "host", &good_hello).await;
         let acked = if ceremony.is_ok() {
             stored_ack(&mut host).await
         } else {
@@ -985,13 +988,15 @@ async fn a_store_failure_ends_the_join_without_another_candidate() {
     let port = host_service.hello_json()["port"]
         .as_u64()
         .expect("store-failure host advertises its port") as u16;
-    let host_hello = host_service.hello_json();
+    let host_hello = pair_hello(&host_service);
     let host_task = tokio::spawn(async move {
         let mut host = tokio::time::timeout(Duration::from_secs(10), host_pair_rx.recv())
             .await
             .expect("store-failure host accepted a stream")
             .expect("store-failure host pair channel is open");
-        run_ceremony(&mut host, "brave otter", "3141", "host", &host_hello).await
+        // The joiner parses `brave-otter-3141` with `split_code`, so its PAKE
+        // password is `brave-otter`; the host fixture must use the same bytes.
+        run_ceremony(&mut host, "brave-otter", "3141", "host", &host_hello).await
     });
     let notice = filament_transport::lan::PairingNotice {
         addr: (Ipv4Addr::LOCALHOST, port).into(),
