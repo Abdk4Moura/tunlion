@@ -29,7 +29,7 @@ use tunlion_lan::record::{self, Hello, HelloAddr, Record};
 use tunlion_lan::wire;
 
 use crate::direct;
-use crate::net::Ev;
+use crate::net::{AttemptId, Ev};
 
 /// The shown and compared route word for a link made by local discovery.
 pub const ROUTE_LAN: &str = "lan";
@@ -495,7 +495,8 @@ pub fn spawn_accept(ep: Endpoint, keys: Arc<dyn Fn() -> Vec<LanKey> + Send + Syn
                     Ok(Ok((conn, k, send, recv))) => {
                         let remote = canonical(conn.remote_address());
                         let pid = fresh_pid();
-                        let transport = direct::make_transport_unread(pid.clone(), conn, send, recv, tx.clone(), true, Some(ep2), true);
+                        let attempt = AttemptId::next();
+                        let transport = direct::make_transport_unread(pid.clone(), conn, send, recv, tx.clone(), true, Some(ep2), true, Some(attempt));
                         let _ = tx.send(Ev::Lan(LanEvent::Linked { pid, name: k.name, secret: k.secret, fleet: k.fleet, transport, remote, dialer: false }));
                     }
                     Ok(Err(e)) => crate::hooks::debug(&format!("lan: inbound refused: {e:#}")),
@@ -546,7 +547,8 @@ pub async fn dial(ep: Endpoint, key: LanKey, addrs: Vec<SocketAddr>, tx: Unbound
     let (addr, conn, send, recv) = won?;
     let pid = fresh_pid();
     let remote = canonical(conn.remote_address());
-    let transport = direct::make_transport_unread(pid.clone(), conn, send, recv, tx.clone(), false, Some(ep), true);
+    let attempt = AttemptId::next();
+    let transport = direct::make_transport_unread(pid.clone(), conn, send, recv, tx.clone(), false, Some(ep), true, Some(attempt));
     let _ = tx.send(Ev::Lan(LanEvent::Linked { pid, name: key.name, secret: key.secret, fleet: key.fleet, transport, remote, dialer: true }));
     Some(addr)
 }

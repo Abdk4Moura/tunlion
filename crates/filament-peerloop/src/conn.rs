@@ -738,6 +738,10 @@ pub enum DirectAuthDomain {
     Device,
     Ephemeral,
     Fleet,
+    /// A LAN-origin primary whose ownership was established by the local
+    /// discovery handshake, not by a DirectPending. It carries no device
+    /// binding and never mints a worker transport key.
+    Lan,
 }
 
 /// Immutable authorization snapshot for one direct attempt. `generation` is
@@ -766,6 +770,10 @@ impl DirectAuth {
 
     fn fleet(generation: u32) -> Self {
         DirectAuth { generation, domain: DirectAuthDomain::Fleet, device_binding: None }
+    }
+
+    fn lan(generation: u32) -> Self {
+        DirectAuth { generation, domain: DirectAuthDomain::Lan, device_binding: None }
     }
 
     /// Worker transport key derived only from the stored DEVICE binding. Fleet
@@ -3785,7 +3793,7 @@ impl Conn {
                 }
                 true
             }
-            DirectAuthDomain::Ephemeral | DirectAuthDomain::Fleet => {
+            DirectAuthDomain::Ephemeral | DirectAuthDomain::Fleet | DirectAuthDomain::Lan => {
                 !self.revoked_peers.contains_key(pid)
             }
         }
@@ -4767,9 +4775,17 @@ impl Conn {
             t.force_close();
             return DirectAdoption::Rejected;
         }
+        // LAN ownership is established by the local discovery handshake before
+        // the transport is announced. A LAN primary may therefore adopt without
+        // a DirectPending, promotion, or probe. This branch never consumes any
+        // of them: it is only taken when none exists for the pid.
+        let lan_owned = route == filament_transport::lan::ROUTE_LAN
+            && self.direct_pending.get(pid).is_none()
+            && !self.promotions.contains_key(pid)
+            && !self.resil.upgrade_probe.contains_key(pid);
         // Validate attempt ownership BEFORE reading the pending secret or
         // mutating any state. A promotion-held standby is the only no-pending
-        // owner; Conn has no synthetic inbound path.
+        // owner besides an explicitly LAN-owned primary.
         if let Some(pending) = self.direct_pending.get(pid) {
             if pending.attempt != attempt {
                 self.log.debug(&format!(
@@ -4778,10 +4794,11 @@ impl Conn {
                 t.force_close();
                 return DirectAdoption::Rejected;
             }
-        } else if !self
-            .promotions
-            .get(pid)
-            .is_some_and(|promotion| promotion.attempt == Some(attempt))
+        } else if !lan_owned
+            && !self
+                .promotions
+                .get(pid)
+                .is_some_and(|promotion| promotion.attempt == Some(attempt))
         {
             self.log.debug(&format!(
                 "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: no attempt ownership"
@@ -4798,7 +4815,11 @@ impl Conn {
             .get(pid)
             .map(|pending| pending.auth.clone())
             .or_else(|| self.promotions.get(pid).and_then(|promotion| promotion.auth.clone()));
-        if !self.direct_attempt_authorized(pid, attempt, auth.as_ref()) {
+        let lan_auth = DirectAuth::lan(0);
+        let auth_ref = auth
+            .as_ref()
+            .or_else(|| if lan_owned { Some(&lan_auth) } else { None });
+        if !self.direct_attempt_authorized(pid, attempt, auth_ref) {
             self.log.debug(&format!(
                 "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: attempt authorization revoked"
             ));
@@ -4834,10 +4855,14 @@ impl Conn {
                 self.retire_serving_link(pid);
             }
         }
+        let lan = route == filament_transport::lan::ROUTE_LAN;
         let pend = self.take_pending_for_adoption(pid, attempt);
-        let tkey = pend
-            .as_ref()
-            .map(|pending| direct::transport_key(&pending.secret.1));
+        let tkey = if lan {
+            None
+        } else {
+            pend.as_ref()
+                .map(|pending| direct::transport_key(&pending.secret.1))
+        };
         // Read the fleet flag BEFORE the secret moves out of the pending.
         //
         // FAIL SAFE WITH NO PENDING. Only the DIALER holds a `DirectPending`, so
@@ -4933,6 +4958,15 @@ impl Conn {
                     existing.verified_name = Some(n.clone());
                 }
             }
+            if lan {
+                // The LAN handshake proves a local holder of a shared secret,
+                // not a device binding. It must never inherit owner trust or a
+                // worker key from another direct path.
+                existing.trusted = false;
+                existing.verified_name = None;
+                existing.expected_secret = None;
+                existing.principal_kind = PrincipalKind::Delegated { caps: Vec::new() };
+            }
             resolve_peer_identity(existing);
             if expected_secret.is_some() {
                 existing.expected_secret = expected_secret;
@@ -4960,8 +4994,8 @@ impl Conn {
                     // that the peer is in the fleet. So it is born untrusted, with no
                     // petname and no owner-equivalence, until a verified fleet-hello
                     // names it.
-                    trusted: !fleet && !ephemeral,
-                    verified_name: if fleet || ephemeral {
+                    trusted: !fleet && !ephemeral && !lan,
+                    verified_name: if fleet || ephemeral || lan {
                         None
                     } else {
                         expected_secret.as_ref().map(|(n, _)| n.clone())
@@ -4975,7 +5009,7 @@ impl Conn {
                     identity_user_pub: None,
                     identity_binding: BindingStrength::None,
                     identity_cert_expires: None,
-                    principal_kind: if fleet {
+                    principal_kind: if fleet || lan {
                         PrincipalKind::Delegated { caps: Vec::new() }
                     } else {
                         PrincipalKind::OwnerDevice
@@ -10797,6 +10831,105 @@ mod warm_identity_tests {
         assert!(link.worker_sources.contains(&old_worker_source));
         assert!(incoming.is_dead());
         assert!(conn.direct_pending.contains_key(pid));
+    }
+
+    /// A LAN primary carries its own checked attempt. It adopts once without a
+    /// pending, consumes no unrelated pending/probe/provisioning state, mints no
+    /// worker key, is not device-trusted, and a duplicate Arc is harmless.
+    #[tokio::test]
+    async fn lan_ready_adopts_without_pending_and_duplicate_is_harmless() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-lan-owned";
+        let t: Arc<dyn Transport> =
+            Rec::with_attempt("lan", &log, net::AttemptId::next());
+        let attempt = t.attempt_id().unwrap();
+        let other = "sid-lan-unrelated";
+        conn.direct_pending.insert(
+            other.into(),
+            direct_pending_with(net::AttemptId::next(), ("dev", "secret")),
+        );
+        let mut probe = UpgradeProbe::armed();
+        probe.token = Some(net::AttemptId::next());
+        probe.auth = Some(DirectAuth::device(1, "dev", "secret"));
+        conn.resil.upgrade_probe.insert(other.into(), probe);
+        conn.pending_bindings
+            .insert("sid-lan-provision".into(), ("dev".into(), "secret".into()));
+
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), filament_transport::lan::ROUTE_LAN),
+            DirectAdoption::Adopted { attempt: seen, tkey: None } if seen == attempt
+        ));
+        let link = &conn.links[pid];
+        assert_eq!(link.direct_route, filament_transport::lan::ROUTE_LAN);
+        assert!(!link.trusted, "LAN was born device-trusted");
+        assert!(link.expected_secret.is_none());
+        assert!(!t.is_dead());
+        assert!(conn.direct_pending.contains_key(other));
+        assert!(conn.resil.upgrade_probe.contains_key(other));
+        assert!(conn.pending_bindings.contains_key("sid-lan-provision"));
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), filament_transport::lan::ROUTE_LAN),
+            DirectAdoption::Duplicate
+        ));
+        assert!(!t.is_dead(), "duplicate LAN ready closed the live transport");
+        assert!(DirectAuth::lan(1).device_binding.is_none());
+        assert!(DirectAuth::lan(1).transport_key().is_none());
+    }
+
+    /// A retired LAN attempt cannot resurrect, and a withdrawn LAN link retires
+    /// its exact attempt for a queued duplicate.
+    #[tokio::test]
+    async fn retired_lan_attempt_cannot_resurrect() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-lan-retired";
+        let t: Arc<dyn Transport> =
+            Rec::with_attempt("lan", &log, net::AttemptId::next());
+        let attempt = t.attempt_id().unwrap();
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), filament_transport::lan::ROUTE_LAN),
+            DirectAdoption::Adopted { .. }
+        ));
+        conn.drop_link(pid);
+        assert!(conn.retired_attempts.contains_key(&attempt));
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), filament_transport::lan::ROUTE_LAN),
+            DirectAdoption::Rejected
+        ));
+        assert!(!conn.links.contains_key(pid));
+
+        let fresh_pid = "sid-lan-already-retired";
+        let fresh: Arc<dyn Transport> =
+            Rec::with_attempt("lan-retired", &log, net::AttemptId::next());
+        let fresh_attempt = fresh.attempt_id().unwrap();
+        conn.retired_attempts.insert(
+            fresh_attempt,
+            RetiredAttempt { pid: fresh_pid.into(), at: Instant::now() },
+        );
+        assert!(matches!(
+            conn.adopt_direct(fresh_pid, fresh.clone(), filament_transport::lan::ROUTE_LAN),
+            DirectAdoption::Rejected
+        ));
+        assert!(fresh.is_dead());
+        assert!(!conn.links.contains_key(fresh_pid));
+    }
+
+    /// LAN ownership does not widen any other route: an unknown non-LAN ready
+    /// still fails closed.
+    #[tokio::test]
+    async fn unknown_non_lan_ready_still_fails_closed() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-non-lan-unknown";
+        let t: Arc<dyn Transport> =
+            Rec::with_attempt("unknown", &log, net::AttemptId::next());
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), "direct-quic"),
+            DirectAdoption::Rejected
+        ));
+        assert!(t.is_dead());
+        assert!(!conn.links.contains_key(pid));
     }
 
     /// A source event forwarded while its link was current must be rejected if
