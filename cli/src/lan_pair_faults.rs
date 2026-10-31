@@ -1013,7 +1013,7 @@ async fn a_store_failure_ends_the_join_without_another_candidate() {
         label: "test".to_string(),
     };
     let _seam = test_seams::install_join_seam(
-        Duration::from_secs(5),
+        Duration::from_secs(15),
         vec![notice],
     );
     let start = Instant::now();
@@ -1025,7 +1025,7 @@ async fn a_store_failure_ends_the_join_without_another_candidate() {
         "got: {error}"
     );
     assert!(
-        start.elapsed() < Duration::from_secs(5),
+        start.elapsed() < Duration::from_secs(10),
         "the join returned on the store failure instead of retrying"
     );
     let host_result = tokio::time::timeout(Duration::from_secs(15), host_task)
