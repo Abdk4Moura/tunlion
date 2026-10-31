@@ -75,7 +75,7 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
     let caps = pair_v2_caps();
     let scope = crate::identity::IntroScope::Device.to_byte();
     let mut cer = Ceremony::new(words, nameplate, caps.clone(), scope);
-    let my_cert = crate::local_device_cert();
+    let my_cert = local_cert_readonly();
     cer.set_exposes(my_cert.is_some());
     let my_fp = binding(&link.keying_material, role);
     let their_fp = binding(&link.keying_material, opposite(role));
@@ -337,6 +337,14 @@ fn lan_enabled() -> bool {
 
 /// A hello for the pairing link. A joiner has no listener yet, so it advertises
 /// the port its daemon will use; a host advertises the port it actually bound.
+/// Read this device's existing certificate. NEVER mints one: PR A must not
+/// create a self-certificate as a side effect of pairing.
+fn local_cert_readonly() -> Option<DeviceCert> {
+    let raw = std::fs::read_to_string(crate::local_device_cert_path()).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    DeviceCert::from_json(&v["cert"])
+}
+
 fn pair_hello(svc: &LanService) -> Value {
     let mut h = svc.hello_json();
     if h["port"].as_u64() == Some(0) {
