@@ -60,13 +60,26 @@ up_node() { # up_node NAME [extra env...]
   FIX_PIDS+=($!)
 }
 
-status_ms() { # status_ms NAME -> "elapsed_ms,exit"
-  local n="$1" t0 t1 rc
-  t0=$(date +%s%N)
-  env HOME="$WORK/home-$n" TUNLION_CONFIG_DIR="$WORK/$n" "$BIN" status --json >/dev/null 2>&1
-  rc=$?
-  t1=$(date +%s%N)
-  printf '%s,%s\n' "$(( (t1 - t0) / 1000000 ))" "$rc"
+control_ms() { # control_ms NAME -> "elapsed_ms,exit" from the loop serviced control socket
+  # Direct cap-status round-trip. Spawning the debug CLI would measure process
+  # startup under load, not the loop's control latency. 1.5 s mirrors the real
+  # `status` probe budget.
+  "$PYV" - "$WORK/$1/control.sock" <<'PROBE'
+import socket, sys, time
+path = sys.argv[1]
+start = time.monotonic()
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1.5)
+    s.connect(path)
+    s.sendall(b'{"op":"l3-state"}\n')
+    s.recv(4096)
+    ok = 0
+except Exception:
+    ok = 6
+ms = int((time.monotonic() - start) * 1000)
+print(f"{ms},{ok}")
+PROBE
 }
 
 [ -x "$BIN" ] || { echo "SETUP: build a test-hooks binary first (TUNLION_BIN); no $BIN"; exit 2; }
@@ -85,7 +98,7 @@ ready=1
 for n in "${PEERS[@]}"; do
   ok_ready=0
   for _ in $(seq 1 60); do
-    line=$(status_ms "$n")
+    line=$(control_ms "$n")
     rc=${line#*,}
     if [ "$rc" = 0 ]; then ok_ready=1; break; fi
     sleep 0.5
@@ -96,8 +109,8 @@ done
 
 ( end=$(( $(date +%s) + WINDOW ))
   while [ "$(date +%s)" -lt "$end" ]; do
-    for n in "${PEERS[@]}"; do status_ms "$n"; done
-    sleep 0.2
+    control_ms bravo
+    sleep 0.5
   done
 ) >"$WORK/status.csv" &
 SPID=$!

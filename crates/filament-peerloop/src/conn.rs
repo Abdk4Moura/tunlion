@@ -926,6 +926,10 @@ async fn run_build_task(
         }
         let delay = test_hooks::establish_delay_ms();
         if delay > 0 {
+            filament_transport::hooks::debug(&format!(
+                "BUILD-DELAY peer={} ms={delay}",
+                plan.peer_id
+            ));
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
         match tokio::time::timeout(
@@ -2643,7 +2647,15 @@ impl Conn {
                         self.log.say(&format!(
                             "tunlion: could not build a WebRTC link for {pid}: {reason}"
                         ));
-                        self.drop_link(&pid);
+                        // Drop only the generation this failed intent owned. A
+                        // newer direct link that landed meanwhile must survive.
+                        if self
+                            .links
+                            .get(&pid)
+                            .is_none_or(|l| Some(l.generation) == plan.prior_generation)
+                        {
+                            self.drop_link(&pid);
+                        }
                     }
                 }
                 BuildDone::Cancelled { plan } => {
@@ -5502,6 +5514,14 @@ impl Conn {
         let pid = pid_val.to_string();
         self.roster.remove(&pid);
         self.webrtc_only.remove(&pid);
+        if let Some(state) = self.builds.get(&pid) {
+            #[cfg(feature = "test-hooks")]
+            let generation = format!(" gen={}", state.generation);
+            #[cfg(not(feature = "test-hooks"))]
+            let generation = "";
+            self.log
+                .debug(&format!("peer-left invalidated build pid={pid}{generation}"));
+        }
         self.cancel_build(&pid);
         if !self.links.contains_key(&pid) {
             return false;
@@ -8143,6 +8163,43 @@ mod warm_identity_tests {
         conn.builds.insert(pid.to_string(), build_state(4));
         conn.on_peer_left(&json!({ "id": pid }));
         assert!(!conn.builds.contains_key(pid));
+    }
+
+    /// A terminal failure must not tear down a newer successful direct link.
+    #[tokio::test]
+    async fn a_terminal_failure_keeps_a_newer_direct_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-fail-race";
+        let mut plan = conn
+            .prepare_build(
+                json!({ "id": pid, "name": "peer" }),
+                None,
+                std::panic::Location::caller(),
+                Replace::NeverLive,
+            )
+            .expect("prepare")
+            .expect("plan");
+        plan.attempt = 2;
+        plan.prior_generation = Some(7);
+        let generation = plan.generation;
+        let direct: Arc<dyn Transport> = Rec::new("direct", &log);
+        let mut link = direct_link(pid, "peer", "peer", direct.clone());
+        link.generation = 99;
+        link.transport = Some(direct.clone());
+        conn.links.insert(pid.to_string(), link);
+        conn.builds.insert(pid.to_string(), build_state(generation));
+        conn.build_tx
+            .send(BuildDone::Failed { plan, reason: "terminal".into() })
+            .unwrap();
+        conn.pump_builds();
+        assert!(
+            conn.links[pid]
+                .transport
+                .as_ref()
+                .is_some_and(|t| Arc::ptr_eq(t, &direct)),
+            "a failed old intent dropped the newer direct link"
+        );
     }
 
     /// Shutdown is an invalidation for every held candidate, not just live links.
