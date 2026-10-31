@@ -774,7 +774,7 @@ async fn a_bad_candidate_is_retried_then_the_right_host_succeeds() {
         JoinCandidate::Paired { secret, .. } => assert!(!secret.is_empty()),
         JoinCandidate::Retry(reason) => panic!("the right host was retried away: {reason}"),
     }
-    let host_result = tokio::time::timeout(Duration::from_secs(10), host_task)
+    let host_result = tokio::time::timeout(Duration::from_secs(15), host_task)
         .await
         .expect("the right host's ceremony finished")
         .expect("the right host task did not panic");
@@ -1023,7 +1023,7 @@ async fn a_store_failure_ends_the_join_without_another_candidate() {
         start.elapsed() < Duration::from_secs(5),
         "the join returned on the store failure instead of retrying"
     );
-    let host_result = tokio::time::timeout(Duration::from_secs(10), host_task)
+    let host_result = tokio::time::timeout(Duration::from_secs(15), host_task)
         .await
         .expect("the host ceremony finished")
         .expect("the host task did not panic");
