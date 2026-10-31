@@ -358,7 +358,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         builds: HashMap::new(),
         build_deferred: std::collections::BTreeMap::new(),
         build_tx,
-        build_rx,
+        build_rx: std::sync::Mutex::new(build_rx),
         pending_bindings: HashMap::new(),
         pending_active: HashSet::new(),
         cancelled_intents: HashMap::new(),
