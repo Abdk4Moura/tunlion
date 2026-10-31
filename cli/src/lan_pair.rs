@@ -94,14 +94,13 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
         if Instant::now() >= deadline {
             bail!("pairing ceremony did not finish in {} s", crate::pair_code::CEREMONY_BUDGET.as_secs());
         }
-        if let Some(sec) = cer.secret() {
-            let _ = sec;
-            if !sent_confirm {
-                if let Some(payload) = cer.take_confirm_payload(&my_fp, &their_fp) {
-                    pair_write(&mut link.send, &payload).await?;
-                    sent_confirm = true;
-                }
+        if cer.has_k() && !sent_confirm {
+            if let Some(payload) = cer.take_confirm_payload(&my_fp, &their_fp) {
+                pair_write(&mut link.send, &payload).await?;
+                sent_confirm = true;
             }
+        }
+        if cer.secret().is_some() {
             if !sent_name {
                 pair_write(&mut link.send, &json!({"type": "pair-name", "v": 1, "name": crate::display_name()})).await?;
                 sent_name = true;
