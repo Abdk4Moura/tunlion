@@ -557,6 +557,7 @@ pub fn spawn_accept(
             let keys = keys.clone();
             let tx = tx.clone();
             let pair = pair.clone();
+            let allow = allow.clone();
             let ep2 = ep.clone();
             let shutdown2 = shutdown.clone();
             let tasks2 = tasks.clone();
