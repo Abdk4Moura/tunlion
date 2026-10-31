@@ -34,6 +34,7 @@ const FRAME_TYPES: &[&str] = &[
     "identity-expose-ack",
     "pair-name",
     "lan-hello",
+    "pair-stored",
 ];
 
 /// What a confirmed LAN ceremony hands to the coordinator. The coordinator is
@@ -213,23 +214,73 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
     Ok((crate::devices_store::sanitize_device_name(&name), secret, peer_cert, hello))
 }
 
+/// Exchange a post-store acknowledgement. A success line may say the other
+/// side saved only when this returns true; otherwise the local result is real
+/// and the remote result is unknown, never claimed.
+async fn stored_ack(link: &mut PairLink) -> bool {
+    if pair_write(&mut link.send, &json!({"type": "pair-stored", "v": 1})).await.is_err() {
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(left, pair_read(&mut link.recv)).await {
+            Ok(Ok(v)) if frame_type(&v) == "pair-stored" => return true,
+            Ok(Ok(_)) => continue,
+            _ => return false,
+        }
+    }
+}
+
 /// The single plain-pair store path. Used by both carriers after `confirm`.
 /// It never issues a certificate, never loads the owner key and never lifts a
 /// revocation. It refuses a blocked peer before writing anything.
-pub fn persist_plain(outcome: &Outcome) -> Result<()> {
-    let name = crate::devices_store::sanitize_device_name(&outcome.peer_name);
+pub fn persist_plain(outcome: &Outcome) -> Result<String> {
+    let requested = crate::devices_store::sanitize_device_name(&outcome.peer_name);
     let caps = pair_v2_caps();
     let scope = crate::identity::IntroScope::Device.to_byte();
     let now = identity::now_secs();
     if let Some(cert) = outcome.cert.as_ref() {
         cert.verify(now).map_err(|e| anyhow!("the peer certificate does not verify: {e}"))?;
-        if crate::fleet_support::device_key_revoked(&cert.device_pub, now) {
-            bail!("{name} paired, but its key is refused here (forgotten earlier). To let it back in: tunlion promote {name}");
+        if crate::fleet_support::device_key_revoked(&cert.device_pub, now) || crate::device_view::device_cert_revoked(&cert.device_pub) {
+            bail!("{requested} paired, but its certified key is refused here (forgotten or revoked). To let it back in: tunlion promote {requested}");
         }
     }
-    if crate::device_view::device_record_revoked(&name) {
-        bail!("{name} paired, but it is REVOKED on this device, so it stays refused. To let it back in: tunlion promote {name}");
+    let records: Vec<Value> = match std::fs::read_to_string(crate::devices_path()) {
+        Ok(raw) => serde_json::from_str(&raw).context("devices.json is not a JSON list")?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(anyhow!("cannot read devices.json: {e}")),
+    };
+    if records.iter().any(|d| d["name"].as_str() == Some(&requested)) && crate::device_view::device_record_revoked(&requested) {
+        bail!("{requested} paired, but it is REVOKED on this device, so it stays refused. To let it back in: tunlion promote {requested}");
     }
+    if outcome.cert.is_none() {
+        identity::check_fail_closed(&records, &requested, None)?;
+    }
+    // A name is a petname, never an identity. If it already belongs to another
+    // pairing, never rewrite that record: choose a free name and say so.
+    let existing = records.iter().find(|d| d["name"].as_str() == Some(&requested));
+    let same = existing.is_some_and(|d| {
+        if d["secret"].as_str() != Some(outcome.secret.as_str()) {
+            return false;
+        }
+        match outcome.cert.as_ref() {
+            None => true,
+            Some(c) => d["deviceCert"]["devicePub"].as_str() == Some(hex::encode(c.device_pub).as_str()),
+        }
+    });
+    let name = if existing.is_some() && !same {
+        let free = crate::devices_store::free_device_name(&records, &requested);
+        ui::say(&ui::paint(ui::Tone::Dim, &format!("  '{requested}' already belongs to another device; saving this one as '{free}'")));
+        free
+    } else if existing.is_some() {
+        requested.clone()
+    } else {
+        requested.clone()
+    };
     match outcome.cert.as_ref() {
         Some(cert) => {
             crate::devices_upsert_atomic(
@@ -240,27 +291,34 @@ pub fn persist_plain(outcome: &Outcome) -> Result<()> {
                 Some(scope),
                 None,
                 None,
-                true,
+                false,
             )
             .context("store pairing secret and certificate")?;
-            crate::store_provisional_identity(&name, cert).context("store provisional identity")?;
+            if let Err(e) = crate::store_provisional_identity(&name, cert) {
+                ui::debug(&format!("pair: provisional identity not stored: {e}"));
+            }
         }
         None => {
-            if let Ok(raw) = std::fs::read_to_string(crate::devices_path()) {
-                if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) {
-                    identity::check_fail_closed(&arr, &name, None)?;
-                }
-            }
-            crate::devices_store_v2(&name, &outcome.secret, &caps).context("store pairing secret")?;
+            crate::devices_upsert_atomic(
+                &name,
+                Some(&outcome.secret),
+                None,
+                Some(&caps),
+                Some(scope),
+                None,
+                None,
+                false,
+            )
+            .context("store pairing secret")?;
         }
     }
     ui::say(&format!(
-        "  {} {} connected \u{b7} remembered on both devices",
+        "  {} {} paired and saved on this device",
         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
         ui::paint(ui::Tone::Bold, &name),
     ));
     ui::say(&ui::paint(ui::Tone::Dim, &format!("  next: tunlion send <file> --to {name}")));
-    Ok(())
+    Ok(name)
 }
 
 fn service_options(serve: bool, pairing: Option<[u8; 16]>, listen: bool) -> Options {
@@ -397,25 +455,44 @@ pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
 
     let local_hello = pair_hello(&svc);
     let result = async {
-        ui::debug("lan pair host: waiting for a pair link");
-        let mut link = tokio::time::timeout(CODE_TTL, pair_rx.recv())
-            .await
-            .map_err(|_| anyhow!("the code expired before another device connected"))?
-            .ok_or_else(|| anyhow!("LAN service stopped"))?;
-        ui::debug(&format!("lan pair host: link from {}", link.remote));
-        let token = match code.begin(Carrier::Lan, Instant::now()) {
-            Begin::Started(t) => t,
-            other => bail!("pairing could not start: {other:?}"),
-        };
-        let (peer_name, secret, cert, hello) = run_ceremony(&mut link, &words, &nameplate, "host", &local_hello).await.inspect_err(|_| {
-            code.fail(token, Instant::now());
-        })?;
-        if !code.confirm(token, Instant::now()) {
-            bail!("this code was already used");
+        let deadline = code.deadline();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("the code expired before another device completed pairing");
+            }
+            ui::debug("lan pair host: waiting for a pair link");
+            let mut link = match tokio::time::timeout(left, pair_rx.recv()).await {
+                Ok(Some(link)) => link,
+                Ok(None) => bail!("LAN service stopped"),
+                Err(_) => bail!("the code expired before another device completed pairing"),
+            };
+            let token = match code.begin(Carrier::Lan, Instant::now()) {
+                Begin::Started(t) => t,
+                Begin::Busy => continue,
+                Begin::Closed => bail!("the code was already used"),
+            };
+            match run_ceremony(&mut link, &words, &nameplate, "host", &local_hello).await {
+                Ok((peer_name, secret, cert, hello)) => {
+                    if !code.confirm(token, Instant::now()) {
+                        bail!("this code was already used");
+                    }
+                    let name = persist_plain(&Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() })?;
+                    svc.learn(&name, &hello);
+                    if stored_ack(&mut link).await {
+                        ui::say(&ui::paint(ui::Tone::Dim, "  the other device confirmed it saved this pairing"));
+                    } else {
+                        ui::say(&ui::paint(ui::Tone::Dim, "  saved here; the other device has not confirmed it saved"));
+                    }
+                    return Ok::<(), anyhow::Error>(());
+                }
+                Err(e) => {
+                    code.fail(token, Instant::now());
+                    ui::say(&ui::paint(ui::Tone::Dim, &format!("  pairing attempt failed: {e:#}")));
+                    continue;
+                }
+            }
         }
-        persist_plain(&Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() })?;
-        svc.learn(&peer_name, &hello);
-        Ok::<(), anyhow::Error>(())
     }
     .await;
     svc.shutdown().await;
@@ -427,6 +504,9 @@ pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
 pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> Result<()> {
     if !lan_enabled() {
         bail!("local discovery is off (network.transports); turn on lan or use the server");
+    }
+    if !nearby && !crate::interactive_allowed() {
+        bail!("nearby pairing needs --nearby when stdin is not a terminal");
     }
     let normalized = crate::pake::norm_code(code);
     let (nameplate, words) = crate::pake::split_code(&normalized);
@@ -481,8 +561,13 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
             let token = 0;
             let (peer_name, secret, cert, hello) = run_ceremony(&mut link, &words, &nameplate, "joiner", &local_hello).await?;
             let peer_name = name.clone().unwrap_or(peer_name);
-            persist_plain(&Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() })?;
-            svc.learn(&peer_name, &hello);
+            let saved = persist_plain(&Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() })?;
+            svc.learn(&saved, &hello);
+            if stored_ack(&mut link).await {
+                ui::say(&ui::paint(ui::Tone::Dim, "  the other device confirmed it saved this pairing"));
+            } else {
+                ui::say(&ui::paint(ui::Tone::Dim, "  saved here; the other device has not confirmed it saved"));
+            }
             return Ok::<(), anyhow::Error>(());
         }
     }

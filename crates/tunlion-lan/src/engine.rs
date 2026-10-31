@@ -356,7 +356,9 @@ impl Engine {
                 }
             }
             Kind::Pairing => {
-                if Some(b.field) != self.pairing {
+                if !allowed {
+                    self.stats.ignored += 1;
+                } else if Some(b.field) != self.pairing {
                     out.push(Action::PairingNearby { addr: SocketAddr::new(src.ip(), b.port), id: b.field, label: wire::pairing_label(&b.field) });
                 }
             }

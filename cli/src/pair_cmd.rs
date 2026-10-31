@@ -1010,6 +1010,7 @@ async fn pair_with_purpose(
     // `--nearby` never touches the server. A plain code also falls back to the
     // LAN carrier when signaling is unreachable; owner enrolment and temporary
     // access stay server-only because this carrier issues neither.
+    let plain_pair = !internal && temporary_spec.is_none() && !FOR_PERSON.load(std::sync::atomic::Ordering::Relaxed);
     if nearby {
         if internal || temporary_spec.is_some() || FOR_PERSON.load(std::sync::atomic::Ordering::Relaxed) {
             bail!("--nearby carries a plain pairing only; this operation needs the server");
@@ -1299,9 +1300,9 @@ async fn pair_with_purpose(
                 crate::lan_pair::HostEvent::Outcome(out) => {
                     let won = pair_code.as_ref().is_some_and(|c| c.confirm(out.token, Instant::now()));
                     if won {
-                        crate::lan_pair::persist_plain(&out)?;
+                        let name = crate::lan_pair::persist_plain(&out)?;
                         if let Some(mut h) = lan_host.take() {
-                            h.learn(&out.peer_name, &out.hello);
+                            h.learn(&name, &out.hello);
                             h.shutdown().await;
                         }
                         return Ok(());
@@ -1901,9 +1902,11 @@ async fn pair_with_purpose(
                         "  works once \u{b7} 10 min \u{b7} or scan it in the Tunlion app"
                     },
                 ));
-                // The same code is visible on the LAN while it is on screen.
+                // The same code is visible on the LAN while it is on screen,
+                // but only for a plain pairing. Temporary access, owner
+                // enrolment and person codes keep their own authority model.
                 let mut id = [0u8; 16];
-                if getrandom::getrandom(&mut id).is_ok() {
+                if plain_pair && getrandom::getrandom(&mut id).is_ok() {
                     let code_state = PairCode::new(id, Instant::now());
                     ui::say(&format!("  nearby: {}  (compare with the other screen)", code_state.label()));
                     match crate::lan_pair::spawn_host(code_state.clone(), my_words.clone(), my_nameplate.clone()).await {

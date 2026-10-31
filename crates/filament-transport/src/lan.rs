@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use quinn::{Endpoint, RecvStream, SendStream};
 use serde_json::{json, Value};
-use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -540,6 +540,7 @@ pub fn spawn_accept(
     pair: Option<Sender<PairLink>>,
     shutdown: Shutdown,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    allow: Arc<dyn Fn(IpAddr) -> bool + Send + Sync>,
     tx: UnboundedSender<Ev>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -563,6 +564,10 @@ pub fn spawn_accept(
                 let _permit = permit;
                 let r = tokio::time::timeout(ACCEPT_AUTH_BUDGET, async {
                     let conn = incoming.await.context("lan accept handshake")?;
+                    if !allow(conn.remote_address().ip()) {
+                        conn.close(quinn::VarInt::from_u32(0x5247), b"interface off");
+                        return Ok(None);
+                    }
                     let alpn = negotiated_alpn(&conn);
                     if alpn.as_deref() == Some(direct::PAIR_ALPN) {
                         let Some(pair) = pair else {
@@ -605,7 +610,9 @@ pub fn spawn_accept(
             if shutdown.is_stopped() {
                 h.abort();
             } else {
-                tasks2.lock().unwrap().push(h);
+                let mut g = tasks2.lock().unwrap();
+                g.retain(|h| !h.is_finished());
+                if g.len() < 256 { g.push(h); } else { h.abort(); }
             }
         }
     })
@@ -887,16 +894,19 @@ impl LanService {
         let (dial_ep, _) = bind(0)?;
         let shutdown = Shutdown::new();
         let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
-        if let Some(ep) = listen_ep.clone() {
-            let h = spawn_accept(ep, keys, pair_tx, shutdown.clone(), tasks.clone(), tx.clone());
-            tasks.lock().unwrap().push(h);
-        }
         let mut engine = Engine::new(pk, port);
         // A one-shot command has no listener: it queries, never announces.
         engine.set_announce(opts.serve);
         engine.set_pairing(opts.pairing);
         engine.set_known(store.known());
         let shared = Arc::new(Mutex::new(Shared { engine, ifaces: Vec::new(), port, started: Some(Instant::now()), errors }));
+        if let Some(ep) = listen_ep.clone() {
+            let allow_shared = shared.clone();
+            let allow: Arc<dyn Fn(IpAddr) -> bool + Send + Sync> =
+                Arc::new(move |ip| allowed_from(&allow_shared.lock().unwrap().ifaces, ip));
+            let h = spawn_accept(ep, keys, pair_tx, shutdown.clone(), tasks.clone(), allow, tx.clone());
+            tasks.lock().unwrap().push(h);
+        }
         let svc = LanService {
             shared: shared.clone(),
             store,
@@ -936,7 +946,6 @@ impl LanService {
             let socks = socks.clone();
             let shared = shared.clone();
             let tx = tx.clone();
-            let serve = opts.serve;
             let shutdown = shutdown.clone();
             let h = tokio::spawn(async move {
                 let mut buf = vec![0u8; 2048];
@@ -958,7 +967,7 @@ impl LanService {
                     let src = canonical(src);
                     let actions = {
                         let mut g = shared.lock().unwrap();
-                        let allowed = serve && allowed_from(&g.ifaces, src.ip());
+                        let allowed = allowed_from(&g.ifaces, src.ip());
                         g.engine.on_datagram(now_ms(), unix_now(), chan, src, &buf[..n], allowed, &mut rng)
                     };
                     for a in actions {
@@ -1143,6 +1152,7 @@ mod tests {
             Some(ptx),
             Shutdown::new(),
             Arc::new(Mutex::new(Vec::new())),
+            Arc::new(|_| true),
             tx,
         );
         let mut dial = tokio::time::timeout(
@@ -1219,7 +1229,7 @@ mod tests {
             ]
         });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_accept(lep, held, None, Shutdown::new(), Arc::new(Mutex::new(Vec::new())), tx.clone());
+        spawn_accept(lep, held, None, Shutdown::new(), Arc::new(Mutex::new(Vec::new())), Arc::new(|_| true), tx.clone());
         let target: SocketAddr = format!("127.0.0.1:{lport}").parse().unwrap();
 
         let (dep, _) = bind(0).unwrap();
@@ -1257,7 +1267,7 @@ mod tests {
         let held: Arc<dyn Fn() -> Vec<LanKey> + Send + Sync> =
             Arc::new(|| vec![LanKey { name: "desk".into(), secret: "44".repeat(32), fleet: false }]);
         let (atx, mut arx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_accept(lep, held, None, Shutdown::new(), Arc::new(Mutex::new(Vec::new())), atx.clone());
+        spawn_accept(lep, held, None, Shutdown::new(), Arc::new(Mutex::new(Vec::new())), Arc::new(|_| true), atx.clone());
         let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
         let (dep, _) = bind(0).unwrap();
         let target: SocketAddr = format!("127.0.0.1:{lport}").parse().unwrap();
