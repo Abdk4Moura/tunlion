@@ -252,6 +252,12 @@ fn service_options(serve: bool, pairing: Option<[u8; 16]>, listen: bool) -> Opti
     opts
 }
 
+fn lan_enabled() -> bool {
+    crate::transport_context::for_root(&crate::settings::config_dir())
+        .map(|ctx| filament_transport::lan::enabled(&ctx))
+        .unwrap_or(false)
+}
+
 fn random_id() -> Result<[u8; 16]> {
     let mut id = [0u8; 16];
     getrandom::getrandom(&mut id).map_err(|e| anyhow!("no secure random: {e}"))?;
@@ -287,6 +293,9 @@ impl Drop for HostHandle {
 /// Start advertising `code` over LAN for a signaling-created code. The label is
 /// printed by the caller, which owns the code screen.
 pub async fn spawn_host(code: PairCode, words: String, nameplate: String) -> Result<HostHandle> {
+    if !lan_enabled() {
+        bail!("local discovery is off (network.transports)");
+    }
     let id = code.pairing_id();
     let (pair_tx, mut pair_rx) = mpsc::channel::<PairLink>(2);
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<crate::net::Ev>();
@@ -329,6 +338,9 @@ pub async fn spawn_host(code: PairCode, words: String, nameplate: String) -> Res
 
 /// Host a plain code with no server. Stores the outcome itself.
 pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
+    if !lan_enabled() {
+        bail!("local discovery is off (network.transports); turn on lan or use the server");
+    }
     let id = random_id()?;
     let code = PairCode::new(id, Instant::now());
     let full = format!("{words}-{nameplate}");
@@ -375,6 +387,9 @@ pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
 /// Join a plain code over the LAN. Interactive use asks before dialing; a
 /// non-interactive run must have said `--nearby` at the command line.
 pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> Result<()> {
+    if !lan_enabled() {
+        bail!("local discovery is off (network.transports); turn on lan or use the server");
+    }
     let normalized = crate::pake::norm_code(code);
     let (nameplate, words) = crate::pake::split_code(&normalized);
     if nameplate.is_empty() || words.is_empty() {
