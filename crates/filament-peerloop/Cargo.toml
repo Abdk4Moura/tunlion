@@ -11,7 +11,7 @@
 # This crate never calls back into the CLI, so there is no cycle.
 [package]
 name = "tunlion-peerloop"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
 license = "MIT"
@@ -111,7 +111,7 @@ filament-overlay = { package = "tunlion-overlay", path = "../filament-overlay", 
 filament-proto = { package = "tunlion-proto", path = "../filament-proto", version = "0.1.0" }
 filament-signal = { package = "tunlion-signal", path = "../filament-signal", version = "0.1.0" }
 filament-transfer = { package = "tunlion-transfer", path = "../filament-transfer", version = "0.1.0" }
-filament-transport = { package = "tunlion-transport", path = "../filament-transport", version = "0.1.0" }
+filament-transport = { package = "tunlion-transport", path = "../filament-transport", version = "0.1.1" }
 tunlion-lan = { path = "../tunlion-lan", version = "0.1.0" }
 ring = "0.17"
 getrandom = "0.2"
