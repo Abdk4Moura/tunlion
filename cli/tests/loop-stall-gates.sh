@@ -85,7 +85,9 @@ ready=1
 for n in "${PEERS[@]}"; do
   ok_ready=0
   for _ in $(seq 1 60); do
-    if status_ms "$n" | awk -F, '$2==0{exit 0} END{exit 1}'; then ok_ready=1; break; fi
+    line=$(status_ms "$n")
+    rc=${line#*,}
+    if [ "$rc" = 0 ]; then ok_ready=1; break; fi
     sleep 0.5
   done
   [ "$ok_ready" = 1 ] || ready=0
