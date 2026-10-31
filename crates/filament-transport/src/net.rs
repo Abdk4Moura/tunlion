@@ -312,6 +312,30 @@ impl Default for SourceId {
     }
 }
 
+/// Authorization identity of one direct readiness attempt. Distinct from
+/// SourceId: SourceId tags events, AttemptId says who is allowed to publish a
+/// link. Allocated checked, never reused.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AttemptId(u64);
+
+impl AttemptId {
+    pub fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let value = NEXT
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| v.checked_add(1),
+            )
+            .expect("AttemptId space exhausted; refusing to reuse an id");
+        AttemptId(value)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug)]
 pub enum Ev {
     Welcome(Value),
@@ -443,6 +467,10 @@ pub enum Ev {
     Interrupted,
     /// A line typed into a listening recv (claim-a-code convenience).
     StdinLine(String),
+    /// Internal terminal-drain barrier for a retired direct attempt. Producers
+    /// already terminated before this is enqueued; handling it clears the
+    /// tombstone. Never protocol/wire.
+    AttemptDrained(AttemptId),
 }
 
 impl std::fmt::Debug for dyn Transport {
@@ -570,6 +598,11 @@ pub trait Transport: Send + Sync {
     /// for a transport that emits no provenance-bearing Control/PcState/
     /// ChannelReady; a required direct adoption with None fails closed.
     fn source_id(&self) -> Option<SourceId> {
+        None
+    }
+    /// Authorization identity of the direct readiness attempt that created this
+    /// transport. None for non-direct transports.
+    fn attempt_id(&self) -> Option<AttemptId> {
         None
     }
     /// Close the underlying QUIC connection immediately. On quinn transports

@@ -960,6 +960,7 @@ pub(crate) async fn bring_up_to_known(
     // The acceptor re-sends its transport-offer (a late initiator can miss the
     // first). Race only the FIRST offer we get; later re-sends are duplicates.
     let mut direct_racing = false;
+    let mut direct_attempt: Option<filament_transport::net::AttemptId> = None;
     // FLEET MODE ONLY. The fleet channel is shared by every sibling (and by our
     // own daemon), so presence and transport-offers arrive from devices that are
     // not the target. Each candidate's identity is proven by certificate
@@ -1341,6 +1342,8 @@ pub(crate) async fn bring_up_to_known(
                         };
                         let tx = tx.clone();
                         let transport_context = transport_context.clone();
+                        let attempt = filament_transport::net::AttemptId::next();
+                        direct_attempt = Some(attempt);
                         tokio::spawn(async move {
                             if let Some(t) = crate::direct::race_connect_labeled(
                                 &transport_context,
@@ -1348,6 +1351,7 @@ pub(crate) async fn bring_up_to_known(
                                 peer_cands,
                                 &secret,
                                 pid.clone(),
+                                attempt,
                                 my_uid_for_race,
                                 peer_uid_for_race,
                                 my_id_for_race,
@@ -1406,6 +1410,12 @@ pub(crate) async fn bring_up_to_known(
                 }
             }
             Ev::DirectReady(pid, t, route) => {
+                if t.attempt_id() != direct_attempt {
+                    t.force_close();
+                    direct_attempt = None;
+                    continue;
+                }
+                direct_attempt = None;
                 // Item 3: the DIRECT-QUIC race won before WebRTC. The acceptor's
                 // `adopt_direct` (main.rs) is born `trusted: true` + identity-bound
                 // `verified_name`, its pair-secret MAC already proved who we are,

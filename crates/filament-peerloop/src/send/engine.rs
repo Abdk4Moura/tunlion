@@ -898,7 +898,12 @@ async fn drive_over(
                 conn.apply_signal(&from, data).await;
             }
             Ev::DirectReady(pid, t, route) => {
-                conn.adopt_direct(&pid, t.clone(), route);
+                if !matches!(
+                    conn.adopt_direct(&pid, t.clone(), route),
+                    crate::conn::DirectAdoption::Adopted { .. }
+                ) {
+                    continue;
+                }
                 let _ = tx.send(Ev::sourced_channel_ready(pid, t));
             }
             Ev::DirectWorkersReady(pid, workers, primary_source) => {

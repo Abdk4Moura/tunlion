@@ -154,7 +154,12 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
                 conn.apply_signal(&from, data).await;
             }
             Ev::DirectReady(pid, t, route) => {
-                conn.adopt_direct(&pid, t.clone(), route);
+                if !matches!(
+                    conn.adopt_direct(&pid, t.clone(), route),
+                    crate::conn::DirectAdoption::Adopted { .. }
+                ) {
+                    continue;
+                }
                 let _ = tx.send(Ev::sourced_channel_ready(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
@@ -325,6 +330,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         room_digest_absent: HashMap::new(),
         recv_done: false,
         direct_pending: HashMap::new(),
+        retired_attempts: HashMap::new(),
         webrtc_only: std::collections::HashSet::new(),
         buffered_offers: HashMap::new(),
         promotions: HashMap::new(),

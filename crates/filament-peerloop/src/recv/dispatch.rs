@@ -4958,12 +4958,12 @@ async fn recv_run(
             // rung-1: authenticated direct-QUIC won the race, adopt as a
             // pre-trusted Link, then funnel into the normal ChannelReady handler.
             Ev::DirectReady(pid, t, route) => {
-                let tkey = conn
-                    .direct_pending
-                    .get(&pid)
-                    .map(|p| direct::transport_key(&p.secret.1));
+                let verdict = conn.adopt_direct(&pid, t.clone(), route);
+                let tkey = match verdict {
+                    crate::conn::DirectAdoption::Adopted { tkey, .. } => tkey,
+                    _ => continue,
+                };
                 let named_before = conn.link(&pid).and_then(|l| l.verified_name.clone());
-                conn.adopt_direct(&pid, t.clone(), route);
                 // A direct link to a REMEMBERED device was authenticated by its
                 // pair secret (the QUIC keying-material MAC), the proof a
                 // WebRTC link gets from `pair-proof`. Only the pair-proof path

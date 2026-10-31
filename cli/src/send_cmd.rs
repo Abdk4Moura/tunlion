@@ -1558,11 +1558,11 @@ pub(crate) async fn send_cmd(
             // handler the WebRTC path uses (announce + offers) by re-emitting
             // ChannelReady, the transfer logic rides the trait unchanged.
             Ev::DirectReady(pid, t, route) => {
-                let tkey = conn
-                    .direct_pending
-                    .get(&pid)
-                    .map(|p| direct::transport_key(&p.secret.1));
-                conn.adopt_direct(&pid, t.clone(), route);
+                let verdict = conn.adopt_direct(&pid, t.clone(), route);
+                let tkey = match verdict {
+                    crate::conn::DirectAdoption::Adopted { tkey, .. } => tkey,
+                    _ => continue,
+                };
                 if let Some(k) = tkey {
                     conn.spawn_direct_workers(&pid, &t, k);
                 }

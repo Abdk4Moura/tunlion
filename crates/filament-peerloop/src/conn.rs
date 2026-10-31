@@ -142,6 +142,8 @@ pub struct PromoteState {
     /// The handoff completed; the next `adopt_direct` for this peer retires
     /// the serving WebRTC link and installs the direct one in its place.
     handed: bool,
+    /// Authorization token of the held direct standby.
+    attempt: Option<net::AttemptId>,
 }
 
 impl PromoteState {
@@ -153,6 +155,7 @@ impl PromoteState {
             answer: None,
             asked: false,
             handed: false,
+            attempt: None,
         }
     }
 
@@ -225,6 +228,9 @@ const MAX_BUILD_EVENTS: usize = 64;
 const MAX_BUILD_EVENT_BYTES: usize = 256 * 1024;
 const MAX_BUILD_SIGNALS: usize = 64;
 const MAX_BUILD_SIGNAL_BYTES: usize = 256 * 1024;
+/// Terminal-drain tombstones and inbound registrations are bounded. New direct
+/// attempts fail closed when full; a tombstone is never evicted early.
+const MAX_RETIRED_ATTEMPTS: usize = 16;
 /// A candidate that never completes is reaped, not left to a detached timer.
 const BUILD_REAP_GRACE: Duration = Duration::from_secs(30);
 /// Direct attempts that expired at the same time are handed to the caller one
@@ -285,6 +291,8 @@ pub struct Link {
     /// Immutable identity of the primary transport attempt that owns this link.
     /// Read by the event gate immediately before dispatch.
     pub source: net::SourceId,
+    /// Direct readiness attempt that owns this link, if direct.
+    pub attempt: Option<net::AttemptId>,
     /// Immutable identities of the current parallel worker transports. Kept
     /// separate from `source` so a worker can never authorize primary teardown
     /// and a stale worker source is removed with its worker.
@@ -674,6 +682,8 @@ pub struct UpgradeProbe {
     /// the standby's `idle_ms()` floor observed so far in the verify window, used
     /// to require SUSTAINED progress (it must keep moving, not just connect).
     pub verify_last_idle: u64,
+    /// Authorization token of the current standby, captured at readiness.
+    pub token: Option<net::AttemptId>,
 }
 
 impl UpgradeProbe {
@@ -685,6 +695,7 @@ impl UpgradeProbe {
             standby_route: "direct-quic",
             verify_started: None,
             verify_last_idle: u64::MAX,
+            token: None,
         }
     }
 }
@@ -709,6 +720,10 @@ pub enum Rung {
 
 /// rung-1: state for one in-flight direct-QUIC attempt.
 pub struct DirectPending {
+    /// Authorization token for this attempt, allocated before any async work.
+    pub attempt: net::AttemptId,    /// The single outer task that can publish primary readiness for this
+    /// attempt. Awaited by retirement cleanup before the drain barrier.
+    pub race_task: Option<tokio::task::JoinHandle<()>>,
     /// (name, secret) for the known device, gates the attempt and keys the MAC.
     pub secret: (String, String),
     /// This dial used the FLEET rendezvous secret, so the link it produces must
@@ -1063,6 +1078,24 @@ pub struct PendingSource {
     pub bytes: usize,
 }
 
+/// Result of a direct readiness adoption. Callers MUST skip all follow-up on
+/// Duplicate/Rejected (no worker spawn, identity bind, or readiness re-drive).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DirectAdoption {
+    Adopted {
+        attempt: net::AttemptId,
+        tkey: Option<[u8; 32]>,
+    },
+    Duplicate,
+    Rejected,
+}
+
+/// One retired attempt until its terminal-drain barrier is handled.
+pub struct RetiredAttempt {
+    pub pid: String,
+    pub at: Instant,
+}
+
 pub struct Conn {
     pub transport_context: filament_transport::TransportContext,
     pub server: String,
@@ -1137,6 +1170,7 @@ pub struct Conn {
     /// (sequential, per the design review, avoids two transports racing to
     /// ChannelReady). On deadline expiry with no DirectReady the entry is
     /// dropped and the normal WebRTC `establish` runs; the fallback is unchanged.
+    pub retired_attempts: HashMap<net::AttemptId, RetiredAttempt>,
     pub direct_pending: HashMap<String, DirectPending>,
     /// Peers that explicitly announced `direct:false` (WebRTC-only, e.g. the
     /// browser). Kept OUT of the roster because presence pushes replace roster
@@ -1411,6 +1445,7 @@ impl Conn {
             room_digest_absent: HashMap::new(),
             recv_done: false,
             direct_pending: HashMap::new(),
+            retired_attempts: HashMap::new(),
             webrtc_only: HashSet::new(),
             buffered_offers: HashMap::new(),
             promotions: HashMap::new(),
@@ -1996,6 +2031,11 @@ impl Conn {
         // A drop is an invalidation: a candidate still building for this peer
         // must not publish after the link it was replacing is gone.
         self.cancel_build(pid);
+        if let Some(attempt) = self.links.get(pid).and_then(|link| link.attempt) {
+            // The adopted producer is already terminal; a queued duplicate ready
+            // for this attempt must not resurrect the link.
+            self.retire_attempt(pid, attempt, None);
+        }
         // The installed link owns its candidate-origin stream; dropping the
         // receiver discards any queued ChannelReady/Control from this
         // generation instead of forwarding it to a later link.
@@ -3004,6 +3044,7 @@ impl Conn {
                 workers: vec![],
                 generation: built.generation,
                 source: built.source,
+                attempt: None,
                 worker_sources: HashSet::new(),
                 attempts: 0,
                 trusted: false,
@@ -3044,6 +3085,10 @@ impl Conn {
     /// handlers that defer/requeue the event).
     pub fn stage_event(&mut self, ev: Ev) -> Option<(Ev, Option<net::SourceId>)> {
         match ev {
+            Ev::AttemptDrained(attempt) => {
+                self.retired_attempts.remove(&attempt);
+                None
+            }
             Ev::Sourced { pid, source, inner } => {
                 // Envelope and inner pid must agree, and nesting is invalid:
                 // otherwise checking one pid would handle another.
@@ -3456,12 +3501,46 @@ impl Conn {
     // budget. The whole thing is gated on `direct::direct_enabled()`, so with the
     // flag OFF none of this runs and the WebRTC path is byte-for-byte unchanged.
 
+    /// Retire an attempt and enqueue its terminal-drain barrier only after the
+    /// finite readiness producer is terminal.
+    fn retire_attempt(
+        &mut self,
+        pid: &str,
+        attempt: net::AttemptId,
+        task: Option<tokio::task::JoinHandle<()>>,
+    ) {
+        if self.retired_attempts.contains_key(&attempt) {
+            return;
+        }
+        self.retired_attempts.insert(
+            attempt,
+            RetiredAttempt { pid: pid.to_string(), at: Instant::now() },
+        );
+        match task {
+            Some(handle) => {
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    // Normal return, early return, panic/JoinError: all terminal
+                    // before the barrier is enqueued.
+                    let _ = handle.await;
+                    let _ = tx.send(Ev::AttemptDrained(attempt));
+                });
+            }
+            None => {
+                // A promotion-held readiness producer is synchronous; no async
+                // producer can emit after this loop turn.
+                let _ = self.tx.send(Ev::AttemptDrained(attempt));
+            }
+        }
+    }
+
     /// Remove a pending direct attempt and stop its offer re-emitter. Every
     /// abandonment path (hint, adoption, expiry) goes through here so the task
     /// cannot keep advertising a dial that no longer exists.
     fn take_direct_pending(&mut self, pid: &str) -> Option<DirectPending> {
-        let pending = self.direct_pending.remove(pid)?;
+        let mut pending = self.direct_pending.remove(pid)?;
         pending.cancel.store(true, Ordering::Relaxed);
+        self.retire_attempt(pid, pending.attempt, pending.race_task.take());
         Some(pending)
     }
 
@@ -3998,9 +4077,17 @@ impl Conn {
         } else {
             Instant::now() + direct::DIRECT_BUDGET
         };
+        if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
+            self.log.debug(&format!(
+                "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
+            ));
+            return;
+        }
         self.direct_pending.insert(
             pid.to_string(),
             DirectPending {
+                attempt: net::AttemptId::next(),
+                race_task: None,
                 fleet: intent == DirectIntent::Fleet,
                 ephemeral: intent == DirectIntent::Promote,
                 secret: (name.to_string(), secret.to_string()),
@@ -4113,6 +4200,7 @@ impl Conn {
         // DirectUpgradeReady (verify-before-upgrade) so the serving relay link is
         // never clobbered. A cold pending posts DirectReady as before.
         let is_probe = p.probe;
+        let attempt = p.attempt;
         // A post-PAKE promotion's winner must not clobber the serving WebRTC
         // link either: it is a standby for the make-before-break handoff, and
         // every loop that promotes routes this event to the same stash.
@@ -4151,7 +4239,7 @@ impl Conn {
         // log sink rather than borrowing `self`.
         let log = self.log.clone();
         let context = self.transport_context.clone();
-        tokio::spawn(async move {
+        let race_task = tokio::spawn(async move {
             // Check for TCP localhost candidate (same-machine peer).
             for cand in &peer_cands {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(cand) {
@@ -4159,7 +4247,7 @@ impl Conn {
                         if let Some(port) = v["port"].as_u64() {
                             let addr = format!("127.0.0.1:{port}");
                             log.trace(&format!("tunlion: trying TCP localhost to {addr}"));
-                            match crate::local::LocalTransport::connect(&addr).await {
+                            match crate::local::LocalTransport::connect(&addr, attempt).await {
                                 Ok(t) => {
                                     let _ = tx.send(mk(pid_s, Arc::new(t), "local-tcp"));
                                     return;
@@ -4181,6 +4269,7 @@ impl Conn {
                 peer_cands,
                 &secret,
                 pid_s.clone(),
+                attempt,
                 my_uid.clone(),
                 peer_uid.clone(),
                 my_id.clone(),
@@ -4211,6 +4300,7 @@ impl Conn {
                         peer_srflx,
                         &secret,
                         pid_s.clone(),
+                        attempt,
                         my_uid.clone(),
                         peer_uid.clone(),
                         my_id.clone(),
@@ -4233,6 +4323,9 @@ impl Conn {
             }
             // On None the per-tick reaper handles the WebRTC fallback at deadline.
         });
+        if let Some(pending) = self.direct_pending.get_mut(pid) {
+            pending.race_task = Some(race_task);
+        }
     }
 
     /// P5 (GAP-6): a relay-committed peer received an UPGRADE-PROBE transport-
@@ -4261,35 +4354,63 @@ impl Conn {
     /// Create the Link for a direct connection that won the race. `peer: None`
     /// (no WebRTC), `direct: true`, `trusted: true` (the pair-secret MAC already
     /// proved identity, at least as strong as the DTLS pair-proof it replaces).
-    pub fn adopt_direct(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
-        // Required adoption: an unidentifiable transport must not become a link.
-        // The event gate could not reject its later callbacks, so fail closed.
-        let source = match t.source_id() {
-            Some(source) => source,
-            None => {
-                self.log.debug(&format!(
-                    "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: transport has no source identity"
-                ));
-                t.force_close();
-                return;
-            }
+    pub fn adopt_direct(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) -> DirectAdoption {
+        let Some(source) = t.source_id() else {
+            self.log.debug(&format!(
+                "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: transport has no source identity"
+            ));
+            t.force_close();
+            return DirectAdoption::Rejected;
         };
-        // Immutable source order: a callback whose source is not newer than the
-        // link it would replace is stale. Equal means the same transport was
-        // announced twice; leave the live link alone.
+        let Some(attempt) = t.attempt_id() else {
+            self.log.debug(&format!(
+                "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: transport has no attempt identity"
+            ));
+            t.force_close();
+            return DirectAdoption::Rejected;
+        };
+        // Exact already-owned duplicate: same attempt and same transport Arc.
         if let Some(existing) = self.links.get(pid) {
-            if existing.source == source {
-                return;
+            if existing.attempt == Some(attempt) {
+                if existing
+                    .transport
+                    .as_ref()
+                    .is_some_and(|live| Arc::ptr_eq(live, &t))
+                {
+                    return DirectAdoption::Duplicate;
+                }
+                t.force_close();
+                return DirectAdoption::Rejected;
             }
-            if existing.source.get() > source.get() {
+        }
+        if self.retired_attempts.contains_key(&attempt) {
+            self.log.debug(&format!(
+                "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: attempt retired"
+            ));
+            t.force_close();
+            return DirectAdoption::Rejected;
+        }
+        // Validate attempt ownership BEFORE reading the pending secret or
+        // mutating any state. A promotion-held standby is the only no-pending
+        // owner; Conn has no synthetic inbound path.
+        if let Some(pending) = self.direct_pending.get(pid) {
+            if pending.attempt != attempt {
                 self.log.debug(&format!(
-                    "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: stale source {} < link {}",
-                    source.get(),
-                    existing.source.get()
+                    "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: ready attempt does not match pending"
                 ));
                 t.force_close();
-                return;
+                return DirectAdoption::Rejected;
             }
+        } else if !self
+            .promotions
+            .get(pid)
+            .is_some_and(|promotion| promotion.attempt == Some(attempt))
+        {
+            self.log.debug(&format!(
+                "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: no attempt ownership"
+            ));
+            t.force_close();
+            return DirectAdoption::Rejected;
         }
         // A promotion handed over (make-before-break): retire the serving
         // WebRTC link in the same step that installs its successor below, so
@@ -4302,6 +4423,9 @@ impl Conn {
             }
         }
         let pend = self.direct_pending.remove(pid);
+        let tkey = pend
+            .as_ref()
+            .map(|pending| direct::transport_key(&pending.secret.1));
         // Read the fleet flag BEFORE the secret moves out of the pending.
         //
         // FAIL SAFE WITH NO PENDING. Only the DIALER holds a `DirectPending`, so
@@ -4377,6 +4501,7 @@ impl Conn {
             existing.direct_route = route;
             existing.generation = generation;
             existing.source = source;
+            existing.attempt = Some(attempt);
             existing.attempts = 0;
             if !ephemeral {
                 existing.trusted = true;
@@ -4402,6 +4527,7 @@ impl Conn {
                     workers: vec![],
                     generation,
                     source,
+                    attempt: Some(attempt),
                     worker_sources: HashSet::new(),
                     attempts: 0,
                     // A direct link is normally born identity-bound: its PAIR-secret
@@ -4437,6 +4563,7 @@ impl Conn {
         // Replay anything the standby buffered before adoption. The tags remain,
         // so a second replacement still rejects them at the handler gate.
         self.flush_pending_source(source);
+        DirectAdoption::Adopted { attempt, tkey }
     }
 
     /// Install worker transports only when the ready event belongs to the
@@ -4595,7 +4722,9 @@ impl Conn {
             .map(|(pid, _)| pid.clone())
             .collect();
         for pid in expired_probes {
-            self.direct_pending.remove(&pid);
+            if let Some(pending) = self.direct_pending.remove(&pid) {
+                self.retire_attempt(&pid, pending.attempt, pending.race_task);
+            }
             // DEBUG, resilience internal (upgrade probe found no path).
             self.log.debug(&format!(
                 "tunlion: UPGRADE-PROBE for {pid} found no direct path in budget, staying on relay"
@@ -4622,7 +4751,8 @@ impl Conn {
             DIRECT_FALLBACKS_PER_CALL
         };
         for pid in expired.into_iter().take(per_call) {
-            if let Some(p) = self.direct_pending.remove(&pid) {
+            if let Some(mut p) = self.direct_pending.remove(&pid) {
+                self.retire_attempt(&pid, p.attempt, p.race_task.take());
                 let info = self
                     .roster
                     .get(&pid)
@@ -4675,7 +4805,7 @@ impl Conn {
             .map(|(pid, _)| pid.clone())
             .collect();
         for pid in linked {
-            self.direct_pending.remove(&pid);
+            let _ = self.take_direct_pending(&pid);
         }
         fell_back
     }
@@ -5290,7 +5420,7 @@ impl Conn {
         // Clear any stray pending direct attempt so `establish` (which early-
         // returns while a direct attempt owns the peer, to keep the ladder
         // sequential) is never suppressed for the relay re-establish.
-        self.direct_pending.remove(pid);
+        let _ = self.take_direct_pending(pid);
         // Carry the proven identity into the fresh relay link so the post-channel
         // pair-proof still binds to the same device (set after establish creates
         // the Link below).
@@ -5404,7 +5534,7 @@ impl Conn {
             // shouldn't be probed; drop its entry.
             if !self.resil.relay_committed.contains(&pid) || !self.links.contains_key(&pid) {
                 self.resil.upgrade_probe.remove(&pid);
-                self.direct_pending.remove(&pid);
+                let _ = self.take_direct_pending(&pid);
                 continue;
             }
             // VERIFYING: a standby connected, judge it before scheduling anything.
@@ -5516,7 +5646,7 @@ impl Conn {
                     Tone::Warn,
                     "  direct path connected but didn't hold, staying on relay (no flap)",
                 ));
-                self.direct_pending.remove(pid);
+                self.take_direct_pending(pid);
                 self.mark_probe_failed(pid);
                 return;
             }
@@ -5569,6 +5699,7 @@ impl Conn {
         // a known-bad path and so a future stall can escalate cleanly again.
         self.resil.relay_committed.remove(pid);
         self.relay_only = false;
+        let expected_attempt = self.resil.upgrade_probe.get(pid).and_then(|probe| probe.token);
         self.resil.upgrade_probe.remove(pid);
         self.direct_pending.remove(pid);
         // Swap the verified direct transport into the link, dropping the relay
@@ -5576,7 +5707,14 @@ impl Conn {
         // transport via the same direct-link shape adopt_direct builds, but reusing
         // the existing identity so the session is preserved across the swap.
         self.drop_link(pid);
-        self.adopt_direct_transport(pid, t.clone(), route, known, carried);
+        let Some(expected_attempt) = expected_attempt else {
+            t.force_close();
+            return;
+        };
+        let adopted = self.adopt_direct_transport(pid, t.clone(), route, expected_attempt, known, carried);
+        if adopted == DirectAdoption::Rejected {
+            return;
+        }
         if was_active {
             self.active = Some(pid.to_string());
         }
@@ -5600,28 +5738,39 @@ impl Conn {
         pid: &str,
         t: Arc<dyn Transport>,
         route: &'static str,
+        expected_attempt: net::AttemptId,
         known: Option<(String, String)>,
         // (trusted, principal_kind) carried from the pre-upgrade link. None only
         // if the link vanished, where the previous defaults are kept so this
         // change stays scoped to the escalation it fixes.
         carried: Option<(bool, PrincipalKind)>,
-    ) {
+    ) -> DirectAdoption {
         let Some(source) = t.source_id() else {
             self.log.debug(&format!(
                 "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: transport has no source identity"
             ));
             t.force_close();
-            return;
+            return DirectAdoption::Rejected;
         };
+        if t.attempt_id() != Some(expected_attempt) {
+            self.log.debug(&format!(
+                "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: upgrade attempt mismatch"
+            ));
+            t.force_close();
+            return DirectAdoption::Rejected;
+        }
+        let attempt = expected_attempt;
         if let Some(existing) = self.links.get(pid) {
-            if existing.source.get() >= source.get() {
-                self.log.debug(&format!(
-                    "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: stale source {} <= link {}",
-                    source.get(),
-                    existing.source.get()
-                ));
+            if existing.attempt == Some(attempt) {
+                if existing
+                    .transport
+                    .as_ref()
+                    .is_some_and(|live| Arc::ptr_eq(live, &t))
+                {
+                    return DirectAdoption::Duplicate;
+                }
                 t.force_close();
-                return;
+                return DirectAdoption::Rejected;
             }
         }
         let info = self
@@ -5648,6 +5797,7 @@ impl Conn {
                 workers: vec![],
                 generation,
                 source,
+                attempt: Some(attempt),
                 worker_sources: HashSet::new(),
                 attempts: 0,
                 trusted: upgrade_principal(&carried).0,
@@ -5666,6 +5816,7 @@ impl Conn {
             },
         );
         self.flush_pending_source(source);
+        DirectAdoption::Adopted { attempt, tkey: None }
     }
 
     // --- POST-PAKE PROMOTION: the make-before-break handoff (see `handoff`) ---
@@ -5686,10 +5837,22 @@ impl Conn {
             self.promote_adopt_now(pid, t, route);
             return;
         }
+        let Some(attempt) = t.attempt_id() else {
+            t.force_close();
+            return;
+        };
+        let source = t.source_id();
         let Some(st) = self.promotions.get_mut(pid) else {
             return;
         };
         if st.handed {
+            return;
+        }
+        if st.attempt.is_some_and(|held| held != attempt) {
+            if let Some(source) = source {
+                self.pending_sources.remove(&source);
+            }
+            t.force_close();
             return;
         }
         if let Some((held, _)) = &st.standby {
@@ -5698,6 +5861,7 @@ impl Conn {
             }
             return;
         }
+        st.attempt = Some(attempt);
         st.standby = Some((t, route));
         let role = st.role;
         let asked = st.asked;
@@ -5717,6 +5881,10 @@ impl Conn {
     /// ephemeral pending it needs cannot be reaped in between: adopting with no
     /// pending would be born trusted.
     fn promote_adopt_now(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
+        let Some(attempt) = t.attempt_id() else {
+            t.force_close();
+            return;
+        };
         let role = self
             .promotions
             .get(pid)
@@ -5734,6 +5902,7 @@ impl Conn {
         }
         let mut st = PromoteState::new(role);
         st.handed = true;
+        st.attempt = Some(attempt);
         self.promotions.insert(pid.to_string(), st);
         self.log.debug(&format!(
             "tunlion: PROMOTE-ADOPT peer={pid} route={route}: no serving link to hand off from"
@@ -5845,11 +6014,11 @@ impl Conn {
             }
         }
         st.handed = true;
-        let tkey = self
-            .direct_pending
-            .get(pid)
-            .map(|p| direct::transport_key(&p.secret.1));
-        self.adopt_direct(pid, t.clone(), route);
+        let verdict = self.adopt_direct(pid, t.clone(), route);
+        let tkey = match verdict {
+            DirectAdoption::Adopted { tkey, .. } => tkey,
+            _ => return,
+        };
         if let Some(k) = tkey {
             self.spawn_direct_workers(pid, &t, k);
         }
@@ -5861,7 +6030,7 @@ impl Conn {
     /// The promotion ends with the WebRTC link still serving.
     fn promotion_stays(&mut self, pid: &str, why: &str) {
         self.abandon_promotion(pid);
-        self.direct_pending.remove(pid);
+        let _ = self.take_direct_pending(pid);
         self.log.debug(&format!(
             "tunlion: PROMOTE-STAY peer={pid} ({why}): the WebRTC link keeps serving"
         ));
@@ -6017,19 +6186,13 @@ impl Conn {
             t.force_close();
             return;
         };
-        // A standby must be newer than the link it may replace. This rejects a
-        // late readiness event from an older attempt without any pid inference.
-        if let Some(link) = self.links.get(pid) {
-            if link.source.get() >= source.get() {
-                self.log.debug(&format!(
-                    "tunlion: STANDBY-REFUSED peer={pid}: stale source {} <= link {}",
-                    source.get(),
-                    link.source.get()
-                ));
-                t.force_close();
-                return;
-            }
-        }
+        let Some(attempt) = t.attempt_id() else {
+            self.log.debug(&format!(
+                "tunlion: STANDBY-REFUSED peer={pid}: transport has no attempt identity"
+            ));
+            t.force_close();
+            return;
+        };
         self.pending_sources.insert(
             source,
             PendingSource {
@@ -6048,15 +6211,32 @@ impl Conn {
             return;
         }
         // Consume any probe DirectPending so expired_direct doesn't reap/backoff it
-        // out from under the verify (the race already won).
+        // out from under the verify (the race already won). Validate ownership
+        // before consuming it.
+        if let Some(pending) = self.direct_pending.get(pid) {
+            if pending.attempt != attempt {
+                self.log.debug(&format!(
+                    "tunlion: STANDBY-REFUSED peer={pid}: standby attempt does not match pending"
+                ));
+                self.pending_sources.remove(&source);
+                t.force_close();
+                return;
+            }
+        }
         self.direct_pending.remove(pid);
         let Some(up) = self.resil.upgrade_probe.get_mut(pid) else {
             // No armed probe, the transport is unowned; dropping it tears it down.
+            self.pending_sources.remove(&source);
             return;
         };
         if up.standby.is_some() {
+            if up.token != Some(attempt) {
+                self.pending_sources.remove(&source);
+                t.force_close();
+            }
             return; // already verifying a standby; ignore the duplicate.
         }
+        up.token = Some(attempt);
         up.standby = Some(t);
         up.standby_route = route;
         up.verify_started = None; // judge_upgrade_standby stamps it on first look
@@ -7024,6 +7204,7 @@ mod warm_identity_tests {
     /// the roster entry for the same sid carries the DISPLAY name.
     fn direct_link(pid: &str, petname: &str, display: &str, t: Arc<dyn Transport>) -> Link {
         let source = t.source_id().unwrap_or(net::SourceId::UNASSIGNED);
+        let attempt = t.attempt_id();
         Link {
             peer: None,
             info: json!({ "id": pid, "name": display }),
@@ -7033,6 +7214,7 @@ mod warm_identity_tests {
             workers: vec![],
             generation: 7,
             source,
+            attempt,
             worker_sources: HashSet::new(),
             attempts: 0,
             trusted: true,
@@ -8091,6 +8273,8 @@ mod warm_identity_tests {
         conn.direct_pending.insert(
             pid.to_string(),
             DirectPending {
+                attempt: net::AttemptId::next(),
+                race_task: None,
                 secret: ("web".into(), "00".into()),
                 fleet: false,
                 ephemeral: false,
@@ -8177,6 +8361,8 @@ mod warm_identity_tests {
         conn.direct_pending.insert(
             "sid-someone-else".into(),
             DirectPending {
+                attempt: net::AttemptId::next(),
+                race_task: None,
                 secret: ("other".into(), "11".into()),
                 fleet: false,
                 ephemeral: false,
@@ -8225,6 +8411,8 @@ mod warm_identity_tests {
             conn.direct_pending.insert(
                 pid.into(),
                 DirectPending {
+                    attempt: net::AttemptId::next(),
+                    race_task: None,
                     secret: (secret.0.into(), secret.1.into()),
                     fleet: false,
                     ephemeral: false,
@@ -8300,6 +8488,8 @@ mod warm_identity_tests {
         conn.direct_pending.insert(
             pid.to_string(),
             DirectPending {
+                attempt: net::AttemptId::next(),
+                race_task: None,
                 secret: ("box".into(), "00".into()),
                 fleet: false,
                 ephemeral: false,
@@ -8367,6 +8557,7 @@ mod warm_identity_tests {
         log: Arc<std::sync::Mutex<Vec<String>>>,
         alive: AtomicBool,
         source: net::SourceId,
+        attempt: net::AttemptId,
     }
     impl Rec {
         fn new(name: &'static str, log: &Arc<std::sync::Mutex<Vec<String>>>) -> Arc<Self> {
@@ -8375,6 +8566,7 @@ mod warm_identity_tests {
                 log: log.clone(),
                 alive: AtomicBool::new(true),
                 source: net::SourceId::next(),
+                attempt: net::AttemptId::next(),
             })
         }
     }
@@ -8404,6 +8596,9 @@ mod warm_identity_tests {
         fn source_id(&self) -> Option<net::SourceId> {
             Some(self.source)
         }
+        fn attempt_id(&self) -> Option<net::AttemptId> {
+            Some(self.attempt)
+        }
     }
 
     fn rec_log(log: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
@@ -8427,6 +8622,8 @@ mod warm_identity_tests {
         conn.direct_pending.insert(
             pid.to_string(),
             DirectPending {
+                attempt: net::AttemptId::next(),
+                race_task: None,
                 secret: (pid.to_string(), "ceremony".into()),
                 fleet: false,
                 ephemeral: true,
@@ -8456,6 +8653,8 @@ mod warm_identity_tests {
         conn.direct_pending.insert(
             pid.to_string(),
             DirectPending {
+                attempt: net::AttemptId::next(),
+                race_task: None,
                 secret: (pid.to_string(), "fleet".into()),
                 fleet: true,
                 ephemeral: false,
@@ -8657,6 +8856,25 @@ mod warm_identity_tests {
         let mut state = build_state(generation);
         state.events_rx = events_rx;
         (state, tx)
+    }
+
+    fn direct_pending_with(attempt: net::AttemptId, secret: (&str, &str)) -> DirectPending {
+        DirectPending {
+            attempt,
+            race_task: None,
+            secret: (secret.0.into(), secret.1.into()),
+            fleet: false,
+            ephemeral: false,
+            deadline: Instant::now() + Duration::from_secs(30),
+            racing: false,
+            endpoint: None,
+            punch_sock: None,
+            my_srflx: None,
+            peer_server_public: None,
+            server_public_dialed: Arc::new(AtomicBool::new(false)),
+            probe: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Prepare one intent for a test, optionally recording its binding first.
@@ -9370,6 +9588,88 @@ mod warm_identity_tests {
         assert!(!conn.links[pid].worker_sources.contains(&old_source));
     }
 
+    /// Exact duplicate readiness for an adopted attempt is harmless; the live
+    /// transport is not closed and the link is unchanged.
+    #[tokio::test]
+    async fn duplicate_ready_after_adoption_is_harmless() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-attempt-duplicate";
+        let t: Arc<dyn Transport> = Rec::new("direct", &log);
+        let attempt = t.attempt_id().unwrap();
+        conn.direct_pending
+            .insert(pid.into(), direct_pending_with(attempt, ("peer", "secret")));
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), "direct-quic"),
+            DirectAdoption::Adopted { attempt: seen, .. } if seen == attempt
+        ));
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), "direct-quic"),
+            DirectAdoption::Duplicate
+        ));
+        assert!(conn.links.contains_key(pid));
+        assert!(!t.is_dead(), "duplicate readiness closed the live transport");
+    }
+
+    /// A queued ready for an attempt whose link was dropped must not resurrect it.
+    #[tokio::test]
+    async fn ready_after_drop_does_not_resurrect() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-attempt-drop";
+        let t: Arc<dyn Transport> = Rec::new("direct", &log);
+        let attempt = t.attempt_id().unwrap();
+        conn.direct_pending
+            .insert(pid.into(), direct_pending_with(attempt, ("peer", "secret")));
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+        conn.drop_link(pid);
+        assert!(!conn.links.contains_key(pid));
+        assert!(matches!(
+            conn.adopt_direct(pid, t, "direct-quic"),
+            DirectAdoption::Rejected
+        ));
+        assert!(!conn.links.contains_key(pid), "retired readiness resurrected a link");
+    }
+
+    /// A ready for a different attempt must not consume the pending or its
+    /// secret/fleet metadata.
+    #[tokio::test]
+    async fn mismatched_ready_does_not_consume_pending() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-attempt-mismatch";
+        let pending_attempt = net::AttemptId::next();
+        conn.direct_pending.insert(
+            pid.into(),
+            direct_pending_with(pending_attempt, ("peer", "keep-me")),
+        );
+        let t: Arc<dyn Transport> = Rec::new("other", &log);
+        assert!(matches!(
+            conn.adopt_direct(pid, t, "direct-quic"),
+            DirectAdoption::Rejected
+        ));
+        let pending = conn.direct_pending.get(pid).expect("pending was consumed");
+        assert_eq!(pending.attempt, pending_attempt);
+        assert_eq!(pending.secret, ("peer".to_string(), "keep-me".to_string()));
+    }
+
+    /// No pending/promotion ownership means no Conn adoption.
+    #[tokio::test]
+    async fn unowned_ready_is_rejected() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-attempt-unowned";
+        let t: Arc<dyn Transport> = Rec::new("direct", &log);
+        assert!(matches!(
+            conn.adopt_direct(pid, t, "direct-quic"),
+            DirectAdoption::Rejected
+        ));
+        assert!(!conn.links.contains_key(pid));
+    }
+
     /// A race that won must not be expired or reaped while it waits beside the
     /// serving link: the old cleanup dropped any pending whose peer had a link.
     #[tokio::test]
@@ -9460,6 +9760,11 @@ mod warm_identity_tests {
         conn.direct_pending.get_mut(pid).unwrap().deadline = Instant::now() - Duration::from_millis(1);
         assert!(conn.expired_direct().is_empty());
         assert!(conn.links.contains_key(pid), "the peer had no link before its successor");
+        if let Some(attempt) = t.attempt_id() {
+            if let Some(pending) = conn.direct_pending.get_mut(pid) {
+                pending.attempt = attempt;
+            }
+        }
         conn.adopt_direct(&p, t, route);
         let l = conn.link(pid).unwrap();
         assert!(l.direct && !l.trusted);

@@ -458,6 +458,7 @@ mod tests {
                 workers: vec![],
                 generation: 1,
                 source: Default::default(),
+                attempt: None,
                 worker_sources: Default::default(),
                 attempts: 0,
                 trusted,

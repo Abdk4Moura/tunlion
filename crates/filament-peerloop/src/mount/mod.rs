@@ -382,7 +382,7 @@ mod tests {
         conn.links.insert(PID.into(), Link {
             peer: None, info: json!({"id": PID}), name: "untrusted display name".into(),
             uid: None, transport: Some(t), workers: vec![], generation: 1,
-            source: Default::default(), worker_sources: Default::default(), attempts: 0,            trusted: true, expected_secret: None,
+            source: Default::default(), attempt: None, worker_sources: Default::default(), attempts: 0,            trusted: true, expected_secret: None,
             // Avoid ambient device-record/consent I/O: the signed grant is keyed
             // by the already-resolved device, never by the display name.
             verified_name: None, presence: Presence::Ready, direct: true,

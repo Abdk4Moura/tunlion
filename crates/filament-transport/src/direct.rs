@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-use crate::net::{SourceId, Transport};
+use crate::net::{AttemptId, SourceId, Transport};
 
 /// Opt-in gate. The ENTIRE direct path is dead unless this is set; default
 /// behaviour (WebRTC) is byte-for-byte unchanged. CHECKPOINT before promoting.
@@ -1040,6 +1040,8 @@ pub struct DirectTransport {
     /// Immutable identity of this transport attempt, captured before the reader
     /// can enqueue any inbound event.
     source: SourceId,
+    /// Authorization identity for primary direct readiness. None for workers.
+    attempt: Option<AttemptId>,
     last_activity: Arc<std::sync::atomic::AtomicU64>,
     dead: Arc<std::sync::atomic::AtomicBool>,
     /// #312: the peer cleanly ENDED its send half (FinishedEarly). Kept separate
@@ -1414,6 +1416,10 @@ impl Transport for DirectTransport {
     fn source_id(&self) -> Option<SourceId> {
         Some(self.source)
     }
+
+    fn attempt_id(&self) -> Option<AttemptId> {
+        self.attempt
+    }
     fn quic_connection(&self) -> Option<quinn::Connection> {
         // Cloning a quinn::Connection is a handle clone, not a new connection.
         Some(self.conn.clone())
@@ -1781,8 +1787,9 @@ pub fn make_transport(
     answerer: bool,
     ep: Option<quinn::Endpoint>,
     primary: bool,
+    attempt: Option<AttemptId>,
 ) -> Arc<dyn Transport> {
-    let mut unread = make_transport_unread(peer_id, conn, send, recv, tx, answerer, ep, primary);
+    let mut unread = make_transport_unread(peer_id, conn, send, recv, tx, answerer, ep, primary, attempt);
     if let Some(reader) = unread.reader.take() {
         tokio::spawn(reader);
     }
@@ -1800,6 +1807,7 @@ pub fn make_transport_unread(
     answerer: bool,
     ep: Option<quinn::Endpoint>,
     primary: bool,
+    attempt: Option<AttemptId>,
 ) -> UnreadTransport {
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
     let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1820,6 +1828,7 @@ pub fn make_transport_unread(
         conn,
         send: Arc::new(Mutex::new(send)),
         source,
+        attempt,
         last_activity,
         dead,
         rx_ended,
@@ -1855,7 +1864,7 @@ pub fn spawn_mesh_accept(
                 match conn.accept_bi().await {
                     Ok((send, recv)) => {
                         let conn2 = conn.clone();
-                        let worker = make_transport(pid.clone(), conn2, send, recv, tx.clone(), true, None, false);
+                        let worker = make_transport(pid.clone(), conn2, send, recv, tx.clone(), true, None, false, None);
                         let _ = tx.send(crate::net::Ev::DirectWorkersReady(pid.clone(), vec![worker], primary_source));
                     }
                     Err(_) => return,
@@ -1913,7 +1922,7 @@ pub async fn dial_workers(
                 match result {
                     Some(Ok((conn, send, recv, ep))) => {
                         workers.push(make_transport(
-                            peer_id.clone(), conn, send, recv, tx.clone(), false, Some(ep), false,
+                            peer_id.clone(), conn, send, recv, tx.clone(), false, Some(ep), false, None,
                         ));
                         if workers.len() >= count { break; }
                     }
@@ -1975,7 +1984,7 @@ pub async fn accept_workers(
                 match result {
                     Some(Ok((conn, send, recv, ep))) => {
                         workers.push(make_transport(
-                            peer_id.clone(), conn, send, recv, tx.clone(), true, Some(ep), false,
+                            peer_id.clone(), conn, send, recv, tx.clone(), true, Some(ep), false, None,
                         ));
                         if workers.len() >= count { break; }
                     }
@@ -2017,6 +2026,7 @@ pub async fn race_connect(
     peer_cands: Vec<String>,
     secret: &str,
     peer_id: String,
+    attempt: AttemptId,
     my_uid: String,
     peer_uid: String,
     my_id: String,
@@ -2025,7 +2035,7 @@ pub async fn race_connect(
     peer_claimed: Option<SocketAddr>,
     server_public_dialed: Arc<AtomicBool>,
 ) -> Option<UnreadTransport> {
-    race_connect_labeled(context, endpoint, peer_cands, secret, peer_id, my_uid, peer_uid, my_id, tx, "direct-quic", exchange, peer_claimed, server_public_dialed).await
+    race_connect_labeled(context, endpoint, peer_cands, secret, peer_id, attempt, my_uid, peer_uid, my_id, tx, "direct-quic", exchange, peer_claimed, server_public_dialed).await
 }
 
 /// Same race, but with the route label parameterized so rung-2 (hole-punch) can
@@ -2050,6 +2060,7 @@ pub async fn race_connect_labeled(
     peer_cands: Vec<String>,
     secret: &str,
     peer_id: String,
+    attempt: AttemptId,
     my_uid: String,
     peer_uid: String,
     my_id: String,
@@ -2298,6 +2309,7 @@ pub async fn race_connect_labeled(
         answerer,
         Some(ep_for_transport),
         true,
+        Some(attempt),
     ))
 }
 
@@ -2430,7 +2442,7 @@ mod tests {
             let ((conn_d, send_d, recv_d), (_conn_a, _send_a, _recv_a)) = connected_pair().await;
             // The peer side never reads `_recv_a`: alive, connected, not draining.
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-            let ours = make_transport("peer".to_string(), conn_d, send_d, recv_d, tx, false, None, true);
+            let ours = make_transport("peer".to_string(), conn_d, send_d, recv_d, tx, false, None, true, None);
             let writer = ours.clone();
             let flood = tokio::spawn(async move {
                 let chunk = vec![7u8; 60 * 1024];
@@ -2476,11 +2488,11 @@ mod tests {
             let ((conn_d, send_d, recv_d), (conn_a, send_a, recv_a)) = connected_pair().await;
             let (peer_tx, _peer_rx) = tokio::sync::mpsc::unbounded_channel();
             let peer = make_transport(
-                "us".to_string(), conn_d, send_d, recv_d, peer_tx, false, None, true,
+                "us".to_string(), conn_d, send_d, recv_d, peer_tx, false, None, true, None,
             );
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let ours = make_transport_unread(
-                "peer".to_string(), conn_a, send_a, recv_a, tx.clone(), true, None, true,
+                "peer".to_string(), conn_a, send_a, recv_a, tx.clone(), true, None, true, None,
             );
             peer.send_control(&serde_json::json!({ "type": "identity-auth-key-enroll-request" }))
                 .await
@@ -2524,11 +2536,11 @@ mod tests {
             let ((conn_d, send_d, recv_d), (conn_a, send_a, recv_a)) = connected_pair().await;
             let (peer_tx, _peer_rx) = tokio::sync::mpsc::unbounded_channel();
             let peer = make_transport(
-                "us".to_string(), conn_d, send_d, recv_d, peer_tx, false, None, true,
+                "us".to_string(), conn_d, send_d, recv_d, peer_tx, false, None, true, None,
             );
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let ours = make_transport_unread(
-                "peer".to_string(), conn_a, send_a, recv_a, tx, true, None, true,
+                "peer".to_string(), conn_a, send_a, recv_a, tx, true, None, true, None,
             );
             let t = ours.transport().clone();
             let source = t.source_id().expect("source id");
@@ -2577,6 +2589,7 @@ mod tests {
                 true,
                 None,
                 true, // PRIMARY: its inbound path is the link's inbound path
+                None,
             );
             assert!(!primary.is_dead(), "a fresh link is alive");
             // The peer cleanly ends its send half, exactly as a dropped or
@@ -2615,6 +2628,7 @@ mod tests {
                 false,
                 None,
                 false, // WORKER: ending a one-shot stream is normal
+                None,
             );
             let _ = send_a.finish();
             // Give the reader time to see the EOF, then require it NOT to be
