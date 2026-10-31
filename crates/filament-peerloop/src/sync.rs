@@ -2231,6 +2231,8 @@ mod tests {
                 transport: link_transport,
                 workers: vec![],
                 generation: 1,
+                source: Default::default(),
+                worker_sources: Default::default(),
                 attempts: 0,
                 trusted,
                 expected_secret: None,

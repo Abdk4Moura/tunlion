@@ -1767,6 +1767,7 @@ async fn pair_with_purpose(
             Ok(None) => bail!("signaling closed"),
             Err(_) => continue,
         };
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {

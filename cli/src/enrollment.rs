@@ -297,7 +297,7 @@ pub(crate) async fn enroll_cmd(
 
         let Some(ev) = ev else { continue };
 
-        let ev = match conn.stage_event(ev) { Some(ev) => ev, None => continue };
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -389,7 +389,7 @@ pub(crate) async fn enroll_cmd(
             }
             Ev::DirectReady(pid, t, route) => {
                 conn.adopt_direct(&pid, t.clone(), route);
-                let _ = tx.send(Ev::ChannelReady(pid, t));
+                let _ = tx.send(Ev::sourced_channel_ready(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
                 conn.mark_ready(&pid, &t, true);
@@ -597,7 +597,7 @@ pub(crate) async fn enroll_and_send_cmd(
             }
             continue;
         };
-        let ev = match conn.stage_event(ev) { Some(ev) => ev, None => continue };
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 // The owner daemon is already in the enroll room; the server hands
@@ -691,7 +691,7 @@ pub(crate) async fn enroll_and_send_cmd(
             }
             Ev::DirectReady(pid, t, route) => {
                 conn.adopt_direct(&pid, t.clone(), route);
-                let _ = tx.send(Ev::ChannelReady(pid, t));
+                let _ = tx.send(Ev::sourced_channel_ready(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
                 open_enrollment(&mut conn, &pid, &t, enroll_seed, device_pub, &ak).await;

@@ -457,6 +457,8 @@ mod tests {
                 transport: Some(t),
                 workers: vec![],
                 generation: 1,
+                source: Default::default(),
+                worker_sources: Default::default(),
                 attempts: 0,
                 trusted,
                 expected_secret: None,

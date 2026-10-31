@@ -282,6 +282,13 @@ pub struct Link {
     pub uid: Option<String>,
     pub transport: Option<Arc<dyn Transport>>,
     pub generation: u32,
+    /// Immutable identity of the primary transport attempt that owns this link.
+    /// Read by the event gate immediately before dispatch.
+    pub source: net::SourceId,
+    /// Immutable identities of the current parallel worker transports. Kept
+    /// separate from `source` so a worker can never authorize primary teardown
+    /// and a stale worker source is removed with its worker.
+    pub worker_sources: HashSet<net::SourceId>,
     pub attempts: u32,
     /// C12: proof-verified known device (per link, not global)
     pub trusted: bool,
@@ -833,6 +840,8 @@ impl BuildCancel {
 pub struct BuiltPeer {
     peer_id: String,
     generation: u32,
+    /// Source identity captured from the Peer before any callback was enqueued.
+    source: net::SourceId,
     peer: Arc<net::Peer>,
     info: Value,
     name: String,
@@ -873,7 +882,11 @@ fn discard_pending_state(mut state: BuildState) {
     let early = std::mem::take(&mut state.early);
     let queued: Vec<Ev> = std::iter::from_fn(|| state.events_rx.try_recv().ok()).collect();
     for ev in early.into_iter().chain(queued) {
-        if let Ev::ChannelReady(_, transport) = ev {
+        let inner = match ev {
+            Ev::Sourced { inner, .. } => *inner,
+            other => other,
+        };
+        if let Ev::ChannelReady(_, transport) = inner {
             transport.force_close();
         }
     }
@@ -886,8 +899,9 @@ fn discard_state(state: BuildState, peer: Arc<net::Peer>) {
 
 fn ev_weight(ev: &Ev) -> usize {
     match ev {
+        Ev::Sourced { inner, .. } => ev_weight(inner),
         Ev::Chunk(_, _, _, bytes) => bytes.len().max(1),
-        Ev::Control(_, value) => value.to_string().len().max(1),
+        Ev::Control(_, value) | Ev::LocalControl(_, value) => value.to_string().len().max(1),
         _ => 1,
     }
 }
@@ -1006,9 +1020,11 @@ async fn run_build_task(
         filament_transport::hooks::debug(&format!("BUILD-HOLD peer={} ms={hold}", plan.peer_id));
         tokio::time::sleep(Duration::from_millis(hold)).await;
     }
+    let source = peer.source();
     let _ = out.send(BuildDone::Ready(BuiltPeer {
         peer_id: plan.peer_id,
         generation: plan.generation,
+        source,
         peer,
         info: plan.info,
         name: plan.name,
@@ -1036,6 +1052,15 @@ pub struct RetiredIntent {
 pub struct LinkEvents {
     pub generation: u32,
     pub rx: mpsc::UnboundedReceiver<Ev>,
+}
+
+/// Source-bound events from a standby/upgrade transport that is not adopted
+/// yet. They are replayed only if that exact source becomes the link source.
+pub struct PendingSource {
+    pub pid: String,
+    pub at: Instant,
+    pub events: std::collections::VecDeque<Ev>,
+    pub bytes: usize,
 }
 
 pub struct Conn {
@@ -1210,6 +1235,9 @@ pub struct Conn {
     /// so a queued ChannelReady/Control from the old generation is discarded
     /// instead of being replayed onto the new link.
     pub link_events: HashMap<String, LinkEvents>,
+    /// Source-bound standby/upgrade events awaiting adoption. Bounded per source
+    /// and in total; overflow closes the standby instead of growing forever.
+    pub pending_sources: HashMap<net::SourceId, PendingSource>,
     /// Roster sids absent from consecutive channel/room digests, for the
     /// two-tick hysteresis in `prune_roster_absent`.
     pub roster_absent: HashMap<String, u8>,
@@ -1416,6 +1444,7 @@ impl Conn {
             revoked_peers: HashMap::new(),
             revoked_bindings: HashSet::new(),
             link_events: HashMap::new(),
+            pending_sources: HashMap::new(),
             roster_absent: HashMap::new(),
             log,
             host,
@@ -1952,7 +1981,7 @@ impl Conn {
         if t.is_dead() {
             return;
         }
-        let _ = self.tx.send(Ev::ChannelReady(pid.to_string(), t.clone()));
+        let _ = self.tx.send(Ev::sourced_channel_ready(pid.to_string(), t.clone()));
     }
 
     /// `#[track_caller]` so a teardown NAMES the path that ordered it. There are
@@ -2593,6 +2622,7 @@ impl Conn {
         )
         .await
         .map_err(|_| anyhow::anyhow!("building the peer connection took over {PEER_BUILD_BUDGET:?}"))??;
+        let source = peer.source();
         let binding = self
             .pending_bindings
             .remove(&pid)
@@ -2602,6 +2632,7 @@ impl Conn {
             BuiltPeer {
                 peer_id: pid.clone(),
                 generation: plan.generation,
+                source,
                 peer,
                 info: plan.info,
                 name: plan.name,
@@ -2756,6 +2787,15 @@ impl Conn {
             now.duration_since(retired.at) < BUILD_REAP_GRACE || active.contains(pid)
         });
         self.current_intent.retain(|pid, _| active.contains(pid));
+        let stale_sources: Vec<net::SourceId> = self
+            .pending_sources
+            .iter()
+            .filter(|(_, pending)| now.duration_since(pending.at) >= BUILD_REAP_GRACE)
+            .map(|(source, _)| *source)
+            .collect();
+        for source in stale_sources {
+            self.drop_pending_source(source);
+        }
         let mut applied = 0usize;
         while let Ok(done) = self.build_rx.try_recv() {
             match done {
@@ -2963,6 +3003,8 @@ impl Conn {
                 transport: None,
                 workers: vec![],
                 generation: built.generation,
+                source: built.source,
+                worker_sources: HashSet::new(),
                 attempts: 0,
                 trusted: false,
                 expected_secret: binding,
@@ -2994,13 +3036,135 @@ impl Conn {
         }
     }
 
-    /// Pass a main-queue event through. Candidate-origin events no longer
-    /// travel on the main queue: each build owns its own channel (see
-    /// `BuildState::events_rx`), so an old, still-serving link's Control or
-    /// PcState can never be replayed onto a replacement. The function is kept
-    /// as the single call-site seam every driver already uses.
-    pub fn stage_event(&mut self, ev: Ev) -> Option<Ev> {
-        Some(ev)
+    /// Final pre-dispatch gate. Transport-origin Control/PcState/ChannelReady
+    /// must carry an immutable SourceId; the event is accepted only if that
+    /// source still belongs to the pid's CURRENT link at the moment the driver
+    /// is about to handle it. A replacement after forwarding therefore cannot
+    /// replay an old callback. Returns the inner event plus its source (used by
+    /// handlers that defer/requeue the event).
+    pub fn stage_event(&mut self, ev: Ev) -> Option<(Ev, Option<net::SourceId>)> {
+        match ev {
+            Ev::Sourced { pid, source, inner } => {
+                // Envelope and inner pid must agree, and nesting is invalid:
+                // otherwise checking one pid would handle another.
+                let valid_inner = match inner.as_ref() {
+                    Ev::Control(ipid, _)
+                    | Ev::PcState(ipid, _)
+                    | Ev::ChannelReady(ipid, _) => ipid == &pid,
+                    _ => false,
+                };
+                if !valid_inner {
+                    return None;
+                }
+                if self.source_current(&pid, source, inner.as_ref()) {
+                    return Some((*inner, Some(source)));
+                }
+                // A standby/upgrade attempt may deliver before adoption. Buffer
+                // it only for its registered source and pid, bounded.
+                if self.pending_sources.get(&source).is_some_and(|p| p.pid == pid) {
+                    self.buffer_pending_source(pid, source, *inner);
+                }
+                None
+            }
+            // A transport-origin event must never arrive untagged. Fail closed
+            // whether or not a link exists.
+            Ev::Control(..) | Ev::PcState(..) | Ev::ChannelReady(..) => None,
+            // Loop-authored events are explicitly trusted: they are created by
+            // this loop, not a transport callback.
+            Ev::LocalControl(pid, value) => Some((Ev::Control(pid, value), None)),
+            Ev::LocalPcState(pid, state) => Some((Ev::PcState(pid, state), None)),
+            other => Some((other, None)),
+        }
+    }
+
+    /// A source is current when it is the link's primary source, or (for
+    /// Control only) one of its current worker sources. PcState/ChannelReady are
+    /// primary-only so a worker can never trigger primary teardown/readiness.
+    fn source_current(&self, pid: &str, source: net::SourceId, inner: &Ev) -> bool {
+        let Some(link) = self.links.get(pid) else {
+            return false;
+        };
+        if link.source == source {
+            return true;
+        }
+        matches!(inner, Ev::Control(..)) && link.worker_sources.contains(&source)
+    }
+
+    /// Buffer a pre-adoption event for a registered source. Per-source and total
+    /// bounds are the existing build-event budget; overflow fails closed by
+    /// dropping the pending source and its standby transport.
+    fn buffer_pending_source(&mut self, pid: String, source: net::SourceId, inner: Ev) {
+        let weight = ev_weight(&inner);
+        let total_events: usize = self.pending_sources.values().map(|p| p.events.len()).sum();
+        let total_bytes: usize = self.pending_sources.values().map(|p| p.bytes).sum();
+        let over_total = total_events >= MAX_BUILD_EVENTS
+            || total_bytes.saturating_add(weight) > MAX_BUILD_EVENT_BYTES;
+        let is_new = !self.pending_sources.contains_key(&source);
+        let over_sources = is_new && self.pending_sources.len() >= MAX_PENDING_BUILDS;
+        let over_source = self.pending_sources.get(&source).is_none_or(|p| {
+            p.events.len() >= MAX_BUILD_EVENTS
+                || p.bytes.saturating_add(weight) > MAX_BUILD_EVENT_BYTES
+        });
+        if over_total || over_sources || over_source {
+            self.drop_pending_source(source);
+            return;
+        }
+        let entry = self
+            .pending_sources
+            .entry(source)
+            .or_insert_with(|| PendingSource {
+                pid: pid.clone(),
+                at: Instant::now(),
+                events: std::collections::VecDeque::new(),
+                bytes: 0,
+            });
+        entry.bytes += weight;
+        entry.events.push_back(inner);
+    }
+
+    /// Drop a pending source and close its standby, so overflow cannot leave a
+    /// live transport that will never be adopted.
+    fn drop_pending_source(&mut self, source: net::SourceId) {
+        let Some(pending) = self.pending_sources.remove(&source) else {
+            return;
+        };
+        if let Some(promotion) = self.promotions.get_mut(&pending.pid) {
+            let matches = promotion
+                .standby
+                .as_ref()
+                .is_some_and(|(transport, _)| transport.source_id() == Some(source));
+            if matches {
+                if let Some((transport, _)) = promotion.standby.take() {
+                    transport.force_close();
+                }
+            }
+        }
+        if let Some(probe) = self.resil.upgrade_probe.get_mut(&pending.pid) {
+            let matches = probe
+                .standby
+                .as_ref()
+                .is_some_and(|transport| transport.source_id() == Some(source));
+            if matches {
+                if let Some(transport) = probe.standby.take() {
+                    transport.force_close();
+                }
+            }
+        }
+    }
+
+    /// Replay buffered standby events after adoption. They keep their tag, so a
+    /// second replacement still rejects them at the final gate.
+    fn flush_pending_source(&mut self, source: net::SourceId) {
+        let Some(pending) = self.pending_sources.remove(&source) else {
+            return;
+        };
+        for inner in pending.events {
+            let _ = self.tx.send(Ev::Sourced {
+                pid: pending.pid.clone(),
+                source,
+                inner: Box::new(inner),
+            });
+        }
     }
 
     /// Stage an inbound signal for a candidate that is still being built.
@@ -3517,6 +3681,7 @@ impl Conn {
                 t.force_close();
             }
         }
+        self.pending_sources.retain(|_, pending| pending.pid != pid);
     }
 
     /// P5 (GAP-6): arm a relay->direct UPGRADE probe, a direct dial run
@@ -4097,6 +4262,35 @@ impl Conn {
     /// (no WebRTC), `direct: true`, `trusted: true` (the pair-secret MAC already
     /// proved identity, at least as strong as the DTLS pair-proof it replaces).
     pub fn adopt_direct(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
+        // Required adoption: an unidentifiable transport must not become a link.
+        // The event gate could not reject its later callbacks, so fail closed.
+        let source = match t.source_id() {
+            Some(source) => source,
+            None => {
+                self.log.debug(&format!(
+                    "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: transport has no source identity"
+                ));
+                t.force_close();
+                return;
+            }
+        };
+        // Immutable source order: a callback whose source is not newer than the
+        // link it would replace is stale. Equal means the same transport was
+        // announced twice; leave the live link alone.
+        if let Some(existing) = self.links.get(pid) {
+            if existing.source == source {
+                return;
+            }
+            if existing.source.get() > source.get() {
+                self.log.debug(&format!(
+                    "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: stale source {} < link {}",
+                    source.get(),
+                    existing.source.get()
+                ));
+                t.force_close();
+                return;
+            }
+        }
         // A promotion handed over (make-before-break): retire the serving
         // WebRTC link in the same step that installs its successor below, so
         // the peer is never without a link. The old channel keeps delivering
@@ -4182,6 +4376,7 @@ impl Conn {
             existing.direct = true;
             existing.direct_route = route;
             existing.generation = generation;
+            existing.source = source;
             existing.attempts = 0;
             if !ephemeral {
                 existing.trusted = true;
@@ -4206,6 +4401,8 @@ impl Conn {
                     transport: Some(t),
                     workers: vec![],
                     generation,
+                    source,
+                    worker_sources: HashSet::new(),
                     attempts: 0,
                     // A direct link is normally born identity-bound: its PAIR-secret
                     // MAC already proved who it is. A FLEET link is not. Its MAC was
@@ -4237,6 +4434,35 @@ impl Conn {
                 },
             );
         }
+        // Replay anything the standby buffered before adoption. The tags remain,
+        // so a second replacement still rejects them at the handler gate.
+        self.flush_pending_source(source);
+    }
+
+    /// Install worker transports only when the ready event belongs to the
+    /// link's CURRENT primary source. A stale event closes its workers and
+    /// leaves the primary untouched.
+    pub fn accept_workers_ready(
+        &mut self,
+        pid: &str,
+        workers: Vec<Arc<dyn Transport>>,
+        primary_source: net::SourceId,
+    ) -> bool {
+        let Some(link) = self.links.get_mut(pid) else {
+            for worker in &workers {
+                worker.force_close();
+            }
+            return false;
+        };
+        if link.source != primary_source {
+            for worker in &workers {
+                worker.force_close();
+            }
+            return false;
+        }
+        link.worker_sources = workers.iter().filter_map(|w| w.source_id()).collect();
+        link.workers = workers;
+        true
     }
 
     /// Spawn K-1 parallel QUIC worker transports in a background task after
@@ -4256,6 +4482,7 @@ impl Conn {
         if k <= 1 {
             return;
         }
+        let primary_source = primary.source_id().unwrap_or(net::SourceId::UNASSIGNED);
         let peer_uid = self.roster.get(pid).and_then(|i| i["uid"].as_str());
         let peer_present = self.roster.contains_key(pid);
         let answerer = match peer_uid {
@@ -4316,7 +4543,7 @@ impl Conn {
                 let workers =
                     direct::accept_workers(endpoints, tkey, pid.clone(), tx.clone(), count).await;
                 if !workers.is_empty() {
-                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers));
+                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers, primary_source));
                 }
             });
         } else {
@@ -4337,7 +4564,7 @@ impl Conn {
                     direct::dial_workers(ports, peer_ip, tkey, pid.clone(), tx.clone(), count)
                         .await;
                 if !workers.is_empty() {
-                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers));
+                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers, primary_source));
                 }
             });
         }
@@ -5360,7 +5587,7 @@ impl Conn {
         ));
         // Re-offer unfinished transfers on the new direct transport (resume:true);
         // the ChannelReady re-emit drives the same path for the send loop.
-        let _ = self.tx.send(Ev::ChannelReady(pid.to_string(), t));
+        let _ = self.tx.send(Ev::sourced_channel_ready(pid.to_string(), t));
     }
 
     /// P5 (GAP-6): build the post-upgrade DIRECT link from a verified standby
@@ -5379,6 +5606,24 @@ impl Conn {
         // change stays scoped to the escalation it fixes.
         carried: Option<(bool, PrincipalKind)>,
     ) {
+        let Some(source) = t.source_id() else {
+            self.log.debug(&format!(
+                "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: transport has no source identity"
+            ));
+            t.force_close();
+            return;
+        };
+        if let Some(existing) = self.links.get(pid) {
+            if existing.source.get() >= source.get() {
+                self.log.debug(&format!(
+                    "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: stale source {} <= link {}",
+                    source.get(),
+                    existing.source.get()
+                ));
+                t.force_close();
+                return;
+            }
+        }
         let info = self
             .roster
             .get(pid)
@@ -5402,6 +5647,8 @@ impl Conn {
                 transport: Some(t),
                 workers: vec![],
                 generation,
+                source,
+                worker_sources: HashSet::new(),
                 attempts: 0,
                 trusted: upgrade_principal(&carried).0,
                 verified_name: known.as_ref().map(|(n, _)| n.clone()),
@@ -5418,6 +5665,7 @@ impl Conn {
                 host: self.host.clone(),
             },
         );
+        self.flush_pending_source(source);
     }
 
     // --- POST-PAKE PROMOTION: the make-before-break handoff (see `handoff`) ---
@@ -5762,6 +6010,35 @@ impl Conn {
         t: Arc<dyn Transport>,
         route: &'static str,
     ) {
+        let Some(source) = t.source_id() else {
+            self.log.debug(&format!(
+                "tunlion: STANDBY-REFUSED peer={pid}: transport has no source identity"
+            ));
+            t.force_close();
+            return;
+        };
+        // A standby must be newer than the link it may replace. This rejects a
+        // late readiness event from an older attempt without any pid inference.
+        if let Some(link) = self.links.get(pid) {
+            if link.source.get() >= source.get() {
+                self.log.debug(&format!(
+                    "tunlion: STANDBY-REFUSED peer={pid}: stale source {} <= link {}",
+                    source.get(),
+                    link.source.get()
+                ));
+                t.force_close();
+                return;
+            }
+        }
+        self.pending_sources.insert(
+            source,
+            PendingSource {
+                pid: pid.to_string(),
+                at: Instant::now(),
+                events: std::collections::VecDeque::new(),
+                bytes: 0,
+            },
+        );
         // A post-PAKE promotion's winner rides this event too (it must not
         // clobber the serving link any more than a probe's may).
         if self.promotions.contains_key(pid)
@@ -5882,6 +6159,7 @@ impl Conn {
                 .debug(&format!("peer-left invalidated build pid={pid}{generation}"));
         }
         self.cancel_build(&pid);
+        self.pending_sources.retain(|_, pending| pending.pid != pid);
         if !self.links.contains_key(&pid) {
             return false;
         }
@@ -6745,6 +7023,7 @@ mod warm_identity_tests {
     /// The link `adopt_direct` builds on the dialer: named by PETNAME, while
     /// the roster entry for the same sid carries the DISPLAY name.
     fn direct_link(pid: &str, petname: &str, display: &str, t: Arc<dyn Transport>) -> Link {
+        let source = t.source_id().unwrap_or(net::SourceId::UNASSIGNED);
         Link {
             peer: None,
             info: json!({ "id": pid, "name": display }),
@@ -6753,6 +7032,8 @@ mod warm_identity_tests {
             transport: Some(t),
             workers: vec![],
             generation: 7,
+            source,
+            worker_sources: HashSet::new(),
             attempts: 0,
             trusted: true,
             expected_secret: Some((petname.to_string(), "s3cret".to_string())),
@@ -8085,10 +8366,16 @@ mod warm_identity_tests {
         name: &'static str,
         log: Arc<std::sync::Mutex<Vec<String>>>,
         alive: AtomicBool,
+        source: net::SourceId,
     }
     impl Rec {
         fn new(name: &'static str, log: &Arc<std::sync::Mutex<Vec<String>>>) -> Arc<Self> {
-            Arc::new(Rec { name, log: log.clone(), alive: AtomicBool::new(true) })
+            Arc::new(Rec {
+                name,
+                log: log.clone(),
+                alive: AtomicBool::new(true),
+                source: net::SourceId::next(),
+            })
         }
     }
     #[async_trait::async_trait]
@@ -8113,6 +8400,9 @@ mod warm_identity_tests {
         }
         fn as_any(&self) -> &dyn std::any::Any {
             self
+        }
+        fn source_id(&self) -> Option<net::SourceId> {
+            Some(self.source)
         }
     }
 
@@ -8398,8 +8688,8 @@ mod warm_identity_tests {
         conn.links.insert(pid.to_string(), link);
         let (state, candidate_tx) = build_state_with_tx(7);
         conn.builds.insert(pid.to_string(), state);
-        // A serving-link event passes straight through the main queue.
-        let old_event = Ev::Control(pid.to_string(), json!({ "type": "ping" }));
+        // A loop-authored event passes straight through the main queue.
+        let old_event = Ev::LocalControl(pid.to_string(), json!({ "type": "ping" }));
         assert!(conn.stage_event(old_event).is_some());
         // Only events sent on the build's own channel are buffered.
         let candidate = Rec::new("candidate", &log);
@@ -8639,9 +8929,11 @@ mod warm_identity_tests {
         .await
         .expect("build a local candidate");
         conn.current_intent.insert(pid.to_string(), 42);
+        let source = peer.source();
         conn.apply_built_peer(BuiltPeer {
             peer_id: pid.to_string(),
             generation: 42,
+            source,
             peer,
             info: json!({ "id": pid, "name": "peer" }),
             name: "peer".to_string(),
@@ -8912,6 +9204,170 @@ mod warm_identity_tests {
             conn.builds.contains_key("sid-two"),
             "a same-named unrelated device was retired"
         );
+    }
+
+    /// A source event forwarded while its link was current must be rejected if
+    /// the same pid is replaced before dequeue/dispatch (final-handler check).
+    #[tokio::test]
+    async fn a_forwarded_current_source_then_replaced_is_rejected() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-source-race";
+        let old = Rec::new("old", &log);
+        let source_a = old.source_id().unwrap();
+        let mut link = relay_link(pid, "peer", "peer", old.clone());
+        link.source = source_a;
+        link.generation = 7;
+        conn.links.insert(pid.to_string(), link);
+        // Queue while A is current; do NOT dequeue yet.
+        conn.tx
+            .send(Ev::Sourced {
+                pid: pid.into(),
+                source: source_a,
+                inner: Box::new(Ev::Control(
+                    pid.into(),
+                    json!({ "type": "l3-nonce", "nonce": "aaaa" }),
+                )),
+            })
+            .unwrap();
+        conn.tx
+            .send(Ev::Sourced {
+                pid: pid.into(),
+                source: source_a,
+                inner: Box::new(Ev::Control(pid.into(), json!({ "type": "path-promote" }))),
+            })
+            .unwrap();
+        // Replace the same pid before dispatch.
+        let new = Rec::new("new", &log);
+        let source_b = new.source_id().unwrap();
+        let mut link = relay_link(pid, "peer", "peer", new);
+        link.source = source_b;
+        link.generation = 8;
+        conn.links.insert(pid.to_string(), link);
+        for _ in 0..2 {
+            let ev = rx.try_recv().unwrap();
+            assert!(conn.stage_event(ev).is_none(), "stale source accepted");
+        }
+    }
+
+    /// The same event shape with the CURRENT source is accepted.
+    #[tokio::test]
+    async fn a_current_source_control_is_accepted() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-source-current";
+        let t = Rec::new("current", &log);
+        let source = t.source_id().unwrap();
+        let mut link = relay_link(pid, "peer", "peer", t);
+        link.source = source;
+        conn.links.insert(pid.to_string(), link);
+        conn.tx
+            .send(Ev::Sourced {
+                pid: pid.into(),
+                source,
+                inner: Box::new(Ev::Control(
+                    pid.into(),
+                    json!({ "type": "l3-nonce", "nonce": "bbbb" }),
+                )),
+            })
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert!(matches!(conn.stage_event(ev), Some((Ev::Control(..), Some(s))) if s == source));
+    }
+
+    /// Envelope/inner pid mismatch, nesting, and untagged transport events are
+    /// all refused; the explicit internal variant is accepted.
+    #[tokio::test]
+    async fn source_envelope_validation_is_strict() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-source-shape";
+        let t = Rec::new("shape", &log);
+        let source = t.source_id().unwrap();
+        let mut link = relay_link(pid, "peer", "peer", t);
+        link.source = source;
+        conn.links.insert(pid.to_string(), link);
+        assert!(conn
+            .stage_event(Ev::Sourced {
+                pid: pid.into(),
+                source,
+                inner: Box::new(Ev::Control("other-pid".into(), json!({ "type": "x" }))),
+            })
+            .is_none());
+        assert!(conn
+            .stage_event(Ev::Sourced {
+                pid: pid.into(),
+                source,
+                inner: Box::new(Ev::Sourced {
+                    pid: pid.into(),
+                    source,
+                    inner: Box::new(Ev::Control(pid.into(), json!({ "type": "x" }))),
+                }),
+            })
+            .is_none());
+        assert!(conn
+            .stage_event(Ev::Control(pid.into(), json!({ "type": "x" })))
+            .is_none());
+        assert!(conn
+            .stage_event(Ev::LocalControl(pid.into(), json!({ "type": "x" })))
+            .is_some());
+    }
+
+    /// A registered standby source buffers until adoption, replays with its tag,
+    /// and is still checked at the final gate.
+    #[tokio::test]
+    async fn a_standby_source_buffers_until_adoption_then_replays() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-source-standby";
+        let t = Rec::new("standby", &log);
+        let source = t.source_id().unwrap();
+        conn.pending_sources.insert(
+            source,
+            PendingSource {
+                pid: pid.into(),
+                at: Instant::now(),
+                events: std::collections::VecDeque::new(),
+                bytes: 0,
+            },
+        );
+        let ev = Ev::Sourced {
+            pid: pid.into(),
+            source,
+            inner: Box::new(Ev::Control(pid.into(), json!({ "type": "l3-nonce" }))),
+        };
+        assert!(conn.stage_event(ev).is_none());
+        assert_eq!(conn.pending_sources[&source].events.len(), 1);
+        // Adopt: make the source current and flush the buffered event.
+        let mut link = relay_link(pid, "peer", "peer", t);
+        link.source = source;
+        conn.links.insert(pid.to_string(), link);
+        conn.flush_pending_source(source);
+        let ev = rx.try_recv().unwrap();
+        assert!(matches!(conn.stage_event(ev), Some((Ev::Control(..), Some(s))) if s == source));
+    }
+
+    /// A workers-ready from an older primary must not authorize its workers on
+    /// the new link; the current primary's ready is accepted.
+    #[tokio::test]
+    async fn stale_workers_ready_is_refused_and_current_is_accepted() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-workers-source";
+        let primary = Rec::new("primary", &log);
+        let primary_source = primary.source_id().unwrap();
+        let mut link = relay_link(pid, "peer", "peer", primary);
+        link.source = primary_source;
+        conn.links.insert(pid.to_string(), link);
+        let old_worker = Rec::new("old-worker", &log);
+        let old_source = old_worker.source_id().unwrap();
+        let new_worker = Rec::new("new-worker", &log);
+        let new_source = new_worker.source_id().unwrap();
+        assert!(!conn.accept_workers_ready(pid, vec![old_worker], net::SourceId::UNASSIGNED));
+        assert!(conn.links[pid].workers.is_empty());
+        assert!(conn.accept_workers_ready(pid, vec![new_worker], primary_source));
+        assert!(conn.links[pid].worker_sources.contains(&new_source));
+        assert!(!conn.links[pid].worker_sources.contains(&old_source));
     }
 
     /// A race that won must not be expired or reaped while it waits beside the

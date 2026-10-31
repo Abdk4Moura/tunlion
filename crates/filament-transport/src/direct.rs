@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-use crate::net::Transport;
+use crate::net::{SourceId, Transport};
 
 /// Opt-in gate. The ENTIRE direct path is dead unless this is set; default
 /// behaviour (WebRTC) is byte-for-byte unchanged. CHECKPOINT before promoting.
@@ -1037,6 +1037,9 @@ thread_local! {
 pub struct DirectTransport {
     conn: quinn::Connection,
     send: Arc<Mutex<SendStream>>,
+    /// Immutable identity of this transport attempt, captured before the reader
+    /// can enqueue any inbound event.
+    source: SourceId,
     last_activity: Arc<std::sync::atomic::AtomicU64>,
     dead: Arc<std::sync::atomic::AtomicBool>,
     /// #312: the peer cleanly ENDED its send half (FinishedEarly). Kept separate
@@ -1407,6 +1410,10 @@ impl Transport for DirectTransport {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn source_id(&self) -> Option<SourceId> {
+        Some(self.source)
+    }
     fn quic_connection(&self) -> Option<quinn::Connection> {
         // Cloning a quinn::Connection is a handle clone, not a new connection.
         Some(self.conn.clone())
@@ -1555,6 +1562,7 @@ fn note_reader_exit(peer_id: &str, primary: bool, reason: &str, frames: u64, dea
 #[allow(clippy::too_many_arguments)]
 fn reader_task(
     peer_id: String,
+    source: SourceId,
     mut recv: RecvStream,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     last_activity: Arc<std::sync::atomic::AtomicU64>,
@@ -1661,7 +1669,11 @@ fn reader_task(
                 KIND_CONTROL => {
                     match crate::control_limits::decode_control(&body) {
                         Some(v) => {
-                            let _ = tx.send(crate::net::Ev::Control(peer_id.clone(), v));
+                            let _ = tx.send(crate::net::Ev::Sourced {
+                                pid: peer_id.clone(),
+                                source,
+                                inner: Box::new(crate::net::Ev::Control(peer_id.clone(), v)),
+                            });
                         }
                         // A control frame we cannot parse used to vanish here with
                         // no trace; it is a frame the peer believes it sent.
@@ -1792,8 +1804,10 @@ pub fn make_transport_unread(
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
     let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let rx_ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let source = SourceId::next();
     let reader = reader_task(
         peer_id,
+        source,
         recv,
         tx,
         last_activity.clone(),
@@ -1805,6 +1819,7 @@ pub fn make_transport_unread(
     let transport: Arc<dyn Transport> = Arc::new(DirectTransport {
         conn,
         send: Arc::new(Mutex::new(send)),
+        source,
         last_activity,
         dead,
         rx_ended,
@@ -1834,13 +1849,14 @@ pub fn spawn_mesh_accept(
 ) {
     if let Some(dt) = t.as_any().downcast_ref::<DirectTransport>() {
         let conn = dt.conn.clone();
+        let primary_source = dt.source;
         tokio::spawn(async move {
             loop {
                 match conn.accept_bi().await {
                     Ok((send, recv)) => {
                         let conn2 = conn.clone();
                         let worker = make_transport(pid.clone(), conn2, send, recv, tx.clone(), true, None, false);
-                        let _ = tx.send(crate::net::Ev::DirectWorkersReady(pid.clone(), vec![worker]));
+                        let _ = tx.send(crate::net::Ev::DirectWorkersReady(pid.clone(), vec![worker], primary_source));
                     }
                     Err(_) => return,
                 }

@@ -108,7 +108,7 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
             }
         }
         let Some(ev) = ev else { continue };
-        let ev = match conn.stage_event(ev) { Some(ev) => ev, None => continue };
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -155,7 +155,7 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
             }
             Ev::DirectReady(pid, t, route) => {
                 conn.adopt_direct(&pid, t.clone(), route);
-                let _ = tx.send(Ev::ChannelReady(pid, t));
+                let _ = tx.send(Ev::sourced_channel_ready(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
                 conn.mark_ready(&pid, &t, true);
@@ -359,6 +359,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         revoked_peers: HashMap::new(),
         revoked_bindings: HashSet::new(),
         link_events: HashMap::new(),
+        pending_sources: HashMap::new(),
         roster_absent: HashMap::new(),
         log: crate::host_impl::cli_log(),
         host: crate::host_impl::cli_host(),
@@ -383,7 +384,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         };
         sess.tick(&sio).await; // C30: converge every iteration (incl. ticks)
         conn.reap_deferred(); // #28: discharge deferred peer-left when idle/dead
-        let ev = match conn.stage_event(ev) { Some(ev) => ev, None => continue };
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {

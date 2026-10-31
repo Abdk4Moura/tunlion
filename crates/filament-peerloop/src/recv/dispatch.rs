@@ -636,17 +636,41 @@ pub async fn drive(
     }
 }
 
+/// A received Control deferred for later re-dispatch, with the immutable source
+/// captured at first handling. The source is replayed with the event so the
+/// final gate can still reject it if the link was replaced meanwhile.
+#[derive(Clone)]
+pub struct DeferredControl {
+    pub value: Value,
+    pub source: Option<net::SourceId>,
+}
+
+impl DeferredControl {
+    /// Rebuild the event with its original provenance. No source means this was
+    /// loop-authored, so it uses the explicit trusted-internal variant.
+    pub fn into_event(self, pid: &str) -> Ev {
+        match self.source {
+            Some(source) => Ev::Sourced {
+                pid: pid.to_string(),
+                source,
+                inner: Box::new(Ev::Control(pid.to_string(), self.value)),
+            },
+            None => Ev::LocalControl(pid.to_string(), self.value),
+        }
+    }
+}
+
 /// Receive-transfer and consent state for one dispatch.
 pub struct RecvState {
     pub by_sid: HashMap<(String, u32), IncomingFile>,
     pub verify_fails: HashMap<String, u32>,
     pub completed: usize,
     pub ever_received: bool,
-    pub pending: std::collections::VecDeque<(String, Value)>,
+    pub pending: std::collections::VecDeque<(String, DeferredControl)>,
     pub pending_proven: Arc<Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>>,
     pub question_open: Arc<std::sync::atomic::AtomicBool>,
     pub question_shown: Instant,
-    pub recv_pending_offers: HashMap<String, Value>,
+    pub recv_pending_offers: HashMap<String, DeferredControl>,
     pub recv_cers: HashMap<String, Ceremony>,
     pub recv_deadlines: HashMap<String, Instant>,
 }
@@ -1923,13 +1947,13 @@ async fn recv_run(
     // later. Measured as a ~1-in-6 spurious decline between two siblings. The
     // answer is to wait for the identity to settle, not to widen the gate:
     // whether the peer is authorized is exactly what is still being computed.
-    let mut fleet_deferred_offers: Vec<(String, serde_json::Value, Instant)> = Vec::new();
+    let mut fleet_deferred_offers: Vec<(String, DeferredControl, Instant)> = Vec::new();
     // Fleet auto-mesh: hellos from siblings whose certificate verified but whom
     // the owner's signed roster we hold does not list (yet). Held, not
     // admitted and not dropped: the roster usually arrives first, but when a
     // sibling's hello wins that race the link must not be lost for good. Each
     // accepted roster replays these through the same verification.
-    let mut fleet_unlisted_hellos: std::collections::HashMap<String, serde_json::Value> =
+    let mut fleet_unlisted_hellos: std::collections::HashMap<String, DeferredControl> =
         Default::default();
     // Brokered meeting places we have joined: channel -> its one-time secret.
     // Kept so a peer arriving on one is proved by that secret, exactly as a
@@ -3665,8 +3689,8 @@ async fn recv_run(
                 log.debug(&format!(
                     "fleet: offer from {p} waited out its grace unverified; deciding it"
                 ));
-                ov["__fleet_waited"] = serde_json::Value::Bool(true);
-                let _ = tx.send(Ev::Control(p, ov));
+                ov.value["__fleet_waited"] = serde_json::Value::Bool(true);
+                let _ = tx.send(ov.into_event(&p));
             }
         }
         // Drop warm-bootstrap waiters whose peer never acked; the client's read
@@ -3990,15 +4014,15 @@ async fn recv_run(
             last_quiet = None;
         }
 
-        let Some(ev) = ev else { continue };
+        let Some((ev, event_source)) = ev else { continue };
 
         // C23: questions from links that died (supersede/peer-left) are
         // moot, the sender re-offers on its new link. Purge them so a 'y'
         // can never accept a ghost (the duplicate-stream ENOENT crash).
         if !st.pending.is_empty() {
-            let front_id = st.pending.front().map(|(_, v)| v["id"].clone());
+            let front_id = st.pending.front().map(|(_, v)| v.value["id"].clone());
             st.pending.retain(|(p, _)| conn.links.contains_key(p));
-            if st.pending.front().map(|(_, v)| v["id"].clone()) != front_id {
+            if st.pending.front().map(|(_, v)| v.value["id"].clone()) != front_id {
                 conn.present.clear_sticky();
                 if let Some((qpid, qv)) = st.pending.front() {
                     let s = conn.link(qpid).map(|l| l.name.clone()).unwrap_or_default();
@@ -4006,8 +4030,8 @@ async fn recv_run(
                         let q = offer_question(
                             log.as_ref(),
                             &s,
-                            qv["name"].as_str().unwrap_or("file"),
-                            qv["size"].as_u64().unwrap_or(0),
+                            qv.value["name"].as_str().unwrap_or("file"),
+                            qv.value["size"].as_u64().unwrap_or(0),
                             paired,
                         );
                         log.say(&q); // permanent: a new question fronted (C25)
@@ -4902,7 +4926,7 @@ async fn recv_run(
                         let buffered = st.recv_pending_offers.remove(&from);
                         st.recv_pending_offers.clear();
                         if let Some(offer) = buffered {
-                            let _ = tx.send(Ev::Control(from.clone(), offer));
+                            let _ = tx.send(offer.into_event(&from));
                         }
                         continue;
                     }
@@ -5025,7 +5049,7 @@ async fn recv_run(
                             tokio::time::sleep(PROVEN_CHALLENGE_DEADLINE).await;
                             if hold_pending.lock().unwrap().contains_key(&hold_pid) {
                                 hold_pending.lock().unwrap().remove(&hold_pid);
-                                let _ = hold_tx.send(Ev::ChannelReady(hold_pid, hold_t));
+                                let _ = hold_tx.send(Ev::sourced_channel_ready(hold_pid, hold_t));
                             }
                         });
                     } else {
@@ -5033,19 +5057,18 @@ async fn recv_run(
                         // ChannelReady at PAKE confirm. Issue the challenge for
                         // identity but do NOT hold the channel; the file-offer
                         // hold re-injects the first offer until identity settles.
-                        let _ = tx.send(Ev::ChannelReady(pid, t));
+                        let _ = tx.send(Ev::sourced_channel_ready(pid, t));
                     }
                 } else {
                     let _ = tx.send(Ev::ChannelReady(pid, t));
                 }
             }
-            Ev::DirectWorkersReady(pid, workers) => {
-                if let Some(link) = conn.link_mut(&pid) {
-                    link.workers = workers;
-                    log.debug(&format!(
-                        "worker transports ready: {pid} {} workers",
-                        link.workers.len()
-                    ));
+            Ev::DirectWorkersReady(pid, workers, primary_source) => {
+                if conn.accept_workers_ready(&pid, workers, primary_source) {
+                    let count = conn.link(&pid).map(|l| l.workers.len()).unwrap_or(0);
+                    log.debug(&format!("worker transports ready: {pid} {count} workers"));
+                } else {
+                    log.debug(&format!("stale worker transports refused: {pid}"));
                 }
             }
             // P5 (GAP-6): relay->direct upgrade standby connected (receiver side).
@@ -5500,7 +5523,13 @@ async fn recv_run(
                                     log.debug(&format!(
                                         "fleet-hello from {pid} held: not listed in the owner's roster"
                                     ));
-                                    fleet_unlisted_hellos.insert(pid.clone(), v.clone());
+                                    fleet_unlisted_hellos.insert(
+                                        pid.clone(),
+                                        DeferredControl {
+                                            value: v.clone(),
+                                            source: event_source,
+                                        },
+                                    );
                                 }
                                 Ok(ok) if ports.identity.device_cert_revoked(&ok.device_pub) => {
                                     fleet_unlisted_hellos.remove(&pid);
@@ -5531,7 +5560,7 @@ async fn recv_run(
                                             log.debug(&format!(
                                                 "fleet: replaying offer deferred while {p} was unverified"
                                             ));
-                                            let _ = tx.send(Ev::Control(p, ov));
+                                            let _ = tx.send(ov.into_event(&p));
                                         }
                                     }
                                     // Reachability, NOT capability: an empty
@@ -6175,7 +6204,7 @@ async fn recv_run(
                         if let Some((held_t, _deadline)) =
                             st.pending_proven.lock().unwrap().remove(&pid)
                         {
-                            let _ = tx.send(Ev::ChannelReady(pid, held_t));
+                            let _ = tx.send(Ev::sourced_channel_ready(pid, held_t));
                         }
                     }
                 }
@@ -6434,11 +6463,11 @@ async fn recv_run(
                                 // removed loses its link at once rather than on
                                 // the next store change.
                                 revocation_sweep_now = true;
-                                for (hp, hv) in std::mem::take(&mut fleet_unlisted_hellos) {
-                                    if conn.links.contains_key(&hp) {
-                                        let _ = tx.send(Ev::Control(hp, hv));
+                                    for (hp, hv) in std::mem::take(&mut fleet_unlisted_hellos) {
+                                        if conn.links.contains_key(&hp) {
+                                            let _ = tx.send(hv.into_event(&hp));
+                                        }
                                     }
-                                }
                             }
                             Ok(false) => {}
                             Err(e) => log.debug(&format!("roster: rejected: {e}")),
@@ -6676,9 +6705,13 @@ async fn recv_run(
                             let rtx = tx.clone();
                             let rpid = pid.clone();
                             let rv = v.clone();
+                            let rsource = event_source;
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_millis(80)).await;
-                                let _ = rtx.send(Ev::Control(rpid, rv));
+                                let _ = rtx.send(
+                                    DeferredControl { value: rv, source: rsource }
+                                        .into_event(&rpid),
+                                );
                             });
                             continue;
                         }
@@ -7601,7 +7634,10 @@ async fn recv_run(
                         // buffered offer dies with it. A confirmed-but-different peer
                         // (a decoy that authenticated nothing) is simply ignored.
                         if !recv_pake_done && st.recv_cers.contains_key(&pid) {
-                            st.recv_pending_offers.insert(pid.clone(), v.clone());
+                            st.recv_pending_offers.insert(
+                                pid.clone(),
+                                DeferredControl { value: v.clone(), source: event_source },
+                            );
                             log.debug(
                                 "buffering a pre-auth file-offer until its ceremony confirms",
                             );
@@ -7654,7 +7690,7 @@ async fn recv_run(
                         if cfg!(feature = "fleet") {
                             fleet_deferred_offers.push((
                                 pid.clone(),
-                                v.clone(),
+                                DeferredControl { value: v.clone(), source: event_source },
                                 Instant::now() + fleet_offer_grace,
                             ));
                         }
@@ -7808,9 +7844,13 @@ async fn recv_run(
                             let rtx = tx.clone();
                             let rpid = pid.clone();
                             let rv = v.clone();
+                            let rsource = event_source;
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_millis(80)).await;
-                                let _ = rtx.send(Ev::Control(rpid, rv));
+                                let _ = rtx.send(
+                                    DeferredControl { value: rv, source: rsource }
+                                        .into_event(&rpid),
+                                );
                             });
                             continue;
                         }
@@ -7977,7 +8017,10 @@ async fn recv_run(
                     }
                     if !ok {
                         if !daemon && ports.env.interactive_terminal && xfer_deny_reason.is_none() {
-                            st.pending.push_back((pid.clone(), v.clone()));
+                            st.pending.push_back((
+                                pid.clone(),
+                                DeferredControl { value: v.clone(), source: event_source },
+                            ));
                             // The sender's no-answer timeout must not fire on a
                             // person who is still deciding; tell it so.
                             let _ = t.send_control(&protocol::pending_msg(&id)).await;
@@ -9086,20 +9129,20 @@ async fn recv_run(
                         answered = true;
                         let (qpid, mut qv) = st.pending.pop_front().unwrap();
                         conn.present.clear_sticky();
-                        qv["__consent"] = json!(ports.env.consent_token.clone());
-                        let _ = tx.send(Ev::Control(qpid, qv)); // re-enter the offer path, consented
+                        qv.value["__consent"] = json!(ports.env.consent_token.clone());
+                        let _ = tx.send(qv.into_event(&qpid)); // re-enter the offer path, consented
                     } else if ans == "n" || ans == "no" {
                         answered = true;
                         let (qpid, qv) = st.pending.pop_front().unwrap();
                         conn.present.clear_sticky();
                         let qname = filament_transfer::safe_incoming_name(
-                            qv["name"].as_str().unwrap_or("file"),
+                            qv.value["name"].as_str().unwrap_or("file"),
                         );
                         note_refusal(
                             &report,
                             daemon,
                             &qname,
-                            qv["size"].as_u64().unwrap_or(0),
+                            qv.value["size"].as_u64().unwrap_or(0),
                             "declined",
                             &format!("declined {qname}"),
                             RefusalClass::Denied,
@@ -9109,14 +9152,14 @@ async fn recv_run(
                             &format!(
                                 "  declined {}",
                                 filament_transfer::safe_incoming_name(
-                                    qv["name"].as_str().unwrap_or("file")
+                                    qv.value["name"].as_str().unwrap_or("file")
                                 )
                             ),
                         ));
                         if let Some(t) = conn.transport_of(&qpid) {
                             let r = t
                                 .send_control(&protocol::decline_msg(
-                                    qv["id"].as_str().unwrap_or_default(),
+                                    qv.value["id"].as_str().unwrap_or_default(),
                                 ))
                                 .await;
                             peer_step(daemon, &qpid, "decline", r, log.as_ref())?;
@@ -9128,8 +9171,8 @@ async fn recv_run(
                         let q = offer_question(
                             log.as_ref(),
                             &s,
-                            qv["name"].as_str().unwrap_or("file"),
-                            qv["size"].as_u64().unwrap_or(0),
+                            qv.value["name"].as_str().unwrap_or("file"),
+                            qv.value["size"].as_u64().unwrap_or(0),
                             paired,
                         );
                         if answered {

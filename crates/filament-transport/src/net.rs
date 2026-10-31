@@ -278,6 +278,41 @@ pub fn upgrade_verify_idle_ms() -> u64 {
 // ------------------------------------------------------------------ events --
 
 #[derive(Debug)]
+/// Immutable identity of the transport attempt that produced an event. Allocated
+/// before the first event is enqueued and carried through every queue hop so the
+/// final handler can reject a callback from a replaced link.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SourceId(u64);
+
+impl SourceId {
+    /// Placeholder for test fixtures and non-transport events. Never current.
+    pub const UNASSIGNED: Self = SourceId(0);
+
+    /// Monotonic, checked allocation: exhaustion fails loud instead of wrapping
+    /// onto an id that may still have queued events.
+    pub fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let value = NEXT
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| v.checked_add(1),
+            )
+            .expect("SourceId space exhausted; refusing to reuse an id");
+        SourceId(value)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for SourceId {
+    fn default() -> Self {
+        Self::UNASSIGNED
+    }
+}
+
 pub enum Ev {
     Welcome(Value),
     PeerJoined(Value),
@@ -328,9 +363,26 @@ pub enum Ev {
     /// a probe.
     DirectUpgradeReady(String, Arc<dyn Transport>, &'static str),
     /// Async completion: K-1 worker transports connected and ready for
-    /// multi-stream striping. Carries (peer sid, workers).
-    DirectWorkersReady(String, Vec<Arc<dyn Transport>>),
+    /// multi-stream striping. Carries (peer sid, workers, originating primary
+    /// source) so a stale ready from a replaced primary cannot authorize old
+    /// worker sources on the new link.
+    DirectWorkersReady(String, Vec<Arc<dyn Transport>>, SourceId),
     Control(String, Value),
+    /// A transport-origin event with immutable provenance. `pid` must match the
+    /// inner Control/PcState/ChannelReady pid; nested Sourced is invalid. The
+    /// handler gate checks `source` against the current link immediately before
+    /// dispatch.
+    Sourced {
+        pid: String,
+        source: SourceId,
+        inner: Box<Ev>,
+    },
+    /// A Control authored by THIS loop (offer replay, consent re-entry). Not a
+    /// transport callback. Transport emitters must never construct this; the
+    /// transport-source audit test enforces the inventory.
+    LocalControl(String, Value),
+    /// A PcState authored by THIS loop. Transport callbacks use Sourced.
+    LocalPcState(String, String),
     /// `Chunk(peer_id, stream_sid, abs_offset, payload)`.
     /// `abs_offset` is `None` for transports without offset info (DataChannel).
     /// `Some(pos)` for direct-QUIC which embeds the absolute byte offset in
@@ -402,6 +454,22 @@ impl std::fmt::Debug for dyn Transport {
 // --------------------------------------------------------------- transport --
 
 #[async_trait]
+impl Ev {
+    /// Build a ChannelReady event that carries the transport's immutable
+    /// source. A transport without one produces an untagged readiness event,
+    /// which the handler gate rejects (fail closed).
+    pub fn sourced_channel_ready(pid: String, transport: Arc<dyn Transport>) -> Ev {
+        match transport.source_id() {
+            Some(source) => Ev::Sourced {
+                pid: pid.clone(),
+                source,
+                inner: Box::new(Ev::ChannelReady(pid, transport)),
+            },
+            None => Ev::ChannelReady(pid, transport),
+        }
+    }
+}
+
 pub trait Transport: Send + Sync {
     async fn send_control(&self, msg: &Value) -> Result<()>;
     /// Frame and send one chunk: [u32 BE sid][u64 BE abs_offset][payload].
@@ -498,6 +566,12 @@ pub trait Transport: Send + Sync {
     /// the trait interface to every transport implementation. Each concrete
     /// impl returns `self` as `&dyn std::any::Any`.
     fn as_any(&self) -> &dyn std::any::Any;
+    /// Immutable identity of this transport attempt. `None` is only legitimate
+    /// for a transport that emits no provenance-bearing Control/PcState/
+    /// ChannelReady; a required direct adoption with None fails closed.
+    fn source_id(&self) -> Option<SourceId> {
+        None
+    }
     /// Close the underlying QUIC connection immediately. On quinn transports
     /// this sends ApplicationClose(0,"") to the peer, triggering ConnectionLost
     /// so the peer can clean up its link. Called before drop_link purges the
@@ -1631,6 +1705,8 @@ pub struct Peer {
     pub id: String,
     pub polite: bool,
     pub pc: Arc<RTCPeerConnection>,
+    /// Immutable source identity captured before any callback is enqueued.
+    source: SourceId,
     state: Mutex<PeerSignalState>,
     sio: Client,
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -1680,6 +1756,7 @@ impl Peer {
         tx: mpsc::UnboundedSender<Ev>,
         generation: u32,
     ) -> Result<Arc<Peer>> {
+        let source = SourceId::next();
         crate::hooks::debug(&format!(
             "tunlion: ICE-CONFIG peer={peer_id} servers={} urls={:?}",
             ice_servers.len(),
@@ -1789,7 +1866,11 @@ impl Peer {
             pc.on_peer_connection_state_change(Box::new(move |s| {
                 crate::hooks::trace(&format!("[pc-state] {} -> {}", pid, s));
                 if !closed.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = tx.send(Ev::PcState(pid.clone(), s.to_string()));
+                    let _ = tx.send(Ev::Sourced {
+                        pid: pid.clone(),
+                        source,
+                        inner: Box::new(Ev::PcState(pid.clone(), s.to_string())),
+                    });
                 }
                 Box::pin(async {})
             }));
@@ -1797,7 +1878,7 @@ impl Peer {
 
         if !polite {
             let dc = pc.create_data_channel("filament", None).await?;
-            wire_channel(peer_id.clone(), dc, tx.clone(), closed.clone(), polite).await;
+            wire_channel(peer_id.clone(), dc, tx.clone(), closed.clone(), polite, source).await;
             let offer = pc.create_offer(None).await?;
             pc.set_local_description(offer).await?;
             let ld = pc
@@ -1819,7 +1900,7 @@ impl Peer {
                 let closed = closed.clone();
                 let pid = pid.clone();
                 Box::pin(async move {
-                    wire_channel(pid, dc, tx, closed, polite).await;
+                    wire_channel(pid, dc, tx, closed, polite, source).await;
                 })
             }));
         }
@@ -1855,6 +1936,7 @@ impl Peer {
             id: peer_id,
             polite,
             pc,
+            source,
             state: Mutex::new(PeerSignalState {
                 pending_candidates: Vec::new(),
                 has_remote: false,
@@ -1874,6 +1956,11 @@ impl Peer {
 
     pub fn is_connected(&self) -> bool {
         self.pc.connection_state() == RTCPeerConnectionState::Connected
+    }
+
+    /// Immutable identity assigned before any event was enqueued.
+    pub fn source(&self) -> SourceId {
+        self.source
     }
 
     /// #246: a peer connection is "live" while it is establishing or serving.
@@ -2369,6 +2456,7 @@ async fn wire_channel(
     tx: mpsc::UnboundedSender<Ev>,
     closed: Arc<std::sync::atomic::AtomicBool>,
     polite: bool,
+    source: SourceId,
 ) {
     // With detach_data_channels(), on_open still fires but webrtc-rs's
     // managed (65535-byte-buffer) read loop never starts, we detach and run
@@ -2445,7 +2533,11 @@ async fn wire_channel(
                             Ok((n, true)) => {
                                 if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                                     if let Some(v) = crate::control_limits::decode_control(&buf[..n]) {
-                                        let _ = tx.send(Ev::Control(peer_id.clone(), v));
+                                        let _ = tx.send(Ev::Sourced {
+                                            pid: peer_id.clone(),
+                                            source,
+                                            inner: Box::new(Ev::Control(peer_id.clone(), v)),
+                                        });
                                     }
                                 }
                             }
@@ -2558,7 +2650,11 @@ async fn wire_channel(
                         l3_in: tokio::sync::Mutex::new(l3_in_rx),
                         l3_out: l3_out_tx,
                     });
-                ready = Some(Ev::ChannelReady(peer_id.clone(), transport));
+                ready = Some(Ev::Sourced {
+                    pid: peer_id.clone(),
+                    source,
+                    inner: Box::new(Ev::ChannelReady(peer_id.clone(), transport)),
+                });
             }
             announce_then_read(&tx, ready, reader);
         })

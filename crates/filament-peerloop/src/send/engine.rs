@@ -678,7 +678,7 @@ async fn drive_over(
         };
         let Some(ev) = ev else { continue };
         last_activity = Instant::now();
-        let ev = match conn.stage_event(ev) { Some(ev) => ev, None => continue };
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -899,12 +899,10 @@ async fn drive_over(
             }
             Ev::DirectReady(pid, t, route) => {
                 conn.adopt_direct(&pid, t.clone(), route);
-                let _ = tx.send(Ev::ChannelReady(pid, t));
+                let _ = tx.send(Ev::sourced_channel_ready(pid, t));
             }
-            Ev::DirectWorkersReady(pid, workers) => {
-                if let Some(link) = conn.link_mut(&pid) {
-                    link.workers = workers;
-                }
+            Ev::DirectWorkersReady(pid, workers, primary_source) => {
+                conn.accept_workers_ready(&pid, workers, primary_source);
             }
             Ev::DirectUpgradeReady(pid, t, route) => {
                 conn.stash_upgrade_standby(&pid, t, route);

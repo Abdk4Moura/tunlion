@@ -1125,7 +1125,7 @@ pub(crate) async fn send_cmd(
         conn.tick_upgrade_prober().await;
         let Some(ev) = ev else { continue };
 
-        let ev = match conn.stage_event(ev) { Some(ev) => ev, None => continue };
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -1566,15 +1566,12 @@ pub(crate) async fn send_cmd(
                 if let Some(k) = tkey {
                     conn.spawn_direct_workers(&pid, &t, k);
                 }
-                let _ = tx.send(Ev::ChannelReady(pid, t));
+                let _ = tx.send(Ev::sourced_channel_ready(pid, t));
             }
-            Ev::DirectWorkersReady(pid, workers) => {
-                if let Some(link) = conn.link_mut(&pid) {
-                    link.workers = workers;
-                    crate::ui::debug(&format!(
-                        "worker transports ready: {pid} {} workers",
-                        link.workers.len()
-                    ));
+            Ev::DirectWorkersReady(pid, workers, primary_source) => {
+                if conn.accept_workers_ready(&pid, workers, primary_source) {
+                    let count = conn.link(&pid).map(|l| l.workers.len()).unwrap_or(0);
+                    crate::ui::debug(&format!("worker transports ready: {pid} {count} workers"));
                 }
             }
             // P5 (GAP-6): a relay->direct upgrade probe's direct standby connected
@@ -1896,7 +1893,7 @@ pub(crate) async fn send_cmd(
                             // on confirm: the offer lives in that handler, which
                             // already ran and deferred while identity was unproven.
                             if let Some(t) = conn.transport_of(&pid) {
-                                let _ = tx.send(Ev::ChannelReady(pid.clone(), t));
+                                let _ = tx.send(Ev::sourced_channel_ready(pid.clone(), t));
                             }
                         }
                         fleet_session::Outcome::Refused(e) => bail!(
@@ -2436,7 +2433,7 @@ pub(crate) async fn send_cmd(
                             "  {next} is a live link to the same device; resuming there"
                         ));
                         conn.active = Some(next.clone());
-                        let _ = tx.send(Ev::ChannelReady(next, t));
+                        let _ = tx.send(Ev::sourced_channel_ready(next, t));
                     }
                 }
             }
