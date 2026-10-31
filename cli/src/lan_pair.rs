@@ -96,6 +96,14 @@ fn ceremony_frame_kind(v: &Value, confirmed: bool) -> Result<&'static str> {
 /// display name (sent only after mutual confirmation) and its certificate when
 /// it presented one that verified. No store happens here.
 pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, role: &'static str, local_hello: &Value) -> Result<(String, String, Option<DeviceCert>, Value)> {
+    let deadline = Instant::now() + crate::pair_code::CEREMONY_BUDGET;
+    run_ceremony_within(link, words, nameplate, role, local_hello, deadline).await
+}
+
+/// The same ceremony with an explicit deadline. The join path caps this at the
+/// earlier of one ceremony budget and the join's original fixed deadline, so a
+/// rejected candidate can never extend the total join budget.
+pub(crate) async fn run_ceremony_within(link: &mut PairLink, words: &str, nameplate: &str, role: &'static str, local_hello: &Value, deadline: Instant) -> Result<(String, String, Option<DeviceCert>, Value)> {
     let caps = pair_v2_caps();
     let scope = crate::identity::IntroScope::Device.to_byte();
     let mut cer = Ceremony::new(words, nameplate, caps.clone(), scope);
@@ -104,7 +112,6 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
     let my_fp = binding(&link.keying_material, role);
     let their_fp = binding(&link.keying_material, opposite(role));
     let fps = (my_fp.as_str(), their_fp.as_str());
-    let deadline = Instant::now() + crate::pair_code::CEREMONY_BUDGET;
 
     let msg = cer.take_msg_payload().ok_or_else(|| anyhow!("pairing ceremony did not produce an element"))?;
     pair_write(&mut link.send, &msg).await?;
@@ -312,14 +319,18 @@ fn choose_pair_name(records: &[Value], requested: &str, secret: &str, cert_pub: 
     }
 }
 
-/// Test-only interleaving seam for the durable-then-provisional window. It is
-/// compiled only for unit tests and does nothing in production. The two
-/// barriers let a test hold the writer at the exact point after the durable
-/// upsert and before the provisional sidecar, then interleave a real
-/// `devices_upsert_atomic` from another thread.
+/// Test-only seams, compiled only for unit tests. The persist barriers let a
+/// test hold the writer at the exact point after the durable upsert and before
+/// the provisional sidecar, then interleave a real `devices_upsert_atomic` from
+/// another thread. The join seam supplies a short total budget and pre-dialed
+/// notices to the real `join_standalone` loop; production has neither.
 #[cfg(test)]
 pub(super) mod test_seams {
+    use std::collections::VecDeque;
     use std::sync::{Arc, Barrier, Mutex, OnceLock};
+    use std::time::Duration;
+
+    use filament_transport::lan::PairingNotice;
 
     pub(super) struct PersistPause {
         pub reached: Arc<Barrier>,
@@ -340,6 +351,52 @@ pub(super) mod test_seams {
         let Some(pause) = slot().lock().unwrap().take() else { return };
         pause.reached.wait();
         pause.release.wait();
+    }
+
+    /// Test-only join budget and pre-dialed notices. Both are read by the real
+    /// `join_standalone` loop; production builds have neither the statics nor
+    /// the branches, and there is no environment or command-line knob.
+    struct JoinSeam {
+        budget: Duration,
+        notices: VecDeque<PairingNotice>,
+    }
+
+    static JOIN_SEAM: OnceLock<Mutex<Option<JoinSeam>>> = OnceLock::new();
+
+    fn join_slot() -> &'static Mutex<Option<JoinSeam>> {
+        JOIN_SEAM.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(super) struct JoinSeamGuard;
+
+    pub(super) fn install_join_seam(budget: Duration, notices: Vec<PairingNotice>) -> JoinSeamGuard {
+        *join_slot().lock().unwrap() = Some(JoinSeam {
+            budget,
+            notices: notices.into(),
+        });
+        JoinSeamGuard
+    }
+
+    impl Drop for JoinSeamGuard {
+        fn drop(&mut self) {
+            *join_slot().lock().unwrap() = None;
+        }
+    }
+
+    pub(super) fn join_budget(default: Duration) -> Duration {
+        join_slot()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(default, |seam| seam.budget)
+    }
+
+    pub(super) fn take_join_notice() -> Option<PairingNotice> {
+        join_slot()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|seam| seam.notices.pop_front())
     }
 }
 
@@ -680,6 +737,68 @@ pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
     result
 }
 
+/// One candidate's attempt after the caller has dialed it. Only the ceremony is
+/// retryable here; dialing is handled by the caller and persistence by the one
+/// caller that owns the outcome. A rejected link is closed before the loop
+/// moves on, so one bad nearby device cannot hold a stream open.
+enum JoinCandidate {
+    Paired { peer_name: String, secret: String, cert: Option<DeviceCert>, hello: Value },
+    Retry(&'static str),
+}
+
+async fn join_candidate(
+    link: &mut PairLink,
+    words: &str,
+    nameplate: &str,
+    local_hello: &Value,
+    deadline: Instant,
+) -> JoinCandidate {
+    let budget = deadline.saturating_duration_since(Instant::now());
+    // `pair_read` has its own 10 s read budget, so cap the whole candidate as
+    // well: the join's remaining budget is a hard ceiling and is never extended
+    // by a slow or silent peer.
+    match tokio::time::timeout(
+        budget,
+        run_ceremony_within(link, words, nameplate, "joiner", local_hello, deadline),
+    )
+    .await
+    {
+        Ok(Ok((peer_name, secret, cert, hello))) => JoinCandidate::Paired { peer_name, secret, cert, hello },
+        Ok(Err(_)) => {
+            // Never log the protocol error or frame: it can carry peer-chosen
+            // material. A fixed category is enough to diagnose a bad candidate.
+            link.conn.close(quinn::VarInt::from_u32(0), b"pairing candidate rejected");
+            JoinCandidate::Retry("ceremony or protocol failure")
+        }
+        Err(_) => {
+            link.conn.close(quinn::VarInt::from_u32(0), b"pairing candidate timed out");
+            JoinCandidate::Retry("ceremony timed out")
+        }
+    }
+}
+
+fn join_timeout_error(attempts: u32, last: Option<&'static str>) -> anyhow::Error {
+    match last {
+        Some(reason) if attempts > 0 => anyhow!(
+            "no nearby pairing device completed the code within 10 minutes ({attempts} candidate(s) tried; last: {reason})"
+        ),
+        _ => anyhow!("no nearby pairing device appeared within 10 minutes"),
+    }
+}
+
+/// The join's total budget. Test builds may shorten it through the seam that
+/// the real loop reads; production always uses the code's 600 s lifetime.
+fn join_code_budget() -> Duration {
+    #[cfg(test)]
+    {
+        test_seams::join_budget(CODE_TTL)
+    }
+    #[cfg(not(test))]
+    {
+        CODE_TTL
+    }
+}
+
 /// Join a plain code over the LAN. Interactive use asks before dialing; a
 /// non-interactive run must have said `--nearby` at the command line.
 pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> Result<()> {
@@ -708,17 +827,27 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
     .await?;
     let local_hello = pair_hello(&svc);
     let result = async {
-        let deadline = Instant::now() + CODE_TTL;
+        let deadline = Instant::now() + join_code_budget();
         let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut attempts: u32 = 0;
+        let mut last_retry: Option<&'static str> = None;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                bail!("no nearby pairing device appeared within 10 minutes");
+                return Err(join_timeout_error(attempts, last_retry));
             }
-            let notice = match tokio::time::timeout(left.min(Duration::from_secs(2)), pairing_rx.recv()).await {
-                Ok(Some(notice)) => notice,
-                Ok(None) => bail!("LAN service stopped"),
-                Err(_) => continue,
+            #[cfg(test)]
+            let injected = test_seams::take_join_notice();
+            #[cfg(not(test))]
+            let injected: Option<filament_transport::lan::PairingNotice> = None;
+            let notice = if let Some(notice) = injected {
+                notice
+            } else {
+                match tokio::time::timeout(left.min(Duration::from_secs(2)), pairing_rx.recv()).await {
+                    Ok(Some(notice)) => notice,
+                    Ok(None) => bail!("LAN service stopped"),
+                    Err(_) => continue,
+                }
             };
             let filament_transport::lan::PairingNotice { addr, label } = notice;
             let key = format!("{addr}|{label}");
@@ -737,6 +866,8 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
                     bail!("nearby pairing needs --nearby when stdin is not a terminal");
                 }
                 ui::say(&ui::paint(ui::Tone::Dim, "  compare this label with the screen showing the code"));
+                // Cancellation and prompt errors stay terminal: `?` returns the
+                // user's decision, it never turns into another candidate dial.
                 let picked = crate::codeentry::pick_opts(
                     "",
                     &["Yes, use this device".to_string(), "No".to_string()],
@@ -746,16 +877,43 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
                     continue;
                 }
             }
-            let mut link = tokio::time::timeout(Duration::from_secs(6), svc.pair_dial(vec![addr])).await
-                .map_err(|_| anyhow!("pairing dial timed out"))??;
-            let token = 0;
-            let (peer_name, secret, cert, hello) = run_ceremony(&mut link, &words, &nameplate, "joiner", &local_hello).await?;
-            let peer_name = name.clone().unwrap_or(peer_name);
-            let outcome = Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() };
-            let (saved, peer_acked) = persist_then_ack(&mut link, &outcome).await?;
-            svc.learn(&saved, &hello);
-            ui::say(&ui::paint(ui::Tone::Dim, saved_claim(peer_acked)));
-            return Ok::<(), anyhow::Error>(());
+            // Dial and ceremony are the only retryable steps. A bad nearby
+            // device must not consume the whole join budget or end the search
+            // before a later legitimate host is heard.
+            let dial_budget = Duration::from_secs(6).min(left);
+            let mut link = match tokio::time::timeout(dial_budget, svc.pair_dial(vec![addr])).await {
+                Ok(Ok(link)) => link,
+                Ok(Err(_)) => {
+                    attempts = attempts.saturating_add(1);
+                    last_retry = Some("dial failed");
+                    ui::debug("lan pairing: candidate dial failed; trying the next nearby device");
+                    continue;
+                }
+                Err(_) => {
+                    attempts = attempts.saturating_add(1);
+                    last_retry = Some("dial timed out");
+                    ui::debug("lan pairing: candidate dial timed out; trying the next nearby device");
+                    continue;
+                }
+            };
+            let candidate_deadline = (Instant::now() + crate::pair_code::CEREMONY_BUDGET).min(deadline);
+            match join_candidate(&mut link, &words, &nameplate, &local_hello, candidate_deadline).await {
+                JoinCandidate::Paired { peer_name, secret, cert, hello } => {
+                    let peer_name = name.clone().unwrap_or(peer_name);
+                    let outcome = Outcome { token: 0, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() };
+                    // Store/metadata failure is terminal: never retry another
+                    // candidate after the one store path has been entered.
+                    let (saved, peer_acked) = persist_then_ack(&mut link, &outcome).await?;
+                    svc.learn(&saved, &hello);
+                    ui::say(&ui::paint(ui::Tone::Dim, saved_claim(peer_acked)));
+                    return Ok::<(), anyhow::Error>(());
+                }
+                JoinCandidate::Retry(reason) => {
+                    attempts = attempts.saturating_add(1);
+                    last_retry = Some(reason);
+                    ui::debug("lan pairing: candidate rejected the code; trying the next nearby device");
+                }
+            }
         }
     }
     .await;

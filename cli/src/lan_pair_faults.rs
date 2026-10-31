@@ -537,6 +537,59 @@ fn one_carrier_wins_and_a_stale_loser_stores_nothing() {
     assert!(!cfg.device_exists("stale"), "the stale closure never ran");
 }
 
+#[test]
+fn an_expired_signaling_claim_is_reclaimed_and_its_old_token_cannot_store() {
+    let _guard = lock_test_config();
+    let cfg = ConfigDir::new("expired-claim");
+    let now = Instant::now();
+    let code = PairCode::new([8; 16], now);
+    let mut token = None;
+
+    // A signaling carrier starts and then abandons without calling fail().
+    assert_eq!(
+        start_signaling_claim(&code, &mut token, now),
+        SignalingClaimStart::Started
+    );
+    let stale = token.expect("the abandoned claim's token");
+    assert_eq!(
+        start_signaling_claim(&code, &mut token, now + Duration::from_secs(1)),
+        SignalingClaimStart::Waiting,
+        "a fresh active attempt still owns the slot"
+    );
+
+    // Once its attempt deadline passes, the next carrier reclaims it.
+    assert_eq!(
+        start_signaling_claim(&code, &mut token, now + crate::pair_code::CEREMONY_BUDGET),
+        SignalingClaimStart::Started
+    );
+    let fresh = token.expect("the reclaiming carrier's token");
+    assert_ne!(stale, fresh, "reclaim must issue a new token");
+
+    let error = store_after_signaling_claim(
+        Some(&code),
+        Some(stale),
+        now + crate::pair_code::CEREMONY_BUDGET + Duration::from_secs(1),
+        || {
+            crate::devices_store::devices_upsert_atomic(
+                "abandoned",
+                Some("abandoned-secret"),
+                None,
+                Some(&["transfer".to_string()]),
+                Some(crate::identity::IntroScope::Device.to_byte()),
+                None,
+                None,
+                false,
+            )
+        },
+    )
+    .expect_err("the abandoned token must not store");
+    assert!(
+        error.to_string().contains("already used by a nearby device"),
+        "got: {error}"
+    );
+    assert!(!cfg.device_exists("abandoned"), "the stale closure never ran");
+}
+
 // ---------------------------------------------------------------------------
 // 4. Forced host cancel after a real ceremony failure: the listener, service
 //    tasks and ceremony task are all closed or joined, leaving no orphan pair
@@ -606,4 +659,251 @@ async fn a_cancelled_host_closes_its_listener_and_joins_its_ceremony_task() {
     );
     assert!(code.winner().is_none(), "a failed ceremony must not claim a winner");
     let _ = cfg;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Standalone join: a reachable bad candidate is retried, a later real host
+//    succeeds, and a silent candidate consumes only its bounded budget.
+// ---------------------------------------------------------------------------
+
+/// A real silent host: it accepts the pairing stream but never runs a
+/// ceremony, so the candidate can only end through the bounded read/timeout.
+async fn silent_host() -> (u16, LanService, mpsc::Receiver<PairLink>, PathBuf) {
+    let dir = unique_dir("silent-host");
+    let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+    let (pair_tx, pair_rx) = mpsc::channel(2);
+    let service = LanService::start(
+        &dir,
+        Options { serve: true, pairing: Some([6; 16]), ..Default::default() },
+        Arc::new(Vec::<filament_transport::lan::LanKey>::new),
+        Some(pair_tx),
+        None,
+        ev_tx,
+    )
+    .await
+    .expect("silent host starts");
+    let port = service.hello_json()["port"]
+        .as_u64()
+        .expect("silent host advertises its port") as u16;
+    (port, service, pair_rx, dir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bad_candidate_is_retried_then_the_right_host_succeeds() {
+    let _guard = lock_test_config();
+
+    // A real candidate that is reachable but sends an out-of-phase frame.
+    let mut bad = connected_pair().await;
+    pair_write(&mut bad.host.send, &json!({"type": "identity-expose", "v": 2}))
+        .await
+        .expect("queue the bad candidate's frame");
+    let local_hello = json!({"role": "joiner-test"});
+    let first = join_candidate(
+        &mut bad.peer,
+        "brave otter",
+        "3141",
+        &local_hello,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        matches!(first, JoinCandidate::Retry(_)),
+        "the bad candidate must be retryable"
+    );
+
+    // Then the legitimate host runs the real production ceremony concurrently.
+    let host_dir = unique_dir("right-host");
+    let peer_dir = unique_dir("right-peer");
+    let (host_ev_tx, _host_ev_rx) = mpsc::unbounded_channel();
+    let (host_pair_tx, mut host_pair_rx) = mpsc::channel(2);
+    let host_service = LanService::start(
+        &host_dir,
+        Options { serve: true, pairing: Some([7; 16]), ..Default::default() },
+        Arc::new(Vec::<filament_transport::lan::LanKey>::new),
+        Some(host_pair_tx),
+        None,
+        host_ev_tx,
+    )
+    .await
+    .expect("right host starts");
+    let port = host_service.hello_json()["port"]
+        .as_u64()
+        .expect("right host advertises its port") as u16;
+    let (peer_ev_tx, _peer_ev_rx) = mpsc::unbounded_channel();
+    let peer_service = LanService::start(
+        &peer_dir,
+        Options::default(),
+        Arc::new(Vec::<filament_transport::lan::LanKey>::new),
+        None,
+        None,
+        peer_ev_tx,
+    )
+    .await
+    .expect("joiner dial service starts");
+    let mut peer = peer_service
+        .pair_dial(vec![(Ipv4Addr::LOCALHOST, port).into()])
+        .await
+        .expect("dial the right host");
+    let peer_hello = peer_service.hello_json();
+    let host_hello = host_service.hello_json();
+    let host_task = tokio::spawn(async move {
+        let mut host = tokio::time::timeout(Duration::from_secs(10), host_pair_rx.recv())
+            .await
+            .expect("the right host accepted a pairing stream")
+            .expect("the right host's pair channel is open");
+        run_ceremony(&mut host, "brave otter", "3141", "host", &host_hello).await
+    });
+
+    let second = join_candidate(
+        &mut peer,
+        "brave otter",
+        "3141",
+        &peer_hello,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await;
+    match second {
+        JoinCandidate::Paired { secret, .. } => assert!(!secret.is_empty()),
+        JoinCandidate::Retry(reason) => panic!("the right host was retried away: {reason}"),
+    }
+    let host_result = tokio::time::timeout(Duration::from_secs(10), host_task)
+        .await
+        .expect("the right host's ceremony finished")
+        .expect("the right host task did not panic");
+    assert!(host_result.is_ok(), "the right host completed its ceremony");
+    let _ = (host_service, peer_service, host_dir, peer_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_candidate_is_bounded_and_all_invalid_errors_are_honest() {
+    let _guard = lock_test_config();
+    let (port, host_service, _pair_rx, host_dir) = silent_host().await;
+    let peer_dir = unique_dir("silent-peer");
+    let (peer_ev_tx, _peer_ev_rx) = mpsc::unbounded_channel();
+    let peer_service = LanService::start(
+        &peer_dir,
+        Options::default(),
+        Arc::new(Vec::<filament_transport::lan::LanKey>::new),
+        None,
+        None,
+        peer_ev_tx,
+    )
+    .await
+    .expect("silent-candidate dial service starts");
+    let mut peer = peer_service
+        .pair_dial(vec![(Ipv4Addr::LOCALHOST, port).into()])
+        .await
+        .expect("dial the silent host");
+    let hello = peer_service.hello_json();
+    let start = Instant::now();
+    let result = join_candidate(
+        &mut peer,
+        "brave otter",
+        "3141",
+        &hello,
+        start + Duration::from_millis(250),
+    )
+    .await;
+    assert!(
+        matches!(result, JoinCandidate::Retry("ceremony timed out")),
+        "a silent candidate is bounded by the remaining budget"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "the silent candidate consumed more than its slice"
+    );
+
+    let error = join_timeout_error(1, Some("ceremony timed out"));
+    let text = error.to_string();
+    assert!(text.contains("1 candidate(s) tried"), "got: {text}");
+    assert!(text.contains("ceremony timed out"), "got: {text}");
+    assert!(!text.contains("brave"), "the code words must not leak: {text}");
+    let _ = (host_service, peer_service, host_dir, peer_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_invalid_candidates_exit_at_the_original_join_budget() {
+    let _guard = lock_test_config();
+    let _cfg = ConfigDir::new("all-invalid");
+    let (port, host_service, _pair_rx, host_dir) = silent_host().await;
+    let notice = filament_transport::lan::PairingNotice {
+        addr: (Ipv4Addr::LOCALHOST, port).into(),
+        label: "test".to_string(),
+    };
+    let _seam = test_seams::install_join_seam(
+        Duration::from_millis(400),
+        vec![notice],
+    );
+    let start = Instant::now();
+    let error = join_standalone("brave-otter-3141", None, true)
+        .await
+        .expect_err("an all-invalid join must not report success");
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "the join must stop at its original budget"
+    );
+    let text = error.to_string();
+    assert!(text.contains("candidate(s) tried"), "got: {text}");
+    assert!(text.contains("ceremony timed out"), "got: {text}");
+    assert!(!text.contains("brave"), "the code words must not leak: {text}");
+    let _ = (host_service, host_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_failure_ends_the_join_without_another_candidate() {
+    let _guard = lock_test_config();
+    let cfg = ConfigDir::new("store-failure");
+    std::fs::write(cfg.path().join("devices.json"), "not a JSON list")
+        .expect("seed an unreadable device store");
+
+    let host_dir = unique_dir("store-failure-host");
+    let (host_ev_tx, _host_ev_rx) = mpsc::unbounded_channel();
+    let (host_pair_tx, mut host_pair_rx) = mpsc::channel(2);
+    let host_service = LanService::start(
+        &host_dir,
+        Options { serve: true, pairing: Some([9; 16]), ..Default::default() },
+        Arc::new(Vec::<filament_transport::lan::LanKey>::new),
+        Some(host_pair_tx),
+        None,
+        host_ev_tx,
+    )
+    .await
+    .expect("store-failure host starts");
+    let port = host_service.hello_json()["port"]
+        .as_u64()
+        .expect("store-failure host advertises its port") as u16;
+    let host_hello = host_service.hello_json();
+    let host_task = tokio::spawn(async move {
+        let mut host = tokio::time::timeout(Duration::from_secs(10), host_pair_rx.recv())
+            .await
+            .expect("store-failure host accepted a stream")
+            .expect("store-failure host pair channel is open");
+        run_ceremony(&mut host, "brave otter", "3141", "host", &host_hello).await
+    });
+    let notice = filament_transport::lan::PairingNotice {
+        addr: (Ipv4Addr::LOCALHOST, port).into(),
+        label: "test".to_string(),
+    };
+    let _seam = test_seams::install_join_seam(
+        Duration::from_secs(5),
+        vec![notice],
+    );
+    let start = Instant::now();
+    let error = join_standalone("brave-otter-3141", None, true)
+        .await
+        .expect_err("a store failure must not report success");
+    assert!(
+        error.to_string().contains("devices.json is not a JSON list"),
+        "got: {error}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "the join returned on the store failure instead of retrying"
+    );
+    let host_result = tokio::time::timeout(Duration::from_secs(10), host_task)
+        .await
+        .expect("the host ceremony finished")
+        .expect("the host task did not panic");
+    assert!(host_result.is_ok());
+    let _ = (host_service, host_dir);
 }

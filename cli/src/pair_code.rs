@@ -101,6 +101,13 @@ impl PairCode {
 
     /// Start a ceremony. The caller must send no PAKE frame and store nothing
     /// before this returns `Started`.
+    ///
+    /// An `Active` claim is only busy while its own attempt deadline is live.
+    /// Once that deadline has passed the claimant can no longer confirm (nor
+    /// store through `confirm`), so the next carrier reclaims the slot with a
+    /// fresh token under this same lock. The old token stays stale forever: it
+    /// can never match the new `Active.token`. Global code expiry is checked
+    /// first and remains authoritative.
     pub fn begin(&self, carrier: Carrier, now: Instant) -> Begin {
         let mut g = self.inner.lock().unwrap();
         if matches!(g.phase, Phase::Consumed(_) | Phase::Closed(_)) {
@@ -113,8 +120,10 @@ impl PairCode {
         if now < g.next_attempt_at {
             return Begin::Busy;
         }
-        if matches!(g.phase, Phase::Active(_)) {
-            return Begin::Busy;
+        if let Phase::Active(active) = &g.phase {
+            if now < active.attempt_deadline {
+                return Begin::Busy;
+            }
         }
         let token = fresh_token();
         let attempt_deadline = (now + CEREMONY_BUDGET).min(g.deadline);
@@ -256,5 +265,93 @@ mod tests {
         c.fail(a, t0);
         let b = match c.begin(Carrier::Lan, t0 + Duration::from_secs(5)) { Begin::Started(t) => t, _ => panic!() };
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_fresh_active_claim_stays_busy_until_its_attempt_deadline() {
+        let c = code();
+        let t0 = Instant::now();
+        let first = match c.begin(Carrier::Signaling, t0) {
+            Begin::Started(t) => t,
+            other => panic!("{other:?}"),
+        };
+        // Just before this attempt's own deadline it still owns the slot.
+        assert_eq!(
+            c.begin(Carrier::Lan, t0 + CEREMONY_BUDGET - Duration::from_millis(1)),
+            Begin::Busy
+        );
+        // At the deadline the slot is reclaimable, and the old token is stale.
+        let second = match c.begin(Carrier::Lan, t0 + CEREMONY_BUDGET) {
+            Begin::Started(t) => t,
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(first, second);
+        assert!(!c.confirm(first, t0 + CEREMONY_BUDGET + Duration::from_millis(1)));
+        assert_eq!(c.winner(), None);
+        assert!(c.confirm(second, t0 + CEREMONY_BUDGET + Duration::from_millis(1)));
+        assert_eq!(c.winner(), Some(Carrier::Lan));
+    }
+
+    #[test]
+    fn an_expired_active_claim_is_reclaimed_by_the_next_carrier() {
+        let c = code();
+        let t0 = Instant::now();
+        let _abandoned = match c.begin(Carrier::Signaling, t0) {
+            Begin::Started(t) => t,
+            other => panic!("{other:?}"),
+        };
+        let reclaimed = match c.begin(Carrier::Lan, t0 + CEREMONY_BUDGET + Duration::from_secs(1)) {
+            Begin::Started(t) => t,
+            other => panic!("expired claim must be reclaimable: {other:?}"),
+        };
+        assert!(c.confirm(reclaimed, t0 + CEREMONY_BUDGET + Duration::from_secs(2)));
+        assert_eq!(c.winner(), Some(Carrier::Lan));
+    }
+
+    #[test]
+    fn global_code_expiry_wins_over_reclaiming_an_active_claim() {
+        let c = code();
+        let t0 = Instant::now();
+        let _abandoned = match c.begin(Carrier::Signaling, t0) {
+            Begin::Started(t) => t,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(c.begin(Carrier::Lan, t0 + CODE_TTL), Begin::Closed);
+        assert!(c.is_closed());
+    }
+
+    #[test]
+    fn concurrent_carriers_get_one_winner_after_reclaim() {
+        use std::sync::{Arc, Barrier};
+
+        let c = code();
+        let t0 = Instant::now();
+        let _abandoned = match c.begin(Carrier::Signaling, t0) {
+            Begin::Started(t) => t,
+            other => panic!("{other:?}"),
+        };
+        let reclaim_at = t0 + CEREMONY_BUDGET + Duration::from_secs(1);
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for carrier in [Carrier::Lan, Carrier::Signaling] {
+            let c = c.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                match c.begin(carrier, reclaim_at) {
+                    Begin::Started(t) => Some(t),
+                    Begin::Busy => None,
+                    Begin::Closed => panic!("the code is still open"),
+                }
+            }));
+        }
+        barrier.wait();
+        let tokens: Vec<u64> = workers
+            .into_iter()
+            .filter_map(|h| h.join().expect("carrier thread"))
+            .collect();
+        assert_eq!(tokens.len(), 1, "exactly one carrier starts");
+        assert!(c.confirm(tokens[0], reclaim_at + Duration::from_secs(1)));
+        assert!(c.winner().is_some());
     }
 }

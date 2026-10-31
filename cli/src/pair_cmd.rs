@@ -2571,6 +2571,14 @@ async fn pair_with_purpose(
         }
     }
     }.await;
+    // A signaling claim is only a loan: if this command leaves before a
+    // confirmed winner, release it so an abandoned peer claim cannot block the
+    // LAN carrier until the code's 600 s deadline. `fail` is token-checked, so
+    // a confirmed winner (`Consumed`) and a newer carrier's token are untouched;
+    // the existing bounded backoff still applies.
+    if let (Some(code), Some(token)) = (pair_code.as_ref(), signaling_token) {
+        code.fail(token, Instant::now());
+    }
     // Every normal, error and cancellation path leaves through here: join the
     // LAN host tasks before returning, not in a detached Drop.
     if let Some(mut h) = lan_host.take() {
