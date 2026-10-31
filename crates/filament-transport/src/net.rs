@@ -312,6 +312,7 @@ impl Default for SourceId {
     }
 }
 
+#[derive(Debug)]
 pub enum Ev {
     Welcome(Value),
     PeerJoined(Value),

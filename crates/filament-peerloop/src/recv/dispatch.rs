@@ -3003,7 +3003,7 @@ async fn recv_run(
             // connection's own `welcome` did, so the ladder could never climb
             // (defect 2). Only a connection that stays up STABLE_AFTER does.
             let mut saw_down = false;
-            match &ev {
+            match ev.as_ref().map(|(event, _)| event) {
                 Some(Ev::SignalingDown(reason, closed)) => {
                     if signaling_health::close_is_current(*closed, sio.id()) {
                         saw_down = true;
