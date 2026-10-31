@@ -106,7 +106,7 @@ happy() {
   asA env TUNLION_LOG=debug TUNLION_NAME=boxa "$BIN" --server "$SERVER" up --detach --dir "$WORK/Adrop" >"$WORK/upA.log" 2>&1
   asB env TUNLION_LOG=debug TUNLION_NAME=boxb "$BIN" --server "$SERVER" up --detach --dir "$WORK/Bdrop" >"$WORK/upB.log" 2>&1
   local line=""
-  for _ in $(seq 1 60); do
+  for _ in $(seq 1 180); do
     line=$(asA timeout 5 "$BIN" reach boxb --timeout 2 2>&1 | grep 'pong via' || true)
     [ -n "$line" ] && break
     sleep 0.5

@@ -1700,6 +1700,9 @@ async fn pair_with_purpose(
                         if let Some(e) = failed {
                             return Err(e);
                         }
+                        if let Some(mut h) = lan_host.take() {
+                            h.shutdown().await;
+                        }
                         offer_background_after_pairing();
                         return Ok(());
                     } // close: not awaiting an enrolment answer
