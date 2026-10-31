@@ -307,6 +307,9 @@ pub enum Ev {
     /// signal the watchdog falsely declared a healthy idle link dead every ~30 s
     /// and reconnected, churning presence for every known device.
     SignalingAlive,
+    /// Internal wake for an off-loop build completion. Drivers pump completions
+    /// on receipt; it carries no protocol meaning and is never sent on a wire.
+    BuildWake,
     /// (peer sid, ...), every channel event is attributed to its link so
     /// the loops can hold many links at once (C18 multi-link).
     ChannelReady(String, Arc<dyn Transport>),
