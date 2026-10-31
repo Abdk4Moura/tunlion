@@ -658,9 +658,11 @@ pub async fn pair_write(send: &mut SendStream, v: &Value) -> Result<()> {
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&(body.len() as u32).to_be_bytes());
     out.extend_from_slice(&body);
+    eprintln!("PAIRDBG write {} bytes", out.len());
     tokio::time::timeout(PAIR_FRAME_BUDGET, send.write_all(&out))
         .await
         .map_err(|_| anyhow!("pairing frame write timed out"))??;
+    eprintln!("PAIRDBG write done");
     Ok(())
 }
 
@@ -677,6 +679,7 @@ pub async fn pair_read(recv: &mut RecvStream) -> Result<Value> {
     tokio::time::timeout(PAIR_FRAME_BUDGET, recv.read_exact(&mut body))
         .await
         .map_err(|_| anyhow!("pairing frame body timed out"))??;
+    eprintln!("PAIRDBG read {} bytes", len);
     serde_json::from_slice(&body).context("pairing frame is not JSON")
 }
 
