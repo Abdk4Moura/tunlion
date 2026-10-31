@@ -38,7 +38,11 @@ cleanup() {
   $SUDO pkill -f "$WORK/" 2>/dev/null
   for n in "${NS[@]}"; do $SUDO ip netns del "$n" 2>/dev/null; done
   $SUDO ip link del lpa0 2>/dev/null; $SUDO ip link del lpb0 2>/dev/null
-  rm -rf "$WORK"
+  if [ "${LAN_PAIR_KEEP:-0}" = "1" ]; then
+    echo "kept: $WORK"
+  else
+    rm -rf "$WORK"
+  fi
 }
 trap cleanup EXIT
 
@@ -158,5 +162,8 @@ happy
 wrong_code
 denied
 echo
+if [ "$FAIL" -ne 0 ]; then
+  for f in "$WORK"/*.log; do [ -f "$f" ] && { echo "--- $f"; tail -40 "$f"; }; done
+fi
 echo "lan-pairing gates: $PASS passed, $FAIL failed${FAILED:+ ($FAILED)}"
 [ "$FAIL" = 0 ]
