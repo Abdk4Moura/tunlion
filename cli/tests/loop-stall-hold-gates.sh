@@ -16,6 +16,8 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-hold.XXXXXX")"
 DA="$WORK/alpha"
 HOLD_MS=${HOLD_MS:-8000}
 ACTION=${ACTION:-forget}
+DELAY_MS=""
+[ "$ACTION" = "peerleft" ] && DELAY_MS="$HOLD_MS"
 
 source "$HERE/lib/fixture.sh"
 trap fixture_cleanup EXIT
@@ -29,6 +31,7 @@ up_with_hold() { # dir log extra env...
     TUNLION_L2=1 TUNLION_LOG=debug \
     TUNLION_DIRECT_TEST_BLOCK=1 \
     TUNLION_TEST_BUILD_HOLD_MS="$HOLD_MS" \
+    TUNLION_TEST_ESTABLISH_DELAY_MS="${DELAY_MS:-}" \
     "$@" \
     "$BIN" --server "$SERVER" up --dir "$WORK/$(basename "$dir")-drop" >"$log" 2>&1 &
   FIX_PIDS+=($!)
@@ -44,13 +47,15 @@ up_with_hold "$WORK/bravo" "$WORK/up-bravo.log"
 
 # Wait for a candidate to actually be built and held.
 held=0
+marker="BUILD-HOLD"
+[ "$ACTION" = "peerleft" ] && marker="BUILD-DELAY"
 for _ in $(seq 1 80); do
-  if grep -q "BUILD-HOLD" "$WORK/up.log" "$WORK/up-bravo.log" 2>/dev/null; then held=1; break; fi
+  if grep -q "$marker" "$WORK/up.log" "$WORK/up-bravo.log" 2>/dev/null; then held=1; break; fi
   sleep 0.5
 done
-[ "$held" = 1 ] || fixture_die "no build reached the hold point"
+[ "$held" = 1 ] || fixture_die "no build reached the $marker point"
 
-held_pid=$(grep -m1 -oP 'BUILD-HOLD peer=\K[^ ]+' "$WORK/up.log" "$WORK/up-bravo.log" 2>/dev/null | head -1 | sed 's/^[^:]*://')
+held_pid=$(grep -m1 -oP "$marker peer=\K[^ ]+" "$WORK/up.log" "$WORK/up-bravo.log" 2>/dev/null | head -1 | sed 's/^[^:]*://')
 [ -n "$held_pid" ] || fixture_die "BUILD-HOLD had no peer id"
 before_alpha=$(grep -c "tunlion: ESTABLISH peer=$held_pid" "$WORK/up.log" 2>/dev/null || true)
 before_bravo=$(grep -c "tunlion: ESTABLISH peer=$held_pid" "$WORK/up-bravo.log" 2>/dev/null || true)
@@ -66,6 +71,13 @@ case "$ACTION" in
   peerleft)
     pid=$(pgrep -f "$WORK/bravo-drop" | head -1)
     [ -n "$pid" ] && kill -TERM "$pid" || echo "no bravo pid for peer-left"
+    observed=0
+    for _ in $(seq 1 80); do
+      if grep -q "peer-left invalidated build pid=$held_pid" "$WORK/up.log" 2>/dev/null; then observed=1; break; fi
+      sleep 0.25
+    done
+    [ "$observed" = 1 ] && ok "observed peer-left for held pid $held_pid with generation" \
+      || bad "peer-left was never observed for held pid $held_pid"
     ;;
   shutdown)
     fs_bounded 20 env HOME="$WORK/home-bravo" TUNLION_CONFIG_DIR="$WORK/bravo" "$BIN" down -y >/dev/null 2>&1 || true
