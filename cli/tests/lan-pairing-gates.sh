@@ -93,8 +93,13 @@ start_host() {
 stop_host() { [ -f "$WORK/host.pid" ] && kill "$(cat "$WORK/host.pid")" 2>/dev/null; }
 
 happy() {
-  say "lan pairing: happy path (server blocked)"
+  say "lan pairing: happy path (server blocked, daemons already running)"
   init_pair || return
+  # The daemons are already running before the code exists: pairing must feed
+  # their live LanService, not only the one-shot's temporary service.
+  asA env TUNLION_LOG=debug TUNLION_NAME=boxa "$BIN" --server "$SERVER" up --detach --dir "$WORK/Adrop" >"$WORK/upA.log" 2>&1
+  asB env TUNLION_LOG=debug TUNLION_NAME=boxb "$BIN" --server "$SERVER" up --detach --dir "$WORK/Bdrop" >"$WORK/upB.log" 2>&1
+  sleep 2
   start_host "$WORK/host.log" || { bad "host never showed a code"; return; }
   local code; code=$(code_of "$WORK/host.log")
   [ -n "$code" ] || { bad "no code in host output"; return; }
@@ -106,9 +111,7 @@ happy() {
   fi
   stop_host
   if grep -aq '"secret"' "$DA/devices.json" && grep -aq '"secret"' "$DB/devices.json"; then ok "both sides stored a pair secret"; else bad "pair secret missing"; fi
-  # The same pair secret is what `up` and `send` consume.
-  asA env TUNLION_LOG=debug TUNLION_NAME=boxa "$BIN" --server "$SERVER" up --detach --dir "$WORK/Adrop" >"$WORK/upA.log" 2>&1
-  asB env TUNLION_LOG=debug TUNLION_NAME=boxb "$BIN" --server "$SERVER" up --detach --dir "$WORK/Bdrop" >"$WORK/upB.log" 2>&1
+  # The already-running daemons are what `reach` and `send` consume.
   local line=""
   for _ in $(seq 1 180); do
     line=$(asA timeout 5 "$BIN" reach boxb --timeout 2 2>&1 | grep 'pong via' || true)
