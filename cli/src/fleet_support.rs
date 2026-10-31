@@ -399,6 +399,11 @@ pub(crate) fn forget_device(name: &str, now: u64) -> Result<ForgetOutcome> {
         crate::sshkeys::remove_authorized_key(name)?;
     }
     crate::device_caps::devices_remove(name)?;
+    // Local discovery's remembered addresses and presence key are part of the
+    // device's access too: keeping them would let a forgotten peer still be
+    // dialled and recognized on the LAN. Presence-key rotation is a separate
+    // spec SHOULD; this removes the record now.
+    filament_transport::lan::LanStore::new(&crate::settings::config_dir()).forget(name);
     Ok(ForgetOutcome { name: name.to_string(), verdict })
 }
 

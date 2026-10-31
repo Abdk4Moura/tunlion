@@ -296,7 +296,8 @@ and the test or gate that closes it. Units 1 to 7 are phase 1; 8 is phase 2.
 | 5 | Loops | `filament-peerloop` `lan_glue.rs` (`seed_lan`, `lan_dial`, `on_linked`, `Ownership`), `recv/dispatch.rs` (start without the server, non-blocking re-dial, periodic remembered dial, `lan-hello` send and learn), `cli/src/send_cmd.rs` + `lan_send.rs` (one-shot send dials remembered addresses beside signaling) | a LAN link is an ordinary `Ev::DirectReady` with route `lan` | `cli/tests/lan-discovery-gates.sh` |
 | 6 | Settings and surfaces | `cli/src/settings.rs` (`network.transports`, `network.lan-skip`), `ping.rs`, `devices`, `doctor.rs` + `lan_doctor.rs` | route word `lan`; doctor `lan` row and `--json` `lan` | unit tests for the validator and the doctor row |
 | 7 | Model | `proofs/lan_discovery_model.py` | | `--self-test`: every mutant caught |
-| 8 | Pairing nearby (phase 2) | `tunlion-lan` pairing beacon (in the core already), `pair_cmd.rs`/`join`, the SPAKE2 ceremony over a local QUIC stream | `LanEvent::PairingNearby` -> join dials it | gate: two namespaces, server blocked, `pair` and `join` with the code complete and then `send` works |
+| 8a | Pairing nearby, plain pair (phase 2) | `tunlion-lan` pairing beacon (in the core already), `filament-transport` pairing ALPN and exporter binding, `cli/src/lan_pair.rs`, `pair_cmd.rs`/`join` | `LanEvent::PairingNearby` -> join dials it; one-winner code state | `cli/tests/lan-pairing-gates.sh`: two namespaces, server blocked, `pair --nearby` and `join <code> --nearby` complete and then `send` works; wrong code, lan-off and cancellation negatives |
+| 8b | Pairing nearby, owner grant (phase 2, separate review) | the same carrier plus `enrol-offer`/`enrol-grant` and the owner decision | an owner-signed certificate over LAN, with the existing ceiling/TTL rules | extends 8a: owner grant happy path, non-interactive refusal, forged offer, runner refusal and revocation |
 
 Gates (`cli/tests/lan-discovery-gates.sh`, namespaces on one lease, server
 blocked by an iptables DROP so connects time out): **lan**, one switch, B's
@@ -308,7 +309,7 @@ router (the different-public-IP case), remembered addresses only. Each must
 `reach` with route `lan` and deliver a `send`; the denied arm
 (`network.transports=direct,relay`) must fail in each.
 
-Later phases, in order: Android (NSD picker for Add device,
+Phase 2 is split: 8a is a plain pair only and issues no certificate; 8b is the owner-grant half and is reviewed separately. Later phases, in order: Android (NSD picker for Add device,
 `ACCESS_LOCAL_NETWORK`, MulticastLock, the core through the FFI); browser
 (daemon HTTP signaling endpoint, LNA flow, served page for Safari/iOS, the
 core as wasm for cached addresses); Windows interface enumeration with the
