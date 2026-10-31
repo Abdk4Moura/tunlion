@@ -564,8 +564,9 @@ pub fn spawn_accept(
                 let r = tokio::time::timeout(ACCEPT_AUTH_BUDGET, async {
                     let conn = incoming.await.context("lan accept handshake")?;
                     let alpn = negotiated_alpn(&conn);
-                    crate::hooks::debug(&format!("lan: inbound alpn {alpn:?}"));
+                    eprintln!("PAIRDBG accept alpn {alpn:?}");
                     if alpn.as_deref() == Some(direct::PAIR_ALPN) {
+                        eprintln!("PAIRDBG pair branch, pair_tx={}", pair.is_some());
                         let Some(pair) = pair else {
                             conn.close(quinn::VarInt::from_u32(0x5041), b"no pairing code");
                             return Ok(None);
