@@ -13,6 +13,9 @@ pub struct DeviceEntry {
     /// unavailable on this platform/daemon (no control channel), so the row
     /// omits the status rather than asserting a falsehood (#217).
     pub online: Option<bool>,
+    /// The held link's route word when it is not the ordinary one: `lan` for
+    /// a link met by local discovery with no server.
+    pub route: Option<String>,
     pub caps_summary: String,    // e.g. "OWNER-EQUIVALENT shell reach:8080 inbox"
     pub countdown: String,       // e.g. "expires in 4m" or "expired 2026-05-01"
                                  // Not "renews in ...": nothing renews (#236).
@@ -203,7 +206,10 @@ fn render_device_row(d: &DeviceEntry) -> String {
     // never "idle"/"offline". The roster carries name + key only, so the row says
     // what is true (known via the owner, no direct channel yet) and nothing else.
     let status = match d.online {
-        Some(true) => ui::paint(Tone::Ok, "online"),
+        Some(true) => match d.route.as_deref() {
+            Some(r) => ui::paint(Tone::Ok, &format!("online {r}")),
+            None => ui::paint(Tone::Ok, "online"),
+        },
         Some(false) if d.tier == DeviceTier::MeshRoster => ui::paint(Tone::Dim, "via owner"),
         // #217: "a warm link is NOT held open right now" is the normal, healthy
         // idle state, not an absence. "offline" promised far more than the value
@@ -401,6 +407,7 @@ mod tests {
                 name: "pixel-7".into(),
                 tier: DeviceTier::Fleet,
                 online: Some(true),
+                route: None,
                 caps_summary: "OWNER-EQUIVALENT shell reach:8080 inbox".into(),
                 countdown: "expires in 9m".into(),
                 last_seen: None,
@@ -409,6 +416,7 @@ mod tests {
                 name: "carol".into(),
                 tier: DeviceTier::External,
                 online: Some(true),
+                route: None,
                 caps_summary: "send→you".into(),
                 countdown: "expires in 4m".into(),
                 last_seen: None,
@@ -428,6 +436,7 @@ mod tests {
                 name: "laptop".into(),
                 tier: DeviceTier::Fleet,
                 online: Some(true),
+                route: None,
                 caps_summary: "inbox mount".into(),
                 countdown: "cert expires in 80d".into(),
                 last_seen: None,
@@ -436,6 +445,7 @@ mod tests {
                 name: "ci-worker-3".into(),
                 tier: DeviceTier::Ephemeral,
                 online: Some(true),
+                route: None,
                 caps_summary: "inbox OWNER-EQUIVALENT shell".into(),
                 countdown: "cert expires in 2h".into(),
                 last_seen: Some("just now".into()),
@@ -456,6 +466,7 @@ mod tests {
                 name: "old-laptop".into(),
                 tier: DeviceTier::NeedsReview,
                 online: Some(false),
+                route: None,
                 caps_summary: "uncertified \u{b7} transfer".into(),
                 countdown: "no certificate".into(),
                 last_seen: None,
@@ -494,6 +505,7 @@ mod tests {
             name: "dovm".into(),
             tier: DeviceTier::Paired,
             online: Some(true),
+            route: None,
             caps_summary: "files".into(),
             countdown: String::new(),
             last_seen: Some("just now".into()),
@@ -547,6 +559,7 @@ mod tests {
             name: "laptop".into(),
             tier: DeviceTier::Fleet,
             online: Some(true),
+            route: None,
             caps_summary: "files".into(),
             countdown: String::new(),
             last_seen: None,

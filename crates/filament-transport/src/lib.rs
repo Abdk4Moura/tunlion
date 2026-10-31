@@ -25,5 +25,6 @@ mod context;
 pub use context::TransportContext;
 pub mod hooks;
 pub mod http;
+pub mod lan;
 pub mod net;
 pub mod turn_bridge;

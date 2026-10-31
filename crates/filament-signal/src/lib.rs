@@ -221,6 +221,19 @@ impl Client {
         ))
     }
 
+    /// A client with no server behind it, for a daemon that starts while the
+    /// server is unreachable and serves paired devices over local discovery
+    /// meanwhile. Emits go to a loopback socket that is drained and discarded;
+    /// no event ever arrives, so the caller's silence watchdog treats it as
+    /// down and re-dials, replacing it.
+    pub async fn offline() -> Result<Client> {
+        let (client, mut far) = Client::loopback().await?;
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut far, &mut tokio::io::sink()).await;
+        });
+        Ok(client)
+    }
+
     /// Close the Socket.IO session and the websocket under it.
     ///
     /// Tries the Socket.IO and websocket close handshake for at most
