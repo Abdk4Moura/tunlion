@@ -508,8 +508,13 @@ fn spawn_ev_drain(mut rx: mpsc::UnboundedReceiver<crate::net::Ev>) {
 pub struct HostHandle {
     pub events: mpsc::UnboundedReceiver<HostEvent>,
     ack: Option<oneshot::Sender<bool>>,
-    svc: LanService,
-    task: tokio::task::JoinHandle<()>,
+    // Owned so shutdown can release the listener endpoint, not just stop it.
+    // `LanService::shutdown` closes connections and joins its tasks, but the
+    // endpoint keeps its UDP socket bound until the endpoint itself drops.
+    svc: Option<LanService>,
+    // Taken only after its join completes, so a cancelled shutdown future can
+    // be retried and a completed handle is never polled a second time.
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HostHandle {
@@ -520,16 +525,27 @@ impl HostHandle {
     }
 
     pub fn learn(&self, name: &str, hello: &Value) -> bool {
-        self.svc.learn(name, hello)
+        self.svc.as_ref().is_some_and(|svc| svc.learn(name, hello))
     }
 
     pub async fn shutdown(&mut self) {
-        self.svc.shutdown().await;
-        self.task.abort();
-        // Drop's abort alone detaches the task. Every caller that can await
-        // shutdown also joins the ceremony task here, so a cancelled host
-        // leaves no task behind that could still touch the code or a link.
-        let _ = (&mut self.task).await;
+        if let Some(svc) = self.svc.as_ref() {
+            svc.shutdown().await;
+        }
+        // Shutdown stops accepting and joins the service tasks, but the
+        // endpoint's UDP socket stays bound while the endpoint is alive.
+        // Release ownership here so a cancelled host leaves no listener
+        // behind for as long as the caller keeps the handle.
+        self.svc = None;
+        if let Some(task) = self.task.as_mut() {
+            task.abort();
+            // Await through the retained handle. The handle is cleared only
+            // after the join returns Ready, so a shutdown future cancelled
+            // mid-await leaves it owned for the next call; a completed handle
+            // is never polled again.
+            let _ = (&mut *task).await;
+        }
+        self.task = None;
     }
 }
 
@@ -537,7 +553,9 @@ impl Drop for HostHandle {
     fn drop(&mut self) {
         // Cancel the ceremony task. The command awaits `shutdown` on every
         // normal/error/cancel path; Drop is only a last-resort abort.
-        self.task.abort();
+        if let Some(task) = self.task.as_mut() {
+            task.abort();
+        }
     }
 }
 
@@ -592,7 +610,7 @@ pub async fn spawn_host(code: PairCode, words: String, nameplate: String) -> Res
             }
         }
     });
-    Ok(HostHandle { events: out_rx, ack: Some(ack_tx), svc, task })
+    Ok(HostHandle { events: out_rx, ack: Some(ack_tx), svc: Some(svc), task: Some(task) })
 }
 
 /// Host a plain code with no server. Stores the outcome itself.

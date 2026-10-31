@@ -551,7 +551,11 @@ async fn a_cancelled_host_closes_its_listener_and_joins_its_ceremony_task() {
     let mut host = spawn_host(code.clone(), "brave otter".into(), "3141".into())
         .await
         .expect("the host starts on the real LanService");
-    let port = host.svc.hello_json()["port"]
+    let port = host
+        .svc
+        .as_ref()
+        .expect("the host owns its LAN service before cancel")
+        .hello_json()["port"]
         .as_u64()
         .expect("the host advertises its listener") as u16;
     assert_ne!(port, 0);
@@ -581,8 +585,14 @@ async fn a_cancelled_host_closes_its_listener_and_joins_its_ceremony_task() {
 
     // The production cancellation path (`pair_cmd`'s finally block) calls this.
     host.shutdown().await;
+    // A repeated cancel path must be harmless: no panic and no listener
+    // resurrection after the owned service was already released.
+    host.shutdown().await;
 
-    assert!(host.task.is_finished(), "the ceremony task was joined");
+    assert!(
+        host.task.is_none(),
+        "the ceremony task was joined and cleared"
+    );
     assert!(
         wait_for_port_free(port).await,
         "the pairing listener port {port} stayed bound after cancel"
