@@ -114,6 +114,38 @@ mod on {
     pub fn premature_mark_fired() {
         PREMATURE_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// Real-loop latency gate: log the wall gap between daemon-loop iterations
+    /// so the worker gate can measure the maximum heartbeat gap, not just the
+    /// watchdog's one report. Test-only; the production build has no call.
+    pub fn loop_beat() {
+        if std::env::var("TUNLION_TEST_LOOP_BEAT").as_deref() != Ok("1") {
+            return;
+        }
+        static LAST: std::sync::Mutex<Option<std::time::Instant>> =
+            std::sync::Mutex::new(None);
+        let now = std::time::Instant::now();
+        let mut last = LAST.lock().unwrap();
+        let gap_ms = (*last).map(|at| now.duration_since(at).as_millis()).unwrap_or(0);
+        *last = Some(now);
+        eprintln!("LOOP-BEAT gap_ms={gap_ms}");
+    }
+
+    /// Real-loop latency gate: hold every WebRTC establish for this many
+    /// milliseconds, modelling a slow establish without changing production
+    /// timing. `0` (the default) is a no-op.
+    pub fn establish_delay_ms() -> u64 {
+        std::env::var("TUNLION_TEST_ESTABLISH_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Real-loop latency gate: restore the old whole-batch drain of expired
+    /// direct attempts, so one binary can prove the before/after difference.
+    pub fn expired_direct_batch() -> bool {
+        std::env::var("TUNLION_TEST_EXPIRED_DIRECT_BATCH").as_deref() == Ok("1")
+    }
 }
 
 #[cfg(not(feature = "test-hooks"))]
@@ -195,6 +227,19 @@ mod off {
     }
     #[inline]
     pub fn premature_mark_fired() {}
+
+    #[inline]
+    pub fn loop_beat() {}
+
+    #[inline]
+    pub fn establish_delay_ms() -> u64 {
+        0
+    }
+
+    #[inline]
+    pub fn expired_direct_batch() -> bool {
+        false
+    }
 }
 
 #[cfg(not(feature = "test-hooks"))]

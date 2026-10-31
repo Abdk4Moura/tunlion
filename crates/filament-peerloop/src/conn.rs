@@ -2133,6 +2133,13 @@ impl Conn {
         if self.host.relay_forbidden() {
             cfg.ice_servers.retain(|s| net::is_stun_only(s));
         }
+        // Real-loop latency gate: a slow establish is the thing being measured.
+        // Outside the peer-build ceiling on purpose, so the delay models the
+        // awaited work rather than being cut short by the ceiling it exceeds.
+        let establish_delay_ms = test_hooks::establish_delay_ms();
+        if establish_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(establish_delay_ms)).await;
+        }
         // Bounded: building the peer connection is local work, but it is
         // awaited on the event loop, so it gets a ceiling like the config GET.
         let peer = match tokio::time::timeout(
@@ -3307,7 +3314,12 @@ impl Conn {
         // Earliest deadline first, so a steady stream of newly expired attempts
         // can never starve one that has waited longer.
         expired.sort_by_key(|pid| self.direct_pending.get(pid).map(|p| p.deadline));
-        for pid in expired.into_iter().take(DIRECT_FALLBACKS_PER_CALL) {
+        let per_call = if test_hooks::expired_direct_batch() {
+            usize::MAX
+        } else {
+            DIRECT_FALLBACKS_PER_CALL
+        };
+        for pid in expired.into_iter().take(per_call) {
             if let Some(p) = self.direct_pending.remove(&pid) {
                 let info = self
                     .roster

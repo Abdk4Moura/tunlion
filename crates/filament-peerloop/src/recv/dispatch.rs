@@ -2079,6 +2079,10 @@ async fn recv_run(
     let receive_started = Instant::now();
 
     loop {
+        // Real-loop latency gate: a test-only line per iteration, so the worker
+        // gate can measure the maximum gap between iterations. No call in a
+        // production build (test_hooks::loop_beat is empty there).
+        test_hooks::loop_beat();
         sync_tasks.reap_sync_tasks(log.as_ref()).await;
         // Reap completed blocking writers every iteration: the handles are
         // owned until their write lands, but a long-lived daemon must not keep
