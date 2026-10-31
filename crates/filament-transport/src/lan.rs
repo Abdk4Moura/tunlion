@@ -566,12 +566,15 @@ pub fn spawn_accept(
                 let _permit = permit;
                 let r = tokio::time::timeout(ACCEPT_AUTH_BUDGET, async {
                     let conn = incoming.await.context("lan accept handshake")?;
-                    if !allow(conn.remote_address().ip()) {
-                        conn.close(quinn::VarInt::from_u32(0x5247), b"interface off");
-                        return Ok(None);
-                    }
                     let alpn = negotiated_alpn(&conn);
                     if alpn.as_deref() == Some(direct::PAIR_ALPN) {
+                        // Pairing is fail-closed until interfaces are known and
+                        // the source is on an allowed interface. Direct links
+                        // keep their established policy below.
+                        if !allow(conn.remote_address().ip()) {
+                            conn.close(quinn::VarInt::from_u32(0x5247), b"interface off");
+                            return Ok(None);
+                        }
                         let Some(pair) = pair else {
                             conn.close(quinn::VarInt::from_u32(0x5041), b"no pairing code");
                             return Ok(None);
@@ -756,6 +759,23 @@ struct Shared {
     port: u16,
     started: Option<Instant>,
     errors: Vec<String>,
+    pairing_forward: (u64, u32),
+}
+
+impl Shared {
+    /// At most 20 pairing announcements per second reach the caller's queue.
+    fn allow_pairing_forward(&mut self, now_ms: u64) -> bool {
+        let (window, count) = self.pairing_forward;
+        if now_ms.saturating_sub(window) >= 1_000 {
+            self.pairing_forward = (now_ms, 1);
+            true
+        } else if count < 20 {
+            self.pairing_forward = (window, count + 1);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// A running discovery service.
@@ -902,11 +922,14 @@ impl LanService {
         engine.set_pairing(opts.pairing);
         engine.set_known(store.known());
         let initial_ifaces = mark(interfaces(), &opts.skip);
-        let shared = Arc::new(Mutex::new(Shared { engine, ifaces: initial_ifaces, port, started: Some(Instant::now()), errors }));
+        let shared = Arc::new(Mutex::new(Shared { engine, ifaces: initial_ifaces, port, started: Some(Instant::now()), errors, pairing_forward: (0, 0) }));
         if let Some(ep) = listen_ep.clone() {
             let allow_shared = shared.clone();
             let allow: Arc<dyn Fn(IpAddr) -> bool + Send + Sync> =
-                Arc::new(move |ip| allowed_from(&allow_shared.lock().unwrap().ifaces, ip));
+                Arc::new(move |ip| {
+                    let g = allow_shared.lock().unwrap();
+                    !g.ifaces.is_empty() && allowed_from(&g.ifaces, ip)
+                });
             let h = spawn_accept(ep, keys, pair_tx, shutdown.clone(), tasks.clone(), allow, tx.clone());
             tasks.lock().unwrap().push(h);
         }
@@ -981,7 +1004,13 @@ impl LanService {
                                 let _ = tx.send(Ev::Lan(LanEvent::Found { name: peer, addr }));
                             }
                             Action::PairingNearby { addr, label, .. } => {
-                                let _ = tx.send(Ev::Lan(LanEvent::PairingNearby { addr, label }));
+                                let keep = {
+                                    let mut g = shared.lock().unwrap();
+                                    !g.ifaces.is_empty() && g.allow_pairing_forward(now_ms())
+                                };
+                                if keep {
+                                    let _ = tx.send(Ev::Lan(LanEvent::PairingNearby { addr, label }));
+                                }
                             }
                         }
                     }

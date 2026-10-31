@@ -217,17 +217,36 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
 /// side saved only when this returns true; otherwise the local result is real
 /// and the remote result is unknown, never claimed.
 async fn stored_ack(link: &mut PairLink) -> bool {
-    if pair_write(&mut link.send, &json!({"type": "pair-stored", "v": 1})).await.is_err() {
+    let mut raw = [0u8; 16];
+    if getrandom::getrandom(&mut raw).is_err() {
+        return false;
+    }
+    let mine = hex::encode(raw);
+    if pair_write(&mut link.send, &json!({"type": "pair-stored", "v": 1, "nonce": mine})).await.is_err() {
         return false;
     }
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut acknowledged_peer = false;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return false;
         }
         match tokio::time::timeout(left, pair_read(&mut link.recv)).await {
-            Ok(Ok(v)) if frame_type(&v) == "pair-stored" => return true,
+            Ok(Ok(v)) if frame_type(&v) == "pair-stored" => {
+                if v["ack_of"].as_str() == Some(mine.as_str()) {
+                    return true;
+                }
+                if let Some(their) = v["nonce"].as_str() {
+                    if !acknowledged_peer {
+                        acknowledged_peer = true;
+                        let ack = json!({"type": "pair-stored", "v": 1, "ack_of": their});
+                        if pair_write(&mut link.send, &ack).await.is_err() {
+                            return false;
+                        }
+                    }
+                }
+            }
             Ok(Ok(_)) => continue,
             _ => return false,
         }
@@ -237,13 +256,13 @@ async fn stored_ack(link: &mut PairLink) -> bool {
 /// A name is a petname, never an identity: an existing record with a different
 /// secret or certified key is never rewritten. A free name is chosen instead.
 fn choose_pair_name(records: &[Value], requested: &str, secret: &str, cert_pub: Option<&str>) -> (String, bool) {
-    let Some(existing) = records.iter().find(|d| d["name"].as_str() == Some(requested)) else {
+    let Some(existing) = records.iter().find(|d| d["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(requested))) else {
         return (requested.to_string(), false);
     };
     let same = existing["secret"].as_str() == Some(secret)
         && cert_pub.is_none_or(|p| existing["deviceCert"]["devicePub"].as_str() == Some(p));
     if same {
-        (requested.to_string(), false)
+        (existing["name"].as_str().unwrap_or(requested).to_string(), false)
     } else {
         (crate::devices_store::free_device_name(records, requested), true)
     }
@@ -295,13 +314,11 @@ pub fn persist_plain(outcome: &Outcome) -> Result<String> {
             )
             .context("store pairing secret and certificate")?;
             if let Err(e) = crate::store_provisional_identity(&final_name, cert) {
-                // The durable record is valid; the provisional overlay anchor is
-                // required for promotion. Fail closed rather than claim success.
-                crate::devices_store::with_devices_mut(|arr| {
-                    arr.retain(|d| d["name"].as_str() != Some(final_name.as_str()));
-                    Ok(())
-                })?;
-                return Err(anyhow!("stored the pairing but could not stage its provisional identity: {e}"));
+                // Keep the successfully committed durable record. Deleting by
+                // name could erase a prior legitimate record or a concurrent
+                // newer write. Withhold success and the post-store ack; report
+                // the missing required metadata honestly.
+                return Err(anyhow!("stored the pairing but could not stage its provisional identity: {e}; the durable record was kept, no success is claimed"));
             }
             ui::say(&format!(
                 "  {} {} paired and saved on this device",
@@ -367,6 +384,11 @@ fn local_cert_readonly() -> Option<DeviceCert> {
 fn daemon_listen_port() -> Option<u64> {
     let raw = std::fs::read_to_string(crate::settings::config_dir().join("lan-state.json")).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
+    let at = v["at"].as_u64()?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    if now.saturating_sub(at) > 30 || at > now.saturating_add(30) {
+        return None;
+    }
     v["listen_port"].as_u64().filter(|p| *p != 0)
 }
 
@@ -417,8 +439,9 @@ impl HostHandle {
 
 impl Drop for HostHandle {
     fn drop(&mut self) {
-        let svc = self.svc.clone();
-        tokio::spawn(async move { svc.shutdown().await });
+        // Cancel the ceremony task. The command awaits `shutdown` on every
+        // normal/error/cancel path; Drop is only a last-resort abort.
+        self.task.abort();
     }
 }
 
@@ -588,8 +611,11 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
             if !seen.insert(key) {
                 continue;
             }
-            if seen.len() > 64 {
-                bail!("too many nearby pairing announcements; refusing to keep listening");
+            if seen.len() >= 64 {
+                // Drop excess new announcements; never abort the join because
+                // an attacker filled the dedupe set.
+                seen.remove(&key);
+                continue;
             }
             ui::say(&format!("Found nearby pairing {label} at {addr}"));
             if !nearby {

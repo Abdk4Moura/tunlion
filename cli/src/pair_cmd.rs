@@ -2515,6 +2515,11 @@ async fn pair_with_purpose(
         }
     }
     }.await;
+    // Every normal, error and cancellation path leaves through here: join the
+    // LAN host tasks before returning, not in a detached Drop.
+    if let Some(mut h) = lan_host.take() {
+        h.shutdown().await;
+    }
     if let Some(session) = temporary.as_mut() { session.shutdown().await; }
     result
 }

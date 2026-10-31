@@ -364,8 +364,13 @@ impl Engine {
                     let addr = SocketAddr::new(src.ip(), b.port);
                     let key = (addr, b.field);
                     if self.pairing_seen.get(&key).is_none_or(|t| now_ms >= *t + 2_000) {
-                        if self.pairing_seen.len() > 256 {
-                            self.pairing_seen.retain(|_, t| now_ms < *t + 10_000);
+                        // HARD cap: TTL alone lets a flood of fresh ids grow the
+                        // map without bound. Evict the oldest entry first.
+                        const MAX_PAIRING_SEEN: usize = 512;
+                        if self.pairing_seen.len() >= MAX_PAIRING_SEEN {
+                            if let Some(oldest) = self.pairing_seen.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k) {
+                                self.pairing_seen.remove(&oldest);
+                            }
                         }
                         self.pairing_seen.insert(key, now_ms);
                         out.push(Action::PairingNearby { addr, id: b.field, label: wire::pairing_label(&b.field) });
