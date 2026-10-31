@@ -91,11 +91,17 @@ fi
 grep -E 'Compiling (tunlion|filament)-(signal|transport|peerloop|lan) ' "$WORK/cli-dryrun.log" | head -4
 echo "OK registry sources only"
 
+say "materialize the packaged crate"
+( cd cli && cargo package --no-verify --allow-dirty -p tunlion )
+CRATE="$CARGO_TARGET_DIR/package/tunlion-0.9.3.crate"
+test -f "$CRATE" || { echo "missing $CRATE"; ls -l "$CARGO_TARGET_DIR/package" | head; exit 1; }
+ls -l "$CRATE"
+
 say "isolated install root from the packaged crate"
 PKG="$WORK/cli-pkg"
 rm -rf "$PKG" "$WORK/cli-prefix"
 mkdir -p "$PKG"
-tar -xzf "$CARGO_TARGET_DIR/package/tunlion-0.9.3.crate" -C "$PKG"
+tar -xzf "$CRATE" -C "$PKG"
 cargo install --path "$PKG/tunlion-0.9.3" --locked --root "$WORK/cli-prefix" --debug --force
 VERSION_OUT="$("$WORK/cli-prefix/bin/tunlion" --version)"
 echo "installed version: $VERSION_OUT"
