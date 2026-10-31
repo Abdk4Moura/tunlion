@@ -687,4 +687,32 @@ mod tests {
     fn a_plain_name_that_is_free_is_kept() {
         assert_eq!(choose_pair_name(&[], "phone", "s", None), ("phone".into(), false));
     }
+
+    #[test]
+    fn a_case_different_pinned_name_is_not_overwritten() {
+        let records = vec![serde_json::json!({
+            "name": "Laptop",
+            "secret": "old",
+            "deviceCert": {"devicePub": "aa"}
+        })];
+        let (name, renamed) = choose_pair_name(&records, "laptop", "new", Some("bb"));
+        assert!(renamed);
+        assert_eq!(name, "laptop-2");
+    }
+
+    #[test]
+    fn a_case_different_same_pairing_keeps_the_stored_name() {
+        let records = vec![serde_json::json!({
+            "name": "Laptop",
+            "secret": "same",
+            "deviceCert": {"devicePub": "aa"}
+        })];
+        assert_eq!(choose_pair_name(&records, "laptop", "same", Some("aa")), ("Laptop".into(), false));
+    }
+
+    #[test]
+    fn the_ceremony_parser_does_not_accept_the_post_store_ack() {
+        assert!(!FRAME_TYPES.contains(&"pair-stored"));
+        assert!(!FRAME_TYPES.contains(&"enrol-offer"));
+    }
 }
