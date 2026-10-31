@@ -72,12 +72,14 @@ case "$ACTION" in
     pid=$(pgrep -f "$WORK/bravo-drop" | head -1)
     [ -n "$pid" ] && kill -TERM "$pid" || echo "no bravo pid for peer-left"
     observed=0
+    observed_gen=""
     for _ in $(seq 1 80); do
-      if grep -q "peer-left invalidated build pid=$held_pid" "$WORK/up.log" 2>/dev/null; then observed=1; break; fi
+      line=$(grep -m1 "peer-left invalidated build pid=$held_pid gen=" "$WORK/up.log" 2>/dev/null || true)
+      if [ -n "$line" ]; then observed=1; observed_gen=${line##*gen=}; break; fi
       sleep 0.25
     done
-    [ "$observed" = 1 ] && ok "observed peer-left for held pid $held_pid with generation" \
-      || bad "peer-left was never observed for held pid $held_pid"
+    [ "$observed" = 1 ] && ok "observed peer-left for held pid $held_pid generation $observed_gen" \
+      || bad "peer-left was never observed for held pid $held_pid with a generation"
     ;;
   shutdown)
     fs_bounded 20 env HOME="$WORK/home-bravo" TUNLION_CONFIG_DIR="$WORK/bravo" "$BIN" down -y >/dev/null 2>&1 || true
