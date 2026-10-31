@@ -563,7 +563,9 @@ pub fn spawn_accept(
                 let _permit = permit;
                 let r = tokio::time::timeout(ACCEPT_AUTH_BUDGET, async {
                     let conn = incoming.await.context("lan accept handshake")?;
-                    if negotiated_alpn(&conn).as_deref() == Some(direct::PAIR_ALPN) {
+                    let alpn = negotiated_alpn(&conn);
+                    crate::hooks::debug(&format!("lan: inbound alpn {alpn:?}"));
+                    if alpn.as_deref() == Some(direct::PAIR_ALPN) {
                         let Some(pair) = pair else {
                             conn.close(quinn::VarInt::from_u32(0x5041), b"no pairing code");
                             return Ok(None);

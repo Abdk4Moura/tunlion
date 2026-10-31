@@ -80,7 +80,7 @@ code_of() { grep -aoE '[A-Za-z]+(-[A-Za-z]+)+-[0-9]{4,5}' "$1" | head -1 | tr 'A
 
 start_host() {
   local log="$1"; shift
-  asA env TUNLION_TRANSPORTS=lan "$BIN" --server "$SERVER" add --nearby --word "brave otter" >"$log" 2>&1 &
+  asA env TUNLION_TRANSPORTS=lan TUNLION_LOG=debug "$BIN" --server "$SERVER" add --nearby --word "brave otter" >"$log" 2>&1 &
   echo $! > "$WORK/host.pid"
   for _ in $(seq 1 60); do grep -aq -- "-[0-9]" "$log" && return 0; sleep 0.25; done
   return 1
@@ -94,7 +94,7 @@ happy() {
   start_host "$WORK/host.log" || { bad "host never showed a code"; return; }
   local code; code=$(code_of "$WORK/host.log")
   [ -n "$code" ] || { bad "no code in host output"; return; }
-  if asB env TUNLION_TRANSPORTS=lan "$BIN" --server "$SERVER" join "$code" --nearby >"$WORK/join.log" 2>&1; then
+  if asB env TUNLION_TRANSPORTS=lan TUNLION_LOG=debug "$BIN" --server "$SERVER" join "$code" --nearby >"$WORK/join.log" 2>&1; then
     ok "join completed with the server blocked"
   else
     bad "join failed: $(tail -3 "$WORK/join.log" | tr '\n' ' ')"
