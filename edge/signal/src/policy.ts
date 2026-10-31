@@ -16,6 +16,45 @@ export const MAX_SESSIONS = 50_000;
 export const MAX_RETIRED_TOTAL = 200_000;
 /** _MemRegistry.PRUNE_INTERVAL (#593): seconds between expired-record sweeps. */
 export const PRUNE_INTERVAL = 30;
+/** Seconds a refresh may drift from the stored session row before it is
+ * written. 6 h turns an always-on daemon's 48 session writes/day into 4. The
+ * persisted expiry is `last_write + SESSION_TTL`, and a write is never later
+ * than the last claim, so the token can expire up to this much earlier after
+ * an eviction, never later. */
+export const SESSION_PERSIST_S = 6 * 3600;
+/** Most expired rows one prune may delete. Pruning is claim-triggered, so this
+ * bounds the session rows per pass, not total rows: the hub also deletes one
+ * member and every subscription for each evicted sid, and a sid's subscription
+ * count is not globally capped. 64 is a session-row bound, not a total-write
+ * or CPU bound. */
+export const SESSION_PRUNE_BATCH = 64;
+/** Most rows one capacity scan may inspect when no expired row is found. */
+export const CAPACITY_SCAN = 64;
+
+function positiveInt(v: unknown, fallback: number): number {
+  const s = typeof v === "string" && v.trim() !== "" ? v : typeof v === "number" ? String(v) : "";
+  const parsed = parseInt(s, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** Session refresh spacing. Zero is allowed (write every refresh); negative
+ *  and non-finite values fall back, and values at or above SESSION_TTL are
+ *  clamped to it because a session must not expire before its next write. */
+export function sessionPersistFrom(env: Record<string, unknown>): number {
+  const raw = env["FIL_SESSION_PERSIST_S"];
+  if (raw === undefined || raw === null || String(raw).trim() === "") return SESSION_PERSIST_S;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return SESSION_PERSIST_S;
+  return Math.min(parsed, SESSION_TTL);
+}
+
+export function pruneBatchFrom(env: Record<string, unknown>): number {
+  return positiveInt(env["FIL_SESSION_PRUNE_BATCH"], SESSION_PRUNE_BATCH);
+}
+
+export function capacityScanFrom(env: Record<string, unknown>): number {
+  return positiveInt(env["FIL_CAPACITY_SCAN"], CAPACITY_SCAN);
+}
 
 /** register(): PAIR_TTL, unclaimed nameplates evaporate after 10 minutes. */
 export const PAIR_TTL = 600;

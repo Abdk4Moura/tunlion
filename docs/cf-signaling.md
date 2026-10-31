@@ -52,7 +52,9 @@ hibernated or evicted object keeps its sockets but loses its heap, so:
   nameplates are written through to the object's SQLite, and memory is the
   read path (reloaded on the first use after a wake);
 - a refresh-only claim (the 30 s daemon sync) does not write: its sliding
-  expiry is held in memory and written once it drifts 30 minutes;
+  expiry is held in memory and written once it drifts 6 hours
+  (`FIL_SESSION_PERSIST_S`), which is 4 session rows a day for an always-on
+  device instead of 48;
 - liveness is the transport itself (an open websocket or a live polling
   session), the same ground truth `_eio_alive` gives the Python lease loop.
   A row whose transport vanished without a close event is cleaned up the
@@ -64,6 +66,38 @@ hibernated or evicted object keeps its sockets but loses its heap, so:
   not used to decide that a live token is dead, because after hibernation it
   can be hours older than the open websocket. A capacity claim frees one
   non-live slot, not a whole dead backlog in one request.
+
+Session validity versus physical rows. A token's authority is its persisted
+`exp`, and every persisted refresh is `write_time + SESSION_TTL`. A write is
+never later than the last real claim, so the token never resumes after the
+Python cutoff `last_claim + 24 h`. The wider spacing can only make it expire
+earlier after an eviction: with 6 h spacing the floor is 18 h, and the tests
+pin both the never-later and 18 h-floor cases against the old 30 min spacing.
+The in-memory `last_seen`/`exp` and the durable `stored_last_seen` are kept
+distinct; only the latter decides when a refresh is written.
+
+Pruning is different from validity. It is claim-triggered, at most once per
+`PRUNE_INTERVAL` (30 s) while claims keep arriving, and each pass deletes at
+most `FIL_SESSION_PRUNE_BATCH` expired sessions (default 64) and the same
+number of expired retired tombstones. The total number of deletes does not
+change; batching only spreads them. A dead row can therefore remain
+indefinitely if no later claim arrives: there is no scheduled sweep and no
+`TTL + constant` physical-retention claim. Capacity is separate again: one
+expired row is found directly through the `sessions_exp` index, otherwise a
+row-value keyset page of at most `FIL_CAPACITY_SCAN` rows (default 64)
+advances an in-memory `(exp, rowid)` cursor and deletes only the one-slot
+deficit. The row-value seek keeps a late cursor on the index instead of
+re-scanning the prefix. A page
+with no dead row fails closed and the next claim continues after it, wrapping
+at the end. A closed but unexpired row beyond the page can delay a new
+session until cursor progress or expiry; that availability tradeoff is
+deliberate. The existing over-cap `capRetired()` path stays unbounded because
+bounding it would weaken the tombstone cap; it normally removes one row.
+Residuals kept explicit: `pruneRetired` still runs `COUNT(*)` over `retired`
+on every pass (pre-existing, not changed here); the capacity cursor is
+heap-only, so after hibernation it starts again at the first page; and a sid's
+subscription fan-out is not globally capped, so the hub cascade is not bounded
+by `FIL_SESSION_PRUNE_BATCH`.
 
 Polling sessions live in memory only: if the object is evicted mid-session,
 the client gets `Session ID unknown` and reconnects, as it would after a
@@ -231,8 +265,13 @@ Known differences, all deliberate:
   the hub deliberately uses the open transport and the unexpired record
   instead, because its `last_seen` is a throttled refresh hint that can be
   stale after hibernation. Capacity frees one dead slot per new claim in both.
-- After an eviction a session's stored expiry can be up to 30 minutes older
-  than in memory (the write-through slack). It still lasts a day after use.
+- Python's in-memory session expires at exactly `last_claim + 24 h`. The hub's
+  persisted row can expire up to `FIL_SESSION_PERSIST_S` earlier after an
+  eviction, never later: the default 6 h spacing gives an 18 h floor, 30 min
+  spacing gives about 23.5 h, and a value clamped to the 24 h TTL gives no
+  guaranteed post-eviction floor beyond the persisted row. Expired rows are
+  pruned only when a later claim runs, not by a scheduler.
+
 
 ## Conformance suite
 
@@ -427,14 +466,32 @@ claim for a large always-on population. At the old continuous rate the one
 hub is about 0.125 GB x 86,400 s = 10,800 GB-s/day, inside 13,000.
 HealthState wakes only for probes.
 
-Rows: a refresh writes nothing until `PERSIST_SLACK` (30 minutes) has passed,
-so an always-on daemon is about 48 session rows a day, not the "few dozen"
-the first estimate guessed; that alone is 192k rows/day at 4,000 always-on
-devices and needs a larger slack before such a population is claimed to fit.
-Each connect measured 9 rows (15 in one run with an extra sync), a pairing
-about 15 ("Hub load test" above), and a 24 h-idle prune can delete a whole
-stale session backlog in one minute (14,337 rows above). Reads come from
-memory, a few rows per claim.
+Rows: a refresh writes nothing until `FIL_SESSION_PERSIST_S` (6 hours) has
+passed, so an always-on daemon is about 4 session rows a day instead of 48;
+at 4,000 always-on devices that is 16k rather than 192k rows a day. Each
+connect measured 9 rows (15 in one run with an extra sync) and a pairing about
+15 ("Hub load test" above). A first claim after a stale day can still find a
+backlog, but it now deletes at most `FIL_SESSION_PRUNE_BATCH` (64) expired
+sessions and retired rows per pass, so the 14,337-row burst above becomes
+about 224 batches over later claims; the total rows are unchanged and a row can
+remain longer if claims stop. Local SQLite at 50k sessions measured with the real hub cleanup
+(`unsubscribeAll` plus `remove`) and a cold heap, modeled at one member and two
+subscriptions per sid: batch 64 -> 257 rows written (65 registry + 192
+cascade), 150,066 rows read and about 364 ms; batch 256 -> 1,025 written,
+150,258 read, about 344 ms; batch 1,024 -> 4,097 written, 151,026 read, about
+385 ms. The read count is the cold `SELECT members` plus `SELECT subs` scan,
+not per-session work. A 1,000-session example with 64 subscriptions per sid
+wrote 4,225 rows (65 registry + 4,160 cascade) and read 65,066 in about 140 ms.
+These are examples, not worst-case bounds: a sid can hold more subscriptions
+and the hub unions them without a global cap. The batch bounds session rows
+per pass, not total writes, reads or CPU. A capacity page of 64 measured about
+130 rows read and 1.5 ms when every row is live; a dead row with a cold heap
+read 150,067 rows and wrote 5. A late row-value cursor started at rowid 49,950 of 50,000 and returned the
+50 remaining rows in about 3.5 ms, planning `SEARCH ... USING INDEX
+sessions_exp (exp>?)`; the old OR predicate planned `SCAN`. With 100k live tombstones and none expired, the new
+retired subquery planned `SEARCH retired USING COVERING INDEX retired_exp
+(exp<?)` in 0.05 ms; `ORDER BY seq` planned `SCAN retired` in 3.7 ms. These are
+local counts, not Cloudflare billed analytics or a production CPU bound.
 
 What that means:
 

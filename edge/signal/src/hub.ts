@@ -27,13 +27,17 @@ import {
   CHAN_RE,
   MAX_CHANNELS,
   MAX_PAYLOAD,
+  MAX_SESSIONS,
   NAMEPLATE_RE,
   PAIR_TTL,
   SYNC_ROSTER_CAP,
+  capacityScanFrom,
   limitsFrom,
   maxDecodePackets,
   pingFrom,
   pingSliceAt,
+  pruneBatchFrom,
+  sessionPersistFrom,
   validId,
 } from "./policy";
 import { MemLimiter, ipBucket } from "./ratelimit";
@@ -111,7 +115,17 @@ export class SignalHub extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.reg = new Registry(ctx.storage.sql, (sid) => this.alive(sid), CF_TOKEN_PREFIX);
+    const envMap = env as unknown as Record<string, unknown>;
+    this.reg = new Registry(
+      ctx.storage.sql,
+      (sid) => this.alive(sid),
+      CF_TOKEN_PREFIX,
+      () => Date.now() / 1000,
+      MAX_SESSIONS,
+      sessionPersistFrom(envMap),
+      pruneBatchFrom(envMap),
+      capacityScanFrom(envMap),
+    );
     this.ping = pingFrom(env as unknown as Record<string, unknown>);
     this.sliceAt = pingSliceAt(env as unknown as Record<string, unknown>);
     const lim = limitsFrom(env as unknown as Record<string, unknown>);
