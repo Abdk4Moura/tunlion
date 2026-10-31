@@ -2083,6 +2083,7 @@ async fn recv_run(
         // gate can measure the maximum gap between iterations. No call in a
         // production build (test_hooks::loop_beat is empty there).
         test_hooks::loop_beat();
+        conn.pump_builds();
         sync_tasks.reap_sync_tasks(log.as_ref()).await;
         // Reap completed blocking writers every iteration: the handles are
         // owned until their write lands, but a long-lived daemon must not keep
@@ -2571,6 +2572,11 @@ async fn recv_run(
                 Ok(Err(e)) => return Err(e),
                 Err(_) => None, // tick: run the settle sweep + quiet-check below
             },
+        };
+
+        let ev = match ev {
+            Some(ev) => conn.stage_event(ev),
+            None => None,
         };
 
         // Settle sweep: re-drive parked shell-class opens whose link proved
@@ -3657,6 +3663,7 @@ async fn recv_run(
         // ADOPT for the same peer; that sequence is not sound if peers recover
         // concurrently, so caller attribution alone is insufficient here.
         for (pid, info, (n, sec)) in conn.expired_direct() {
+            conn.note_binding(&pid, (n.clone(), sec.clone()));
             let adopted = conn.maybe_adopt(&info, true).await.with_context(|| {
                 format!("direct fallback adoption failed for peer {pid} on receive path")
             });
@@ -4551,6 +4558,7 @@ async fn recv_run(
                 }
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 // A browser's PeerLink sends its transport hint BEFORE any SDP.

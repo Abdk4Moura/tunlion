@@ -76,6 +76,7 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
     let mut sent = false;
     let mut acked = false;
     loop {
+        conn.pump_builds();
         let slice = Duration::from_secs(2).min(deadline.saturating_sub(started.elapsed()));
         let ev = match tokio::time::timeout(slice, rx.recv()).await {
             Ok(Some(ev)) => Some(ev),
@@ -107,6 +108,7 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
             }
         }
         let Some(ev) = ev else { continue };
+        let ev = match conn.stage_event(ev) { Some(ev) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -141,6 +143,7 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
                 }
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 conn.ensure_responder(&from, &data).await?;
@@ -290,6 +293,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         ui::paint(ui::Tone::Bold, &b_name)
     ));
 
+    let (build_tx, build_rx) = mpsc::unbounded_channel();
     let mut conn = Conn {
         transport_context,
         server: server.to_string(),
@@ -340,6 +344,13 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         fleet_grants_pushed: Default::default(),
         stuck_retry: HashMap::new(),
         ice_cache: crate::conn::SharedIceCache::default(),
+        builds: HashMap::new(),
+        build_deferred: std::collections::BTreeMap::new(),
+        build_tx,
+        build_rx,
+        pending_bindings: HashMap::new(),
+        pending_active: HashSet::new(),
+        inline_establish: false,
         roster_absent: HashMap::new(),
         log: crate::host_impl::cli_log(),
         host: crate::host_impl::cli_host(),
@@ -363,6 +374,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         };
         sess.tick(&sio).await; // C30: converge every iteration (incl. ticks)
         conn.reap_deferred(); // #28: discharge deferred peer-left when idle/dead
+        let ev = match conn.stage_event(ev) { Some(ev) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -452,6 +464,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
                 who.insert(pid, is_b);
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 conn.ensure_responder(&from, &data).await?;

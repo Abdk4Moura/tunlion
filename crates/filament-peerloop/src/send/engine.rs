@@ -534,6 +534,7 @@ async fn drive_over(
     let source_failed: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
+        conn.pump_builds();
         if cancel.is_cancelled() {
             return Err(SendFailure::interrupted("the send was cancelled"));
         }
@@ -576,6 +577,7 @@ async fn drive_over(
         // every iteration; without it a failed direct promote would strand the
         // code receiver.
         for (pid, info, (name, secret)) in conn.expired_direct() {
+            conn.note_binding(&pid, (name.clone(), secret.clone()));
             conn.establish_as(info, None).await.map_err(|error| {
                 SendFailure::engine(format!(
                     "direct fallback establish failed for {pid}: {error}"
@@ -585,7 +587,7 @@ async fn drive_over(
                 link.expected_secret = Some((name, secret));
             }
             if conn.to_filter.is_none() && conn.active.is_none() {
-                conn.active = Some(pid);
+                conn.note_active(&pid);
             }
         }
         // Code ceremony progression: relay our element, then our confirmation.
@@ -676,6 +678,7 @@ async fn drive_over(
         };
         let Some(ev) = ev else { continue };
         last_activity = Instant::now();
+        let ev = match conn.stage_event(ev) { Some(ev) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -777,6 +780,7 @@ async fn drive_over(
                 }
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 if data["type"].as_str() == Some("not-recognized") {

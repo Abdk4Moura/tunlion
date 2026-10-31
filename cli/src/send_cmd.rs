@@ -802,6 +802,7 @@ pub(crate) async fn send_cmd(
     ));
 
     loop {
+        conn.pump_builds();
         // Never a silent minute: while the peer has not connected, or has
         // stopped answering mid-send, say so every few seconds. Not while a
         // code waits to be typed, and not while a person there is deciding.
@@ -1045,6 +1046,7 @@ pub(crate) async fn send_cmd(
         // location is sufficient to distinguish this fallback from adoption.
         // The receiver-side caller below routes through maybe_adopt instead.
         for (pid, info, (n, sec)) in conn.expired_direct() {
+            conn.note_binding(&pid, (n.clone(), sec.clone()));
             conn.establish_as(info, None).await.with_context(|| {
                 format!("direct fallback establish failed for peer {pid} on send path")
             })?;
@@ -1055,7 +1057,7 @@ pub(crate) async fn send_cmd(
                 && conn.active.is_none()
                 && (!use_code || pake_peer.as_deref() == Some(pid.as_str()))
             {
-                conn.active = Some(pid.clone());
+                conn.note_active(&pid);
             }
         }
         // C30 phase 3: tell every link our truth every ~10s (sender side has
@@ -1123,6 +1125,7 @@ pub(crate) async fn send_cmd(
         conn.tick_upgrade_prober().await;
         let Some(ev) = ev else { continue };
 
+        let ev = match conn.stage_event(ev) { Some(ev) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -1334,6 +1337,7 @@ pub(crate) async fn send_cmd(
                 }
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 // A browser's PeerLink sends its transport hint BEFORE any SDP.

@@ -1253,6 +1253,7 @@ async fn pair_with_purpose(
 
     let result = async {
     loop {
+        conn.pump_builds();
         // OFFER SIDE: offer this device's key once the key exchange is done,
         // and keep offering until the other side answers. Nothing is conferred
         // by offering: the owner device decides (see `enrol_offer_decision`).
