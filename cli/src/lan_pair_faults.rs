@@ -850,6 +850,119 @@ async fn all_invalid_candidates_exit_at_the_original_join_budget() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_loop_retries_a_bad_notice_and_persists_the_right_host() {
+    let _guard = lock_test_config();
+    let cfg = ConfigDir::new("join-loop-success");
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // Reachable candidate that sends an out-of-phase frame: the real join loop
+    // must close it and move to the next pre-dialed notice.
+    let bad_dir = unique_dir("bad-notice-host");
+    let (bad_ev_tx, _bad_ev_rx) = mpsc::unbounded_channel();
+    let (bad_pair_tx, mut bad_pair_rx) = mpsc::channel(2);
+    let bad_service = LanService::start(
+        &bad_dir,
+        Options { serve: true, pairing: Some([11; 16]), ..Default::default() },
+        Arc::new(Vec::<filament_transport::lan::LanKey>::new),
+        Some(bad_pair_tx),
+        None,
+        bad_ev_tx,
+    )
+    .await
+    .expect("bad notice host starts");
+    let bad_port = bad_service.hello_json()["port"]
+        .as_u64()
+        .expect("bad notice host advertises its port") as u16;
+    let bad_order = order.clone();
+    let bad_task = tokio::spawn(async move {
+        let mut link = tokio::time::timeout(Duration::from_secs(10), bad_pair_rx.recv())
+            .await
+            .expect("bad notice host accepted a stream")
+            .expect("bad notice host pair channel is open");
+        bad_order.lock().unwrap().push("bad");
+        pair_write(&mut link.send, &json!({"type": "identity-expose", "v": 2}))
+            .await
+            .expect("send the bad candidate's frame");
+    });
+
+    // The legitimate host runs the real ceremony and the post-store ack.
+    let good_dir = unique_dir("good-notice-host");
+    let (good_ev_tx, _good_ev_rx) = mpsc::unbounded_channel();
+    let (good_pair_tx, mut good_pair_rx) = mpsc::channel(2);
+    let good_service = LanService::start(
+        &good_dir,
+        Options { serve: true, pairing: Some([12; 16]), ..Default::default() },
+        Arc::new(Vec::<filament_transport::lan::LanKey>::new),
+        Some(good_pair_tx),
+        None,
+        good_ev_tx,
+    )
+    .await
+    .expect("good notice host starts");
+    let good_port = good_service.hello_json()["port"]
+        .as_u64()
+        .expect("good notice host advertises its port") as u16;
+    let good_hello = good_service.hello_json();
+    let good_order = order.clone();
+    let good_task = tokio::spawn(async move {
+        let mut host = tokio::time::timeout(Duration::from_secs(10), good_pair_rx.recv())
+            .await
+            .expect("good notice host accepted a stream")
+            .expect("good notice host pair channel is open");
+        good_order.lock().unwrap().push("good");
+        let ceremony = run_ceremony(&mut host, "brave otter", "3141", "host", &good_hello).await;
+        let acked = if ceremony.is_ok() {
+            stored_ack(&mut host).await
+        } else {
+            false
+        };
+        (ceremony, acked)
+    });
+
+    let _seam = test_seams::install_join_seam(
+        Duration::from_secs(10),
+        vec![
+            filament_transport::lan::PairingNotice {
+                addr: (Ipv4Addr::LOCALHOST, bad_port).into(),
+                label: tunlion_lan::wire::pairing_label(&[11; 16]),
+            },
+            filament_transport::lan::PairingNotice {
+                addr: (Ipv4Addr::LOCALHOST, good_port).into(),
+                label: tunlion_lan::wire::pairing_label(&[12; 16]),
+            },
+        ],
+    );
+    join_standalone("brave-otter-3141", None, true)
+        .await
+        .expect("the loop reaches and stores the right host");
+    // No wall-clock bound here: at the 10 s seam deadline the loop returns its
+    // timeout error instead of Ok, so reaching the ordered "bad" then "good"
+    // attempts and a durable ack already proves the first candidate did not
+    // consume the whole deadline. A wall-clock margin would only add load flake.
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec!["bad", "good"],
+        "the bad candidate is attempted first, then the right host"
+    );
+    // Host and joiner run in this same process, so both report the same
+    // `display_name`; the stored name cannot distinguish them without a
+    // production change. Attempt order, exactly one durable record, and the
+    // host-side ack identify the successful remote ceremony instead.
+    let records = cfg.devices();
+    assert_eq!(records.len(), 1, "exactly one durable pairing record");
+    assert!(
+        records[0]["secret"].as_str().is_some_and(|s| !s.is_empty()),
+        "the durable record carries the pair secret"
+    );
+
+    bad_task.await.expect("bad candidate task did not panic");
+    let (ceremony, acked) = good_task.await.expect("good host task did not panic");
+    assert!(ceremony.is_ok(), "the right host completed its ceremony");
+    assert!(acked, "the right host acknowledged the durable store");
+    let _ = (bad_service, good_service, bad_dir, good_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_store_failure_ends_the_join_without_another_candidate() {
     let _guard = lock_test_config();
     let cfg = ConfigDir::new("store-failure");

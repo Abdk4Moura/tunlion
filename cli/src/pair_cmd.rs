@@ -868,6 +868,20 @@ pub(crate) enum SignalingClaimStart {
     Blocked,
 }
 
+/// Release the signaling claim (if any) this command still owns after its
+/// event loop. `fail` checks the current token under the same lock as
+/// `confirm`, so an abandoned claim is released while a consumed winner and a
+/// newer carrier's token are untouched. The existing bounded backoff applies.
+pub(crate) fn release_owned_signaling_claim(
+    code: Option<&PairCode>,
+    token: Option<u64>,
+    now: Instant,
+) {
+    if let (Some(code), Some(token)) = (code, token) {
+        code.fail(token, now);
+    }
+}
+
 /// Take a signaling token through the code's single CAS. Used by the PairUsed
 /// handler and by the first PAKE frame, so a missing or delayed PairUsed is a
 /// retry, never an implicit token.
@@ -2573,12 +2587,10 @@ async fn pair_with_purpose(
     }.await;
     // A signaling claim is only a loan: if this command leaves before a
     // confirmed winner, release it so an abandoned peer claim cannot block the
-    // LAN carrier until the code's 600 s deadline. `fail` is token-checked, so
-    // a confirmed winner (`Consumed`) and a newer carrier's token are untouched;
-    // the existing bounded backoff still applies.
-    if let (Some(code), Some(token)) = (pair_code.as_ref(), signaling_token) {
-        code.fail(token, Instant::now());
-    }
+    // LAN carrier until the code's 600 s deadline. The helper is token-checked,
+    // so a confirmed winner (`Consumed`) and a newer carrier's token are
+    // untouched; the existing bounded backoff still applies.
+    release_owned_signaling_claim(pair_code.as_ref(), signaling_token, Instant::now());
     // Every normal, error and cancellation path leaves through here: join the
     // LAN host tasks before returning, not in a detached Drop.
     if let Some(mut h) = lan_host.take() {
@@ -2598,6 +2610,77 @@ mod promise_tests {
         assert!(signal_store_has_token(None, None), "a joiner has no local code to consume");
         assert!(!signal_store_has_token(Some(&code), None), "a host must hold the CAS token");
         assert!(signal_store_has_token(Some(&code), Some(1)));
+    }
+
+    // The exact helper called after the pair async block: an abandoned owned
+    // claim is released, while a consumed winner and a newer LAN token survive.
+    #[test]
+    fn post_loop_cleanup_releases_only_the_owned_abandoned_claim() {
+        let t0 = Instant::now();
+
+        // Abandoned signaling claim: released, so the next carrier can start.
+        let abandoned = PairCode::new([21; 16], t0);
+        let mut token = None;
+        assert_eq!(
+            start_signaling_claim(&abandoned, &mut token, t0),
+            SignalingClaimStart::Started
+        );
+        let owned = token.expect("the owned signaling token");
+        release_owned_signaling_claim(Some(&abandoned), Some(owned), t0 + Duration::from_secs(2));
+        assert!(matches!(
+            abandoned.begin(PairCarrier::Lan, t0 + Duration::from_secs(3)),
+            Begin::Started(_)
+        ));
+
+        // Consumed winner: the old signaling token is stale and changes nothing.
+        let won = PairCode::new([22; 16], t0);
+        let mut stale_token = None;
+        assert_eq!(
+            start_signaling_claim(&won, &mut stale_token, t0),
+            SignalingClaimStart::Started
+        );
+        let stale = stale_token.expect("the stale signaling token");
+        won.fail(stale, t0);
+        let lan_token = match won.begin(PairCarrier::Lan, t0 + Duration::from_secs(2)) {
+            Begin::Started(t) => t,
+            other => panic!("LAN carrier starts after backoff: {other:?}"),
+        };
+        assert!(won.confirm(lan_token, t0 + Duration::from_secs(3)));
+        release_owned_signaling_claim(Some(&won), Some(stale), t0 + Duration::from_secs(4));
+        assert_eq!(won.winner(), Some(PairCarrier::Lan));
+        assert_eq!(
+            won.begin(PairCarrier::Signaling, t0 + Duration::from_secs(5)),
+            Begin::Closed
+        );
+
+        // A newer LAN token: the abandoned signaling token must not release it.
+        let newer = PairCode::new([23; 16], t0);
+        let mut old_token = None;
+        assert_eq!(
+            start_signaling_claim(&newer, &mut old_token, t0),
+            SignalingClaimStart::Started
+        );
+        let old = old_token.expect("the abandoned signaling token");
+        let fresh_lan = match newer.begin(
+            PairCarrier::Lan,
+            t0 + crate::pair_code::CEREMONY_BUDGET,
+        ) {
+            Begin::Started(t) => t,
+            other => panic!("stale claim is reclaimable: {other:?}"),
+        };
+        release_owned_signaling_claim(
+            Some(&newer),
+            Some(old),
+            t0 + crate::pair_code::CEREMONY_BUDGET + Duration::from_secs(1),
+        );
+        assert!(
+            newer.confirm(
+                fresh_lan,
+                t0 + crate::pair_code::CEREMONY_BUDGET + Duration::from_secs(2),
+            ),
+            "the newer LAN token must still confirm"
+        );
+        assert_eq!(newer.winner(), Some(PairCarrier::Lan));
     }
 
     // `add <device>` over a spoken code: --allow omitted must mean the
