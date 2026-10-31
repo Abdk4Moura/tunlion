@@ -180,11 +180,18 @@ static FROZE_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 pub const DIRECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// ALPN, distinguishes our QUIC app; both ends must agree.
-const ALPN: &[u8] = b"filament-direct/1";
+pub(crate) const ALPN: &[u8] = b"filament-direct/1";
+/// Local pairing carrier, served on the same LAN listener. A distinct ALPN
+/// keeps the frozen direct handshake byte-for-byte unchanged: a peer that
+/// offers only `filament-direct/1` can never be mistaken for a pairing link.
+pub(crate) const PAIR_ALPN: &[u8] = b"filament-pair/1";
 // PROTOCOL LITERAL: frozen, do not rename (ALPN above, and these two):
 // both ends of a direct link derive and check these exact bytes.
 const TRANSPORT_KEY_INFO: &[u8] = b"filament-direct-transport-v1";
 const KEYING_MATERIAL_LABEL: &[u8] = b"filament-direct-auth";
+/// Local pairing binds its SPAKE2 confirmation to this QUIC session with a
+/// separate exporter label, so a direct-link binding can never be reused.
+const PAIR_KEYING_MATERIAL_LABEL: &[u8] = b"filament-pair-v1";
 
 /// Max app payload per send_frame on the direct-QUIC path. QUIC streams are
 /// byte-streams with no datagram cap, so larger frames just mean fewer
@@ -811,7 +818,7 @@ fn direct_transport_config() -> Arc<quinn::TransportConfig> {
     Arc::new(tc)
 }
 
-pub fn server_config() -> Result<quinn::ServerConfig> {
+fn server_config_with_alpn(alpn: &[&[u8]]) -> Result<quinn::ServerConfig> {
     let ck = rcgen::generate_simple_self_signed(vec!["filament-direct".to_string()])
         .context("self-signed cert")?;
     let cert_der = CertificateDer::from(ck.cert.der().clone());
@@ -823,7 +830,7 @@ pub fn server_config() -> Result<quinn::ServerConfig> {
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der.into())
         .context("server single cert")?;
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    crypto.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
 
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .context("quic server config")?;
@@ -832,20 +839,40 @@ pub fn server_config() -> Result<quinn::ServerConfig> {
     Ok(sc)
 }
 
-pub fn client_config() -> Result<quinn::ClientConfig> {
+pub fn server_config() -> Result<quinn::ServerConfig> {
+    server_config_with_alpn(&[ALPN])
+}
+
+/// The LAN listener accepts both the frozen direct ALPN and the pairing
+/// carrier. Only the LAN adapter ever uses this config.
+pub(crate) fn server_config_lan() -> Result<quinn::ServerConfig> {
+    server_config_with_alpn(&[ALPN, PAIR_ALPN])
+}
+
+fn client_config_with_alpn(alpn: &[u8]) -> Result<quinn::ClientConfig> {
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .context("client tls versions")?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider())))
         .with_no_client_auth();
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    crypto.alpn_protocols = vec![alpn.to_vec()];
 
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .context("quic client config")?;
     let mut cc = quinn::ClientConfig::new(Arc::new(qcc));
     cc.transport_config(direct_transport_config());
     Ok(cc)
+}
+
+pub fn client_config() -> Result<quinn::ClientConfig> {
+    client_config_with_alpn(ALPN)
+}
+
+/// Client config for the pairing carrier only: a pairing dial never offers
+/// `filament-direct/1`, so it can never be answered by a direct-only listener.
+pub(crate) fn pair_client_config() -> Result<quinn::ClientConfig> {
+    client_config_with_alpn(PAIR_ALPN)
 }
 
 /// Bind a quinn endpoint on an EPHEMERAL UDP port that BOTH accepts and dials
@@ -893,10 +920,21 @@ pub fn bind_endpoint() -> Result<(Endpoint, u16)> {
 /// MITM relay terminating TLS on each leg gets a DIFFERENT value, so the MAC it
 /// would have to forward cannot validate against its own peer's binding.
 pub(crate) fn keying_material(conn: &quinn::Connection) -> Result<[u8; 32]> {
+    keying_material_label(conn, KEYING_MATERIAL_LABEL)
+}
+
+fn keying_material_label(conn: &quinn::Connection, label: &[u8]) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
-    conn.export_keying_material(&mut out, KEYING_MATERIAL_LABEL, b"")
+    conn.export_keying_material(&mut out, label, b"")
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
     Ok(out)
+}
+
+/// The pairing session's channel binding. Role separation happens in the
+/// caller: both ends add `|host` or `|joiner` to the hex of this value, so a
+/// confirmation cannot be reflected onto the other role.
+pub(crate) fn pairing_keying_material(conn: &quinn::Connection) -> Result<[u8; 32]> {
+    keying_material_label(conn, PAIR_KEYING_MATERIAL_LABEL)
 }
 
 /// Auth tag: HMAC(transport_key, keying_material || who). `who` direction-tags

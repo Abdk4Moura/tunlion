@@ -15,13 +15,16 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use quinn::Endpoint;
+use quinn::{Endpoint, RecvStream, SendStream};
 use serde_json::{json, Value};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use tunlion_lan::engine::{Action, Channel, Engine, Known};
 use tunlion_lan::iface::{self, Addr, Class, Flags, Interface};
@@ -70,6 +73,50 @@ pub enum LanEvent {
     Found { name: String, addr: SocketAddr },
     /// A pairing code is on screen on a device at `addr` (spec section 7).
     PairingNearby { addr: SocketAddr, label: String },
+}
+
+/// A pairing-carrier connection, handed to the one-shot pair command. The
+/// adapter does not run the ceremony: the command owns the state, consent and
+/// persistence.
+pub struct PairLink {
+    pub conn: quinn::Connection,
+    pub send: SendStream,
+    pub recv: RecvStream,
+    pub keying_material: [u8; 32],
+    pub remote: SocketAddr,
+    pub dialer: bool,
+}
+
+impl std::fmt::Debug for PairLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PairLink({}, dialer={})", self.remote, self.dialer)
+    }
+}
+
+/// Cooperative stop for every task a `LanService` started. `shutdown` joins
+/// them, so success, expiry and cancellation leave no listener or ticker behind.
+#[derive(Clone)]
+pub struct Shutdown {
+    flag: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl Shutdown {
+    fn new() -> Self {
+        Self { flag: Arc::new(AtomicBool::new(false)), notify: Arc::new(Notify::new()) }
+    }
+    pub fn stop(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+    pub fn is_stopped(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+    async fn wait(&self) {
+        while !self.is_stopped() {
+            self.notify.notified().await;
+        }
+    }
 }
 
 impl std::fmt::Debug for LanEvent {
@@ -421,6 +468,12 @@ pub fn hello(pk: [u8; 32], port: u16, skip: &Skip) -> Hello {
 
 /// A dual-stack QUIC endpoint on `port` (0 = any), accepting and dialing.
 pub fn bind(port: u16) -> Result<(Endpoint, u16)> {
+    bind_with(port, false)
+}
+
+/// `pair` adds the pairing ALPN to the listener. The daemon and one-shot
+/// senders keep the frozen direct-only listener.
+fn bind_with(port: u16, pair: bool) -> Result<(Endpoint, u16)> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).context("lan UDP socket")?;
     sock.set_only_v6(false).ok();
@@ -432,14 +485,22 @@ pub fn bind(port: u16) -> Result<(Endpoint, u16)> {
     let socket: std::net::UdpSocket = sock.into();
     socket.set_nonblocking(true)?;
     let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime"))?;
+    let server = if pair { direct::server_config_lan()? } else { direct::server_config()? };
     let mut ep = Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
-        Some(direct::server_config()?),
+        Some(server),
         runtime.wrap_udp_socket(socket)?,
         runtime,
     )?;
     ep.set_default_client_config(direct::client_config()?);
     Ok((ep, port))
+}
+
+/// The ALPN the peer selected, if the handshake exposed one.
+fn negotiated_alpn(conn: &quinn::Connection) -> Option<Vec<u8>> {
+    conn.handshake_data()
+        .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|h| h.protocol)
 }
 
 fn to_dial(a: SocketAddr) -> SocketAddr {
@@ -470,40 +531,141 @@ async fn accept_auth(conn: &quinn::Connection, keys: &[LanKey]) -> Result<(LanKe
     Ok((k.clone(), send, recv))
 }
 
-/// Accept loop on the listener. Every authenticated connection becomes an
-/// `Ev::Lan(Linked)` with `dialer: false`.
-pub fn spawn_accept(ep: Endpoint, keys: Arc<dyn Fn() -> Vec<LanKey> + Send + Sync>, tx: UnboundedSender<Ev>) {
+/// Accept loop on the listener. A direct connection becomes
+/// `Ev::Lan(Linked)`; a `filament-pair/1` connection becomes a `PairLink` on
+/// `pair`, and is closed when no pairing code is on screen.
+pub fn spawn_accept(
+    ep: Endpoint,
+    keys: Arc<dyn Fn() -> Vec<LanKey> + Send + Sync>,
+    pair: Option<UnboundedSender<PairLink>>,
+    shutdown: Shutdown,
+    tx: UnboundedSender<Ev>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_ACCEPTS));
-        while let Some(incoming) = ep.accept().await {
+        loop {
+            let incoming = tokio::select! {
+                _ = shutdown.wait() => break,
+                incoming = ep.accept() => match incoming { Some(i) => i, None => break },
+            };
             let Ok(permit) = inflight.clone().try_acquire_owned() else {
                 incoming.refuse();
                 continue;
             };
             let keys = keys.clone();
             let tx = tx.clone();
+            let pair = pair.clone();
             let ep2 = ep.clone();
+            let shutdown2 = shutdown.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 let r = tokio::time::timeout(ACCEPT_AUTH_BUDGET, async {
                     let conn = incoming.await.context("lan accept handshake")?;
+                    if negotiated_alpn(&conn).as_deref() == Some(direct::PAIR_ALPN) {
+                        let Some(pair) = pair else {
+                            conn.close(quinn::VarInt::from_u32(0x5041), b"no pairing code");
+                            return Ok(None);
+                        };
+                        let (send, recv) = conn.accept_bi().await.context("accept pairing stream")?;
+                        let keying_material = direct::pairing_keying_material(&conn)?;
+                        let remote = canonical(conn.remote_address());
+                        let _ = pair.send(PairLink {
+                            conn,
+                            send,
+                            recv,
+                            keying_material,
+                            remote,
+                            dialer: false,
+                        });
+                        return Ok(None);
+                    }
                     let (k, send, recv) = accept_auth(&conn, &keys()).await?;
-                    Ok::<_, anyhow::Error>((conn, k, send, recv))
+                    Ok::<_, anyhow::Error>(Some((conn, k, send, recv)))
                 })
                 .await;
                 match r {
-                    Ok(Ok((conn, k, send, recv))) => {
+                    Ok(Ok(Some((conn, k, send, recv)))) => {
+                        if shutdown2.is_stopped() { conn.close(quinn::VarInt::from_u32(0), b"lan stopped"); return; }
                         let remote = canonical(conn.remote_address());
                         let pid = fresh_pid();
                         let transport = direct::make_transport_unread(pid.clone(), conn, send, recv, tx.clone(), true, Some(ep2), true);
                         let _ = tx.send(Ev::Lan(LanEvent::Linked { pid, name: k.name, secret: k.secret, fleet: k.fleet, transport, remote, dialer: false }));
                     }
+                    Ok(Ok(None)) => {}
                     Ok(Err(e)) => crate::hooks::debug(&format!("lan: inbound refused: {e:#}")),
                     Err(_) => crate::hooks::debug("lan: inbound did not authenticate in time"),
                 }
             });
         }
-    });
+    })
+}
+
+/// Dial one of up to five pairing candidates with the pairing ALPN only. The
+/// caller owns the ceremony and consent; this returns the first session that
+/// completed the QUIC handshake, not an authenticated peer.
+pub async fn pair_dial(ep: &Endpoint, addrs: Vec<SocketAddr>) -> Result<PairLink> {
+    let cfg = direct::pair_client_config()?;
+    let mut last: Option<anyhow::Error> = None;
+    for (i, a) in addrs.into_iter().take(5).enumerate() {
+        if i > 0 {
+            tokio::time::sleep(DIAL_STAGGER).await;
+        }
+        let r = tokio::time::timeout(Duration::from_secs(5), async {
+            let conn = ep.connect_with(cfg.clone(), to_dial(a), "filament-pair")?.await.context("pair dial handshake")?;
+            let (send, recv) = conn.open_bi().await.context("open pairing stream")?;
+            let keying_material = direct::pairing_keying_material(&conn)?;
+            Ok::<_, anyhow::Error>(PairLink {
+                conn,
+                send,
+                recv,
+                keying_material,
+                remote: canonical(conn.remote_address()),
+                dialer: true,
+            })
+        })
+        .await;
+        match r {
+            Ok(Ok(link)) => return Ok(link),
+            Ok(Err(e)) => last = Some(e),
+            Err(_) => last = Some(anyhow!("pair dial timed out")),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("no pairing candidate")))
+}
+
+/// One pairing frame is a u32-BE length plus JSON. The cap is deliberately
+/// far above the contract frames and far below anything that could pin memory.
+pub const PAIR_MAX_FRAME: usize = 64 * 1024;
+const PAIR_FRAME_BUDGET: Duration = Duration::from_secs(10);
+
+pub async fn pair_write(send: &mut SendStream, v: &Value) -> Result<()> {
+    let body = serde_json::to_vec(v)?;
+    if body.is_empty() || body.len() > PAIR_MAX_FRAME {
+        return Err(anyhow!("pairing frame is {} bytes", body.len()));
+    }
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    tokio::time::timeout(PAIR_FRAME_BUDGET, send.write_all(&out))
+        .await
+        .map_err(|_| anyhow!("pairing frame write timed out"))??;
+    Ok(())
+}
+
+pub async fn pair_read(recv: &mut RecvStream) -> Result<Value> {
+    let mut hdr = [0u8; 4];
+    tokio::time::timeout(PAIR_FRAME_BUDGET, recv.read_exact(&mut hdr))
+        .await
+        .map_err(|_| anyhow!("pairing frame header timed out"))??;
+    let len = u32::from_be_bytes(hdr) as usize;
+    if len == 0 || len > PAIR_MAX_FRAME {
+        return Err(anyhow!("pairing frame length {len} is outside 1..={PAIR_MAX_FRAME}"));
+    }
+    let mut body = vec![0u8; len];
+    tokio::time::timeout(PAIR_FRAME_BUDGET, recv.read_exact(&mut body))
+        .await
+        .map_err(|_| anyhow!("pairing frame body timed out"))??;
+    serde_json::from_slice(&body).context("pairing frame is not JSON")
 }
 
 /// Dial `addrs` concurrently with `key`; the first authenticated connection
@@ -558,6 +720,12 @@ pub struct Options {
     /// Bind the listener and send beacons (the daemon). A one-shot command
     /// only queries and dials.
     pub serve: bool,
+    /// Receive discovery datagrams without announcing (a pairing joiner).
+    /// Binds the discovery port with reuse so it hears pairing beacons.
+    pub listen_discovery: bool,
+    /// Advertise this pairing id while a code is on screen. `None` never sends
+    /// a pairing beacon and never accepts a pairing connection.
+    pub pairing: Option<[u8; 16]>,
     pub skip: Skip,
 }
 
@@ -577,7 +745,10 @@ pub struct LanService {
     pk: [u8; 32],
     port: u16,
     skip: Skip,
+    listen_ep: Option<Endpoint>,
     dial_ep: Endpoint,
+    shutdown: Shutdown,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     tx: UnboundedSender<Ev>,
 }
 
@@ -679,12 +850,19 @@ impl LanService {
     /// Start the service. With `opts.serve` the listener is bound (default
     /// port, else any), beacons go out, queries are answered and inbound links
     /// are accepted with `keys`.
-    pub async fn start(config_dir: &Path, opts: Options, keys: Arc<dyn Fn() -> Vec<LanKey> + Send + Sync>, tx: UnboundedSender<Ev>) -> Result<LanService> {
+    pub async fn start(
+        config_dir: &Path,
+        opts: Options,
+        keys: Arc<dyn Fn() -> Vec<LanKey> + Send + Sync>,
+        pair_tx: Option<UnboundedSender<PairLink>>,
+        tx: UnboundedSender<Ev>,
+    ) -> Result<LanService> {
         let store = LanStore::new(config_dir);
         let pk = store.presence_key()?;
         let mut errors = Vec::new();
+        let pairing = opts.pairing.is_some();
         let (listen_ep, port) = if opts.serve {
-            match bind(wire::DEFAULT_LISTEN_PORT).or_else(|_| bind(0)) {
+            match bind_with(wire::DEFAULT_LISTEN_PORT, pairing).or_else(|_| bind_with(0, pairing)) {
                 Ok((ep, port)) => (Some(ep), port),
                 Err(e) => {
                     errors.push(format!("listener: {e:#}"));
@@ -695,19 +873,37 @@ impl LanService {
             (None, 0)
         };
         let (dial_ep, _) = bind(0)?;
-        if let Some(ep) = listen_ep {
-            spawn_accept(ep, keys, tx.clone());
+        let shutdown = Shutdown::new();
+        let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        if let Some(ep) = listen_ep.clone() {
+            let h = spawn_accept(ep, keys, pair_tx, shutdown.clone(), tx.clone());
+            tasks.lock().unwrap().push(h);
         }
         let mut engine = Engine::new(pk, port);
         // A one-shot command has no listener: it queries, never announces.
         engine.set_announce(opts.serve);
+        engine.set_pairing(opts.pairing);
         engine.set_known(store.known());
         let shared = Arc::new(Mutex::new(Shared { engine, ifaces: Vec::new(), port, started: Some(Instant::now()), errors }));
-        let svc = LanService { shared: shared.clone(), store, pk, port, skip: opts.skip.clone(), dial_ep, tx: tx.clone() };
+        let svc = LanService {
+            shared: shared.clone(),
+            store,
+            pk,
+            port,
+            skip: opts.skip.clone(),
+            listen_ep,
+            dial_ep,
+            shutdown: shutdown.clone(),
+            tasks: tasks.clone(),
+            tx: tx.clone(),
+        };
 
-        // Sockets: the daemon owns the discovery port; a one-shot command
-        // binds any port, so replies to its queries come back to it.
-        let bport = if opts.serve { wire::DISCOVERY_PORT } else { 0 };
+        // Sockets: the daemon owns the discovery port; a pairing joiner binds
+        // it with reuse but never announces, so it hears beacons without
+        // answering them. Other one-shots bind any port for query replies.
+        let receive_only = opts.listen_discovery;
+        let bport = if opts.serve || receive_only { wire::DISCOVERY_PORT } else { 0 };
+        let reuse = opts.serve || receive_only;
         let note = |what: &str, r: Result<tokio::net::UdpSocket>, errs: &mut Vec<String>| match r {
             Ok(s) => Some(s),
             Err(e) => {
@@ -717,8 +913,8 @@ impl LanService {
         };
         let mut errs = Vec::new();
         let socks = Arc::new(Sockets {
-            beacon4: note("discovery socket (v4)", udp(false, bport, opts.serve).or_else(|_| udp(false, 0, false)), &mut errs),
-            beacon6: note("discovery socket (v6)", udp(true, bport, opts.serve).or_else(|_| udp(true, 0, false)), &mut errs),
+            beacon4: note("discovery socket (v4)", udp(false, bport, reuse).or_else(|_| udp(false, 0, false)), &mut errs),
+            beacon6: note("discovery socket (v6)", udp(true, bport, reuse).or_else(|_| udp(true, 0, false)), &mut errs),
             mdns4: if opts.serve { note("mDNS socket", udp(false, tunlion_lan::mdns::MDNS_PORT, true), &mut errs) } else { None },
         });
         shared.lock().unwrap().errors.extend(errs);
@@ -729,7 +925,8 @@ impl LanService {
             let shared = shared.clone();
             let tx = tx.clone();
             let serve = opts.serve;
-            tokio::spawn(async move {
+            let shutdown = shutdown.clone();
+            let h = tokio::spawn(async move {
                 let mut buf = vec![0u8; 2048];
                 loop {
                     let sock = match (chan, which) {
@@ -738,7 +935,11 @@ impl LanService {
                         (Channel::Mdns, _) => socks.mdns4.as_ref(),
                     };
                     let Some(sock) = sock else { return };
-                    let Ok((n, src)) = sock.recv_from(&mut buf).await else {
+                    let recv = tokio::select! {
+                        _ = shutdown.wait() => return,
+                        recv = sock.recv_from(&mut buf) => recv,
+                    };
+                    let Ok((n, src)) = recv else {
                         tokio::time::sleep(Duration::from_millis(200)).await;
                         continue;
                     };
@@ -761,13 +962,15 @@ impl LanService {
                     }
                 }
             });
+            tasks.lock().unwrap().push(h);
         }
 
         // Ticker: interfaces are re-read every 5 s; the engine paces itself.
         {
             let shared = shared.clone();
             let skip = opts.skip.clone();
-            tokio::spawn(async move {
+            let shutdown = shutdown.clone();
+            let h = tokio::spawn(async move {
                 let mut last_scan: Option<Instant> = None;
                 let mut routes_cache = Vec::new();
                 let mut hints = Vec::new();
@@ -790,9 +993,13 @@ impl LanService {
                             socks.send(&s).await;
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    tokio::select! {
+                        _ = shutdown.wait() => break,
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    }
                 }
             });
+            tasks.lock().unwrap().push(h);
         }
         Ok(svc)
     }
@@ -812,6 +1019,34 @@ impl LanService {
 
     pub fn query_soon(&self) {
         self.shared.lock().unwrap().engine.query_soon();
+    }
+
+    /// Stop every task this service started and close both endpoints. Used by
+    /// the one-shot pair command on success, expiry, cancellation and failure.
+    pub async fn shutdown(&self) {
+        self.shutdown.stop();
+        if let Some(ep) = &self.listen_ep {
+            ep.close(quinn::VarInt::from_u32(0), b"lan stopped");
+        }
+        self.dial_ep.close(quinn::VarInt::from_u32(0), b"lan stopped");
+        let handles = {
+            let mut g = self.tasks.lock().unwrap();
+            std::mem::take(&mut *g)
+        };
+        for mut h in handles {
+            tokio::select! {
+                _ = &mut h => {}
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    h.abort();
+                    let _ = h.await;
+                }
+            }
+        }
+    }
+
+    /// Dial pairing candidates with the pairing ALPN only.
+    pub async fn pair_dial(&self, addrs: Vec<SocketAddr>) -> Result<PairLink> {
+        pair_dial(&self.dial_ep, addrs).await
     }
 
     /// Dial `addrs` for `key` in the background. The result arrives as
@@ -930,7 +1165,7 @@ mod tests {
             ]
         });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_accept(lep, held, tx.clone());
+        spawn_accept(lep, held, None, Shutdown::new(), tx.clone());
         let target: SocketAddr = format!("127.0.0.1:{lport}").parse().unwrap();
 
         let (dep, _) = bind(0).unwrap();
@@ -968,7 +1203,7 @@ mod tests {
         let held: Arc<dyn Fn() -> Vec<LanKey> + Send + Sync> =
             Arc::new(|| vec![LanKey { name: "desk".into(), secret: "44".repeat(32), fleet: false }]);
         let (atx, mut arx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_accept(lep, held, atx.clone());
+        spawn_accept(lep, held, None, Shutdown::new(), atx.clone());
         let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
         let (dep, _) = bind(0).unwrap();
         let target: SocketAddr = format!("127.0.0.1:{lport}").parse().unwrap();

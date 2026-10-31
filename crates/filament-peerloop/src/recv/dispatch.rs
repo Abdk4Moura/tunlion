@@ -1558,8 +1558,8 @@ async fn recv_run(
         let keys_host = host.clone();
         let keys: std::sync::Arc<dyn Fn() -> Vec<filament_transport::lan::LanKey> + Send + Sync> =
             std::sync::Arc::new(move || crate::lan_glue::keys(keys_host.as_ref()));
-        let opts = filament_transport::lan::Options { serve: true, skip: filament_transport::lan::skip(&transport_context) };
-        match filament_transport::lan::LanService::start(&host.config_dir(), opts, keys, tx.clone()).await {
+        let opts = filament_transport::lan::Options { serve: true, skip: filament_transport::lan::skip(&transport_context), ..Default::default() };
+        match filament_transport::lan::LanService::start(&host.config_dir(), opts, keys, None, tx.clone()).await {
             Ok(svc) => conn.lan = Some(svc),
             Err(e) => log.say(&log.paint(Tone::Warn, &format!("  local discovery off: {e:#}"))),
         }

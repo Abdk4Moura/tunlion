@@ -400,7 +400,7 @@ async fn run_step(step: Step, name: &str, server: &str, relay: bool) -> Result<(
             ui::say(&format!(
                 "  {name} is paired. To make it one of your devices, it joins once with the code below."
             ));
-            crate::pair_cmd::pair_cmd(server, None, Some(name.to_string()), None, relay, true, Vec::new(), None, true)
+            crate::pair_cmd::pair_cmd(server, None, Some(name.to_string()), None, relay, true, Vec::new(), None, true, false)
                 .await?;
         }
         Step::GrantShell => crate::dispatch::grant_cmd(Some(name.into()), Some("shell".into()), None, false).await?,

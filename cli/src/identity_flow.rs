@@ -873,7 +873,7 @@ pub(crate) async fn join_guided(
                 ui::Tone::Dim,
                 &format!("  same as  tunlion join {code}"),
             ));
-            crate::pair_cmd::pair_cmd(server, Some(code), name, None, relay, false, Vec::new(), None, false)
+            crate::pair_cmd::pair_cmd(server, Some(code), name, None, relay, false, Vec::new(), None, false, false)
                 .await
         }
         JoinInput::File(path) => join_cmd(caps, server, relay, Some(path), None, name, to, None).await,

@@ -14,6 +14,7 @@
 use crate::conn::{AdoptSource, Conn, Presence};
 use crate::net::{self, Ev};
 use crate::pake_ceremony::{Ceremony, Inbound as PakeInbound, pair_v2_caps};
+use crate::pair_code::{Begin, Carrier as PairCarrier, PairCode};
 use crate::{
     cancelled, codeentry, devices_path, devices_store_v2,
     devices_upsert_atomic, direct, display_name, fleet, fleet_ui, fresh_secret, identity,
@@ -867,8 +868,10 @@ pub(crate) async fn pair_cmd(
     // entry (Enter there only ever meant "generate them") and puts the file
     // alternative on the code screen instead, where it is relevant.
     quick: bool,
+    // `--nearby`: use the LAN carrier only, with no signaling attempt.
+    nearby: bool,
 ) -> Result<()> {
-    pair_with_purpose(server, code, name, word, relay, internal, posture, enrol_ttl, quick, None).await
+    pair_with_purpose(server, code, name, word, relay, internal, posture, enrol_ttl, quick, None, nearby).await
 }
 
 pub(crate) async fn temporary_cmd(server: &str, spec: filament_peerloop::access::AccessSpec, relay: bool) -> Result<()> {
@@ -888,6 +891,7 @@ async fn pair_with_purpose(
     enrol_ttl: Option<u64>,
     quick: bool,
     temporary_spec: Option<filament_peerloop::access::AccessSpec>,
+    nearby: bool,
 ) -> Result<()> {
     if code.is_none() && word.is_none() && !interactive_allowed() {
         let (message, exit_code) = fleet_ui::pair_ui::err_pair_interactive();
@@ -1003,12 +1007,33 @@ async fn pair_with_purpose(
     let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
     // The home screen may already have opened this connection while the
     // person was choosing (preconnect.rs); otherwise connect now, as always.
+    // `--nearby` never touches the server. A plain code also falls back to the
+    // LAN carrier when signaling is unreachable; owner enrolment and temporary
+    // access stay server-only because this carrier issues neither.
+    if nearby {
+        if internal || temporary_spec.is_some() || FOR_PERSON.load(std::sync::atomic::Ordering::Relaxed) {
+            bail!("--nearby carries a plain pairing only; this operation needs the server");
+        }
+        return match &code {
+            Some(c) => crate::lan_pair::join_standalone(c, name, true).await,
+            None => crate::lan_pair::host_standalone(my_words.clone(), my_nameplate.clone()).await,
+        };
+    }
     let (sio, tx, mut rx) = match crate::preconnect::take(server).await {
         Some(warm) => warm,
         None => {
             let (tx, rx) = mpsc::unbounded_channel::<Ev>();
-            let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
-            (sio, tx, rx)
+            match net::connect_signaling(&transport_context, server, tx.clone()).await {
+                Ok(sio) => (sio, tx, rx),
+                Err(e) if !internal && temporary_spec.is_none() && !FOR_PERSON.load(std::sync::atomic::Ordering::Relaxed) => {
+                    ui::say(&ui::paint(ui::Tone::Dim, &format!("  server unreachable ({e:#}); trying the local network")));
+                    return match &code {
+                        Some(c) => crate::lan_pair::join_standalone(c, name, false).await,
+                        None => crate::lan_pair::host_standalone(my_words.clone(), my_nameplate.clone()).await,
+                    };
+                }
+                Err(e) => return Err(e),
+            }
         }
     };
     // Meta must exist for pairing; an unguessable solo room keeps strangers
@@ -1250,9 +1275,33 @@ async fn pair_with_purpose(
     // Gate 17b hook: connect but never complete, so the ceremony budget fires
     // deterministically (same-machine pairs otherwise finish in ~1s).
     let stall = test_hooks::pair_stall();
+    // The LAN carrier shares this code's one-winner state with signaling.
+    let mut pair_code: Option<PairCode> = None;
+    let mut lan_host: Option<crate::lan_pair::HostHandle> = None;
+    let mut signaling_token: Option<u64> = None;
+    let mut signaling_blocked = false;
 
     let result = async {
     loop {
+        // A LAN ceremony that confirmed hands its outcome here, where the one
+        // store call and the one code decision live.
+        let lan_event = lan_host.as_mut().and_then(|h| h.events.try_recv().ok());
+        if let Some(ev) = lan_event {
+            match ev {
+                crate::lan_pair::HostEvent::Outcome(out) => {
+                    let won = pair_code.as_ref().is_some_and(|c| c.confirm(out.token, Instant::now()));
+                    if won {
+                        crate::lan_pair::persist_plain(&out)?;
+                        if let Some(h) = lan_host.take() { h.shutdown().await; }
+                        return Ok(());
+                    }
+                }
+                crate::lan_pair::HostEvent::Failed { why, .. } => {
+                    ui::debug(&format!("lan pairing attempt failed: {why}"));
+                }
+            }
+        }
+
         // OFFER SIDE: offer this device's key once the key exchange is done,
         // and keep offering until the other side answers. Nothing is conferred
         // by offering: the owner device decides (see `enrol_offer_decision`).
@@ -1421,6 +1470,11 @@ async fn pair_with_purpose(
                                 }
                             }
                             // No cert: store secret only (legacy or first-pair no identity)
+                            if let (Some(token), Some(code)) = (signaling_token, pair_code.as_ref()) {
+                                if !code.confirm(token, Instant::now()) {
+                                    bail!("this code was already used by a nearby device");
+                                }
+                            }
                             devices_store_v2(&n, &sec, &caps)?;
                             // ...unless WE certified them during this ceremony. Then the
                             // secret and the certificate belong in one record: the owner
@@ -1469,6 +1523,11 @@ async fn pair_with_purpose(
                             // If process crashes between them, cap_authorize sees new-secret + old-cert (or no cert)
                             // yielding wrong userPub. Fix: devices_upsert_atomic writes both fields together.
                             let pcert = peer_identity_cert.as_ref().unwrap();
+                            if let (Some(token), Some(code)) = (signaling_token, pair_code.as_ref()) {
+                                if !code.confirm(token, Instant::now()) {
+                                    bail!("this code was already used by a nearby device");
+                                }
+                            }
                             // allow_reanchor: same accepted ceremony as above.
                             devices_upsert_atomic(
                                 &n,
@@ -1828,6 +1887,17 @@ async fn pair_with_purpose(
                         "  works once \u{b7} 10 min \u{b7} or scan it in the Tunlion app"
                     },
                 ));
+                // The same code is visible on the LAN while it is on screen.
+                let mut id = [0u8; 16];
+                if getrandom::getrandom(&mut id).is_ok() {
+                    let code_state = PairCode::new(id, Instant::now());
+                    ui::say(&format!("  nearby: {}  (compare with the other screen)", code_state.label()));
+                    match crate::lan_pair::spawn_host(code_state.clone(), my_words.clone(), my_nameplate.clone()).await {
+                        Ok(h) => lan_host = Some(h),
+                        Err(e) => ui::debug(&format!("lan pairing unavailable: {e:#}")),
+                    }
+                    pair_code = Some(code_state);
+                }
             }
             Ev::PairCode(v) => {
                 // v1 server (shouldn't happen for a v2 create, but be safe): a
@@ -1841,6 +1911,19 @@ async fn pair_with_purpose(
             Ev::PairUsed(_) => {
                 ui::say(&step_line("Code claimed"));
                 ceremony_deadline.get_or_insert_with(|| Instant::now() + ceremony_budget);
+                if let Some(code) = pair_code.as_ref() {
+                    match code.begin(PairCarrier::Signaling, Instant::now()) {
+                        Begin::Started(t) => signaling_token = Some(t),
+                        Begin::Busy => {
+                            signaling_blocked = true;
+                            ui::say("  another device is pairing with this code; this claim cannot proceed");
+                        }
+                        Begin::Closed => {
+                            signaling_blocked = true;
+                            ui::say("  this code was already used; this claim cannot proceed");
+                        }
+                    }
+                }
             }
             Ev::PairMatched(v) => {
                 let room = v["room"].as_str().unwrap_or_default().to_string();
@@ -1902,6 +1985,9 @@ async fn pair_with_purpose(
                     data["type"].as_str(),
                     Some("pake-msg") | Some("pake-confirm")
                 ) {
+                    if signaling_blocked {
+                        continue;
+                    }
                     match crate::pake_ceremony::partner_for(
                         pake_peer.as_deref(),
                         &from,
