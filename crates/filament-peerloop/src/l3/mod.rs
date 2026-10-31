@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -362,8 +362,56 @@ pub struct L3 {
     signaling: Vec<IpAddr>,
     /// Persisted next-sequence provider (host-configured).
     next_seq: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// MagicDNS writer: one owned task consumes snapshots in order, coalescing
+    /// to the newest queued snapshot before each blocking write. An older
+    /// peer-removal can therefore never be overwritten by a slower older write.
+    hosts_tx: Option<tokio::sync::mpsc::UnboundedSender<HostsSnapshot>>,
+    hosts_seq: AtomicU64,
+    /// Kept for ownership/lifetime. The writer drains its queue (including the
+    /// last removal) before exiting when the sender is dropped with `L3`.
+    _hosts_writer: Option<tokio::task::JoinHandle<()>>,
     /// False once the packet pump has observed the endpoint go away.
     endpoint_alive: Arc<AtomicBool>,
+}
+
+/// One MagicDNS snapshot handed to the owned writer. `seq` is monotonic so the
+/// writer can coalesce queued updates without an older one ever winning.
+pub(crate) struct HostsSnapshot {
+    seq: u64,
+    entries: Vec<(String, Ipv6Addr, Option<Ipv4Addr>)>,
+}
+
+/// Newest snapshot from a batch: highest sequence wins. Pure so the ordering
+/// rule is testable without touching the host file.
+fn newest_snapshot(snapshots: impl IntoIterator<Item = HostsSnapshot>) -> Option<HostsSnapshot> {
+    snapshots.into_iter().max_by_key(|snapshot| snapshot.seq)
+}
+
+/// Spawn the single MagicDNS writer. It performs its own blocking I/O and
+/// drains to the newest snapshot already queued, so the final removal before
+/// shutdown is still written even if an older write was in flight.
+fn spawn_hosts_writer(log: Arc<dyn LogSink>) -> (tokio::sync::mpsc::UnboundedSender<HostsSnapshot>, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<HostsSnapshot>();
+    let handle = tokio::spawn(async move {
+        while let Some(first) = rx.recv().await {
+            let mut queued = vec![first];
+            while let Ok(next) = rx.try_recv() {
+                queued.push(next);
+            }
+            let Some(snapshot) = newest_snapshot(queued) else {
+                continue;
+            };
+            let entries = snapshot.entries;
+            match tokio::task::spawn_blocking(move || rewrite_hosts_block(&entries)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log.debug(&format!(
+                    "  MagicDNS: /etc/hosts not updated ({e}); overlay still works by IP"
+                )),
+                Err(e) => log.debug(&format!("  MagicDNS: host writer failed: {e}")),
+            }
+        }
+    });
+    (tx, handle)
 }
 
 type ExitRoutePlan = Vec<Vec<String>>;
@@ -526,6 +574,7 @@ impl L3 {
         let endpoint_alive = Arc::new(AtomicBool::new(true));
         let pump_alive = endpoint_alive.clone();
         let routes: Arc<Mutex<RouteTable>> = Arc::new(Mutex::new(RouteTable::default()));
+        let (hosts_tx, hosts_writer) = spawn_hosts_writer(log.clone());
         let l3 = Arc::new(L3 {
             tun: tun.clone(),
             routes: routes.clone(),
@@ -541,6 +590,9 @@ impl L3 {
             advertised: advertised_prefixes,
             signaling: signaling_addrs,
             next_seq,
+            hosts_tx: Some(hosts_tx),
+            hosts_seq: AtomicU64::new(0),
+            _hosts_writer: Some(hosts_writer),
             endpoint_alive,
         });
         // Clear any stale MagicDNS block from a previous run - but only in kernel
@@ -1116,14 +1168,12 @@ impl L3 {
         self.sync_kernel_subnets().await;
     }
 
-    /// Rewrite the managed /etc/hosts block from the current verified names so
-    /// native tools resolve `<petname>` and `<petname>.mesh`. Best-effort: a
+    /// Publish the managed /etc/hosts snapshot from the current verified names
+    /// so native tools resolve `<petname>` and `<petname>.mesh`. Best-effort: a
     /// non-root daemon (or read-only /etc/hosts) just skips it and the overlay
-    /// still works by IP.
-    /// Refresh the managed /etc/hosts block from the current verified names so
-    /// native tools resolve `<petname>` and `<petname>.mesh`. Best-effort: a
-    /// non-root daemon (or read-only /etc/hosts) just skips it and the overlay
-    /// still works by IP.
+    /// still works by IP. The write itself belongs to the single owned writer,
+    /// so publishing never blocks the daemon loop and an older snapshot cannot
+    /// overwrite a newer removal.
     pub async fn refresh_hosts(&self) {
         // Userspace mode has no kernel route to the overlay, so a resolved
         // `<peer>.mesh` would point at an unroutable IP (worse than not resolving);
@@ -1138,18 +1188,11 @@ impl L3 {
             .values()
             .map(|(n, v6, v4)| (n.clone(), *v6, *v4))
             .collect();
-        // A host file write is blocking I/O; never hold the daemon loop on it.
-        let log = self.log.clone();
-        tokio::spawn(async move {
-            let written = tokio::task::spawn_blocking(move || rewrite_hosts_block(&entries)).await;
-            match written {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => log.debug(&format!(
-                    "  MagicDNS: /etc/hosts not updated ({e}); overlay still works by IP"
-                )),
-                Err(e) => log.debug(&format!("  MagicDNS: host writer failed: {e}")),
-            }
-        });
+        let Some(hosts_tx) = &self.hosts_tx else {
+            return;
+        };
+        let seq = self.hosts_seq.fetch_add(1, Ordering::Relaxed);
+        let _ = hosts_tx.send(HostsSnapshot { seq, entries });
     }
 }
 
@@ -1977,7 +2020,7 @@ mod tests {
             None
         );
     }
-    use super::{diagnose_tun_failure, dest_ip, kernel_overlay_blocker, prefix_contains, render_hosts, sanitize_host, RouteTable, Transport};
+    use super::{diagnose_tun_failure, dest_ip, kernel_overlay_blocker, newest_snapshot, prefix_contains, render_hosts, sanitize_host, HostsSnapshot, RouteTable, Transport};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
 
@@ -1999,6 +2042,20 @@ mod tests {
         let cleared = render_hosts(&again, &[]);
         assert!(!cleared.contains("tunlion-mesh"));
         assert!(cleared.contains("127.0.0.1 localhost"));
+    }
+
+    /// A slow older write must never overwrite a newer peer removal: the
+    /// writer coalesces to the highest sequence before rendering.
+    #[test]
+    fn newer_hosts_snapshot_always_wins() {
+        let a: Ipv6Addr = "fdf1:1af7:c30d:1a1::99aa".parse().unwrap();
+        let older = HostsSnapshot { seq: 1, entries: vec![("old-peer".into(), a, None)] };
+        // The removal snapshot is newer even though it is empty.
+        let newer = HostsSnapshot { seq: 2, entries: vec![] };
+        let picked = newest_snapshot(vec![newer, older]).expect("a snapshot");
+        assert_eq!(picked.seq, 2);
+        assert!(picked.entries.is_empty());
+        assert!(!render_hosts("", &picked.entries).contains("tunlion-mesh"));
     }
 
     #[test]
@@ -2225,6 +2282,9 @@ mod tests {
             advertised: Vec::new(),
             signaling: Vec::new(),
             next_seq: std::sync::Arc::new(|| 1),
+            hosts_tx: None,
+            hosts_seq: std::sync::atomic::AtomicU64::new(0),
+            _hosts_writer: None,
             endpoint_alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }

@@ -3447,9 +3447,9 @@ async fn recv_run(
                     revocation_snap = snap;
                     // An explicit forget/revoke is a lifecycle invalidation;
                     // a plain add/rename must not cancel the fleet's builds.
-                    if invalidate {
-                        conn.invalidate_builds();
-                    }
+                    // The per-peer invalidation runs AFTER the doomed set and
+                    // the store-dropped device secrets are known (below), so
+                    // forgetting A cannot cancel or block B.
                     revoked_secrets.extend(ports.daemon.prune_to_store(&mut devices));
                     // Meeting places a now-revoked sibling brokered.
                     brokered.retain(|_, (sec, broker)| {
@@ -3523,6 +3523,9 @@ async fn recv_run(
                         ) {
                             unrouted.push(pid.clone());
                         }
+                    }
+                    if invalidate {
+                        conn.invalidate_peers(&doomed, &revoked_secrets);
                     }
                     forgotten_channels.extend(revoked_secrets.iter().map(|s| host.channel_of(s)));
                     revoked_secrets.clear();
@@ -4380,6 +4383,11 @@ async fn recv_run(
                 conn.reset_digest_reconcile();
             }
             Ev::KnownPeer(v) => {
+                // Test-only raw offer-first gate: do not let the announcer's
+                // KnownPeer create/adopt a link ahead of the browser's SDP.
+                if crate::test_hooks::suppress_known_peer() {
+                    continue;
+                }
                 if host.is_self_uid(&conn.my_uid, v["uid"].as_str()) {
                     continue; // our own sender/daemon shares these channels
                 }
@@ -7305,9 +7313,9 @@ async fn recv_run(
                     }
                 }
                 Some("pair-intro") => {
-                    if let Some(name) = v["name"].as_str() {
-                        conn.allow_name(name);
-                    }
+                    // No authorization happens before the trusted/same-owner/
+                    // not-introduced checks and the store write below. A raw
+                    // payload name must never clear a revocation.
                     // C19/C20: only a fingerprint-verified known device may
                     // vouch new trust into this store. "Verified" means the
                     // link resolved to one of OUR records by its pair secret
@@ -7364,6 +7372,10 @@ async fn recv_run(
                         None
                     };
                     if let Some(iname) = stored {
+                        // The vouch passed every authority check and the store
+                        // write succeeded: re-authorize exactly this introduced
+                        // identity. Other revoked secrets stay revoked.
+                        conn.authorize_binding(&isec);
                         devices.push((iname.clone(), isec.clone()));
                         sess.channels.push(host.channel_of(&isec)); // C30
                         sess.touch();

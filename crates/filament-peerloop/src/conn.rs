@@ -772,7 +772,6 @@ pub struct BuildPlan {
     caller: &'static std::panic::Location<'static>,
     attempt: u8,
     prior_generation: Option<u32>,
-    epoch: u64,
     signals: std::collections::VecDeque<Value>,
     signal_bytes: usize,
 }
@@ -785,7 +784,9 @@ pub(crate) enum BuildIce {
 
 /// The bounded, cancellable build task for one peer. `signals` is the per-pid
 /// staging area for inbound signaling that arrives before the candidate is
-/// installed; `generation` tags every early event and staged signal.
+/// installed. `early` holds candidate-origin events drained from the build's
+/// OWN channel; that channel is the immutable provenance, so an event from the
+/// previously serving link can never be replayed onto the installed candidate.
 pub struct BuildState {
     generation: u32,
     cancel: Arc<BuildCancel>,
@@ -793,10 +794,12 @@ pub struct BuildState {
     started: Instant,
     signals: std::collections::VecDeque<Value>,
     signal_bytes: usize,
-    early: std::sync::Mutex<std::collections::VecDeque<Ev>>,
+    early: std::collections::VecDeque<Ev>,
     early_bytes: usize,
-    stuck: bool,
-    name: String,
+    events_rx: mpsc::UnboundedReceiver<Ev>,
+    /// Binding this intent was prepared with (authoritative pair secret). Used
+    /// only to decide whether a re-pair supersedes the in-flight intent.
+    binding: Option<(String, String)>,
 }
 
 pub(crate) struct BuildCancel {
@@ -824,8 +827,9 @@ impl BuildCancel {
 }
 
 /// A fully built candidate, produced only by the build task. `early` holds the
-/// Ev callbacks queued during construction; `early_rx` keeps the same candidate
-/// channel for later events and is forwarded only after installation.
+/// Ev callbacks queued during construction; `events_rx` keeps the same
+/// candidate-local channel for later events and is forwarded only after
+/// installation.
 pub struct BuiltPeer {
     peer_id: String,
     generation: u32,
@@ -838,7 +842,6 @@ pub struct BuiltPeer {
     replace: Replace,
     caller: &'static std::panic::Location<'static>,
     prior_generation: Option<u32>,
-    epoch: u64,
 }
 
 pub(crate) enum BuildStart {
@@ -866,13 +869,18 @@ fn discard_built(built: BuiltPeer) {
     close_built(built.peer);
 }
 
-fn discard_state(state: BuildState, peer: Arc<net::Peer>) {
-    let early = std::mem::take(&mut *state.early.lock().unwrap());
-    for ev in early {
+fn discard_pending_state(mut state: BuildState) {
+    let early = std::mem::take(&mut state.early);
+    let queued: Vec<Ev> = std::iter::from_fn(|| state.events_rx.try_recv().ok()).collect();
+    for ev in early.into_iter().chain(queued) {
         if let Ev::ChannelReady(_, transport) = ev {
             transport.force_close();
         }
     }
+}
+
+fn discard_state(state: BuildState, peer: Arc<net::Peer>) {
+    discard_pending_state(state);
     close_built(peer);
 }
 
@@ -884,10 +892,31 @@ fn ev_weight(ev: &Ev) -> usize {
     }
 }
 
+/// Move the build's own queued events into its bounded early buffer. Returns
+/// false when a bound was hit; the caller cancels that build. Nothing from the
+/// previous link can enter this channel, so everything here is candidate-local.
+fn drain_candidate_events(state: &mut BuildState) -> bool {
+    loop {
+        let ev = match state.events_rx.try_recv() {
+            Ok(ev) => ev,
+            Err(_) => return true,
+        };
+        let weight = ev_weight(&ev);
+        if state.early.len() >= MAX_BUILD_EVENTS
+            || state.early_bytes.saturating_add(weight) > MAX_BUILD_EVENT_BYTES
+        {
+            return false;
+        }
+        state.early_bytes += weight;
+        state.early.push_back(ev);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_build_task(
     plan: BuildPlan,
-    events: mpsc::UnboundedSender<Ev>,
+    candidate: mpsc::UnboundedSender<Ev>,
+    wake: mpsc::UnboundedSender<Ev>,
     cancel: Arc<BuildCancel>,
     out: mpsc::UnboundedSender<BuildDone>,
     context: filament_transport::TransportContext,
@@ -901,9 +930,10 @@ async fn run_build_task(
     let connect_polite = plan.polite;
     let connect_relay = plan.relay_ice;
     let connect_gen = plan.generation;
-    let wake_tx = events.clone();
+    let wake_tx = wake;
     let retry_plan = plan.clone();
     let connect_cfg = plan.config;
+    let delay_pid = plan.peer_id.clone();
     let build = async move {
         let mut cfg = match connect_cfg {
             BuildIce::Cached(cfg) => cfg,
@@ -926,6 +956,10 @@ async fn run_build_task(
         }
         let delay = test_hooks::establish_delay_ms();
         if delay > 0 {
+            filament_transport::hooks::debug(&format!(
+                "BUILD-DELAY peer={} ms={delay}",
+                delay_pid
+            ));
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
         match tokio::time::timeout(
@@ -937,7 +971,7 @@ async fn run_build_task(
                 cfg.ice_servers,
                 connect_relay,
                 sio,
-                events,
+                candidate,
                 connect_gen,
             ),
         )
@@ -967,7 +1001,7 @@ async fn run_build_task(
             return;
         }
     };
-    let hold = test_hooks::build_hold_ms();
+    let hold = test_hooks::build_hold_ms(&plan.peer_id);
     if hold > 0 {
         filament_transport::hooks::debug(&format!("BUILD-HOLD peer={} ms={hold}", plan.peer_id));
         tokio::time::sleep(Duration::from_millis(hold)).await;
@@ -984,9 +1018,24 @@ async fn run_build_task(
         replace: plan.replace,
         caller: plan.caller,
         prior_generation: plan.prior_generation,
-        epoch: plan.epoch,
     }));
     let _ = wake_tx.send(Ev::BuildWake);
+}
+
+/// One peer's retired build generation. Cancelled generations are terminal:
+/// the completion pump will not retry or apply them. Cancellation is per peer,
+/// not a global epoch, so retiring A leaves B and C free to build.
+#[derive(Clone, Copy)]
+pub struct RetiredIntent {
+    pub generation: u32,
+    pub at: Instant,
+}
+
+/// One installed link's candidate-origin event stream. Owned by `Conn`, keyed
+/// by pid, and drained once per loop turn. It dies with its link.
+pub struct LinkEvents {
+    pub generation: u32,
+    pub rx: mpsc::UnboundedReceiver<Ev>,
 }
 
 pub struct Conn {
@@ -1137,16 +1186,30 @@ pub struct Conn {
     /// starts, applied only when the candidate is installed.
     pub pending_bindings: HashMap<String, (String, String)>,
     pub pending_active: HashSet<String>,
-    /// Lifecycle epoch for builds. A forget/revoke bumps it; every spawn,
-    /// deferred retry and apply must match the epoch it captured.
-    pub build_epoch: u64,
-    /// Session-scoped pids invalidated by forget/revoke. A re-pair on a new
-    /// signaling session gets a new pid and is allowed; this is not a name
-    /// blacklist.
-    pub blocked_builds: HashSet<String>,
-    /// Device names forgotten/revoked. Cleared by a fresh pair-intro/enrollment,
-    /// so a legitimate re-pair is a new authorized epoch, not a permanent label.
-    pub blocked_names: HashSet<String>,
+    /// Per-peer intent generations retired by cancel/drop/peer-left/reap. A
+    /// Ready or Failed completion at or below the retired generation is dead:
+    /// a queued failure cannot retry a peer that already left, and an older
+    /// completion cannot remove a newer intent. A fresh intent gets a higher
+    /// `next_gen`, so cancelling one peer never blocks another.
+    pub cancelled_intents: HashMap<String, RetiredIntent>,
+    /// The generation of the newest intent prepared for each pid. Any older
+    /// spawn/deferred retry/apply is stale, so a re-pair supersedes an older
+    /// retry instead of racing it.
+    pub current_intent: HashMap<String, u32>,
+    /// Peers whose current intent was explicitly forgotten/revoked, with the
+    /// generation retired. A same-pid rebuild is refused unless it carries a
+    /// fresh authorized binding; a new-signaling-session pid is a new peer.
+    pub revoked_peers: HashMap<String, RetiredIntent>,
+    /// Stable device secrets the store has forgotten. A build carrying one is
+    /// refused regardless of pid, so a reconnect cannot re-use a stale label;
+    /// only an authenticated re-pair/vouch clears that exact secret. Fleet
+    /// rendezvous secrets are NOT device identities and never enter this set.
+    pub revoked_bindings: HashSet<String>,
+    /// Candidate-origin event streams for INSTALLED links, keyed by pid. The
+    /// entry is owned by the link: drop_link/replacement removes and drains it,
+    /// so a queued ChannelReady/Control from the old generation is discarded
+    /// instead of being replayed onto the new link.
+    pub link_events: HashMap<String, LinkEvents>,
     /// Roster sids absent from consecutive channel/room digests, for the
     /// two-tick hysteresis in `prune_roster_absent`.
     pub roster_absent: HashMap<String, u8>,
@@ -1348,9 +1411,11 @@ impl Conn {
             build_rx,
             pending_bindings: HashMap::new(),
             pending_active: HashSet::new(),
-            build_epoch: 0,
-            blocked_builds: HashSet::new(),
-            blocked_names: HashSet::new(),
+            cancelled_intents: HashMap::new(),
+            current_intent: HashMap::new(),
+            revoked_peers: HashMap::new(),
+            revoked_bindings: HashSet::new(),
+            link_events: HashMap::new(),
             roster_absent: HashMap::new(),
             log,
             host,
@@ -1902,6 +1967,10 @@ impl Conn {
         // A drop is an invalidation: a candidate still building for this peer
         // must not publish after the link it was replacing is gone.
         self.cancel_build(pid);
+        // The installed link owns its candidate-origin stream; dropping the
+        // receiver discards any queued ChannelReady/Control from this
+        // generation instead of forwarding it to a later link.
+        self.link_events.remove(pid);
         self.log.debug(&format!(
             "  drop_link({pid}) ordered by {}",
             std::panic::Location::caller()
@@ -2353,11 +2422,19 @@ impl Conn {
         replace: Replace,
     ) -> Result<Option<BuildPlan>> {
         let peer_id = info["id"].as_str().unwrap_or_default().to_string();
-        if self.blocked_builds.contains(&peer_id) {
-            return Ok(None);
-        }
-        let claimed_name = info["name"].as_str().unwrap_or_default();
-        if !claimed_name.is_empty() && self.blocked_names.contains(claimed_name) {
+        let carried_secret = self
+            .pending_bindings
+            .get(&peer_id)
+            .cloned()
+            .or_else(|| self.links.get(&peer_id).and_then(|l| l.expected_secret.clone()));
+        // Per-peer intent guard. A forgotten binding refuses every pid that
+        // presents it; a forgotten pid refuses a bare rebuild but accepts a
+        // fresh authorized binding (a real re-pair). No display name is a key.
+        if self.intent_blocked(&peer_id, carried_secret.as_ref()) {
+            self.log.debug(&format!(
+                "tunlion: ESTABLISH-REFUSED peer={peer_id} caller={caller}: \
+                 its intent was revoked and no fresh binding authorized it"
+            ));
             return Ok(None);
         }
         if self.direct_pending.contains_key(&peer_id) {
@@ -2375,13 +2452,21 @@ impl Conn {
             return Ok(None);
         }
         if self.builds.contains_key(&peer_id) {
-            return Ok(None);
+            let supersedes = self
+                .builds
+                .get(&peer_id)
+                .is_some_and(|state| self.authorized_replacement(&state.binding, &carried_secret));
+            if !supersedes {
+                return Ok(None);
+            }
+            self.retire_build(&peer_id);
         }
-        let carried_secret = self
-            .pending_bindings
-            .get(&peer_id)
-            .cloned()
-            .or_else(|| self.links.get(&peer_id).and_then(|l| l.expected_secret.clone()));
+        if let Some((plan, _)) = self.build_deferred.get(&peer_id) {
+            if !self.authorized_replacement(&plan.carried_secret, &carried_secret) {
+                return Ok(None);
+            }
+            self.retire_build(&peer_id);
+        }
         let uid = info["uid"].as_str().map(|s| s.to_string());
         let peer_present = self.roster.contains_key(&peer_id);
         let name = info["name"].as_str().unwrap_or("peer").to_string();
@@ -2405,6 +2490,10 @@ impl Conn {
         self.next_gen += 1;
         let generation = self.next_gen;
         let relay_ice = self.relay_only || test_hooks::webrtc_relay_only();
+        // This is now the only intent allowed to run/install for this pid. A
+        // re-pair therefore supersedes an older deferred retry instead of
+        // racing it; the older generation remains retired.
+        self.current_intent.insert(peer_id.clone(), generation);
         let config = match lock_ice(&self.ice_cache).cfg.clone() {
             Some((at, cfg)) if at.elapsed() < ICE_CONFIG_FRESH => {
                 self.chunk_size = cfg.chunk_size;
@@ -2443,7 +2532,6 @@ impl Conn {
             caller,
             attempt: 0,
             prior_generation,
-            epoch: self.build_epoch,
             signals: std::collections::VecDeque::new(),
             signal_bytes: 0,
         }))
@@ -2523,7 +2611,6 @@ impl Conn {
                 replace: plan.replace,
                 caller: plan.caller,
                 prior_generation: plan.prior_generation,
-                epoch: plan.epoch,
             },
             std::collections::VecDeque::new(),
             std::collections::VecDeque::new(),
@@ -2533,8 +2620,11 @@ impl Conn {
         Ok(())
     }
 
-    fn start_build(&mut self, mut plan: BuildPlan) -> BuildStart {
-        if plan.epoch != self.build_epoch {
+    fn start_build(&mut self, plan: BuildPlan) -> BuildStart {
+        if self.intent_retired(&plan.peer_id, plan.generation)
+            || self.current_intent.get(&plan.peer_id) != Some(&plan.generation)
+            || self.intent_blocked(&plan.peer_id, plan.carried_secret.as_ref())
+        {
             return BuildStart::AlreadyBuilding;
         }
         if self.builds.contains_key(&plan.peer_id) {
@@ -2558,14 +2648,18 @@ impl Conn {
     fn spawn_build(&mut self, mut plan: BuildPlan) {
         let pid = plan.peer_id.clone();
         let generation = plan.generation;
-        let stuck = plan.replace == Replace::StuckAttempt;
-        let name = plan.name.clone();
         let signals = std::mem::take(&mut plan.signals);
         let signal_bytes = plan.signal_bytes;
+        let binding = plan.carried_secret.clone();
         let cancel = Arc::new(BuildCancel::new());
         let task_cancel = cancel.clone();
         let out = self.build_tx.clone();
-        let events = self.tx.clone();
+        // Candidate events go to this build's OWN channel, never the main
+        // queue. That is the immutable provenance: the previously serving
+        // link's events stay on the main queue, and stale callbacks cannot be
+        // replayed onto the candidate after installation.
+        let (candidate_tx, candidate_rx) = mpsc::unbounded_channel();
+        let wake = self.tx.clone();
         let context = self.transport_context.clone();
         let server = self.server.clone();
         let sio = self.sio.clone();
@@ -2574,7 +2668,16 @@ impl Conn {
         let relay_forbidden = self.host.relay_forbidden();
         let handle = tokio::spawn(async move {
             run_build_task(
-                plan, events, task_cancel, out, context, server, sio, my_uid, cache,
+                plan,
+                candidate_tx,
+                wake,
+                task_cancel,
+                out,
+                context,
+                server,
+                sio,
+                my_uid,
+                cache,
                 relay_forbidden,
             )
             .await;
@@ -2588,18 +2691,72 @@ impl Conn {
                 started: Instant::now(),
                 signals,
                 signal_bytes,
-                early: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                early: std::collections::VecDeque::new(),
                 early_bytes: 0,
-                stuck,
-                name,
+                events_rx: candidate_rx,
+                binding,
             },
         );
     }
 
-    /// Poll the build lifecycle: apply finished candidates, start deferred
-    /// intents while slots are free, and reap a task that outlived its grace.
-    /// Every Conn driver calls this once per loop turn; it never awaits.
+    /// Poll the build lifecycle: drain candidate-local events into their
+    /// bounded buffers, apply finished candidates, start deferred intents while
+    /// slots are free, and reap a task that outlived its grace. Every Conn
+    /// driver calls this once per loop turn; it never awaits.
     pub fn pump_builds(&mut self) -> usize {
+        // Installed-link event streams are candidate-local. Forward them only
+        // while the link still carries the generation that created the stream;
+        // a replaced/dropped link's queued events are discarded, never applied
+        // to a newer link that reused the pid.
+        let linked: Vec<(String, u32)> = self
+            .link_events
+            .iter()
+            .map(|(pid, events)| (pid.clone(), events.generation))
+            .collect();
+        for (pid, generation) in linked {
+            let current = self.links.get(&pid).map(|l| l.generation) == Some(generation);
+            if !current {
+                self.link_events.remove(&pid);
+                continue;
+            }
+            let tx = self.tx.clone();
+            if let Some(events) = self.link_events.get_mut(&pid) {
+                while let Ok(ev) = events.rx.try_recv() {
+                    let _ = tx.send(ev);
+                }
+            }
+        }
+        // Candidate events are drained here, never taken from the main queue.
+        // An event from the previously serving link therefore cannot be
+        // replayed onto a candidate that is about to install.
+        let mut overflow: Vec<String> = Vec::new();
+        for (pid, state) in self.builds.iter_mut() {
+            if !drain_candidate_events(state) {
+                overflow.push(pid.clone());
+            }
+        }
+        for pid in overflow {
+            self.cancel_build(&pid);
+        }
+        // Retirement entries are bounded by outstanding work plus the build
+        // reap grace. A build task is aborted/reaped at that bound, and its
+        // completion is drained in the same pump, so no queued completion can
+        // outlive this window; pruning therefore cannot revive a stale apply.
+        let now = Instant::now();
+        let active: HashSet<String> = self
+            .builds
+            .keys()
+            .chain(self.build_deferred.keys())
+            .chain(self.links.keys())
+            .cloned()
+            .collect();
+        self.cancelled_intents.retain(|pid, retired| {
+            now.duration_since(retired.at) < BUILD_REAP_GRACE || active.contains(pid)
+        });
+        self.revoked_peers.retain(|pid, retired| {
+            now.duration_since(retired.at) < BUILD_REAP_GRACE || active.contains(pid)
+        });
+        self.current_intent.retain(|pid, _| active.contains(pid));
         let mut applied = 0usize;
         while let Ok(done) = self.build_rx.try_recv() {
             match done {
@@ -2621,8 +2778,16 @@ impl Conn {
                         "tunlion: BUILD-FAILED peer={pid} attempt={} reason={reason}",
                         plan.attempt
                     ));
+                    // A failure queued before peer-left/drop/cancel belongs to
+                    // a retired intent. It is terminal: no retry and no link
+                    // teardown (the cancel already decided this peer's fate).
+                    if self.intent_retired(&pid, generation) {
+                        self.log.debug(&format!(
+                            "tunlion: BUILD-FAILED peer={pid} gen={generation} retired, not retrying"
+                        ));
+                        continue;
+                    }
                     if plan.attempt + 1 < 3
-                        && plan.epoch == self.build_epoch
                         && !self.builds.contains_key(&pid)
                         && (self.build_deferred.len() < MAX_DEFERRED_BUILDS
                             || self.build_deferred.contains_key(&pid))
@@ -2656,8 +2821,18 @@ impl Conn {
                 }
                 BuildDone::Cancelled { plan } => {
                     let pid = plan.peer_id.clone();
+                    let generation = plan.generation;
                     self.log.debug(&format!("tunlion: BUILD-CANCELLED peer={pid}"));
-                    self.builds.remove(&pid);
+                    // Cancelled is terminal for THIS generation. A newer intent
+                    // (higher generation) must keep its slot.
+                    let matches = self
+                        .builds
+                        .get(&pid)
+                        .is_some_and(|state| state.generation == generation);
+                    if matches {
+                        self.builds.remove(&pid);
+                    }
+                    self.retire_intent(&pid, generation);
                 }
             }
         }
@@ -2679,7 +2854,11 @@ impl Conn {
                 .map(|(pid, _)| pid.clone());
             let Some(pid) = next else { break };
             let Some((plan, _)) = self.build_deferred.remove(&pid) else { break };
-            if self.builds.contains_key(&pid) || plan.epoch != self.build_epoch {
+            if self.builds.contains_key(&pid)
+                || self.current_intent.get(&pid) != Some(&plan.generation)
+                || self.intent_retired(&pid, plan.generation)
+                || self.intent_blocked(&pid, plan.carried_secret.as_ref())
+            {
                 continue;
             }
             self.spawn_build(plan);
@@ -2688,11 +2867,15 @@ impl Conn {
     }
 
     fn apply_built_peer(&mut self, built: BuiltPeer) {
-        let Some(state) = self.builds.remove(&built.peer_id) else {
+        let Some(mut state) = self.builds.remove(&built.peer_id) else {
             discard_built(built);
             return;
         };
-        if state.generation != built.generation || state.cancel.is_cancelled() || built.epoch != self.build_epoch {
+        if state.generation != built.generation
+            || state.cancel.is_cancelled()
+            || self.current_intent.get(&built.peer_id) != Some(&built.generation)
+            || self.intent_retired(&built.peer_id, built.generation)
+        {
             discard_built(built);
             return;
         }
@@ -2721,13 +2904,32 @@ impl Conn {
             built.replace == Replace::StuckAttempt || !live,
             "apply_built_peer must never drop a link with a live transport"
         );
-        let early = std::mem::take(&mut *state.early.lock().unwrap());
+        let pid = built.peer_id.clone();
+        let generation = built.generation;
         let binding = self
             .pending_bindings
             .remove(&built.peer_id)
             .or(built.carried_secret.clone());
+        // A revocation that landed after prepare must still fence the apply.
+        if self.intent_blocked(&pid, binding.as_ref()) {
+            discard_state(state, built.peer);
+            return;
+        }
+        // Anything already emitted during construction is replayed first, in
+        // order; then the SAME candidate channel is forwarded for the life of
+        // the link. No old-link event can enter it.
+        if !drain_candidate_events(&mut state) {
+            discard_built(built);
+            return;
+        }
+        let early = std::mem::take(&mut state.early);
+        let candidate_rx = state.events_rx;
         let pending_active = self.pending_active.remove(&built.peer_id);
         self.install_built(built, early, state.signals, binding, pending_active);
+        // The forwarder is owned by the link: pump_builds drains this receiver
+        // only while the link still carries `generation`, and drop_link/
+        // replacement removes it, discarding queued stale events.
+        self.link_events.insert(pid, LinkEvents { generation, rx: candidate_rx });
     }
 
     fn install_built(
@@ -2739,6 +2941,14 @@ impl Conn {
         pending_active: bool,
     ) {
         let webrtc_only = self.webrtc_only.contains(&built.peer_id);
+        // A candidate that reached apply with a binding the store still holds
+        // is a fresh authorized intent: the old revoked generation stays
+        // retired (monotonic generations), but the pid is no longer blocked.
+        if let Some((_, secret)) = &binding {
+            if self.store_holds_binding(secret) && !self.revoked_bindings.contains(secret) {
+                self.revoked_peers.remove(&built.peer_id);
+            }
+        }
         self.drop_link(&built.peer_id);
         if webrtc_only {
             self.webrtc_only.insert(built.peer_id.clone());
@@ -2784,53 +2994,22 @@ impl Conn {
         }
     }
 
-    /// Stage a candidate event before the normal dispatcher sees it. Events
-    /// produced by an old, still-serving link keep flowing; only traffic for a
-    /// building candidate with no installed transport is held. The build's
-    /// generation is the immutable provenance, and the inventory is bounded.
+    /// Pass a main-queue event through. Candidate-origin events no longer
+    /// travel on the main queue: each build owns its own channel (see
+    /// `BuildState::events_rx`), so an old, still-serving link's Control or
+    /// PcState can never be replayed onto a replacement. The function is kept
+    /// as the single call-site seam every driver already uses.
     pub fn stage_event(&mut self, ev: Ev) -> Option<Ev> {
-        let pid = match &ev {
-            Ev::ChannelReady(pid, _)
-            | Ev::Control(pid, _)
-            | Ev::PcState(pid, _)
-            | Ev::Stuck(pid, _) => pid.clone(),
-            _ => return Some(ev),
-        };
-        let old_transport = self.links.get(&pid).and_then(|l| l.transport.clone());
-        let Some(stuck_build) = self.builds.get(&pid).map(|s| s.stuck) else {
-            return Some(ev);
-        };
-        if let Ev::ChannelReady(_, transport) = &ev {
-            if old_transport
-                .as_ref()
-                .is_some_and(|old| Arc::ptr_eq(old, transport))
-            {
-                return Some(ev);
-            }
-        } else if old_transport.is_some() && !stuck_build {
-            return Some(ev);
-        }
-        let state = self.builds.get_mut(&pid).expect("build checked above");
-        let weight = ev_weight(&ev);
-        let mut early = state.early.lock().unwrap();
-        if early.len() >= MAX_BUILD_EVENTS
-            || state.early_bytes.saturating_add(weight) > MAX_BUILD_EVENT_BYTES
-        {
-            drop(early);
-            state.cancel.cancel();
-            return None;
-        }
-        state.early_bytes += weight;
-        early.push_back(ev);
-        None
+        Some(ev)
     }
 
     /// Stage an inbound signal for a candidate that is still being built.
     /// Returns true when consumed. Callers must invoke this before their normal
-    /// signal handler. `to` names the candidate; the build's generation is the
-    /// immutable provenance.
+    /// signal handler. The candidate is named by the server-stamped envelope
+    /// `from`; a payload's `to`/`from` is peer-controlled data and is never
+    /// used to choose a build.
     pub fn stage_signal(&mut self, data: &Value) -> bool {
-        let Some(pid) = data["to"].as_str().or_else(|| data["from"].as_str()) else {
+        let Some(pid) = data["from"].as_str() else {
             return false;
         };
         if let Some(state) = self.builds.get_mut(pid) {
@@ -2864,35 +3043,172 @@ impl Conn {
             && self.transport_of(pid).is_none()
     }
 
-    /// Forget/revoke invalidation. A new authorized build captures the new
-    /// epoch; old spawns, deferred intents and completions cannot publish.
-    pub fn block_name(&mut self, name: &str) {
-        if !name.is_empty() {
-            self.blocked_names.insert(name.to_string());
+    /// A different binding the store still authorizes is a real re-pair and may
+    /// supersede an older in-flight/deferred intent for the same pid. Any other
+    /// case is a duplicate establish and is deduped.
+    fn authorized_replacement(
+        &self,
+        current: &Option<(String, String)>,
+        incoming: &Option<(String, String)>,
+    ) -> bool {
+        let Some((_, new)) = incoming else {
+            return false;
+        };
+        if new.is_empty()
+            || self.revoked_bindings.contains(new)
+            || !self.store_holds_binding(new)
+        {
+            return false;
+        }
+        match current {
+            Some((_, old)) => old != new,
+            None => true,
         }
     }
 
-    pub fn allow_name(&mut self, name: &str) {
-        self.blocked_names.remove(name);
+    /// True when this build generation is no longer allowed to run or install.
+    /// Both tombstones are per peer: a retirement for A says nothing about B.
+    fn intent_retired(&self, pid: &str, generation: u32) -> bool {
+        let cancelled = self
+            .cancelled_intents
+            .get(pid)
+            .is_some_and(|r| generation <= r.generation);
+        let revoked = self
+            .revoked_peers
+            .get(pid)
+            .is_some_and(|r| generation <= r.generation);
+        cancelled || revoked
     }
 
-    pub fn invalidate_builds(&mut self) {
-        let mut invalid: Vec<(String, String)> = self
-            .builds
-            .iter()
-            .map(|(pid, state)| (pid.clone(), state.name.clone()))
-            .collect();
-        invalid.extend(
-            self.links
+    /// Record a generation as terminal. Only the highest retired generation is
+    /// kept; `next_gen` is monotonic, so a fresh intent is always above it.
+    fn retire_intent(&mut self, pid: &str, generation: u32) {
+        let entry = self
+            .cancelled_intents
+            .entry(pid.to_string())
+            .or_insert(RetiredIntent { generation, at: Instant::now() });
+        if generation > entry.generation {
+            entry.generation = generation;
+            entry.at = Instant::now();
+        }
+    }
+
+    /// The current device store is the authority for a re-pair's binding. A
+    /// hint, a stale envelope, or an arbitrary new string is not enough.
+    fn store_holds_binding(&self, secret: &str) -> bool {
+        !secret.is_empty()
+            && self
+                .host
+                .devices_load()
                 .iter()
-                .map(|(pid, link)| (pid.clone(), link.shown().to_string())),
-        );
-        for (pid, name) in invalid {
-            self.blocked_builds.insert(pid);
-            self.block_name(&name);
+                .any(|(_, held)| held == secret)
+    }
+
+    /// Refusal predicate for a build intent.
+    ///
+    /// A secret the store dropped refuses EVERY pid that presents it. A pid
+    /// whose intent was explicitly revoked refuses a bare rebuild, and accepts
+    /// only a binding the current store still holds (a real re-pair). Display
+    /// names are never keys: several devices may share one.
+    fn intent_blocked(&self, pid: &str, binding: Option<&(String, String)>) -> bool {
+        if let Some((_, secret)) = binding {
+            if !secret.is_empty() {
+                if self.revoked_bindings.contains(secret) {
+                    return true;
+                }
+                if self.revoked_peers.contains_key(pid) {
+                    return !self.store_holds_binding(secret);
+                }
+                return false;
+            }
         }
-        self.build_epoch = self.build_epoch.wrapping_add(1);
-        self.cancel_builds();
+        self.revoked_peers.contains_key(pid)
+    }
+
+    /// Explicit forget/revoke invalidation for the departed set only.
+    ///
+    /// `revoked_secrets` are DEVICE secrets the store dropped (never a fleet
+    /// rendezvous secret). Doomed pids are retired by pid+generation, which is
+    /// enough for fleet links whose binding is shared across siblings. A build
+    /// is retired only when its own binding is one of the dropped device
+    /// secrets; a shared display name is not evidence and never names a target.
+    pub fn invalidate_peers(
+        &mut self,
+        doomed: &[(String, String)],
+        revoked_secrets: &HashSet<String>,
+    ) {
+        for secret in revoked_secrets {
+            if !secret.is_empty() {
+                self.revoked_bindings.insert(secret.clone());
+            }
+        }
+        let build_pids: Vec<(String, Option<String>)> = self
+            .builds
+            .keys()
+            .map(|pid| {
+                let secret = self
+                    .pending_bindings
+                    .get(pid)
+                    .map(|(_, s)| s.clone())
+                    .or_else(|| {
+                        self.links
+                            .get(pid)
+                            .and_then(|l| l.expected_secret.as_ref().map(|(_, s)| s.clone()))
+                    });
+                (pid.clone(), secret)
+            })
+            .chain(self.build_deferred.iter().map(|(pid, (plan, _))| {
+                (pid.clone(), plan.carried_secret.as_ref().map(|(_, s)| s.clone()))
+            }))
+            .collect();
+        let mut targets: HashMap<String, u32> = HashMap::new();
+        {
+            let mut add = |pid: &str, generation: u32| {
+                let entry = targets.entry(pid.to_string()).or_insert(0);
+                *entry = (*entry).max(generation);
+            };
+            for (pid, _) in doomed {
+                // Retire the LINK generation, not a newer authorized build
+                // that may already be superseding it for the same pid.
+                let generation = self.links.get(pid).map(|l| l.generation).unwrap_or(0);
+                add(pid, generation);
+            }
+            for (pid, secret) in build_pids {
+                if secret.as_deref().is_some_and(|s| revoked_secrets.contains(s)) {
+                    let generation = self
+                        .builds
+                        .get(&pid)
+                        .map(|state| state.generation)
+                        .or_else(|| {
+                            self.build_deferred
+                                .get(&pid)
+                                .map(|(plan, _)| plan.generation)
+                        })
+                        .unwrap_or(0);
+                    add(&pid, generation);
+                }
+            }
+        }
+        for (pid, generation) in targets {
+            let entry = self
+                .revoked_peers
+                .entry(pid.clone())
+                .or_insert(RetiredIntent { generation, at: Instant::now() });
+            if generation > entry.generation {
+                entry.generation = generation;
+                entry.at = Instant::now();
+            }
+            self.cancel_build(&pid);
+        }
+    }
+
+    /// An authenticated vouch authorizes exactly this introduced secret again.
+    /// Callers must already have passed trusted + same-owner + not-introduced
+    /// and the store write. A different forgotten secret stays revoked.
+    pub fn authorize_binding(&mut self, secret: &str) {
+        if !secret.is_empty() {
+            self.revoked_bindings.remove(secret);
+        }
     }
 
     pub fn note_binding(&mut self, pid: &str, binding: (String, String)) {
@@ -2904,13 +3220,25 @@ impl Conn {
     }
 
     pub fn cancel_build(&mut self, pid: &str) {
+        self.retire_build(pid);
+        self.pending_bindings.remove(pid);
+        self.pending_active.remove(pid);
+    }
+
+    /// Retire an in-flight/deferred intent without discarding the caller's
+    /// just-recorded binding. Used when a re-pair supersedes an older intent.
+    fn retire_build(&mut self, pid: &str) {
         if let Some(state) = self.builds.remove(pid) {
             state.cancel.cancel();
             state.handle.abort();
+            self.retire_intent(pid, state.generation);
+            discard_pending_state(state);
         }
-        self.build_deferred.remove(pid);
-        self.pending_bindings.remove(pid);
-        self.pending_active.remove(pid);
+        if let Some((plan, _)) = self.build_deferred.remove(pid) {
+            // Deferred-only peers still need a tombstone: a queued Failed for
+            // that generation must not re-queue a retry after this cancel.
+            self.retire_intent(pid, plan.generation);
+        }
     }
 
     pub fn cancel_builds(&mut self) {
@@ -5510,8 +5838,13 @@ impl Conn {
         let pid = pid_val.to_string();
         self.roster.remove(&pid);
         self.webrtc_only.remove(&pid);
-        if self.builds.contains_key(&pid) {
-            self.log.debug(&format!("peer-left invalidated build pid={pid}"));
+        if let Some(state) = self.builds.get(&pid) {
+            #[cfg(feature = "test-hooks")]
+            let generation = format!(" gen={}", state.generation);
+            #[cfg(not(feature = "test-hooks"))]
+            let generation = "";
+            self.log
+                .debug(&format!("peer-left invalidated build pid={pid}{generation}"));
         }
         self.cancel_build(&pid);
         if !self.links.contains_key(&pid) {
@@ -7977,6 +8310,7 @@ mod warm_identity_tests {
     }
 
     fn build_state(generation: u32) -> BuildState {
+        let (_tx, events_rx) = mpsc::unbounded_channel();
         BuildState {
             generation,
             cancel: Arc::new(BuildCancel::new()),
@@ -7984,38 +8318,61 @@ mod warm_identity_tests {
             started: Instant::now(),
             signals: std::collections::VecDeque::new(),
             signal_bytes: 0,
-            early: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            early: std::collections::VecDeque::new(),
             early_bytes: 0,
-            stuck: false,
-            name: "peer".into(),
+            events_rx,
+            binding: None,
         }
     }
 
-    /// An old link's traffic must keep flowing while a replacement builds: only
-    /// the candidate's own transport is staged. This is the source attribution
-    /// the batch fix must not regress.
+    /// Test build state plus its candidate-local sender, so a test can prove
+    /// which events reach the installed link and which are discarded.
+    fn build_state_with_tx(generation: u32) -> (BuildState, mpsc::UnboundedSender<Ev>) {
+        let (tx, events_rx) = mpsc::unbounded_channel();
+        let mut state = build_state(generation);
+        state.events_rx = events_rx;
+        (state, tx)
+    }
+
+    /// Prepare one intent for a test, optionally recording its binding first.
+    fn prepared_plan(conn: &mut Conn, pid: &str, binding: Option<(&str, &str)>) -> BuildPlan {
+        if let Some((name, secret)) = binding {
+            conn.note_binding(pid, (name.to_string(), secret.to_string()));
+        }
+        conn.prepare_build(
+            json!({ "id": pid, "name": "peer" }),
+            None,
+            std::panic::Location::caller(),
+            Replace::StuckAttempt,
+        )
+        .expect("prepare")
+        .expect("a plan")
+    }
+
+    /// Candidate events never travel on the main queue, so an old link's
+    /// Control/PcState cannot be replayed onto a replacement. The dedicated
+    /// channel is the provenance.
     #[tokio::test]
-    async fn only_the_candidate_transport_is_staged_during_a_build() {
-        let (mut conn, _far, _rx) = test_conn().await;
+    async fn candidate_events_are_candidate_local() {
+        let (mut conn, _far, mut _rx) = test_conn().await;
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pid = "sid-building";
         let old = Rec::new("old", &log);
         let mut link = relay_link(pid, "peer", "peer", old.clone());
         link.transport = Some(old.clone());
         conn.links.insert(pid.to_string(), link);
-        conn.builds.insert(pid.to_string(), build_state(7));
+        let (state, candidate_tx) = build_state_with_tx(7);
+        conn.builds.insert(pid.to_string(), state);
+        // A serving-link event passes straight through the main queue.
         let old_event = Ev::Control(pid.to_string(), json!({ "type": "ping" }));
-        assert!(
-            conn.stage_event(old_event).is_some(),
-            "the serving link's control was buffered as candidate traffic"
-        );
+        assert!(conn.stage_event(old_event).is_some());
+        // Only events sent on the build's own channel are buffered.
         let candidate = Rec::new("candidate", &log);
-        let new_event = Ev::ChannelReady(pid.to_string(), candidate);
-        assert!(
-            conn.stage_event(new_event).is_none(),
-            "the candidate's ChannelReady was not staged"
-        );
-        assert_eq!(conn.builds[pid].early.lock().unwrap().len(), 1);
+        candidate_tx
+            .send(Ev::ChannelReady(pid.to_string(), candidate))
+            .unwrap();
+        conn.pump_builds();
+        assert_eq!(conn.builds[pid].early.len(), 1);
     }
 
     /// Signaling can arrive before installation; the envelope names the peer in
@@ -8246,6 +8603,7 @@ mod warm_identity_tests {
         )
         .await
         .expect("build a local candidate");
+        conn.current_intent.insert(pid.to_string(), 42);
         conn.apply_built_peer(BuiltPeer {
             peer_id: pid.to_string(),
             generation: 42,
@@ -8258,7 +8616,6 @@ mod warm_identity_tests {
             replace: Replace::StuckAttempt,
             caller: std::panic::Location::caller(),
             prior_generation: Some(7),
-            epoch: conn.build_epoch,
         });
         assert!(
             conn.links[pid]
@@ -8283,6 +8640,192 @@ mod warm_identity_tests {
         assert!(conn.builds.is_empty());
         assert!(!conn.pending_bindings.contains_key(pid));
         assert!(!conn.pending_active.contains(pid));
+    }
+
+    /// Forget A must not freeze B or an unrelated build-only peer C. The
+    /// departed device secret refuses any pid that presents it, and a fresh
+    /// authorized re-pair is a new intent above the retired generation.
+    #[tokio::test]
+    async fn forgetting_one_peer_leaves_unrelated_peers_building() {
+        let host = Arc::new(TestHost {
+            devices: vec![("a".into(), "secret-a2".into())],
+        });
+        let (mut conn, _far, _rx) = test_conn_with_host(host).await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let a: Arc<dyn Transport> = Rec::new("a", &log);
+        let mut link = direct_link("sid-a", "a", "a", a);
+        link.expected_secret = Some(("a".into(), "secret-a".into()));
+        conn.links.insert("sid-a".into(), link);
+        conn.builds.insert("sid-b".into(), build_state(5));
+        conn.note_binding("sid-b", ("b".into(), "secret-b".into()));
+        conn.builds.insert("sid-c".into(), build_state(6));
+        conn.note_binding("sid-c", ("c".into(), "secret-c".into()));
+        let mut dropped = HashSet::new();
+        dropped.insert("secret-a".to_string());
+        conn.invalidate_peers(&[("sid-a".into(), "a".into())], &dropped);
+        assert!(conn.revoked_bindings.contains("secret-a"));
+        assert!(!conn.revoked_bindings.contains("secret-b"));
+        assert!(!conn.revoked_peers.contains_key("sid-b"));
+        assert!(!conn.revoked_peers.contains_key("sid-c"));
+        assert!(conn.builds.contains_key("sid-b"), "forget A cancelled B's build");
+        assert!(conn.builds.contains_key("sid-c"), "forget A cancelled C's build");
+        assert!(conn.intent_blocked("sid-a", Some(&("a".into(), "secret-a".into()))));
+        assert!(
+            !conn.intent_blocked("sid-a", Some(&("a".into(), "secret-a2".into()))),
+            "a fresh authorized secret was refused"
+        );
+        assert!(
+            conn.intent_blocked("sid-new", Some(&("a".into(), "secret-a".into()))),
+            "a revoked binding was accepted on a new pid"
+        );
+    }
+
+    /// A re-pair's fresh authorized binding supersedes an older deferred retry
+    /// for the same pid instead of letting the old generation race it.
+    #[tokio::test]
+    async fn a_re_pair_supersedes_an_older_deferred_retry() {
+        let host = Arc::new(TestHost {
+            devices: vec![("dev".into(), "new-secret".into())],
+        });
+        let (mut conn, _far, _rx) = test_conn_with_host(host).await;
+        let pid = "sid-repair";
+        let old = prepared_plan(&mut conn, pid, Some(("dev", "old-secret")));
+        let old_generation = old.generation;
+        conn.build_deferred.insert(pid.into(), (old.clone(), Instant::now()));
+        let new = prepared_plan(&mut conn, pid, Some(("dev", "new-secret")));
+        assert!(new.generation > old_generation);
+        assert!(
+            !conn.build_deferred.contains_key(pid),
+            "an older deferred retry survived the re-pair"
+        );
+        assert!(matches!(conn.start_build(old), BuildStart::AlreadyBuilding));
+        assert_eq!(conn.current_intent.get(pid), Some(&new.generation));
+    }
+
+    /// A failure queued before peer-left/drop/cancel must not requeue a retry.
+    #[tokio::test]
+    async fn a_failure_queued_before_drop_does_not_retry() {
+        for left in [false, true] {
+            let (mut conn, _far, _rx) = test_conn().await;
+            let pid = "sid-fail-cancel";
+            let plan = prepared_plan(&mut conn, pid, None);
+            conn.builds.insert(pid.into(), build_state(plan.generation));
+            conn.build_tx
+                .send(BuildDone::Failed { plan, reason: "held".into() })
+                .unwrap();
+            if left {
+                conn.on_peer_left(&json!({ "id": pid }));
+            } else {
+                conn.cancel_build(pid);
+            }
+            conn.pump_builds();
+            assert!(conn.builds.is_empty(), "retired build was re-created");
+            assert!(conn.build_deferred.is_empty(), "retired build was retried");
+            assert!(conn.links.is_empty(), "retired build installed a link");
+        }
+    }
+
+    /// An older Cancelled completion is terminal for its own generation only;
+    /// it must not remove a newer intent's build slot.
+    #[tokio::test]
+    async fn an_older_cancelled_completion_cannot_remove_a_newer_intent() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-older";
+        let old = prepared_plan(&mut conn, pid, None);
+        conn.builds.insert(pid.into(), build_state(old.generation));
+        conn.build_tx
+            .send(BuildDone::Cancelled { plan: old.clone() })
+            .unwrap();
+        conn.builds.insert(pid.into(), build_state(old.generation + 1));
+        conn.current_intent.insert(pid.into(), old.generation + 1);
+        conn.pump_builds();
+        assert_eq!(
+            conn.builds.get(pid).map(|state| state.generation),
+            Some(old.generation + 1),
+            "an older Cancelled removed a newer intent"
+        );
+    }
+
+    /// The fleet rendezvous secret is shared by every sibling. Forgetting one
+    /// sibling retires its pid, never the shared binding.
+    #[tokio::test]
+    async fn revoking_a_fleet_sibling_does_not_revoke_the_shared_rendezvous() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let t: Arc<dyn Transport> = Rec::new("fleet", &log);
+        let mut link = direct_link("sid-fleet", "sib", "sib", t);
+        link.expected_secret = Some(("fleet".into(), "fleet-rv".into()));
+        conn.links.insert("sid-fleet".into(), link);
+        let mut dropped = HashSet::new();
+        dropped.insert("device-secret".to_string());
+        conn.invalidate_peers(&[("sid-fleet".into(), "sib".into())], &dropped);
+        assert!(
+            !conn.revoked_bindings.contains("fleet-rv"),
+            "the shared fleet rendezvous secret was revoked"
+        );
+        assert!(!conn.intent_blocked(
+            "sid-other",
+            Some(&("sib".into(), "fleet-rv".into()))
+        ));
+    }
+
+    /// Only the introduced secret is re-authorized by a vouch.
+    #[tokio::test]
+    async fn authorize_binding_clears_only_the_vouched_secret() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.revoked_bindings.insert("forgotten".into());
+        conn.revoked_bindings.insert("vouched".into());
+        conn.authorize_binding("vouched");
+        assert!(!conn.revoked_bindings.contains("vouched"));
+        assert!(conn.revoked_bindings.contains("forgotten"));
+    }
+
+    /// Signal staging follows the server-stamped `from`, never a payload `to`.
+    #[tokio::test]
+    async fn stage_signal_attributes_only_the_server_envelope_from() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-signal-attr";
+        conn.builds.insert(pid.to_string(), build_state(3));
+        assert!(conn.stage_signal(&json!({
+            "from": pid,
+            "data": { "to": "decoy", "type": "description" }
+        })));
+        assert!(!conn.stage_signal(&json!({
+            "from": "someone-else",
+            "data": { "to": pid, "type": "description" }
+        })));
+        assert_eq!(conn.builds[pid].signals.len(), 1);
+    }
+
+    /// A dropped/replaced link's queued candidate events are discarded, not
+    /// forwarded to whatever link reuses the pid.
+    #[tokio::test]
+    async fn a_replaced_link_cannot_forward_queued_events() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-forwarder";
+        let t: Arc<dyn Transport> = Rec::new("serving", &log);
+        let mut link = relay_link(pid, "peer", "peer", t);
+        link.generation = 7;
+        conn.links.insert(pid.to_string(), link);
+        let (tx, events_rx) = mpsc::unbounded_channel();
+        conn.link_events
+            .insert(pid.to_string(), LinkEvents { generation: 7, rx: events_rx });
+        tx.send(Ev::Control(pid.to_string(), json!({ "type": "ping" })))
+            .unwrap();
+        conn.pump_builds();
+        assert!(
+            matches!(rx.try_recv(), Ok(Ev::Control(p, _)) if p == pid),
+            "a live link's event was not forwarded"
+        );
+        tx.send(Ev::Control(pid.to_string(), json!({ "type": "stale" })))
+            .unwrap();
+        conn.drop_link(pid);
+        conn.pump_builds();
+        assert!(
+            rx.try_recv().is_err(),
+            "a stale old-link event was forwarded after replacement"
+        );
     }
 
     /// A race that won must not be expired or reaped while it waits beside the
