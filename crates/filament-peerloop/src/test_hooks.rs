@@ -162,6 +162,69 @@ mod on {
             .unwrap_or(0)
     }
 
+    /// Test-only deterministic pre-publication barrier. The fixture creates a
+    /// private directory, the build task publishes an atomic
+    /// `ready.<sid>.<generation>` marker there, and it may not publish the
+    /// candidate until the fixture writes `release.<sid>.<generation>`. The
+    /// wait is cancellation-aware and bounded; a timeout retires the candidate
+    /// instead of auto-publishing it. Release builds never read this.
+    pub fn build_barrier_dir() -> Option<std::path::PathBuf> {
+        let raw = std::env::var_os("TUNLION_TEST_BUILD_BARRIER_DIR")?;
+        let path = std::path::PathBuf::from(raw);
+        if !path.is_absolute() {
+            return None;
+        }
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        if !meta.file_type().is_dir() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let uid = unsafe { libc::geteuid() };
+            if meta.uid() != uid || meta.mode() & 0o077 != 0 {
+                return None;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return None;
+        }
+        Some(path)
+    }
+
+    /// Bound for the test-only pre-publication barrier. A missing release
+    /// retires the candidate after this bound; it never publishes implicitly.
+    /// Clamp untrusted env input so a huge value cannot overflow Instant.
+    pub fn build_barrier_max_ms() -> u64 {
+        std::env::var("TUNLION_TEST_BUILD_BARRIER_MAX_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120_000)
+            .clamp(1_000, 300_000)
+    }
+
+    /// Whether the test-only pre-publication barrier is configured. Used by
+    /// cancellation paths to let the build task observe cancellation and close
+    /// its built peer instead of aborting the task and dropping a live Peer.
+    pub fn build_barrier_configured() -> bool {
+        std::env::var_os("TUNLION_TEST_BUILD_BARRIER_DIR").is_some()
+    }
+
+    /// A safe marker key for a peer id and candidate generation. Socket ids are
+    /// URL-safe, but validate before joining them into a path.
+    pub fn build_barrier_key(pid: &str, generation: u32) -> Option<String> {
+        if pid.is_empty()
+            || pid.len() > 128
+            || !pid
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return None;
+        }
+        Some(format!("{pid}.{generation}"))
+    }
+
     /// Raw offer-first gate: suppress the automatic KnownPeer adoption that
     /// normally races ahead of the browser's SDP, so the gate can prove the
     /// responder path from a bare offer. Test-only; release builds never read it.
@@ -266,6 +329,26 @@ mod off {
     #[inline]
     pub fn build_hold_ms(_pid: &str) -> u64 {
         0
+    }
+
+    #[inline]
+    pub fn build_barrier_dir() -> Option<std::path::PathBuf> {
+        None
+    }
+
+    #[inline]
+    pub fn build_barrier_max_ms() -> u64 {
+        0
+    }
+
+    #[inline]
+    pub fn build_barrier_configured() -> bool {
+        false
+    }
+
+    #[inline]
+    pub fn build_barrier_key(_pid: &str, _generation: u32) -> Option<String> {
+        None
     }
 
     #[inline]

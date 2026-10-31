@@ -865,11 +865,36 @@ fn close_built(peer: Arc<net::Peer>) {
     tokio::spawn(async move { peer.close().await });
 }
 
+/// Test-only bounded cleanup for a candidate that must never publish. This
+/// runs in the build task, not the main loop. It emits a completion trace only
+/// after `peer.close()` has returned; a timeout emits FAILED and best-effort
+/// close continues without ever being counted as successful quiescence.
+async fn cleanup_built_bounded(peer: Arc<net::Peer>, pid: &str, generation: u32) -> bool {
+    peer.mark_closed();
+    let budget = std::time::Duration::from_secs(5);
+    match tokio::time::timeout(budget, peer.close()).await {
+        Ok(()) => {
+            filament_transport::hooks::debug(&format!(
+                "BUILD-CLEANUP-COMPLETE peer={pid} gen={generation}"
+            ));
+            true
+        }
+        Err(_) => {
+            filament_transport::hooks::debug(&format!(
+                "BUILD-CLEANUP-FAILED peer={pid} gen={generation} reason=timeout"
+            ));
+            let p = peer.clone();
+            tokio::spawn(async move { p.close().await });
+            false
+        }
+    }
+}
+
 fn discard_built(built: BuiltPeer) {
     close_built(built.peer);
 }
 
-fn discard_pending_state(mut state: BuildState) {
+fn discard_pending_now(state: &mut BuildState) {
     let early = std::mem::take(&mut state.early);
     let queued: Vec<Ev> = std::iter::from_fn(|| state.events_rx.try_recv().ok()).collect();
     for ev in early.into_iter().chain(queued) {
@@ -877,6 +902,10 @@ fn discard_pending_state(mut state: BuildState) {
             transport.force_close();
         }
     }
+}
+
+fn discard_pending_state(mut state: BuildState) {
+    discard_pending_now(&mut state);
 }
 
 fn discard_state(state: BuildState, peer: Arc<net::Peer>) {
@@ -1001,10 +1030,103 @@ async fn run_build_task(
             return;
         }
     };
+    // Test-only pre-publication barrier. The fixture's private directory
+    // receives an atomic ready marker for this exact sid+generation; the
+    // candidate may not publish until the fixture writes the matching release
+    // marker. Cancellation and the bounded deadline retire the candidate; a
+    // timeout never falls through to Ready. This runs in the build task only.
+    if let Some(dir) = test_hooks::build_barrier_dir() {
+        let Some(key) = test_hooks::build_barrier_key(&plan.peer_id, plan.generation) else {
+            filament_transport::hooks::debug(&format!(
+                "BUILD-BARRIER-BADKEY peer={} gen={}",
+                plan.peer_id, plan.generation
+            ));
+            let _ = cleanup_built_bounded(peer.clone(), &plan.peer_id, plan.generation).await;
+            let _ = out.send(BuildDone::Cancelled { plan: retry_plan });
+            let _ = wake_tx.send(Ev::BuildWake);
+            return;
+        };
+        let ready = dir.join(format!("ready.{key}"));
+        let release = dir.join(format!("release.{key}"));
+        let temp = dir.join(format!(".ready.{key}.{}", std::process::id()));
+        if std::fs::write(&temp, format!("gen={}\n", plan.generation)).is_err()
+            || std::fs::rename(&temp, &ready).is_err()
+        {
+            let _ = std::fs::remove_file(&temp);
+            filament_transport::hooks::debug(&format!(
+                "BUILD-BARRIER-READY-FAILED peer={} gen={}",
+                plan.peer_id, plan.generation
+            ));
+            let _ = cleanup_built_bounded(peer.clone(), &plan.peer_id, plan.generation).await;
+            let _ = out.send(BuildDone::Cancelled { plan: retry_plan });
+            let _ = wake_tx.send(Ev::BuildWake);
+            return;
+        }
+        filament_transport::hooks::debug(&format!(
+            "BUILD-BARRIER-READY peer={} gen={}",
+            plan.peer_id, plan.generation
+        ));
+        let deadline =
+            Instant::now() + Duration::from_millis(test_hooks::build_barrier_max_ms());
+        loop {
+            if cancel.is_cancelled() {
+                filament_transport::hooks::debug(&format!(
+                    "BUILD-BARRIER-CANCELLED peer={} gen={}",
+                    plan.peer_id, plan.generation
+                ));
+                let _ = cleanup_built_bounded(peer.clone(), &plan.peer_id, plan.generation).await;
+                let _ = out.send(BuildDone::Cancelled { plan: retry_plan });
+                let _ = wake_tx.send(Ev::BuildWake);
+                return;
+            }
+            if release.exists() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                filament_transport::hooks::debug(&format!(
+                    "BUILD-BARRIER-TIMEOUT peer={} gen={}",
+                    plan.peer_id, plan.generation
+                ));
+                let _ = cleanup_built_bounded(peer.clone(), &plan.peer_id, plan.generation).await;
+                let _ = out.send(BuildDone::Cancelled { plan: retry_plan });
+                let _ = wake_tx.send(Ev::BuildWake);
+                return;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    filament_transport::hooks::debug(&format!(
+                        "BUILD-BARRIER-CANCELLED peer={} gen={}",
+                        plan.peer_id, plan.generation
+                    ));
+                    let _ = cleanup_built_bounded(peer.clone(), &plan.peer_id, plan.generation).await;
+                    let _ = out.send(BuildDone::Cancelled { plan: retry_plan });
+                    let _ = wake_tx.send(Ev::BuildWake);
+                    return;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        }
+        filament_transport::hooks::debug(&format!(
+            "BUILD-BARRIER-RELEASED peer={} gen={}",
+            plan.peer_id, plan.generation
+        ));
+    }
     let hold = test_hooks::build_hold_ms(&plan.peer_id);
     if hold > 0 {
         filament_transport::hooks::debug(&format!("BUILD-HOLD peer={} ms={hold}", plan.peer_id));
-        tokio::time::sleep(Duration::from_millis(hold)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(hold)) => {}
+            _ = cancel.cancelled() => {
+                filament_transport::hooks::debug(&format!(
+                    "BUILD-HOLD-CANCELLED peer={} gen={}",
+                    plan.peer_id, plan.generation
+                ));
+                let _ = cleanup_built_bounded(peer.clone(), &plan.peer_id, plan.generation).await;
+                let _ = out.send(BuildDone::Cancelled { plan: retry_plan });
+                let _ = wake_tx.send(Ev::BuildWake);
+                return;
+            }
+        }
     }
     let _ = out.send(BuildDone::Ready(BuiltPeer {
         peer_id: plan.peer_id,
@@ -2830,7 +2952,9 @@ impl Conn {
                         .get(&pid)
                         .is_some_and(|state| state.generation == generation);
                     if matches {
-                        self.builds.remove(&pid);
+                        if let Some(state) = self.builds.remove(&pid) {
+                            discard_pending_state(state);
+                        }
                     }
                     self.retire_intent(&pid, generation);
                 }
@@ -3208,15 +3332,32 @@ impl Conn {
     /// generation or older. A newer authorized intent survives.
     fn cancel_intent_through(&mut self, pid: &str, generation: u32) {
         let mut removed = false;
+        let barrier = test_hooks::build_barrier_configured();
         if self
             .builds
             .get(pid)
             .is_some_and(|state| state.generation <= generation)
         {
-            if let Some(state) = self.builds.remove(pid) {
+            if barrier {
+                // Keep the BuildState until its terminal BuildDone arrives. The
+                // task observes cancellation, awaits bounded peer close, and
+                // reports CANCELLED; aborting here would detach a live Peer.
+                let mut retained = None;
+                if let Some(state) = self.builds.get_mut(pid) {
+                    let gen = state.generation;
+                    state.cancel.cancel();
+                    discard_pending_now(state);
+                    retained = Some(gen);
+                }
+                if let Some(gen) = retained {
+                    self.retire_intent(pid, gen);
+                    removed = true;
+                }
+            } else if let Some(state) = self.builds.remove(pid) {
+                let generation = state.generation;
                 state.cancel.cancel();
                 state.handle.abort();
-                self.retire_intent(pid, state.generation);
+                self.retire_intent(pid, generation);
                 discard_pending_state(state);
                 removed = true;
             }
@@ -3263,10 +3404,22 @@ impl Conn {
     /// Retire an in-flight/deferred intent without discarding the caller's
     /// just-recorded binding. Used when a re-pair supersedes an older intent.
     fn retire_build(&mut self, pid: &str) {
-        if let Some(state) = self.builds.remove(pid) {
+        if test_hooks::build_barrier_configured() {
+            let mut retained = None;
+            if let Some(state) = self.builds.get_mut(pid) {
+                let generation = state.generation;
+                state.cancel.cancel();
+                discard_pending_now(state);
+                retained = Some(generation);
+            }
+            if let Some(generation) = retained {
+                self.retire_intent(pid, generation);
+            }
+        } else if let Some(state) = self.builds.remove(pid) {
+            let generation = state.generation;
             state.cancel.cancel();
             state.handle.abort();
-            self.retire_intent(pid, state.generation);
+            self.retire_intent(pid, generation);
             discard_pending_state(state);
         }
         if let Some((plan, _)) = self.build_deferred.remove(pid) {
