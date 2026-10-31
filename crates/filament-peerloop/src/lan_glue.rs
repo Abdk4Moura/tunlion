@@ -14,12 +14,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use filament_transport::lan::{self, LanEvent, LanKey};
-use filament_transport::net::Ev;
+use filament_transport::net::{AttemptId, Ev};
 use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
 use tunlion_lan::record::{not_circular, RouteOwner};
 
-use crate::conn::{Conn, DirectPending};
+use crate::conn::{Conn, DirectAuth, DirectPending};
 
 /// Route ownership for the circular-route guard (spec section 9.3): an
 /// address belongs to the link to X when it is X's overlay address, as the
@@ -57,11 +57,20 @@ impl Conn {
     /// Record that `pid` is a LAN link authenticated with `secret` for `name`,
     /// so `adopt_direct` gives it exactly the trust a signaled direct link to
     /// that device gets.
-    pub fn seed_lan(&mut self, pid: &str, name: &str, secret: &str, fleet: bool) {
+    pub fn seed_lan(&mut self, pid: &str, name: &str, secret: &str, fleet: bool, attempt: AttemptId) {
         self.roster.insert(pid.to_string(), json!({ "id": pid, "name": name, "via": lan::ROUTE_LAN }));
+        self.next_gen += 1;
+        let auth = if fleet {
+            DirectAuth::lan_fleet(self.next_gen)
+        } else {
+            DirectAuth::lan_device(self.next_gen, name, secret)
+        };
         self.direct_pending.insert(
             pid.to_string(),
             DirectPending {
+                attempt,
+                auth,
+                race_task: None,
                 secret: (name.to_string(), secret.to_string()),
                 fleet,
                 ephemeral: false,
@@ -107,12 +116,12 @@ impl Conn {
 /// the transport as `Ev::DirectReady`, which starts its reader only after the
 /// ready event is queued (the order `UnreadTransport` exists to keep).
 pub fn on_linked(conn: &mut Conn, tx: &UnboundedSender<Ev>, ev: LanEvent, log: &dyn crate::host::LogSink) {
-    if let LanEvent::Linked { pid, name, secret, fleet, transport, remote, dialer } = ev {
+    if let LanEvent::Linked { pid, name, secret, fleet, attempt, transport, remote, dialer } = ev {
         log.debug(&format!(
             "lan: {} {name} at {remote} ({pid})",
             if dialer { "linked to" } else { "accepted" }
         ));
-        conn.seed_lan(&pid, &name, &secret, fleet);
+        conn.seed_lan(&pid, &name, &secret, fleet, attempt);
         transport.announce(tx, |t| Ev::DirectReady(pid, t, lan::ROUTE_LAN));
     }
 }

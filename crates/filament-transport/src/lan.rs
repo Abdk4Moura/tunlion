@@ -65,7 +65,7 @@ pub enum LanEvent {
     /// transport is not reading yet: the loop records the link, then
     /// `announce`s it, so no frame from the peer can be handled before the
     /// link exists (a file-offer arriving first was dropped).
-    Linked { pid: String, name: String, secret: String, fleet: bool, transport: direct::UnreadTransport, remote: SocketAddr, dialer: bool },
+    Linked { pid: String, name: String, secret: String, fleet: bool, attempt: AttemptId, transport: direct::UnreadTransport, remote: SocketAddr, dialer: bool },
     /// A recognized peer announced itself at `addr` (its listener).
     Found { name: String, addr: SocketAddr },
     /// A pairing code is on screen on a device at `addr` (spec section 7).
@@ -497,7 +497,7 @@ pub fn spawn_accept(ep: Endpoint, keys: Arc<dyn Fn() -> Vec<LanKey> + Send + Syn
                         let pid = fresh_pid();
                         let attempt = AttemptId::next();
                         let transport = direct::make_transport_unread(pid.clone(), conn, send, recv, tx.clone(), true, Some(ep2), true, Some(attempt));
-                        let _ = tx.send(Ev::Lan(LanEvent::Linked { pid, name: k.name, secret: k.secret, fleet: k.fleet, transport, remote, dialer: false }));
+                        let _ = tx.send(Ev::Lan(LanEvent::Linked { pid, name: k.name, secret: k.secret, fleet: k.fleet, attempt, transport, remote, dialer: false }));
                     }
                     Ok(Err(e)) => crate::hooks::debug(&format!("lan: inbound refused: {e:#}")),
                     Err(_) => crate::hooks::debug("lan: inbound did not authenticate in time"),
@@ -549,7 +549,7 @@ pub async fn dial(ep: Endpoint, key: LanKey, addrs: Vec<SocketAddr>, tx: Unbound
     let remote = canonical(conn.remote_address());
     let attempt = AttemptId::next();
     let transport = direct::make_transport_unread(pid.clone(), conn, send, recv, tx.clone(), false, Some(ep), true, Some(attempt));
-    let _ = tx.send(Ev::Lan(LanEvent::Linked { pid, name: key.name, secret: key.secret, fleet: key.fleet, transport, remote, dialer: true }));
+    let _ = tx.send(Ev::Lan(LanEvent::Linked { pid, name: key.name, secret: key.secret, fleet: key.fleet, attempt, transport, remote, dialer: true }));
     Some(addr)
 }
 
