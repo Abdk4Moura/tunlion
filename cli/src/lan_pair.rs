@@ -33,6 +33,7 @@ const FRAME_TYPES: &[&str] = &[
     "identity-expose",
     "identity-expose-ack",
     "pair-name",
+    "lan-hello",
 ];
 
 /// What a confirmed LAN ceremony hands to the coordinator. The coordinator is
@@ -43,6 +44,9 @@ pub struct Outcome {
     pub peer_name: String,
     pub secret: String,
     pub cert: Option<DeviceCert>,
+    /// The peer's `lan-hello`, learned after the pair so the daemons can find
+    /// each other immediately (the pairing link is the authenticated hello link).
+    pub hello: Value,
 }
 
 #[derive(Debug)]
@@ -66,7 +70,7 @@ fn frame_type(v: &Value) -> &str {
 /// Run the plain-pair ceremony over one pairing link. Returns the peer's
 /// display name (sent only after mutual confirmation) and its certificate when
 /// it presented one that verified. No store happens here.
-pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, role: &'static str) -> Result<(String, String, Option<DeviceCert>)> {
+pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, role: &'static str, local_hello: &Value) -> Result<(String, String, Option<DeviceCert>, Value)> {
     let caps = pair_v2_caps();
     let scope = crate::identity::IntroScope::Device.to_byte();
     let mut cer = Ceremony::new(words, nameplate, caps.clone(), scope);
@@ -87,6 +91,8 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
     let mut our_expose_acked = false;
     let mut peer_name: Option<String> = None;
     let mut peer_cert: Option<DeviceCert> = None;
+    let mut peer_hello: Option<Value> = None;
+    let mut sent_hello = false;
 
     loop {
         if Instant::now() >= deadline {
@@ -102,6 +108,10 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
             if !sent_name {
                 pair_write(&mut link.send, &json!({"type": "pair-name", "v": 1, "name": crate::display_name()})).await?;
                 sent_name = true;
+            }
+            if !sent_hello {
+                pair_write(&mut link.send, local_hello).await?;
+                sent_hello = true;
             }
             if !sent_expose {
                 if let Some(cert) = my_cert.as_ref() {
@@ -125,7 +135,7 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
             let peer_acks = cer.peer_acks_expose();
             let ours_done = my_cert.is_none() || !peer_acks || our_expose_acked;
             let theirs_done = !peer_will || peer_cert.is_some();
-            if peer_name.is_some() && ours_done && theirs_done {
+            if peer_name.is_some() && peer_hello.is_some() && ours_done && theirs_done {
                 break;
             }
         }
@@ -151,6 +161,15 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
                     bail!("pairing REFUSED: invalid peer name");
                 }
                 peer_name = Some(n.to_string());
+            }
+            "lan-hello" => {
+                if cer.secret().is_none() {
+                    bail!("pairing REFUSED: a LAN hello arrived before key confirmation");
+                }
+                if tunlion_lan::record::Hello::from_json(&frame).is_none() {
+                    bail!("pairing REFUSED: malformed LAN hello");
+                }
+                peer_hello = Some(frame);
             }
             "identity-expose" => {
                 let Some(k) = cer.k() else {
@@ -190,7 +209,8 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
 
     let name = peer_name.ok_or_else(|| anyhow!("pairing REFUSED: the peer sent no name"))?;
     let secret = cer.secret().cloned().ok_or_else(|| anyhow!("pairing REFUSED: no secret"))?;
-    Ok((crate::devices_store::sanitize_device_name(&name), secret, peer_cert))
+    let hello = peer_hello.ok_or_else(|| anyhow!("pairing REFUSED: the peer sent no LAN hello"))?;
+    Ok((crate::devices_store::sanitize_device_name(&name), secret, peer_cert, hello))
 }
 
 /// The single plain-pair store path. Used by both carriers after `confirm`.
@@ -276,6 +296,10 @@ pub struct HostHandle {
 }
 
 impl HostHandle {
+    pub fn learn(&self, name: &str, hello: &Value) -> bool {
+        self.svc.learn(name, hello)
+    }
+
     pub async fn shutdown(&mut self) {
         self.svc.shutdown().await;
         self.task.abort();
@@ -307,6 +331,7 @@ pub async fn spawn_host(code: PairCode, words: String, nameplate: String) -> Res
         ev_tx,
     )
     .await?;
+    let local_hello = svc.hello_json();
     let (out_tx, out_rx) = mpsc::unbounded_channel::<HostEvent>();
     let task = tokio::spawn(async move {
         while !code.is_closed() {
@@ -320,9 +345,9 @@ pub async fn spawn_host(code: PairCode, words: String, nameplate: String) -> Res
                 }
                 Begin::Closed => return,
             };
-            match run_ceremony(&mut link, &words, &nameplate, "host").await {
-                Ok((peer_name, secret, cert)) => {
-                    let _ = out_tx.send(HostEvent::Outcome(Outcome { token, peer_name, secret, cert }));
+            match run_ceremony(&mut link, &words, &nameplate, "host", &local_hello).await {
+                Ok((peer_name, secret, cert, hello)) => {
+                    let _ = out_tx.send(HostEvent::Outcome(Outcome { token, peer_name, secret, cert, hello }));
                     return;
                 }
                 Err(e) => {
@@ -360,6 +385,7 @@ pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
     )
     .await?;
 
+    let local_hello = svc.hello_json();
     let result = async {
         ui::debug("lan pair host: waiting for a pair link");
         let mut link = tokio::time::timeout(CODE_TTL, pair_rx.recv())
@@ -371,13 +397,14 @@ pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
             Begin::Started(t) => t,
             other => bail!("pairing could not start: {other:?}"),
         };
-        let (peer_name, secret, cert) = run_ceremony(&mut link, &words, &nameplate, "host").await.inspect_err(|_| {
+        let (peer_name, secret, cert, hello) = run_ceremony(&mut link, &words, &nameplate, "host", &local_hello).await.inspect_err(|_| {
             code.fail(token, Instant::now());
         })?;
         if !code.confirm(token, Instant::now()) {
             bail!("this code was already used");
         }
-        persist_plain(&Outcome { token, peer_name, secret, cert })?;
+        persist_plain(&Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() })?;
+        svc.learn(&peer_name, &hello);
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -405,6 +432,7 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
         ev_tx,
     )
     .await?;
+    let local_hello = svc.hello_json();
     let result = async {
         let deadline = Instant::now() + CODE_TTL;
         let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -441,9 +469,10 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
             let mut link = tokio::time::timeout(Duration::from_secs(6), svc.pair_dial(vec![addr])).await
                 .map_err(|_| anyhow!("pairing dial timed out"))??;
             let token = 0;
-            let (peer_name, secret, cert) = run_ceremony(&mut link, &words, &nameplate, "joiner").await?;
+            let (peer_name, secret, cert, hello) = run_ceremony(&mut link, &words, &nameplate, "joiner", &local_hello).await?;
             let peer_name = name.clone().unwrap_or(peer_name);
-            persist_plain(&Outcome { token, peer_name, secret, cert })?;
+            persist_plain(&Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() })?;
+            svc.learn(&peer_name, &hello);
             return Ok::<(), anyhow::Error>(());
         }
     }

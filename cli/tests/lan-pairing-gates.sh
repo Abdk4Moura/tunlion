@@ -121,6 +121,8 @@ happy() {
   fi
   asA "$BIN" down >/dev/null 2>&1 || true
   asB "$BIN" down >/dev/null 2>&1 || true
+  cp "$DA/daemon.log" "$WORK/happy-A-daemon.log" 2>/dev/null || true
+  cp "$DB/daemon.log" "$WORK/happy-B-daemon.log" 2>/dev/null || true
 }
 
 wrong_code() {
