@@ -44,7 +44,6 @@ rm -rf "$ISO"
 mkdir -p "$ISO/home" "$ISO/prefix" "$ISO/config"
 export HOME="$ISO/home"
 export npm_config_prefix="$ISO/prefix"
-export PATH="$ISO/prefix/bin:$PATH"
 ( cd "$ISO" && npm install -g --foreground-scripts tunlion@0.9.3 2>&1 | tee "$WORK/npm-install.log" )
 if grep -q 'cli-v0.9.3' "$WORK/npm-install.log"; then
   echo "postinstall reported cli-v0.9.3"
@@ -61,16 +60,16 @@ else
 fi
 
 say "npm binary version, tl shortcut, help"
-tunlion --version | tee "$WORK/npm-version.txt"
+"$ISO/prefix/bin/tunlion" --version | tee "$WORK/npm-version.txt"
 grep -q '^tunlion 0\.9\.3' "$WORK/npm-version.txt"
-tl --version | tee "$WORK/npm-tl-version.txt"
+"$ISO/prefix/bin/tl" --version | tee "$WORK/npm-tl-version.txt"
 grep -q '^tunlion 0\.9\.3' "$WORK/npm-tl-version.txt"
-tunlion --help > "$WORK/npm-help.txt" 2>&1
+"$ISO/prefix/bin/tunlion" --help > "$WORK/npm-help.txt" 2>&1
 grep -qi 'usage' "$WORK/npm-help.txt"
 
 say "npm isolated status with no existing configuration"
 set +e
-TUNLION_CONFIG_DIR="$ISO/config" tunlion status --json > "$WORK/npm-status.json" 2> "$WORK/npm-status.err"
+TUNLION_CONFIG_DIR="$ISO/config" "$ISO/prefix/bin/tunlion" status --json > "$WORK/npm-status.json" 2> "$WORK/npm-status.err"
 npm_status_rc=$?
 set -e
 echo "status exit=$npm_status_rc"
@@ -85,6 +84,8 @@ if pgrep -f "$ISO/prefix/bin/tunlion" >/dev/null 2>&1; then
 fi
 
 say "clean HOME curl installer"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+echo "tl already on PATH: $(command -v tl || echo none)"
 ISO2="$WORK/curl-iso"
 rm -rf "$ISO2"
 mkdir -p "$ISO2/home" "$ISO2/config"
