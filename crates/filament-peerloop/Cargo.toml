@@ -109,7 +109,7 @@ filament-overlay = { package = "tunlion-overlay", path = "../filament-overlay", 
 # returns `VerifyResult` and calls `decide_verify`, so the receive verify is the
 # same decision the CLI always made, from the one crate that owns it.
 filament-proto = { package = "tunlion-proto", path = "../filament-proto", version = "0.1.0" }
-filament-signal = { package = "tunlion-signal", path = "../filament-signal", version = "0.1.0" }
+filament-signal = { package = "tunlion-signal", path = "../filament-signal", version = "0.1.1" }
 filament-transfer = { package = "tunlion-transfer", path = "../filament-transfer", version = "0.1.0" }
 filament-transport = { package = "tunlion-transport", path = "../filament-transport", version = "0.1.1" }
 tunlion-lan = { path = "../tunlion-lan", version = "0.1.0" }

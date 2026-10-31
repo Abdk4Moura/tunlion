@@ -100,7 +100,7 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 futures-util = "0.3.32"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider", "http2", "charset", "system-proxy"] }
 directories = "6"
-filament-signal = { package = "tunlion-signal", path = "../crates/filament-signal", version = "0.1.0" }
+filament-signal = { package = "tunlion-signal", path = "../crates/filament-signal", version = "0.1.1" }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = "1.0.228"
 serde_json = "1.0.150"
