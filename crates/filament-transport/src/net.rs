@@ -277,7 +277,6 @@ pub fn upgrade_verify_idle_ms() -> u64 {
 
 // ------------------------------------------------------------------ events --
 
-#[derive(Debug)]
 /// Immutable identity of the transport attempt that produced an event. Allocated
 /// before the first event is enqueued and carried through every queue hop so the
 /// final handler can reject a callback from a replaced link.
@@ -453,7 +452,6 @@ impl std::fmt::Debug for dyn Transport {
 
 // --------------------------------------------------------------- transport --
 
-#[async_trait]
 impl Ev {
     /// Build a ChannelReady event that carries the transport's immutable
     /// source. A transport without one produces an untagged readiness event,
@@ -470,6 +468,7 @@ impl Ev {
     }
 }
 
+#[async_trait]
 pub trait Transport: Send + Sync {
     async fn send_control(&self, msg: &Value) -> Result<()>;
     /// Frame and send one chunk: [u32 BE sid][u64 BE abs_offset][payload].
