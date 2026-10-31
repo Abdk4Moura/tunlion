@@ -2640,7 +2640,6 @@ impl Conn {
             return BuildStart::Busy;
         }
         let generation = plan.generation;
-        let pid = plan.peer_id.clone();
         self.spawn_build(plan);
         BuildStart::Started(generation)
     }
@@ -2788,6 +2787,7 @@ impl Conn {
                         continue;
                     }
                     if plan.attempt + 1 < 3
+                        && self.current_intent.get(&pid) == Some(&generation)
                         && !self.builds.contains_key(&pid)
                         && (self.build_deferred.len() < MAX_DEFERRED_BUILDS
                             || self.build_deferred.contains_key(&pid))
@@ -2919,7 +2919,7 @@ impl Conn {
         // order; then the SAME candidate channel is forwarded for the life of
         // the link. No old-link event can enter it.
         if !drain_candidate_events(&mut state) {
-            discard_built(built);
+            discard_state(state, built.peer);
             return;
         }
         let early = std::mem::take(&mut state.early);
@@ -3198,7 +3198,42 @@ impl Conn {
                 entry.generation = generation;
                 entry.at = Instant::now();
             }
-            self.cancel_build(&pid);
+            // Retire only intents at or below the revoked generation. A newer
+            // authorized re-pair for the same pid must keep building.
+            self.cancel_intent_through(&pid, generation);
+        }
+    }
+
+    /// Cancel a build/deferred intent only when it belongs to the retired
+    /// generation or older. A newer authorized intent survives.
+    fn cancel_intent_through(&mut self, pid: &str, generation: u32) {
+        let mut removed = false;
+        if self
+            .builds
+            .get(pid)
+            .is_some_and(|state| state.generation <= generation)
+        {
+            if let Some(state) = self.builds.remove(pid) {
+                state.cancel.cancel();
+                state.handle.abort();
+                self.retire_intent(pid, state.generation);
+                discard_pending_state(state);
+                removed = true;
+            }
+        }
+        if self
+            .build_deferred
+            .get(pid)
+            .is_some_and(|(plan, _)| plan.generation <= generation)
+        {
+            if let Some((plan, _)) = self.build_deferred.remove(pid) {
+                self.retire_intent(pid, plan.generation);
+                removed = true;
+            }
+        }
+        if removed {
+            self.pending_bindings.remove(pid);
+            self.pending_active.remove(pid);
         }
     }
 
@@ -5838,9 +5873,9 @@ impl Conn {
         let pid = pid_val.to_string();
         self.roster.remove(&pid);
         self.webrtc_only.remove(&pid);
-        if let Some(state) = self.builds.get(&pid) {
+        if let Some(_state) = self.builds.get(&pid) {
             #[cfg(feature = "test-hooks")]
-            let generation = format!(" gen={}", state.generation);
+            let generation = format!(" gen={}", _state.generation);
             #[cfg(not(feature = "test-hooks"))]
             let generation = "";
             self.log
@@ -8826,6 +8861,35 @@ mod warm_identity_tests {
             rx.try_recv().is_err(),
             "a stale old-link event was forwarded after replacement"
         );
+    }
+
+    /// Retiring the old link's generation must not cancel a newer authorized
+    /// build for the same pid (a re-pair racing a forget).
+    #[tokio::test]
+    async fn a_forget_does_not_kill_a_newer_authorized_build() {
+        let host = Arc::new(TestHost {
+            devices: vec![("dev".into(), "new-secret".into())],
+        });
+        let (mut conn, _far, _rx) = test_conn_with_host(host).await;
+        let pid = "sid-race-forget";
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let old: Arc<dyn Transport> = Rec::new("old", &log);
+        let mut link = direct_link(pid, "dev", "dev", old);
+        link.generation = 7;
+        link.expected_secret = Some(("dev".into(), "old-secret".into()));
+        conn.links.insert(pid.into(), link);
+        conn.builds.insert(pid.into(), build_state(8));
+        conn.note_binding(pid, ("dev".into(), "new-secret".into()));
+        conn.current_intent.insert(pid.into(), 8);
+        let mut dropped = HashSet::new();
+        dropped.insert("old-secret".to_string());
+        conn.invalidate_peers(&[(pid.into(), "dev".into())], &dropped);
+        assert!(
+            conn.builds.contains_key(pid),
+            "a newer authorized build was cancelled by the old link's revocation"
+        );
+        assert!(!conn.intent_retired(pid, 8));
+        assert!(conn.intent_retired(pid, 7));
     }
 
     /// A race that won must not be expired or reaped while it waits beside the
