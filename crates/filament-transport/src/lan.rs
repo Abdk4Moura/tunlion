@@ -910,6 +910,7 @@ impl LanService {
             let h = spawn_accept(ep, keys, pair_tx, shutdown.clone(), tasks.clone(), allow, tx.clone());
             tasks.lock().unwrap().push(h);
         }
+        let store_tick = store.clone();
         let svc = LanService {
             shared: shared.clone(),
             store,
@@ -993,7 +994,6 @@ impl LanService {
         {
             let shared = shared.clone();
             let skip = opts.skip.clone();
-            let store_tick = store.clone();
             let shutdown = shutdown.clone();
             let h = tokio::spawn(async move {
                 let mut last_scan: Option<Instant> = None;
