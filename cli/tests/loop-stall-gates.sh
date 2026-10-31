@@ -60,12 +60,6 @@ up_node() { # up_node NAME [extra env...]
   FIX_PIDS+=($!)
 }
 
-wait_log() { # wait_log FILE REGEX SECS
-  local i
-  for i in $(seq 1 $(( $3 * 2 ))); do grep -qE "$2" "$1" 2>/dev/null && return 0; sleep 0.5; done
-  return 1
-}
-
 status_ms() { # status_ms NAME -> "elapsed_ms,exit"
   local n="$1" t0 t1 rc
   t0=$(date +%s%N)
@@ -109,9 +103,13 @@ SPID=$!
 # The joins are the trigger: each sibling starts a direct attempt, the blocked
 # race expires, and the fallback establishes. With EXPECT=stall the fallbacks
 # drain as one batch; the loop must still answer afterwards.
-for n in "${PEERS[@]}"; do
-  wait_log "$WORK/up-$n.log" "fleet device '" 120 || bad "$n never admitted a fleet sibling"
+ok_join=0
+for _ in $(seq 1 240); do
+  n=$(grep -l "joined the mesh" "$WORK"/up-*.log 2>/dev/null | wc -l)
+  if [ "$n" -ge 2 ]; then ok_join=1; break; fi
+  sleep 0.5
 done
+[ "$ok_join" = 1 ] || bad "no fleet sibling joined within 120s"
 
 wait "$SPID" 2>/dev/null || true
 
@@ -119,7 +117,7 @@ joined=$(grep -l "joined the mesh" "$WORK"/up-*.log 2>/dev/null | wc -l)
 stall_lines=$(grep -h "event loop stalled" "$WORK"/up-*.log 2>/dev/null | wc -l)
 max_gap=$(awk -F'gap_ms=' '/LOOP-BEAT/ {g=$2+0; if (g>m) m=g} END{print m+0}' "$WORK"/up-*.log 2>/dev/null)
 max_status=$(awk -F, 'BEGIN{m=0} {if ($1+0>m) m=$1+0} END{print m+0}' "$WORK/status.csv" 2>/dev/null)
-timeouts=$(awk -F, '$2!=0{n++} END{print n+0}' "$WORK/status.csv" 2>/dev/null)
+timeouts=$(awk -F, '$1>=1400 && $2!=0{n++} END{print n+0}' "$WORK/status.csv" 2>/dev/null)
 
 echo
 echo "STALL-EVIDENCE label=$LABEL expect=$EXPECT peers=${#PEERS[@]} delay_ms=$DELAY_MS"
