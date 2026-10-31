@@ -572,16 +572,21 @@ pub fn spawn_accept(
                             return Ok(None);
                         };
                         let (send, recv) = conn.accept_bi().await.context("accept pairing stream")?;
+                        eprintln!("PAIRDBG accept_bi done");
                         let keying_material = direct::pairing_keying_material(&conn)?;
+                        eprintln!("PAIRDBG km done");
                         let remote = canonical(conn.remote_address());
-                        if pair.try_send(PairLink {
+                        eprintln!("PAIRDBG try_send");
+                        let sent = pair.try_send(PairLink {
                             conn,
                             send,
                             recv,
                             keying_material,
                             remote,
                             dialer: false,
-                        }).is_err() {
+                        });
+                        eprintln!("PAIRDBG try_send {} , err={:?}", sent.is_ok(), sent.as_ref().err());
+                        if sent.is_err() {
                             return Ok(None);
                         }
                         return Ok(None);
