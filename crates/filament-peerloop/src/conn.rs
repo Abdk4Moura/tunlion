@@ -8892,6 +8892,28 @@ mod warm_identity_tests {
         assert!(conn.intent_retired(pid, 7));
     }
 
+    /// Two devices may share a display name. A forgotten device selects only
+    /// its own build by device secret; the same-named peer is untouched.
+    #[tokio::test]
+    async fn a_duplicate_display_name_does_not_select_an_unrelated_build() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.builds.insert("sid-one".into(), build_state(5));
+        conn.note_binding("sid-one", ("same-name".into(), "secret-one".into()));
+        conn.builds.insert("sid-two".into(), build_state(6));
+        conn.note_binding("sid-two", ("same-name".into(), "secret-two".into()));
+        let mut dropped = HashSet::new();
+        dropped.insert("secret-one".to_string());
+        conn.invalidate_peers(&[], &dropped);
+        assert!(
+            !conn.builds.contains_key("sid-one"),
+            "the forgotten device's build was not retired"
+        );
+        assert!(
+            conn.builds.contains_key("sid-two"),
+            "a same-named unrelated device was retired"
+        );
+    }
+
     /// A race that won must not be expired or reaped while it waits beside the
     /// serving link: the old cleanup dropped any pending whose peer had a link.
     #[tokio::test]
