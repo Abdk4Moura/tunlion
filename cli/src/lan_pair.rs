@@ -235,6 +235,21 @@ async fn stored_ack(link: &mut PairLink) -> bool {
     }
 }
 
+/// A name is a petname, never an identity: an existing record with a different
+/// secret or certified key is never rewritten. A free name is chosen instead.
+fn choose_pair_name(records: &[Value], requested: &str, secret: &str, cert_pub: Option<&str>) -> (String, bool) {
+    let Some(existing) = records.iter().find(|d| d["name"].as_str() == Some(requested)) else {
+        return (requested.to_string(), false);
+    };
+    let same = existing["secret"].as_str() == Some(secret)
+        && cert_pub.is_none_or(|p| existing["deviceCert"]["devicePub"].as_str() == Some(p));
+    if same {
+        (requested.to_string(), false)
+    } else {
+        (crate::devices_store::free_device_name(records, requested), true)
+    }
+}
+
 /// The single plain-pair store path. Used by both carriers after `confirm`.
 /// It never issues a certificate, never loads the owner key and never lifts a
 /// revocation. It refuses a blocked peer before writing anything.
@@ -262,25 +277,11 @@ pub fn persist_plain(outcome: &Outcome) -> Result<String> {
     }
     // A name is a petname, never an identity. If it already belongs to another
     // pairing, never rewrite that record: choose a free name and say so.
-    let existing = records.iter().find(|d| d["name"].as_str() == Some(&requested));
-    let same = existing.is_some_and(|d| {
-        if d["secret"].as_str() != Some(outcome.secret.as_str()) {
-            return false;
-        }
-        match outcome.cert.as_ref() {
-            None => true,
-            Some(c) => d["deviceCert"]["devicePub"].as_str() == Some(hex::encode(c.device_pub).as_str()),
-        }
-    });
-    let name = if existing.is_some() && !same {
-        let free = crate::devices_store::free_device_name(&records, &requested);
-        ui::say(&ui::paint(ui::Tone::Dim, &format!("  '{requested}' already belongs to another device; saving this one as '{free}'")));
-        free
-    } else if existing.is_some() {
-        requested.clone()
-    } else {
-        requested.clone()
-    };
+    let cert_pub = outcome.cert.as_ref().map(|c| hex::encode(c.device_pub));
+    let (name, renamed) = choose_pair_name(&records, &requested, &outcome.secret, cert_pub.as_deref());
+    if renamed {
+        ui::say(&ui::paint(ui::Tone::Dim, &format!("  '{requested}' already belongs to another device; saving this one as '{name}'")));
+    }
     match outcome.cert.as_ref() {
         Some(cert) => {
             crate::devices_upsert_atomic(
@@ -549,6 +550,9 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
             if !seen.insert(key) {
                 continue;
             }
+            if seen.len() > 64 {
+                bail!("too many nearby pairing announcements; refusing to keep listening");
+            }
             ui::say(&format!("Found nearby pairing {label} at {addr}"));
             if !nearby {
                 if !crate::interactive_allowed() {
@@ -586,3 +590,37 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
 
 /// Frame size guard used by unit tests and by the carrier's read path.
 pub const _FRAME_GUARD: usize = PAIR_MAX_FRAME;
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_different_identity_never_overwrites_a_pinned_name() {
+        let records = vec![serde_json::json!({
+            "name": "laptop",
+            "secret": "old",
+            "deviceCert": {"devicePub": "aa"}
+        })];
+        let (name, renamed) = choose_pair_name(&records, "laptop", "new", Some("bb"));
+        assert!(renamed);
+        assert_eq!(name, "laptop-2");
+    }
+
+    #[test]
+    fn the_same_pairing_can_be_updated_in_place() {
+        let records = vec![serde_json::json!({
+            "name": "laptop",
+            "secret": "same",
+            "deviceCert": {"devicePub": "aa"}
+        })];
+        assert_eq!(choose_pair_name(&records, "laptop", "same", Some("aa")), ("laptop".into(), false));
+        assert_eq!(choose_pair_name(&records, "laptop", "same", None), ("laptop".into(), false));
+    }
+
+    #[test]
+    fn a_plain_name_that_is_free_is_kept() {
+        assert_eq!(choose_pair_name(&[], "phone", "s", None), ("phone".into(), false));
+    }
+}
