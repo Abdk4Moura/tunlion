@@ -1016,7 +1016,11 @@ async fn pair_with_purpose(
         }
         return match &code {
             Some(c) => crate::lan_pair::join_standalone(c, name, true).await,
-            None => crate::lan_pair::host_standalone(my_words.clone(), my_nameplate.clone()).await,
+            None => {
+                let words = custom_words.clone().unwrap_or_else(crate::pake::words::mint_words);
+                let np = preview_nameplate.clone().unwrap_or_else(crate::pake::words::mint_pair_nameplate);
+                crate::lan_pair::host_standalone(words, np).await
+            }
         };
     }
     let (sio, tx, mut rx) = match crate::preconnect::take(server).await {
