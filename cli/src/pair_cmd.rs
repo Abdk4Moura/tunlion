@@ -1321,7 +1321,7 @@ async fn pair_with_purpose(
                             false
                         };
                         ui::say(&ui::paint(ui::Tone::Dim, if confirmed {
-                            "  the other device confirmed it saved this pairing"
+                            "  the other device says it saved this pairing"
                         } else {
                             "  saved here; the other device has not confirmed it saved"
                         }));
