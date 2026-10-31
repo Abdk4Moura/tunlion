@@ -614,12 +614,13 @@ pub async fn pair_dial(ep: &Endpoint, addrs: Vec<SocketAddr>) -> Result<PairLink
             let conn = ep.connect_with(cfg.clone(), to_dial(a), "filament-pair")?.await.context("pair dial handshake")?;
             let (send, recv) = conn.open_bi().await.context("open pairing stream")?;
             let keying_material = direct::pairing_keying_material(&conn)?;
+            let remote = canonical(conn.remote_address());
             Ok::<_, anyhow::Error>(PairLink {
                 conn,
                 send,
                 recv,
                 keying_material,
-                remote: canonical(conn.remote_address()),
+                remote,
                 dialer: true,
             })
         })
