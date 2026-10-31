@@ -1154,19 +1154,20 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             tx,
         );
-        let dial = tokio::time::timeout(
+        let mut dial = tokio::time::timeout(
             Duration::from_secs(10),
             pair_dial(&cli, vec![format!("127.0.0.1:{port}").parse().unwrap()]),
         )
         .await
         .expect("pair dial did not finish")
         .expect("pair dial failed");
+        // Open_bi is local until the first byte, so write before waiting for the
+        // host to accept the stream.
+        pair_write(&mut dial.send, &serde_json::json!({"type":"pake-msg","v":2})).await.unwrap();
         let mut host = tokio::time::timeout(Duration::from_secs(10), prx.recv())
             .await
             .expect("host did not receive a pair link")
             .expect("pair link channel closed");
-        let mut dial = dial;
-        pair_write(&mut dial.send, &serde_json::json!({"type":"pake-msg","v":2})).await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(10), pair_read(&mut host.recv))
             .await
             .expect("host read timed out")
