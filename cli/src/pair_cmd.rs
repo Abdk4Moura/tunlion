@@ -851,6 +851,13 @@ pub(crate) fn shell_not_granted_hint(
 /// this mesh. `posture` is the ceiling to grant it, empty meaning the
 /// same-person default. Both are decided by the operator at the moment of
 /// adding, because that is when they know what the machine is for.
+/// The one store gate: a host that owns a PairCode may not store without the
+/// token its signaling ceremony acquired. A joiner with no local code has
+/// nothing to consume and is allowed.
+fn signal_store_has_token(code: Option<&PairCode>, token: Option<u64>) -> bool {
+    code.is_none() || token.is_some()
+}
+
 pub(crate) async fn pair_cmd(
     server: &str,
     mut code: Option<String>,
@@ -1497,7 +1504,10 @@ async fn pair_with_purpose(
                             }
                             // No cert: store secret only (legacy or first-pair no identity)
                             if let Some(code) = pair_code.as_ref() {
-                                let token = signaling_token.ok_or_else(|| anyhow!("pairing store without a signaling claim token"))?;
+                                if !signal_store_has_token(Some(code), signaling_token) {
+                                    bail!("pairing store without a signaling claim token");
+                                }
+                                let token = signaling_token.expect("checked token presence");
                                 if !code.confirm(token, Instant::now()) {
                                     bail!("this code was already used by a nearby device");
                                 }
@@ -1551,7 +1561,10 @@ async fn pair_with_purpose(
                             // yielding wrong userPub. Fix: devices_upsert_atomic writes both fields together.
                             let pcert = peer_identity_cert.as_ref().unwrap();
                             if let Some(code) = pair_code.as_ref() {
-                                let token = signaling_token.ok_or_else(|| anyhow!("pairing store without a signaling claim token"))?;
+                                if !signal_store_has_token(Some(code), signaling_token) {
+                                    bail!("pairing store without a signaling claim token");
+                                }
+                                let token = signaling_token.expect("checked token presence");
                                 if !code.confirm(token, Instant::now()) {
                                     bail!("this code was already used by a nearby device");
                                 }
@@ -2527,6 +2540,14 @@ async fn pair_with_purpose(
 #[cfg(test)]
 mod promise_tests {
     use super::*;
+
+    #[test]
+    fn a_host_cannot_store_without_a_signal_claim_token() {
+        let code = PairCode::new([3; 16], Instant::now());
+        assert!(signal_store_has_token(None, None), "a joiner has no local code to consume");
+        assert!(!signal_store_has_token(Some(&code), None), "a host must hold the CAS token");
+        assert!(signal_store_has_token(Some(&code), Some(1)));
+    }
 
     // `add <device>` over a spoken code: --allow omitted must mean the
     // documented transfer+mount, never shell ("pairing alone never yields a

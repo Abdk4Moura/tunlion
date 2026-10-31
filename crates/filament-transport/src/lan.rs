@@ -73,6 +73,15 @@ pub enum LanEvent {
     PairingNearby { addr: SocketAddr, label: String },
 }
 
+/// A bounded pairing announcement delivered on its own channel, never on the
+/// generic unbounded `Ev` queue. A paused consumer drops notices instead of
+/// growing memory.
+#[derive(Clone, Debug)]
+pub struct PairingNotice {
+    pub addr: SocketAddr,
+    pub label: String,
+}
+
 /// A pairing-carrier connection, handed to the one-shot pair command. The
 /// adapter does not run the ceremony: the command owns the state, consent and
 /// persistence.
@@ -896,6 +905,7 @@ impl LanService {
         opts: Options,
         keys: Arc<dyn Fn() -> Vec<LanKey> + Send + Sync>,
         pair_tx: Option<Sender<PairLink>>,
+        pairing_tx: Option<Sender<PairingNotice>>,
         tx: UnboundedSender<Ev>,
     ) -> Result<LanService> {
         let store = LanStore::new(config_dir);
@@ -973,6 +983,7 @@ impl LanService {
             let socks = socks.clone();
             let shared = shared.clone();
             let tx = tx.clone();
+            let pairing_tx = pairing_tx.clone();
             let shutdown = shutdown.clone();
             let h = tokio::spawn(async move {
                 let mut buf = vec![0u8; 2048];
@@ -1009,7 +1020,9 @@ impl LanService {
                                     !g.ifaces.is_empty() && g.allow_pairing_forward(now_ms())
                                 };
                                 if keep {
-                                    let _ = tx.send(Ev::Lan(LanEvent::PairingNearby { addr, label }));
+                                    if let Some(tx) = pairing_tx.as_ref() {
+                                        let _ = tx.try_send(PairingNotice { addr, label });
+                                    }
                                 }
                             }
                         }
@@ -1174,6 +1187,25 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::net::Transport;
+
+    #[tokio::test]
+    async fn shutdown_wakes_every_waiter_without_a_lost_permit() {
+        let s = Shutdown::new();
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            let s2 = s.clone();
+            waits.push(tokio::spawn(async move { s2.wait().await }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        s.stop();
+        for w in waits {
+            tokio::time::timeout(Duration::from_secs(2), w)
+                .await
+                .expect("a shutdown waiter was not woken")
+                .expect("waiter task panicked");
+        }
+        assert!(s.is_stopped());
+    }
 
     #[tokio::test]
     async fn pair_carrier_negotiates_and_frames_both_ways() {

@@ -67,6 +67,31 @@ fn frame_type(v: &Value) -> &str {
     v["type"].as_str().unwrap_or("")
 }
 
+/// The ceremony phase parser. Post-store acknowledgements are deliberately not
+/// part of it: an untrusted first frame must produce a clean error, never a
+/// panic or an ack accepted before the peer persisted.
+fn ceremony_frame_kind(v: &Value, confirmed: bool) -> Result<&'static str> {
+    let kind = frame_type(v);
+    if kind == "pair-stored" {
+        bail!("post-store acknowledgement outside the pairing ceremony");
+    }
+    if !FRAME_TYPES.contains(&kind) {
+        bail!("unsupported pairing frame '{}'", if kind.is_empty() { "(missing)" } else { kind });
+    }
+    if !confirmed && matches!(kind, "pair-name" | "lan-hello" | "identity-expose" | "identity-expose-ack") {
+        bail!("pairing frame '{kind}' arrived before key confirmation");
+    }
+    Ok(match kind {
+        "pake-msg" => "pake-msg",
+        "pake-confirm" => "pake-confirm",
+        "pair-name" => "pair-name",
+        "lan-hello" => "lan-hello",
+        "identity-expose" => "identity-expose",
+        "identity-expose-ack" => "identity-expose-ack",
+        _ => unreachable!("allowlist checked"),
+    })
+}
+
 /// Run the plain-pair ceremony over one pairing link. Returns the peer's
 /// display name (sent only after mutual confirmation) and its certificate when
 /// it presented one that verified. No store happens here.
@@ -141,10 +166,7 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
         }
 
         let frame = pair_read(&mut link.recv).await.context("pairing frame")?;
-        let kind = frame_type(&frame);
-        if kind.is_empty() || !FRAME_TYPES.contains(&kind) {
-            bail!("pairing REFUSED: unsupported frame type '{}'", if kind.is_empty() { "(missing)" } else { kind });
-        }
+        let kind = ceremony_frame_kind(&frame, cer.secret().is_some())?;
         match kind {
             "pake-msg" | "pake-confirm" => match cer.on_signal(&frame, Some(fps)) {
                 PakeInbound::Consumed => {}
@@ -216,6 +238,10 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
 /// Exchange a post-store acknowledgement. A success line may say the other
 /// side saved only when this returns true; otherwise the local result is real
 /// and the remote result is unknown, never claimed.
+fn ack_of_matches(v: &Value, mine: &str) -> bool {
+    v["ack_of"].as_str() == Some(mine)
+}
+
 async fn stored_ack(link: &mut PairLink) -> bool {
     let mut raw = [0u8; 16];
     if getrandom::getrandom(&mut raw).is_err() {
@@ -234,7 +260,7 @@ async fn stored_ack(link: &mut PairLink) -> bool {
         }
         match tokio::time::timeout(left, pair_read(&mut link.recv)).await {
             Ok(Ok(v)) if frame_type(&v) == "pair-stored" => {
-                if v["ack_of"].as_str() == Some(mine.as_str()) {
+                if ack_of_matches(&v, &mine) {
                     return true;
                 }
                 if let Some(their) = v["nonce"].as_str() {
@@ -372,24 +398,31 @@ fn lan_enabled() -> bool {
 /// the port its daemon will use; a host advertises the port it actually bound.
 /// Read this device's existing certificate. NEVER mints one: PR A must not
 /// create a self-certificate as a side effect of pairing.
+fn reusable_cert(cert: &DeviceCert, own: [u8; 32], now: u64) -> bool {
+    cert.device_pub == own && cert.verify(now).is_ok()
+}
+
 fn local_cert_readonly() -> Option<DeviceCert> {
     let raw = std::fs::read_to_string(crate::local_device_cert_path()).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
     let cert = DeviceCert::from_json(&v["cert"])?;
-    cert.verify(identity::now_secs()).ok()?;
     let own = crate::overlay::overlay_pubkey_bytes().ok()?;
-    (cert.device_pub == own).then_some(cert)
+    reusable_cert(&cert, own, identity::now_secs()).then_some(cert)
+}
+
+fn fresh_listen_port(v: &Value, now: u64) -> Option<u64> {
+    let at = v["at"].as_u64()?;
+    if now.saturating_sub(at) > 30 || at > now.saturating_add(30) {
+        return None;
+    }
+    v["listen_port"].as_u64().filter(|p| *p != 0)
 }
 
 fn daemon_listen_port() -> Option<u64> {
     let raw = std::fs::read_to_string(crate::settings::config_dir().join("lan-state.json")).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
-    let at = v["at"].as_u64()?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    if now.saturating_sub(at) > 30 || at > now.saturating_add(30) {
-        return None;
-    }
-    v["listen_port"].as_u64().filter(|p| *p != 0)
+    fresh_listen_port(&v, now)
 }
 
 fn pair_hello(svc: &LanService) -> Value {
@@ -460,6 +493,7 @@ pub async fn spawn_host(code: PairCode, words: String, nameplate: String) -> Res
         service_options(true, Some(id), false),
         Arc::new(Vec::<filament_transport::lan::LanKey>::new),
         Some(pair_tx),
+        None,
         ev_tx,
     )
     .await?;
@@ -519,6 +553,7 @@ pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
         service_options(true, Some(id), false),
         Arc::new(Vec::<filament_transport::lan::LanKey>::new),
         Some(pair_tx),
+        None,
         ev_tx,
     )
     .await?;
@@ -550,7 +585,7 @@ pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
                     let name = persist_plain(&Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() })?;
                     svc.learn(&name, &hello);
                     if stored_ack(&mut link).await {
-                        ui::say(&ui::paint(ui::Tone::Dim, "  the other device confirmed it saved this pairing"));
+                        ui::say(&ui::paint(ui::Tone::Dim, "  the other device says it saved this pairing"));
                     } else {
                         ui::say(&ui::paint(ui::Tone::Dim, "  saved here; the other device has not confirmed it saved"));
                     }
@@ -583,12 +618,15 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
     if nameplate.is_empty() || words.is_empty() {
         bail!("that code doesn't look right, expected something like brave-otter-ruby-3141");
     }
-    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<crate::net::Ev>();
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel::<crate::net::Ev>();
+    spawn_ev_drain(ev_rx);
+    let (pairing_tx, mut pairing_rx) = mpsc::channel(16);
     let svc = LanService::start(
         &crate::settings::config_dir(),
         service_options(false, None, true),
         Arc::new(Vec::<filament_transport::lan::LanKey>::new),
         None,
+        Some(pairing_tx),
         ev_tx,
     )
     .await?;
@@ -601,12 +639,12 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
             if left.is_zero() {
                 bail!("no nearby pairing device appeared within 10 minutes");
             }
-            let ev = match tokio::time::timeout(left.min(Duration::from_secs(2)), ev_rx.recv()).await {
-                Ok(Some(ev)) => ev,
+            let notice = match tokio::time::timeout(left.min(Duration::from_secs(2)), pairing_rx.recv()).await {
+                Ok(Some(notice)) => notice,
                 Ok(None) => bail!("LAN service stopped"),
                 Err(_) => continue,
             };
-            let crate::net::Ev::Lan(filament_transport::lan::LanEvent::PairingNearby { addr, label }) = ev else { continue };
+            let filament_transport::lan::PairingNotice { addr, label } = notice;
             let key = format!("{addr}|{label}");
             if !seen.insert(key.clone()) {
                 continue;
@@ -640,7 +678,7 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
             let saved = persist_plain(&Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() })?;
             svc.learn(&saved, &hello);
             if stored_ack(&mut link).await {
-                ui::say(&ui::paint(ui::Tone::Dim, "  the other device confirmed it saved this pairing"));
+                ui::say(&ui::paint(ui::Tone::Dim, "  the other device says it saved this pairing"));
             } else {
                 ui::say(&ui::paint(ui::Tone::Dim, "  saved here; the other device has not confirmed it saved"));
             }
@@ -714,5 +752,48 @@ mod tests {
     fn the_ceremony_parser_does_not_accept_the_post_store_ack() {
         assert!(!FRAME_TYPES.contains(&"pair-stored"));
         assert!(!FRAME_TYPES.contains(&"enrol-offer"));
+        assert!(ceremony_frame_kind(&serde_json::json!({"type":"pair-stored","v":1}), false).is_err());
+        assert!(ceremony_frame_kind(&serde_json::json!({"type":"pair-stored","v":1}), true).is_err());
+        assert!(ceremony_frame_kind(&serde_json::json!({"type":"pair-name","name":"x"}), false).is_err());
+        assert!(ceremony_frame_kind(&serde_json::json!({"type":"pake-msg","v":2}), false).is_ok());
+    }
+
+    #[test]
+    fn a_stale_or_foreign_certificate_is_not_reusable() {
+        let cert = DeviceCert { device_pub: [1; 32], user_pub: [2; 32], expires: 10, issued: 1, sig: [0; 64] };
+        assert!(!reusable_cert(&cert, [1; 32], 100), "expired and unsigned");
+        assert!(!reusable_cert(&cert, [9; 32], 5), "does not match this overlay key");
+    }
+
+    #[test]
+    fn a_stale_daemon_state_advertises_no_port() {
+        let now = 1_800_000_000u64;
+        assert_eq!(fresh_listen_port(&serde_json::json!({"at": now - 31, "listen_port": 47821}), now), None);
+        assert_eq!(fresh_listen_port(&serde_json::json!({"at": now - 10, "listen_port": 47821}), now), Some(47821));
+        assert_eq!(fresh_listen_port(&serde_json::json!({"at": now, "listen_port": 0}), now), None);
+    }
+
+    #[test]
+    fn an_ack_never_matches_another_session_or_empty_frame() {
+        assert!(!ack_of_matches(&serde_json::json!({"ack_of":"other"}), "mine"));
+        assert!(!ack_of_matches(&serde_json::json!({"type":"pair-stored"}), "mine"));
+        assert!(ack_of_matches(&serde_json::json!({"ack_of":"mine"}), "mine"));
+    }
+
+    #[test]
+    fn the_actual_store_allocates_a_case_insensitive_free_name() {
+        let mut arr = vec![serde_json::json!({"name":"Laptop","secret":"old"})];
+        let final_name = filament_peerloop::recv::store::upsert_peer_record(
+            &mut arr,
+            "laptop",
+            Some("new"),
+            None,
+            Some(&["transfer".to_string()]),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(final_name, "laptop-2");
+        assert_eq!(arr[0]["name"], "Laptop", "the existing record is unchanged");
     }
 }

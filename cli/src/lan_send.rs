@@ -11,7 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub(crate) async fn start(context: &filament_transport::TransportContext, tx: UnboundedSender<Ev>) -> anyhow::Result<LanService> {
     let opts = Options { serve: false, skip: filament_transport::lan::skip(context), ..Default::default() };
-    LanService::start(&crate::settings::config_dir(), opts, Arc::new(Vec::<LanKey>::new), None, tx).await
+    LanService::start(&crate::settings::config_dir(), opts, Arc::new(Vec::<LanKey>::new), None, None, tx).await
 }
 
 /// The circular-route guard for a one-shot: every paired device's recorded
