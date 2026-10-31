@@ -1300,7 +1300,7 @@ async fn pair_with_purpose(
                     let won = pair_code.as_ref().is_some_and(|c| c.confirm(out.token, Instant::now()));
                     if won {
                         crate::lan_pair::persist_plain(&out)?;
-                        if let Some(h) = lan_host.take() { h.shutdown().await; }
+                        if let Some(mut h) = lan_host.take() { h.shutdown().await; }
                         return Ok(());
                     }
                 }
