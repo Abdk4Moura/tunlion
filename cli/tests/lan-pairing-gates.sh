@@ -103,9 +103,9 @@ happy() {
   stop_host
   if grep -aq '"secret"' "$DA/devices.json" && grep -aq '"secret"' "$DB/devices.json"; then ok "both sides stored a pair secret"; else bad "pair secret missing"; fi
   # The same pair secret is what `up` and `send` consume.
-  asA env TUNLION_TRANSPORTS=lan TUNLION_LOG=debug TUNLION_NAME=boxa "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/upA.log" 2>&1 &
+  asA env TUNLION_LOG=debug TUNLION_NAME=boxa "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/upA.log" 2>&1 &
   echo $! > "$WORK/upA.pid"
-  asB env TUNLION_TRANSPORTS=lan TUNLION_LOG=debug TUNLION_NAME=boxb "$BIN" --server "$SERVER" up --dir "$WORK/Bdrop" >"$WORK/upB.log" 2>&1 &
+  asB env TUNLION_LOG=debug TUNLION_NAME=boxb "$BIN" --server "$SERVER" up --dir "$WORK/Bdrop" >"$WORK/upB.log" 2>&1 &
   echo $! > "$WORK/upB.pid"
   local line=""
   for _ in $(seq 1 60); do
