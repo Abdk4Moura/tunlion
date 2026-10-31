@@ -23,8 +23,14 @@ export interface Env {
   FIL_CHUNK_SIZE?: string;
   FIL_PING_INTERVAL?: string;
   FIL_PING_TIMEOUT?: string;
-  /** Population at or below which an alarm pings in one batch (default 512). */
+  /** Population at or below which an alarm pings in one batch (default 40). */
   FIL_PING_SLICE_AT?: string;
+  /** Session refresh write spacing in seconds (default 21600, 6 h). */
+  FIL_SESSION_PERSIST_S?: string;
+  /** Expired session/retired rows one prune may delete (default 64). */
+  FIL_SESSION_PRUNE_BATCH?: string;
+  /** Rows one capacity scan may inspect (default 64). */
+  FIL_CAPACITY_SCAN?: string;
   FIL_MAX_DECODE_PACKETS?: string;
   FIL_SESSION_CLAIM_LIMIT?: string;
   FIL_CLAIM_LIMIT?: string;
