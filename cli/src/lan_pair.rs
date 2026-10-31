@@ -243,6 +243,13 @@ fn ack_of_matches(v: &Value, mine: &str) -> bool {
 }
 
 async fn stored_ack(link: &mut PairLink) -> bool {
+    stored_ack_within(link, Duration::from_secs(10)).await
+}
+
+/// The production budget is ten seconds. Tests use a shorter one so a lost
+/// acknowledgement is exercised without a ten-second sleep; the frame logic
+/// and the nonce match are identical.
+async fn stored_ack_within(link: &mut PairLink, budget: Duration) -> bool {
     let mut raw = [0u8; 16];
     if getrandom::getrandom(&mut raw).is_err() {
         return false;
@@ -251,7 +258,7 @@ async fn stored_ack(link: &mut PairLink) -> bool {
     if pair_write(&mut link.send, &json!({"type": "pair-stored", "v": 1, "nonce": mine})).await.is_err() {
         return false;
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + budget;
     let mut acknowledged_peer = false;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -279,6 +286,17 @@ async fn stored_ack(link: &mut PairLink) -> bool {
     }
 }
 
+/// What this side may say about the OTHER side's store. The local result is
+/// always real; the peer's is only claimed when its nonce-bound acknowledgement
+/// arrived. Loss is reported as unknown, never as a mutual success.
+pub(crate) fn saved_claim(peer_acked: bool) -> &'static str {
+    if peer_acked {
+        "  the other device says it saved this pairing"
+    } else {
+        "  saved here; the other device has not confirmed it saved"
+    }
+}
+
 /// A name is a petname, never an identity: an existing record with a different
 /// secret or certified key is never rewritten. A free name is chosen instead.
 fn choose_pair_name(records: &[Value], requested: &str, secret: &str, cert_pub: Option<&str>) -> (String, bool) {
@@ -291,6 +309,37 @@ fn choose_pair_name(records: &[Value], requested: &str, secret: &str, cert_pub: 
         (existing["name"].as_str().unwrap_or(requested).to_string(), false)
     } else {
         (crate::devices_store::free_device_name(records, requested), true)
+    }
+}
+
+/// Test-only interleaving seam for the durable-then-provisional window. It is
+/// compiled only for unit tests and does nothing in production. The two
+/// barriers let a test hold the writer at the exact point after the durable
+/// upsert and before the provisional sidecar, then interleave a real
+/// `devices_upsert_atomic` from another thread.
+#[cfg(test)]
+pub(super) mod test_seams {
+    use std::sync::{Arc, Barrier, Mutex, OnceLock};
+
+    pub(super) struct PersistPause {
+        pub reached: Arc<Barrier>,
+        pub release: Arc<Barrier>,
+    }
+
+    static PAUSE: OnceLock<Mutex<Option<PersistPause>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<PersistPause>> {
+        PAUSE.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(super) fn set_persist_pause(pause: PersistPause) {
+        *slot().lock().unwrap() = Some(pause);
+    }
+
+    pub(super) fn pause_before_provisional() {
+        let Some(pause) = slot().lock().unwrap().take() else { return };
+        pause.reached.wait();
+        pause.release.wait();
     }
 }
 
@@ -339,6 +388,8 @@ pub fn persist_plain(outcome: &Outcome) -> Result<String> {
                 false,
             )
             .context("store pairing secret and certificate")?;
+            #[cfg(test)]
+            test_seams::pause_before_provisional();
             if let Err(e) = crate::store_provisional_identity(&final_name, cert) {
                 // Keep the successfully committed durable record. Deleting by
                 // name could erase a prior legitimate record or a concurrent
@@ -379,6 +430,14 @@ pub fn persist_plain(outcome: &Outcome) -> Result<String> {
     Ok(name)
 }
 
+/// Persist first; acknowledge the peer only after the durable store succeeded.
+/// A provisional failure returns before the first post-store frame, so the peer
+/// cannot read a mutual success this side did not achieve.
+async fn persist_then_ack(link: &mut PairLink, outcome: &Outcome) -> Result<(String, bool)> {
+    let name = persist_plain(outcome)?;
+    let acked = stored_ack(link).await;
+    Ok((name, acked))
+}
 
 fn service_options(serve: bool, pairing: Option<[u8; 16]>, listen: bool) -> Options {
     let mut opts = Options { serve, listen_discovery: listen, pairing, ..Default::default() };
@@ -467,6 +526,10 @@ impl HostHandle {
     pub async fn shutdown(&mut self) {
         self.svc.shutdown().await;
         self.task.abort();
+        // Drop's abort alone detaches the task. Every caller that can await
+        // shutdown also joins the ceremony task here, so a cancelled host
+        // leaves no task behind that could still touch the code or a link.
+        let _ = (&mut self.task).await;
     }
 }
 
@@ -582,13 +645,10 @@ pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
                     if !code.confirm(token, Instant::now()) {
                         bail!("this code was already used");
                     }
-                    let name = persist_plain(&Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() })?;
+                    let outcome = Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() };
+                    let (name, peer_acked) = persist_then_ack(&mut link, &outcome).await?;
                     svc.learn(&name, &hello);
-                    if stored_ack(&mut link).await {
-                        ui::say(&ui::paint(ui::Tone::Dim, "  the other device says it saved this pairing"));
-                    } else {
-                        ui::say(&ui::paint(ui::Tone::Dim, "  saved here; the other device has not confirmed it saved"));
-                    }
+                    ui::say(&ui::paint(ui::Tone::Dim, saved_claim(peer_acked)));
                     return Ok::<(), anyhow::Error>(());
                 }
                 Err(e) => {
@@ -675,13 +735,10 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
             let token = 0;
             let (peer_name, secret, cert, hello) = run_ceremony(&mut link, &words, &nameplate, "joiner", &local_hello).await?;
             let peer_name = name.clone().unwrap_or(peer_name);
-            let saved = persist_plain(&Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() })?;
+            let outcome = Outcome { token, peer_name: peer_name.clone(), secret, cert, hello: hello.clone() };
+            let (saved, peer_acked) = persist_then_ack(&mut link, &outcome).await?;
             svc.learn(&saved, &hello);
-            if stored_ack(&mut link).await {
-                ui::say(&ui::paint(ui::Tone::Dim, "  the other device says it saved this pairing"));
-            } else {
-                ui::say(&ui::paint(ui::Tone::Dim, "  saved here; the other device has not confirmed it saved"));
-            }
+            ui::say(&ui::paint(ui::Tone::Dim, saved_claim(peer_acked)));
             return Ok::<(), anyhow::Error>(());
         }
     }
@@ -797,3 +854,7 @@ mod tests {
         assert_eq!(arr[0]["name"], "Laptop", "the existing record is unchanged");
     }
 }
+
+#[cfg(test)]
+#[path = "lan_pair_faults.rs"]
+mod fault_tests;

@@ -1365,6 +1365,55 @@ mod tests {
             other => panic!("expected the peer's frame, got {other:?}"),
         }
     }
+
+    /// Cancellation is a `LanService::shutdown`: every accept, frame, discovery
+    /// receiver and ticker task must be joined, and the listener's UDP port
+    /// must be free again. A surviving task is an orphan pair service that can
+    /// keep beacons or an accepted link alive after the command returned.
+    #[tokio::test]
+    async fn shutdown_joins_every_pair_service_task_and_frees_the_listener() {
+        let dir = std::env::temp_dir().join(format!(
+            "lan-shutdown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (pair_tx, _pair_rx) = tokio::sync::mpsc::channel(2);
+        let svc = LanService::start(
+            &dir,
+            Options { serve: true, pairing: Some([9; 16]), ..Default::default() },
+            Arc::new(Vec::<LanKey>::new),
+            Some(pair_tx),
+            None,
+            tx,
+        )
+        .await
+        .expect("pairing service starts");
+        let port = svc.port;
+        assert_ne!(port, 0, "the listener actually bound a UDP port");
+        let tasks = svc.tasks.clone();
+        assert!(!tasks.lock().unwrap().is_empty(), "the service owns tasks to join");
+
+        svc.shutdown().await;
+
+        assert!(tasks.lock().unwrap().is_empty(), "every service task joined");
+        let mut freed = false;
+        for _ in 0..40 {
+            if std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(freed, "listener port {port} stayed bound after shutdown");
+        // Shutdown is idempotent: a second cancel path must not panic or leak.
+        svc.shutdown().await;
+        assert!(tasks.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Is local discovery on? `network.transports` is `auto` (the default) or a

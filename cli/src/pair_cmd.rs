@@ -858,6 +858,55 @@ fn signal_store_has_token(code: Option<&PairCode>, token: Option<u64>) -> bool {
     code.is_none() || token.is_some()
 }
 
+/// The outcome of trying to acquire the signaling carrier's token. These are
+/// exactly the three states the event loop needs: keep going, retry later, and
+/// stop because a carrier already consumed the code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignalingClaimStart {
+    Started,
+    Waiting,
+    Blocked,
+}
+
+/// Take a signaling token through the code's single CAS. Used by the PairUsed
+/// handler and by the first PAKE frame, so a missing or delayed PairUsed is a
+/// retry, never an implicit token.
+pub(crate) fn start_signaling_claim(
+    code: &PairCode,
+    token: &mut Option<u64>,
+    now: Instant,
+) -> SignalingClaimStart {
+    match code.begin(PairCarrier::Signaling, now) {
+        Begin::Started(t) => {
+            *token = Some(t);
+            SignalingClaimStart::Started
+        }
+        Begin::Busy => SignalingClaimStart::Waiting,
+        Begin::Closed => SignalingClaimStart::Blocked,
+    }
+}
+
+/// Run the one store only after this carrier's claim is still current. A host
+/// that owns a code with no token stores nothing; a stale or already-consumed
+/// token stores nothing; only the winning token reaches `store`.
+pub(crate) fn store_after_signaling_claim<T>(
+    code: Option<&PairCode>,
+    token: Option<u64>,
+    now: Instant,
+    store: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if !signal_store_has_token(code, token) {
+        bail!("pairing store without a signaling claim token");
+    }
+    if let Some(code) = code {
+        let token = token.expect("checked token presence");
+        if !code.confirm(token, now) {
+            bail!("this code was already used by a nearby device");
+        }
+    }
+    store()
+}
+
 pub(crate) async fn pair_cmd(
     server: &str,
     mut code: Option<String>,
@@ -1503,16 +1552,12 @@ async fn pair_with_purpose(
                                 }
                             }
                             // No cert: store secret only (legacy or first-pair no identity)
-                            if let Some(code) = pair_code.as_ref() {
-                                if !signal_store_has_token(Some(code), signaling_token) {
-                                    bail!("pairing store without a signaling claim token");
-                                }
-                                let token = signaling_token.expect("checked token presence");
-                                if !code.confirm(token, Instant::now()) {
-                                    bail!("this code was already used by a nearby device");
-                                }
-                            }
-                            devices_store_v2(&n, &sec, &caps)?;
+                            store_after_signaling_claim(
+                                pair_code.as_ref(),
+                                signaling_token,
+                                Instant::now(),
+                                || devices_store_v2(&n, &sec, &caps),
+                            )?;
                             // ...unless WE certified them during this ceremony. Then the
                             // secret and the certificate belong in one record: the owner
                             // dials on the secret and judges on the certificate, and a
@@ -1560,29 +1605,27 @@ async fn pair_with_purpose(
                             // If process crashes between them, cap_authorize sees new-secret + old-cert (or no cert)
                             // yielding wrong userPub. Fix: devices_upsert_atomic writes both fields together.
                             let pcert = peer_identity_cert.as_ref().unwrap();
-                            if let Some(code) = pair_code.as_ref() {
-                                if !signal_store_has_token(Some(code), signaling_token) {
-                                    bail!("pairing store without a signaling claim token");
-                                }
-                                let token = signaling_token.expect("checked token presence");
-                                if !code.confirm(token, Instant::now()) {
-                                    bail!("this code was already used by a nearby device");
-                                }
-                            }
-                            // allow_reanchor: same accepted ceremony as above.
-                            devices_upsert_atomic(
-                                &n,
-                                Some(&sec),
-                                Some(pcert),
-                                Some(&caps),
-                                Some(scope),
-                                None,
-                                None,
-                                true,
-                            )
-                            .context("atomic store secret+cert")?;
-                            // Also store provisional for overlay check: on overlay failure, REMOVE the durable anchor
-                            store_provisional_identity(&n, pcert).context("store provisional")?;
+                            store_after_signaling_claim(
+                                pair_code.as_ref(),
+                                signaling_token,
+                                Instant::now(),
+                                || {
+                                    // allow_reanchor: same accepted ceremony as above.
+                                    devices_upsert_atomic(
+                                        &n,
+                                        Some(&sec),
+                                        Some(pcert),
+                                        Some(&caps),
+                                        Some(scope),
+                                        None,
+                                        None,
+                                        true,
+                                    )
+                                    .context("atomic store secret+cert")?;
+                                    // Also store provisional for overlay check: on overlay failure, REMOVE the durable anchor
+                                    store_provisional_identity(&n, pcert).context("store provisional")
+                                },
+                            )?;
                         }
                         // A pairing between two DIFFERENT identities files the peer
                         // as EXTERNAL (someone else's, time-boxed, deny-by-default).
@@ -1958,14 +2001,14 @@ async fn pair_with_purpose(
                 ui::say(&step_line("Code claimed"));
                 ceremony_deadline.get_or_insert_with(|| Instant::now() + ceremony_budget);
                 if let Some(code) = pair_code.as_ref() {
-                    match code.begin(PairCarrier::Signaling, Instant::now()) {
-                        Begin::Started(t) => signaling_token = Some(t),
-                        Begin::Busy => {
+                    match start_signaling_claim(code, &mut signaling_token, Instant::now()) {
+                        SignalingClaimStart::Started => {}
+                        SignalingClaimStart::Waiting => {
                             // Backoff or another active carrier: not a spent claim.
                             // A later PAKE frame retries begin; do not poison.
                             ui::debug("  signaling claim waits for the code's current attempt");
                         }
-                        Begin::Closed => {
+                        SignalingClaimStart::Blocked => {
                             signaling_blocked = true;
                             ui::say("  this code was already used; this claim cannot proceed");
                         }
@@ -2037,10 +2080,10 @@ async fn pair_with_purpose(
                     }
                     if let Some(code) = pair_code.as_ref() {
                         if signaling_token.is_none() {
-                            match code.begin(PairCarrier::Signaling, Instant::now()) {
-                                Begin::Started(t) => signaling_token = Some(t),
-                                Begin::Busy => continue,
-                                Begin::Closed => {
+                            match start_signaling_claim(code, &mut signaling_token, Instant::now()) {
+                                SignalingClaimStart::Started => {}
+                                SignalingClaimStart::Waiting => continue,
+                                SignalingClaimStart::Blocked => {
                                     signaling_blocked = true;
                                     continue;
                                 }
