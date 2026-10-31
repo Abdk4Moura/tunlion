@@ -144,6 +144,8 @@ pub struct PromoteState {
     handed: bool,
     /// Authorization token of the held direct standby.
     attempt: Option<net::AttemptId>,
+    /// Immutable authorization snapshot copied from the pending that armed it.
+    auth: Option<DirectAuth>,
 }
 
 impl PromoteState {
@@ -156,6 +158,7 @@ impl PromoteState {
             asked: false,
             handed: false,
             attempt: None,
+            auth: None,
         }
     }
 
@@ -684,6 +687,8 @@ pub struct UpgradeProbe {
     pub verify_last_idle: u64,
     /// Authorization token of the current standby, captured at readiness.
     pub token: Option<net::AttemptId>,
+    /// Immutable authorization snapshot copied from the probe's DirectPending.
+    pub auth: Option<DirectAuth>,
 }
 
 impl UpgradeProbe {
@@ -696,6 +701,7 @@ impl UpgradeProbe {
             verify_started: None,
             verify_last_idle: u64::MAX,
             token: None,
+            auth: None,
         }
     }
 }
@@ -718,12 +724,55 @@ pub enum Rung {
     Exhausted,
 }
 
+/// Which authority an immutable direct attempt was authorized by. A fleet
+/// rendezvous secret proves membership, and a ceremony secret proves only the
+/// code holder; neither is a device binding and neither may enter
+/// `revoked_bindings`. Keeping the domain explicit prevents a shared string
+/// from being compared as if it named a device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DirectAuthDomain {
+    Device,
+    Ephemeral,
+    Fleet,
+}
+
+/// Immutable authorization snapshot for one direct attempt. `generation` is
+/// allocated from `Conn::next_gen` before any async work. `device_binding` is
+/// populated ONLY for `Device`; it is the exact (name, secret) held by the
+/// current device store when the attempt was armed.
+#[derive(Clone, Debug)]
+pub struct DirectAuth {
+    pub generation: u32,
+    pub domain: DirectAuthDomain,
+    pub device_binding: Option<(String, String)>,
+}
+
+impl DirectAuth {
+    fn device(generation: u32, name: &str, secret: &str) -> Self {
+        DirectAuth {
+            generation,
+            domain: DirectAuthDomain::Device,
+            device_binding: Some((name.to_string(), secret.to_string())),
+        }
+    }
+
+    fn ephemeral(generation: u32) -> Self {
+        DirectAuth { generation, domain: DirectAuthDomain::Ephemeral, device_binding: None }
+    }
+
+    fn fleet(generation: u32) -> Self {
+        DirectAuth { generation, domain: DirectAuthDomain::Fleet, device_binding: None }
+    }
+}
+
 /// rung-1: state for one in-flight direct-QUIC attempt.
 pub struct DirectPending {
     /// Authorization token for this attempt, allocated before any async work.
     pub attempt: net::AttemptId,    /// The single outer task that can publish primary readiness for this
     /// attempt. Awaited by retirement cleanup before the drain barrier.
     pub race_task: Option<tokio::task::JoinHandle<()>>,
+    /// Immutable authorization context captured when this attempt was armed.
+    pub auth: DirectAuth,
     /// (name, secret) for the known device, gates the attempt and keys the MAC.
     pub secret: (String, String),
     /// This dial used the FLEET rendezvous secret, so the link it produces must
@@ -1073,6 +1122,9 @@ pub struct LinkEvents {
 /// yet. They are replayed only if that exact source becomes the link source.
 pub struct PendingSource {
     pub pid: String,
+    /// The direct attempt that owns this source. None for a generic staged
+    /// source; direct standby cleanup only touches an exact match.
+    pub attempt: Option<net::AttemptId>,
     pub at: Instant,
     pub events: std::collections::VecDeque<Ev>,
     pub bytes: usize,
@@ -2031,7 +2083,8 @@ impl Conn {
         // A drop is an invalidation: a candidate still building for this peer
         // must not publish after the link it was replacing is gone.
         self.cancel_build(pid);
-        if let Some(attempt) = self.links.get(pid).and_then(|link| link.attempt) {
+        let link_attempt = self.links.get(pid).and_then(|link| link.attempt);
+        if let Some(attempt) = link_attempt {
             // The adopted producer is already terminal; a queued duplicate ready
             // for this attempt must not resurrect the link.
             self.retire_attempt(pid, attempt, None);
@@ -2062,8 +2115,21 @@ impl Conn {
         // barrier still waiting on the peer must release onto the old path. One
         // already handed over is the exception: its adoption is queued and needs
         // the entry to keep its ephemeral pending from being reaped first.
+        let promotion_attempt = if self.promotions.get(pid).is_some_and(|s| s.handed) {
+            None
+        } else {
+            self.promotions.get(pid).and_then(|s| s.attempt)
+        };
         if !self.promotions.get(pid).is_some_and(|s| s.handed) {
             self.abandon_promotion(pid);
+        }
+        // Retire only the exact ownership removed with this link. A newer
+        // same-pid attempt, probe, or source must not be swept by a drop.
+        if let Some(attempt) = promotion_attempt {
+            self.retire_direct_ownership(pid, attempt);
+        }
+        if let Some(attempt) = link_attempt {
+            self.retire_direct_ownership(pid, attempt);
         }
         if let Some(old) = self.links.remove(pid) {
             // Never await close in the event loop (F8): mark + spawn.
@@ -3159,6 +3225,7 @@ impl Conn {
             .entry(source)
             .or_insert_with(|| PendingSource {
                 pid: pid.clone(),
+                attempt: None,
                 at: Instant::now(),
                 events: std::collections::VecDeque::new(),
                 bytes: 0,
@@ -3350,6 +3417,72 @@ impl Conn {
             if !secret.is_empty() {
                 self.revoked_bindings.insert(secret.clone());
             }
+        }
+        // Direct ownership is invalidated by exact attempt, never by pid alone
+        // and never by a display name. A revoked DEVICE binding selects only
+        // device-domain attempts; fleet and ephemeral attempts are selected only
+        // when their own pid is doomed. A newer same-pid device attempt that the
+        // current store proves survives its old link's forget.
+        let doomed_pids: HashSet<String> =
+            doomed.iter().map(|(pid, _)| pid.clone()).collect();
+        let mut direct_targets: Vec<(String, net::AttemptId)> = Vec::new();
+        let mut push_target = |pid: &str,
+                               attempt: net::AttemptId,
+                               targets: &mut Vec<(String, net::AttemptId)>| {
+            if !targets.iter().any(|(p, a)| p.as_str() == pid && *a == attempt) {
+                targets.push((pid.to_string(), attempt));
+            }
+        };
+        for (pid, pending) in &self.direct_pending {
+            let revoked_device = pending.auth.domain == DirectAuthDomain::Device
+                && pending
+                    .auth
+                    .device_binding
+                    .as_ref()
+                    .is_some_and(|(_, secret)| revoked_secrets.contains(secret));
+            let doomed_attempt = doomed_pids.contains(pid.as_str())
+                && !self.direct_auth_survives_forget(pid, &pending.auth);
+            if revoked_device || doomed_attempt {
+                push_target(pid, pending.attempt, &mut direct_targets);
+            }
+        }
+        // A standby may already have consumed its pending. Its immutable attempt
+        // and authorization snapshot still identify exactly what to retire.
+        for (pid, probe) in &self.resil.upgrade_probe {
+            let Some(attempt) = probe.token else {
+                continue;
+            };
+            let Some(auth) = probe.auth.as_ref() else {
+                continue;
+            };
+            let revoked_device = auth.domain == DirectAuthDomain::Device
+                && auth
+                    .device_binding
+                    .as_ref()
+                    .is_some_and(|(_, secret)| revoked_secrets.contains(secret));
+            let doomed_attempt =
+                doomed_pids.contains(pid.as_str()) && !self.direct_auth_survives_forget(pid, auth);
+            if revoked_device || doomed_attempt {
+                push_target(pid, attempt, &mut direct_targets);
+            }
+        }
+        for (pid, promotion) in &self.promotions {
+            let (Some(attempt), Some(auth)) = (promotion.attempt, promotion.auth.as_ref()) else {
+                continue;
+            };
+            let revoked_device = auth.domain == DirectAuthDomain::Device
+                && auth
+                    .device_binding
+                    .as_ref()
+                    .is_some_and(|(_, secret)| revoked_secrets.contains(secret));
+            let doomed_attempt =
+                doomed_pids.contains(pid.as_str()) && !self.direct_auth_survives_forget(pid, auth);
+            if revoked_device || doomed_attempt {
+                push_target(pid, attempt, &mut direct_targets);
+            }
+        }
+        for (pid, attempt) in direct_targets {
+            self.retire_direct_ownership(&pid, attempt);
         }
         let build_pids: Vec<(String, Option<String>)> = self
             .builds
@@ -3569,6 +3702,116 @@ impl Conn {
         Some(pending)
     }
 
+    /// Exact-attempt retirement: a newer pending for the same pid is untouched.
+    fn take_direct_pending_if(
+        &mut self,
+        pid: &str,
+        expected: net::AttemptId,
+    ) -> Option<DirectPending> {
+        if self
+            .direct_pending
+            .get(pid)
+            .is_some_and(|pending| pending.attempt != expected)
+        {
+            return None;
+        }
+        self.take_direct_pending(pid)
+    }
+
+    /// Side-effect-free final authorization check for one direct attempt.
+    ///
+    /// Unknown provenance fails closed. A device binding must not be revoked and
+    /// only needs current-store membership when the pid itself was revoked (a
+    /// newer same-pid re-pair). An ephemeral or fleet attempt is never treated
+    /// as a device binding; while its pid is revoked, neither has an explicit
+    /// reauthorization context in this state, so both stay rejected.
+    fn direct_attempt_authorized(
+        &self,
+        pid: &str,
+        attempt: net::AttemptId,
+        auth: Option<&DirectAuth>,
+    ) -> bool {
+        if self.retired_attempts.contains_key(&attempt) {
+            return false;
+        }
+        let Some(auth) = auth else {
+            return false;
+        };
+        match auth.domain {
+            DirectAuthDomain::Device => {
+                let Some((_, secret)) = auth.device_binding.as_ref() else {
+                    return false;
+                };
+                if self.revoked_bindings.contains(secret) {
+                    return false;
+                }
+                if let Some(revoked) = self.revoked_peers.get(pid) {
+                    if auth.generation <= revoked.generation {
+                        return false;
+                    }
+                    if !self.store_holds_binding(secret) {
+                        return false;
+                    }
+                }
+                true
+            }
+            DirectAuthDomain::Ephemeral | DirectAuthDomain::Fleet => {
+                !self.revoked_peers.contains_key(pid)
+            }
+        }
+    }
+
+    /// A newer device attempt survives an old-link forget only when the current
+    /// store proves the new binding and the attempt is newer than that link.
+    fn direct_auth_survives_forget(&self, pid: &str, auth: &DirectAuth) -> bool {
+        if auth.domain != DirectAuthDomain::Device {
+            return false;
+        }
+        let Some((_, secret)) = auth.device_binding.as_ref() else {
+            return false;
+        };
+        if self.revoked_bindings.contains(secret) || !self.store_holds_binding(secret) {
+            return false;
+        }
+        let old_generation = self.links.get(pid).map(|link| link.generation).unwrap_or(0);
+        auth.generation > old_generation
+    }
+
+    /// Retire exactly one attempt and only the promotion, probe, or source
+    /// entries that carry that same immutable attempt. Anything with different
+    /// or unknown provenance is left alone and is re-checked at readiness.
+    fn retire_direct_ownership(&mut self, pid: &str, attempt: net::AttemptId) {
+        let _ = self.take_direct_pending_if(pid, attempt);
+        if self
+            .promotions
+            .get(pid)
+            .is_some_and(|promotion| promotion.attempt == Some(attempt))
+        {
+            if let Some(st) = self.promotions.remove(pid) {
+                if let Some(answer) = st.answer {
+                    let _ = answer.send(None);
+                }
+                if let Some((transport, _)) = st.standby {
+                    transport.force_close();
+                }
+            }
+        }
+        if self
+            .resil
+            .upgrade_probe
+            .get(pid)
+            .is_some_and(|probe| probe.token == Some(attempt))
+        {
+            if let Some(probe) = self.resil.upgrade_probe.remove(pid) {
+                if let Some(transport) = probe.standby {
+                    transport.force_close();
+                }
+            }
+        }
+        self.pending_sources
+            .retain(|_, pending| !(pending.pid == pid && pending.attempt == Some(attempt)));
+    }
+
     /// Whether a peer explicitly told us it has no direct-QUIC transport.
     ///
     /// The browser's PeerLink sends `{type:"transport-hint", direct:false}` as
@@ -3738,9 +3981,12 @@ impl Conn {
         }
         if armed {
             self.abandon_promotion(pid);
-            let attempt = self.direct_pending.get(pid).map(|pending| pending.attempt);
+            let pending = self.direct_pending.get(pid);
+            let attempt = pending.map(|pending| pending.attempt);
+            let auth = pending.map(|pending| pending.auth.clone());
             let mut state = PromoteState::new(role);
             state.attempt = attempt;
+            state.auth = auth;
             self.promotions.insert(pid.to_string(), state);
             self.gate_for_promotion(pid);
         }
@@ -3786,8 +4032,11 @@ impl Conn {
             if let Some((t, _)) = st.standby {
                 t.force_close();
             }
+            if let Some(attempt) = st.attempt {
+                self.pending_sources
+                    .retain(|_, pending| !(pending.pid == pid && pending.attempt == Some(attempt)));
+            }
         }
-        self.pending_sources.retain(|_, pending| pending.pid != pid);
     }
 
     /// P5 (GAP-6): arm a relay->direct UPGRADE probe, a direct dial run
@@ -3798,17 +4047,27 @@ impl Conn {
     /// rather than clobbering the serving relay link. A no-op if a probe is
     /// already in flight for this peer.
     async fn start_upgrade_probe(&mut self, pid: &str, name: &str, secret: &str) {
+        // A probe must not re-arm a binding the store dropped or a pid whose
+        // current authorization was revoked. The relay path stays serving.
+        if self.intent_blocked(pid, Some(&(name.to_string(), secret.to_string()))) {
+            self.resil.upgrade_probe.remove(pid);
+            return;
+        }
         // A probe already in flight (its own DirectPending), don't double-dial.
         if self.direct_pending.contains_key(pid) {
             return;
         }
         self.start_direct_inner(pid, name, secret, DirectIntent::Probe)
             .await;
-        // Capture the upstream attempt BEFORE any readiness can arrive; the
-        // probe token is an authorization identity, never inferred from a ready.
-        if let Some(attempt) = self.direct_pending.get(pid).map(|pending| pending.attempt) {
+        // Capture the upstream attempt and authorization BEFORE any readiness can
+        // arrive; the probe token is an authorization identity, never inferred
+        // from a ready.
+        if let Some(pending) = self.direct_pending.get(pid) {
+            let attempt = pending.attempt;
+            let auth = pending.auth.clone();
             if let Some(probe) = self.resil.upgrade_probe.get_mut(pid) {
                 probe.token = Some(attempt);
+                probe.auth = Some(auth);
             }
         }
     }
@@ -4117,10 +4376,19 @@ impl Conn {
             ));
             return;
         }
+        self.next_gen += 1;
+        let auth = match intent {
+            DirectIntent::Fleet => DirectAuth::fleet(self.next_gen),
+            DirectIntent::Promote => DirectAuth::ephemeral(self.next_gen),
+            DirectIntent::Normal | DirectIntent::Probe => {
+                DirectAuth::device(self.next_gen, name, secret)
+            }
+        };
         self.direct_pending.insert(
             pid.to_string(),
             DirectPending {
                 attempt: net::AttemptId::next(),
+                auth,
                 race_task: None,
                 fleet: intent == DirectIntent::Fleet,
                 ephemeral: intent == DirectIntent::Promote,
@@ -4442,6 +4710,22 @@ impl Conn {
         {
             self.log.debug(&format!(
                 "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: no attempt ownership"
+            ));
+            t.force_close();
+            return DirectAdoption::Rejected;
+        }
+        // Final side-effect-free authorization gate BEFORE any promotion or link
+        // mutation. Unknown provenance fails closed. A revoked old device binding
+        // cannot be laundered through a surviving pending or promotion, while a
+        // newer same-pid re-pair proven by the current store survives.
+        let auth = self
+            .direct_pending
+            .get(pid)
+            .map(|pending| pending.auth.clone())
+            .or_else(|| self.promotions.get(pid).and_then(|promotion| promotion.auth.clone()));
+        if !self.direct_attempt_authorized(pid, attempt, auth.as_ref()) {
+            self.log.debug(&format!(
+                "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: attempt authorization revoked"
             ));
             t.force_close();
             return DirectAdoption::Rejected;
@@ -5765,6 +6049,18 @@ impl Conn {
             t.force_close();
             return;
         }
+        let auth = self
+            .resil
+            .upgrade_probe
+            .get(pid)
+            .and_then(|probe| probe.auth.clone());
+        if !self.direct_attempt_authorized(pid, attempt, auth.as_ref()) {
+            self.log.debug(&format!(
+                "tunlion: UPGRADE-REFUSED peer={pid}: standby authorization revoked"
+            ));
+            t.force_close();
+            return;
+        }
         if self
             .direct_pending
             .get(pid)
@@ -5986,6 +6282,11 @@ impl Conn {
             .get(pid)
             .map(|s| s.role)
             .unwrap_or(PromoteRole::Follow);
+        let auth = self
+            .promotions
+            .get(pid)
+            .and_then(|s| s.auth.clone())
+            .or_else(|| self.direct_pending.get(pid).map(|p| p.auth.clone()));
         if let Some(st) = self.promotions.remove(pid) {
             if let Some(answer) = st.answer {
                 let _ = answer.send(None);
@@ -5999,6 +6300,7 @@ impl Conn {
         let mut st = PromoteState::new(role);
         st.handed = true;
         st.attempt = Some(attempt);
+        st.auth = auth;
         self.promotions.insert(pid.to_string(), st);
         self.log.debug(&format!(
             "tunlion: PROMOTE-ADOPT peer={pid} route={route}: no serving link to hand off from"
@@ -6340,10 +6642,18 @@ impl Conn {
             if st.standby.as_ref().is_some_and(|(held, _)| Arc::ptr_eq(held, &t)) {
                 return; // duplicate held standby
             }
+            if !self.direct_attempt_authorized(pid, attempt, st.auth.as_ref()) {
+                self.log.debug(&format!(
+                    "tunlion: STANDBY-REFUSED peer={pid}: promotion authorization revoked"
+                ));
+                t.force_close();
+                return;
+            }
             self.pending_sources.insert(
                 source,
                 PendingSource {
                     pid: pid.to_string(),
+                    attempt: Some(attempt),
                     at: Instant::now(),
                     events: std::collections::VecDeque::new(),
                     bytes: 0,
@@ -6388,10 +6698,18 @@ impl Conn {
             t.force_close();
             return;
         }
+        if !self.direct_attempt_authorized(pid, attempt, Some(&pending.auth)) {
+            self.log.debug(&format!(
+                "tunlion: STANDBY-REFUSED peer={pid}: probe authorization revoked"
+            ));
+            t.force_close();
+            return;
+        }
         self.pending_sources.insert(
             source,
             PendingSource {
                 pid: pid.to_string(),
+                attempt: Some(attempt),
                 at: Instant::now(),
                 events: std::collections::VecDeque::new(),
                 bytes: 0,
@@ -8450,6 +8768,7 @@ mod warm_identity_tests {
             pid.to_string(),
             DirectPending {
                 attempt: net::AttemptId::next(),
+                auth: DirectAuth::device(1, "web", "00"),
                 race_task: None,
                 secret: ("web".into(), "00".into()),
                 fleet: false,
@@ -8538,6 +8857,7 @@ mod warm_identity_tests {
             "sid-someone-else".into(),
             DirectPending {
                 attempt: net::AttemptId::next(),
+                auth: DirectAuth::device(1, "other", "11"),
                 race_task: None,
                 secret: ("other".into(), "11".into()),
                 fleet: false,
@@ -8588,6 +8908,7 @@ mod warm_identity_tests {
                 pid.into(),
                 DirectPending {
                     attempt: net::AttemptId::next(),
+                    auth: DirectAuth::device(1, secret.0, secret.1),
                     race_task: None,
                     secret: (secret.0.into(), secret.1.into()),
                     fleet: false,
@@ -8665,6 +8986,7 @@ mod warm_identity_tests {
             pid.to_string(),
             DirectPending {
                 attempt: net::AttemptId::next(),
+                auth: DirectAuth::device(1, "box", "00"),
                 race_task: None,
                 secret: ("box".into(), "00".into()),
                 fleet: false,
@@ -8815,6 +9137,7 @@ mod warm_identity_tests {
             pid.to_string(),
             DirectPending {
                 attempt: net::AttemptId::next(),
+                auth: DirectAuth::ephemeral(1),
                 race_task: None,
                 secret: (pid.to_string(), "ceremony".into()),
                 fleet: false,
@@ -8831,8 +9154,10 @@ mod warm_identity_tests {
             },
         );
         let attempt = conn.direct_pending.get(pid).map(|pending| pending.attempt);
+        let auth = conn.direct_pending.get(pid).map(|pending| pending.auth.clone());
         let mut state = PromoteState::new(role);
         state.attempt = attempt;
+        state.auth = auth;
         conn.promotions.insert(pid.to_string(), state);
         conn.gate_for_promotion(pid);
     }
@@ -8848,6 +9173,7 @@ mod warm_identity_tests {
             pid.to_string(),
             DirectPending {
                 attempt: net::AttemptId::next(),
+                auth: DirectAuth::fleet(1),
                 race_task: None,
                 secret: (pid.to_string(), "fleet".into()),
                 fleet: true,
@@ -9055,6 +9381,7 @@ mod warm_identity_tests {
     fn direct_pending_with(attempt: net::AttemptId, secret: (&str, &str)) -> DirectPending {
         DirectPending {
             attempt,
+            auth: DirectAuth::device(1, secret.0, secret.1),
             race_task: None,
             secret: (secret.0.into(), secret.1.into()),
             fleet: false,
@@ -9618,6 +9945,268 @@ mod warm_identity_tests {
         );
     }
 
+    /// A revoked armed attempt is retired at the exact attempt. Its tombstone
+    /// rejects a matching late DirectReady before mutation, and the reaper has
+    /// no pending left to turn into a WebRTC fallback.
+    #[tokio::test]
+    async fn a_revoked_armed_pending_cannot_be_resurrected_by_late_ready() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-revoke-late";
+        let t: Arc<dyn Transport> = Rec::new("late", &log);
+        let attempt = t.attempt_id().unwrap();
+        let mut pending = direct_pending_with(attempt, ("dev", "old-secret"));
+        pending.auth = DirectAuth::device(8, "dev", "old-secret");
+        conn.direct_pending.insert(pid.into(), pending);
+        let mut dropped = HashSet::new();
+        dropped.insert("old-secret".to_string());
+        conn.invalidate_peers(&[], &dropped);
+        assert!(!conn.direct_pending.contains_key(pid), "revoked pending survived");
+        assert!(
+            conn.retired_attempts.contains_key(&attempt),
+            "the exact attempt was not tombstoned for its drain barrier"
+        );
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), "direct-quic"),
+            DirectAdoption::Rejected
+        ));
+        assert!(!conn.links.contains_key(pid), "late ready resurrected a link");
+        assert!(t.is_dead(), "the rejected incoming transport was not closed");
+        assert!(conn.expired_direct().is_empty(), "a revoked pending fell back");
+    }
+
+    /// Invalidation cleans only the promotion, probe, and source entries that
+    /// carry the affected immutable attempt; unrelated newer metadata survives.
+    #[tokio::test]
+    async fn revocation_cleans_only_matching_promotion_probe_and_sources() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let promo_pid = "sid-revoke-promo";
+        let promo_attempt = net::AttemptId::next();
+        let promo_standby: Arc<dyn Transport> = Rec::new("promo-standby", &log);
+        let mut pending = direct_pending_with(promo_attempt, ("dev", "old-secret"));
+        pending.ephemeral = true;
+        pending.auth = DirectAuth::ephemeral(8);
+        conn.direct_pending.insert(promo_pid.into(), pending);
+        let mut promotion = PromoteState::new(PromoteRole::Lead);
+        promotion.attempt = Some(promo_attempt);
+        promotion.auth = Some(DirectAuth::ephemeral(8));
+        promotion.standby = Some((promo_standby.clone(), "direct-quic"));
+        conn.promotions.insert(promo_pid.into(), promotion);
+        conn.pending_sources.insert(
+            net::SourceId::next(),
+            PendingSource {
+                pid: promo_pid.into(),
+                attempt: Some(promo_attempt),
+                at: Instant::now(),
+                events: std::collections::VecDeque::new(),
+                bytes: 0,
+            },
+        );
+
+        let probe_pid = "sid-revoke-probe";
+        let probe_attempt = net::AttemptId::next();
+        let probe_standby: Arc<dyn Transport> = Rec::new("probe-standby", &log);
+        let mut probe = UpgradeProbe::armed();
+        probe.token = Some(probe_attempt);
+        probe.auth = Some(DirectAuth::device(8, "dev", "old-secret"));
+        probe.standby = Some(probe_standby.clone());
+        probe.verify_started = Some(Instant::now());
+        conn.resil.upgrade_probe.insert(probe_pid.into(), probe);
+        conn.pending_sources.insert(
+            net::SourceId::next(),
+            PendingSource {
+                pid: probe_pid.into(),
+                attempt: Some(probe_attempt),
+                at: Instant::now(),
+                events: std::collections::VecDeque::new(),
+                bytes: 0,
+            },
+        );
+
+        let keep_pid = "sid-keep-direct";
+        let keep_attempt = net::AttemptId::next();
+        let mut keep = direct_pending_with(keep_attempt, ("dev", "current-secret"));
+        keep.auth = DirectAuth::device(9, "dev", "current-secret");
+        conn.direct_pending.insert(keep_pid.into(), keep);
+        let mut keep_probe = UpgradeProbe::armed();
+        keep_probe.token = Some(net::AttemptId::next());
+        keep_probe.auth = Some(DirectAuth::device(9, "dev", "current-secret"));
+        conn.resil.upgrade_probe.insert(keep_pid.into(), keep_probe);
+        let keep_source = net::SourceId::next();
+        conn.pending_sources.insert(
+            keep_source,
+            PendingSource {
+                pid: keep_pid.into(),
+                attempt: Some(keep_attempt),
+                at: Instant::now(),
+                events: std::collections::VecDeque::new(),
+                bytes: 0,
+            },
+        );
+
+        let mut dropped = HashSet::new();
+        dropped.insert("old-secret".to_string());
+        conn.invalidate_peers(
+            &[(promo_pid.into(), "dev".into()), (probe_pid.into(), "dev".into())],
+            &dropped,
+        );
+        assert!(!conn.promotions.contains_key(promo_pid));
+        assert!(!conn.resil.upgrade_probe.contains_key(probe_pid));
+        assert!(promo_standby.is_dead() && probe_standby.is_dead());
+        assert!(conn
+            .pending_sources
+            .values()
+            .all(|pending| pending.pid != promo_pid && pending.pid != probe_pid));
+        assert!(conn.direct_pending.contains_key(keep_pid));
+        assert!(conn.resil.upgrade_probe.contains_key(keep_pid));
+        assert!(conn.pending_sources.contains_key(&keep_source));
+    }
+
+    /// A newer same-pid device attempt whose binding the current store holds
+    /// survives the old link's forget and adopts without the revoked secret.
+    #[tokio::test]
+    async fn a_newer_current_store_device_attempt_survives_old_link_forget() {
+        let host = Arc::new(TestHost {
+            devices: vec![("dev".into(), "new-secret".into())],
+        });
+        let (mut conn, _far, _rx) = test_conn_with_host(host).await;
+        let pid = "sid-new-device-successor";
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let old: Arc<dyn Transport> = Rec::new("old", &log);
+        let mut link = direct_link(pid, "dev", "dev", old);
+        link.generation = 7;
+        link.expected_secret = Some(("dev".into(), "old-secret".into()));
+        conn.links.insert(pid.into(), link);
+        let successor: Arc<dyn Transport> = Rec::new("successor", &log);
+        let successor_attempt = successor.attempt_id().unwrap();
+        let mut pending = direct_pending_with(successor_attempt, ("dev", "new-secret"));
+        pending.auth = DirectAuth::device(8, "dev", "new-secret");
+        conn.direct_pending.insert(pid.into(), pending);
+        let mut dropped = HashSet::new();
+        dropped.insert("old-secret".to_string());
+        conn.invalidate_peers(&[(pid.into(), "dev".into())], &dropped);
+        assert!(conn.direct_pending.contains_key(pid), "the new store binding was swept");
+        assert!(!conn.retired_attempts.contains_key(&successor_attempt));
+        assert!(matches!(
+            conn.adopt_direct(pid, successor, "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+        assert_eq!(
+            conn.links[pid].expected_secret,
+            Some(("dev".to_string(), "new-secret".to_string())),
+            "the revoked secret was restored instead of the current binding"
+        );
+    }
+
+    /// The fleet rendezvous secret is shared. Forgetting sibling A retires only
+    /// A's exact attempt; B and the shared secret remain untouched.
+    #[tokio::test]
+    async fn fleet_sibling_attempts_are_isolated_by_pid() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let a_pid = "sid-fleet-a";
+        let b_pid = "sid-fleet-b";
+        let a_attempt = net::AttemptId::next();
+        let b_attempt = net::AttemptId::next();
+        let mut a = direct_pending_with(a_attempt, ("fleet", "fleet-rv"));
+        a.fleet = true;
+        a.auth = DirectAuth::fleet(8);
+        let mut b = direct_pending_with(b_attempt, ("fleet", "fleet-rv"));
+        b.fleet = true;
+        b.auth = DirectAuth::fleet(9);
+        conn.direct_pending.insert(a_pid.into(), a);
+        conn.direct_pending.insert(b_pid.into(), b);
+        let mut dropped = HashSet::new();
+        dropped.insert("device-secret".to_string());
+        conn.invalidate_peers(&[(a_pid.into(), "sib-a".into())], &dropped);
+        assert!(!conn.direct_pending.contains_key(a_pid));
+        assert!(conn.direct_pending.contains_key(b_pid), "sibling B was revoked");
+        assert!(!conn.revoked_bindings.contains("fleet-rv"));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let b_transport: Arc<dyn Transport> = Rec::new("fleet-b", &log);
+        if let Some(pending) = conn.direct_pending.get_mut(b_pid) {
+            pending.attempt = b_transport.attempt_id().unwrap();
+        }
+        assert!(matches!(
+            conn.adopt_direct(b_pid, b_transport, "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+    }
+
+    /// A revoked binding is refused by the final adoption gate before any link
+    /// mutation; the serving Arc, generation, active slot, and pending survive.
+    #[tokio::test]
+    async fn revoked_binding_is_rejected_before_adoption_mutation() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-adopt-revoked";
+        let serving: Arc<dyn Transport> = Rec::new("serving", &log);
+        let mut link = direct_link(pid, "dev", "dev", serving.clone());
+        link.generation = 7;
+        conn.links.insert(pid.into(), link);
+        conn.active = Some(pid.into());
+        let incoming: Arc<dyn Transport> = Rec::new("incoming", &log);
+        let attempt = incoming.attempt_id().unwrap();
+        let mut pending = direct_pending_with(attempt, ("dev", "revoked-secret"));
+        pending.auth = DirectAuth::device(8, "dev", "revoked-secret");
+        conn.direct_pending.insert(pid.into(), pending);
+        conn.revoked_bindings.insert("revoked-secret".into());
+        assert!(matches!(
+            conn.adopt_direct(pid, incoming.clone(), "direct-quic"),
+            DirectAdoption::Rejected
+        ));
+        assert!(incoming.is_dead());
+        let link = &conn.links[pid];
+        assert!(Arc::ptr_eq(link.transport.as_ref().unwrap(), &serving));
+        assert_eq!(link.generation, 7);
+        assert!(conn.is_active(pid));
+        assert!(conn.direct_pending.contains_key(pid));
+    }
+
+    /// A revoked or retired upgrade standby is refused before relay commitment,
+    /// active state, serving link, probe, or pending can be mutated.
+    #[tokio::test]
+    async fn revoked_or_retired_upgrade_is_rejected_pre_mutation() {
+        for retired in [false, true] {
+            let (mut conn, _far, _rx) = test_conn().await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = if retired { "sid-upgrade-retired" } else { "sid-upgrade-revoked" };
+            let serving: Arc<dyn Transport> = Rec::new("serving", &log);
+            let mut link = direct_link(pid, "dev", "dev", serving.clone());
+            link.generation = 7;
+            link.expected_secret = Some(("dev".into(), "old-secret".into()));
+            conn.links.insert(pid.into(), link);
+            conn.active = Some(pid.into());
+            conn.resil.relay_committed.insert(pid.into());
+            let incoming: Arc<dyn Transport> = Rec::new("incoming", &log);
+            let attempt = incoming.attempt_id().unwrap();
+            let mut pending = direct_pending_with(attempt, ("dev", "old-secret"));
+            pending.auth = DirectAuth::device(8, "dev", "old-secret");
+            conn.direct_pending.insert(pid.into(), pending);
+            let mut probe = UpgradeProbe::armed();
+            probe.token = Some(attempt);
+            probe.auth = Some(DirectAuth::device(8, "dev", "old-secret"));
+            conn.resil.upgrade_probe.insert(pid.into(), probe);
+            if retired {
+                conn.retired_attempts.insert(
+                    attempt,
+                    RetiredAttempt { pid: pid.into(), at: Instant::now() },
+                );
+            } else {
+                conn.revoked_bindings.insert("old-secret".into());
+            }
+            conn.perform_upgrade(pid, incoming.clone(), "direct-quic").await;
+            assert!(incoming.is_dead());
+            let link = &conn.links[pid];
+            assert!(Arc::ptr_eq(link.transport.as_ref().unwrap(), &serving));
+            assert_eq!(link.generation, 7);
+            assert!(conn.is_active(pid));
+            assert!(conn.resil.relay_committed.contains(pid));
+            assert!(conn.resil.upgrade_probe.contains_key(pid));
+            assert!(conn.direct_pending.contains_key(pid));
+        }
+    }
+
     /// A source event forwarded while its link was current must be rejected if
     /// the same pid is replaced before dequeue/dispatch (final-handler check).
     #[tokio::test]
@@ -9738,6 +10327,7 @@ mod warm_identity_tests {
             source,
             PendingSource {
                 pid: pid.into(),
+                attempt: None,
                 at: Instant::now(),
                 events: std::collections::VecDeque::new(),
                 bytes: 0,
