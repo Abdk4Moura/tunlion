@@ -103,10 +103,8 @@ happy() {
   stop_host
   if grep -aq '"secret"' "$DA/devices.json" && grep -aq '"secret"' "$DB/devices.json"; then ok "both sides stored a pair secret"; else bad "pair secret missing"; fi
   # The same pair secret is what `up` and `send` consume.
-  asA env TUNLION_LOG=debug TUNLION_NAME=boxa "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/upA.log" 2>&1 &
-  echo $! > "$WORK/upA.pid"
-  asB env TUNLION_LOG=debug TUNLION_NAME=boxb "$BIN" --server "$SERVER" up --dir "$WORK/Bdrop" >"$WORK/upB.log" 2>&1 &
-  echo $! > "$WORK/upB.pid"
+  asA env TUNLION_LOG=debug TUNLION_NAME=boxa "$BIN" --server "$SERVER" up --detach --dir "$WORK/Adrop" >"$WORK/upA.log" 2>&1
+  asB env TUNLION_LOG=debug TUNLION_NAME=boxb "$BIN" --server "$SERVER" up --detach --dir "$WORK/Bdrop" >"$WORK/upB.log" 2>&1
   local line=""
   for _ in $(seq 1 60); do
     line=$(asA timeout 5 "$BIN" reach boxb --timeout 2 2>&1 | grep 'pong via' || true)
@@ -121,7 +119,8 @@ happy() {
   else
     bad "send over the paired secret failed"
   fi
-  for p in "$WORK/upA.pid" "$WORK/upB.pid"; do kill "$(cat "$p")" 2>/dev/null; done
+  asA "$BIN" down >/dev/null 2>&1 || true
+  asB "$BIN" down >/dev/null 2>&1 || true
 }
 
 wrong_code() {

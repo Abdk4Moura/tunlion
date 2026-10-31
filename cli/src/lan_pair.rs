@@ -78,9 +78,7 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
     let deadline = Instant::now() + crate::pair_code::CEREMONY_BUDGET;
 
     let msg = cer.take_msg_payload().ok_or_else(|| anyhow!("pairing ceremony did not produce an element"))?;
-    eprintln!("PAIRDBG {role}: sending element to {}", link.remote);
     pair_write(&mut link.send, &msg).await?;
-    eprintln!("PAIRDBG {role}: element sent");
 
     let mut sent_confirm = false;
     let mut sent_name = false;
@@ -133,7 +131,6 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
         }
 
         let frame = pair_read(&mut link.recv).await.context("pairing frame")?;
-        eprintln!("PAIRDBG {role}: got frame {}", frame_type(&frame));
         let kind = frame_type(&frame);
         if kind.is_empty() || !FRAME_TYPES.contains(&kind) {
             bail!("pairing REFUSED: unsupported frame type '{}'", if kind.is_empty() { "(missing)" } else { kind });
