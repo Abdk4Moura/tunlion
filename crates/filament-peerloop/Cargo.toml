@@ -112,6 +112,7 @@ filament-proto = { package = "tunlion-proto", path = "../filament-proto", versio
 filament-signal = { package = "tunlion-signal", path = "../filament-signal", version = "0.1.0" }
 filament-transfer = { package = "tunlion-transfer", path = "../filament-transfer", version = "0.1.0" }
 filament-transport = { package = "tunlion-transport", path = "../filament-transport", version = "0.1.1" }
+tunlion-lan = { path = "../tunlion-lan", version = "0.1.0" }
 ring = "0.17"
 getrandom = "0.2"
 # The same owner-only atomic writer the CLI's store used. The store module's

@@ -28,6 +28,13 @@ release build failed and nothing was published under it.
   lease (`TUNLION_LEASE`, 6 hours by default). The owner removes a runner when
   its lease ends, after 15 minutes offline, or when it runs `tunlion down`.
 - crates.io: `cargo install --locked tunlion`.
+- Paired devices and fleet siblings on the same network find each other
+  directly: presence beacons carry no device name or key, the existing
+  authenticated handshake still decides who the peer is, and the address is
+  remembered and retried on later links beside signaling. `tunlion doctor`
+  shows the `lan` row and `--json` carries it. `tunlion set network.transports
+  direct,relay` turns discovery off; `tunlion set network.lan-skip
+  eth1,10.20.0.0/16` opts interfaces out.
 
 ### Changed
 

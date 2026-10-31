@@ -1168,7 +1168,33 @@ async fn recv_run(
     // so this is only exercised by the daemon (`up`/`up --dir`).
     // The daemon waits for the network instead of exiting (see
     // `connect_signaling_patiently`); a one-shot receive still fails fast.
-    let mut sio = if daemon {
+    // Local discovery (docs/protocol/local-discovery.md): with it on, the
+    // daemon does not wait for the server. It serves paired devices on any
+    // shared or private network meanwhile, and the self-heal loop below keeps
+    // re-dialing the server without blocking anything.
+    let lan_on = daemon && filament_transport::lan::enabled(&transport_context);
+    let mut start_offline = false;
+    let mut sio = if lan_on {
+        if !(server.starts_with("http://") || server.starts_with("https://")) {
+            anyhow::bail!("--server must be an http:// or https:// URL, got '{server}'");
+        }
+        match tokio::time::timeout(Duration::from_secs(4), net::connect_signaling(&transport_context, server, tx.clone())).await {
+            Ok(Ok(c)) => c,
+            other => {
+                let why = match other {
+                    Ok(Err(e)) => format!("{e:#}"),
+                    _ => "no answer in 4s".to_string(),
+                };
+                log.say(&format!(
+                    "  {} waiting for network: can't reach the tunlion server yet; retrying, and serving paired devices on the local network meanwhile",
+                    log.paint(Tone::Warn, "!")
+                ));
+                log.debug(&format!("  signaling connect failed at start: {why}"));
+                start_offline = true;
+                filament_signal::Client::offline().await?
+            }
+        }
+    } else if daemon {
         crate::recv::events::connect_signaling_patiently(
             &transport_context,
             server,
@@ -1528,6 +1554,18 @@ async fn recv_run(
         // same body runs with no screen at all (a library consumer, a journal).
         .with_presentation(ports.present.clone()),
     );
+    if lan_on {
+        let keys_host = host.clone();
+        let keys: std::sync::Arc<dyn Fn() -> Vec<filament_transport::lan::LanKey> + Send + Sync> =
+            std::sync::Arc::new(move || crate::lan_glue::keys(keys_host.as_ref()));
+        let opts = filament_transport::lan::Options { serve: true, skip: filament_transport::lan::skip(&transport_context) };
+        match filament_transport::lan::LanService::start(&host.config_dir(), opts, keys, tx.clone()).await {
+            Ok(svc) => conn.lan = Some(svc),
+            Err(e) => log.say(&log.paint(Tone::Warn, &format!("  local discovery off: {e:#}"))),
+        }
+    }
+    let lan_started = Instant::now();
+    let mut last_lan_dial: Option<Instant> = None;
     // WARM-HOLD: load configured warm-peers at daemon startup
     if daemon {
         conn.load_warm_peers_config();
@@ -2013,6 +2051,21 @@ async fn recv_run(
         health.note_serving();
         host.report_signaling(health.snapshot_json());
     }
+    // A daemon that started without the server is down from the first tick:
+    // the ladder re-dials it in the background.
+    if start_offline && signaling_self_heal {
+        let now = Instant::now();
+        signaling_down_since = Some(now);
+        signaling_up_since = None;
+        last_reconnect_try = now;
+        reconnect_wait = Duration::from_secs(1);
+        health.note_down("unreachable at start");
+        host.report_signaling(health.snapshot_json());
+    }
+    // The re-dial runs in its own task so a server that drops packets (a
+    // connect that takes its whole timeout) never stalls this loop: links,
+    // the control socket and local discovery keep being served meanwhile.
+    let mut reconnect_task: Option<tokio::task::JoinHandle<anyhow::Result<filament_signal::Client>>> = None;
     let mut last_watchdog = Instant::now();
     // Link self-heal cadence (the multi-minute-outage fix, #3). A transport that
     // died past the QUIC idle timeout lingers in `links` as a zombie and SUPPRESSES
@@ -3082,7 +3135,10 @@ async fn recv_run(
             // NOT torn down, they ride independent WebRTC/QUIC transports and
             // keep flowing across the cosmetic signaling reconnect (the #28
             // contract).
-            if signaling_down_since.is_some() && last_reconnect_try.elapsed() >= reconnect_wait {
+            if signaling_down_since.is_some()
+                && reconnect_task.is_none()
+                && last_reconnect_try.elapsed() >= reconnect_wait
+            {
                 last_reconnect_try = Instant::now();
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
                 reconnect_wait = signaling_health::reconnect_delay(
@@ -3092,7 +3148,15 @@ async fn recv_run(
                 // Drop the old client (no-op if already gone). Its close, when
                 // it lands, carries the old id and is ignored above.
                 let _ = sio.disconnect().await;
-                match net::reconnect_signaling(&transport_context, server, tx.clone()).await {
+                let (ctx, srv, tx2) = (transport_context.clone(), server.to_string(), tx.clone());
+                reconnect_task = Some(tokio::spawn(async move { net::reconnect_signaling(&ctx, &srv, tx2).await }));
+            }
+            if reconnect_task.as_ref().is_some_and(|t| t.is_finished()) {
+                let joined = match reconnect_task.take() {
+                    Some(t) => t.await.unwrap_or_else(|e| Err(anyhow::anyhow!("reconnect task: {e}"))),
+                    None => Err(anyhow::anyhow!("no reconnect task")),
+                };
+                match joined {
                     Ok(new_sio) => {
                         sio = new_sio;
                         cleanup.signaling = Some(sio.clone());
@@ -3381,6 +3445,37 @@ async fn recv_run(
         if daemon && last_mount_check.elapsed() >= Duration::from_secs(30) {
             last_mount_check = Instant::now();
             ports.daemon.mount_health_tick(host.as_ref()).await;
+        }
+
+        // Local discovery: dial remembered addresses of paired devices we have
+        // no link to, for as long as the server is unreachable, and at start
+        // (until 40 s) for any device signaling has not linked within the
+        // online grace. Every 15 s.
+        if conn.lan.is_some()
+            && last_lan_dial.map_or(lan_started.elapsed() >= Duration::from_millis(300), |t| t.elapsed() >= Duration::from_secs(15))
+        {
+            last_lan_dial = Some(Instant::now());
+            if let Some(l) = conn.lan.as_ref() {
+                l.write_state(&host.config_dir());
+            }
+            let offline = signaling_down_since.is_some();
+            let since = lan_started.elapsed();
+            if filament_transport::lan::may_dial(offline, since) && (offline || since < Duration::from_secs(40)) {
+                let devices = host.devices_load();
+                let own = lan_ownership(&ports, l3.as_ref(), &devices).await;
+                let mut missing = 0;
+                for (n, sec) in &devices {
+                    if !conn.has_link_to(n) {
+                        missing += 1;
+                        conn.lan_dial(n, sec, false, &[], &own);
+                    }
+                }
+                if offline && missing > 0 {
+                    if let Some(l) = conn.lan.as_ref() {
+                        l.query_soon();
+                    }
+                }
+            }
         }
 
         // WARM-HOLD: periodically check for warm peers that need connections.
@@ -4895,6 +4990,22 @@ async fn recv_run(
             }
             // rung-1: authenticated direct-QUIC won the race, adopt as a
             // pre-trusted Link, then funnel into the normal ChannelReady handler.
+            Ev::Lan(e) => match e {
+                filament_transport::lan::LanEvent::Found { name, addr } => {
+                    if filament_transport::lan::may_dial(signaling_down_since.is_some(), lan_started.elapsed()) && !conn.has_link_to(&name) {
+                        let devices = host.devices_load();
+                        if let Some((n, sec)) = devices.iter().find(|(n, _)| n.eq_ignore_ascii_case(&name)).cloned() {
+                            let own = lan_ownership(&ports, l3.as_ref(), &devices).await;
+                            conn.lan_dial(&n, &sec, false, &[addr], &own);
+                        }
+                    }
+                }
+                e @ filament_transport::lan::LanEvent::Linked { .. } => {
+                    crate::lan_glue::on_linked(conn, &tx, e, log.as_ref());
+                }
+                // Phase 2 (pairing nearby) consumes this.
+                filament_transport::lan::LanEvent::PairingNearby { .. } => {}
+            },
             Ev::DirectReady(pid, t, route) => {
                 let tkey = conn
                     .direct_pending
@@ -4915,7 +5026,7 @@ async fn recv_run(
                         }
                     }
                 }
-                if let Some(k) = tkey {
+                if let Some(k) = tkey.filter(|_| route != filament_transport::lan::ROUTE_LAN) {
                     conn.spawn_direct_workers(&pid, &t, k);
                 }
                 // A link on a brokered meeting place: adoption just copied the
@@ -5084,6 +5195,12 @@ async fn recv_run(
                 let _ = t
                     .send_control(&json!({ "type": "caps", "shell": l2_enabled }))
                     .await;
+                // Local discovery: every time a paired device links, by any
+                // route, tell it every address we have, so it can find us later
+                // with no server (spec section 8). Only to a proven identity.
+                if let (Some(svc), true) = (conn.lan.as_ref(), conn.link(&pid).is_some_and(|l| l.trusted && l.verified_name.is_some())) {
+                    let _ = t.send_control(&svc.hello_json()).await;
+                }
                 // L3 (serve_tun mesh): on a datagram-capable (direct) link, send a
                 // SIGNED announce of our overlay address, bound to THIS link's
                 // channel binding so it can't be replayed elsewhere. Both ends
@@ -5354,6 +5471,20 @@ async fn recv_run(
                 }
             }
             Ev::Control(pid, v) => match log_ctl_rx(&pid, v["type"].as_str(), log.as_ref()) {
+                // Local discovery hello: remember the peer's addresses and key.
+                // Only from a link whose identity is proven by its pair secret;
+                // a fleet link before its certificate, or a code link, is not.
+                Some(tunlion_lan::record::HELLO_TYPE) => {
+                    let who = conn.link(&pid).filter(|l| l.trusted).and_then(|l| l.verified_name.clone());
+                    match (conn.lan.as_ref(), who) {
+                        (Some(svc), Some(name)) if host.devices_load().iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) => {
+                            if svc.learn(&name, &v) {
+                                log.debug(&format!("lan: learned {name}'s addresses"));
+                            }
+                        }
+                        _ => log.debug(&format!("lan: hello from {pid} ignored (identity not proven)")),
+                    }
+                }
                 // The post-PAKE promotion's handoff: the sender asks us to move
                 // to the direct link at its frame boundary (crate::handoff).
                 Some("path-promote" | "path-promoted" | "path-declined" | "path-stay") => {
@@ -10894,4 +11025,26 @@ mod l3_start_state_tests {
             "ready"
         );
     }
+}
+
+
+/// Route ownership for the local-discovery guard: every paired device's
+/// recorded overlay addresses plus the overlay's live table.
+async fn lan_ownership(
+    ports: &RecvPorts,
+    l3: Option<&std::sync::Arc<dyn MeshTunnel>>,
+    devices: &[(String, String)],
+) -> crate::lan_glue::Ownership {
+    let stored: Vec<(String, Option<String>, Option<String>)> = devices
+        .iter()
+        .map(|(n, _)| {
+            let (v6, v4) = ports.store.devices_overlay(n);
+            (n.clone(), v6, v4)
+        })
+        .collect();
+    let live: Vec<(String, std::net::IpAddr)> = match l3 {
+        Some(m) => m.peers_with_transport().await.into_iter().map(|(n, ip, _)| (n, ip)).collect(),
+        None => Vec::new(),
+    };
+    crate::lan_glue::Ownership::build(stored, live)
 }

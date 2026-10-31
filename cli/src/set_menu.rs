@@ -30,7 +30,20 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
         &["shell", "shell-user", "shell-program", "sshd-overlay", "ssh.cert_ttl", "gate.settle_ms", "fleet.owner_grants"],
     ),
     ("Connections", &["relay", "server", "prefer", "avoid", "only", "auto-warm", "warm-max", "warm-peers"]),
-    ("Network", &["tun-addr", "l3-mode", "wireguard", "auto-proxy", "advertise-routes", "accept-routes", "route-snat"]),
+    (
+        "Network",
+        &[
+            "tun-addr",
+            "l3-mode",
+            "wireguard",
+            "auto-proxy",
+            "advertise-routes",
+            "accept-routes",
+            "route-snat",
+            "network.transports",
+            "network.lan-skip",
+        ],
+    ),
 ];
 
 // ------------------------------------------------------------------ gate --
