@@ -186,16 +186,20 @@ falls back to signaling.
 
 The carrier is one bidirectional QUIC stream of the same code ceremony frames
 (`CONTRACT.md`): a `u32` big-endian length followed by JSON, maximum 65536
-bytes per frame. The allowlist is `pake-msg`, `pake-confirm`,
-`identity-expose`, `identity-expose-ack`, `pair-name`, `lan-hello` and the
-post-store acknowledgement `pair-stored`
-(`{"type":"pair-name","v":1,"name":"..."}`, sent only after mutual
-confirmation; a display name, never authentication). `lan-hello` is the
+bytes per frame. The ceremony allowlist is `pake-msg`, `pake-confirm`,
+`identity-expose`, `identity-expose-ack`, `pair-name` and `lan-hello`.
+`pair-name` is `{"type":"pair-name","v":1,"name":"..."}`, sent only after mutual
+confirmation; it is a display name, never authentication. `lan-hello` is the
 section 8 hello, sent on the authenticated pairing link so a daemon that is
 already running learns the peer's presence key and addresses without a prior
-signaling link. `pair-stored` acknowledges that the sender persisted the pair;
-without it a side may say it saved locally but must not claim the peer saved. Unknown, oversized,
-truncated or out-of-order frames abort the ceremony.
+signaling link. Unknown, oversized, truncated or out-of-order frames abort the
+ceremony.
+
+`pair-stored` is a POST-CEREMONY acknowledgement on the same stream, outside
+the PAKE parser. It carries a fresh nonce and an `ack_of`; a side accepts it
+only after its own local persist. It is the peer's claim that it saved, not
+proof of remote durable storage; a side without a matching acknowledgement may
+say it saved locally but must not claim the peer saved.
 
 The confirmation MAC is bound to the QUIC session with a separate RFC 5705
 exporter label, `filament-pair-v1`. Both sides pass the exporter value hex with
