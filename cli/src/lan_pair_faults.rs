@@ -691,6 +691,9 @@ async fn silent_host() -> (u16, LanService, mpsc::Receiver<PairLink>, PathBuf) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bad_candidate_is_retried_then_the_right_host_succeeds() {
     let _guard = lock_test_config();
+    // Isolate device-certificate state like the production join-loop fixture;
+    // ambient certs otherwise leave the host awaiting an identity frame.
+    let _cfg = ConfigDir::new("bad-candidate-right-host");
 
     // A real candidate that is reachable but sends an out-of-phase frame.
     let mut bad = connected_pair().await;
