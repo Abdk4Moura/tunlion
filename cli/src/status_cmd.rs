@@ -810,6 +810,20 @@ pub(crate) async fn detach_up(daemon_argv: &[String]) -> Result<()> {
         },
         other => other,
     };
+    // With local discovery the daemon serves (control socket, ready edge)
+    // before it reaches the server, so "ready" alone no longer means
+    // connected. A daemon that says it is still reconnecting is not claimed to
+    // be serving (gate 21).
+    let outcome = match outcome {
+        DetachOutcome::Ready
+            if crate::daemon_health::signaling()
+                .await
+                .is_some_and(|s| s["state"].as_str() == Some("reconnecting")) =>
+        {
+            DetachOutcome::NotReadyYet
+        }
+        other => other,
+    };
     let tail = log_tail_since(&log_path, log_start, DETACH_LOG_LINES);
     match outcome {
         // Another `up` won the single-instance election at the same instant: a
@@ -858,7 +872,7 @@ pub(crate) async fn detach_up(daemon_argv: &[String]) -> Result<()> {
             // daemon retries by design rather than exit), so this is not a
             // failure, but it must not read as "serving" either.
             ui::say(&format!(
-                "  {} daemon started (pid {pid}) but is not connected yet; it keeps retrying in the background. Check with `tunlion status`. Output: {}",
+                "  {} daemon started (pid {pid}) but is not connected yet; it keeps retrying in the background (paired devices on the local network can still reach it). Check with `tunlion status`. Output: {}",
                 ui::paint(ui::Tone::Warn, "!"),
                 log_path.display()
             ));

@@ -3955,6 +3955,7 @@ dependencies = [
  "tar",
  "tokio",
  "tunlion-fleet",
+ "tunlion-lan",
  "tunlion-overlay",
  "tunlion-peerloop",
  "tunlion-proto",
@@ -4004,6 +4005,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunlion-lan"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "tunlion-overlay"
 version = "0.1.0"
 dependencies = [
@@ -4016,7 +4026,7 @@ dependencies = [
 
 [[package]]
 name = "tunlion-peerloop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4039,6 +4049,7 @@ dependencies = [
  "smoltcp",
  "tokio",
  "tunlion-fleet",
+ "tunlion-lan",
  "tunlion-overlay",
  "tunlion-proto",
  "tunlion-signal",
@@ -4058,7 +4069,7 @@ dependencies = [
 
 [[package]]
 name = "tunlion-signal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -4079,12 +4090,13 @@ version = "0.1.0"
 
 [[package]]
 name = "tunlion-transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
  "futures-util",
+ "libc",
  "quinn",
  "quinn-proto",
  "rcgen",
@@ -4095,6 +4107,7 @@ dependencies = [
  "socket2 0.5.10",
  "tokio",
  "tokio-rustls",
+ "tunlion-lan",
  "tunlion-signal",
  "webrtc",
 ]

@@ -78,6 +78,7 @@ pub mod identity;
 pub mod l2;
 #[cfg(feature = "l3")]
 pub mod l3;
+pub mod lan_glue;
 pub mod limits;
 pub mod link_manager;
 pub mod liveness;

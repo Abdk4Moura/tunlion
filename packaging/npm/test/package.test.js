@@ -1,5 +1,5 @@
 'use strict'
-// Packaging-shape tests for @abdk4moura/filament-cli. No network, no Rust, no
+// Packaging-shape tests for tunlion. No network, no Rust, no
 // postinstall: the launcher is exercised against a fake vendor binary.
 const assert = require('node:assert/strict')
 const { execFileSync, spawnSync } = require('node:child_process')

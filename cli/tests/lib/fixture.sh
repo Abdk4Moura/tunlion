@@ -115,6 +115,9 @@ fixture_cleanup() {
 start_backend() {
   for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
   sleep 1
+  # backend_start uses `exec`, so the recorded PID is `python app.py` itself
+  # and cleanup kills the process that owns the port and any inherited build
+  # lock descriptor (the helper also closes fd 3/fd 9 for the child only).
   backend_start "$CLI_DIR/../backend" "$PYV" "$WORK/backend.log" \
     PORT="$PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
     FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25

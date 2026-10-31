@@ -1,0 +1,19 @@
+# tunlion-lan: the local discovery protocol (docs/protocol/local-discovery.md)
+# as a small sans-IO core. Pure functions to encode, decode, derive and verify,
+# plus an `Engine` that turns time and received datagrams into actions. No
+# sockets, no async runtime, no peerloop types: the CLI daemon, the Android
+# app and a wasm build for the browser drive the same code through their own
+# adapters.
+[package]
+name = "tunlion-lan"
+version = "0.1.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/tunlion"
+description = "Server-free local discovery for tunlion: beacons, probes and remembered addresses"
+
+[dependencies]
+sha2 = "0.11.0"
+hex = "0.4"
+serde_json = "1.0.150"

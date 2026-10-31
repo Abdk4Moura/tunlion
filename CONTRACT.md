@@ -532,6 +532,37 @@ evaporate after 10 minutes.
 When `localHelper.available`, optionally show its `peers` as "found on your LAN
 (offline)". It's a presence hint from the native helper; absent by default.
 
+### Local discovery (`lan-hello`, beacons, the lan listener)
+
+Normative spec: `docs/protocol/local-discovery.md`; vectors:
+`crates/tunlion-lan/vectors/v1.json` (any client conforms by reproducing
+them). What a client must honour on the link and on the network:
+
+- **`lan-hello`** is a control frame sent once on every new link to a paired
+  device, by any route: `{"type":"lan-hello","v":1,"pk":<64 hex>,"port":<u16>,
+  "addrs":[{"ip","class"}]}`. A receiver accepts it only on a link whose
+  identity is proven by the pair secret, ignores unknown fields, skips entries
+  with an unknown class or a non-advertisable address, and treats an older
+  peer that never sends one as "nothing to remember". A daemon that does not
+  know the type drops it (unknown control types are ignored), so mixed builds
+  link as before.
+- **Beacons** are 34-byte datagrams on UDP 47820 (multicast `239.255.84.76` /
+  `ff02::7475:6e6c`, subnet broadcast, unicast replies) and the same bytes in
+  the `b=` TXT string of `_tunlion._udp.local`. They carry no name, key or
+  stable id. A recognized beacon is an address hint only.
+- **The lan listener** (UDP 47821 by default) is the direct-QUIC endpoint of
+  `direct.rs` (ALPN `filament-direct/1`, exporter MAC over the pair secret).
+  The dialer writes its tag first; the listener finds the secret by trying
+  each it holds and then answers. No identifier precedes the tag. The
+  observed-address exchange of the signaled path is not run on it.
+- **Route word**: a link made this way reports `route: "lan"` in `ping`/`reach`
+  and `devices --json`; the human forms are `lan, direct` and `online lan`.
+- **Off switch**: `network.transports` without `lan` means no datagram, no
+  listener, no remembered dial. Discovery is silent on an interface the user
+  listed in `network.lan-skip` and on a Windows Public network.
+- **Guard**: an address carried by our own link to X is never dialed for X
+  (route ownership, not interface name).
+
 ## Relationship frames
 
 Wire-visible pieces of the relationship model designed in

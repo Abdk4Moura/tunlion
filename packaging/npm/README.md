@@ -1,9 +1,9 @@
-# @abdk4moura/filament-cli
+# tunlion
 
 Send files and reach your devices, peer to peer. No upload, no account.
 
 ```sh
-npm i -g @abdk4moura/filament-cli
+npm i -g tunlion
 tunlion send video.mp4 --code
 # `tl` is installed as a shortcut for the same binary:
 tl send video.mp4 --code
