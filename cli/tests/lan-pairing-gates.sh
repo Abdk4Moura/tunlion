@@ -35,7 +35,11 @@ command -v ip >/dev/null || refuse "needs iproute2"
 
 NS=(lpA lpB)
 cleanup() {
-  $SUDO pkill -f "$WORK/" 2>/dev/null
+  # Explicit ownership only: never pkill a pattern, which could catch a lease
+  # daemon whose command line happens to share a path.
+  stop_host
+  asA "$BIN" down >/dev/null 2>&1 || true
+  asB "$BIN" down >/dev/null 2>&1 || true
   for n in "${NS[@]}"; do $SUDO ip netns del "$n" 2>/dev/null; done
   $SUDO ip link del lpa0 2>/dev/null; $SUDO ip link del lpb0 2>/dev/null
   if [ "${LAN_PAIR_KEEP:-0}" = "1" ]; then
