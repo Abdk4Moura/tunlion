@@ -42,22 +42,32 @@ const TIMEOUT = Number(process.env.RAW_TIMEOUT_MS || 12000);
   await page.exposeFunction('__rawSend', (data) => {
     socket.emit('signal', { to: daemon.id, data });
   });
-  socket.on('signal', async ({ data }) => {
-    try { await page.evaluate((d) => window.__rawRecv(d), data); } catch (_) {}
+  const inbox = [];
+  let recvReady = false;
+  socket.on('signal', async ({ from, data }) => {
+    console.log('[raw-recv]', from, data && data.type, data && data.description && data.description.type);
+    if (!recvReady) { inbox.push(data); return; }
+    try { await page.evaluate((d) => window.__rawRecv(d), data); } catch (e) { console.log('[raw-recv-error]', String(e).slice(0,200)); }
   });
-  const ready = page.evaluate(async ({ TIMEOUT }) => {
+
+  // Build the peer and define the receiver first; only then send the offer.
+  await page.evaluate(({ UID, TIMEOUT }) => {
     const pc = new RTCPeerConnection({ iceServers: [] });
     const dc = pc.createDataChannel('filament');
     const t0 = performance.now();
     const sent = [];
+    let descriptionSent = false;
+    const pendingCandidates = [];
+    const opened = new Promise((resolve, reject) => {
+      dc.onopen = () => resolve(performance.now() - t0);
+      setTimeout(() => reject(new Error('data channel did not open')), TIMEOUT);
+    });
     pc.onicecandidate = (e) => {
       if (!e.candidate) return;
+      const candidate = e.candidate.toJSON ? e.candidate.toJSON() : e.candidate;
+      if (!descriptionSent) { pendingCandidates.push(candidate); return; }
       sent.push('candidate');
-      window.__rawSend({
-        type: 'candidate',
-        uid: 'raw-browser-uid',
-        candidate: e.candidate.toJSON ? e.candidate.toJSON() : e.candidate,
-      });
+      window.__rawSend({ type: 'candidate', uid: UID, candidate });
     };
     window.__rawRecv = async (data) => {
       if (!data) return;
@@ -66,16 +76,27 @@ const TIMEOUT = Number(process.env.RAW_TIMEOUT_MS || 12000);
         try { await pc.addIceCandidate(data.candidate); } catch (_) {}
       }
     };
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    sent.push('description');
-    window.__rawSend({ type: 'description', uid: 'raw-browser-uid', description: pc.localDescription });
-    const readyMs = await new Promise((resolve, reject) => {
-      dc.onopen = () => resolve(performance.now() - t0);
-      setTimeout(() => reject(new Error('data channel did not open')), TIMEOUT);
-    });
-    return { readyMs, sent, first: sent[0], hint: sent.includes('transport-hint') };
-  }, { TIMEOUT });
+    window.__rawOffer = async () => {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      descriptionSent = true;
+      sent.push('description');
+      console.log('[raw-send] description');
+      window.__rawSend({ type: 'description', uid: UID, description: pc.localDescription });
+      for (const candidate of pendingCandidates.splice(0)) {
+        sent.push('candidate');
+        window.__rawSend({ type: 'candidate', uid: UID, candidate });
+      }
+      const readyMs = await opened;
+      return { readyMs, sent, first: sent[0], hint: sent.includes('transport-hint') };
+    };
+    window.__rawRecvReady = true;
+  }, { UID, TIMEOUT });
+  recvReady = true;
+  for (const data of inbox.splice(0)) {
+    await page.evaluate((d) => window.__rawRecv(d), data);
+  }
+  const ready = page.evaluate(() => window.__rawOffer());
 
   const result = await ready;
   await browser.close();

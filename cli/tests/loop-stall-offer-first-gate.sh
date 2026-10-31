@@ -11,6 +11,9 @@ SERVER="http://127.0.0.1:$PORT"
 PYV="${TUNLION_TEST_VENV:-python3}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-offer.XXXXXX")"
 DA="$WORK/alpha"
+# Test-only: no daemon may adopt this raw sender from the server's discovery
+# push. The raw client still receives known-peer to learn the daemon sid.
+export TUNLION_TEST_SUPPRESS_KNOWN_PEER=1
 source "$HERE/lib/fixture.sh"
 trap fixture_cleanup EXIT
 KNOWN_RED_ALLOW=()
