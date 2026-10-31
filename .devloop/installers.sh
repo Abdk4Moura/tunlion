@@ -45,9 +45,20 @@ mkdir -p "$ISO/home" "$ISO/prefix" "$ISO/config"
 export HOME="$ISO/home"
 export npm_config_prefix="$ISO/prefix"
 export PATH="$ISO/prefix/bin:$PATH"
-( cd "$ISO" && npm install -g tunlion@0.9.3 2>&1 | tee "$WORK/npm-install.log" )
-grep -q 'cli-v0.9.3' "$WORK/npm-install.log" || { echo "postinstall did not report cli-v0.9.3"; exit 1; }
-npm list -g --depth=0 2>/dev/null | grep -E 'tunlion@0\.9\.3' || { echo "installed npm version mismatch"; exit 1; }
+( cd "$ISO" && npm install -g --foreground-scripts tunlion@0.9.3 2>&1 | tee "$WORK/npm-install.log" )
+if grep -q 'cli-v0.9.3' "$WORK/npm-install.log"; then
+  echo "postinstall reported cli-v0.9.3"
+else
+  echo "postinstall output not shown by npm; verifying installed files instead"
+fi
+node -p "require('$ISO/prefix/lib/node_modules/tunlion/package.json').version" | tee "$WORK/npm-pkg-version.txt"
+grep -qx '0.9.3' "$WORK/npm-pkg-version.txt"
+test -x "$ISO/prefix/lib/node_modules/tunlion/vendor/tunlion" || { echo "vendor binary missing"; ls -l "$ISO/prefix/lib/node_modules/tunlion" ; exit 1; }
+if npm list -g --depth=0 2>/dev/null | grep -qE 'tunlion@0\.9\.3'; then
+  echo "npm list shows tunlion@0.9.3"
+else
+  echo "installed npm version mismatch"; npm list -g --depth=0 2>&1 | head -5; exit 1
+fi
 
 say "npm binary version, tl shortcut, help"
 tunlion --version | tee "$WORK/npm-version.txt"
