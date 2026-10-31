@@ -1780,7 +1780,7 @@ fn reader_task(
 /// reads would be a silent hang of its own), it just announces nothing.
 pub struct UnreadTransport {
     transport: Arc<dyn Transport>,
-    reader: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>>,
+    reader: std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>>>,
 }
 
 impl UnreadTransport {
@@ -1796,15 +1796,24 @@ impl UnreadTransport {
         ready: impl FnOnce(Arc<dyn Transport>) -> crate::net::Ev,
     ) {
         let _ = tx.send(ready(self.transport.clone()));
-        if let Some(reader) = self.reader.take() {
+        if let Some(reader) = self.take_reader() {
             tokio::spawn(reader);
         }
+    }
+
+    fn take_reader(
+        &mut self,
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>> {
+        self.reader
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 }
 
 impl Drop for UnreadTransport {
     fn drop(&mut self) {
-        if let Some(reader) = self.reader.take() {
+        if let Some(reader) = self.take_reader() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(reader);
             }
@@ -1829,7 +1838,7 @@ pub fn make_transport(
     attempt: Option<AttemptId>,
 ) -> Arc<dyn Transport> {
     let mut unread = make_transport_unread(peer_id, conn, send, recv, tx, answerer, ep, primary, attempt);
-    if let Some(reader) = unread.reader.take() {
+    if let Some(reader) = unread.take_reader() {
         tokio::spawn(reader);
     }
     unread.transport.clone()
@@ -1883,7 +1892,7 @@ pub fn make_transport_unread(
     });
     let reader: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> =
         Box::pin(reader);
-    UnreadTransport { transport, reader: Some(reader) }
+    UnreadTransport { transport, reader: std::sync::Mutex::new(Some(reader)) }
 }
 
 /// Mesh reuse: spawn a background task that accepts new incoming QUIC streams

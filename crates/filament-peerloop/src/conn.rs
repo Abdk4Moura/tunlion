@@ -902,7 +902,7 @@ pub struct BuildState {
     signal_bytes: usize,
     early: std::collections::VecDeque<Ev>,
     early_bytes: usize,
-    events_rx: mpsc::UnboundedReceiver<Ev>,
+    events_rx: std::sync::Mutex<mpsc::UnboundedReceiver<Ev>>,
     /// Binding this intent was prepared with (authoritative pair secret). Used
     /// only to decide whether a re-pair supersedes the in-flight intent.
     binding: Option<(String, String)>,
@@ -979,7 +979,13 @@ fn discard_built(built: BuiltPeer) {
 
 fn discard_pending_state(mut state: BuildState) {
     let early = std::mem::take(&mut state.early);
-    let queued: Vec<Ev> = std::iter::from_fn(|| state.events_rx.try_recv().ok()).collect();
+    let queued: Vec<Ev> = {
+        let rx = state
+            .events_rx
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    };
     for ev in early.into_iter().chain(queued) {
         let inner = match ev {
             Ev::Sourced { inner, .. } => *inner,
@@ -1010,9 +1016,15 @@ fn ev_weight(ev: &Ev) -> usize {
 /// previous link can enter this channel, so everything here is candidate-local.
 fn drain_candidate_events(state: &mut BuildState) -> bool {
     loop {
-        let ev = match state.events_rx.try_recv() {
-            Ok(ev) => ev,
-            Err(_) => return true,
+        let ev = {
+            let mut rx = state
+                .events_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            rx.try_recv().ok()
+        };
+        let Some(ev) = ev else {
+            return true;
         };
         let weight = ev_weight(&ev);
         if state.early.len() >= MAX_BUILD_EVENTS
@@ -1150,7 +1162,7 @@ pub struct RetiredIntent {
 /// by pid, and drained once per loop turn. It dies with its link.
 pub struct LinkEvents {
     pub generation: u32,
-    pub rx: mpsc::UnboundedReceiver<Ev>,
+    pub rx: std::sync::Mutex<mpsc::UnboundedReceiver<Ev>>,
 }
 
 /// Source-bound events from a standby/upgrade transport that is not adopted
@@ -1344,7 +1356,7 @@ pub struct Conn {
     pub builds: HashMap<String, BuildState>,
     pub build_deferred: std::collections::BTreeMap<String, (BuildPlan, Instant)>,
     pub build_tx: mpsc::UnboundedSender<BuildDone>,
-    pub build_rx: mpsc::UnboundedReceiver<BuildDone>,
+    pub build_rx: std::sync::Mutex<mpsc::UnboundedReceiver<BuildDone>>,
     /// Pair bindings and active intent captured by the caller before a build
     /// starts, applied only when the candidate is installed.
     pub pending_bindings: HashMap<String, (String, String)>,
@@ -1576,7 +1588,7 @@ impl Conn {
             builds: HashMap::new(),
             build_deferred: std::collections::BTreeMap::new(),
             build_tx,
-            build_rx,
+            build_rx: std::sync::Mutex::new(build_rx),
             pending_bindings: HashMap::new(),
             pending_active: HashSet::new(),
             cancelled_intents: HashMap::new(),
@@ -2882,7 +2894,7 @@ impl Conn {
                 signal_bytes,
                 early: std::collections::VecDeque::new(),
                 early_bytes: 0,
-                events_rx: candidate_rx,
+                events_rx: std::sync::Mutex::new(candidate_rx),
                 binding,
             },
         );
@@ -2910,7 +2922,11 @@ impl Conn {
             }
             let tx = self.tx.clone();
             if let Some(events) = self.link_events.get_mut(&pid) {
-                while let Ok(ev) = events.rx.try_recv() {
+                let mut rx = events
+                    .rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                while let Ok(ev) = rx.try_recv() {
                     let _ = tx.send(ev);
                 }
             }
@@ -2956,7 +2972,15 @@ impl Conn {
             self.drop_pending_source(source);
         }
         let mut applied = 0usize;
-        while let Ok(done) = self.build_rx.try_recv() {
+        loop {
+            let done = {
+                let mut rx = self
+                    .build_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                rx.try_recv().ok()
+            };
+            let Some(done) = done else { break; };
             match done {
                 BuildDone::Ready(built) => {
                     self.apply_built_peer(built);
@@ -3122,13 +3146,16 @@ impl Conn {
             return;
         }
         let early = std::mem::take(&mut state.early);
-        let candidate_rx = state.events_rx;
+        let candidate_rx = state
+            .events_rx
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let pending_active = self.pending_active.remove(&built.peer_id);
         self.install_built(built, early, state.signals, binding, pending_active);
         // The forwarder is owned by the link: pump_builds drains this receiver
         // only while the link still carries `generation`, and drop_link/
         // replacement removes it, discarding queued stale events.
-        self.link_events.insert(pid, LinkEvents { generation, rx: candidate_rx });
+        self.link_events.insert(pid, LinkEvents { generation, rx: std::sync::Mutex::new(candidate_rx) });
     }
 
     fn install_built(
@@ -9578,7 +9605,7 @@ mod warm_identity_tests {
             signal_bytes: 0,
             early: std::collections::VecDeque::new(),
             early_bytes: 0,
-            events_rx,
+            events_rx: std::sync::Mutex::new(events_rx),
             binding: None,
         }
     }
@@ -9588,7 +9615,7 @@ mod warm_identity_tests {
     fn build_state_with_tx(generation: u32) -> (BuildState, mpsc::UnboundedSender<Ev>) {
         let (tx, events_rx) = mpsc::unbounded_channel();
         let mut state = build_state(generation);
-        state.events_rx = events_rx;
+        state.events_rx = std::sync::Mutex::new(events_rx);
         (state, tx)
     }
 
@@ -10090,7 +10117,7 @@ mod warm_identity_tests {
         conn.links.insert(pid.to_string(), link);
         let (tx, events_rx) = mpsc::unbounded_channel();
         conn.link_events
-            .insert(pid.to_string(), LinkEvents { generation: 7, rx: events_rx });
+            .insert(pid.to_string(), LinkEvents { generation: 7, rx: std::sync::Mutex::new(events_rx) });
         tx.send(Ev::Control(pid.to_string(), json!({ "type": "ping" })))
             .unwrap();
         conn.pump_builds();
