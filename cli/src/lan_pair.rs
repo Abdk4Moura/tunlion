@@ -271,10 +271,9 @@ pub struct HostHandle {
 }
 
 impl HostHandle {
-    pub async fn shutdown(self) {
+    pub async fn shutdown(&mut self) {
         self.svc.shutdown().await;
         self.task.abort();
-        let _ = self.task.await;
     }
 }
 

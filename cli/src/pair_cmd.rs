@@ -876,7 +876,7 @@ pub(crate) async fn pair_cmd(
 
 pub(crate) async fn temporary_cmd(server: &str, spec: filament_peerloop::access::AccessSpec, relay: bool) -> Result<()> {
     spec.validate()?;
-    pair_with_purpose(server, None, None, None, relay, false, Vec::new(), None, true, Some(spec)).await
+    pair_with_purpose(server, None, None, None, relay, false, Vec::new(), None, true, Some(spec), false).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1029,7 +1029,11 @@ async fn pair_with_purpose(
                     ui::say(&ui::paint(ui::Tone::Dim, &format!("  server unreachable ({e:#}); trying the local network")));
                     return match &code {
                         Some(c) => crate::lan_pair::join_standalone(c, name, false).await,
-                        None => crate::lan_pair::host_standalone(my_words.clone(), my_nameplate.clone()).await,
+                        None => {
+                            let words = custom_words.clone().unwrap_or_else(crate::pake::words::mint_words);
+                            let np = preview_nameplate.clone().unwrap_or_else(crate::pake::words::mint_pair_nameplate);
+                            crate::lan_pair::host_standalone(words, np).await
+                        }
                     };
                 }
                 Err(e) => return Err(e),
