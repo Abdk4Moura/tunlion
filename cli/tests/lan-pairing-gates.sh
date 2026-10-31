@@ -80,7 +80,7 @@ code_of() { grep -aoE '[A-Za-z]+(-[A-Za-z]+)+-[0-9]{4,5}' "$1" | head -1 | tr 'A
 
 start_host() {
   local log="$1"; shift
-  asA env TUNLION_TRANSPORTS=lan "$BIN" --server "$SERVER" pair --nearby --word "brave otter" >"$log" 2>&1 &
+  asA env TUNLION_TRANSPORTS=lan "$BIN" --server "$SERVER" add --nearby --word "brave otter" >"$log" 2>&1 &
   echo $! > "$WORK/host.pid"
   for _ in $(seq 1 60); do grep -aq -- "-[0-9]" "$log" && return 0; sleep 0.25; done
   return 1
@@ -145,7 +145,7 @@ wrong_code() {
 denied() {
   say "lan pairing: network.transports without lan"
   init_pair || return
-  if asA env TUNLION_TRANSPORTS=direct,relay "$BIN" --server "$SERVER" pair --nearby --word "brave otter" >"$WORK/deny.log" 2>&1; then
+  if asA env TUNLION_TRANSPORTS=direct,relay "$BIN" --server "$SERVER" add --nearby --word "brave otter" >"$WORK/deny.log" 2>&1; then
     bad "pair --nearby succeeded with lan off"
   else
     ok "pair --nearby refused with lan off"
