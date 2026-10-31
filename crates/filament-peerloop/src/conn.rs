@@ -3501,6 +3501,31 @@ impl Conn {
     // budget. The whole thing is gated on `direct::direct_enabled()`, so with the
     // flag OFF none of this runs and the WebRTC path is byte-for-byte unchanged.
 
+    /// Remove a pending only when it is the expected attempt, transferring its
+    /// already-terminal producer handle to an await-only cleanup. Used when the
+    /// transport becomes the standby/link, so no tombstone is installed.
+    fn take_pending_for_adoption(
+        &mut self,
+        pid: &str,
+        expected: net::AttemptId,
+    ) -> Option<DirectPending> {
+        if self
+            .direct_pending
+            .get(pid)
+            .is_some_and(|pending| pending.attempt != expected)
+        {
+            return None;
+        }
+        let mut pending = self.direct_pending.remove(pid)?;
+        pending.cancel.store(true, Ordering::Relaxed);
+        if let Some(handle) = pending.race_task.take() {
+            tokio::spawn(async move {
+                let _ = handle.await;
+            });
+        }
+        Some(pending)
+    }
+
     /// Retire an attempt and enqueue its terminal-drain barrier only after the
     /// finite readiness producer is terminal.
     fn retire_attempt(
@@ -3713,8 +3738,10 @@ impl Conn {
         }
         if armed {
             self.abandon_promotion(pid);
-            self.promotions
-                .insert(pid.to_string(), PromoteState::new(role));
+            let attempt = self.direct_pending.get(pid).map(|pending| pending.attempt);
+            let mut state = PromoteState::new(role);
+            state.attempt = attempt;
+            self.promotions.insert(pid.to_string(), state);
             self.gate_for_promotion(pid);
         }
         Promotion::Retained
@@ -3776,7 +3803,14 @@ impl Conn {
             return;
         }
         self.start_direct_inner(pid, name, secret, DirectIntent::Probe)
-            .await
+            .await;
+        // Capture the upstream attempt BEFORE any readiness can arrive; the
+        // probe token is an authorization identity, never inferred from a ready.
+        if let Some(attempt) = self.direct_pending.get(pid).map(|pending| pending.attempt) {
+            if let Some(probe) = self.resil.upgrade_probe.get_mut(pid) {
+                probe.token = Some(attempt);
+            }
+        }
     }
 
     /// Ensure we have a TCP listener for local connections.
@@ -4422,7 +4456,7 @@ impl Conn {
                 self.retire_serving_link(pid);
             }
         }
-        let pend = self.direct_pending.remove(pid);
+        let pend = self.take_pending_for_adoption(pid, attempt);
         let tkey = pend
             .as_ref()
             .map(|pending| direct::transport_key(&pending.secret.1));
@@ -5695,22 +5729,62 @@ impl Conn {
             .links
             .get(pid)
             .map(|l| (l.trusted, l.principal_kind.clone()));
+        // Validate ownership BEFORE clearing relay state or dropping the serving
+        // link. A rejected/stale standby must leave the relay path intact.
+        if t.source_id().is_none() {
+            t.force_close();
+            return;
+        }
+        let Some(attempt) = t.attempt_id() else {
+            t.force_close();
+            return;
+        };
+        if let Some(existing) = self.links.get(pid) {
+            if existing.attempt == Some(attempt)
+                && existing
+                    .transport
+                    .as_ref()
+                    .is_some_and(|live| Arc::ptr_eq(live, &t))
+            {
+                return; // duplicate upgrade of the already-active link
+            }
+        }
+        let Some(expected_attempt) = self
+            .resil
+            .upgrade_probe
+            .get(pid)
+            .and_then(|probe| probe.token)
+        else {
+            t.force_close();
+            return;
+        };
+        if attempt != expected_attempt {
+            self.log.debug(&format!(
+                "tunlion: UPGRADE-REFUSED peer={pid}: standby attempt mismatch"
+            ));
+            t.force_close();
+            return;
+        }
+        if self
+            .direct_pending
+            .get(pid)
+            .is_some_and(|pending| pending.attempt != attempt)
+        {
+            t.force_close();
+            return;
+        }
         // Clear the relay commitment FIRST so the new direct link isn't treated as
         // a known-bad path and so a future stall can escalate cleanly again.
         self.resil.relay_committed.remove(pid);
         self.relay_only = false;
-        let expected_attempt = self.resil.upgrade_probe.get(pid).and_then(|probe| probe.token);
         self.resil.upgrade_probe.remove(pid);
-        self.direct_pending.remove(pid);
+        // Transfer the matching producer; never raw-remove another pending.
+        let _ = self.take_pending_for_adoption(pid, attempt);
         // Swap the verified direct transport into the link, dropping the relay
         // link/transport (drop_link tears down the WebRTC peer). adopt the new
         // transport via the same direct-link shape adopt_direct builds, but reusing
         // the existing identity so the session is preserved across the swap.
         self.drop_link(pid);
-        let Some(expected_attempt) = expected_attempt else {
-            t.force_close();
-            return;
-        };
         let adopted = self.adopt_direct_transport(pid, t.clone(), route, expected_attempt, known, carried);
         if adopted == DirectAdoption::Rejected {
             return;
@@ -5848,7 +5922,7 @@ impl Conn {
         if st.handed {
             return;
         }
-        if st.attempt.is_some_and(|held| held != attempt) {
+        if st.attempt != Some(attempt) {
             if let Some(source) = source {
                 self.pending_sources.remove(&source);
             }
@@ -5881,10 +5955,32 @@ impl Conn {
     /// ephemeral pending it needs cannot be reaped in between: adopting with no
     /// pending would be born trusted.
     fn promote_adopt_now(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
-        let Some(attempt) = t.attempt_id() else {
+        let Some(incoming) = t.attempt_id() else {
             t.force_close();
             return;
         };
+        let expected = self
+            .promotions
+            .get(pid)
+            .and_then(|state| state.attempt)
+            .or_else(|| self.direct_pending.get(pid).map(|pending| pending.attempt));
+        let Some(expected) = expected else {
+            t.force_close();
+            return;
+        };
+        if incoming != expected {
+            t.force_close();
+            return;
+        }
+        if self
+            .direct_pending
+            .get(pid)
+            .is_some_and(|pending| pending.attempt != expected)
+        {
+            t.force_close();
+            return;
+        }
+        let attempt = expected;
         let role = self
             .promotions
             .get(pid)
@@ -5972,6 +6068,23 @@ impl Conn {
         let Some((t, route)) = st.standby.clone() else {
             return;
         };
+        let Some(attempt) = t.attempt_id() else {
+            t.force_close();
+            return;
+        };
+        if t.source_id().is_none() || st.attempt != Some(attempt) {
+            t.force_close();
+            return;
+        }
+        if self.links.get(pid).is_some_and(|link| {
+            link.attempt == Some(attempt)
+                && link
+                    .transport
+                    .as_ref()
+                    .is_some_and(|live| Arc::ptr_eq(live, &t))
+        }) {
+            return; // duplicate of the already-active link
+        }
         st.handed = true;
         if let Some(s) = serving {
             tokio::spawn(async move {
@@ -6000,6 +6113,23 @@ impl Conn {
         let Some((t, route)) = st.standby.clone() else {
             return;
         };
+        let Some(attempt) = t.attempt_id() else {
+            t.force_close();
+            return;
+        };
+        if t.source_id().is_none() || st.attempt != Some(attempt) {
+            t.force_close();
+            return;
+        }
+        if self.links.get(pid).is_some_and(|link| {
+            link.attempt == Some(attempt)
+                && link
+                    .transport
+                    .as_ref()
+                    .is_some_and(|live| Arc::ptr_eq(live, &t))
+        }) {
+            return; // duplicate of the already-active link
+        }
         match st.answer.take() {
             Some(answer) if !answer.is_closed() => {
                 let _ = answer.send(Some(t.clone()));
@@ -6193,6 +6323,71 @@ impl Conn {
             t.force_close();
             return;
         };
+        // A post-PAKE promotion's winner rides this event too (it must not
+        // clobber the serving link any more than a probe's may). Validate its
+        // ownership BEFORE inserting a pending source or consuming pending state.
+        let promotion_branch = self.promotions.contains_key(pid)
+            || self.direct_pending.get(pid).is_some_and(|p| p.ephemeral && !p.probe);
+        if promotion_branch {
+            let Some(st) = self.promotions.get(pid) else {
+                t.force_close();
+                return;
+            };
+            if st.attempt != Some(attempt) {
+                t.force_close();
+                return;
+            }
+            if st.standby.as_ref().is_some_and(|(held, _)| Arc::ptr_eq(held, &t)) {
+                return; // duplicate held standby
+            }
+            self.pending_sources.insert(
+                source,
+                PendingSource {
+                    pid: pid.to_string(),
+                    at: Instant::now(),
+                    events: std::collections::VecDeque::new(),
+                    bytes: 0,
+                },
+            );
+            self.on_promote_standby(pid, t, route);
+            return;
+        }
+        // Probe branch: require an armed probe and matching token BEFORE taking
+        // any pending or inserting a source entry.
+        let (probe_token, duplicate_held) = match self.resil.upgrade_probe.get(pid) {
+            Some(up) => (
+                up.token,
+                up.standby
+                    .as_ref()
+                    .is_some_and(|held| Arc::ptr_eq(held, &t)),
+            ),
+            None => {
+                t.force_close();
+                return;
+            }
+        };
+        let Some(probe_token) = probe_token else {
+            t.force_close();
+            return;
+        };
+        if probe_token != attempt {
+            t.force_close();
+            return;
+        }
+        if duplicate_held {
+            return;
+        }
+        let Some(pending) = self.direct_pending.get(pid) else {
+            t.force_close();
+            return;
+        };
+        if pending.attempt != attempt {
+            self.log.debug(&format!(
+                "tunlion: STANDBY-REFUSED peer={pid}: standby attempt does not match pending"
+            ));
+            t.force_close();
+            return;
+        }
         self.pending_sources.insert(
             source,
             PendingSource {
@@ -6202,36 +6397,17 @@ impl Conn {
                 bytes: 0,
             },
         );
-        // A post-PAKE promotion's winner rides this event too (it must not
-        // clobber the serving link any more than a probe's may).
-        if self.promotions.contains_key(pid)
-            || self.direct_pending.get(pid).is_some_and(|p| p.ephemeral && !p.probe)
-        {
-            self.on_promote_standby(pid, t, route);
-            return;
-        }
-        // Consume any probe DirectPending so expired_direct doesn't reap/backoff it
-        // out from under the verify (the race already won). Validate ownership
-        // before consuming it.
-        if let Some(pending) = self.direct_pending.get(pid) {
-            if pending.attempt != attempt {
-                self.log.debug(&format!(
-                    "tunlion: STANDBY-REFUSED peer={pid}: standby attempt does not match pending"
-                ));
-                self.pending_sources.remove(&source);
-                t.force_close();
-                return;
-            }
-        }
-        self.direct_pending.remove(pid);
+        let _ = self.take_pending_for_adoption(pid, attempt);
         let Some(up) = self.resil.upgrade_probe.get_mut(pid) else {
-            // No armed probe, the transport is unowned; dropping it tears it down.
-            self.pending_sources.remove(&source);
+            t.force_close();
             return;
         };
-        if up.standby.is_some() {
-            if up.token != Some(attempt) {
-                self.pending_sources.remove(&source);
+        if up.token.is_some_and(|token| token != attempt) {
+            t.force_close();
+            return;
+        }
+        if let Some(held) = &up.standby {
+            if !Arc::ptr_eq(held, &t) {
                 t.force_close();
             }
             return; // already verifying a standby; ignore the duplicate.
@@ -8556,7 +8732,7 @@ mod warm_identity_tests {
         name: &'static str,
         log: Arc<std::sync::Mutex<Vec<String>>>,
         alive: AtomicBool,
-        source: net::SourceId,
+        source: Option<net::SourceId>,
         attempt: net::AttemptId,
     }
     impl Rec {
@@ -8565,8 +8741,21 @@ mod warm_identity_tests {
                 name,
                 log: log.clone(),
                 alive: AtomicBool::new(true),
-                source: net::SourceId::next(),
+                source: Some(net::SourceId::next()),
                 attempt: net::AttemptId::next(),
+            })
+        }
+        fn without_source(
+            name: &'static str,
+            log: &Arc<std::sync::Mutex<Vec<String>>>,
+            attempt: net::AttemptId,
+        ) -> Arc<Self> {
+            Arc::new(Rec {
+                name,
+                log: log.clone(),
+                alive: AtomicBool::new(true),
+                source: None,
+                attempt,
             })
         }
     }
@@ -8590,11 +8779,14 @@ mod warm_identity_tests {
         fn is_dead(&self) -> bool {
             !self.alive.load(Ordering::Relaxed)
         }
+        fn force_close(&self) {
+            self.alive.store(false, Ordering::Relaxed);
+        }
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
         fn source_id(&self) -> Option<net::SourceId> {
-            Some(self.source)
+            self.source
         }
         fn attempt_id(&self) -> Option<net::AttemptId> {
             Some(self.attempt)
@@ -8638,8 +8830,10 @@ mod warm_identity_tests {
                 cancel: Arc::new(AtomicBool::new(false)),
             },
         );
-        conn.promotions
-            .insert(pid.to_string(), PromoteState::new(role));
+        let attempt = conn.direct_pending.get(pid).map(|pending| pending.attempt);
+        let mut state = PromoteState::new(role);
+        state.attempt = attempt;
+        conn.promotions.insert(pid.to_string(), state);
         conn.gate_for_promotion(pid);
     }
 
@@ -9668,6 +9862,219 @@ mod warm_identity_tests {
             DirectAdoption::Rejected
         ));
         assert!(!conn.links.contains_key(pid));
+    }
+
+    /// A rejected upgrade must not destroy the serving relay link, active flag,
+    /// probe token, pending metadata, or relay commitment.
+    #[tokio::test]
+    async fn upgrade_mismatch_preserves_serving_state() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-upgrade-mismatch";
+        let serving: Arc<dyn Transport> = Rec::new("serving", &log);
+        let mut link = direct_link(pid, "peer", "peer", serving.clone());
+        link.generation = 7;
+        let pending_attempt = net::AttemptId::next();
+        link.attempt = Some(pending_attempt);
+        conn.links.insert(pid.into(), link);
+        conn.active = Some(pid.into());
+        conn.resil.relay_committed.insert(pid.into());
+        let pending = direct_pending_with(pending_attempt, ("peer", "keep"));
+        conn.direct_pending.insert(pid.into(), pending);
+        let mut probe = UpgradeProbe::armed();
+        probe.token = Some(pending_attempt);
+        conn.resil.upgrade_probe.insert(pid.into(), probe);
+        let incoming: Arc<dyn Transport> = Rec::new("incoming", &log);
+        conn.perform_upgrade(pid, incoming.clone(), "direct-quic").await;
+        assert!(conn.links[pid]
+            .transport
+            .as_ref()
+            .is_some_and(|live| Arc::ptr_eq(live, &serving)));
+        assert_eq!(conn.links[pid].generation, 7);
+        assert!(conn.is_active(pid));
+        assert!(conn.resil.relay_committed.contains(pid));
+        assert_eq!(
+            conn.direct_pending.get(pid).map(|p| p.attempt),
+            Some(pending_attempt)
+        );
+        assert_eq!(
+            conn.resil.upgrade_probe.get(pid).and_then(|p| p.token),
+            Some(pending_attempt)
+        );
+        assert!(incoming.is_dead(), "the rejected standby must be closed");
+    }
+
+    /// A matching attempt with no source identity still fails before any
+    /// destructive upgrade step.
+    #[tokio::test]
+    async fn upgrade_missing_source_preserves_serving_state() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-upgrade-nosource";
+        let serving: Arc<dyn Transport> = Rec::new("serving", &log);
+        let mut link = direct_link(pid, "peer", "peer", serving.clone());
+        link.generation = 7;
+        let try_attempt = net::AttemptId::next();
+        link.attempt = Some(try_attempt);
+        conn.links.insert(pid.into(), link);
+        conn.active = Some(pid.into());
+        conn.resil.relay_committed.insert(pid.into());
+        conn.direct_pending.insert(
+            pid.into(),
+            direct_pending_with(try_attempt, ("peer", "keep")),
+        );
+        let mut probe = UpgradeProbe::armed();
+        probe.token = Some(try_attempt);
+        conn.resil.upgrade_probe.insert(pid.into(), probe);
+        let incoming: Arc<dyn Transport> =
+            Rec::without_source("incoming", &log, try_attempt);
+        conn.perform_upgrade(pid, incoming.clone(), "direct-quic").await;
+        assert!(conn.links[pid]
+            .transport
+            .as_ref()
+            .is_some_and(|live| Arc::ptr_eq(live, &serving)));
+        assert_eq!(conn.links[pid].generation, 7);
+        assert!(conn.is_active(pid));
+        assert!(conn.resil.relay_committed.contains(pid));
+        assert_eq!(
+            conn.direct_pending.get(pid).map(|p| p.attempt),
+            Some(try_attempt)
+        );
+        assert_eq!(
+            conn.resil.upgrade_probe.get(pid).and_then(|p| p.token),
+            Some(try_attempt)
+        );
+        assert!(incoming.is_dead());
+    }
+
+    /// A matching pending with no armed probe must not be consumed by standby
+    /// staging.
+    #[tokio::test]
+    async fn standby_without_probe_preserves_pending() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-standby-noprobe";
+        let attempt = net::AttemptId::next();
+        conn.direct_pending.insert(
+            pid.into(),
+            direct_pending_with(attempt, ("peer", "keep")),
+        );
+        let incoming: Arc<dyn Transport> = Rec::new("incoming", &log);
+        let source = incoming.source_id().unwrap();
+        conn.stash_upgrade_standby(pid, incoming.clone(), "direct-quic");
+        let pending = conn.direct_pending.get(pid).expect("pending was consumed");
+        assert_eq!(pending.attempt, attempt);
+        assert_eq!(pending.secret, ("peer".to_string(), "keep".to_string()));
+        assert!(!conn.pending_sources.contains_key(&source));
+        assert!(incoming.is_dead());
+    }
+
+    /// A probe whose token does not match the pending must not consume pending
+    /// metadata or replace the probe token.
+    #[tokio::test]
+    async fn standby_probe_mismatch_preserves_pending_and_token() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-standby-mismatch";
+        let attempt = net::AttemptId::next();
+        let other = net::AttemptId::next();
+        conn.direct_pending.insert(
+            pid.into(),
+            direct_pending_with(attempt, ("peer", "keep")),
+        );
+        let mut probe = UpgradeProbe::armed();
+        probe.token = Some(other);
+        conn.resil.upgrade_probe.insert(pid.into(), probe);
+        let incoming: Arc<dyn Transport> = Rec::new("incoming", &log);
+        let source = incoming.source_id().unwrap();
+        conn.stash_upgrade_standby(pid, incoming.clone(), "direct-quic");
+        let pending = conn.direct_pending.get(pid).expect("pending was consumed");
+        assert_eq!(pending.attempt, attempt);
+        assert_eq!(
+            conn.resil.upgrade_probe.get(pid).and_then(|p| p.token),
+            Some(other)
+        );
+        assert!(!conn.pending_sources.contains_key(&source));
+        assert!(incoming.is_dead());
+    }
+
+    /// A promotion with no upstream-attempt token is not authorization; a ready
+    /// must not consume pending metadata or create a source registration.
+    #[tokio::test]
+    async fn standby_promotion_none_token_preserves_pending() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-promo-none";
+        let attempt = net::AttemptId::next();
+        let mut pending = direct_pending_with(attempt, ("peer", "keep"));
+        pending.ephemeral = true;
+        conn.direct_pending.insert(pid.into(), pending);
+        conn.promotions
+            .insert(pid.into(), PromoteState::new(PromoteRole::Lead));
+        let incoming: Arc<dyn Transport> = Rec::new("incoming", &log);
+        let source = incoming.source_id().unwrap();
+        conn.stash_upgrade_standby(pid, incoming.clone(), "direct-quic");
+        let pending = conn.direct_pending.get(pid).expect("pending was consumed");
+        assert_eq!(pending.attempt, attempt);
+        assert_eq!(pending.secret, ("peer".to_string(), "keep".to_string()));
+        assert!(!conn.pending_sources.contains_key(&source));
+        assert!(conn.promotions[pid].attempt.is_none());
+        assert!(incoming.is_dead());
+    }
+
+    /// promote_adopt_now must not mint a promotion token from a ready when no
+    /// upstream pending/promotion token exists.
+    #[tokio::test]
+    async fn promote_adopt_now_without_upstream_token_is_rejected() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-promo-adopt-none";
+        let incoming: Arc<dyn Transport> = Rec::new("incoming", &log);
+        conn.promote_adopt_now(pid, incoming.clone(), "direct-quic");
+        assert!(!conn.links.contains_key(pid));
+        assert!(!conn.promotions.contains_key(pid));
+        assert!(incoming.is_dead());
+    }
+
+    /// on_promote_standby requires the upstream token even when a promotion
+    /// record exists.
+    #[tokio::test]
+    async fn on_promote_standby_none_token_is_rejected() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-promo-standby-none";
+        let serving: Arc<dyn Transport> = Rec::new("serving", &log);
+        conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", serving));
+        conn.promotions
+            .insert(pid.into(), PromoteState::new(PromoteRole::Lead));
+        let incoming: Arc<dyn Transport> = Rec::new("incoming", &log);
+        conn.on_promote_standby(pid, incoming.clone(), "direct-quic");
+        assert!(conn.promotions[pid].standby.is_none());
+        assert!(incoming.is_dead());
+    }
+
+    /// A duplicate upgrade carrying the active link transport is harmless.
+    #[tokio::test]
+    async fn upgrade_duplicate_is_harmless() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-upgrade-duplicate";
+        let serving: Arc<dyn Transport> = Rec::new("serving", &log);
+        let mut link = direct_link(pid, "peer", "peer", serving.clone());
+        link.generation = 7;
+        let attempt = serving.attempt_id().unwrap();
+        link.attempt = Some(attempt);
+        conn.links.insert(pid.into(), link);
+        let mut probe = UpgradeProbe::armed();
+        probe.token = Some(attempt);
+        conn.resil.upgrade_probe.insert(pid.into(), probe);
+        conn.perform_upgrade(pid, serving.clone(), "direct-quic").await;
+        assert!(conn.links[pid]
+            .transport
+            .as_ref()
+            .is_some_and(|live| Arc::ptr_eq(live, &serving)));
+        assert_eq!(conn.links[pid].generation, 7);
+        assert!(!serving.is_dead(), "duplicate upgrade closed the live link");
     }
 
     /// A race that won must not be expired or reaped while it waits beside the
