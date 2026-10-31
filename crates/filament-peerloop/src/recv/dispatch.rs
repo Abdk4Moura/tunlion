@@ -1004,6 +1004,7 @@ impl RecvCleanup {
             self.note_phase("flush");
         }
         if let Some(conn) = &mut self.conn {
+            conn.cancel_builds();
             conn.close_links_for_exit();
         }
         tokio::task::yield_now().await;
@@ -2083,6 +2084,7 @@ async fn recv_run(
         // gate can measure the maximum gap between iterations. No call in a
         // production build (test_hooks::loop_beat is empty there).
         test_hooks::loop_beat();
+        conn.pump_builds();
         sync_tasks.reap_sync_tasks(log.as_ref()).await;
         // Reap completed blocking writers every iteration: the handles are
         // owned until their write lands, but a long-lived daemon must not keep
@@ -2571,6 +2573,11 @@ async fn recv_run(
                 Ok(Err(e)) => return Err(e),
                 Err(_) => None, // tick: run the settle sweep + quiet-check below
             },
+        };
+
+        let ev = match ev {
+            Some(ev) => conn.stage_event(ev),
+            None => None,
         };
 
         // Settle sweep: re-drive parked shell-class opens whose link proved
@@ -3256,7 +3263,14 @@ async fn recv_run(
                 .map(|(_, l)| l.shown().to_string())
                 .collect();
             for who in live {
-                ports.store.devices_touch(&who, None, None);
+                let store = ports.store.clone();
+                let who_owned = who.to_string();
+                tokio::spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        store.devices_touch(&who_owned, None, None);
+                    })
+                    .await;
+                });
             }
         }
 
@@ -3420,6 +3434,7 @@ async fn recv_run(
             // `devices` before anything below can re-add or dial it.
             let snap = ports.daemon.revocation_snapshot();
             if revocation_sweep_now || (snap.is_some() && snap != revocation_snap) {
+                let invalidate = revocation_sweep_now;
                 revocation_sweep_now = false;
                 if snap.is_none() {
                     // A store that cannot be read is never "everything was
@@ -3430,6 +3445,11 @@ async fn recv_run(
                     }
                 } else {
                     revocation_snap = snap;
+                    // An explicit forget/revoke is a lifecycle invalidation;
+                    // a plain add/rename must not cancel the fleet's builds.
+                    if invalidate {
+                        conn.invalidate_builds();
+                    }
                     revoked_secrets.extend(ports.daemon.prune_to_store(&mut devices));
                     // Meeting places a now-revoked sibling brokered.
                     brokered.retain(|_, (sec, broker)| {
@@ -3657,6 +3677,7 @@ async fn recv_run(
         // ADOPT for the same peer; that sequence is not sound if peers recover
         // concurrently, so caller attribution alone is insufficient here.
         for (pid, info, (n, sec)) in conn.expired_direct() {
+            conn.note_binding(&pid, (n.clone(), sec.clone()));
             let adopted = conn.maybe_adopt(&info, true).await.with_context(|| {
                 format!("direct fallback adoption failed for peer {pid} on receive path")
             });
@@ -4551,6 +4572,7 @@ async fn recv_run(
                 }
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 // A browser's PeerLink sends its transport hint BEFORE any SDP.
@@ -4895,6 +4917,10 @@ async fn recv_run(
                 if peer_step(daemon, &from, "responder", r, log.as_ref())?.is_none() {
                     continue;
                 }
+                if conn.build_pending(&from) {
+                    conn.stage_signal(&v);
+                    continue;
+                }
                 conn.apply_signal(&from, data).await;
             }
             // rung-1: authenticated direct-QUIC won the race, adopt as a
@@ -5205,7 +5231,14 @@ async fn recv_run(
                                     l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t.clone())
                                         .await;
                                     // Store overlay addresses for `tunlion addr <device>`
-                                    ports.store.devices_touch(&who, Some(ip), Some(v4));
+                                    let store = ports.store.clone();
+                                    let who_owned = who.to_string();
+                                    tokio::spawn(async move {
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            store.devices_touch(&who_owned, Some(ip), Some(v4));
+                                        })
+                                        .await;
+                                    });
                                 } else {
                                     log.debug(&format!(
                                         "  l3-announce from {pid} ignored: stale sequence {}",
@@ -5891,7 +5924,14 @@ async fn recv_run(
                                                 "  {} L3 peer {who}.mesh ({ip} / {v4})",
                                                 log.paint(Tone::Ok, log.glyph_ok())
                                             ));
-                                            ports.store.devices_touch(&who, Some(ip), Some(v4));
+                                            let store = ports.store.clone();
+                                            let who_owned = who.to_string();
+                                            tokio::spawn(async move {
+                                                let _ = tokio::task::spawn_blocking(move || {
+                                                    store.devices_touch(&who_owned, Some(ip), Some(v4));
+                                                })
+                                                .await;
+                                            });
 
                                             // Subnet routes, after the peer is on
                                             // the overlay. Three conditions, in
@@ -7265,6 +7305,9 @@ async fn recv_run(
                     }
                 }
                 Some("pair-intro") => {
+                    if let Some(name) = v["name"].as_str() {
+                        conn.allow_name(name);
+                    }
                     // C19/C20: only a fingerprint-verified known device may
                     // vouch new trust into this store. "Verified" means the
                     // link resolved to one of OUR records by its pair secret

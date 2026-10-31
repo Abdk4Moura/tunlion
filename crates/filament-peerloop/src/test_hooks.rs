@@ -146,6 +146,15 @@ mod on {
     pub fn expired_direct_batch() -> bool {
         std::env::var("TUNLION_TEST_EXPIRED_DIRECT_BATCH").as_deref() == Ok("1")
     }
+
+    /// Real-loop publication gate: hold a built candidate before it is reported,
+    /// so the gate can forget/revoke/stop its peer while the candidate exists.
+    pub fn build_hold_ms() -> u64 {
+        std::env::var("TUNLION_TEST_BUILD_HOLD_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(not(feature = "test-hooks"))]
@@ -239,6 +248,11 @@ mod off {
     #[inline]
     pub fn expired_direct_batch() -> bool {
         false
+    }
+
+    #[inline]
+    pub fn build_hold_ms() -> u64 {
+        0
     }
 }
 

@@ -9,6 +9,20 @@
       "expires": "2026-12-31"
     },
     {
+      "path": "cli/tests/loop-stall-lifecycle-gates.sh",
+      "disposition": "diagnostic",
+      "issue": "https://github.com/Abdk4Moura/tunlion/issues/456",
+      "owner": "appropriator",
+      "expires": "2026-12-31"
+    },
+    {
+      "path": "cli/tests/loop-stall-hold-gates.sh",
+      "disposition": "diagnostic",
+      "issue": "https://github.com/Abdk4Moura/tunlion/issues/456",
+      "owner": "appropriator",
+      "expires": "2026-12-31"
+    },
+    {
       "path": "cli/tests/ack-loss-repro.sh",
       "disposition": "diagnostic",
       "issue": "https://github.com/Abdk4Moura/tunlion/issues/294",

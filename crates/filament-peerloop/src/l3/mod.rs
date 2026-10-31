@@ -1138,9 +1138,18 @@ impl L3 {
             .values()
             .map(|(n, v6, v4)| (n.clone(), *v6, *v4))
             .collect();
-        if let Err(e) = rewrite_hosts_block(&entries) {
-            self.log.debug(&format!("  MagicDNS: /etc/hosts not updated ({e}); overlay still works by IP"));
-        }
+        // A host file write is blocking I/O; never hold the daemon loop on it.
+        let log = self.log.clone();
+        tokio::spawn(async move {
+            let written = tokio::task::spawn_blocking(move || rewrite_hosts_block(&entries)).await;
+            match written {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log.debug(&format!(
+                    "  MagicDNS: /etc/hosts not updated ({e}); overlay still works by IP"
+                )),
+                Err(e) => log.debug(&format!("  MagicDNS: host writer failed: {e}")),
+            }
+        });
     }
 }
 
