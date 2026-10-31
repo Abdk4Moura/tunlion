@@ -98,6 +98,7 @@ pub struct Engine {
     mdns_label: (u32, String),
     last_mdns_answer: u64,
     pairing: Option<[u8; 16]>,
+    pairing_seen: HashMap<(SocketAddr, [u8; 16]), u64>,
     announce: bool,
     pub stats: Stats,
 }
@@ -141,6 +142,7 @@ impl Engine {
             mdns_label: (u32::MAX, String::new()),
             last_mdns_answer: 0,
             pairing: None,
+            pairing_seen: HashMap::new(),
             announce: true,
             stats: Stats::default(),
         }
@@ -359,7 +361,15 @@ impl Engine {
                 if !allowed {
                     self.stats.ignored += 1;
                 } else if Some(b.field) != self.pairing {
-                    out.push(Action::PairingNearby { addr: SocketAddr::new(src.ip(), b.port), id: b.field, label: wire::pairing_label(&b.field) });
+                    let addr = SocketAddr::new(src.ip(), b.port);
+                    let key = (addr, b.field);
+                    if self.pairing_seen.get(&key).is_none_or(|t| now_ms >= *t + 2_000) {
+                        if self.pairing_seen.len() > 256 {
+                            self.pairing_seen.retain(|_, t| now_ms < *t + 10_000);
+                        }
+                        self.pairing_seen.insert(key, now_ms);
+                        out.push(Action::PairingNearby { addr, id: b.field, label: wire::pairing_label(&b.field) });
+                    }
                 }
             }
         }

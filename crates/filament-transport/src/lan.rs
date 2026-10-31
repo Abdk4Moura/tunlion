@@ -15,7 +15,6 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,7 +22,6 @@ use anyhow::{anyhow, Context, Result};
 use quinn::{Endpoint, RecvStream, SendStream};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
-use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use tunlion_lan::engine::{Action, Channel, Engine, Known};
@@ -97,24 +95,27 @@ impl std::fmt::Debug for PairLink {
 /// them, so success, expiry and cancellation leave no listener or ticker behind.
 #[derive(Clone)]
 pub struct Shutdown {
-    flag: Arc<AtomicBool>,
-    notify: Arc<Notify>,
+    tx: tokio::sync::watch::Sender<bool>,
+    rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Shutdown {
     fn new() -> Self {
-        Self { flag: Arc::new(AtomicBool::new(false)), notify: Arc::new(Notify::new()) }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        Self { tx, rx }
     }
     pub fn stop(&self) {
-        self.flag.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        let _ = self.tx.send(true);
     }
     pub fn is_stopped(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+        *self.rx.borrow()
     }
     async fn wait(&self) {
-        while !self.is_stopped() {
-            self.notify.notified().await;
+        let mut rx = self.rx.clone();
+        while !*rx.borrow() {
+            if rx.changed().await.is_err() {
+                break;
+            }
         }
     }
 }
@@ -443,7 +444,7 @@ fn mark(ifs: Vec<Interface>, skip: &Skip) -> Vec<Interface> {
 pub fn hello(pk: [u8; 32], port: u16, skip: &Skip) -> Hello {
     let mut addrs = Vec::new();
     for i in mark(interfaces(), skip) {
-        if i.opted_out {
+        if i.opted_out || i.public_network || !i.flags.up {
             continue;
         }
         let class = iface::classify(&i.flags);
@@ -900,7 +901,8 @@ impl LanService {
         engine.set_announce(opts.serve);
         engine.set_pairing(opts.pairing);
         engine.set_known(store.known());
-        let shared = Arc::new(Mutex::new(Shared { engine, ifaces: Vec::new(), port, started: Some(Instant::now()), errors }));
+        let initial_ifaces = mark(interfaces(), &opts.skip);
+        let shared = Arc::new(Mutex::new(Shared { engine, ifaces: initial_ifaces, port, started: Some(Instant::now()), errors }));
         if let Some(ep) = listen_ep.clone() {
             let allow_shared = shared.clone();
             let allow: Arc<dyn Fn(IpAddr) -> bool + Send + Sync> =
@@ -991,6 +993,7 @@ impl LanService {
         {
             let shared = shared.clone();
             let skip = opts.skip.clone();
+            let store_tick = store.clone();
             let shutdown = shutdown.clone();
             let h = tokio::spawn(async move {
                 let mut last_scan: Option<Instant> = None;
@@ -1003,7 +1006,9 @@ impl LanService {
                         routes_cache = routes(&ifs);
                         hints = neighbors();
                         socks.join(&ifs);
-                        shared.lock().unwrap().ifaces = ifs;
+                        let mut g = shared.lock().unwrap();
+                        g.ifaces = ifs;
+                        g.engine.set_known(store_tick.known());
                     }
                     let actions = {
                         let mut g = shared.lock().unwrap();

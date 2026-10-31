@@ -1301,10 +1301,23 @@ async fn pair_with_purpose(
                     let won = pair_code.as_ref().is_some_and(|c| c.confirm(out.token, Instant::now()));
                     if won {
                         let name = crate::lan_pair::persist_plain(&out)?;
-                        if let Some(mut h) = lan_host.take() {
+                        let confirmed = if let Some(mut h) = lan_host.take() {
+                            h.mark_stored();
+                            let ev = tokio::time::timeout(std::time::Duration::from_secs(12), h.events.recv())
+                                .await
+                                .ok()
+                                .flatten();
                             h.learn(&name, &out.hello);
                             h.shutdown().await;
-                        }
+                            matches!(ev, Some(crate::lan_pair::HostEvent::Stored(true)))
+                        } else {
+                            false
+                        };
+                        ui::say(&ui::paint(ui::Tone::Dim, if confirmed {
+                            "  the other device confirmed it saved this pairing"
+                        } else {
+                            "  saved here; the other device has not confirmed it saved"
+                        }));
                         return Ok(());
                     }
                 }
@@ -1482,7 +1495,8 @@ async fn pair_with_purpose(
                                 }
                             }
                             // No cert: store secret only (legacy or first-pair no identity)
-                            if let (Some(token), Some(code)) = (signaling_token, pair_code.as_ref()) {
+                            if let Some(code) = pair_code.as_ref() {
+                                let token = signaling_token.ok_or_else(|| anyhow!("pairing store without a signaling claim token"))?;
                                 if !code.confirm(token, Instant::now()) {
                                     bail!("this code was already used by a nearby device");
                                 }
@@ -1535,7 +1549,8 @@ async fn pair_with_purpose(
                             // If process crashes between them, cap_authorize sees new-secret + old-cert (or no cert)
                             // yielding wrong userPub. Fix: devices_upsert_atomic writes both fields together.
                             let pcert = peer_identity_cert.as_ref().unwrap();
-                            if let (Some(token), Some(code)) = (signaling_token, pair_code.as_ref()) {
+                            if let Some(code) = pair_code.as_ref() {
+                                let token = signaling_token.ok_or_else(|| anyhow!("pairing store without a signaling claim token"))?;
                                 if !code.confirm(token, Instant::now()) {
                                     bail!("this code was already used by a nearby device");
                                 }
@@ -1932,8 +1947,9 @@ async fn pair_with_purpose(
                     match code.begin(PairCarrier::Signaling, Instant::now()) {
                         Begin::Started(t) => signaling_token = Some(t),
                         Begin::Busy => {
-                            signaling_blocked = true;
-                            ui::say("  another device is pairing with this code; this claim cannot proceed");
+                            // Backoff or another active carrier: not a spent claim.
+                            // A later PAKE frame retries begin; do not poison.
+                            ui::debug("  signaling claim waits for the code's current attempt");
                         }
                         Begin::Closed => {
                             signaling_blocked = true;
@@ -2004,6 +2020,18 @@ async fn pair_with_purpose(
                 ) {
                     if signaling_blocked {
                         continue;
+                    }
+                    if let Some(code) = pair_code.as_ref() {
+                        if signaling_token.is_none() {
+                            match code.begin(PairCarrier::Signaling, Instant::now()) {
+                                Begin::Started(t) => signaling_token = Some(t),
+                                Begin::Busy => continue,
+                                Begin::Closed => {
+                                    signaling_blocked = true;
+                                    continue;
+                                }
+                            }
+                        }
                     }
                     match crate::pake_ceremony::partner_for(
                         pake_peer.as_deref(),

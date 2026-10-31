@@ -187,9 +187,14 @@ falls back to signaling.
 The carrier is one bidirectional QUIC stream of the same code ceremony frames
 (`CONTRACT.md`): a `u32` big-endian length followed by JSON, maximum 65536
 bytes per frame. The allowlist is `pake-msg`, `pake-confirm`,
-`identity-expose`, `identity-expose-ack` and the carrier's `pair-name`
+`identity-expose`, `identity-expose-ack`, `pair-name`, `lan-hello` and the
+post-store acknowledgement `pair-stored`
 (`{"type":"pair-name","v":1,"name":"..."}`, sent only after mutual
-confirmation; a display name, never authentication). Unknown, oversized,
+confirmation; a display name, never authentication). `lan-hello` is the
+section 8 hello, sent on the authenticated pairing link so a daemon that is
+already running learns the peer's presence key and addresses without a prior
+signaling link. `pair-stored` acknowledges that the sender persisted the pair;
+without it a side may say it saved locally but must not claim the peer saved. Unknown, oversized,
 truncated or out-of-order frames abort the ceremony.
 
 The confirmation MAC is bound to the QUIC session with a separate RFC 5705

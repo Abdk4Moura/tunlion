@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use filament_transport::lan::{
     pair_read, pair_write, LanService, Options, PairLink, PAIR_MAX_FRAME,
@@ -34,12 +34,11 @@ const FRAME_TYPES: &[&str] = &[
     "identity-expose-ack",
     "pair-name",
     "lan-hello",
-    "pair-stored",
 ];
 
 /// What a confirmed LAN ceremony hands to the coordinator. The coordinator is
 /// the only place that confirms the code and stores the record.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Outcome {
     pub token: u64,
     pub peer_name: String,
@@ -53,6 +52,7 @@ pub struct Outcome {
 #[derive(Debug)]
 pub enum HostEvent {
     Outcome(Outcome),
+    Stored(bool),
     Failed { token: u64, why: String },
 }
 
@@ -284,7 +284,7 @@ pub fn persist_plain(outcome: &Outcome) -> Result<String> {
     }
     match outcome.cert.as_ref() {
         Some(cert) => {
-            crate::devices_upsert_atomic(
+            let final_name = crate::devices_upsert_atomic(
                 &name,
                 Some(&outcome.secret),
                 Some(cert),
@@ -295,12 +295,25 @@ pub fn persist_plain(outcome: &Outcome) -> Result<String> {
                 false,
             )
             .context("store pairing secret and certificate")?;
-            if let Err(e) = crate::store_provisional_identity(&name, cert) {
-                ui::debug(&format!("pair: provisional identity not stored: {e}"));
+            if let Err(e) = crate::store_provisional_identity(&final_name, cert) {
+                // The durable record is valid; the provisional overlay anchor is
+                // required for promotion. Fail closed rather than claim success.
+                crate::devices_store::with_devices_mut(|arr| {
+                    arr.retain(|d| d["name"].as_str() != Some(final_name.as_str()));
+                    Ok(())
+                })?;
+                return Err(anyhow!("stored the pairing but could not stage its provisional identity: {e}"));
             }
+            ui::say(&format!(
+                "  {} {} paired and saved on this device",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                ui::paint(ui::Tone::Bold, &final_name),
+            ));
+            ui::say(&ui::paint(ui::Tone::Dim, &format!("  next: tunlion send <file> --to {final_name}")));
+            return Ok(final_name);
         }
         None => {
-            crate::devices_upsert_atomic(
+            let final_name = crate::devices_upsert_atomic(
                 &name,
                 Some(&outcome.secret),
                 None,
@@ -311,16 +324,19 @@ pub fn persist_plain(outcome: &Outcome) -> Result<String> {
                 false,
             )
             .context("store pairing secret")?;
+            ui::say(&format!(
+                "  {} {} paired and saved on this device",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                ui::paint(ui::Tone::Bold, &final_name),
+            ));
+            ui::say(&ui::paint(ui::Tone::Dim, &format!("  next: tunlion send <file> --to {final_name}")));
+            return Ok(final_name);
         }
     }
-    ui::say(&format!(
-        "  {} {} paired and saved on this device",
-        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-        ui::paint(ui::Tone::Bold, &name),
-    ));
-    ui::say(&ui::paint(ui::Tone::Dim, &format!("  next: tunlion send <file> --to {name}")));
+    #[allow(unreachable_code)]
     Ok(name)
 }
+
 
 fn service_options(serve: bool, pairing: Option<[u8; 16]>, listen: bool) -> Options {
     let mut opts = Options { serve, listen_discovery: listen, pairing, ..Default::default() };
@@ -343,14 +359,24 @@ fn lan_enabled() -> bool {
 fn local_cert_readonly() -> Option<DeviceCert> {
     let raw = std::fs::read_to_string(crate::local_device_cert_path()).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
-    DeviceCert::from_json(&v["cert"])
+    let cert = DeviceCert::from_json(&v["cert"])?;
+    cert.verify(identity::now_secs()).ok()?;
+    let own = crate::overlay::overlay_pubkey_bytes().ok()?;
+    (cert.device_pub == own).then_some(cert)
+}
+
+fn daemon_listen_port() -> Option<u64> {
+    let raw = std::fs::read_to_string(crate::settings::config_dir().join("lan-state.json")).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v["listen_port"].as_u64().filter(|p| *p != 0)
 }
 
 fn pair_hello(svc: &LanService) -> Value {
     let mut h = svc.hello_json();
-    if h["port"].as_u64() == Some(0) {
-        h["port"] = json!(tunlion_lan::wire::DEFAULT_LISTEN_PORT);
-    }
+    // If a daemon already owns the listener, the pair command's fallback port
+    // dies with this one-shot. Advertise the daemon's port instead.
+    let port = daemon_listen_port().or_else(|| h["port"].as_u64().filter(|p| *p != 0)).unwrap_or(tunlion_lan::wire::DEFAULT_LISTEN_PORT as u64);
+    h["port"] = json!(port);
     h
 }
 
@@ -368,11 +394,18 @@ fn spawn_ev_drain(mut rx: mpsc::UnboundedReceiver<crate::net::Ev>) {
 /// code over LAN and returns the first confirmed outcome to the coordinator.
 pub struct HostHandle {
     pub events: mpsc::UnboundedReceiver<HostEvent>,
+    ack: Option<oneshot::Sender<bool>>,
     svc: LanService,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl HostHandle {
+    pub fn mark_stored(&mut self) {
+        if let Some(tx) = self.ack.take() {
+            let _ = tx.send(true);
+        }
+    }
+
     pub fn learn(&self, name: &str, hello: &Value) -> bool {
         self.svc.learn(name, hello)
     }
@@ -410,6 +443,7 @@ pub async fn spawn_host(code: PairCode, words: String, nameplate: String) -> Res
     .await?;
     let local_hello = pair_hello(&svc);
     let (out_tx, out_rx) = mpsc::unbounded_channel::<HostEvent>();
+    let (ack_tx, ack_rx) = oneshot::channel::<bool>();
     let task = tokio::spawn(async move {
         while !code.is_closed() {
             let Some(mut link) = pair_rx.recv().await else { return };
@@ -425,6 +459,11 @@ pub async fn spawn_host(code: PairCode, words: String, nameplate: String) -> Res
             match run_ceremony(&mut link, &words, &nameplate, "host", &local_hello).await {
                 Ok((peer_name, secret, cert, hello)) => {
                     let _ = out_tx.send(HostEvent::Outcome(Outcome { token, peer_name, secret, cert, hello }));
+                    let stored = ack_rx.await.unwrap_or(false);
+                    if stored {
+                        let acked = stored_ack(&mut link).await;
+                        let _ = out_tx.send(HostEvent::Stored(acked));
+                    }
                     return;
                 }
                 Err(e) => {
@@ -434,7 +473,7 @@ pub async fn spawn_host(code: PairCode, words: String, nameplate: String) -> Res
             }
         }
     });
-    Ok(HostHandle { events: out_rx, svc, task })
+    Ok(HostHandle { events: out_rx, ack: Some(ack_tx), svc, task })
 }
 
 /// Host a plain code with no server. Stores the outcome itself.
