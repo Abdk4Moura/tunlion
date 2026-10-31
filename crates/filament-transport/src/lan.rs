@@ -1134,6 +1134,47 @@ mod tests {
     use super::*;
     use crate::net::Transport;
 
+    #[tokio::test]
+    async fn pair_carrier_negotiates_and_frames_both_ways() {
+        let (srv, port) = bind_with(0, true).unwrap();
+        let (cli, _) = bind_with(0, false).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ptx, mut prx) = tokio::sync::mpsc::channel(1);
+        let accept = spawn_accept(
+            srv,
+            Arc::new(Vec::<LanKey>::new),
+            Some(ptx),
+            Shutdown::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            tx,
+        );
+        let dial = tokio::time::timeout(
+            Duration::from_secs(10),
+            pair_dial(&cli, vec![format!("127.0.0.1:{port}").parse().unwrap()]),
+        )
+        .await
+        .expect("pair dial did not finish")
+        .expect("pair dial failed");
+        let mut host = tokio::time::timeout(Duration::from_secs(10), prx.recv())
+            .await
+            .expect("host did not receive a pair link")
+            .expect("pair link channel closed");
+        let mut dial = dial;
+        pair_write(&mut dial.send, &serde_json::json!({"type":"pake-msg","v":2})).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(10), pair_read(&mut host.recv))
+            .await
+            .expect("host read timed out")
+            .unwrap();
+        assert_eq!(got["type"], "pake-msg");
+        pair_write(&mut host.send, &serde_json::json!({"type":"pake-confirm","v":2})).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(10), pair_read(&mut dial.recv))
+            .await
+            .expect("dial read timed out")
+            .unwrap();
+        assert_eq!(got["type"], "pake-confirm");
+        accept.abort();
+    }
+
     #[test]
     fn skip_matches_by_user_name_or_cidr() {
         let i = Interface {
