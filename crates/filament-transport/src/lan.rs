@@ -129,6 +129,74 @@ impl Shutdown {
     }
 }
 
+/// Test-only interleaving points for the accept/registration/shutdown race.
+/// Installed per listener port so concurrently running tests cannot cross.
+#[cfg(test)]
+mod accept_seam {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::Notify;
+
+    pub struct Seam {
+        pub port: u16,
+        pub after_spawn: Notify,
+        pub release_register: Notify,
+        pub parent_done: Notify,
+        pub child_started: Notify,
+        pub child_gate: Notify,
+        pub shutdown_snapshot: Notify,
+        pub release_shutdown: Notify,
+        pub shutdown_seam_used: AtomicBool,
+        pub registered: AtomicUsize,
+        pub stopped_at_register: AtomicUsize,
+        pub child_drops: AtomicUsize,
+    }
+
+    impl Seam {
+        fn new(port: u16) -> Seam {
+            Seam {
+                port,
+                after_spawn: Notify::new(),
+                release_register: Notify::new(),
+                parent_done: Notify::new(),
+                child_started: Notify::new(),
+                child_gate: Notify::new(),
+                shutdown_snapshot: Notify::new(),
+                release_shutdown: Notify::new(),
+                shutdown_seam_used: AtomicBool::new(false),
+                registered: AtomicUsize::new(0),
+                stopped_at_register: AtomicUsize::new(0),
+                child_drops: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    pub struct ChildDrop(pub Arc<Seam>);
+
+    impl Drop for ChildDrop {
+        fn drop(&mut self) {
+            self.0.child_drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    static SEAMS: Mutex<Vec<Arc<Seam>>> = Mutex::new(Vec::new());
+
+    pub fn install(port: u16) -> Arc<Seam> {
+        let s = Arc::new(Seam::new(port));
+        SEAMS.lock().unwrap().push(s.clone());
+        s
+    }
+
+    pub fn find(port: u16) -> Option<Arc<Seam>> {
+        SEAMS.lock().unwrap().iter().find(|s| s.port == port).cloned()
+    }
+
+    pub fn remove(port: u16) {
+        SEAMS.lock().unwrap().retain(|s| s.port != port);
+    }
+}
+
 impl std::fmt::Debug for LanEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print the secret.
@@ -553,6 +621,8 @@ pub fn spawn_accept(
     allow: Arc<dyn Fn(IpAddr) -> bool + Send + Sync>,
     tx: UnboundedSender<Ev>,
 ) -> JoinHandle<()> {
+    #[cfg(test)]
+    let test_port = ep.local_addr().map(|a| a.port()).unwrap_or(0);
     tokio::spawn(async move {
         let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_ACCEPTS));
         loop {
@@ -564,6 +634,8 @@ pub fn spawn_accept(
                 incoming.refuse();
                 continue;
             };
+            #[cfg(test)]
+            let seam = accept_seam::find(test_port);
             let keys = keys.clone();
             let tx = tx.clone();
             let pair = pair.clone();
@@ -571,8 +643,17 @@ pub fn spawn_accept(
             let ep2 = ep.clone();
             let shutdown2 = shutdown.clone();
             let tasks2 = tasks.clone();
+            #[cfg(test)]
+            let seam_child = seam.clone();
             let h = tokio::spawn(async move {
                 let _permit = permit;
+                #[cfg(test)]
+                let _drop = seam_child.as_ref().map(|s| accept_seam::ChildDrop(s.clone()));
+                #[cfg(test)]
+                if let Some(s) = &seam_child {
+                    s.child_started.notify_one();
+                    s.child_gate.notified().await;
+                }
                 let r = tokio::time::timeout(ACCEPT_AUTH_BUDGET, async {
                     let conn = incoming.await.context("lan accept handshake")?;
                     let alpn = negotiated_alpn(&conn);
@@ -621,13 +702,42 @@ pub fn spawn_accept(
                     Err(_) => crate::hooks::debug("lan: inbound did not authenticate in time"),
                 }
             });
-            if shutdown.is_stopped() {
-                h.abort();
-            } else {
-                let mut g = tasks2.lock().unwrap();
-                g.retain(|h| !h.is_finished());
-                if g.len() < 256 { g.push(h); } else { h.abort(); }
+            // Test-only: pause after the child handle exists but before it is
+            // registered, so the shutdown snapshot can be forced into the gap.
+            // `h` stays owned by this frame across the pause. There is no such
+            // await in production.
+            #[cfg(test)]
+            if let Some(s) = &seam {
+                s.after_spawn.notify_one();
+                s.release_register.notified().await;
             }
+            // The stop check and the registration are one critical section:
+            // `shutdown` sets the watch before it takes this same vector, so
+            // either this child is in that snapshot or it is pushed after the
+            // snapshot and the shutdown loop takes it on a later pass. An abort
+            // is only a request; the handle stays owned and is joined.
+            let mut g = tasks2.lock().unwrap();
+            g.retain(|h| !h.is_finished());
+            // Over the cap, an aborted handle is still retained (not dropped),
+            // so this iteration can transiently reach 257. The next retain
+            // prunes finished handles; every shutdown pass takes the whole
+            // vector, so growth is bounded by spawns during one pass.
+            let stopped = shutdown.is_stopped();
+            if stopped || g.len() >= 256 {
+                h.abort();
+            }
+            #[cfg(test)]
+            if let Some(s) = &seam {
+                if stopped {
+                    s.stopped_at_register.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                s.registered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            g.push(h);
+        }
+        #[cfg(test)]
+        if let Some(s) = accept_seam::find(test_port) {
+            s.parent_done.notify_one();
         }
     })
 }
@@ -1109,16 +1219,37 @@ impl LanService {
             ep.close(quinn::VarInt::from_u32(0), b"lan stopped");
         }
         self.dial_ep.close(quinn::VarInt::from_u32(0), b"lan stopped");
-        let handles = {
-            let mut g = self.tasks.lock().unwrap();
-            std::mem::take(&mut *g)
-        };
-        for mut h in handles {
-            tokio::select! {
-                _ = &mut h => {}
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                    h.abort();
-                    let _ = h.await;
+        // Registration and the snapshot above are serialized by the same
+        // mutex. A child registered after a pass still lands in this vector,
+        // so keep taking passes until no owned handle remains. Joining the
+        // accept parent is what proves it can no longer publish a child.
+        loop {
+            let handles = {
+                let mut g = self.tasks.lock().unwrap();
+                std::mem::take(&mut *g)
+            };
+            #[cfg(test)]
+            if let Some(s) = accept_seam::find(self.port) {
+                if !s.shutdown_seam_used.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    s.shutdown_snapshot.notify_one();
+                    s.release_shutdown.notified().await;
+                }
+            }
+            if handles.is_empty() {
+                break;
+            }
+            for mut h in handles {
+                tokio::select! {
+                    _ = &mut h => {}
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                        // Existing bounded-join policy: wait two seconds, then
+                        // request abort. The final await is intentionally the
+                        // prior unbounded cancellation join; a task that ignores
+                        // abort can delay completion. The handle is never
+                        // dropped unjoined, so ownership is preserved.
+                        h.abort();
+                        let _ = h.await;
+                    }
                 }
             }
         }
@@ -1198,6 +1329,19 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::net::Transport;
+
+    /// If the seam test panics before its explicit releases, unblock the
+    /// test-only waits so the runtime can tear the tasks down instead of
+    /// leaving a paused parent/child behind. Notifications are idempotent.
+    struct ReleaseSeamOnDrop(Arc<accept_seam::Seam>);
+
+    impl Drop for ReleaseSeamOnDrop {
+        fn drop(&mut self) {
+            self.0.release_register.notify_one();
+            self.0.child_gate.notify_one();
+            self.0.release_shutdown.notify_one();
+        }
+    }
 
     #[tokio::test]
     async fn shutdown_wakes_every_waiter_without_a_lost_permit() {
@@ -1422,6 +1566,99 @@ mod tests {
         assert!(freed, "listener port {port} stayed bound after shutdown");
         // A consumed LanService has no second shutdown call. Repeated cancel
         // is exercised at the HostHandle seam, where ownership is optional.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the check-then-register gap: the accept parent has spawned
+    /// its child and is paused before registration; shutdown stops and takes its
+    /// first snapshot in that gap. The child must still be registered into the
+    /// same owned vector, then joined, so shutdown cannot return before the
+    /// child's destructor ran and the listener port is free.
+    #[tokio::test]
+    async fn shutdown_owns_accept_child_registered_after_stop_snapshot() {
+        use std::sync::atomic::Ordering;
+
+        let dir = std::env::temp_dir().join(format!(
+            "lan-shutdown-seam-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let held: Arc<dyn Fn() -> Vec<LanKey> + Send + Sync> = Arc::new(|| {
+            vec![LanKey { name: "peer".into(), secret: "55".repeat(32), fleet: false }]
+        });
+        let svc = LanService::start(
+            &dir,
+            Options { serve: true, ..Default::default() },
+            held,
+            None,
+            None,
+            tx,
+        )
+        .await
+        .expect("service starts");
+        let port = svc.port;
+        let tasks = svc.tasks.clone();
+        let seam = accept_seam::install(port);
+        // Also releases the seam waits if an assertion panics before the
+        // explicit notify sequence below.
+        let _seam_release = ReleaseSeamOnDrop(seam.clone());
+
+        let (dep, _) = bind(0).unwrap();
+        let target: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let (dtx, _drx) = tokio::sync::mpsc::unbounded_channel();
+        let dialer = tokio::spawn(async move {
+            let key = LanKey { name: "peer".into(), secret: "55".repeat(32), fleet: false };
+            let _ = tokio::time::timeout(Duration::from_secs(8), dial(dep, key, vec![target], dtx)).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(8), seam.after_spawn.notified())
+            .await
+            .expect("the accept parent reached registration");
+        tokio::time::timeout(Duration::from_secs(8), seam.child_started.notified())
+            .await
+            .expect("the accept child reached its gate");
+
+        let stopping = tokio::spawn(svc.shutdown());
+        tokio::time::timeout(Duration::from_secs(8), seam.shutdown_snapshot.notified())
+            .await
+            .expect("shutdown took its first snapshot");
+
+        // The snapshot is already taken. Let the parent publish its child; the
+        // shutdown loop must take that later registration on a following pass.
+        seam.release_register.notify_one();
+        tokio::time::timeout(Duration::from_secs(8), seam.parent_done.notified())
+            .await
+            .expect("the accept parent exited after registering");
+        seam.release_shutdown.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(8), stopping)
+            .await
+            .expect("shutdown finished")
+            .expect("shutdown task did not panic");
+        accept_seam::remove(port);
+
+        assert_eq!(seam.stopped_at_register.load(Ordering::SeqCst), 1, "the child took the stopped abort->push->join path");
+        assert_eq!(seam.registered.load(Ordering::SeqCst), 1, "the child was registered into shutdown's owned set");
+        assert_eq!(seam.child_drops.load(Ordering::SeqCst), 1, "the accept child's drop marker ran before shutdown returned");
+        assert!(tasks.lock().unwrap().is_empty(), "every owned task joined");
+
+        // The client end must not outlive the assertion and keep a connection
+        // alive; the listener's own endpoint is the single owner tested here.
+        dialer.abort();
+        let _ = dialer.await;
+        let mut freed = false;
+        for _ in 0..40 {
+            if std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(freed, "listener port {port} stayed bound after shutdown");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
