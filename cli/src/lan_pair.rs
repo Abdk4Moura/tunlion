@@ -49,7 +49,6 @@ pub struct Outcome {
     pub hello: Value,
 }
 
-#[derive(Debug)]
 pub enum HostEvent {
     Outcome(Outcome),
     Stored(bool),

@@ -1324,6 +1324,7 @@ async fn pair_with_purpose(
                 crate::lan_pair::HostEvent::Failed { why, .. } => {
                     ui::debug(&format!("lan pairing attempt failed: {why}"));
                 }
+                crate::lan_pair::HostEvent::Stored(_) => {}
             }
         }
 
