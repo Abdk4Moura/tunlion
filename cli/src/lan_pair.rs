@@ -78,6 +78,7 @@ pub async fn run_ceremony(link: &mut PairLink, words: &str, nameplate: &str, rol
     let deadline = Instant::now() + crate::pair_code::CEREMONY_BUDGET;
 
     let msg = cer.take_msg_payload().ok_or_else(|| anyhow!("pairing ceremony did not produce an element"))?;
+    ui::debug(&format!("lan pair: sending element as {role} to {}", link.remote));
     pair_write(&mut link.send, &msg).await?;
 
     let mut sent_confirm = false;
@@ -362,10 +363,12 @@ pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
     .await?;
 
     let result = async {
+        ui::debug("lan pair host: waiting for a pair link");
         let mut link = tokio::time::timeout(CODE_TTL, pair_rx.recv())
             .await
             .map_err(|_| anyhow!("the code expired before another device connected"))?
             .ok_or_else(|| anyhow!("LAN service stopped"))?;
+        ui::debug(&format!("lan pair host: link from {}", link.remote));
         let token = match code.begin(Carrier::Lan, Instant::now()) {
             Begin::Started(t) => t,
             other => bail!("pairing could not start: {other:?}"),
