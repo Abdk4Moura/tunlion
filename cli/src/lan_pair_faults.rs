@@ -754,12 +754,14 @@ async fn a_bad_candidate_is_retried_then_the_right_host_succeeds() {
             .await
             .expect("the right host accepted a pairing stream")
             .expect("the right host's pair channel is open");
-        run_ceremony(&mut host, "brave otter", "3141", "host", &host_hello).await
+        // Production derives the PAKE password from `split_code`, so this
+        // fixture must pass the same normalized bytes as the joiner below.
+        run_ceremony(&mut host, "brave-otter", "3141", "host", &host_hello).await
     });
 
     let second = join_candidate(
         &mut peer,
-        "brave otter",
+        "brave-otter",
         "3141",
         &peer_hello,
         Instant::now() + Duration::from_secs(10),
