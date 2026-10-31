@@ -2491,6 +2491,7 @@ mod tests {
                 rx.try_recv().is_err(),
                 "nothing may be queued before the link is announced"
             );
+            let announced_source = ours.transport().source_id().expect("source id");
             ours.announce(&tx, |t| crate::net::Ev::DirectReady("peer".to_string(), t, "direct-quic"));
             let first = rx.recv().await.expect("an event");
             assert!(
@@ -2498,11 +2499,18 @@ mod tests {
                 "a Control from the peer was queued before its DirectReady"
             );
             let second = rx.recv().await.expect("the peer's frame");
-            assert!(
-                matches!(second, crate::net::Ev::Control(ref p, ref v)
-                    if p == "peer" && v["type"] == "identity-auth-key-enroll-request"),
-                "the buffered frame must still be delivered, after DirectReady"
-            );
+            match second {
+                crate::net::Ev::Sourced { pid, source, inner } => {
+                    assert_eq!(pid, "peer");
+                    assert_eq!(source, announced_source, "envelope source must be the originating transport");
+                    assert!(
+                        matches!(*inner, crate::net::Ev::Control(ref p, ref v)
+                            if p == "peer" && v["type"] == "identity-auth-key-enroll-request"),
+                        "the buffered frame must still be delivered, after DirectReady"
+                    );
+                }
+                other => panic!("expected a Sourced Control, got {other:?}"),
+            }
         })
         .await
         .expect("announce-order test did not finish within 20s (a stall must FAIL here)");
@@ -2523,12 +2531,20 @@ mod tests {
                 "peer".to_string(), conn_a, send_a, recv_a, tx, true, None, true,
             );
             let t = ours.transport().clone();
+            let source = t.source_id().expect("source id");
             drop(ours);
             peer.send_control(&serde_json::json!({ "type": "ping" }))
                 .await
                 .expect("peer sends");
             let ev = rx.recv().await.expect("the reader runs after a drop");
-            assert!(matches!(ev, crate::net::Ev::Control(ref p, _) if p == "peer"));
+            match ev {
+                crate::net::Ev::Sourced { pid, source: seen, inner } => {
+                    assert_eq!(pid, "peer");
+                    assert_eq!(seen, source, "the dropped link's reader must keep its source");
+                    assert!(matches!(*inner, crate::net::Ev::Control(ref p, _) if p == "peer"));
+                }
+                other => panic!("expected a Sourced Control, got {other:?}"),
+            }
             drop(t);
         })
         .await
