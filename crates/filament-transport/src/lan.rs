@@ -1090,9 +1090,20 @@ impl LanService {
         self.shared.lock().unwrap().engine.query_soon();
     }
 
-    /// Stop every task this service started and close both endpoints. Used by
+    /// Stop every task this service started and release both endpoints. Used by
     /// the one-shot pair command on success, expiry, cancellation and failure.
-    pub async fn shutdown(&self) {
+    ///
+    /// Consumes this handle. Awaited to completion, all service tasks are
+    /// joined and both endpoints are dropped, so their sockets are released
+    /// once no other `LanService` or `Endpoint` clone still exists. The
+    /// `Clone` impl is unchanged: consuming one handle does not invalidate
+    /// aliases, and a remaining alias can keep the listener port bound.
+    ///
+    /// Cancelling this future drops `self`, so the endpoints and watch sender
+    /// drop and tasks stop through the shutdown watch, but unjoined task
+    /// handles are detached rather than joined. An empty task vector alone
+    /// proves ownership was taken, not that every join completed.
+    pub async fn shutdown(self) {
         self.shutdown.stop();
         if let Some(ep) = &self.listen_ep {
             ep.close(quinn::VarInt::from_u32(0), b"lan stopped");
@@ -1409,9 +1420,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(freed, "listener port {port} stayed bound after shutdown");
-        // Shutdown is idempotent: a second cancel path must not panic or leak.
-        svc.shutdown().await;
-        assert!(tasks.lock().unwrap().is_empty());
+        // A consumed LanService has no second shutdown call. Repeated cancel
+        // is exercised at the HostHandle seam, where ownership is optional.
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

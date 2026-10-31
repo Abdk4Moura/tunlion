@@ -529,14 +529,12 @@ impl HostHandle {
     }
 
     pub async fn shutdown(&mut self) {
-        if let Some(svc) = self.svc.as_ref() {
+        // `shutdown` consumes the service and drops its endpoints, so the
+        // listener port is released when the await completes. Handing the
+        // service back with the handle is not supported.
+        if let Some(svc) = self.svc.take() {
             svc.shutdown().await;
         }
-        // Shutdown stops accepting and joins the service tasks, but the
-        // endpoint's UDP socket stays bound while the endpoint is alive.
-        // Release ownership here so a cancelled host leaves no listener
-        // behind for as long as the caller keeps the handle.
-        self.svc = None;
         if let Some(task) = self.task.as_mut() {
             task.abort();
             // Await through the retained handle. The handle is cleared only
