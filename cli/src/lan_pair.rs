@@ -277,6 +277,16 @@ fn lan_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// A hello for the pairing link. A joiner has no listener yet, so it advertises
+/// the port its daemon will use; a host advertises the port it actually bound.
+fn pair_hello(svc: &LanService) -> Value {
+    let mut h = svc.hello_json();
+    if h["port"].as_u64() == Some(0) {
+        h["port"] = json!(tunlion_lan::wire::DEFAULT_LISTEN_PORT);
+    }
+    h
+}
+
 fn random_id() -> Result<[u8; 16]> {
     let mut id = [0u8; 16];
     getrandom::getrandom(&mut id).map_err(|e| anyhow!("no secure random: {e}"))?;
@@ -331,7 +341,7 @@ pub async fn spawn_host(code: PairCode, words: String, nameplate: String) -> Res
         ev_tx,
     )
     .await?;
-    let local_hello = svc.hello_json();
+    let local_hello = pair_hello(&svc);
     let (out_tx, out_rx) = mpsc::unbounded_channel::<HostEvent>();
     let task = tokio::spawn(async move {
         while !code.is_closed() {
@@ -385,7 +395,7 @@ pub async fn host_standalone(words: String, nameplate: String) -> Result<()> {
     )
     .await?;
 
-    let local_hello = svc.hello_json();
+    let local_hello = pair_hello(&svc);
     let result = async {
         ui::debug("lan pair host: waiting for a pair link");
         let mut link = tokio::time::timeout(CODE_TTL, pair_rx.recv())
@@ -432,7 +442,7 @@ pub async fn join_standalone(code: &str, name: Option<String>, nearby: bool) -> 
         ev_tx,
     )
     .await?;
-    let local_hello = svc.hello_json();
+    let local_hello = pair_hello(&svc);
     let result = async {
         let deadline = Instant::now() + CODE_TTL;
         let mut seen: BTreeSet<String> = BTreeSet::new();
