@@ -149,11 +149,24 @@ mod on {
 
     /// Real-loop publication gate: hold a built candidate before it is reported,
     /// so the gate can forget/revoke/stop its peer while the candidate exists.
-    pub fn build_hold_ms() -> u64 {
+    /// When TUNLION_TEST_BUILD_HOLD_PID is set, only that sid is held; an unset
+    /// PID keeps the original global behavior.
+    pub fn build_hold_ms(pid: &str) -> u64 {
+        let only = std::env::var("TUNLION_TEST_BUILD_HOLD_PID").ok();
+        if only.as_deref().is_some_and(|only| only != pid) {
+            return 0;
+        }
         std::env::var("TUNLION_TEST_BUILD_HOLD_MS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
+    }
+
+    /// Raw offer-first gate: suppress the automatic KnownPeer adoption that
+    /// normally races ahead of the browser's SDP, so the gate can prove the
+    /// responder path from a bare offer. Test-only; release builds never read it.
+    pub fn suppress_known_peer() -> bool {
+        std::env::var("TUNLION_TEST_SUPPRESS_KNOWN_PEER").as_deref() == Ok("1")
     }
 }
 
@@ -251,8 +264,13 @@ mod off {
     }
 
     #[inline]
-    pub fn build_hold_ms() -> u64 {
+    pub fn build_hold_ms(_pid: &str) -> u64 {
         0
+    }
+
+    #[inline]
+    pub fn suppress_known_peer() -> bool {
+        false
     }
 }
 
