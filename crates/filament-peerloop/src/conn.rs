@@ -9271,12 +9271,20 @@ mod warm_identity_tests {
     }
 
     /// What `start_direct_promote` registers, without the network: the
-    /// ephemeral pending and the promotion, gated on the lead end.
-    fn armed_promotion(conn: &mut Conn, pid: &str, role: PromoteRole, deadline: Instant) {
+    /// ephemeral pending and the promotion, gated on the lead end. Returns the
+    /// exact armed attempt so a fixture transport can carry the same immutable
+    /// identity production receives from the race.
+    fn armed_promotion(
+        conn: &mut Conn,
+        pid: &str,
+        role: PromoteRole,
+        deadline: Instant,
+    ) -> net::AttemptId {
+        let attempt = net::AttemptId::next();
         conn.direct_pending.insert(
             pid.to_string(),
             DirectPending {
-                attempt: net::AttemptId::next(),
+                attempt,
                 auth: DirectAuth::ephemeral(1),
                 race_task: None,
                 secret: (pid.to_string(), "ceremony".into()),
@@ -9293,13 +9301,13 @@ mod warm_identity_tests {
                 cancel: Arc::new(AtomicBool::new(false)),
             },
         );
-        let attempt = conn.direct_pending.get(pid).map(|pending| pending.attempt);
         let auth = conn.direct_pending.get(pid).map(|pending| pending.auth.clone());
         let mut state = PromoteState::new(role);
-        state.attempt = attempt;
+        state.attempt = Some(attempt);
         state.auth = auth;
         conn.promotions.insert(pid.to_string(), state);
         conn.gate_for_promotion(pid);
+        attempt
     }
 
     fn soon() -> Instant {
@@ -9400,7 +9408,7 @@ mod warm_identity_tests {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pid = "sid-lost";
         code_link(&mut conn, pid, Rec::new("webrtc", &log));
-        armed_promotion(&mut conn, pid, PromoteRole::Lead, Instant::now() - Duration::from_millis(1));
+        let _ = armed_promotion(&mut conn, pid, PromoteRole::Lead, Instant::now() - Duration::from_millis(1));
         let fell_back = conn.expired_direct();
         assert!(fell_back.is_empty(), "a lost race rebuilt WebRTC: {fell_back:?}");
         assert!(conn.links.contains_key(pid), "the serving link was dropped");
@@ -10026,11 +10034,22 @@ mod warm_identity_tests {
         );
         tx.send(Ev::Control(pid.to_string(), json!({ "type": "stale" })))
             .unwrap();
+        let retired_attempt = conn.links[pid].attempt;
         conn.drop_link(pid);
         conn.pump_builds();
+        let forwarded: Vec<Ev> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
-            rx.try_recv().is_err(),
+            !forwarded
+                .iter()
+                .any(|ev| matches!(ev, Ev::Control(p, _) if p == pid)),
             "a stale old-link event was forwarded after replacement"
+        );
+        assert!(
+            retired_attempt.is_none()
+                || forwarded
+                    .iter()
+                    .any(|ev| matches!(ev, Ev::AttemptDrained(a) if Some(*a) == retired_attempt)),
+            "the dropped link's drain barrier was not delivered"
         );
     }
 
@@ -11248,8 +11267,9 @@ mod warm_identity_tests {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pid = "sid-parked";
         code_link(&mut conn, pid, Rec::new("webrtc", &log));
-        armed_promotion(&mut conn, pid, PromoteRole::Follow, soon());
-        conn.stash_upgrade_standby(pid, Rec::new("quic", &log), "direct-quic");
+        let armed = armed_promotion(&mut conn, pid, PromoteRole::Follow, soon());
+        let quic = Rec::with_attempt("quic", &log, armed);
+        conn.stash_upgrade_standby(pid, quic, "direct-quic");
         conn.direct_pending.get_mut(pid).unwrap().deadline = Instant::now() - Duration::from_millis(1);
         assert!(conn.expired_direct().is_empty());
         assert!(conn.direct_pending.contains_key(pid), "the won race's pending was reaped");
@@ -11266,10 +11286,10 @@ mod warm_identity_tests {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pid = "sid-lead";
         code_link(&mut conn, pid, Rec::new("webrtc", &log));
-        armed_promotion(&mut conn, pid, PromoteRole::Lead, soon());
+        let armed = armed_promotion(&mut conn, pid, PromoteRole::Lead, soon());
         let stream = conn.transport_of(pid).unwrap(); // what a running stream_one holds
         stream.send_frame(1, 0, b"a").await.unwrap();
-        let quic = Rec::new("quic", &log);
+        let quic = Rec::with_attempt("quic", &log, armed);
         conn.stash_upgrade_standby(pid, quic.clone(), "direct-quic");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!conn.link(pid).unwrap().direct, "the serving link changed before the answer");
@@ -11307,13 +11327,13 @@ mod warm_identity_tests {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pid = "sid-follow";
         code_link(&mut conn, pid, Rec::new("webrtc", &log));
-        armed_promotion(&mut conn, pid, PromoteRole::Follow, soon());
+        let armed = armed_promotion(&mut conn, pid, PromoteRole::Follow, soon());
         assert!(
             conn.on_promote_control(pid, &handoff::message(handoff::PATH_PROMOTE))
                 .await
         );
         assert!(rec_log(&log).is_empty(), "answered before it had a direct link");
-        let quic = Rec::new("quic", &log);
+        let quic = Rec::with_attempt("quic", &log, armed);
         conn.stash_upgrade_standby(pid, quic.clone(), "direct-quic");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(rec_log(&log), vec!["webrtc:path-promoted"]);
@@ -11330,11 +11350,10 @@ mod warm_identity_tests {
         conn.direct_pending.get_mut(pid).unwrap().deadline = Instant::now() - Duration::from_millis(1);
         assert!(conn.expired_direct().is_empty());
         assert!(conn.links.contains_key(pid), "the peer had no link before its successor");
-        if let Some(attempt) = t.attempt_id() {
-            if let Some(pending) = conn.direct_pending.get_mut(pid) {
-                pending.attempt = attempt;
-            }
-        }
+        assert!(conn
+            .direct_pending
+            .get(pid)
+            .is_some_and(|pending| pending.attempt == t.attempt_id().unwrap()));
         conn.adopt_direct(&p, t, route);
         let l = conn.link(pid).unwrap();
         assert!(l.direct && !l.trusted);
@@ -11380,9 +11399,9 @@ mod warm_identity_tests {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pid = "sid-declined";
         code_link(&mut conn, pid, Rec::new("webrtc", &log));
-        armed_promotion(&mut conn, pid, PromoteRole::Lead, soon());
+        let armed = armed_promotion(&mut conn, pid, PromoteRole::Lead, soon());
         let stream = conn.transport_of(pid).unwrap();
-        let quic = Rec::new("quic", &log);
+        let quic = Rec::with_attempt("quic", &log, armed);
         conn.stash_upgrade_standby(pid, quic, "direct-quic");
         tokio::time::sleep(Duration::from_millis(100)).await;
         let held = {
@@ -11424,9 +11443,9 @@ mod warm_identity_tests {
         let pid = "sid-dead";
         let webrtc = Rec::new("webrtc", &log);
         code_link(&mut conn, pid, webrtc.clone());
-        armed_promotion(&mut conn, pid, PromoteRole::Lead, soon());
+        let armed = armed_promotion(&mut conn, pid, PromoteRole::Lead, soon());
         webrtc.alive.store(false, Ordering::Relaxed);
-        conn.stash_upgrade_standby(pid, Rec::new("quic", &log), "direct-quic");
+        conn.stash_upgrade_standby(pid, Rec::with_attempt("quic", &log, armed), "direct-quic");
         let readied = std::iter::from_fn(|| rx.try_recv().ok())
             .any(|ev| matches!(ev, Ev::DirectReady(ref p, _, _) if p == pid));
         assert!(readied, "the winner was not adopted");
