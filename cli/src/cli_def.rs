@@ -375,6 +375,11 @@ pub(crate) enum Cmd {
         /// modes do not diverge.
         #[arg(long, value_name = "WAY")]
         via: Option<String>,
+        /// Use the local network only, with no server: a plain pairing, no
+        /// owner certificate. Both devices must be on the same multicast or
+        /// broadcast LAN.
+        #[arg(long)]
+        nearby: bool,
         /// Withdraw an outstanding invitation so it can never be claimed
         /// again, here or by the running receiver: the name it was made for,
         /// or its id from `tunlion devices --json`. At a terminal with no name,
@@ -415,6 +420,11 @@ pub(crate) enum Cmd {
         /// Owner device display name when several owners are present.
         #[arg(long)]
         to: Option<String>,
+        /// Use the local network only, with no server: a plain pairing, no
+        /// owner certificate. Requires the code; never dials a nearby beacon
+        /// without this flag when stdin is not a terminal.
+        #[arg(long)]
+        nearby: bool,
     },
     /// Tell the owner you are shutting down so it frees your slot now.
     /// Advisory only: if the owner is unreachable, the offline budget still

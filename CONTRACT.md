@@ -376,7 +376,13 @@ peer, and is required by the authentication order. It is not a statement that
 every connection or every platform always starts on WebRTC.
 
 ### Code ceremony frames (`pake-msg`, `pake-confirm`)
-The SPAKE2 code ceremony rides the opaque `signal` relay, which may lose a
+The SPAKE2 code ceremony rides the opaque `signal` relay for a server-backed
+pairing, and the same frames ride a local QUIC stream (`filament-pair/1`,
+`docs/protocol/local-discovery.md` section 7.1) when both peers are on the
+same link. The frame bodies, re-send rules and confirmation MAC are identical;
+the local carrier's stream is reliable, so each frame is sent once. The
+carrier adds a post-confirmation `pair-name` frame for the display name only.
+The `signal` relay may lose a
 frame (a relay drop, a socket reconnect mid-ceremony) or deliver one twice. No
 single emit is load-bearing (C30):
 

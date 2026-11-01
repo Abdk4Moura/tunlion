@@ -1299,6 +1299,7 @@ pub(crate) async fn async_main() -> Result<()> {
             out,
             via,
             withdraw,
+            nearby,
         } => {
             // The inverse of minting lives on the verb that mints: `add` hands
             // out an invitation, `add --withdraw` takes it back.
@@ -1537,6 +1538,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     allow,
                     enrol_ttl,
                     quick,
+                    nearby,
                 )
                 .await
             } else {
@@ -1551,7 +1553,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 if args_given && code.is_none() && word.is_none() && !crate::interactive_allowed() {
                     return Err(add_code_needs_people(name.as_deref()));
                 }
-                pair_cmd(&server, code, name, word, relay, false, allow, None, false).await
+                pair_cmd(&server, code, name, word, relay, false, allow, None, false, nearby).await
             }
         }
         Cmd::Join {
@@ -1560,6 +1562,7 @@ pub(crate) async fn async_main() -> Result<()> {
             invite_fd,
             name,
             to,
+            nearby,
         } => {
             // ONE VERB FOR THE PERSON HOLDING THE THING. They were handed a code
             // or a file; making them know WHICH, and then pick between `join
@@ -1589,13 +1592,16 @@ pub(crate) async fn async_main() -> Result<()> {
                     crate::bail_usage!("{msg}");
                 }
             }
+            if nearby && (invite_file.is_some() || invite_fd.is_some()) {
+                crate::bail_usage!("--nearby takes a pairing code; an invitation is claimed on the server path");
+            }
             if let Some(code) = code {
                 if invite_file.is_some() || invite_fd.is_some() {
                     crate::bail_usage!("give a code or an invitation file, not both");
                 }
                 // Same ceremony `add <code>` runs: accepting a code confers no
                 // membership by itself, the offering side decides that.
-                pair_cmd(&server, Some(code), name, None, relay, false, Vec::new(), None, false).await
+                pair_cmd(&server, Some(code), name, None, relay, false, Vec::new(), None, false, nearby).await
             } else if invite_file.is_none() && invite_fd.is_none() && ui_caps.interactive {
                 // Nothing given at a terminal: ONE prompt that takes a code, an
                 // invitation, or a file path, and runs whichever it is. The

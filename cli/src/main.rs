@@ -21,6 +21,9 @@ mod authkey;
 mod ctl;
 mod lan_doctor;
 mod lan_send;
+/// Plain code pairing over the LAN, and the one-winner code state.
+mod lan_pair;
+mod pair_code;
 mod subnet_forward;
 mod diag;
 use filament_transport::direct;

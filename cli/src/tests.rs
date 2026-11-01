@@ -1062,7 +1062,7 @@ fn device_names_resolve_forgivingly_against_the_real_store() {
     // `add "pop os"` names the new device pop-os-style, kind words untouched.
     match canonicalize_cmd(Cmd::Add {
         who: Some("Travel Laptop".into()), name: None, word: None, for_: Some(String::new()),
-        allow: vec![], expires: None, reuse: None, out: None, via: None, withdraw: None,
+        allow: vec![], expires: None, reuse: None, out: None, via: None, withdraw: None, nearby: false,
     }).unwrap() {
         Cmd::Add { who, for_, .. } => {
             assert_eq!(who.as_deref(), Some("travel-laptop"));
