@@ -1573,9 +1573,11 @@ mod tests {
         let Some(Ev::DirectReady(_, dtrans, _)) = drx.recv().await else { panic!("no dialer ready") };
         dtrans.send_control(&json!({"type": "file-offer", "probe": 1})).await.unwrap();
         // Acceptor: the link event comes first, and nothing else until announce.
-        let Some(Ev::Lan(LanEvent::Linked { transport: at, pid, .. })) = tokio::time::timeout(Duration::from_secs(8), arx.recv()).await.unwrap() else {
+        let Some(Ev::Lan(LanEvent::Linked { transport: at, pid, attempt, .. })) = tokio::time::timeout(Duration::from_secs(8), arx.recv()).await.unwrap() else {
             panic!("acceptor did not link")
         };
+        let expected_source = at.transport().source_id().expect("LAN primary has a source");
+        assert_eq!(at.transport().attempt_id(), Some(attempt));
         assert!(
             tokio::time::timeout(Duration::from_millis(500), arx.recv()).await.is_err(),
             "a frame was delivered before the link was announced"
@@ -1583,9 +1585,15 @@ mod tests {
         at.announce(&atx, |t| Ev::DirectReady(pid.clone(), t, ROUTE_LAN));
         assert!(matches!(arx.recv().await, Some(Ev::DirectReady(..))), "the ready event comes first");
         match tokio::time::timeout(Duration::from_secs(5), arx.recv()).await.unwrap() {
-            Some(Ev::Control(p, v)) => {
+            Some(Ev::Sourced { pid: envelope_pid, source, inner }) => {
+                assert_eq!(envelope_pid, pid);
+                assert_eq!(source, expected_source, "the frame keeps its announced source");
+                let Ev::Control(p, v) = *inner else {
+                    panic!("the sourced frame is not a control frame")
+                };
                 assert_eq!(p, pid);
                 assert_eq!(v["type"], "file-offer");
+                assert_eq!(v["probe"], 1);
             }
             other => panic!("expected the peer's frame, got {other:?}"),
         }

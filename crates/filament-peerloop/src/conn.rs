@@ -12174,7 +12174,7 @@ mod warm_identity_tests {
         let source = t.source_id().expect("fixture transport has a source");
         conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", t));
         conn.bind_active(pid);
-        let (queued, queue) = tokio::sync::mpsc::unbounded_channel();
+        let (queue, queued) = tokio::sync::mpsc::unbounded_channel();
         queue
             .send(Ev::Sourced {
                 pid: pid.into(),
@@ -12221,7 +12221,7 @@ mod warm_identity_tests {
         let old_source = old.source_id().expect("fixture transport has a source");
         conn.links.insert(pid.into(), delegated_link(pid, old));
         conn.bind_active(pid);
-        let (queued, queue) = tokio::sync::mpsc::unbounded_channel();
+        let (queue, queued) = tokio::sync::mpsc::unbounded_channel();
         queue
             .send(Ev::Sourced {
                 pid: pid.into(),
@@ -12258,7 +12258,7 @@ mod warm_identity_tests {
         let pid = "sid-leave-immediate";
         conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", Rec::new("webrtc", &log)));
         conn.bind_active(pid);
-        let (queued, _queue) = tokio::sync::mpsc::unbounded_channel();
+        let (_queue, queued) = tokio::sync::mpsc::unbounded_channel();
         conn.link_events.insert(
             pid.into(),
             LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
@@ -12278,7 +12278,7 @@ mod warm_identity_tests {
         conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", FakeQuic::flowing()));
         conn.bind_active(pid);
         let source = net::SourceId::next();
-        let (queued, queue) = tokio::sync::mpsc::unbounded_channel();
+        let (queue, queued) = tokio::sync::mpsc::unbounded_channel();
         queue
             .send(Ev::Sourced {
                 pid: pid.into(),
@@ -12331,7 +12331,7 @@ mod warm_identity_tests {
         let source = t.source_id().expect("fixture transport has a source");
         conn.links.insert(pid.into(), delegated_link(pid, t));
         conn.bind_active(pid);
-        let (queued, queue) = tokio::sync::mpsc::unbounded_channel();
+        let (queue, queued) = tokio::sync::mpsc::unbounded_channel();
         queue
             .send(Ev::Sourced {
                 pid: pid.into(),
@@ -12380,7 +12380,7 @@ mod warm_identity_tests {
         let source = t.source_id().expect("fixture transport has a source");
         conn.links.insert(pid.into(), delegated_link(pid, t));
         conn.bind_active(pid);
-        let (queued, queue) = tokio::sync::mpsc::unbounded_channel();
+        let (queue, queued) = tokio::sync::mpsc::unbounded_channel();
         queue
             .send(Ev::Sourced {
                 pid: pid.into(),
