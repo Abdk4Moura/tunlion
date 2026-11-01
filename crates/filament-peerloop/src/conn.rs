@@ -7227,40 +7227,53 @@ impl Conn {
         let Some(pid_val) = v["id"].as_str() else {
             return false;
         };
-        // A departure barrier `stage_event` admitted: the departed link's
-        // already-read events were dispatched ahead of it, and the marker is
-        // bound to that exact source. Consume it once and run the ordinary
-        // finalizer now, with its normal return value. A marker whose source is
-        // not the CURRENT link's belongs to a link replaced before this ran:
-        // the successor is newer authority, so nothing of it is touched (not
-        // even the cleanup below), and the stale marker dies here.
-        if let Some(source) = self
-            .link_events
-            .get_mut(pid_val)
-            .and_then(|events| events.departure_ready.take())
-        {
-            return if self.links.get(pid_val).map(|link| link.source) == Some(source) {
-                self.finalize_peer_left(v)
-            } else {
-                false
-            };
-        }
-        // A barrier for this exact link is already queued: its events were
-        // handed over, so the local queue is legitimately empty. A DUPLICATE
-        // room signal must not finalize on that empty queue and beat the
-        // barrier; the barrier does the drop. Checked after the ready marker
-        // (that one is the validated hand-over itself).
-        if let Some(source) = self
-            .link_events
-            .get(pid_val)
-            .and_then(|events| events.departure_pending)
-        {
-            if self.links.get(pid_val).map(|link| link.source) == Some(source) {
-                return false;
-            }
-            // The link it protected is gone or replaced: the flag dies with it.
+        // A force/revoked departure is an IMMEDIATE teardown order. It must not
+        // be swallowed by a hand-over already in flight: clear BOTH once-only
+        // markers first, so the queued barrier and the controls it carried can
+        // no longer act on this link, then fall through to the ordinary cleanup
+        // and finalizer below. Ordinary ready/pending behaviour is unchanged.
+        let forced = v["__fil_force_drop"].as_bool() == Some(true);
+        if forced {
             if let Some(events) = self.link_events.get_mut(pid_val) {
+                events.departure_ready = None;
                 events.departure_pending = None;
+            }
+        } else {
+            // A departure barrier `stage_event` admitted: the departed link's
+            // already-read events were dispatched ahead of it, and the marker is
+            // bound to that exact source. Consume it once and run the ordinary
+            // finalizer now, with its normal return value. A marker whose source
+            // is not the CURRENT link's belongs to a link replaced before this
+            // ran: the successor is newer authority, so nothing of it is touched
+            // (not even the cleanup below), and the stale marker dies here.
+            if let Some(source) = self
+                .link_events
+                .get_mut(pid_val)
+                .and_then(|events| events.departure_ready.take())
+            {
+                return if self.links.get(pid_val).map(|link| link.source) == Some(source) {
+                    self.finalize_peer_left(v)
+                } else {
+                    false
+                };
+            }
+            // A barrier for this exact link is already queued: its events were
+            // handed over, so the local queue is legitimately empty. A DUPLICATE
+            // room signal must not finalize on that empty queue and beat the
+            // barrier; the barrier does the drop. Checked after the ready marker
+            // (that one is the validated hand-over itself).
+            if let Some(source) = self
+                .link_events
+                .get(pid_val)
+                .and_then(|events| events.departure_pending)
+            {
+                if self.links.get(pid_val).map(|link| link.source) == Some(source) {
+                    return false;
+                }
+                // The link it protected is gone or replaced: the flag dies with it.
+                if let Some(events) = self.link_events.get_mut(pid_val) {
+                    events.departure_pending = None;
+                }
             }
         }
         let pid = pid_val.to_string();
@@ -7302,7 +7315,6 @@ impl Conn {
         // after the delivery-ack and its data channel still reads as flowing
         // (`link_flowing` counts the last data byte for 3 s). Promotion now
         // lets small transfers finish on WebRTC, so this is the common case.
-        let forced = v["__fil_force_drop"].as_bool() == Some(true);
         let defer_disabled = test_hooks::no_defer();
         if !forced && !delegated && !defer_disabled && !self.recv_done && self.link_flowing(&pid) {
             // Idempotent: first peer-left for this sid records the original
@@ -12692,6 +12704,112 @@ mod warm_identity_tests {
             conn.stage_event(first).is_none(),
             "an over-budget hand-over prefix was processed after the drop"
         );
+    }
+
+    /// A force/revoked order arriving while a hand-over barrier is QUEUED must
+    /// tear down immediately: both markers are cleared, the link drops, and the
+    /// already-handed-over control and the barrier itself fail the source gate.
+    #[tokio::test]
+    async fn a_forced_departure_beats_a_pending_barrier() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-force-after-pending";
+        let t = Rec::new("webrtc", &log);
+        let source = t.source_id().expect("fixture transport has a source");
+        conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", t));
+        conn.bind_active(pid);
+        let (queue, queued) = tokio::sync::mpsc::unbounded_channel();
+        queue
+            .send(Ev::Sourced {
+                pid: pid.into(),
+                source,
+                inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
+            })
+            .unwrap();
+        conn.link_events.insert(
+            pid.into(),
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
+        );
+
+        assert!(!conn.on_peer_left(&json!({ "id": pid })));
+        assert!(
+            conn.link_events.get(pid).is_some_and(|e| e.departure_pending == Some(source)),
+            "the barrier was not recorded as pending"
+        );
+        assert!(
+            conn.on_peer_left(&json!({ "id": pid, "__fil_force_drop": true })),
+            "a forced departure did not run the ordinary finalizer immediately"
+        );
+        assert!(!conn.links.contains_key(pid), "a forced departure was deferred behind its barrier");
+        assert!(!conn.link_events.contains_key(pid), "the forced departure kept the link's markers");
+        let control = rx.try_recv().expect("the hand-over prefix is missing");
+        assert!(
+            conn.stage_event(control).is_none(),
+            "an old control was processed after the forced drop"
+        );
+        let barrier = rx.try_recv().expect("the barrier is missing");
+        assert!(
+            matches!(&barrier, Ev::Sourced { inner, .. } if matches!(inner.as_ref(), Ev::PeerLeft(_))),
+            "the queued follow-up was not the barrier"
+        );
+        assert!(
+            conn.stage_event(barrier).is_none(),
+            "the queued barrier survived the forced drop"
+        );
+        let after = drained(&mut rx);
+        assert!(
+            after.iter().all(|e| matches!(e, Ev::AttemptDrained(_))),
+            "unexpected events after the forced drop"
+        );
+    }
+
+    /// A force/revoked order arriving between `stage_event` validating the
+    /// barrier (ready marker set) and the caller invoking `on_peer_left` must
+    /// still be immediate; the validated marker cannot resurrect the drop.
+    #[tokio::test]
+    async fn a_forced_departure_beats_an_already_validated_barrier() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-force-after-ready";
+        let t = Rec::new("webrtc", &log);
+        let source = t.source_id().expect("fixture transport has a source");
+        conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", t));
+        conn.bind_active(pid);
+        let (queue, queued) = tokio::sync::mpsc::unbounded_channel();
+        queue
+            .send(Ev::Sourced {
+                pid: pid.into(),
+                source,
+                inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
+            })
+            .unwrap();
+        conn.link_events.insert(
+            pid.into(),
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
+        );
+
+        assert!(!conn.on_peer_left(&json!({ "id": pid })));
+        let _ = rx.try_recv().expect("the queued control was not handed over");
+        let payload = match conn.stage_event(rx.try_recv().expect("no barrier")) {
+            Some((Ev::PeerLeft(payload), _)) => payload,
+            _ => panic!("the barrier was not dispatched as a room departure"),
+        };
+        assert!(
+            conn.link_events.get(pid).is_some_and(|e| e.departure_ready == Some(source)),
+            "the validated barrier did not record its marker"
+        );
+
+        assert!(
+            conn.on_peer_left(&json!({ "id": pid, "__fil_force_drop": true })),
+            "a forced departure behind a validated barrier was not immediate"
+        );
+        assert!(!conn.links.contains_key(pid), "the validated marker blocked the forced drop");
+        assert!(!conn.link_events.contains_key(pid), "the forced departure kept the validated marker");
+        assert!(
+            !conn.on_peer_left(&payload),
+            "the validated barrier re-reported a link the forced drop already removed"
+        );
+        assert!(!conn.links.contains_key(pid), "the forced drop left the link behind");
     }
 
     /// The serving link died while the race ran: there is nothing to hand off
