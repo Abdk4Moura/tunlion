@@ -752,6 +752,7 @@ async fn a_bad_candidate_is_retried_then_the_right_host_succeeds() {
     // fills in the daemon/default port; mirror that on both fixture sides.
     let peer_hello = pair_hello(&peer_service);
     let host_hello = pair_hello(&host_service);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let host_task = tokio::spawn(async move {
         let mut host = tokio::time::timeout(Duration::from_secs(10), host_pair_rx.recv())
             .await
@@ -759,7 +760,14 @@ async fn a_bad_candidate_is_retried_then_the_right_host_succeeds() {
             .expect("the right host's pair channel is open");
         // Production derives the PAKE password from `split_code`, so this
         // fixture must pass the same normalized bytes as the joiner below.
-        run_ceremony(&mut host, "brave-otter", "3141", "host", &host_hello).await
+        let ceremony = run_ceremony(&mut host, "brave-otter", "3141", "host", &host_hello).await;
+        // `run_ceremony` does not await the post-store acknowledgement. Keep
+        // this fixture's last `PairLink`, and its QUIC connection, alive until
+        // the joiner has finished reading every final frame; otherwise this
+        // task's return can drop the connection mid-read and turn a valid
+        // ceremony into a spurious retry. The sender drops on any joiner panic.
+        let _ = release_rx.await;
+        ceremony
     });
 
     let second = join_candidate(
@@ -773,9 +781,9 @@ async fn a_bad_candidate_is_retried_then_the_right_host_succeeds() {
     match second {
         JoinCandidate::Paired { secret, .. } => {
             assert!(!secret.is_empty());
-            // The production caller persists and then acknowledges; the host
-            // ceremony waits for that acknowledgement before returning.
-            let _ = stored_ack(&mut peer).await;
+            // The joiner has read the host's final frames and owns no more of
+            // them, so the fixture host may now return and release its link.
+            let _ = release_tx.send(());
         }
         JoinCandidate::Retry(reason) => panic!("the right host was retried away: {reason}"),
     }
