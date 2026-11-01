@@ -8925,6 +8925,7 @@ mod warm_identity_tests {
     async fn warm_hold_tick_keeps_a_live_direct_link_named_by_petname() {
         let host = Arc::new(TestHost {
             devices: vec![("x".to_string(), "s3cret".to_string())],
+            ..Default::default()
         });
         let channel = host.channel_of("s3cret");
 
@@ -10761,6 +10762,7 @@ mod warm_identity_tests {
     async fn forgetting_one_peer_leaves_unrelated_peers_building() {
         let host = Arc::new(TestHost {
             devices: vec![("a".into(), "secret-a2".into())],
+            ..Default::default()
         });
         let (mut conn, _far, _rx) = test_conn_with_host(host).await;
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -10798,6 +10800,7 @@ mod warm_identity_tests {
     async fn a_re_pair_supersedes_an_older_deferred_retry() {
         let host = Arc::new(TestHost {
             devices: vec![("dev".into(), "new-secret".into())],
+            ..Default::default()
         });
         let (mut conn, _far, _rx) = test_conn_with_host(host).await;
         let pid = "sid-repair";
@@ -10957,6 +10960,7 @@ mod warm_identity_tests {
     async fn a_forget_does_not_kill_a_newer_authorized_build() {
         let host = Arc::new(TestHost {
             devices: vec![("dev".into(), "new-secret".into())],
+            ..Default::default()
         });
         let (mut conn, _far, _rx) = test_conn_with_host(host).await;
         let pid = "sid-race-forget";
@@ -11128,6 +11132,7 @@ mod warm_identity_tests {
     async fn a_newer_current_store_device_attempt_survives_old_link_forget() {
         let host = Arc::new(TestHost {
             devices: vec![("dev".into(), "new-secret".into())],
+            ..Default::default()
         });
         let (mut conn, _far, _rx) = test_conn_with_host(host).await;
         let pid = "sid-new-device-successor";
@@ -11527,6 +11532,7 @@ mod warm_identity_tests {
     async fn newer_same_pid_probe_and_promotion_survive_old_retirement() {
         let host = Arc::new(TestHost {
             devices: vec![("dev".into(), "new-secret".into())],
+            ..Default::default()
         });
         let (mut conn, _far, _rx) = test_conn_with_host(host).await;
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -11795,6 +11801,7 @@ mod warm_identity_tests {
     async fn lan_reservation_adopts_once_and_duplicate_is_harmless() {
         let host = Arc::new(TestHost {
             devices: vec![("dev".into(), "secret".into())],
+            ..Default::default()
         });
         let (mut conn, _far, _rx) = test_conn_with_host(host).await;
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -11912,6 +11919,7 @@ mod warm_identity_tests {
                 ("dev".into(), "secret".into()),
                 ("other".into(), "other-secret".into()),
             ],
+            ..Default::default()
         });
         let (mut conn, _far, _rx) = test_conn_with_host(host).await;
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));

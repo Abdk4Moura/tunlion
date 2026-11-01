@@ -278,6 +278,10 @@ impl HostServices for CoreHost {
         self.store.devices_load()
     }
 
+    fn device_record_revoked(&self, name: &str) -> bool {
+        self.store.device_record_revoked(name)
+    }
+
     fn is_self_uid(&self, my_uid: &str, peer_uid: Option<&str>) -> bool {
         peer_uid == Some(my_uid)
     }
