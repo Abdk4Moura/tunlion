@@ -38,18 +38,24 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            cli/target
-          key: app-cli-${{ matrix.target }}-${{ hashFiles('cli/Cargo.lock') }}
+            target
+          key: app-cli-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
       - run: |
           rustup target add ${{ matrix.target }}
           cargo install cargo-ndk --locked --version 4.1.2
       - name: Build the CLI from this app revision
         working-directory: cli
+        env:
+          # `cli/` is a member of the root workspace, so cargo writes the
+          # artifact under the workspace `target/`, not `cli/target/`. Name it
+          # explicitly so both ABIs copy from the directory cargo actually used.
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           cargo ndk --platform 26 -t ${{ matrix.abi }} build --release --locked --bin tunlion
-          mkdir -p ../android-cli
-          cp target/${{ matrix.target }}/release/tunlion ../android-cli/libtunlion_cli.so
+          mkdir -p "$GITHUB_WORKSPACE/android-cli"
+          cp "$GITHUB_WORKSPACE/target/${{ matrix.target }}/release/tunlion" \
+            "$GITHUB_WORKSPACE/android-cli/libtunlion_cli.so"
       - uses: actions/upload-artifact@v4
         with:
           name: app-cli-${{ matrix.abi }}
