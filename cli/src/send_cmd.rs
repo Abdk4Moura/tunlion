@@ -1238,6 +1238,10 @@ pub(crate) async fn send_cmd(
                                 continue;
                             }
                             let pid = p["id"].as_str().unwrap_or_default().to_string();
+                            // Same claim-before-establish rule as the KnownPeer
+                            // arm: an in-flight candidate keeps its answered
+                            // channel and a live-but-unbound link is announced.
+                            conn.note_binding(&pid, (name.clone(), secret.clone()));
                             conn.start_direct(&pid, name, secret).await;
                             conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
                             if let Some(l) = conn.link_mut(&pid) {
@@ -1381,6 +1385,15 @@ pub(crate) async fn send_cmd(
                         // maybe_adopt->establish below skips the WebRTC offer
                         // until the budget expires (then it falls back).
                         let (n, sec) = (n.clone(), sec.clone());
+                        // Declare the store-authorized binding BEFORE the
+                        // establish, not by patching the Link afterwards. A
+                        // candidate that is already building (an inbound
+                        // responder the peer is answering right now) must
+                        // inherit this claim instead of being retired by a
+                        // rival outbound build; a LIVE but unbound link is
+                        // re-announced with it. Patching after the fact only
+                        // reaches a link that already exists.
+                        conn.note_binding(&pid, (n.clone(), sec.clone()));
                         conn.start_direct(&pid, &n, &sec).await;
                         conn.maybe_adopt(&v, true).await?;
                         if let Some(l) = conn.link_mut(&pid) {

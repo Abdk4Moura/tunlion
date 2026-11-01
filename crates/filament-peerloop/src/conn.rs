@@ -1762,7 +1762,10 @@ pub fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn Transpo
             identity_known: l.trusted || l.identity_binding == BindingStrength::Proven,
             lan_device_name: lan_device_name.as_deref(),
             has_transport: l.transport.is_some(),
-            alive: l.transport.as_ref().is_some_and(|t| t.is_alive()),
+            alive: l
+                .transport
+                .as_ref()
+                .is_some_and(|t| t.is_alive() && !t.is_dead()),
             direct: l.direct,
             idle_ms: l.transport.as_ref().map_or(u64::MAX, |t| t.idle_ms()),
             age_ms: l.established_at.map(|t| t.elapsed().as_millis() as u64),
@@ -2270,6 +2273,14 @@ impl Conn {
                 return Ok(false);
             }
             self.establish_as(v.clone(), None).await?;
+        } else if let Some(binding) = self.pending_bindings.get(&peer_id).cloned() {
+            // The establish below is skipped because a link already exists, so
+            // this is the LAST chance to act on the claim: a live link with no
+            // binding yet cannot claim the target slot and would otherwise
+            // never be announced again. Reuse it -- bind the store-authorized
+            // device and re-announce the transport it serves, with that
+            // transport's own immutable source. No-op once the link is bound.
+            self.claim_live_unbound_link(&peer_id, Some(binding));
         }
         // #28: a deferred-active slot is claimable. When the active link got a
         // peer-left but is still flowing, we keep `active` pointing at it (so a
@@ -2919,6 +2930,14 @@ impl Conn {
                  keeping its live link ({})",
                 self.link_kind(&peer_id)
             ));
+            // Reuse, do not strand: a live link that has no binding yet cannot
+            // claim the target slot, and a refusal is the LAST establish that
+            // peer will get. Claim the store-authorized binding onto THIS link
+            // and announce the transport it already serves, with that
+            // transport's own immutable source, so the ordinary ChannelReady
+            // path takes the slot. Nothing is reattributed: the announcement
+            // names the serving Arc, never a replaced one.
+            self.claim_live_unbound_link(&peer_id, carried_secret);
             return Ok(None);
         }
         if self.builds.contains_key(&peer_id) {
@@ -2927,12 +2946,20 @@ impl Conn {
                 .get(&peer_id)
                 .is_some_and(|state| self.authorized_replacement(&state.binding, &carried_secret));
             if !supersedes {
+                // Join, do not retire: the candidate already building is the
+                // one the peer can answer (it may carry that very offer), and a
+                // binding claim is authorization, not a new negotiation.
+                // Retiring it here deleted the only channel that could carry
+                // the answer while the replacement waited for a readiness the
+                // peer never sent -- it still held the link it had answered.
+                self.claim_binding_on_pending_build(&peer_id, carried_secret);
                 return Ok(None);
             }
             self.retire_build(&peer_id);
         }
         if let Some((plan, _)) = self.build_deferred.get(&peer_id) {
             if !self.authorized_replacement(&plan.carried_secret, &carried_secret) {
+                self.claim_binding_on_pending_build(&peer_id, carried_secret);
                 return Ok(None);
             }
             self.retire_build(&peer_id);
@@ -3705,24 +3732,104 @@ impl Conn {
     /// A different binding the store still authorizes is a real re-pair and may
     /// supersede an older in-flight/deferred intent for the same pid. Any other
     /// case is a duplicate establish and is deduped.
+    ///
+    /// A candidate that has NO binding yet is not stale authority: it is the
+    /// candidate the peer may be answering at that moment, and a binding claim
+    /// is an authorization fact, not a new negotiation. Retiring it here is the
+    /// cross-dial hang: the outbound fallback's claim retired the inbound
+    /// responder candidate that carried the peer's offer, and the replacement
+    /// then waited for a readiness the peer never sent, because the peer still
+    /// held the link it had already answered.
     fn authorized_replacement(
         &self,
         current: &Option<(String, String)>,
         incoming: &Option<(String, String)>,
     ) -> bool {
-        let Some((_, new)) = incoming else {
+        let Some((name, new)) = incoming else {
             return false;
         };
-        if new.is_empty()
-            || self.revoked_bindings.contains(new)
-            || !self.store_holds_binding(new)
-        {
+        if !self.binding_authorized(name, new) {
             return false;
         }
         match current {
             Some((_, old)) => old != new,
-            None => true,
+            None => false,
         }
+    }
+
+    /// The current device store is the authority for a binding. A hint, a stale
+    /// envelope or an arbitrary string is not enough, and a revoked or
+    /// forgotten secret never authorizes anything (it stays fail-closed). The
+    /// durable record revocation is checked too: `devices_load` deliberately
+    /// retains revoked rows with their pair secret until the next sweep.
+    fn binding_authorized(&self, name: &str, secret: &str) -> bool {
+        !secret.is_empty()
+            && !self.revoked_bindings.contains(secret)
+            && !self.host.device_record_revoked(name)
+            && self.store_holds_binding(secret)
+    }
+
+    /// Keep a store-authorized binding claim on the candidate that is already
+    /// building instead of minting a rival generation for the same pid.
+    ///
+    /// `apply_built_peer` reads `pending_bindings` at apply time, so recording
+    /// it here is enough for the retained candidate to install bound to the
+    /// claimed device. A DIFFERENT claim is never overwritten: that is a re-pair
+    /// and takes the supersede path instead.
+    fn claim_binding_on_pending_build(
+        &mut self,
+        peer_id: &str,
+        carried: Option<(String, String)>,
+    ) {
+        let Some(binding) = carried.filter(|(name, secret)| self.binding_authorized(name, secret)) else {
+            return;
+        };
+        if self
+            .pending_bindings
+            .get(peer_id)
+            .is_some_and(|held| held.1 != binding.1)
+        {
+            return;
+        }
+        if let Some(state) = self.builds.get_mut(peer_id) {
+            if state.binding.is_none() {
+                state.binding = Some(binding.clone());
+            }
+        }
+        if let Some((plan, _)) = self.build_deferred.get_mut(peer_id) {
+            if plan.carried_secret.is_none() {
+                plan.carried_secret = Some(binding.clone());
+            }
+        }
+        self.pending_bindings.insert(peer_id.to_string(), binding);
+    }
+
+    /// Bind a LIVE, non-direct link that carries no binding yet to a
+    /// store-authorized pair secret, then re-announce the transport it already
+    /// serves, tagged with that transport's own immutable source.
+    ///
+    /// This is the reuse half of the cross-dial fix: refusing an establish must
+    /// not leave behind a live-but-unclaimable link. Deliberately narrow -- a
+    /// link that already holds a binding is left untouched (so a daemon's
+    /// steady roster ticks never re-offer), and a direct link's binding stays
+    /// owned by its attempt, never claimed here.
+    fn claim_live_unbound_link(&mut self, peer_id: &str, carried: Option<(String, String)>) {
+        let Some(binding) = carried.filter(|(name, secret)| self.binding_authorized(name, secret)) else {
+            return;
+        };
+        let Some(link) = self.links.get(peer_id) else {
+            return;
+        };
+        if link.direct || link.lan_binding.is_some() || link.expected_secret.is_some() {
+            return;
+        }
+        let Some(t) = link.transport.as_ref().filter(|t| !t.is_dead()).cloned() else {
+            return;
+        };
+        if let Some(link) = self.links.get_mut(peer_id) {
+            link.expected_secret = Some(binding);
+        }
+        let _ = self.tx.send(Ev::sourced_channel_ready(peer_id.to_string(), t));
     }
 
     /// True when this build generation is no longer allowed to run or install.
@@ -13293,6 +13400,206 @@ mod warm_identity_tests {
             .any(|ev| matches!(ev, Ev::DirectReady(ref p, _, _) if p == pid));
         assert!(readied, "the winner was not adopted");
         assert!(rec_log(&log).is_empty(), "a handoff was attempted over a dead path");
+    }
+
+    /// Cross-dial regression: an inbound WebRTC candidate for the current pair
+    /// secret must keep the channel the peer is answering, and a redundant
+    /// outbound establish must not delete it or strand the live serving link.
+    ///
+    /// Deterministic: the candidate/install states are constructed directly, so
+    /// no ICE, STUN or timing is involved. What is asserted is the scheduling
+    /// rule and the readiness gate, not a network race.
+    #[tokio::test]
+    async fn a_binding_claim_joins_the_answered_candidate_and_reannounces_the_serving_link() {
+        let host = Arc::new(TestHost {
+            devices: vec![("boxb".to_string(), "pair-secret".to_string())],
+            ..TestHost::default()
+        });
+        let (mut conn, _far, mut rx) = test_conn_with_host(host).await;
+        // Keep generated intents above the generations this test names by hand,
+        // exactly as the monotonic allocator does in production.
+        conn.next_gen = 100;
+        let pid = "sid-b";
+        let info = json!({ "id": pid, "name": "boxb", "uid": "uid-b" });
+
+        // 1. The inbound responder candidate the peer is answering: it is
+        //    building and carries no binding yet.
+        let gen1: u32 = 11;
+        conn.current_intent.insert(pid.to_string(), gen1);
+        conn.builds.insert(pid.to_string(), build_state(gen1));
+        conn.note_binding(pid, ("boxb".into(), "pair-secret".into()));
+        let plan = conn
+            .prepare_build(info.clone(), Some(true), std::panic::Location::caller(), Replace::NeverLive)
+            .expect("prepare");
+        assert!(plan.is_none(), "the binding claim minted a rival candidate");
+        assert_eq!(conn.current_intent[pid], gen1, "the answered candidate was retired");
+        assert_eq!(
+            conn.builds[pid].binding.as_ref().map(|(_, s)| s.as_str()),
+            Some("pair-secret"),
+            "the retained candidate did not take the claim"
+        );
+
+        // 2. That candidate installs: live transport, active target, but its
+        //    readiness was already consumed while it was still unbound.
+        conn.builds.clear();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let serving = Rec::new("serving", &log);
+        let serving_arc: Arc<dyn Transport> = serving.clone();
+        let serving_source = serving.source.expect("fixture source");
+        let mut link = relay_link(pid, "boxb", "boxb", serving_arc.clone());
+        link.source = serving_source;
+        link.expected_secret = None;
+        conn.links.insert(pid.to_string(), link);
+        conn.active = Some(pid.to_string());
+
+        // A redundant known-target adoption on that live link reuses it: the
+        // establish is skipped (a link exists), so the claim must land HERE and
+        // the serving transport must be re-announced with its own immutable
+        // source, or the target slot can never be taken.
+        let adopted = conn
+            .maybe_adopt(&json!({ "id": pid, "name": "boxb", "uid": "uid-b" }), true)
+            .await
+            .expect("adopt");
+        assert!(adopted, "the live target was not adopted");
+        assert_eq!(
+            conn.links[pid].expected_secret.as_ref().map(|(_, s)| s.as_str()),
+            Some("pair-secret"),
+            "the live serving link never took the claim"
+        );
+        match conn.stage_event(rx.try_recv().expect("the serving link was not re-announced")) {
+            Some((Ev::ChannelReady(got, t), Some(seen))) => {
+                assert_eq!(got, pid);
+                assert!(Arc::ptr_eq(&t, &serving_arc), "a different transport was announced");
+                assert_eq!(seen, serving_source, "readiness lost its build source");
+            }
+            _ => panic!("the source-tagged readiness of the serving link was rejected"),
+        }
+        // A second claim is a no-op: an already-bound serving link is never
+        // re-announced, so steady roster ticks cannot re-offer on it.
+        let plan = conn
+            .prepare_build(info.clone(), Some(true), std::panic::Location::caller(), Replace::NeverLive)
+            .expect("prepare");
+        assert!(plan.is_none(), "a redundant establish beat a live serving link");
+        assert!(rx.try_recv().is_err(), "a bound serving link was re-announced");
+        // The same Arc keeps serving, and it is still the active target.
+        conn.mark_ready(pid, &serving_arc, false);
+        assert!(conn.links[pid]
+            .transport
+            .as_ref()
+            .is_some_and(|t| Arc::ptr_eq(t, &serving_arc)));
+        assert!(conn.is_active(pid));
+        serving_arc.send_control(&json!({ "type": "ping" })).await.unwrap();
+        assert!(rec_log(&log).contains(&"serving:ping".to_string()));
+
+        // 3. A concurrent redundant outbound candidate completes with the SAME
+        //    authorized binding: it must not replace the live serving Arc.
+        let redundant_source = net::SourceId::next();
+        let peer = net::Peer::connect(
+            pid.to_string(),
+            conn.my_uid.clone(),
+            true,
+            Vec::new(),
+            false,
+            conn.sio.clone(),
+            conn.tx.clone(),
+            12,
+        )
+        .await
+        .expect("local candidate");
+        conn.builds.insert(pid.to_string(), build_state(12));
+        conn.current_intent.insert(pid.to_string(), 12);
+        conn.apply_built_peer(BuiltPeer {
+            peer_id: pid.to_string(),
+            generation: 12,
+            source: redundant_source,
+            peer,
+            info: info.clone(),
+            name: "boxb".to_string(),
+            uid: Some("uid-b".to_string()),
+            carried_secret: Some(("boxb".into(), "pair-secret".into())),
+            active_on_apply: true,
+            replace: Replace::NeverLive,
+            caller: std::panic::Location::caller(),
+            prior_generation: Some(gen1),
+        });
+        assert!(conn.builds.is_empty(), "the refused candidate held its slot");
+        assert_eq!(conn.links[pid].source, serving_source, "the serving source was replaced");
+        assert!(
+            conn.links[pid]
+                .transport
+                .as_ref()
+                .is_some_and(|t| Arc::ptr_eq(t, &serving_arc)),
+            "a redundant completion replaced the serving transport"
+        );
+
+        // 4. A real replacement still happens, and then the OLD source must be
+        //    refused while the replacement's own source is accepted.
+        let replacement = Rec::new("replacement", &log);
+        let replacement_arc: Arc<dyn Transport> = replacement.clone();
+        let replacement_source = replacement.source.expect("fixture source");
+        let peer2 = net::Peer::connect(
+            pid.to_string(),
+            conn.my_uid.clone(),
+            true,
+            Vec::new(),
+            false,
+            conn.sio.clone(),
+            conn.tx.clone(),
+            13,
+        )
+        .await
+        .expect("local replacement candidate");
+        conn.install_built(
+            BuiltPeer {
+                peer_id: pid.to_string(),
+                generation: 13,
+                source: replacement_source,
+                peer: peer2,
+                info: info.clone(),
+                name: "boxb".to_string(),
+                uid: Some("uid-b".to_string()),
+                carried_secret: Some(("boxb".into(), "new-secret".into())),
+                active_on_apply: true,
+                replace: Replace::NeverLive,
+                caller: std::panic::Location::caller(),
+                prior_generation: Some(12),
+            },
+            std::collections::VecDeque::new(),
+            std::collections::VecDeque::new(),
+            Some(("boxb".into(), "new-secret".into())),
+            false,
+        );
+        assert_eq!(conn.links[pid].source, replacement_source);
+        assert!(conn.stage_event(Ev::Sourced {
+            pid: pid.to_string(),
+            source: serving_source,
+            inner: Box::new(Ev::ChannelReady(pid.to_string(), serving_arc.clone())),
+        })
+        .is_none(), "the replaced link's source reopened it");
+        assert!(
+            conn.stage_event(Ev::sourced_channel_ready(pid.to_string(), replacement_arc)).is_some(),
+            "the replacement's own readiness was refused"
+        );
+
+        // 5. A changed, still-authorized binding is a real re-pair: it must
+        //    still supersede an in-flight candidate bound to a revoked one.
+        let other = "sid-repair";
+        let mut stale = build_state(21);
+        stale.binding = Some(("boxb".into(), "old-secret".into()));
+        conn.builds.insert(other.to_string(), stale);
+        conn.current_intent.insert(other.to_string(), 21);
+        conn.revoked_bindings.insert("old-secret".into());
+        conn.note_binding(other, ("boxb".into(), "pair-secret".into()));
+        let plan = conn
+            .prepare_build(
+                json!({ "id": other, "name": "boxb", "uid": "uid-b" }),
+                Some(true),
+                std::panic::Location::caller(),
+                Replace::NeverLive,
+            )
+            .expect("prepare");
+        assert!(plan.is_some(), "a changed authorized binding could not replace");
+        assert!(!conn.builds.contains_key(other), "the revoked-bound candidate survived");
     }
 }
 
