@@ -6832,6 +6832,15 @@ impl Conn {
         self.log.debug(&format!(
             "tunlion: PROMOTED peer={pid} route={route}: the transfer moved to the direct link at a frame boundary"
         ));
+        // A handoff REPLACES the serving link's source, so the re-armed
+        // ChannelReady queued at PAKE confirm is rejected by the exact-source
+        // gate (the `begin_handoff` ask and the offer cross the same boundary).
+        // Re-announce the link just installed, exactly as the relay->direct
+        // upgrade does: without it a sender whose offer was dropped in that
+        // window has no second chance ("Nothing is re-offered" below), and the
+        // receiver waits forever for a first byte after "authenticated,
+        // sending". The handler offers only the transfers still unfinished.
+        let _ = self.tx.send(Ev::sourced_channel_ready(pid.to_string(), t));
     }
 
     /// The promotion ends with the WebRTC link still serving.
@@ -9811,11 +9820,24 @@ mod warm_identity_tests {
         conn.rearm_channel_ready(pid, promo);
         let mut announced = false;
         while let Ok(ev) = rx.try_recv() {
-            if let Ev::ChannelReady(p, t) = ev {
-                announced = p == pid && Arc::ptr_eq(&t, &served);
+            // The announcement must SURVIVE the loop's exact-source gate. The
+            // gate fails closed on an untagged ChannelReady, so a handoff
+            // wrapper that hides its serving transport's source makes this
+            // re-emit vanish: no offer is ever sent and a `receive <code>`
+            // waits forever after "authenticated, sending". Routing the event
+            // through `stage_event` is what pins that (regression: the wrapper
+            // returned the trait default `None`, the event arrived untagged and
+            // was dropped here).
+            if let Some((Ev::ChannelReady(p, t), source)) = conn.stage_event(ev) {
+                announced = p == pid
+                    && Arc::ptr_eq(&t, &served)
+                    && source == conn.link(pid).map(|l| l.source);
             }
         }
-        assert!(announced, "the retained link was not announced, so nothing would be offered");
+        assert!(
+            announced,
+            "the retained link was not announced, so nothing would be offered"
+        );
     }
 
     /// A peer that does not advertise `handoff` (an older CLI) tears its own

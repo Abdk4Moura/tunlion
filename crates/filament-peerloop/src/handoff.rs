@@ -39,7 +39,7 @@
 //! grace after it moves.
 
 use anyhow::Result;
-use filament_transport::net::Transport;
+use filament_transport::net::{AttemptId, SourceId, Transport};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -204,6 +204,21 @@ impl Transport for HandoffTransport {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+    // The wrapper replaces the PATH, never the LINK that owns it. Every control
+    // and readiness event it emits still belongs to the serving transport's
+    // immutable source, so it must report that source (and attempt) rather than
+    // the `None` defaults. `Ev::sourced_channel_ready` turns a `None` into an
+    // UNTAGGED `ChannelReady`, and the exact-source gate fails closed on those:
+    // the re-armed ChannelReady a code-path promotion relies on was dropped,
+    // so the sender never offered and the transfer hung after
+    // "authenticated, sending". `current()` is the path that would carry the
+    // event right now, which is exactly the attribution the gate checks.
+    fn source_id(&self) -> Option<SourceId> {
+        self.current().source_id()
+    }
+    fn attempt_id(&self) -> Option<AttemptId> {
+        self.current().attempt_id()
+    }
     fn force_close(&self) {
         self.current().force_close()
     }
@@ -257,6 +272,8 @@ mod tests {
         name: &'static str,
         log: Arc<Mutex<Vec<String>>>,
         hold: Option<Arc<tokio::sync::Notify>>,
+        source: Option<SourceId>,
+        attempt: Option<AttemptId>,
     }
 
     #[async_trait::async_trait]
@@ -282,14 +299,49 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+        fn source_id(&self) -> Option<SourceId> {
+            self.source
+        }
+        fn attempt_id(&self) -> Option<AttemptId> {
+            self.attempt
+        }
     }
 
     fn path(name: &'static str, log: &Arc<Mutex<Vec<String>>>) -> Arc<dyn Transport> {
-        Arc::new(Path { name, log: log.clone(), hold: None })
+        Arc::new(Path { name, log: log.clone(), hold: None, source: None, attempt: None })
     }
 
     fn entries(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
         log.lock().unwrap().clone()
+    }
+
+    /// The wrapper replaces the PATH, never the LINK that owns it. If it hid
+    /// the serving transport's source, `Ev::sourced_channel_ready` would build
+    /// an UNTAGGED `ChannelReady` and the exact-source gate would drop it. That
+    /// is the code-path wedge: a promotion re-arms `ChannelReady` at PAKE
+    /// confirm so the sender offers, the re-emit vanished, and the receiver sat
+    /// after "authenticated, sending" until the test timed out.
+    #[tokio::test]
+    async fn a_wrapped_path_keeps_the_links_source_and_attempt() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let source = SourceId::next();
+        let attempt = AttemptId::next();
+        let old: Arc<dyn Transport> = Arc::new(Path {
+            name: "old",
+            log: log.clone(),
+            hold: None,
+            source: Some(source),
+            attempt: Some(attempt),
+        });
+        let h = HandoffTransport::wrap(old);
+        assert_eq!(h.source_id(), Some(source), "the wrapper lost the link's source");
+        assert_eq!(h.attempt_id(), Some(attempt), "the wrapper lost the attempt identity");
+        let ht: Arc<dyn Transport> = h.clone();
+        let ready = filament_transport::net::Ev::sourced_channel_ready("peer".into(), ht);
+        assert!(
+            matches!(ready, filament_transport::net::Ev::Sourced { .. }),
+            "an untagged readiness event is dropped by the exact-source gate"
+        );
     }
 
     /// The ordering the receiver depends on: every frame before the ask rides
@@ -338,6 +390,8 @@ mod tests {
             name: "old",
             log: log.clone(),
             hold: Some(release.clone()),
+            source: None,
+            attempt: None,
         });
         let h = HandoffTransport::wrap(old);
         let ht: Arc<dyn Transport> = h.clone();
