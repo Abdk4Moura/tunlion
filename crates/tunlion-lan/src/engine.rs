@@ -98,6 +98,7 @@ pub struct Engine {
     mdns_label: (u32, String),
     last_mdns_answer: u64,
     pairing: Option<[u8; 16]>,
+    pairing_seen: HashMap<(SocketAddr, [u8; 16]), u64>,
     announce: bool,
     pub stats: Stats,
 }
@@ -141,6 +142,7 @@ impl Engine {
             mdns_label: (u32::MAX, String::new()),
             last_mdns_answer: 0,
             pairing: None,
+            pairing_seen: HashMap::new(),
             announce: true,
             stats: Stats::default(),
         }
@@ -356,8 +358,23 @@ impl Engine {
                 }
             }
             Kind::Pairing => {
-                if Some(b.field) != self.pairing {
-                    out.push(Action::PairingNearby { addr: SocketAddr::new(src.ip(), b.port), id: b.field, label: wire::pairing_label(&b.field) });
+                if !allowed {
+                    self.stats.ignored += 1;
+                } else if Some(b.field) != self.pairing {
+                    let addr = SocketAddr::new(src.ip(), b.port);
+                    let key = (addr, b.field);
+                    if self.pairing_seen.get(&key).is_none_or(|t| now_ms >= *t + 2_000) {
+                        // HARD cap: TTL alone lets a flood of fresh ids grow the
+                        // map without bound. Evict the oldest entry first.
+                        const MAX_PAIRING_SEEN: usize = 512;
+                        if self.pairing_seen.len() >= MAX_PAIRING_SEEN {
+                            if let Some(oldest) = self.pairing_seen.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k) {
+                                self.pairing_seen.remove(&oldest);
+                            }
+                        }
+                        self.pairing_seen.insert(key, now_ms);
+                        out.push(Action::PairingNearby { addr, id: b.field, label: wire::pairing_label(&b.field) });
+                    }
                 }
             }
         }
@@ -411,5 +428,33 @@ impl Engine {
                 mdns::Parsed::Other => Vec::new(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn pairing_receive_is_allowed_and_bounded() {
+        let mut e = Engine::new([1; 32], 47821);
+        let src: SocketAddr = "192.168.1.9:47821".parse().unwrap();
+        let mut id = [0u8; 16];
+        id[0] = 1;
+        let beacon = wire::pairing(id, [5; 12], 47821).encode();
+        let first = e.on_datagram(0, 1_800_000_000, Channel::Beacon, src, &beacon, true, &mut |b| b.fill(7));
+        assert_eq!(first.len(), 1);
+        let again = e.on_datagram(100, 1_800_000_000, Channel::Beacon, src, &beacon, true, &mut |b| b.fill(7));
+        assert!(again.is_empty(), "same id within 2 s is deduped");
+        let denied = e.on_datagram(3_000, 1_800_000_000, Channel::Beacon, src, &beacon, false, &mut |b| b.fill(7));
+        assert!(denied.is_empty(), "a disallowed source never reaches the caller");
+        for i in 0..700u16 {
+            let mut fresh = [0u8; 16];
+            fresh[0..2].copy_from_slice(&i.to_be_bytes());
+            let b = wire::pairing(fresh, [6; 12], 47821).encode();
+            let _ = e.on_datagram(10_000 + i as u64 * 3_000, 1_800_000_000, Channel::Beacon, src, &b, true, &mut |b| b.fill(7));
+        }
+        assert!(e.pairing_seen.len() <= 512, "the dedupe map has a hard cap");
     }
 }
