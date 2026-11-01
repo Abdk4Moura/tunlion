@@ -1006,6 +1006,19 @@ fn allowed_from(ifs: &[Interface], src: IpAddr) -> bool {
     !ifs.iter().any(|i| (i.opted_out || i.public_network) && i.addrs.iter().any(|a| in_prefix(src, a.ip, a.prefix)))
 }
 
+/// The pairing source gate (spec section 10): a source on an opted-out or
+/// public interface is refused on every platform, even when it is loopback.
+/// Otherwise a source is admitted only once the interface list has been read,
+/// so a non-loopback source cannot pair while an opted-out or public interface
+/// might still be unknown. Loopback is exempt from that wait: it is never on a
+/// public network, and it is the local transport the fault fixtures use where
+/// interface enumeration does not exist yet (Windows). The ceremony, not the
+/// interface list, authenticates a loopback source.
+fn pairing_source_allowed(ifs: &[Interface], src: IpAddr) -> bool {
+    let src = src.to_canonical();
+    (!ifs.is_empty() || src.is_loopback()) && allowed_from(ifs, src)
+}
+
 impl LanService {
     /// Start the service. With `opts.serve` the listener is bound (default
     /// port, else any), beacons go out, queries are answered and inbound links
@@ -1048,7 +1061,7 @@ impl LanService {
             let allow: Arc<dyn Fn(IpAddr) -> bool + Send + Sync> =
                 Arc::new(move |ip| {
                     let g = allow_shared.lock().unwrap();
-                    !g.ifaces.is_empty() && allowed_from(&g.ifaces, ip)
+                    pairing_source_allowed(&g.ifaces, ip)
                 });
             let h = spawn_accept(ep, keys, pair_tx, shutdown.clone(), tasks.clone(), allow, tx.clone());
             tasks.lock().unwrap().push(h);
@@ -1127,7 +1140,8 @@ impl LanService {
                             Action::PairingNearby { addr, label, .. } => {
                                 let keep = {
                                     let mut g = shared.lock().unwrap();
-                                    !g.ifaces.is_empty() && g.allow_pairing_forward(now_ms())
+                                    pairing_source_allowed(&g.ifaces, addr.ip())
+                                        && g.allow_pairing_forward(now_ms())
                                 };
                                 if keep {
                                     if let Some(tx) = pairing_tx.as_ref() {
@@ -1418,6 +1432,60 @@ mod tests {
         assert!(Skip(vec!["WG0".into()]).matches(&i));
         assert!(Skip(vec!["10.8.0.0/16".into()]).matches(&i));
         assert!(!Skip(vec!["eth0".into(), "192.168.0.0/16".into()]).matches(&i));
+    }
+
+    fn gate_iface(addrs: &[&str], opted_out: bool, public_network: bool) -> Interface {
+        Interface {
+            index: 3,
+            name: "test0".into(),
+            flags: Flags::default(),
+            addrs: addrs.iter().map(|a| Addr { ip: a.parse().unwrap(), prefix: 24 }).collect(),
+            opted_out,
+            public_network,
+        }
+    }
+
+    /// With no interface list (where enumeration is unavailable) only loopback
+    /// may pair; every non-loopback source stays fail-closed.
+    #[test]
+    fn pairing_source_gate_admits_only_loopback_while_interfaces_are_unknown() {
+        let empty: Vec<Interface> = Vec::new();
+        for allowed in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            assert!(
+                pairing_source_allowed(&empty, allowed.parse().unwrap()),
+                "{allowed} is loopback and must pair"
+            );
+        }
+        for denied in ["10.0.0.7", "192.168.1.7", "8.8.8.8", "2001:4860:4860::8888"] {
+            assert!(
+                !pairing_source_allowed(&empty, denied.parse().unwrap()),
+                "{denied} is not loopback and must stay fail-closed"
+            );
+        }
+    }
+
+    /// A known opted-out or public interface keeps refusing its source, and
+    /// loopback does not bypass that exclusion. A known normal interface still
+    /// admits its source.
+    #[test]
+    fn pairing_source_gate_keeps_known_exclusions_even_for_loopback() {
+        let normal = gate_iface(&["10.0.0.5"], false, false);
+        assert!(pairing_source_allowed(std::slice::from_ref(&normal), "10.0.0.7".parse().unwrap()));
+        for iface in [
+            gate_iface(&["10.0.0.5"], false, true),
+            gate_iface(&["10.0.0.5"], true, false),
+        ] {
+            assert!(!pairing_source_allowed(std::slice::from_ref(&iface), "10.0.0.7".parse().unwrap()));
+        }
+        for iface in [
+            gate_iface(&["127.0.0.1"], false, true),
+            gate_iface(&["127.0.0.1"], true, false),
+        ] {
+            assert!(
+                !pairing_source_allowed(std::slice::from_ref(&iface), "127.0.0.1".parse().unwrap()),
+                "a known public/opted-out loopback interface is still excluded"
+            );
+        }
     }
 
     #[test]

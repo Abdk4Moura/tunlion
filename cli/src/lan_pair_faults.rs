@@ -1006,7 +1006,17 @@ async fn a_store_failure_ends_the_join_without_another_candidate() {
             .expect("store-failure host pair channel is open");
         // The joiner parses `brave-otter-3141` with `split_code`, so its PAKE
         // password is `brave-otter`; the host fixture must use the same bytes.
-        run_ceremony(&mut host, "brave-otter", "3141", "host", &host_hello).await
+        let ceremony = run_ceremony(&mut host, "brave-otter", "3141", "host", &host_hello).await;
+        // The joiner's next step is the forced store failure, after which it
+        // returns and releases this connection. Keep this side open until that
+        // close: dropping the last handle here can discard the host frames the
+        // joiner is still reading, turning its expected store error into a
+        // ceremony or protocol failure. Production hosts hold the link through
+        // their store and post-store acknowledgement for the same reason.
+        if ceremony.is_ok() {
+            let _ = host.conn.closed().await;
+        }
+        ceremony
     });
     let notice = filament_transport::lan::PairingNotice {
         addr: (Ipv4Addr::LOCALHOST, port).into(),
