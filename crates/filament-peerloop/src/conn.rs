@@ -2623,7 +2623,15 @@ impl Conn {
         }
         let mut connected = Vec::new();
         let peers = self.warm_hold.peers_to_connect();
+        // At most ONE peer per tick: each attempt may gather candidates, and
+        // serializing several of them over the daemon loop is what produced the
+        // 20 s watchdog stall after a fleet join. Warming one peer per 10 s tick
+        // is fast enough and keeps the loop responsive.
+        let mut dial_attempted = false;
         for peer in peers {
+            if dial_attempted {
+                break;
+            }
             let device = devices
                 .iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case(&peer))
@@ -2681,30 +2689,31 @@ impl Conn {
             let Some(info) = self.roster.get(&pid).cloned() else {
                 continue;
             };
+            dial_attempted = true;
             // A paired device is re-dialled the way its known-peer arrival dials
             // it: direct first (establish below then yields to the pending
             // attempt), and the link bound to its pair secret. A secretless link
             // proves nothing and is exactly what the room digest reconcile reaps
             // as a room peer that left.
             if let Some((petname, secret)) = &device {
-                self.start_direct(&pid, petname, secret).await;
+                // Candidate gathering (public_ip probe + srflx) can take seconds
+                // per peer and is awaited BEFORE the direct intent is inserted.
+                // Bound it on the daemon loop: a skipped warm dial is harmless
+                // (signaling still establishes), a 20 s stalled loop is not.
+                if tokio::time::timeout(
+                    Duration::from_secs(1),
+                    self.start_direct(&pid, petname, secret),
+                )
+                .await
+                .is_err()
+                {
+                    self.log.debug(&format!(
+                        "warm-hold: direct candidate gathering for '{peer}' exceeded the loop budget"
+                    ));
+                }
                 self.note_binding(&pid, (petname.clone(), secret.clone()));
             }
-            // The daemon loop must never await a WebRTC establishment: ICE
-            // gathering and candidate exchange can take tens of seconds, and the
-            // loop watchdog then reports the whole daemon stalled (seen live on
-            // the offer-first and Android gates right after a fleet join). The
-            // direct race started above runs OFF this future; this relay
-            // establish is only the fallback, so bound it and retry next tick.
-            let result = match tokio::time::timeout(
-                Duration::from_secs(1),
-                self.establish_as(info, None),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!("warm-hold establish exceeded the loop budget")),
-            };
+            let result = self.establish_as(info, None).await;
             if let (Some((petname, secret)), Some(l)) = (&device, self.links.get_mut(&pid)) {
                 if l.expected_secret.is_none() {
                     l.expected_secret = Some((petname.clone(), secret.clone()));
