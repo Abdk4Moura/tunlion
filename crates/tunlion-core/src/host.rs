@@ -227,6 +227,10 @@ impl HostServices for CoreHost {
         )
     }
 
+    fn device_ceiling(&self, name: &str) -> Vec<String> {
+        self.store.device_caps(name)
+    }
+
     fn persisted_principal_for_cert(&self, cert: &DeviceCert) -> PersistedPrincipal {
         let owner = self.store.owner_pub_from_keystore();
         let (kind, not_after, max_offline, last_seen) = self

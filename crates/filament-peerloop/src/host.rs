@@ -607,6 +607,12 @@ pub trait HostServices: Send + Sync + 'static {
     fn device_record_revoked(&self, _name: &str) -> bool {
         false
     }
+    /// The capability CEILING of this device's live store record, for a LAN
+    /// delegated principal. The v1 baseline is `["transfer"]`; an unknown record
+    /// is empty. An inert host grants nothing, so it answers empty.
+    fn device_ceiling(&self, _name: &str) -> Vec<String> {
+        Vec::new()
+    }
     /// Does this device's store record LITERALLY list `capability` for `name`?
     /// Unlike `device_allows`, no baseline is implied (`device_allows` answers
     /// "transfer" with yes for every record). Used where a record grant is the

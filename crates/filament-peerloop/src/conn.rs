@@ -3944,6 +3944,26 @@ impl Conn {
         Some(name)
     }
 
+    /// The name a link-keyed reply (the `reach-pong` registry) may key this link
+    /// by: a PROVEN `verified_name`, else the canonical current-store name of an
+    /// exact authenticated LAN DEVICE binding. Display/roster names are NEVER
+    /// used; a revoked, unbound or fleet link answers `None`.
+    pub fn link_peer_name(&self, pid: &str) -> Option<String> {
+        self.links
+            .get(pid)
+            .and_then(|l| l.verified_name.clone())
+            .or_else(|| self.authenticated_lan_peer(pid))
+    }
+
+    /// The delegated ceiling a LAN link may carry: the live store record's caps,
+    /// only while the link's exact authenticated binding still resolves. A
+    /// revoked, removed, unbound or fleet reservation gets the empty ceiling.
+    fn lan_delegated_caps(&self, pid: &str) -> Vec<String> {
+        self.authenticated_lan_peer(pid)
+            .map(|name| self.host.device_ceiling(&name))
+            .unwrap_or_default()
+    }
+
     /// Refusal predicate for a build intent.
     ///
     /// A secret the store dropped refuses EVERY pid that presents it. A pid
@@ -5624,6 +5644,20 @@ impl Conn {
                     host: self.host.clone(),
                 },
             );
+        }
+        if lan {
+            // The LAN link was admitted with the exact pair secret of a CURRENT
+            // live device record. Its delegated principal carries that record's
+            // ceiling, so the receiver's transfer gate does not read the empty
+            // caps an unverified direct link is born with. A revoked, removed,
+            // unbound or fleet reservation resolves nothing here and keeps the
+            // empty ceiling. This is authority for the LAN delegated principal
+            // only: `trusted` stays false, no `verified_name` is minted, and
+            // `expected_secret`/worker keys are untouched.
+            let caps = self.lan_delegated_caps(pid);
+            if let Some(link) = self.links.get_mut(pid) {
+                link.principal_kind = PrincipalKind::Delegated { caps };
+            }
         }
         // Replay anything the standby buffered before adoption. The tags remain,
         // so a second replacement still rejects them at the handler gate.
@@ -8730,6 +8764,8 @@ mod warm_identity_tests {
         /// for every live record. Off by default so pre-existing tests keep the
         /// inert-host answer.
         transfer_allowed: bool,
+        /// The live store record's capability ceiling for `device_ceiling`.
+        ceilings: Vec<(String, Vec<String>)>,
     }
 
     #[async_trait::async_trait]
@@ -8751,6 +8787,13 @@ mod warm_identity_tests {
         }
         fn device_allows(&self, _name: &str, capability: &str) -> bool {
             self.transfer_allowed && capability == "transfer"
+        }
+        fn device_ceiling(&self, name: &str) -> Vec<String> {
+            self.ceilings
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, caps)| caps.clone())
+                .unwrap_or_default()
         }
         fn is_self_uid(&self, _my_uid: &str, _peer_uid: Option<&str>) -> bool {
             false
@@ -8842,6 +8885,7 @@ mod warm_identity_tests {
         let host = Arc::new(TestHost {
             devices: vec![("boxb".to_string(), "s1".to_string())],
             transfer_allowed: true,
+            ceilings: vec![("boxb".to_string(), vec!["transfer".to_string()])],
             ..Default::default()
         });
         let (mut conn, _far, _rx) = test_conn_with_host(host).await;
@@ -8857,6 +8901,16 @@ mod warm_identity_tests {
             "send could not select the LAN target"
         );
         assert_eq!(conn.authenticated_lan_peer(pid).as_deref(), Some("boxb"));
+        assert_eq!(
+            conn.link_peer_name(pid).as_deref(),
+            Some("boxb"),
+            "reach-pong could not key a LAN link by its exact device binding"
+        );
+        assert_eq!(
+            conn.lan_delegated_caps(pid),
+            vec!["transfer".to_string()],
+            "a live LAN device must carry its stored ceiling, not the empty one"
+        );
         assert!(!conn.link(pid).unwrap().trusted, "routing must not mint trust");
         assert!(
             conn.link(pid).unwrap().verified_name.is_none(),
@@ -8877,6 +8931,7 @@ mod warm_identity_tests {
             devices: vec![("boxb".to_string(), "s1".to_string())],
             revoked_records: vec!["boxb".to_string()],
             transfer_allowed: true,
+            ceilings: vec![("boxb".to_string(), vec!["transfer".to_string()])],
             ..Default::default()
         });
         let (mut revoked_conn, _far, _rx) = test_conn_with_host(revoked_host.clone()).await;
@@ -8888,23 +8943,44 @@ mod warm_identity_tests {
         );
         assert!(!revoked_conn.link_matches_device(pid, "boxb", "s1"));
         assert_eq!(revoked_conn.authenticated_lan_peer(pid), None);
+        assert!(revoked_conn.link_peer_name(pid).is_none());
+        assert!(
+            revoked_conn.lan_delegated_caps(pid).is_empty(),
+            "a revoked record's retained secret still minted a non-empty ceiling"
+        );
         assert!(
             crate::lan_glue::keys(&*revoked_host).is_empty(),
             "a revoked record's retained secret was offered as a LAN MAC key"
         );
 
+        // A REMOVED record (forgotten) has no live row, so it must also keep the
+        // empty ceiling and never answer the pong registry.
+        let removed_host = Arc::new(TestHost {
+            devices: vec![],
+            transfer_allowed: true,
+            ceilings: vec![("boxb".to_string(), vec!["transfer".to_string()])],
+            ..Default::default()
+        });
+        let (mut removed_conn, _far, _rx) = test_conn_with_host(removed_host).await;
+        removed_conn.links.insert(pid.to_string(), lan_link(pid));
+        assert!(removed_conn.link_peer_name(pid).is_none());
+        assert!(removed_conn.lan_delegated_caps(pid).is_empty());
+
         // A live record that DENIES transfer still routes (routing is not
-        // permission) but must not earn the daemon's baseline auto-consent.
+        // permission) but must not earn the daemon's baseline auto-consent or a
+        // ceiling from the record.
         let denied_host = Arc::new(TestHost {
             devices: vec![("boxb".to_string(), "s1".to_string())],
             denied_transfer: vec!["boxb".to_string()],
             transfer_allowed: true,
+            ceilings: vec![("boxb".to_string(), vec!["transfer".to_string()])],
             ..Default::default()
         });
         let (mut denied_conn, _far, _rx) = test_conn_with_host(denied_host).await;
         denied_conn.links.insert(pid.to_string(), lan_link(pid));
         assert!(warm_link_for(&denied_conn, "boxb").is_some());
         assert_eq!(denied_conn.authenticated_lan_peer(pid), None);
+        assert!(denied_conn.lan_delegated_caps(pid).is_empty());
     }
 
     // --- the pure decision ------------------------------------------------
@@ -11992,6 +12068,18 @@ mod warm_identity_tests {
             conn.links[existing_pid].transport.as_ref().unwrap(),
             &lan_existing
         ));
+        // The link's DELEGATED ceiling comes from the authenticated device's
+        // current store record, not from the empty default that denied every
+        // transfer at the capability gate.
+        for owned in [pid, existing_pid] {
+            assert!(
+                matches!(
+                    &conn.links[owned].principal_kind,
+                    PrincipalKind::Delegated { caps } if caps == &vec!["transfer".to_string()]
+                ),
+                "LAN adoption did not apply the stored transfer ceiling to {owned}"
+            );
+        }
 
         // A LAN fleet reservation keeps its name for dedup but exposes NO
         // device binding: the shared rendezvous secret never becomes one.
@@ -12009,6 +12097,13 @@ mod warm_identity_tests {
         assert!(fleet_binding.device.is_none());
         assert!(conn.links[fleet_pid].expected_secret.is_none());
         assert!(conn.links[fleet_pid].device_secret().is_none());
+        assert!(
+            matches!(
+                &conn.links[fleet_pid].principal_kind,
+                PrincipalKind::Delegated { caps } if caps.is_empty()
+            ),
+            "a fleet reservation must never inherit a device ceiling"
+        );
         let auth = DirectAuth::lan_device(1, "dev", "secret");
         assert!(auth.device_binding.is_some());
         assert!(auth.transport_key().is_none());
@@ -12026,6 +12121,8 @@ mod warm_identity_tests {
                 ("dev".into(), "secret".into()),
                 ("other".into(), "other-secret".into()),
             ],
+            transfer_allowed: true,
+            ceilings: vec![("dev".to_string(), vec!["transfer".to_string()])],
             ..Default::default()
         });
         let (mut conn, _far, _rx) = test_conn_with_host(host).await;

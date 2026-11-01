@@ -815,8 +815,11 @@ impl RecvDaemon for CliRecv {
         }
     }
     async fn reach_pong(&mut self, conn: &Conn, pid: &str, v: &Value) {
-        let peer = conn.links.get(pid).and_then(|l| l.verified_name.as_deref());
-        self.liveness.answered(peer, pid, v);
+        // A PROVEN name, else the exact current-store device binding of a LAN
+        // link. Never the display/roster name: a pong may only wake the probe
+        // for the peer that link actually reaches.
+        let peer = conn.link_peer_name(pid);
+        self.liveness.answered(peer.as_deref(), pid, v);
     }
     fn peer_present(&self, alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool {
         crate::link_manager::peer_present(alive, direct, heard_ms, idle_ms)
