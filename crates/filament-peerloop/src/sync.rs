@@ -2231,9 +2231,13 @@ mod tests {
                 transport: link_transport,
                 workers: vec![],
                 generation: 1,
+                source: Default::default(),
+                attempt: None,
+                worker_sources: Default::default(),
                 attempts: 0,
                 trusted,
                 expected_secret: None,
+                lan_binding: None,
                 // Avoid ambient device-record/consent I/O: the gate is keyed by
                 // the resolved device key, not the display name.
                 verified_name: verified.map(str::to_string),

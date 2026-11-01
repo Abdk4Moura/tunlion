@@ -465,10 +465,13 @@ fn serving_off_refusal(
 }
 
 /// Whether an offer is accepted without asking, before the capability layer.
-/// A daemon accepts only proven links. A foreground receive accepts on `-y`,
-/// on a re-enqueued answer the person already gave, on a proven link, on the
-/// resume of a partial it already accepted, and on the CODE: typing the code a
-/// sender's ceremony was bound to is the consent (`receive --help`). Pure.
+/// A daemon accepts only proven links (the caller may also pass an exact
+/// authenticated LAN DEVICE binding it has already checked against the current
+/// store; that is baseline transfer consent, not link trust). A foreground
+/// receive accepts on `-y`, on a re-enqueued answer the person already gave, on
+/// a proven link, on the resume of a partial it already accepted, and on the
+/// CODE: typing the code a sender's ceremony was bound to is the consent
+/// (`receive --help`). Pure.
 pub fn offer_has_consent(
     daemon: bool,
     yes: bool,
@@ -636,17 +639,41 @@ pub async fn drive(
     }
 }
 
+/// A received Control deferred for later re-dispatch, with the immutable source
+/// captured at first handling. The source is replayed with the event so the
+/// final gate can still reject it if the link was replaced meanwhile.
+#[derive(Clone)]
+pub struct DeferredControl {
+    pub value: Value,
+    pub source: Option<net::SourceId>,
+}
+
+impl DeferredControl {
+    /// Rebuild the event with its original provenance. No source means this was
+    /// loop-authored, so it uses the explicit trusted-internal variant.
+    pub fn into_event(self, pid: &str) -> Ev {
+        match self.source {
+            Some(source) => Ev::Sourced {
+                pid: pid.to_string(),
+                source,
+                inner: Box::new(Ev::Control(pid.to_string(), self.value)),
+            },
+            None => Ev::LocalControl(pid.to_string(), self.value),
+        }
+    }
+}
+
 /// Receive-transfer and consent state for one dispatch.
 pub struct RecvState {
     pub by_sid: HashMap<(String, u32), IncomingFile>,
     pub verify_fails: HashMap<String, u32>,
     pub completed: usize,
     pub ever_received: bool,
-    pub pending: std::collections::VecDeque<(String, Value)>,
+    pub pending: std::collections::VecDeque<(String, DeferredControl)>,
     pub pending_proven: Arc<Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>>,
     pub question_open: Arc<std::sync::atomic::AtomicBool>,
     pub question_shown: Instant,
-    pub recv_pending_offers: HashMap<String, Value>,
+    pub recv_pending_offers: HashMap<String, DeferredControl>,
     pub recv_cers: HashMap<String, Ceremony>,
     pub recv_deadlines: HashMap<String, Instant>,
 }
@@ -1004,6 +1031,7 @@ impl RecvCleanup {
             self.note_phase("flush");
         }
         if let Some(conn) = &mut self.conn {
+            conn.cancel_builds();
             conn.close_links_for_exit();
         }
         tokio::task::yield_now().await;
@@ -1960,13 +1988,13 @@ async fn recv_run(
     // later. Measured as a ~1-in-6 spurious decline between two siblings. The
     // answer is to wait for the identity to settle, not to widen the gate:
     // whether the peer is authorized is exactly what is still being computed.
-    let mut fleet_deferred_offers: Vec<(String, serde_json::Value, Instant)> = Vec::new();
+    let mut fleet_deferred_offers: Vec<(String, DeferredControl, Instant)> = Vec::new();
     // Fleet auto-mesh: hellos from siblings whose certificate verified but whom
     // the owner's signed roster we hold does not list (yet). Held, not
     // admitted and not dropped: the roster usually arrives first, but when a
     // sibling's hello wins that race the link must not be lost for good. Each
     // accepted roster replays these through the same verification.
-    let mut fleet_unlisted_hellos: std::collections::HashMap<String, serde_json::Value> =
+    let mut fleet_unlisted_hellos: std::collections::HashMap<String, DeferredControl> =
         Default::default();
     // Brokered meeting places we have joined: channel -> its one-time secret.
     // Kept so a peer arriving on one is proved by that secret, exactly as a
@@ -2132,6 +2160,11 @@ async fn recv_run(
     let receive_started = Instant::now();
 
     loop {
+        // Real-loop latency gate: a test-only line per iteration, so the worker
+        // gate can measure the maximum gap between iterations. No call in a
+        // production build (test_hooks::loop_beat is empty there).
+        test_hooks::loop_beat();
+        conn.pump_builds();
         sync_tasks.reap_sync_tasks(log.as_ref()).await;
         // Reap completed blocking writers every iteration: the handles are
         // owned until their write lands, but a long-lived daemon must not keep
@@ -2622,6 +2655,11 @@ async fn recv_run(
             },
         };
 
+        let ev = match ev {
+            Some(ev) => conn.stage_event(ev),
+            None => None,
+        };
+
         // Settle sweep: re-drive parked shell-class opens whose link proved
         // since parking (same link AND same device key, else the proof is
         // for someone else), deny those past their settle bound. Zero cost
@@ -3021,7 +3059,7 @@ async fn recv_run(
             // connection's own `welcome` did, so the ladder could never climb
             // (defect 2). Only a connection that stays up STABLE_AFTER does.
             let mut saw_down = false;
-            match &ev {
+            match ev.as_ref().map(|(event, _)| event) {
                 Some(Ev::SignalingDown(reason, closed)) => {
                     if signaling_health::close_is_current(*closed, sio.id()) {
                         saw_down = true;
@@ -3316,7 +3354,14 @@ async fn recv_run(
                 .map(|(_, l)| l.shown().to_string())
                 .collect();
             for who in live {
-                ports.store.devices_touch(&who, None, None);
+                let store = ports.store.clone();
+                let who_owned = who.to_string();
+                tokio::spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        store.devices_touch(&who_owned, None, None);
+                    })
+                    .await;
+                });
             }
         }
 
@@ -3511,6 +3556,7 @@ async fn recv_run(
             // `devices` before anything below can re-add or dial it.
             let snap = ports.daemon.revocation_snapshot();
             if revocation_sweep_now || (snap.is_some() && snap != revocation_snap) {
+                let invalidate = revocation_sweep_now;
                 revocation_sweep_now = false;
                 if snap.is_none() {
                     // A store that cannot be read is never "everything was
@@ -3521,6 +3567,11 @@ async fn recv_run(
                     }
                 } else {
                     revocation_snap = snap;
+                    // An explicit forget/revoke is a lifecycle invalidation;
+                    // a plain add/rename must not cancel the fleet's builds.
+                    // The per-peer invalidation runs AFTER the doomed set and
+                    // the store-dropped device secrets are known (below), so
+                    // forgetting A cannot cancel or block B.
                     revoked_secrets.extend(ports.daemon.prune_to_store(&mut devices));
                     // Meeting places a now-revoked sibling brokered.
                     brokered.retain(|_, (sec, broker)| {
@@ -3550,7 +3601,9 @@ async fn recv_run(
                     let mut unrouted: Vec<String> = Vec::new();
                     for (pid, l) in &conn.links {
                         let facts = crate::recv::revocation::LinkFacts {
-                            secret: l.expected_secret.as_ref().map(|(_, s)| s.as_str()),
+                            // LAN device reservations are bindings too; a LAN
+                            // fleet reservation exposes no device secret.
+                            secret: l.device_secret(),
                             device_pub: l.identity_device_pub,
                         };
                         // Is this peer's key on the forget block? Read once:
@@ -3594,6 +3647,9 @@ async fn recv_run(
                         ) {
                             unrouted.push(pid.clone());
                         }
+                    }
+                    if invalidate {
+                        conn.invalidate_peers(&doomed, &revoked_secrets);
                     }
                     forgotten_channels.extend(revoked_secrets.iter().map(|s| host.channel_of(s)));
                     revoked_secrets.clear();
@@ -3733,8 +3789,8 @@ async fn recv_run(
                 log.debug(&format!(
                     "fleet: offer from {p} waited out its grace unverified; deciding it"
                 ));
-                ov["__fleet_waited"] = serde_json::Value::Bool(true);
-                let _ = tx.send(Ev::Control(p, ov));
+                ov.value["__fleet_waited"] = serde_json::Value::Bool(true);
+                let _ = tx.send(ov.into_event(&p));
             }
         }
         // Drop warm-bootstrap waiters whose peer never acked; the client's read
@@ -3748,6 +3804,7 @@ async fn recv_run(
         // ADOPT for the same peer; that sequence is not sound if peers recover
         // concurrently, so caller attribution alone is insufficient here.
         for (pid, info, (n, sec)) in conn.expired_direct() {
+            conn.note_binding(&pid, (n.clone(), sec.clone()));
             let adopted = conn.maybe_adopt(&info, true).await.with_context(|| {
                 format!("direct fallback adoption failed for peer {pid} on receive path")
             });
@@ -3990,7 +4047,7 @@ async fn recv_run(
             && conn.links.keys().all(|pid| {
                 conn.links
                     .get(pid)
-                    .map(|l| l.expected_secret.is_none())
+                    .map(|l| l.expected_secret.is_none() && l.lan_binding.is_none())
                     .unwrap_or(true)
                     && !fleet_pending.contains(pid)
                     && !fleet_verified.contains(pid)
@@ -4057,15 +4114,15 @@ async fn recv_run(
             last_quiet = None;
         }
 
-        let Some(ev) = ev else { continue };
+        let Some((ev, event_source)) = ev else { continue };
 
         // C23: questions from links that died (supersede/peer-left) are
         // moot, the sender re-offers on its new link. Purge them so a 'y'
         // can never accept a ghost (the duplicate-stream ENOENT crash).
         if !st.pending.is_empty() {
-            let front_id = st.pending.front().map(|(_, v)| v["id"].clone());
+            let front_id = st.pending.front().map(|(_, v)| v.value["id"].clone());
             st.pending.retain(|(p, _)| conn.links.contains_key(p));
-            if st.pending.front().map(|(_, v)| v["id"].clone()) != front_id {
+            if st.pending.front().map(|(_, v)| v.value["id"].clone()) != front_id {
                 conn.present.clear_sticky();
                 if let Some((qpid, qv)) = st.pending.front() {
                     let s = conn.link(qpid).map(|l| l.name.clone()).unwrap_or_default();
@@ -4073,8 +4130,8 @@ async fn recv_run(
                         let q = offer_question(
                             log.as_ref(),
                             &s,
-                            qv["name"].as_str().unwrap_or("file"),
-                            qv["size"].as_u64().unwrap_or(0),
+                            qv.value["name"].as_str().unwrap_or("file"),
+                            qv.value["size"].as_u64().unwrap_or(0),
                             paired,
                         );
                         log.say(&q); // permanent: a new question fronted (C25)
@@ -4324,6 +4381,7 @@ async fn recv_run(
                             // room roster, and reaps it after two digest ticks.
                             // Test the property directly instead of the proxy.
                             let channel_introduced = l.expected_secret.is_some()
+                                || l.lan_binding.is_some()
                                 || fleet_pending.contains(pid)
                                 || fleet_verified.contains(pid);
                             let present = (!channel_introduced).then(|| present.contains(pid));
@@ -4450,6 +4508,11 @@ async fn recv_run(
                 conn.reset_digest_reconcile();
             }
             Ev::KnownPeer(v) => {
+                // Test-only raw offer-first gate: do not let the announcer's
+                // KnownPeer create/adopt a link ahead of the browser's SDP.
+                if crate::test_hooks::suppress_known_peer() {
+                    continue;
+                }
                 if host.is_self_uid(&conn.my_uid, v["uid"].as_str()) {
                     continue; // our own sender/daemon shares these channels
                 }
@@ -4642,6 +4705,7 @@ async fn recv_run(
                 }
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 // A browser's PeerLink sends its transport hint BEFORE any SDP.
@@ -4963,7 +5027,7 @@ async fn recv_run(
                         let buffered = st.recv_pending_offers.remove(&from);
                         st.recv_pending_offers.clear();
                         if let Some(offer) = buffered {
-                            let _ = tx.send(Ev::Control(from.clone(), offer));
+                            let _ = tx.send(offer.into_event(&from));
                         }
                         continue;
                     }
@@ -4984,6 +5048,10 @@ async fn recv_run(
                 // malformed uid) gets no signal applied; the daemon carries on.
                 let r = conn.ensure_responder(&from, &data).await;
                 if peer_step(daemon, &from, "responder", r, log.as_ref())?.is_none() {
+                    continue;
+                }
+                if conn.build_pending(&from) {
+                    conn.stage_signal(&v);
                     continue;
                 }
                 conn.apply_signal(&from, data).await;
@@ -5007,12 +5075,12 @@ async fn recv_run(
                 filament_transport::lan::LanEvent::PairingNearby { .. } => {}
             },
             Ev::DirectReady(pid, t, route) => {
-                let tkey = conn
-                    .direct_pending
-                    .get(&pid)
-                    .map(|p| direct::transport_key(&p.secret.1));
+                let verdict = conn.adopt_direct(&pid, t.clone(), route);
+                let tkey = match verdict {
+                    crate::conn::DirectAdoption::Adopted { tkey, .. } => tkey,
+                    _ => continue,
+                };
                 let named_before = conn.link(&pid).and_then(|l| l.verified_name.clone());
-                conn.adopt_direct(&pid, t.clone(), route);
                 // A direct link to a REMEMBERED device was authenticated by its
                 // pair secret (the QUIC keying-material MAC), the proof a
                 // WebRTC link gets from `pair-proof`. Only the pair-proof path
@@ -5098,7 +5166,7 @@ async fn recv_run(
                             tokio::time::sleep(PROVEN_CHALLENGE_DEADLINE).await;
                             if hold_pending.lock().unwrap().contains_key(&hold_pid) {
                                 hold_pending.lock().unwrap().remove(&hold_pid);
-                                let _ = hold_tx.send(Ev::ChannelReady(hold_pid, hold_t));
+                                let _ = hold_tx.send(Ev::sourced_channel_ready(hold_pid, hold_t));
                             }
                         });
                     } else {
@@ -5106,19 +5174,18 @@ async fn recv_run(
                         // ChannelReady at PAKE confirm. Issue the challenge for
                         // identity but do NOT hold the channel; the file-offer
                         // hold re-injects the first offer until identity settles.
-                        let _ = tx.send(Ev::ChannelReady(pid, t));
+                        let _ = tx.send(Ev::sourced_channel_ready(pid, t));
                     }
                 } else {
                     let _ = tx.send(Ev::ChannelReady(pid, t));
                 }
             }
-            Ev::DirectWorkersReady(pid, workers) => {
-                if let Some(link) = conn.link_mut(&pid) {
-                    link.workers = workers;
-                    log.debug(&format!(
-                        "worker transports ready: {pid} {} workers",
-                        link.workers.len()
-                    ));
+            Ev::DirectWorkersReady(pid, workers, primary_source) => {
+                if conn.accept_workers_ready(&pid, workers, primary_source) {
+                    let count = conn.link(&pid).map(|l| l.workers.len()).unwrap_or(0);
+                    log.debug(&format!("worker transports ready: {pid} {count} workers"));
+                } else {
+                    log.debug(&format!("stale worker transports refused: {pid}"));
                 }
             }
             // P5 (GAP-6): relay->direct upgrade standby connected (receiver side).
@@ -5318,7 +5385,14 @@ async fn recv_run(
                                     l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t.clone())
                                         .await;
                                     // Store overlay addresses for `tunlion addr <device>`
-                                    ports.store.devices_touch(&who, Some(ip), Some(v4));
+                                    let store = ports.store.clone();
+                                    let who_owned = who.to_string();
+                                    tokio::spawn(async move {
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            store.devices_touch(&who_owned, Some(ip), Some(v4));
+                                        })
+                                        .await;
+                                    });
                                 } else {
                                     log.debug(&format!(
                                         "  l3-announce from {pid} ignored: stale sequence {}",
@@ -5586,7 +5660,13 @@ async fn recv_run(
                                     log.debug(&format!(
                                         "fleet-hello from {pid} held: not listed in the owner's roster"
                                     ));
-                                    fleet_unlisted_hellos.insert(pid.clone(), v.clone());
+                                    fleet_unlisted_hellos.insert(
+                                        pid.clone(),
+                                        DeferredControl {
+                                            value: v.clone(),
+                                            source: event_source,
+                                        },
+                                    );
                                 }
                                 Ok(ok) if ports.identity.device_cert_revoked(&ok.device_pub) => {
                                     fleet_unlisted_hellos.remove(&pid);
@@ -5617,7 +5697,7 @@ async fn recv_run(
                                             log.debug(&format!(
                                                 "fleet: replaying offer deferred while {p} was unverified"
                                             ));
-                                            let _ = tx.send(Ev::Control(p, ov));
+                                            let _ = tx.send(ov.into_event(&p));
                                         }
                                     }
                                     // Reachability, NOT capability: an empty
@@ -6018,7 +6098,14 @@ async fn recv_run(
                                                 "  {} L3 peer {who}.mesh ({ip} / {v4})",
                                                 log.paint(Tone::Ok, log.glyph_ok())
                                             ));
-                                            ports.store.devices_touch(&who, Some(ip), Some(v4));
+                                            let store = ports.store.clone();
+                                            let who_owned = who.to_string();
+                                            tokio::spawn(async move {
+                                                let _ = tokio::task::spawn_blocking(move || {
+                                                    store.devices_touch(&who_owned, Some(ip), Some(v4));
+                                                })
+                                                .await;
+                                            });
 
                                             // Subnet routes, after the peer is on
                                             // the overlay. Three conditions, in
@@ -6254,7 +6341,7 @@ async fn recv_run(
                         if let Some((held_t, _deadline)) =
                             st.pending_proven.lock().unwrap().remove(&pid)
                         {
-                            let _ = tx.send(Ev::ChannelReady(pid, held_t));
+                            let _ = tx.send(Ev::sourced_channel_ready(pid, held_t));
                         }
                     }
                 }
@@ -6513,11 +6600,11 @@ async fn recv_run(
                                 // removed loses its link at once rather than on
                                 // the next store change.
                                 revocation_sweep_now = true;
-                                for (hp, hv) in std::mem::take(&mut fleet_unlisted_hellos) {
-                                    if conn.links.contains_key(&hp) {
-                                        let _ = tx.send(Ev::Control(hp, hv));
+                                    for (hp, hv) in std::mem::take(&mut fleet_unlisted_hellos) {
+                                        if conn.links.contains_key(&hp) {
+                                            let _ = tx.send(hv.into_event(&hp));
+                                        }
                                     }
-                                }
                             }
                             Ok(false) => {}
                             Err(e) => log.debug(&format!("roster: rejected: {e}")),
@@ -6755,9 +6842,13 @@ async fn recv_run(
                             let rtx = tx.clone();
                             let rpid = pid.clone();
                             let rv = v.clone();
+                            let rsource = event_source;
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_millis(80)).await;
-                                let _ = rtx.send(Ev::Control(rpid, rv));
+                                let _ = rtx.send(
+                                    DeferredControl { value: rv, source: rsource }
+                                        .into_event(&rpid),
+                                );
                             });
                             continue;
                         }
@@ -7392,6 +7483,9 @@ async fn recv_run(
                     }
                 }
                 Some("pair-intro") => {
+                    // No authorization happens before the trusted/same-owner/
+                    // not-introduced checks and the store write below. A raw
+                    // payload name must never clear a revocation.
                     // C19/C20: only a fingerprint-verified known device may
                     // vouch new trust into this store. "Verified" means the
                     // link resolved to one of OUR records by its pair secret
@@ -7448,6 +7542,10 @@ async fn recv_run(
                         None
                     };
                     if let Some(iname) = stored {
+                        // The vouch passed every authority check and the store
+                        // write succeeded: re-authorize exactly this introduced
+                        // identity. Other revoked secrets stay revoked.
+                        conn.authorize_binding(&isec);
                         devices.push((iname.clone(), isec.clone()));
                         sess.channels.push(host.channel_of(&isec)); // C30
                         sess.touch();
@@ -7673,7 +7771,10 @@ async fn recv_run(
                         // buffered offer dies with it. A confirmed-but-different peer
                         // (a decoy that authenticated nothing) is simply ignored.
                         if !recv_pake_done && st.recv_cers.contains_key(&pid) {
-                            st.recv_pending_offers.insert(pid.clone(), v.clone());
+                            st.recv_pending_offers.insert(
+                                pid.clone(),
+                                DeferredControl { value: v.clone(), source: event_source },
+                            );
                             log.debug(
                                 "buffering a pre-auth file-offer until its ceremony confirms",
                             );
@@ -7726,7 +7827,7 @@ async fn recv_run(
                         if cfg!(feature = "fleet") {
                             fleet_deferred_offers.push((
                                 pid.clone(),
-                                v.clone(),
+                                DeferredControl { value: v.clone(), source: event_source },
                                 Instant::now() + fleet_offer_grace,
                             ));
                         }
@@ -7880,9 +7981,13 @@ async fn recv_run(
                             let rtx = tx.clone();
                             let rpid = pid.clone();
                             let rv = v.clone();
+                            let rsource = event_source;
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_millis(80)).await;
-                                let _ = rtx.send(Ev::Control(rpid, rv));
+                                let _ = rtx.send(
+                                    DeferredControl { value: rv, source: rsource }
+                                        .into_event(&rpid),
+                                );
                             });
                             continue;
                         }
@@ -7907,8 +8012,22 @@ async fn recv_run(
                     // pending queue and the answer arrives via StdinLine, a
                     // per-process token marks re-enqueued offers so a remote
                     // peer can't forge "already consented".
-                    let sender_name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                    //
+                    // A LAN link is deliberately untrusted/un-Proven, but its
+                    // local handshake already verified the sender's pair-secret
+                    // MAC. For the BASELINE transfer capability every paired
+                    // device holds, an exact authenticated DEVICE reservation
+                    // that is still the current store's binding is as good as the
+                    // legacy trust flag. Nothing is set on the link and no
+                    // owner/worker capability is implied; under authoritative
+                    // mode the trust floor still refuses it.
+                    let lan_sender = conn.authenticated_lan_peer(&pid);
+                    let sender_name = lan_sender
+                        .clone()
+                        .unwrap_or_else(|| conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default());
                     let link_trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    // Consent only; the trust floor below still sees the real flag.
+                    let consent_trusted = link_trusted || lan_sender.is_some();
                     let consented =
                         v["__consent"].as_str() == Some(ports.env.consent_token.as_str());
                     // Legacy (pre-capability) decision, per mode.
@@ -7923,7 +8042,7 @@ async fn recv_run(
                         daemon,
                         yes,
                         consented,
-                        link_trusted,
+                        consent_trusted,
                         is_resume && offset > 0,
                         code_consent,
                     );
@@ -8049,7 +8168,10 @@ async fn recv_run(
                     }
                     if !ok {
                         if !daemon && ports.env.interactive_terminal && xfer_deny_reason.is_none() {
-                            st.pending.push_back((pid.clone(), v.clone()));
+                            st.pending.push_back((
+                                pid.clone(),
+                                DeferredControl { value: v.clone(), source: event_source },
+                            ));
                             // The sender's no-answer timeout must not fire on a
                             // person who is still deciding; tell it so.
                             let _ = t.send_control(&protocol::pending_msg(&id)).await;
@@ -9158,20 +9280,20 @@ async fn recv_run(
                         answered = true;
                         let (qpid, mut qv) = st.pending.pop_front().unwrap();
                         conn.present.clear_sticky();
-                        qv["__consent"] = json!(ports.env.consent_token.clone());
-                        let _ = tx.send(Ev::Control(qpid, qv)); // re-enter the offer path, consented
+                        qv.value["__consent"] = json!(ports.env.consent_token.clone());
+                        let _ = tx.send(qv.into_event(&qpid)); // re-enter the offer path, consented
                     } else if ans == "n" || ans == "no" {
                         answered = true;
                         let (qpid, qv) = st.pending.pop_front().unwrap();
                         conn.present.clear_sticky();
                         let qname = filament_transfer::safe_incoming_name(
-                            qv["name"].as_str().unwrap_or("file"),
+                            qv.value["name"].as_str().unwrap_or("file"),
                         );
                         note_refusal(
                             &report,
                             daemon,
                             &qname,
-                            qv["size"].as_u64().unwrap_or(0),
+                            qv.value["size"].as_u64().unwrap_or(0),
                             "declined",
                             &format!("declined {qname}"),
                             RefusalClass::Denied,
@@ -9181,14 +9303,14 @@ async fn recv_run(
                             &format!(
                                 "  declined {}",
                                 filament_transfer::safe_incoming_name(
-                                    qv["name"].as_str().unwrap_or("file")
+                                    qv.value["name"].as_str().unwrap_or("file")
                                 )
                             ),
                         ));
                         if let Some(t) = conn.transport_of(&qpid) {
                             let r = t
                                 .send_control(&protocol::decline_msg(
-                                    qv["id"].as_str().unwrap_or_default(),
+                                    qv.value["id"].as_str().unwrap_or_default(),
                                 ))
                                 .await;
                             peer_step(daemon, &qpid, "decline", r, log.as_ref())?;
@@ -9200,8 +9322,8 @@ async fn recv_run(
                         let q = offer_question(
                             log.as_ref(),
                             &s,
-                            qv["name"].as_str().unwrap_or("file"),
-                            qv["size"].as_u64().unwrap_or(0),
+                            qv.value["name"].as_str().unwrap_or("file"),
+                            qv.value["size"].as_u64().unwrap_or(0),
                             paired,
                         );
                         if answered {

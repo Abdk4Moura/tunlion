@@ -30,7 +30,7 @@ use tunlion_lan::record::{self, Hello, HelloAddr, Record};
 use tunlion_lan::wire;
 
 use crate::direct;
-use crate::net::Ev;
+use crate::net::{AttemptId, Ev};
 
 /// The shown and compared route word for a link made by local discovery.
 pub const ROUTE_LAN: &str = "lan";
@@ -66,7 +66,7 @@ pub enum LanEvent {
     /// transport is not reading yet: the loop records the link, then
     /// `announce`s it, so no frame from the peer can be handled before the
     /// link exists (a file-offer arriving first was dropped).
-    Linked { pid: String, name: String, secret: String, fleet: bool, transport: direct::UnreadTransport, remote: SocketAddr, dialer: bool },
+    Linked { pid: String, name: String, secret: String, fleet: bool, attempt: AttemptId, transport: direct::UnreadTransport, remote: SocketAddr, dialer: bool },
     /// A recognized peer announced itself at `addr` (its listener).
     Found { name: String, addr: SocketAddr },
     /// A pairing code is on screen on a device at `addr` (spec section 7).
@@ -694,8 +694,9 @@ pub fn spawn_accept(
                         if shutdown2.is_stopped() { conn.close(quinn::VarInt::from_u32(0), b"lan stopped"); return; }
                         let remote = canonical(conn.remote_address());
                         let pid = fresh_pid();
-                        let transport = direct::make_transport_unread(pid.clone(), conn, send, recv, tx.clone(), true, Some(ep2), true);
-                        let _ = tx.send(Ev::Lan(LanEvent::Linked { pid, name: k.name, secret: k.secret, fleet: k.fleet, transport, remote, dialer: false }));
+                        let attempt = AttemptId::next();
+                        let transport = direct::make_transport_unread(pid.clone(), conn, send, recv, tx.clone(), true, Some(ep2), true, Some(attempt));
+                        let _ = tx.send(Ev::Lan(LanEvent::Linked { pid, name: k.name, secret: k.secret, fleet: k.fleet, attempt, transport, remote, dialer: false }));
                     }
                     Ok(Ok(None)) => {}
                     Ok(Err(e)) => crate::hooks::debug(&format!("lan: inbound refused: {e:#}")),
@@ -851,8 +852,9 @@ pub async fn dial(ep: Endpoint, key: LanKey, addrs: Vec<SocketAddr>, tx: Unbound
     let (addr, conn, send, recv) = won?;
     let pid = fresh_pid();
     let remote = canonical(conn.remote_address());
-    let transport = direct::make_transport_unread(pid.clone(), conn, send, recv, tx.clone(), false, Some(ep), true);
-    let _ = tx.send(Ev::Lan(LanEvent::Linked { pid, name: key.name, secret: key.secret, fleet: key.fleet, transport, remote, dialer: true }));
+    let attempt = AttemptId::next();
+    let transport = direct::make_transport_unread(pid.clone(), conn, send, recv, tx.clone(), false, Some(ep), true, Some(attempt));
+    let _ = tx.send(Ev::Lan(LanEvent::Linked { pid, name: key.name, secret: key.secret, fleet: key.fleet, attempt, transport, remote, dialer: true }));
     Some(addr)
 }
 
@@ -1571,9 +1573,11 @@ mod tests {
         let Some(Ev::DirectReady(_, dtrans, _)) = drx.recv().await else { panic!("no dialer ready") };
         dtrans.send_control(&json!({"type": "file-offer", "probe": 1})).await.unwrap();
         // Acceptor: the link event comes first, and nothing else until announce.
-        let Some(Ev::Lan(LanEvent::Linked { transport: at, pid, .. })) = tokio::time::timeout(Duration::from_secs(8), arx.recv()).await.unwrap() else {
+        let Some(Ev::Lan(LanEvent::Linked { transport: at, pid, attempt, .. })) = tokio::time::timeout(Duration::from_secs(8), arx.recv()).await.unwrap() else {
             panic!("acceptor did not link")
         };
+        let expected_source = at.transport().source_id().expect("LAN primary has a source");
+        assert_eq!(at.transport().attempt_id(), Some(attempt));
         assert!(
             tokio::time::timeout(Duration::from_millis(500), arx.recv()).await.is_err(),
             "a frame was delivered before the link was announced"
@@ -1581,9 +1585,15 @@ mod tests {
         at.announce(&atx, |t| Ev::DirectReady(pid.clone(), t, ROUTE_LAN));
         assert!(matches!(arx.recv().await, Some(Ev::DirectReady(..))), "the ready event comes first");
         match tokio::time::timeout(Duration::from_secs(5), arx.recv()).await.unwrap() {
-            Some(Ev::Control(p, v)) => {
+            Some(Ev::Sourced { pid: envelope_pid, source, inner }) => {
+                assert_eq!(envelope_pid, pid);
+                assert_eq!(source, expected_source, "the frame keeps its announced source");
+                let Ev::Control(p, v) = *inner else {
+                    panic!("the sourced frame is not a control frame")
+                };
                 assert_eq!(p, pid);
                 assert_eq!(v["type"], "file-offer");
+                assert_eq!(v["probe"], 1);
             }
             other => panic!("expected the peer's frame, got {other:?}"),
         }

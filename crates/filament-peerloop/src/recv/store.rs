@@ -651,6 +651,27 @@ impl DeviceStore {
             .collect()
     }
 
+    /// A device record's capability ceiling, with the v1 baseline `["transfer"]`
+    /// when the record predates `caps`. An unknown name is empty. Used by the
+    /// core host for a LAN delegated principal; the CLI host reads the same
+    /// field through `device_caps`.
+    pub fn device_caps(&self, name: &str) -> Vec<String> {
+        let Some(record) = self
+            .devices_records()
+            .into_iter()
+            .find(|d| d["name"].as_str() == Some(name))
+        else {
+            return Vec::new();
+        };
+        match record.get("caps").and_then(|c| c.as_array()) {
+            Some(list) => list
+                .iter()
+                .filter_map(|c| c.as_str().map(str::to_string))
+                .collect(),
+            None => vec!["transfer".to_string()],
+        }
+    }
+
     pub fn device_cert_for(&self, name: &str) -> Option<DeviceCert> {
         self.devices_records()
             .into_iter()

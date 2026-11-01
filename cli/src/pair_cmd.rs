@@ -1362,6 +1362,7 @@ async fn pair_with_purpose(
 
     let result = async {
     loop {
+        conn.pump_builds();
         // A LAN ceremony that confirmed hands its outcome here, where the one
         // store call and the one code decision live.
         let lan_event = lan_host.as_mut().and_then(|h| h.events.try_recv().ok());
@@ -1926,6 +1927,7 @@ async fn pair_with_purpose(
             Ok(None) => bail!("signaling closed"),
             Err(_) => continue,
         };
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -2449,6 +2451,10 @@ async fn pair_with_purpose(
                     continue;
                 }
                 conn.ensure_responder(&from, &data).await?;
+                if conn.build_pending(&from) {
+                    conn.stage_signal(&v);
+                    continue;
+                }
                 conn.apply_signal(&from, data).await;
             }
             Ev::ChannelReady(pid, t) => {

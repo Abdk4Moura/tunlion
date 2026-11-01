@@ -22,11 +22,15 @@ pub struct LocalTransport {
     stream: Arc<Mutex<TcpStream>>,
     dead: Arc<AtomicBool>,
     last_activity: Arc<AtomicU64>,
+    attempt: Option<filament_transport::net::AttemptId>,
 }
 
 impl LocalTransport {
     /// Connect to a peer's TCP localhost.
-    pub async fn connect(addr: &str) -> Result<Self> {
+    pub async fn connect(
+        addr: &str,
+        attempt: filament_transport::net::AttemptId,
+    ) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
         let stream = Arc::new(Mutex::new(stream));
 
@@ -34,6 +38,7 @@ impl LocalTransport {
             stream,
             dead: Arc::new(AtomicBool::new(false)),
             last_activity: Arc::new(AtomicU64::new(now_ms())),
+            attempt: Some(attempt),
         })
     }
 
@@ -43,6 +48,7 @@ impl LocalTransport {
             stream: Arc::new(Mutex::new(stream)),
             dead: Arc::new(AtomicBool::new(false)),
             last_activity: Arc::new(AtomicU64::new(now_ms())),
+            attempt: None,
         }
     }
 }
@@ -111,6 +117,10 @@ impl Transport for LocalTransport {
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn attempt_id(&self) -> Option<filament_transport::net::AttemptId> {
+        self.attempt
     }
 }
 

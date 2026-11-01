@@ -845,6 +845,7 @@ pub(crate) async fn send_cmd(
     ));
 
     loop {
+        conn.pump_builds();
         // Never a silent minute: while the peer has not connected, or has
         // stopped answering mid-send, say so every few seconds. Not while a
         // code waits to be typed, and not while a person there is deciding.
@@ -1088,6 +1089,7 @@ pub(crate) async fn send_cmd(
         // location is sufficient to distinguish this fallback from adoption.
         // The receiver-side caller below routes through maybe_adopt instead.
         for (pid, info, (n, sec)) in conn.expired_direct() {
+            conn.note_binding(&pid, (n.clone(), sec.clone()));
             conn.establish_as(info, None).await.with_context(|| {
                 format!("direct fallback establish failed for peer {pid} on send path")
             })?;
@@ -1098,7 +1100,7 @@ pub(crate) async fn send_cmd(
                 && conn.active.is_none()
                 && (!use_code || pake_peer.as_deref() == Some(pid.as_str()))
             {
-                conn.active = Some(pid.clone());
+                conn.note_active(&pid);
             }
         }
         // C30 phase 3: tell every link our truth every ~10s (sender side has
@@ -1166,6 +1168,7 @@ pub(crate) async fn send_cmd(
         conn.tick_upgrade_prober().await;
         let Some(ev) = ev else { continue };
 
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -1235,6 +1238,10 @@ pub(crate) async fn send_cmd(
                                 continue;
                             }
                             let pid = p["id"].as_str().unwrap_or_default().to_string();
+                            // Same claim-before-establish rule as the KnownPeer
+                            // arm: an in-flight candidate keeps its answered
+                            // channel and a live-but-unbound link is announced.
+                            conn.note_binding(&pid, (name.clone(), secret.clone()));
                             conn.start_direct(&pid, name, secret).await;
                             conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
                             if let Some(l) = conn.link_mut(&pid) {
@@ -1378,6 +1385,15 @@ pub(crate) async fn send_cmd(
                         // maybe_adopt->establish below skips the WebRTC offer
                         // until the budget expires (then it falls back).
                         let (n, sec) = (n.clone(), sec.clone());
+                        // Declare the store-authorized binding BEFORE the
+                        // establish, not by patching the Link afterwards. A
+                        // candidate that is already building (an inbound
+                        // responder the peer is answering right now) must
+                        // inherit this claim instead of being retired by a
+                        // rival outbound build; a LIVE but unbound link is
+                        // re-announced with it. Patching after the fact only
+                        // reaches a link that already exists.
+                        conn.note_binding(&pid, (n.clone(), sec.clone()));
                         conn.start_direct(&pid, &n, &sec).await;
                         conn.maybe_adopt(&v, true).await?;
                         if let Some(l) = conn.link_mut(&pid) {
@@ -1387,6 +1403,7 @@ pub(crate) async fn send_cmd(
                 }
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 // A browser's PeerLink sends its transport hint BEFORE any SDP.
@@ -1596,6 +1613,10 @@ pub(crate) async fn send_cmd(
                 // C18: an offer from an unlinked roster peer creates a polite
                 // responder link (browsers mesh-dial everyone, fix #7 rules).
                 conn.ensure_responder(&from, &data).await?;
+                if conn.build_pending(&from) {
+                    conn.stage_signal(&v);
+                    continue;
+                }
                 conn.apply_signal(&from, data).await;
             }
             // rung-1: the authenticated direct-QUIC connection won the race.
@@ -1603,15 +1624,15 @@ pub(crate) async fn send_cmd(
             // handler the WebRTC path uses (announce + offers) by re-emitting
             // ChannelReady, the transfer logic rides the trait unchanged.
             Ev::DirectReady(pid, t, route) => {
-                let tkey = conn
-                    .direct_pending
-                    .get(&pid)
-                    .map(|p| direct::transport_key(&p.secret.1));
-                conn.adopt_direct(&pid, t.clone(), route);
+                let verdict = conn.adopt_direct(&pid, t.clone(), route);
+                let tkey = match verdict {
+                    crate::conn::DirectAdoption::Adopted { tkey, .. } => tkey,
+                    _ => continue,
+                };
                 if let Some(k) = tkey.filter(|_| route != filament_transport::lan::ROUTE_LAN) {
                     conn.spawn_direct_workers(&pid, &t, k);
                 }
-                let _ = tx.send(Ev::ChannelReady(pid, t));
+                let _ = tx.send(Ev::sourced_channel_ready(pid, t));
             }
             Ev::Lan(e) => match e {
                 filament_transport::lan::LanEvent::Found { name, addr } => {
@@ -1632,13 +1653,10 @@ pub(crate) async fn send_cmd(
                 }
                 filament_transport::lan::LanEvent::PairingNearby { .. } => {}
             },
-            Ev::DirectWorkersReady(pid, workers) => {
-                if let Some(link) = conn.link_mut(&pid) {
-                    link.workers = workers;
-                    crate::ui::debug(&format!(
-                        "worker transports ready: {pid} {} workers",
-                        link.workers.len()
-                    ));
+            Ev::DirectWorkersReady(pid, workers, primary_source) => {
+                if conn.accept_workers_ready(&pid, workers, primary_source) {
+                    let count = conn.link(&pid).map(|l| l.workers.len()).unwrap_or(0);
+                    crate::ui::debug(&format!("worker transports ready: {pid} {count} workers"));
                 }
             }
             // P5 (GAP-6): a relay->direct upgrade probe's direct standby connected
@@ -1671,11 +1689,13 @@ pub(crate) async fn send_cmd(
                 // connected". The session that actually connects and holds the
                 // target's secret IS the target, so it takes the slot.
                 if !conn.is_active(&pid) && !established && !use_code && !fleet_target {
-                    let proves_target = known_target.as_ref().is_some_and(|(_, sec)| {
-                        conn.link(&pid)
-                            .and_then(|l| l.expected_secret.as_ref())
-                            .is_some_and(|(_, s)| s == sec)
-                    });
+                    // A pair-proof link matches on `expected_secret`; a LAN link
+                    // matches on its exact authenticated DEVICE reservation while
+                    // that binding is still the store's. Either way this decides
+                    // which link is the target, not what it may do.
+                    let proves_target = known_target
+                        .as_ref()
+                        .is_some_and(|(n, sec)| conn.link_matches_device(&pid, n, sec));
                     if proves_target {
                         if let Some(old) = conn.active.clone() {
                             ui::debug(&format!(
@@ -1960,7 +1980,7 @@ pub(crate) async fn send_cmd(
                             // on confirm: the offer lives in that handler, which
                             // already ran and deferred while identity was unproven.
                             if let Some(t) = conn.transport_of(&pid) {
-                                let _ = tx.send(Ev::ChannelReady(pid.clone(), t));
+                                let _ = tx.send(Ev::sourced_channel_ready(pid.clone(), t));
                             }
                         }
                         fleet_session::Outcome::Refused(e) => bail!(
@@ -2500,7 +2520,7 @@ pub(crate) async fn send_cmd(
                             "  {next} is a live link to the same device; resuming there"
                         ));
                         conn.active = Some(next.clone());
-                        let _ = tx.send(Ev::ChannelReady(next, t));
+                        let _ = tx.send(Ev::sourced_channel_ready(next, t));
                     }
                 }
             }

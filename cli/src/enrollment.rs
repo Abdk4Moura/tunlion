@@ -280,6 +280,7 @@ pub(crate) async fn enroll_cmd(
     let enroll_deadline = Duration::from_secs(60);
 
     loop {
+        conn.pump_builds();
         let elapsed = started.elapsed();
         if elapsed >= enroll_deadline {
             return Err(enrollment_timeout(enroll_deadline.as_secs()));
@@ -296,6 +297,7 @@ pub(crate) async fn enroll_cmd(
 
         let Some(ev) = ev else { continue };
 
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -375,14 +377,24 @@ pub(crate) async fn enroll_cmd(
                 }
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 conn.ensure_responder(&from, &data).await?;
+                if conn.build_pending(&from) {
+                    conn.stage_signal(&v);
+                    continue;
+                }
                 conn.apply_signal(&from, data).await;
             }
             Ev::DirectReady(pid, t, route) => {
-                conn.adopt_direct(&pid, t.clone(), route);
-                let _ = tx.send(Ev::ChannelReady(pid, t));
+                if !matches!(
+                    conn.adopt_direct(&pid, t.clone(), route),
+                    crate::conn::DirectAdoption::Adopted { .. }
+                ) {
+                    continue;
+                }
+                let _ = tx.send(Ev::sourced_channel_ready(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
                 conn.mark_ready(&pid, &t, true);
@@ -578,6 +590,7 @@ pub(crate) async fn enroll_and_send_cmd(
     let deadline = Duration::from_secs(60);
 
     loop {
+        conn.pump_builds();
         if started.elapsed() >= deadline {
             return Err(enrollment_timeout(deadline.as_secs()));
         }
@@ -589,6 +602,7 @@ pub(crate) async fn enroll_and_send_cmd(
             }
             continue;
         };
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 // The owner daemon is already in the enroll room; the server hands
@@ -670,14 +684,24 @@ pub(crate) async fn enroll_and_send_cmd(
                 }
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 conn.ensure_responder(&from, &data).await?;
+                if conn.build_pending(&from) {
+                    conn.stage_signal(&v);
+                    continue;
+                }
                 conn.apply_signal(&from, data).await;
             }
             Ev::DirectReady(pid, t, route) => {
-                conn.adopt_direct(&pid, t.clone(), route);
-                let _ = tx.send(Ev::ChannelReady(pid, t));
+                if !matches!(
+                    conn.adopt_direct(&pid, t.clone(), route),
+                    crate::conn::DirectAdoption::Adopted { .. }
+                ) {
+                    continue;
+                }
+                let _ = tx.send(Ev::sourced_channel_ready(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
                 open_enrollment(&mut conn, &pid, &t, enroll_seed, device_pub, &ak).await;

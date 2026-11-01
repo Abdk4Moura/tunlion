@@ -76,6 +76,7 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
     let mut sent = false;
     let mut acked = false;
     loop {
+        conn.pump_builds();
         let slice = Duration::from_secs(2).min(deadline.saturating_sub(started.elapsed()));
         let ev = match tokio::time::timeout(slice, rx.recv()).await {
             Ok(Some(ev)) => Some(ev),
@@ -107,6 +108,7 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
             }
         }
         let Some(ev) = ev else { continue };
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -141,14 +143,24 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
                 }
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 conn.ensure_responder(&from, &data).await?;
+                if conn.build_pending(&from) {
+                    conn.stage_signal(&v);
+                    continue;
+                }
                 conn.apply_signal(&from, data).await;
             }
             Ev::DirectReady(pid, t, route) => {
-                conn.adopt_direct(&pid, t.clone(), route);
-                let _ = tx.send(Ev::ChannelReady(pid, t));
+                if !matches!(
+                    conn.adopt_direct(&pid, t.clone(), route),
+                    crate::conn::DirectAdoption::Adopted { .. }
+                ) {
+                    continue;
+                }
+                let _ = tx.send(Ev::sourced_channel_ready(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
                 conn.mark_ready(&pid, &t, true);
@@ -290,6 +302,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         ui::paint(ui::Tone::Bold, &b_name)
     ));
 
+    let (build_tx, build_rx) = mpsc::unbounded_channel();
     let mut conn = Conn {
         transport_context,
         server: server.to_string(),
@@ -317,6 +330,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         room_digest_absent: HashMap::new(),
         recv_done: false,
         direct_pending: HashMap::new(),
+        retired_attempts: HashMap::new(),
         lan: None,
         webrtc_only: std::collections::HashSet::new(),
         buffered_offers: HashMap::new(),
@@ -341,6 +355,18 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         fleet_grants_pushed: Default::default(),
         stuck_retry: HashMap::new(),
         ice_cache: crate::conn::SharedIceCache::default(),
+        builds: HashMap::new(),
+        build_deferred: std::collections::BTreeMap::new(),
+        build_tx,
+        build_rx: std::sync::Mutex::new(build_rx),
+        pending_bindings: HashMap::new(),
+        pending_active: HashSet::new(),
+        cancelled_intents: HashMap::new(),
+        current_intent: HashMap::new(),
+        revoked_peers: HashMap::new(),
+        revoked_bindings: HashSet::new(),
+        link_events: HashMap::new(),
+        pending_sources: HashMap::new(),
         roster_absent: HashMap::new(),
         log: crate::host_impl::cli_log(),
         host: crate::host_impl::cli_host(),
@@ -354,6 +380,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
     let mut channel_digest_absent: HashMap<String, u8> = HashMap::new();
 
     loop {
+        conn.pump_builds();
         if Instant::now() > deadline {
             bail!("timed out, both devices must be online (e.g. running `tunlion up`)");
         }
@@ -364,6 +391,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         };
         sess.tick(&sio).await; // C30: converge every iteration (incl. ticks)
         conn.reap_deferred(); // #28: discharge deferred peer-left when idle/dead
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -453,9 +481,14 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
                 who.insert(pid, is_b);
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 conn.ensure_responder(&from, &data).await?;
+                if conn.build_pending(&from) {
+                    conn.stage_signal(&v);
+                    continue;
+                }
                 conn.apply_signal(&from, data).await;
             }
             Ev::ChannelReady(pid, t) => {

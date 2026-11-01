@@ -82,7 +82,9 @@ pub mod mesh_stub;
 pub mod ports;
 pub mod renewal;
 pub mod report;
-#[cfg(feature = "dispatch")]
+// The decisions are wire-free and also exercised by Conn's minimal-feature
+// authorization regressions. Keep the production dispatch boundary unchanged.
+#[cfg(any(feature = "dispatch", test))]
 pub mod revocation;
 #[cfg(feature = "dispatch")]
 pub mod roster;

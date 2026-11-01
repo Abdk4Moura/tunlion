@@ -534,6 +534,7 @@ async fn drive_over(
     let source_failed: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
+        conn.pump_builds();
         if cancel.is_cancelled() {
             return Err(SendFailure::interrupted("the send was cancelled"));
         }
@@ -576,6 +577,7 @@ async fn drive_over(
         // every iteration; without it a failed direct promote would strand the
         // code receiver.
         for (pid, info, (name, secret)) in conn.expired_direct() {
+            conn.note_binding(&pid, (name.clone(), secret.clone()));
             conn.establish_as(info, None).await.map_err(|error| {
                 SendFailure::engine(format!(
                     "direct fallback establish failed for {pid}: {error}"
@@ -585,7 +587,7 @@ async fn drive_over(
                 link.expected_secret = Some((name, secret));
             }
             if conn.to_filter.is_none() && conn.active.is_none() {
-                conn.active = Some(pid);
+                conn.note_active(&pid);
             }
         }
         // Code ceremony progression: relay our element, then our confirmation.
@@ -676,6 +678,7 @@ async fn drive_over(
         };
         let Some(ev) = ev else { continue };
         last_activity = Instant::now();
+        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -777,6 +780,7 @@ async fn drive_over(
                 }
             }
             Ev::Signal(v) => {
+                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 if data["type"].as_str() == Some("not-recognized") {
@@ -887,16 +891,23 @@ async fn drive_over(
                 conn.ensure_responder(&from, &data)
                     .await
                     .map_err(internal)?;
+                if conn.build_pending(&from) {
+                    conn.stage_signal(&v);
+                    continue;
+                }
                 conn.apply_signal(&from, data).await;
             }
             Ev::DirectReady(pid, t, route) => {
-                conn.adopt_direct(&pid, t.clone(), route);
-                let _ = tx.send(Ev::ChannelReady(pid, t));
-            }
-            Ev::DirectWorkersReady(pid, workers) => {
-                if let Some(link) = conn.link_mut(&pid) {
-                    link.workers = workers;
+                if !matches!(
+                    conn.adopt_direct(&pid, t.clone(), route),
+                    crate::conn::DirectAdoption::Adopted { .. }
+                ) {
+                    continue;
                 }
+                let _ = tx.send(Ev::sourced_channel_ready(pid, t));
+            }
+            Ev::DirectWorkersReady(pid, workers, primary_source) => {
+                conn.accept_workers_ready(&pid, workers, primary_source);
             }
             Ev::DirectUpgradeReady(pid, t, route) => {
                 conn.stash_upgrade_standby(&pid, t, route);
@@ -904,11 +915,12 @@ async fn drive_over(
             Ev::ChannelReady(pid, t) => {
                 conn.mark_ready(&pid, &t, false);
                 if !conn.is_active(&pid) && !established && !use_code {
-                    let proves = known_target.as_ref().is_some_and(|(_, sec)| {
-                        conn.link(&pid)
-                            .and_then(|l| l.expected_secret.as_ref())
-                            .is_some_and(|(_, s)| s == sec)
-                    });
+                    // Pair/proof links match on `expected_secret`; a LAN link
+                    // matches on its exact authenticated DEVICE reservation while
+                    // that binding is still the store's. Target selection only.
+                    let proves = known_target
+                        .as_ref()
+                        .is_some_and(|(n, sec)| conn.link_matches_device(&pid, n, sec));
                     if proves {
                         conn.active = Some(pid.clone());
                     }

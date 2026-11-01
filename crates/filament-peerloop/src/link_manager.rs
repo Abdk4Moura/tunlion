@@ -56,6 +56,12 @@ pub struct LinkObs<'a> {
     pub pid: &'a str,
     /// The device name this link PROVED it reaches (`Link::verified_name`).
     pub verified_name: Option<&'a str>,
+    /// The canonical store name of an exact authenticated LAN DEVICE reservation
+    /// (`Link::authenticated_device_name`). Populated by the caller ONLY while the
+    /// reservation's `(name, secret)` is the current store's binding and the
+    /// secret is not revoked. A routing name, never an identity proof: the link
+    /// stays untrusted and un-Proven, and no capability is granted.
+    pub lan_device_name: Option<&'a str>,
     /// We know WHO this link reaches: the legacy pair-proof trust flag, or a
     /// proven certificate binding. This decides ROUTING, never permission: what
     /// the peer may do is still decided by the capability gate on its side.
@@ -91,13 +97,18 @@ pub enum Placement {
 
 /// May a request for `peer` ride this link? Pure.
 ///
-/// The link must reach `peer` (by its PROVEN name, matched case-insensitively),
-/// we must know who it reaches, and it must be alive; a non-direct link must also
-/// not have gone quiet past `WARM_RELAY_STALE_MS`, since that is a relay path
-/// that may already be evicted.
+/// The link must reach `peer` by its PROVEN name (matched case-insensitively),
+/// OR by an exact authenticated LAN DEVICE reservation that the caller has
+/// already checked against the current store. A LAN link is deliberately NOT
+/// `identity_known` and stays untrusted/un-Proven; this is a routing decision
+/// only, and permission is still decided by the receiving capability gate. The
+/// link must be alive; a non-direct link must also not have gone quiet past
+/// `WARM_RELAY_STALE_MS`, since that is a relay path that may already be evicted.
 pub fn eligible(l: &LinkObs<'_>, peer: &str) -> bool {
-    l.identity_known
-        && l.verified_name.is_some_and(|n| n.eq_ignore_ascii_case(peer))
+    let reaches_peer = (l.identity_known
+        && l.verified_name.is_some_and(|n| n.eq_ignore_ascii_case(peer)))
+        || l.lan_device_name.is_some_and(|n| n.eq_ignore_ascii_case(peer));
+    reaches_peer
         && l.has_transport
         && l.alive
         && (l.direct || l.idle_ms < WARM_RELAY_STALE_MS)
@@ -318,6 +329,7 @@ mod tests {
         LinkObs {
             pid,
             verified_name: name,
+            lan_device_name: None,
             identity_known: true,
             has_transport: true,
             alive: true,
@@ -325,6 +337,40 @@ mod tests {
             idle_ms: 0,
             age_ms: Some(0),
         }
+    }
+
+    #[test]
+    fn an_exact_authenticated_lan_device_link_resolves_without_trust() {
+        // The LAN link is deliberately untrusted and un-Proven; the caller has
+        // already checked its exact (name, secret) reservation against the
+        // current store. Routing may name it, permission is unchanged.
+        let mut lan = obs("lan", None);
+        lan.identity_known = false;
+        lan.lan_device_name = Some("Laptop");
+        lan.direct = true;
+        assert_eq!(
+            place(Work::Interactive, "laptop", &[lan]),
+            Placement::Reuse { pid: "lan".into() }
+        );
+    }
+
+    #[test]
+    fn a_lan_reservation_never_resolves_a_different_device() {
+        let mut lan = obs("lan", None);
+        lan.identity_known = false;
+        lan.lan_device_name = Some("server");
+        lan.direct = true;
+        assert_eq!(place(Work::Interactive, "laptop", &[lan]), Placement::Establish);
+    }
+
+    #[test]
+    fn a_dead_lan_link_is_not_placed_even_when_the_binding_matches() {
+        let mut lan = obs("lan", None);
+        lan.identity_known = false;
+        lan.lan_device_name = Some("laptop");
+        lan.direct = true;
+        lan.alive = false;
+        assert_eq!(place(Work::Interactive, "laptop", &[lan]), Placement::Establish);
     }
 
     #[test]
