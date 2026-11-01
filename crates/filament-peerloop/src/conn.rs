@@ -1201,6 +1201,26 @@ pub struct RetiredIntent {
 pub struct LinkEvents {
     pub generation: u32,
     pub rx: std::sync::Mutex<mpsc::UnboundedReceiver<Ev>>,
+    /// Set by `stage_event` when it admits a departure barrier for THIS exact
+    /// source (the link's current primary). `on_peer_left` consumes it once to
+    /// distinguish that validated hand-over from a fresh room departure; it
+    /// dies with this entry (replacement/drop re-insert it or remove it) and is
+    /// never written by anything that has not passed the exact-source gate.
+    pub departure_ready: Option<net::SourceId>,
+    /// A departure barrier for this exact source is queued (its events were
+    /// already handed over, so the local queue is empty). A DUPLICATE ordinary
+    /// peer-left for the same link must not finalize on that empty queue; it
+    /// waits for the barrier, which is already in the main queue.
+    pub departure_pending: Option<net::SourceId>,
+}
+
+/// What a bounded hand-over of one link's already-read events moved.
+enum QueueDrain {
+    Empty,
+    Moved(usize),
+    /// More than the per-link event budget was queued: the hand-over cannot be
+    /// completed without an unbounded loop, so the caller drops instead.
+    Overflow,
 }
 
 /// Source-bound events from a standby/upgrade transport that is not adopted
@@ -3193,7 +3213,7 @@ impl Conn {
         // The forwarder is owned by the link: pump_builds drains this receiver
         // only while the link still carries `generation`, and drop_link/
         // replacement removes it, discarding queued stale events.
-        self.link_events.insert(pid, LinkEvents { generation, rx: std::sync::Mutex::new(candidate_rx) });
+        self.link_events.insert(pid, LinkEvents { generation, rx: std::sync::Mutex::new(candidate_rx), departure_ready: None, departure_pending: None });
     }
 
     fn install_built(
@@ -3276,21 +3296,35 @@ impl Conn {
             }
             Ev::Sourced { pid, source, inner } => {
                 // A departure barrier (`on_peer_left` queued it behind that
-                // link's already-read events). It is consumed here, never
-                // re-dispatched: the finalizer is the ordinary departure path.
+                // link's already-read events). The exact-source gate still runs
+                // HERE, but the event is then handed to the ordinary caller as
+                // a normal `Ev::PeerLeft`: its pre-drop snapshot and messaging
+                // must run as they do for any room departure. The once-only
+                // marker records that this departure was already validated, so
+                // `on_peer_left` can finish it without re-draining the queue.
                 if let Ev::PeerLeft(v) = inner.as_ref() {
                     if v["id"].as_str() != Some(pid.as_str()) {
                         return None;
                     }
-                    // Same final gate as any transport-origin event: only the
-                    // link's CURRENT primary source may drop it. A replacement
-                    // adopted after the barrier was queued is newer authority
-                    // and must survive; a stale barrier only self-rejects.
-                    if self.source_current(&pid, source, inner.as_ref()) {
-                        let v = v.clone();
-                        self.finalize_peer_left(&v);
+                    // A replacement adopted after the barrier was queued is
+                    // newer authority and must survive; a stale barrier only
+                    // self-rejects (and never marks anything).
+                    if !self.source_current(&pid, source, inner.as_ref()) {
+                        return None;
                     }
-                    return None;
+                    match self.link_events.get_mut(&pid) {
+                        Some(events)
+                            if self.links.get(&pid).map(|link| link.generation)
+                                == Some(events.generation) =>
+                        {
+                            events.departure_ready = Some(source);
+                        }
+                        // No live queue for this link (dropped since the drain):
+                        // there is nothing this hand-over protects.
+                        _ => return None,
+                    }
+                    let v = v.clone();
+                    return Some((Ev::PeerLeft(v), Some(source)));
                 }
                 // Envelope and inner pid must agree, and nesting is invalid:
                 // otherwise checking one pid would handle another.
@@ -7193,6 +7227,42 @@ impl Conn {
         let Some(pid_val) = v["id"].as_str() else {
             return false;
         };
+        // A departure barrier `stage_event` admitted: the departed link's
+        // already-read events were dispatched ahead of it, and the marker is
+        // bound to that exact source. Consume it once and run the ordinary
+        // finalizer now, with its normal return value. A marker whose source is
+        // not the CURRENT link's belongs to a link replaced before this ran:
+        // the successor is newer authority, so nothing of it is touched (not
+        // even the cleanup below), and the stale marker dies here.
+        if let Some(source) = self
+            .link_events
+            .get_mut(pid_val)
+            .and_then(|events| events.departure_ready.take())
+        {
+            return if self.links.get(pid_val).map(|link| link.source) == Some(source) {
+                self.finalize_peer_left(v)
+            } else {
+                false
+            };
+        }
+        // A barrier for this exact link is already queued: its events were
+        // handed over, so the local queue is legitimately empty. A DUPLICATE
+        // room signal must not finalize on that empty queue and beat the
+        // barrier; the barrier does the drop. Checked after the ready marker
+        // (that one is the validated hand-over itself).
+        if let Some(source) = self
+            .link_events
+            .get(pid_val)
+            .and_then(|events| events.departure_pending)
+        {
+            if self.links.get(pid_val).map(|link| link.source) == Some(source) {
+                return false;
+            }
+            // The link it protected is gone or replaced: the flag dies with it.
+            if let Some(events) = self.link_events.get_mut(pid_val) {
+                events.departure_pending = None;
+            }
+        }
         let pid = pid_val.to_string();
         self.roster.remove(&pid);
         self.webrtc_only.remove(&pid);
@@ -7250,26 +7320,42 @@ impl Conn {
             ));
             return false;
         }
-        // A non-flowing link can still hold events the transport already READ
-        // but the loop has not forwarded yet (the per-link candidate queue is
+        // A current link can still hold events the transport already READ but
+        // the loop has not forwarded yet (the per-link candidate queue is
         // drained once per turn by `pump_builds`). Dropping the link here
         // deletes that queue, so the last control a peer sent just before
         // leaving - a decline, a final open/close - is lost even though it
-        // arrived. Forward that link's current events in order, then queue an
-        // internal, source-tagged departure behind them; the link stays alive
-        // until the barrier runs, so the gate can still accept those events.
-        if !forced && self.drain_current_link_events(&pid) {
-            if let Some(source) = self.links.get(&pid).map(|link| link.source) {
-                let _ = self.tx.send(Ev::Sourced {
-                    pid: pid.clone(),
-                    source,
-                    inner: Box::new(Ev::PeerLeft(v.clone())),
-                });
-                self.log.debug(&format!(
-                    "peer-left for {pid} queued behind its already-read link events"
-                ));
+        // arrived. Hand over a BOUNDED batch of that link's current events in
+        // order (never a loop over a concurrent producer), then queue an
+        // internal, source-tagged departure behind them. Over the per-link
+        // budget the hand-over fails closed: drop now, as before, and let the
+        // gate reject the already-forwarded prefix once the link is gone.
+        if !forced {
+            match self.drain_current_link_events(&pid) {
+                QueueDrain::Empty => {}
+                QueueDrain::Moved(moved) => {
+                    if let Some(source) = self.links.get(&pid).map(|link| link.source) {
+                        let _ = self.tx.send(Ev::Sourced {
+                            pid: pid.clone(),
+                            source,
+                            inner: Box::new(Ev::PeerLeft(v.clone())),
+                        });
+                        if let Some(events) = self.link_events.get_mut(&pid) {
+                            events.departure_pending = Some(source);
+                        }
+                        self.log.debug(&format!(
+                            "peer-left for {pid}: {moved} already-read event(s) handed over ahead of the departure"
+                        ));
+                    }
+                    return false;
+                }
+                QueueDrain::Overflow => {
+                    self.log.debug(&format!(
+                        "peer-left for {pid}: already-read events exceed {MAX_BUILD_EVENTS}; dropping without hand-over"
+                    ));
+                    return self.finalize_peer_left(v);
+                }
             }
-            return false;
         }
         self.finalize_peer_left(v)
     }
@@ -7318,34 +7404,54 @@ impl Conn {
         was_active
     }
 
-    /// Move the events already READ from `pid`'s current link (its candidate
-    /// queue) onto the main queue, in arrival order, without touching another
-    /// link's stream. Returns whether anything was moved. Only called from
-    /// `on_peer_left`, immediately before queueing the departure barrier, so
-    /// those events are dispatched while the link they came from still exists.
-    fn drain_current_link_events(&mut self, pid: &str) -> bool {
+    /// Move a BOUNDED batch of the events already READ from `pid`'s current
+    /// link (its candidate queue) onto the main queue, in arrival order,
+    /// without touching another link's stream. The batch is capped at the
+    /// existing per-link event budget, so a producer still writing cannot keep
+    /// this loop spinning; over the cap the caller fails closed instead of
+    /// retrying or retaining. Only called from `on_peer_left`, immediately
+    /// before queueing the departure barrier, so those events are dispatched
+    /// while the link they came from still exists.
+    fn drain_current_link_events(&mut self, pid: &str) -> QueueDrain {
         let Some(generation) = self.link_events.get(pid).map(|events| events.generation) else {
-            return false;
+            return QueueDrain::Empty;
         };
         // The entry must belong to the link this leave names. A newer
         // generation is different authority and is not ours to drain.
         if self.links.get(pid).map(|link| link.generation) != Some(generation) {
-            return false;
+            return QueueDrain::Empty;
         }
         let tx = self.tx.clone();
         let Some(events) = self.link_events.get_mut(pid) else {
-            return false;
+            return QueueDrain::Empty;
         };
         let mut rx = events
             .rx
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut moved = false;
-        while let Ok(ev) = rx.try_recv() {
-            moved = true;
-            let _ = tx.send(ev);
+        let mut moved = 0;
+        while moved < MAX_BUILD_EVENTS {
+            match rx.try_recv() {
+                Ok(ev) => {
+                    let _ = tx.send(ev);
+                    moved += 1;
+                }
+                Err(_) => {
+                    return if moved == 0 {
+                        QueueDrain::Empty
+                    } else {
+                        QueueDrain::Moved(moved)
+                    };
+                }
+            }
         }
-        moved
+        // Exactly at the cap: probe once (never loop) to tell "the queue ended
+        // there" from "there is more than may be handed over in one turn".
+        if rx.try_recv().is_ok() {
+            QueueDrain::Overflow
+        } else {
+            QueueDrain::Moved(moved)
+        }
     }
 
     /// #28: re-check every deferred peer-left. Called on every main-loop tick
@@ -10387,7 +10493,7 @@ mod warm_identity_tests {
         conn.links.insert(pid.to_string(), link);
         let (tx, events_rx) = mpsc::unbounded_channel();
         conn.link_events
-            .insert(pid.to_string(), LinkEvents { generation: 7, rx: std::sync::Mutex::new(events_rx) });
+            .insert(pid.to_string(), LinkEvents { generation: 7, rx: std::sync::Mutex::new(events_rx), departure_ready: None, departure_pending: None });
         tx.send(Ev::Control(pid.to_string(), json!({ "type": "ping" })))
             .unwrap();
         conn.pump_builds();
@@ -12184,7 +12290,7 @@ mod warm_identity_tests {
             .unwrap();
         conn.link_events.insert(
             pid.into(),
-            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
         );
 
         assert!(!conn.on_peer_left(&json!({ "id": pid })), "a queued departure was taken as immediate");
@@ -12198,14 +12304,50 @@ mod warm_identity_tests {
         );
         assert_eq!(seen, Some(source), "the control lost its provenance");
         assert!(conn.links.contains_key(pid), "dispatching the control dropped the link");
-        let barrier = rx.try_recv().expect("no departure barrier was queued behind the control");
+        // A duplicate room signal while the barrier is queued must not finalize
+        // on the now-empty local queue and beat the barrier.
         assert!(
-            matches!(&barrier, Ev::Sourced { pid: p, inner, .. }
-                if p.as_str() == pid && matches!(inner.as_ref(), Ev::PeerLeft(_))),
-            "the queued follow-up was not a departure barrier"
+            !conn.on_peer_left(&json!({ "id": pid })),
+            "a duplicate departure finalized ahead of its barrier"
         );
-        assert!(conn.stage_event(barrier).is_none(), "the barrier leaked into dispatch");
+        assert!(conn.links.contains_key(pid), "a duplicate departure dropped the link early");
+        let barrier = rx.try_recv().expect("no departure barrier was queued behind the control");
+        let payload = match conn.stage_event(barrier) {
+            Some((Ev::PeerLeft(payload), seen)) => {
+                assert_eq!(seen, Some(source), "the barrier lost its provenance");
+                payload
+            }
+            _ => panic!("the barrier was not dispatched as an ordinary room departure"),
+        };
+        // The caller gets the normal bool: the handed-over control already ran,
+        // and the departure still reports the active link.
+        assert!(
+            conn.on_peer_left(&payload),
+            "the barrier no longer reports the active departure"
+        );
         assert!(!conn.links.contains_key(pid), "the barrier did not finish the departure");
+        // The drop's own tombstone is all that is left; nothing that could act on
+        // the departed link survives it.
+        let rest: Vec<Ev> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !rest.iter().any(|e| matches!(e, Ev::Sourced { inner, .. }
+                if matches!(inner.as_ref(), Ev::PeerLeft(_) | Ev::Control(..)))),
+            "a departure or control leaked past the drop"
+        );
+        assert!(
+            rest.iter().all(|e| matches!(e, Ev::AttemptDrained(_))),
+            "unexpected events after the drop"
+        );
+        // Even a frame queued behind the barrier cannot be processed afterwards.
+        let _ = conn.tx.send(Ev::Sourced {
+            pid: pid.into(),
+            source,
+            inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
+        });
+        assert!(
+            conn.stage_event(rx.try_recv().expect("the late frame was not queued")).is_none(),
+            "a frame behind the barrier was processed after the drop"
+        );
     }
 
     /// The barrier is tied to the exact link that departed. A newer authorized
@@ -12231,7 +12373,7 @@ mod warm_identity_tests {
             .unwrap();
         conn.link_events.insert(
             pid.into(),
-            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
         );
 
         assert!(!conn.on_peer_left(&json!({ "id": pid })));
@@ -12261,11 +12403,15 @@ mod warm_identity_tests {
         let (_queue, queued) = tokio::sync::mpsc::unbounded_channel();
         conn.link_events.insert(
             pid.into(),
-            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
         );
         assert!(conn.on_peer_left(&json!({ "id": pid })), "an idle departure stopped reporting the active link");
         assert!(!conn.links.contains_key(pid), "the departure did not drop the link");
-        assert!(rx.try_recv().is_err(), "an empty queue still produced a barrier");
+        // The drop may queue its own retirement tombstone; it must not queue a
+        // barrier or any control that could act on the gone link.
+        let after = drained(&mut rx);
+        assert!(!after.iter().any(is_barrier_or_control), "an empty queue still produced a barrier");
+        assert!(after.iter().all(|e| matches!(e, Ev::AttemptDrained(_))), "unexpected events after the drop");
     }
 
     /// A link that is still moving bytes keeps the pre-existing deferral: the
@@ -12288,7 +12434,7 @@ mod warm_identity_tests {
             .unwrap();
         conn.link_events.insert(
             pid.into(),
-            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
         );
 
         assert!(!conn.on_peer_left(&json!({ "id": pid })));
@@ -12341,7 +12487,7 @@ mod warm_identity_tests {
             .unwrap();
         conn.link_events.insert(
             pid.into(),
-            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
         );
 
         assert!(
@@ -12360,7 +12506,17 @@ mod warm_identity_tests {
         );
         assert_eq!(seen, Some(source), "the decline lost its provenance");
         let barrier = rx.try_recv().expect("no departure barrier followed the decline");
-        assert!(conn.stage_event(barrier).is_none(), "the barrier leaked into dispatch");
+        let payload = match conn.stage_event(barrier) {
+            Some((Ev::PeerLeft(payload), seen)) => {
+                assert_eq!(seen, Some(source), "the delegated barrier lost its provenance");
+                payload
+            }
+            _ => panic!("the delegated barrier was not dispatched as a room departure"),
+        };
+        assert!(
+            !conn.on_peer_left(&payload),
+            "the delegated departure reported a rejoinable leave"
+        );
         assert!(!conn.links.contains_key(pid), "the delegated enrollment did not end");
         assert!(
             !conn.deferred_left.contains_key(pid),
@@ -12390,19 +12546,152 @@ mod warm_identity_tests {
             .unwrap();
         conn.link_events.insert(
             pid.into(),
-            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
         );
 
         assert!(!conn.on_peer_left(&json!({ "id": pid, "__fil_force_drop": true })));
         assert!(!conn.links.contains_key(pid), "a forced departure was retained");
         assert!(!conn.link_events.contains_key(pid), "the forced departure kept the source's queue");
-        assert!(rx.try_recv().is_err(), "a forced departure queued a handover barrier");
+        // Forced teardown queues no hand-over: only its own retirement
+        // tombstone may appear, never queued control or a barrier.
+        let after = drained(&mut rx);
+        assert!(!after.iter().any(is_barrier_or_control), "a forced departure queued a handover barrier");
+        assert!(after.iter().all(|e| matches!(e, Ev::AttemptDrained(_))), "unexpected events after the forced drop");
         let stale = Ev::Sourced {
             pid: pid.into(),
             source,
             inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-accept" }))),
         };
         assert!(conn.stage_event(stale).is_none(), "a force-dropped source's control was revived");
+    }
+
+    fn drained(rx: &mut mpsc::UnboundedReceiver<Ev>) -> Vec<Ev> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// A departure barrier or a control that could act on a link. Tombstones
+    /// (`AttemptDrained`) are teardown bookkeeping, not retained authority.
+    fn is_barrier_or_control(ev: &Ev) -> bool {
+        match ev {
+            Ev::Sourced { inner, .. } => matches!(inner.as_ref(), Ev::PeerLeft(_) | Ev::Control(..)),
+            Ev::PeerLeft(_) => true,
+            _ => false,
+        }
+    }
+
+    /// A barrier that `stage_event` already validated is bound to the exact
+    /// link. If that link is replaced before the ordinary handler runs, the
+    /// marker must die with it: no cleanup of the successor, no rejoin window,
+    /// no drop of newer authority.
+    #[tokio::test]
+    async fn a_validated_departure_marker_dies_with_its_link_not_the_successor() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-marker-replaced";
+        let old = Rec::new("webrtc", &log);
+        let old_source = old.source_id().expect("fixture transport has a source");
+        conn.links.insert(pid.into(), delegated_link(pid, old));
+        conn.bind_active(pid);
+        let (queue, queued) = tokio::sync::mpsc::unbounded_channel();
+        queue
+            .send(Ev::Sourced {
+                pid: pid.into(),
+                source: old_source,
+                inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
+            })
+            .unwrap();
+        conn.link_events.insert(
+            pid.into(),
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
+        );
+        assert!(!conn.on_peer_left(&json!({ "id": pid })));
+        let _ = rx.try_recv().expect("the queued control was not handed over");
+        let payload = match conn.stage_event(rx.try_recv().expect("no barrier")) {
+            Some((Ev::PeerLeft(payload), _)) => payload,
+            _ => panic!("the barrier was not dispatched as a room departure"),
+        };
+        assert!(
+            conn.link_events.get(pid).is_some_and(|e| e.departure_ready == Some(old_source)),
+            "the validated barrier did not record its once-only marker"
+        );
+
+        let successor = Rec::new("direct", &log);
+        let successor_source = successor.source_id().expect("fixture transport has a source");
+        let mut replacement = relay_link(pid, "peer", "peer", successor);
+        replacement.generation = 8;
+        conn.links.insert(pid.into(), replacement);
+
+        assert!(
+            !conn.on_peer_left(&payload),
+            "a stale marker reported the successor's departure"
+        );
+        assert!(
+            conn.link(pid).is_some_and(|l| l.source == successor_source && l.generation == 8),
+            "a stale marker dropped the replacement link"
+        );
+        assert!(
+            conn.link_events.get(pid).is_some_and(|e| e.departure_ready.is_none()),
+            "the stale marker survived its link"
+        );
+    }
+
+    /// A concurrent producer must not turn the hand-over into an event-loop
+    /// stall: the batch is capped at the existing per-link event budget, and an
+    /// over-budget queue fails closed (drop now) instead of retaining or
+    /// retrying. The already-forwarded prefix is dead because the link is gone.
+    #[tokio::test]
+    async fn an_over_budget_queue_fails_closed_without_a_hand_over() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-leave-over-budget";
+        let t = Rec::new("webrtc", &log);
+        let source = t.source_id().expect("fixture transport has a source");
+        conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", t));
+        conn.bind_active(pid);
+        let (queue, queued) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..MAX_BUILD_EVENTS + 1 {
+            queue
+                .send(Ev::Sourced {
+                    pid: pid.into(),
+                    source,
+                    inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
+                })
+                .unwrap();
+        }
+        conn.link_events.insert(
+            pid.into(),
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
+        );
+
+        assert!(
+            conn.on_peer_left(&json!({ "id": pid })),
+            "the over-budget departure did not run the ordinary finalizer"
+        );
+        assert!(!conn.links.contains_key(pid), "an over-budget queue retained the link");
+        let forwarded = drained(&mut rx);
+        assert!(
+            !forwarded.iter().any(|e| matches!(e, Ev::Sourced { inner, .. }
+                if matches!(inner.as_ref(), Ev::PeerLeft(_)))),
+            "an over-budget queue still queued a barrier"
+        );
+        assert_eq!(
+            forwarded
+                .iter()
+                .filter(|e| matches!(e, Ev::Sourced { inner, .. }
+                    if matches!(inner.as_ref(), Ev::Control(..))))
+                .count(),
+            MAX_BUILD_EVENTS,
+            "the hand-over was not capped at the per-link event budget"
+        );
+        let first = forwarded
+            .into_iter()
+            .find(|e| matches!(e, Ev::Sourced { inner, .. }
+                if matches!(inner.as_ref(), Ev::Control(..))))
+            .expect("the capped prefix is missing");
+        assert!(
+            conn.stage_event(first).is_none(),
+            "an over-budget hand-over prefix was processed after the drop"
+        );
     }
 
     /// The serving link died while the race ran: there is nothing to hand off
