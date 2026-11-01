@@ -3275,6 +3275,23 @@ impl Conn {
                 None
             }
             Ev::Sourced { pid, source, inner } => {
+                // A departure barrier (`on_peer_left` queued it behind that
+                // link's already-read events). It is consumed here, never
+                // re-dispatched: the finalizer is the ordinary departure path.
+                if let Ev::PeerLeft(v) = inner.as_ref() {
+                    if v["id"].as_str() != Some(pid.as_str()) {
+                        return None;
+                    }
+                    // Same final gate as any transport-origin event: only the
+                    // link's CURRENT primary source may drop it. A replacement
+                    // adopted after the barrier was queued is newer authority
+                    // and must survive; a stale barrier only self-rejects.
+                    if self.source_current(&pid, source, inner.as_ref()) {
+                        let v = v.clone();
+                        self.finalize_peer_left(&v);
+                    }
+                    return None;
+                }
                 // Envelope and inner pid must agree, and nesting is invalid:
                 // otherwise checking one pid would handle another.
                 let valid_inner = match inner.as_ref() {
@@ -3308,8 +3325,9 @@ impl Conn {
     }
 
     /// A source is current when it is the link's primary source, or (for
-    /// Control only) one of its current worker sources. PcState/ChannelReady are
-    /// primary-only so a worker can never trigger primary teardown/readiness.
+    /// Control only) one of its current worker sources. PcState/ChannelReady
+    /// and a departure barrier (`Ev::PeerLeft`) are primary-only so a worker
+    /// can never trigger primary teardown/readiness or a departure.
     fn source_current(&self, pid: &str, source: net::SourceId, inner: &Ev) -> bool {
         let Some(link) = self.links.get(pid) else {
             return false;
@@ -7161,6 +7179,16 @@ impl Conn {
     /// completes on the live channel and the idle link is reaped harmlessly.
     /// The roster entry is removed immediately (the sid truly left); only the
     /// LINK drop is deferred.
+    ///
+    /// The link drop can also be deferred one turn for a current link that
+    /// still has events the transport already read: those are forwarded first
+    /// and an internal `Ev::PeerLeft` barrier, tagged with the link's exact
+    /// current source, follows them. Delegated/ephemeral links are included —
+    /// a temporary-access decline is exactly such a control — but only the
+    /// QUEUE HANDOVER is deferred; their enrollment still ends and they are
+    /// never rejoinable. A forced reap drop never takes this path, so a
+    /// revoked/force-dropped source can never process queued control.
+    /// See `drain_current_link_events`.
     pub fn on_peer_left(&mut self, v: &Value) -> bool {
         let Some(pid_val) = v["id"].as_str() else {
             return false;
@@ -7181,19 +7209,16 @@ impl Conn {
         if !self.links.contains_key(&pid) {
             return false;
         }
-        // Delegated (ephemeral) devices are removed immediately on disconnect —
-        // not deferred, not rejoinable. They must re-enroll on reconnect.
-        if matches!(
+        // Delegated (ephemeral) devices are removed on disconnect — not
+        // deferred, not rejoinable; they must re-enroll on reconnect. The drop
+        // itself still runs through `finalize_peer_left` below, because even a
+        // delegated link can hold an already-read control (a temporary-access
+        // decline) that belongs to this departure. Only the QUEUE HANDOVER is
+        // allowed to run first; nothing about the delegation changes.
+        let delegated = matches!(
             self.link(&pid).map(|l| &l.principal_kind),
             Some(PrincipalKind::Delegated { .. })
-        ) {
-            let name = self.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-            self.drop_link(&pid);
-            self.log.debug(&format!(
-                "ephemeral device {name} disconnected, enrollment revoked"
-            ));
-            return false;
-        }
+        );
         // Defer the drop while the data channel is still moving bytes, unless
         // this is the force re-injection from reap_deferred (the link has since
         // gone idle/dead and must drop now). TUNLION_TEST_NO_DEFER reverts to
@@ -7209,7 +7234,7 @@ impl Conn {
         // lets small transfers finish on WebRTC, so this is the common case.
         let forced = v["__fil_force_drop"].as_bool() == Some(true);
         let defer_disabled = test_hooks::no_defer();
-        if !forced && !defer_disabled && !self.recv_done && self.link_flowing(&pid) {
+        if !forced && !delegated && !defer_disabled && !self.recv_done && self.link_flowing(&pid) {
             // Idempotent: first peer-left for this sid records the original
             // payload; a duplicate is swallowed (no double-defer, no drop).
             self.deferred_left
@@ -7222,6 +7247,56 @@ impl Conn {
             // DEBUG, resilience internal (deferred drop while channel flowing).
             self.log.debug(&format!(
                 "{name} signaling left, data channel still flowing, deferring drop"
+            ));
+            return false;
+        }
+        // A non-flowing link can still hold events the transport already READ
+        // but the loop has not forwarded yet (the per-link candidate queue is
+        // drained once per turn by `pump_builds`). Dropping the link here
+        // deletes that queue, so the last control a peer sent just before
+        // leaving - a decline, a final open/close - is lost even though it
+        // arrived. Forward that link's current events in order, then queue an
+        // internal, source-tagged departure behind them; the link stays alive
+        // until the barrier runs, so the gate can still accept those events.
+        if !forced && self.drain_current_link_events(&pid) {
+            if let Some(source) = self.links.get(&pid).map(|link| link.source) {
+                let _ = self.tx.send(Ev::Sourced {
+                    pid: pid.clone(),
+                    source,
+                    inner: Box::new(Ev::PeerLeft(v.clone())),
+                });
+                self.log.debug(&format!(
+                    "peer-left for {pid} queued behind its already-read link events"
+                ));
+            }
+            return false;
+        }
+        self.finalize_peer_left(v)
+    }
+
+    /// The departure itself, split out so a queued `Ev::PeerLeft` barrier can
+    /// run it only after the departed link's already-read events were handled.
+    /// `v` is the ORIGINAL peer-left payload (a forced reap re-injection runs
+    /// this directly, exactly as it always did).
+    ///
+    /// This is the ONE drop path for an ordinary departure, so it keeps both
+    /// tails: delegated/ephemeral devices still lose their enrollment at once
+    /// and are never rejoinable, and every other link still opens the rejoin
+    /// window when it was active. Nothing here retains a link indefinitely:
+    /// the queue handover in `on_peer_left` defers the CALL by one queue drain,
+    /// never the decision.
+    fn finalize_peer_left(&mut self, v: &Value) -> bool {
+        let Some(pid) = v["id"].as_str().map(str::to_string) else {
+            return false;
+        };
+        if matches!(
+            self.link(&pid).map(|l| &l.principal_kind),
+            Some(PrincipalKind::Delegated { .. })
+        ) {
+            let name = self.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+            self.drop_link(&pid);
+            self.log.debug(&format!(
+                "ephemeral device {name} disconnected, enrollment revoked"
             ));
             return false;
         }
@@ -7241,6 +7316,36 @@ impl Conn {
             self.rejoin.waiting_rejoin = Some(Instant::now());
         }
         was_active
+    }
+
+    /// Move the events already READ from `pid`'s current link (its candidate
+    /// queue) onto the main queue, in arrival order, without touching another
+    /// link's stream. Returns whether anything was moved. Only called from
+    /// `on_peer_left`, immediately before queueing the departure barrier, so
+    /// those events are dispatched while the link they came from still exists.
+    fn drain_current_link_events(&mut self, pid: &str) -> bool {
+        let Some(generation) = self.link_events.get(pid).map(|events| events.generation) else {
+            return false;
+        };
+        // The entry must belong to the link this leave names. A newer
+        // generation is different authority and is not ours to drain.
+        if self.links.get(pid).map(|link| link.generation) != Some(generation) {
+            return false;
+        }
+        let tx = self.tx.clone();
+        let Some(events) = self.link_events.get_mut(pid) else {
+            return false;
+        };
+        let mut rx = events
+            .rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut moved = false;
+        while let Ok(ev) = rx.try_recv() {
+            moved = true;
+            let _ = tx.send(ev);
+        }
+        moved
     }
 
     /// #28: re-check every deferred peer-left. Called on every main-loop tick
@@ -12052,6 +12157,252 @@ mod warm_identity_tests {
         conn.recv_done = true;
         conn.on_peer_left(&json!({ "id": pid }));
         assert!(!conn.links.contains_key(pid), "a completed receive deferred its departed sender");
+    }
+
+    /// A control the transport already READ, but the loop had not forwarded
+    /// yet when the peer's signaling departure arrived, must still be
+    /// dispatched. The departure waits behind it (one turn) instead of deleting
+    /// its queue with the link. This is the minimum-forget/decline-then-leave
+    /// race, deterministically: pre-fix the departure drops the link first and
+    /// `stage_event` never sees the control.
+    #[tokio::test]
+    async fn a_queued_control_is_dispatched_before_the_departed_link_is_dropped() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-leave-with-control";
+        let t = Rec::new("webrtc", &log);
+        let source = t.source_id().expect("fixture transport has a source");
+        conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", t));
+        conn.bind_active(pid);
+        let (queued, queue) = tokio::sync::mpsc::unbounded_channel();
+        queue
+            .send(Ev::Sourced {
+                pid: pid.into(),
+                source,
+                inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
+            })
+            .unwrap();
+        conn.link_events.insert(
+            pid.into(),
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
+        );
+
+        assert!(!conn.on_peer_left(&json!({ "id": pid })), "a queued departure was taken as immediate");
+        assert!(conn.links.contains_key(pid), "the link died before its queued control was dispatched");
+        let control = rx.try_recv().expect("the queued control was not forwarded");
+        let (inner, seen) = conn.stage_event(control).expect("the queued control was dropped");
+        assert!(
+            matches!(inner, Ev::Control(_, ref v)
+                if v["type"].as_str() == Some("access-decline")),
+            "a different event was dispatched"
+        );
+        assert_eq!(seen, Some(source), "the control lost its provenance");
+        assert!(conn.links.contains_key(pid), "dispatching the control dropped the link");
+        let barrier = rx.try_recv().expect("no departure barrier was queued behind the control");
+        assert!(
+            matches!(&barrier, Ev::Sourced { pid: p, inner, .. }
+                if p.as_str() == pid && matches!(inner.as_ref(), Ev::PeerLeft(_))),
+            "the queued follow-up was not a departure barrier"
+        );
+        assert!(conn.stage_event(barrier).is_none(), "the barrier leaked into dispatch");
+        assert!(!conn.links.contains_key(pid), "the barrier did not finish the departure");
+    }
+
+    /// The barrier is tied to the exact link that departed. A newer authorized
+    /// link adopted for the same pid before the queue drains is not the link it
+    /// names, so the stale barrier rejects itself and the successor survives -
+    /// and the departed source's own control is not revived onto it.
+    #[tokio::test]
+    async fn a_departure_barrier_cannot_drop_a_replacement_link() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-leave-replaced";
+        let old = Rec::new("webrtc", &log);
+        let old_source = old.source_id().expect("fixture transport has a source");
+        conn.links.insert(pid.into(), delegated_link(pid, old));
+        conn.bind_active(pid);
+        let (queued, queue) = tokio::sync::mpsc::unbounded_channel();
+        queue
+            .send(Ev::Sourced {
+                pid: pid.into(),
+                source: old_source,
+                inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
+            })
+            .unwrap();
+        conn.link_events.insert(
+            pid.into(),
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
+        );
+
+        assert!(!conn.on_peer_left(&json!({ "id": pid })));
+        let successor = Rec::new("direct", &log);
+        let successor_source = successor.source_id().expect("fixture transport has a source");
+        let mut replacement = relay_link(pid, "peer", "peer", successor);
+        replacement.generation = 8;
+        conn.links.insert(pid.into(), replacement);
+
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none(), "a departed source's control was revived");
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none(), "the stale barrier was dispatched");
+        assert!(
+            conn.link(pid).is_some_and(|l| l.source == successor_source && l.generation == 8),
+            "the stale departure dropped the replacement link"
+        );
+    }
+
+    /// Nothing queued: the departure is still immediate and still reports the
+    /// active link, exactly as before the queue-drain was added.
+    #[tokio::test]
+    async fn a_departure_with_nothing_queued_still_drops_the_link_at_once() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-leave-immediate";
+        conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", Rec::new("webrtc", &log)));
+        conn.bind_active(pid);
+        let (queued, _queue) = tokio::sync::mpsc::unbounded_channel();
+        conn.link_events.insert(
+            pid.into(),
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
+        );
+        assert!(conn.on_peer_left(&json!({ "id": pid })), "an idle departure stopped reporting the active link");
+        assert!(!conn.links.contains_key(pid), "the departure did not drop the link");
+        assert!(rx.try_recv().is_err(), "an empty queue still produced a barrier");
+    }
+
+    /// A link that is still moving bytes keeps the pre-existing deferral: the
+    /// queue belongs to a live channel, so it is left for `pump_builds` and no
+    /// departure barrier is queued.
+    #[tokio::test]
+    async fn a_flowing_link_keeps_the_old_deferral_even_with_queued_events() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let pid = "sid-leave-flowing";
+        conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", FakeQuic::flowing()));
+        conn.bind_active(pid);
+        let source = net::SourceId::next();
+        let (queued, queue) = tokio::sync::mpsc::unbounded_channel();
+        queue
+            .send(Ev::Sourced {
+                pid: pid.into(),
+                source,
+                inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
+            })
+            .unwrap();
+        conn.link_events.insert(
+            pid.into(),
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
+        );
+
+        assert!(!conn.on_peer_left(&json!({ "id": pid })));
+        assert!(conn.links.contains_key(pid), "a flowing link was dropped on departure");
+        assert!(conn.deferred_left.contains_key(pid), "the flowing deferral stopped recording the leave");
+        assert!(rx.try_recv().is_err(), "a flowing link's departure was queued as a barrier");
+        let still_queued = conn
+            .link_events
+            .get(pid)
+            .expect("the flowing link lost its event stream")
+            .rx
+            .lock()
+            .unwrap()
+            .try_recv()
+            .is_ok();
+        assert!(still_queued, "the flowing path consumed the queued events early");
+    }
+
+    /// The exact authz a temporary-access/service-offer guest carries: delegated
+    /// (ephemeral), never a standing device.
+    fn delegated_link(pid: &str, t: Arc<dyn Transport>) -> Link {
+        let mut l = relay_link(pid, "guest", "guest", t);
+        l.principal_kind = PrincipalKind::Delegated { caps: Vec::new() };
+        l.trusted = false;
+        l
+    }
+
+    /// The diagnosed temporary-access decline: the guest sends `access-decline`
+    /// and its signaling socket closes in the same breath. The frame is already
+    /// read, but the host's per-link queue has not forwarded it when peer-left
+    /// arrives. Pre-fix the delegated drop removes the link and the queue, so
+    /// the host never sees the decline. Here it is staged `Some` before the
+    /// enrollment ends, and the enrollment still ends (no rejoin window).
+    #[tokio::test]
+    async fn a_delegated_link_hands_its_queued_decline_over_before_its_enrollment_ends() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-temporary-guest";
+        let t = Rec::new("webrtc", &log);
+        let source = t.source_id().expect("fixture transport has a source");
+        conn.links.insert(pid.into(), delegated_link(pid, t));
+        conn.bind_active(pid);
+        let (queued, queue) = tokio::sync::mpsc::unbounded_channel();
+        queue
+            .send(Ev::Sourced {
+                pid: pid.into(),
+                source,
+                inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
+            })
+            .unwrap();
+        conn.link_events.insert(
+            pid.into(),
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
+        );
+
+        assert!(
+            !conn.on_peer_left(&json!({ "id": pid })),
+            "a delegated departure was reported as a rejoinable leave"
+        );
+        assert!(
+            conn.links.contains_key(pid),
+            "the delegated link died before its queued decline was handed over"
+        );
+        let control = rx.try_recv().expect("the queued decline was destroyed with the link");
+        let (inner, seen) = conn.stage_event(control).expect("the delegated decline was not dispatched");
+        assert!(
+            matches!(inner, Ev::Control(_, ref v) if v["type"].as_str() == Some("access-decline")),
+            "the delegated link dispatched something other than the decline"
+        );
+        assert_eq!(seen, Some(source), "the decline lost its provenance");
+        let barrier = rx.try_recv().expect("no departure barrier followed the decline");
+        assert!(conn.stage_event(barrier).is_none(), "the barrier leaked into dispatch");
+        assert!(!conn.links.contains_key(pid), "the delegated enrollment did not end");
+        assert!(
+            !conn.deferred_left.contains_key(pid),
+            "a delegated departure was made rejoinable"
+        );
+    }
+
+    /// A forced (reap/revoked) departure must never hand over queued control:
+    /// there is no authenticated live link left to act on it. The drop stays
+    /// immediate, the source's queue dies with it, and its tags are dead.
+    #[tokio::test]
+    async fn a_forced_delegated_departure_never_processes_queued_control() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-temporary-revoked";
+        let t = Rec::new("webrtc", &log);
+        let source = t.source_id().expect("fixture transport has a source");
+        conn.links.insert(pid.into(), delegated_link(pid, t));
+        conn.bind_active(pid);
+        let (queued, queue) = tokio::sync::mpsc::unbounded_channel();
+        queue
+            .send(Ev::Sourced {
+                pid: pid.into(),
+                source,
+                inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-accept" }))),
+            })
+            .unwrap();
+        conn.link_events.insert(
+            pid.into(),
+            LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued) },
+        );
+
+        assert!(!conn.on_peer_left(&json!({ "id": pid, "__fil_force_drop": true })));
+        assert!(!conn.links.contains_key(pid), "a forced departure was retained");
+        assert!(!conn.link_events.contains_key(pid), "the forced departure kept the source's queue");
+        assert!(rx.try_recv().is_err(), "a forced departure queued a handover barrier");
+        let stale = Ev::Sourced {
+            pid: pid.into(),
+            source,
+            inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-accept" }))),
+        };
+        assert!(conn.stage_event(stale).is_none(), "a force-dropped source's control was revived");
     }
 
     /// The serving link died while the race ran: there is nothing to hand off
