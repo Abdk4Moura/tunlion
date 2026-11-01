@@ -144,12 +144,17 @@ pub fn on_linked(conn: &mut Conn, tx: &UnboundedSender<Ev>, ev: LanEvent, log: &
     }
 }
 
-/// The secrets a LAN link may authenticate with: every paired device. (Fleet
-/// siblings are the next step: their link is admitted by certificate after
-/// the MAC, and the hello must wait for that; see the design doc's plan.)
+/// The secrets a LAN link may authenticate with: every LIVE paired device.
+/// Revoked records may retain their pair secret in the store (`devices_load`),
+/// so they are filtered here as well: a revoked device must not even complete
+/// the LAN MAC handshake, not merely be declined later by the resolver or
+/// consent. (Fleet siblings are the next step: their link is admitted by
+/// certificate after the MAC, and the hello must wait for that; see the design
+/// doc's plan.)
 pub fn keys(host: &dyn crate::host::HostServices) -> Vec<LanKey> {
     host.devices_load()
         .into_iter()
+        .filter(|(name, _)| !host.device_record_revoked(name))
         .map(|(name, secret)| LanKey { name, secret, fleet: false })
         .collect()
 }

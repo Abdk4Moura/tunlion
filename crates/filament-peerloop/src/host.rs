@@ -598,6 +598,15 @@ pub trait HostServices: Send + Sync + 'static {
     fn device_allows(&self, _name: &str, _capability: &str) -> bool {
         false
     }
+    /// Is this device's store record REVOKED (the durable `certRevoked` /
+    /// terminal `principalState` decision), even though the record may retain
+    /// its pair secret? `devices_load` deliberately keeps such rows so the
+    /// device can be displayed and re-enabled; every LAN name resolution and
+    /// baseline transfer consent must fail closed on them without waiting for
+    /// the next revocation sweep. An inert host records no revocations.
+    fn device_record_revoked(&self, _name: &str) -> bool {
+        false
+    }
     /// Does this device's store record LITERALLY list `capability` for `name`?
     /// Unlike `device_allows`, no baseline is implied (`device_allows` answers
     /// "transfer" with yes for every record). Used where a record grant is the

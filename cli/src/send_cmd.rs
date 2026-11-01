@@ -1676,11 +1676,13 @@ pub(crate) async fn send_cmd(
                 // connected". The session that actually connects and holds the
                 // target's secret IS the target, so it takes the slot.
                 if !conn.is_active(&pid) && !established && !use_code && !fleet_target {
-                    let proves_target = known_target.as_ref().is_some_and(|(_, sec)| {
-                        conn.link(&pid)
-                            .and_then(|l| l.expected_secret.as_ref())
-                            .is_some_and(|(_, s)| s == sec)
-                    });
+                    // A pair-proof link matches on `expected_secret`; a LAN link
+                    // matches on its exact authenticated DEVICE reservation while
+                    // that binding is still the store's. Either way this decides
+                    // which link is the target, not what it may do.
+                    let proves_target = known_target
+                        .as_ref()
+                        .is_some_and(|(n, sec)| conn.link_matches_device(&pid, n, sec));
                     if proves_target {
                         if let Some(old) = conn.active.clone() {
                             ui::debug(&format!(

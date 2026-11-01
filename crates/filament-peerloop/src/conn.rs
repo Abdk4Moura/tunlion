@@ -292,6 +292,172 @@ pub struct LanBinding {
     pub device: Option<(String, String)>,
 }
 
+/// Resolve a LAN reservation to the CURRENT store's canonical device name, only
+/// for an exact authenticated DEVICE binding.
+///
+/// Pure so every consumer (warm routing, send's target selection, the daemon's
+/// baseline transfer consent) uses one rule. Deliberately narrow:
+/// * `device` is `None` for a fleet reservation, whose shared rendezvous secret
+///   is membership evidence and must never name a device;
+/// * the binding's `(name, secret)` must match one store record (name
+///   case-insensitively, secret exactly) — a forgotten or re-paired device
+///   matches nothing;
+/// * the secret must not be in the session's revoked set;
+/// * `record_revoked` must say the matching record is live. `devices_load`
+///   deliberately KEEPS revoked rows with their secret, so this is the
+///   authoritative check that fails closed before the next revocation sweep.
+///
+/// Returns the store's casing of the name. This is a ROUTING name: it grants no
+/// capability and never marks the link trusted or Proven.
+pub fn authenticated_lan_device_name<'a>(
+    binding: Option<&LanBinding>,
+    devices: &'a [(String, String)],
+    revoked: &HashSet<String>,
+    record_revoked: &dyn Fn(&str) -> bool,
+) -> Option<&'a str> {
+    let (bound_name, secret) = binding?.device.as_ref()?;
+    if secret.is_empty() || revoked.contains(secret) {
+        return None;
+    }
+    devices
+        .iter()
+        .find(|entry| {
+            entry.0.eq_ignore_ascii_case(bound_name)
+                && entry.1.as_str() == secret
+                // `devices_load` keeps revoked rows (with their secret) so they
+                // can be displayed/re-enabled. A revoked record is not a live
+                // authority: resolution and consent fail closed NOW, not at the
+                // next sweep.
+                && !record_revoked(entry.0.as_str())
+        })
+        .map(|entry| entry.0.as_str())
+}
+
+#[cfg(test)]
+mod lan_resolution_tests {
+    use super::*;
+
+    fn store(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+        rows.iter()
+            .map(|(n, s)| ((*n).to_string(), (*s).to_string()))
+            .collect()
+    }
+
+    fn device_binding(name: &str, secret: &str) -> LanBinding {
+        LanBinding {
+            name: name.to_string(),
+            device: Some((name.to_string(), secret.to_string())),
+        }
+    }
+
+    fn live(_: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn an_exact_current_device_binding_resolves_to_the_stored_name() {
+        let devices = store(&[("Laptop", "s1")]);
+        assert_eq!(
+            authenticated_lan_device_name(
+                Some(&device_binding("laptop", "s1")),
+                &devices,
+                &HashSet::new(),
+                &live
+            ),
+            Some("Laptop"),
+            "routing uses the store casing, matched case-insensitively on the binding"
+        );
+    }
+
+    #[test]
+    fn a_repaired_or_wrong_secret_binding_resolves_nothing() {
+        let devices = store(&[("laptop", "new")]);
+        assert_eq!(
+            authenticated_lan_device_name(
+                Some(&device_binding("laptop", "old")),
+                &devices,
+                &HashSet::new(),
+                &live
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_forgotten_binding_resolves_nothing() {
+        assert_eq!(
+            authenticated_lan_device_name(
+                Some(&device_binding("laptop", "s1")),
+                &[],
+                &HashSet::new(),
+                &live
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_revoked_binding_resolves_nothing() {
+        let devices = store(&[("laptop", "s1")]);
+        let revoked: HashSet<String> = ["s1".to_string()].into_iter().collect();
+        assert_eq!(
+            authenticated_lan_device_name(
+                Some(&device_binding("laptop", "s1")),
+                &devices,
+                &revoked,
+                &live
+            ),
+            None
+        );
+    }
+
+    /// The store RETAINS a revoked record's pair secret (`certRevoked` /
+    /// terminal `principalState`). That row must not resolve, even when the
+    /// session's revoked-secret set is still empty (before the next sweep).
+    #[test]
+    fn a_revoked_record_with_a_retained_secret_resolves_nothing() {
+        let devices = store(&[("laptop", "s1")]);
+        let revoked_record = |name: &str| name.eq_ignore_ascii_case("Laptop");
+        assert_eq!(
+            authenticated_lan_device_name(
+                Some(&device_binding("laptop", "s1")),
+                &devices,
+                &HashSet::new(),
+                &revoked_record
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fleet_reservation_never_names_a_device() {
+        let devices = store(&[("laptop", "s1")]);
+        let fleet = LanBinding {
+            name: "laptop".into(),
+            device: None,
+        };
+        assert_eq!(
+            authenticated_lan_device_name(Some(&fleet), &devices, &HashSet::new(), &live),
+            None,
+            "the shared fleet rendezvous secret is membership evidence, not a device binding"
+        );
+    }
+
+    #[test]
+    fn an_empty_secret_resolves_nothing() {
+        let devices = store(&[("laptop", "s1")]);
+        assert_eq!(
+            authenticated_lan_device_name(
+                Some(&device_binding("laptop", "")),
+                &devices,
+                &HashSet::new(),
+                &live
+            ),
+            None
+        );
+    }
+}
+
 pub struct Link {
     /// WebRTC peer connection. `None` for a rung-1 direct link (no ICE/DTLS
     /// negotiation, it rides authenticated QUIC), so every WebRTC-only call
@@ -384,6 +550,27 @@ impl Link {
             .or(self.expected_secret.as_ref().map(|(n, _)| n.as_str()))
             .or(self.lan_binding.as_ref().map(|b| b.name.as_str()))
             .unwrap_or(&self.name)
+    }
+
+    /// ROUTING ONLY: the canonical stored name this link reaches when it carries
+    /// an exact authenticated LAN DEVICE reservation that is STILL the current
+    /// store's binding.
+    ///
+    /// This is not an identity proof and must never become one: it does not set
+    /// `trusted`, `verified_name` or `BindingStrength::Proven`, does not touch
+    /// `expected_secret`, mints no worker key, and grants no capability. It names
+    /// the device so request routing (`reach`/`send` warm reuse) can match the
+    /// link the local handshake already authenticated with that device's pair
+    /// secret. A forgotten, revoked, re-paired or fleet-reserved link resolves
+    /// nothing: the store lookup is exact on `(name, secret)` and the secret
+    /// must not be in `revoked`.
+    pub fn authenticated_device_name<'a>(
+        &self,
+        devices: &'a [(String, String)],
+        revoked: &HashSet<String>,
+        record_revoked: &dyn Fn(&str) -> bool,
+    ) -> Option<&'a str> {
+        authenticated_lan_device_name(self.lan_binding.as_ref(), devices, revoked, record_revoked)
     }
 
     /// The exact device secret this link is bound to: a pair-secret hypothesis,
@@ -1519,16 +1706,19 @@ pub fn upgrade_principal(
 /// and unauthenticated, which a finished version would have to answer first.
 const LOCAL_TCP_TRANSPORT: bool = false;
 
-/// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, the
-/// same key the L2 cap gate uses) to a warm, trusted, alive link, preferring a
-/// direct one and then the longest-lived (so a fresh one-shot `exec` link cannot
-/// displace the daemon's stable link). The single resolver for every warm-reuse
-/// op (open + pty), so the eligibility rule lives in exactly one place. A miss
-/// means the caller falls back to a fresh establish, which is correct.
+/// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, or
+/// on an exact authenticated LAN DEVICE reservation that is still the current
+/// store's binding) to a warm, alive link, preferring a direct one and then the
+/// longest-lived (so a fresh one-shot `exec` link cannot displace the daemon's
+/// stable link). The single resolver for every warm-reuse op (open + pty), so
+/// the eligibility rule lives in exactly one place. A miss means the caller
+/// falls back to a fresh establish, which is correct. Routing only: permission
+/// is still the receiving capability gate's decision.
 ///
-/// Moved here from `cli/src/daemon_ctl.rs` with its body unchanged: it takes a
-/// [`Conn`] and returns a transport pair, both of which this crate owns, so the
-/// only thing that changed is the path that names it.
+/// Moved here from `cli/src/daemon_ctl.rs`; it takes a [`Conn`] and returns a
+/// transport pair, both of which this crate owns. The body now also resolves an
+/// exact authenticated LAN DEVICE reservation (routing only; the link stays
+/// untrusted and un-Proven).
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn Transport>)> {
     // Eligibility is "do I know WHO this link reaches", because the caller is
@@ -1542,13 +1732,35 @@ pub fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn Transpo
     // there. A Proven identity binding answers the actual question.
     // NOTE: this decides ROUTING, not permission. What the peer may do to us is
     // still decided by the capability gate on the receiving side.
-    let links: Vec<LinkObs<'_>> = conn
+    // LAN device reservations are resolved here, once, from the CURRENT store
+    // and the session's revoked set. They are routing names only (see
+    // `Link::authenticated_device_name`); the link itself stays untrusted and
+    // carries no capability. One observation per link, so the name and its pid
+    // can never be paired from different iterations.
+    let devices = conn.host.devices_load();
+    let observed: Vec<(&str, &Link, Option<String>)> = conn
         .links
         .iter()
-        .map(|(pid, l)| LinkObs {
-            pid: pid.as_str(),
+        .map(|(pid, l)| {
+            (
+                pid.as_str(),
+                l,
+                l.authenticated_device_name(
+                    &devices,
+                    &conn.revoked_bindings,
+                    &|name: &str| conn.host.device_record_revoked(name),
+                )
+                .map(str::to_string),
+            )
+        })
+        .collect();
+    let links: Vec<LinkObs<'_>> = observed
+        .iter()
+        .map(|(pid, l, lan_device_name)| LinkObs {
+            pid: *pid,
             verified_name: l.verified_name.as_deref(),
             identity_known: l.trusted || l.identity_binding == BindingStrength::Proven,
+            lan_device_name: lan_device_name.as_deref(),
             has_transport: l.transport.is_some(),
             alive: l.transport.as_ref().is_some_and(|t| t.is_alive()),
             direct: l.direct,
@@ -3549,6 +3761,80 @@ impl Conn {
                 .devices_load()
                 .iter()
                 .any(|(_, held)| held == secret)
+    }
+
+    /// Is `pid`'s link the target device `(name, secret)` for ROUTING?
+    ///
+    /// A pair/proof link answers from its `expected_secret` SECRET alone (the
+    /// historical rule; aliases and brokered rendezvous names must keep
+    /// working). A LAN link answers only from an exact authenticated DEVICE
+    /// reservation whose `(name, secret)` is still a LIVE current-store record
+    /// (not revoked) and whose secret is not in the revoked set. Used by send's
+    /// active-target selection so a LAN link authenticated with the target's
+    /// pair secret is recognized without minting `verified_name`, `trusted`,
+    /// Proven, or a worker key. This decides WHICH link carries the request,
+    /// never what the peer may do.
+    pub fn link_matches_device(&self, pid: &str, name: &str, secret: &str) -> bool {
+        let Some(link) = self.links.get(pid) else { return false };
+        // Preserve the pre-existing NON-LAN target rule exactly: the link's
+        // pair-secret hypothesis matches on the SECRET only, so an alias or a
+        // brokered rendezvous name that differs from `expected_secret.0` still
+        // selects its link.
+        if link
+            .expected_secret
+            .as_ref()
+            .is_some_and(|(_, s)| s.as_str() == secret)
+        {
+            return true;
+        }
+        // LAN: only an exact authenticated DEVICE reservation (name AND
+        // secret, live current-store record, not revoked) selects the target.
+        let Some((_, bound_secret)) = link
+            .lan_binding
+            .as_ref()
+            .and_then(|binding| binding.device.as_ref())
+        else {
+            return false;
+        };
+        if bound_secret.as_str() != secret {
+            return false;
+        }
+        let devices = self.host.devices_load();
+        link.authenticated_device_name(
+            &devices,
+            &self.revoked_bindings,
+            &|name: &str| self.host.device_record_revoked(name),
+        )
+        .is_some_and(|held| held.eq_ignore_ascii_case(name))
+    }
+
+    /// The canonical stored device name of an exact authenticated LAN DEVICE
+    /// link, for the daemon's BASELINE transfer consent only.
+    ///
+    /// The local LAN handshake already verified this device's pair-secret MAC,
+    /// so for the transfer capability every paired device holds, a daemon may
+    /// accept the offer without asking. This does not set `trusted`, does not
+    /// make the identity Proven, and grants no owner/worker capability: under
+    /// authoritative mode the trust floor still refuses an untrusted link.
+    /// A revoked record, or a record that denies transfer, fails closed here
+    /// even while its pair secret is still present in the store.
+    pub fn authenticated_lan_peer(&self, pid: &str) -> Option<String> {
+        let link = self.links.get(pid)?;
+        let devices = self.host.devices_load();
+        let name = link
+            .authenticated_device_name(
+                &devices,
+                &self.revoked_bindings,
+                &|name: &str| self.host.device_record_revoked(name),
+            )?
+            .to_string();
+        if self.host.device_record_revoked(&name)
+            || !self.host.device_allows(&name, "transfer")
+            || self.host.device_capability_denied(&name, "transfer")
+        {
+            return None;
+        }
+        Some(name)
     }
 
     /// Refusal predicate for a build intent.
@@ -8328,6 +8614,15 @@ mod warm_identity_tests {
     #[derive(Default)]
     struct TestHost {
         devices: Vec<(String, String)>,
+        /// Records the store still carries with their pair secret but which are
+        /// REVOKED (`certRevoked` / terminal `principalState`).
+        revoked_records: Vec<String>,
+        /// Devices whose record denies the L0 transfer capability.
+        denied_transfer: Vec<String>,
+        /// Mirror the CLI host's baseline: `device_allows(_, "transfer")` is true
+        /// for every live record. Off by default so pre-existing tests keep the
+        /// inert-host answer.
+        transfer_allowed: bool,
     }
 
     #[async_trait::async_trait]
@@ -8337,6 +8632,18 @@ mod warm_identity_tests {
         }
         fn devices_load(&self) -> Vec<(String, String)> {
             self.devices.clone()
+        }
+        fn device_record_revoked(&self, name: &str) -> bool {
+            self.revoked_records
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(name))
+        }
+        fn device_capability_denied(&self, name: &str, capability: &str) -> bool {
+            capability == "transfer"
+                && self.denied_transfer.iter().any(|n| n.eq_ignore_ascii_case(name))
+        }
+        fn device_allows(&self, _name: &str, capability: &str) -> bool {
+            self.transfer_allowed && capability == "transfer"
         }
         fn is_self_uid(&self, _my_uid: &str, _peer_uid: Option<&str>) -> bool {
             false
@@ -8403,6 +8710,94 @@ mod warm_identity_tests {
             },
         ));
         (conn, far, rx)
+    }
+
+    /// The live LAN regression: an exact authenticated DEVICE reservation that
+    /// is still the current store's binding must resolve for reach/send routing
+    /// even though the link stays untrusted and un-Proven. A revoked record
+    /// (which the store keeps, WITH its pair secret) must resolve nothing even
+    /// before the next sweep, and its LAN MAC key must not be offered.
+    #[tokio::test]
+    async fn an_exact_lan_device_binding_resolves_for_reach_and_send_without_trust() {
+        fn lan_link(pid: &str) -> Link {
+            let mut link = direct_link(pid, "boxb", "boxb", FakeQuic::flowing());
+            link.trusted = false;
+            link.verified_name = None;
+            link.expected_secret = None;
+            link.direct_route = filament_transport::lan::ROUTE_LAN;
+            link.lan_binding = Some(LanBinding {
+                name: "boxb".to_string(),
+                device: Some(("boxb".to_string(), "s1".to_string())),
+            });
+            link
+        }
+
+        let host = Arc::new(TestHost {
+            devices: vec![("boxb".to_string(), "s1".to_string())],
+            transfer_allowed: true,
+            ..Default::default()
+        });
+        let (mut conn, _far, _rx) = test_conn_with_host(host).await;
+        let pid = "lan-live";
+        conn.links.insert(pid.to_string(), lan_link(pid));
+
+        assert!(
+            warm_link_for(&conn, "boxb").is_some(),
+            "reach could not route a live LAN device link"
+        );
+        assert!(
+            conn.link_matches_device(pid, "boxb", "s1"),
+            "send could not select the LAN target"
+        );
+        assert_eq!(conn.authenticated_lan_peer(pid).as_deref(), Some("boxb"));
+        assert!(!conn.link(pid).unwrap().trusted, "routing must not mint trust");
+        assert!(
+            conn.link(pid).unwrap().verified_name.is_none(),
+            "routing must not mint a verified name"
+        );
+
+        // A re-pair (different secret) resolves nothing.
+        assert!(!conn.link_matches_device(pid, "boxb", "other"));
+        // A session-revoked binding resolves nothing.
+        conn.revoked_bindings.insert("s1".to_string());
+        assert!(warm_link_for(&conn, "boxb").is_none());
+        assert_eq!(conn.authenticated_lan_peer(pid), None);
+
+        // A record revoked on disk RETAINS its pair secret. With no sweep yet
+        // (revoked_bindings empty) it must still never route, be selected, be
+        // consented to, or yield a LAN MAC key.
+        let revoked_host = Arc::new(TestHost {
+            devices: vec![("boxb".to_string(), "s1".to_string())],
+            revoked_records: vec!["boxb".to_string()],
+            transfer_allowed: true,
+            ..Default::default()
+        });
+        let (mut revoked_conn, _far, _rx) = test_conn_with_host(revoked_host.clone()).await;
+        revoked_conn.links.insert(pid.to_string(), lan_link(pid));
+        assert!(revoked_conn.revoked_bindings.is_empty(), "no sweep has run yet");
+        assert!(
+            warm_link_for(&revoked_conn, "boxb").is_none(),
+            "a revoked record with a retained secret routed reach"
+        );
+        assert!(!revoked_conn.link_matches_device(pid, "boxb", "s1"));
+        assert_eq!(revoked_conn.authenticated_lan_peer(pid), None);
+        assert!(
+            crate::lan_glue::keys(&*revoked_host).is_empty(),
+            "a revoked record's retained secret was offered as a LAN MAC key"
+        );
+
+        // A live record that DENIES transfer still routes (routing is not
+        // permission) but must not earn the daemon's baseline auto-consent.
+        let denied_host = Arc::new(TestHost {
+            devices: vec![("boxb".to_string(), "s1".to_string())],
+            denied_transfer: vec!["boxb".to_string()],
+            transfer_allowed: true,
+            ..Default::default()
+        });
+        let (mut denied_conn, _far, _rx) = test_conn_with_host(denied_host).await;
+        denied_conn.links.insert(pid.to_string(), lan_link(pid));
+        assert!(warm_link_for(&denied_conn, "boxb").is_some());
+        assert_eq!(denied_conn.authenticated_lan_peer(pid), None);
     }
 
     // --- the pure decision ------------------------------------------------

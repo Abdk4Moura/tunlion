@@ -915,11 +915,12 @@ async fn drive_over(
             Ev::ChannelReady(pid, t) => {
                 conn.mark_ready(&pid, &t, false);
                 if !conn.is_active(&pid) && !established && !use_code {
-                    let proves = known_target.as_ref().is_some_and(|(_, sec)| {
-                        conn.link(&pid)
-                            .and_then(|l| l.expected_secret.as_ref())
-                            .is_some_and(|(_, s)| s == sec)
-                    });
+                    // Pair/proof links match on `expected_secret`; a LAN link
+                    // matches on its exact authenticated DEVICE reservation while
+                    // that binding is still the store's. Target selection only.
+                    let proves = known_target
+                        .as_ref()
+                        .is_some_and(|(n, sec)| conn.link_matches_device(&pid, n, sec));
                     if proves {
                         conn.active = Some(pid.clone());
                     }

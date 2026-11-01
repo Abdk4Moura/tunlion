@@ -465,10 +465,13 @@ fn serving_off_refusal(
 }
 
 /// Whether an offer is accepted without asking, before the capability layer.
-/// A daemon accepts only proven links. A foreground receive accepts on `-y`,
-/// on a re-enqueued answer the person already gave, on a proven link, on the
-/// resume of a partial it already accepted, and on the CODE: typing the code a
-/// sender's ceremony was bound to is the consent (`receive --help`). Pure.
+/// A daemon accepts only proven links (the caller may also pass an exact
+/// authenticated LAN DEVICE binding it has already checked against the current
+/// store; that is baseline transfer consent, not link trust). A foreground
+/// receive accepts on `-y`, on a re-enqueued answer the person already gave, on
+/// a proven link, on the resume of a partial it already accepted, and on the
+/// CODE: typing the code a sender's ceremony was bound to is the consent
+/// (`receive --help`). Pure.
 pub fn offer_has_consent(
     daemon: bool,
     yes: bool,
@@ -8009,8 +8012,22 @@ async fn recv_run(
                     // pending queue and the answer arrives via StdinLine, a
                     // per-process token marks re-enqueued offers so a remote
                     // peer can't forge "already consented".
-                    let sender_name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                    //
+                    // A LAN link is deliberately untrusted/un-Proven, but its
+                    // local handshake already verified the sender's pair-secret
+                    // MAC. For the BASELINE transfer capability every paired
+                    // device holds, an exact authenticated DEVICE reservation
+                    // that is still the current store's binding is as good as the
+                    // legacy trust flag. Nothing is set on the link and no
+                    // owner/worker capability is implied; under authoritative
+                    // mode the trust floor still refuses it.
+                    let lan_sender = conn.authenticated_lan_peer(&pid);
+                    let sender_name = lan_sender
+                        .clone()
+                        .unwrap_or_else(|| conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default());
                     let link_trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    // Consent only; the trust floor below still sees the real flag.
+                    let consent_trusted = link_trusted || lan_sender.is_some();
                     let consented =
                         v["__consent"].as_str() == Some(ports.env.consent_token.as_str());
                     // Legacy (pre-capability) decision, per mode.
@@ -8025,7 +8042,7 @@ async fn recv_run(
                         daemon,
                         yes,
                         consented,
-                        link_trusted,
+                        consent_trusted,
                         is_resume && offset > 0,
                         code_consent,
                     );

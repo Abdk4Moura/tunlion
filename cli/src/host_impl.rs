@@ -349,6 +349,9 @@ impl HostServices for CliHost {
     fn device_allows(&self, name: &str, capability: &str) -> bool {
         crate::device_caps::device_allows(name, capability)
     }
+    fn device_record_revoked(&self, name: &str) -> bool {
+        crate::device_view::device_record_revoked(name)
+    }
     fn device_record_grants(&self, name: &str, capability: &str) -> bool {
         crate::device_caps::device_caps(name).is_some_and(|c| c.iter().any(|g| g == capability))
     }
