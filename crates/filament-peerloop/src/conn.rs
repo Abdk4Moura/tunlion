@@ -2690,7 +2690,21 @@ impl Conn {
                 self.start_direct(&pid, petname, secret).await;
                 self.note_binding(&pid, (petname.clone(), secret.clone()));
             }
-            let result = self.establish_as(info, None).await;
+            // The daemon loop must never await a WebRTC establishment: ICE
+            // gathering and candidate exchange can take tens of seconds, and the
+            // loop watchdog then reports the whole daemon stalled (seen live on
+            // the offer-first and Android gates right after a fleet join). The
+            // direct race started above runs OFF this future; this relay
+            // establish is only the fallback, so bound it and retry next tick.
+            let result = match tokio::time::timeout(
+                Duration::from_secs(1),
+                self.establish_as(info, None),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("warm-hold establish exceeded the loop budget")),
+            };
             if let (Some((petname, secret)), Some(l)) = (&device, self.links.get_mut(&pid)) {
                 if l.expected_secret.is_none() {
                     l.expected_secret = Some((petname.clone(), secret.clone()));
@@ -11984,6 +11998,8 @@ mod warm_identity_tests {
     async fn lan_reservation_adopts_once_and_duplicate_is_harmless() {
         let host = Arc::new(TestHost {
             devices: vec![("dev".into(), "secret".into())],
+            transfer_allowed: true,
+            ceilings: vec![("dev".to_string(), vec!["transfer".to_string()])],
             ..Default::default()
         });
         let (mut conn, _far, _rx) = test_conn_with_host(host).await;
