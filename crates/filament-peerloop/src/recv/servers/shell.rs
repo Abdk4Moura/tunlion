@@ -991,6 +991,7 @@ mod tests {
             attempts: 0,
             trusted: true,
             expected_secret: None,
+            lan_binding: None,
             verified_name: Some(verified_name.into()),
             presence: Presence::Ready,
             direct: true,

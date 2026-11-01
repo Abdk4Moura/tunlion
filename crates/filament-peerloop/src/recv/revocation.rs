@@ -35,7 +35,9 @@ pub fn bind_brokered_link(link: &mut Link, broker: &BrokeredBy) {
     link.admit_fleet(broker.owner_pub, broker.device_pub, broker.expires);
 }
 
-/// What the sweep needs to know about one link.
+/// What the sweep needs to know about one link. `secret` is the exact device
+/// binding, including an authenticated LAN device reservation; a LAN fleet
+/// reservation's shared RV is not a device binding and is never reported.
 pub struct LinkFacts<'a> {
     pub secret: Option<&'a str>,
     pub device_pub: Option<[u8; 32]>,
@@ -130,7 +132,9 @@ pub fn route_must_withdraw(
 pub fn facts_for<'a>(conn: &'a Conn, pid: &str) -> LinkFacts<'a> {
     let link = conn.link(pid);
     LinkFacts {
-        secret: link.and_then(|l| l.expected_secret.as_ref().map(|(_, s)| s.as_str())),
+        // Includes an authenticated LAN device reservation, but never a LAN
+        // fleet reservation's shared rendezvous secret.
+        secret: link.and_then(|l| l.device_secret()),
         device_pub: link.and_then(|l| l.identity_device_pub),
     }
 }

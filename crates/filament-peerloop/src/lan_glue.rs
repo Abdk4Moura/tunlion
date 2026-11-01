@@ -54,9 +54,9 @@ impl Ownership {
 }
 
 impl Conn {
-    /// Record that `pid` is a LAN link authenticated with `secret` for `name`,
-    /// so `adopt_direct` gives it exactly the trust a signaled direct link to
-    /// that device gets.
+    /// Record that `pid` is a LAN link authenticated with `secret` for `name`.
+    /// The reservation carries the exact attempt and device binding, but it
+    /// never makes the link trusted, verified, Proven, or worker-keyed.
     pub fn seed_lan(&mut self, pid: &str, name: &str, secret: &str, fleet: bool, attempt: AttemptId) {
         self.roster.insert(pid.to_string(), json!({ "id": pid, "name": name, "via": lan::ROUTE_LAN }));
         self.next_gen += 1;
@@ -73,6 +73,7 @@ impl Conn {
                 race_task: None,
                 secret: (name.to_string(), secret.to_string()),
                 fleet,
+                lan: true,
                 ephemeral: false,
                 deadline: Instant::now() + Duration::from_secs(30),
                 racing: true,
@@ -88,8 +89,25 @@ impl Conn {
     }
 
     /// Is there a usable link to `name` already (any route)?
+    ///
+    /// A LAN link is deliberately neither trusted nor `verified_name`d, so the
+    /// warm/Proven matcher cannot see it. Match it by its own authenticated
+    /// reservation instead: a live `ROUTE_LAN` transport whose reservation name
+    /// is this device. This is identity for DEDUP only and grants no capability.
     pub fn has_link_to(&self, name: &str) -> bool {
         crate::conn::warm_link_for(self, name).is_some()
+            || self.links.values().any(|link| {
+                link.direct
+                    && link.direct_route == lan::ROUTE_LAN
+                    && link
+                        .lan_binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.name.eq_ignore_ascii_case(name))
+                    && link
+                        .transport
+                        .as_ref()
+                        .is_some_and(|t| t.is_alive() && !t.is_dead())
+            })
     }
 
     /// Dial `name` over local discovery: its remembered addresses plus

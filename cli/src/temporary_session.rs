@@ -126,10 +126,7 @@ impl Session {
                 let decline = json!({"type":"access-decline","v":1,
                     "id":review.snapshot().id,"revision":review.snapshot().revision});
                 crate::ui::say(&format!("  Temporary access declined: {}", crate::access_ui::terminal_label(&error.to_string())));
-                self.shutdown().await;
-                mux.transport().send_control(&decline).await?;
-                drain_final_control(&mux).await;
-                self.ended = true;
+                self.deliver_decline_and_shutdown(&mux, &decline).await?;
                 return Ok(true);
             }
             let signature = crate::overlay::overlay_sign_possession(&review.acceptance_message()?)?;
@@ -502,6 +499,21 @@ impl Session {
             }
         }
         self.active = false;
+    }
+
+    /// The user declined, and this process is about to leave. The `access-decline`
+    /// control is the LAST frame this side ever sends, so it must be written and
+    /// drained while the mux still owns its streams: teardown first would hand the
+    /// peer a departed session and the decision could be lost with it. Output order
+    /// (the declined line) is the caller's; teardown still runs even if the send
+    /// fails, and the failure is reported after it, as before.
+    async fn deliver_decline_and_shutdown(&mut self, mux: &Arc<Mux>, decline: &Value) -> Result<()> {
+        let sent = mux.transport().send_control(decline).await;
+        drain_final_control(mux).await;
+        self.shutdown().await;
+        sent?;
+        self.ended = true;
+        Ok(())
     }
 
     async fn advance_end(&mut self) -> bool {
@@ -903,5 +915,59 @@ mod tests {
         for value in ["00".repeat(65), "00".repeat(63), "gg".repeat(64)] {
             assert!(signature(&json!({"signature":value})).is_err());
         }
+    }
+
+    /// Records what the peer would see, and how many streams the session still
+    /// owned at that moment. `live_streams` is torn down by `shutdown`, so a
+    /// send observed with a stream still registered proves the decline left
+    /// before teardown rather than after it.
+    struct RecordingTransport {
+        sent: Arc<std::sync::Mutex<Vec<(String, usize)>>>,
+        mux: Arc<std::sync::Mutex<Option<std::sync::Weak<Mux>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl filament_transport::net::Transport for RecordingTransport {
+        async fn send_control(&self, msg: &Value) -> Result<()> {
+            let held = self.mux.lock().unwrap().clone();
+            let live = match held.and_then(|weak| weak.upgrade()) {
+                Some(mux) => mux.live_streams().await,
+                None => usize::MAX,
+            };
+            self.sent
+                .lock()
+                .unwrap()
+                .push((msg["type"].as_str().unwrap_or_default().to_string(), live));
+            Ok(())
+        }
+        async fn send_frame(&self, _: u32, _: u64, _: &[u8]) -> Result<()> { Ok(()) }
+        async fn flush(&self) -> Result<()> { Ok(()) }
+        fn max_payload(&self) -> usize { 1024 }
+        fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+
+    #[tokio::test]
+    async fn the_decline_frame_is_delivered_before_the_session_is_torn_down() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let mux = Mux::new(
+            Arc::new(RecordingTransport { sent: sent.clone(), mux: slot.clone() }),
+            Arc::new(filament_peerloop::host::NoHost),
+        );
+        *slot.lock().unwrap() = Some(Arc::downgrade(&mux));
+        mux.register_access_stream(mux.alloc_sid()).await.unwrap();
+        assert_eq!(mux.live_streams().await, 1, "fixture has no stream to tear down");
+        let binding = TemporaryBinding::new([1; 32], &AccessSpec::default(), Lifetime::UntilEnded, 100).unwrap();
+        let mut session = Session::recipient(binding);
+        session.mux = Some(mux.clone());
+        let decline = json!({"type":"access-decline","v":1,"id":"offer","revision":1});
+        session.deliver_decline_and_shutdown(&mux, &decline).await.unwrap();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![("access-decline".to_string(), 1)],
+            "the decline was not written while the session still owned its streams"
+        );
+        assert_eq!(mux.live_streams().await, 0, "decline path did not tear the session down");
+        assert!(session.ended, "the decline path did not finish the session");
     }
 }

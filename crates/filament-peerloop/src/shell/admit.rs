@@ -522,6 +522,7 @@ mod tests {
                 attempts: 0,
                 trusted: true,
                 expected_secret: None,
+                lan_binding: None,
                 verified_name: verified.map(str::to_string),
                 presence: Presence::Ready,
                 direct: true,

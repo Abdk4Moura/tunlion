@@ -3598,7 +3598,9 @@ async fn recv_run(
                     let mut unrouted: Vec<String> = Vec::new();
                     for (pid, l) in &conn.links {
                         let facts = crate::recv::revocation::LinkFacts {
-                            secret: l.expected_secret.as_ref().map(|(_, s)| s.as_str()),
+                            // LAN device reservations are bindings too; a LAN
+                            // fleet reservation exposes no device secret.
+                            secret: l.device_secret(),
                             device_pub: l.identity_device_pub,
                         };
                         // Is this peer's key on the forget block? Read once:
@@ -4042,7 +4044,7 @@ async fn recv_run(
             && conn.links.keys().all(|pid| {
                 conn.links
                     .get(pid)
-                    .map(|l| l.expected_secret.is_none())
+                    .map(|l| l.expected_secret.is_none() && l.lan_binding.is_none())
                     .unwrap_or(true)
                     && !fleet_pending.contains(pid)
                     && !fleet_verified.contains(pid)
@@ -4376,6 +4378,7 @@ async fn recv_run(
                             // room roster, and reaps it after two digest ticks.
                             // Test the property directly instead of the proxy.
                             let channel_introduced = l.expected_secret.is_some()
+                                || l.lan_binding.is_some()
                                 || fleet_pending.contains(pid)
                                 || fleet_verified.contains(pid);
                             let present = (!channel_introduced).then(|| present.contains(pid));

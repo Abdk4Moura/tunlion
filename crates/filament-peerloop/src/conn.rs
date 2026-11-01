@@ -280,6 +280,18 @@ pub enum DigestSurface {
     Room,
 }
 
+/// The local-discovery reservation that authenticated a LAN link.
+///
+/// `name` is the reservation name used for dedup/route matching. `device` is
+/// the exact stored (name, secret) DEVICE binding, and is `None` for a LAN
+/// fleet reservation: the shared rendezvous secret is membership evidence, not
+/// a device binding, and must never enter revocation comparisons as one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LanBinding {
+    pub name: String,
+    pub device: Option<(String, String)>,
+}
+
 pub struct Link {
     /// WebRTC peer connection. `None` for a rung-1 direct link (no ICE/DTLS
     /// negotiation, it rides authenticated QUIC), so every WebRTC-only call
@@ -305,6 +317,11 @@ pub struct Link {
     pub trusted: bool,
     /// (name, secret) hypothesis to prove/verify on this link
     pub expected_secret: Option<(String, String)>,
+    /// LAN-origin reservation identity. Deliberately separate from
+    /// `expected_secret` so a LAN link stays untrusted/delegated without a pair
+    /// binding, while revocation and dedup can still see its exact device
+    /// binding (device LAN only; never the fleet shared RV).
+    pub lan_binding: Option<LanBinding>,
     /// The devices.json PETNAME this link proved as (the cap-store key). Set on a
     /// verified `pair-proof` (WebRTC) or at birth for a direct link (already
     /// identity-bound). `None` until proven. Capability lookups (e.g. the `shell`
@@ -365,7 +382,24 @@ impl Link {
         self.verified_name
             .as_deref()
             .or(self.expected_secret.as_ref().map(|(n, _)| n.as_str()))
+            .or(self.lan_binding.as_ref().map(|b| b.name.as_str()))
             .unwrap_or(&self.name)
+    }
+
+    /// The exact device secret this link is bound to: a pair-secret hypothesis,
+    /// or an authenticated LAN device reservation. A LAN fleet reservation
+    /// carries no device binding, so its shared rendezvous secret is never
+    /// returned here.
+    pub fn device_secret(&self) -> Option<&str> {
+        self.expected_secret
+            .as_ref()
+            .map(|(_, secret)| secret.as_str())
+            .or_else(|| {
+                self.lan_binding
+                    .as_ref()
+                    .and_then(|binding| binding.device.as_ref())
+                    .map(|(_, secret)| secret.as_str())
+            })
     }
 
     /// Admit this link as a delegated (auth-key-enrolled) principal.
@@ -739,8 +773,8 @@ pub enum DirectAuthDomain {
     Ephemeral,
     Fleet,
     /// A LAN-origin primary whose ownership was established by the local
-    /// discovery handshake, not by a DirectPending. It carries no device
-    /// binding and never mints a worker transport key.
+    /// discovery handshake. It keeps the exact device reservation for revocation
+    /// but never mints a worker transport key.
     Lan,
 }
 
@@ -813,6 +847,10 @@ pub struct DirectPending {
     /// This dial used the FLEET rendezvous secret, so the link it produces must
     /// NOT be born trusted / owner-equivalent. See `DirectIntent::Fleet`.
     pub fleet: bool,
+    /// Seeded by local discovery (`seed_lan`). A LAN reservation has no
+    /// signaling pid/path to fall back to, so expiry retires it instead of
+    /// handing it to the WebRTC establish.
+    pub lan: bool,
     /// This dial is a post-PAKE PROMOTION on the one-time-code path, keyed by
     /// the EPHEMERAL ceremony secret. Its MAC proves "the peer that typed this
     /// code", not "a device we remember", so the link it produces must not be
@@ -3195,6 +3233,7 @@ impl Conn {
                 attempts: 0,
                 trusted: false,
                 expected_secret: binding,
+                lan_binding: None,
                 verified_name: None,
                 presence: Presence::Connecting,
                 direct: false,
@@ -3929,6 +3968,27 @@ impl Conn {
         auth.generation > old_generation
     }
 
+    /// A newer current-store device binding may supersede a LIVE direct primary
+    /// only when that primary's own binding is no longer current (the store
+    /// dropped it, or revocation still marks it). Everything else keeps the
+    /// no-hybrid rejection in `adopt_direct`: a different attempt must never
+    /// leave the old transport installed under the new epoch.
+    fn direct_supersedes_live_primary(
+        &self,
+        pid: &str,
+        auth: Option<&DirectAuth>,
+        existing: &Link,
+    ) -> bool {
+        let Some(auth) = auth else { return false; };
+        if !self.direct_auth_survives_forget(pid, auth) {
+            return false;
+        }
+        let Some((_, old_secret)) = existing.expected_secret.as_ref() else {
+            return false;
+        };
+        self.revoked_bindings.contains(old_secret) || !self.store_holds_binding(old_secret)
+    }
+
     /// Retire exactly one attempt and only the promotion, probe, or source
     /// entries that carry that same immutable attempt. Anything with different
     /// or unknown provenance is left alone and is re-checked at readiness.
@@ -4543,6 +4603,7 @@ impl Conn {
                 auth,
                 race_task: None,
                 fleet: intent == DirectIntent::Fleet,
+                lan: false,
                 ephemeral: intent == DirectIntent::Promote,
                 secret: (name.to_string(), secret.to_string()),
                 deadline,
@@ -4889,15 +4950,22 @@ impl Conn {
         // through this path. Installing only the new epoch while keeping the old
         // transport was a hybrid that dropped the incoming Arc. Reject before
         // promoting, taking pending state, or touching workers. Same-attempt
-        // live exact duplicates already returned Duplicate above.
-        if self.links.get(pid).is_some_and(|existing| {
+        // live exact duplicates already returned Duplicate above. The one
+        // exception is a newer current-store binding whose old link binding was
+        // forgotten/revoked: that re-pair supersedes the live primary below.
+        let live_different_attempt_primary = self.links.get(pid).is_some_and(|existing| {
             existing.direct
                 && existing.attempt != Some(attempt)
                 && existing
                     .transport
                     .as_ref()
                     .is_some_and(|live| !live.is_dead())
-        }) {
+        });
+        let supersedes_live_primary = live_different_attempt_primary
+            && self.links.get(pid).is_some_and(|existing| {
+                self.direct_supersedes_live_primary(pid, auth.as_ref(), existing)
+            });
+        if live_different_attempt_primary && !supersedes_live_primary {
             self.log.debug(&format!(
                 "tunlion: DIRECT-ADOPT-REFUSED peer={pid}: live primary attempt is different"
             ));
@@ -4914,14 +4982,36 @@ impl Conn {
                 self.retire_serving_link(pid);
             }
         }
+        // A superseding re-pair replaces the whole live primary, not just its
+        // epoch: dropping the link closes the old transport after the normal
+        // grace so the incoming Arc is the one installed, never a hybrid.
+        if supersedes_live_primary {
+            let was_active = self.is_active(pid);
+            self.log.debug(&format!(
+                "tunlion: DIRECT-ADOPT-REPLACE peer={pid}: a newer authorized attempt supersedes the live binding"
+            ));
+            self.drop_link(pid);
+            if was_active {
+                self.active = Some(pid.to_string());
+            }
+        }
         let lan = route == filament_transport::lan::ROUTE_LAN;
         let pend = self.take_pending_for_adoption(pid, attempt);
-        let tkey = if lan {
-            None
-        } else {
-            pend.as_ref()
-                .map(|pending| direct::transport_key(&pending.secret.1))
-        };
+        // Only a DEVICE binding may key workers, exactly as the upgrade path
+        // does. Deriving this from `pending.secret` handed a fleet rendezvous
+        // secret (or an ephemeral ceremony secret) a worker key it must never
+        // have.
+        let tkey = pend.as_ref().and_then(|pending| pending.auth.transport_key());
+        // Keep the exact device reservation for revocation/dedup. A fleet LAN
+        // reservation carries no device binding; its shared RV must never be
+        // stored here as one.
+        let lan_device_binding = pend.as_ref().and_then(|pending| {
+            if pending.auth.domain == DirectAuthDomain::Lan {
+                pending.auth.device_binding.clone()
+            } else {
+                None
+            }
+        });
         // Read the fleet flag BEFORE the secret moves out of the pending.
         //
         // FAIL SAFE WITH NO PENDING. Only the DIALER holds a `DirectPending`, so
@@ -4971,11 +5061,19 @@ impl Conn {
             .cloned()
             .unwrap_or_else(|| json!({ "id": pid, "name": name }));
         let uid = info["uid"].as_str().map(|s| s.to_string());
-        let expected_secret = if secret.is_empty() {
+        // LAN's proof is a shared local secret, not a pair binding. A LAN link
+        // must not inherit or mint `expected_secret`, or later identity/digest
+        // decisions would treat a local-network holder as that paired device.
+        // Its device reservation is kept separately in `lan_binding`.
+        let expected_secret = if lan || secret.is_empty() {
             None
         } else {
             Some((name.clone(), secret))
         };
+        let lan_binding = lan.then(|| LanBinding {
+            name: name.clone(),
+            device: lan_device_binding,
+        });
         self.next_gen += 1;
         let generation = self.next_gen;
         // If a Link already exists for this pid (e.g. from a stall-watchdog
@@ -5030,6 +5128,10 @@ impl Conn {
             if expected_secret.is_some() {
                 existing.expected_secret = expected_secret;
             }
+            // Unconditional: a non-LAN replacement must not inherit a stale LAN
+            // reservation, and a LAN replacement keeps (or clears, for fleet)
+            // its exact device binding.
+            existing.lan_binding = lan_binding.clone();
         } else {
             // Mesh reuse: spawn accept loop before t moves into Link.
             direct::spawn_mesh_accept(pid.to_string(), &t, self.tx.clone());
@@ -5060,6 +5162,7 @@ impl Conn {
                         expected_secret.as_ref().map(|(n, _)| n.clone())
                     },
                     expected_secret,
+                    lan_binding,
                     presence: Presence::Ready,
                     direct: true,
                     direct_route: route,
@@ -5219,7 +5322,8 @@ impl Conn {
     /// one (pid, info) to establish, caller awaits establish outside the borrow,
     /// so one loop iteration pays for at most ONE establish. Remaining expired
     /// attempts stay pending and are returned by the next call. Also drops any
-    /// pending whose Link already exists.
+    /// pending whose Link already exists. LAN reservations are the exception:
+    /// they have no signaling peer, so expiry retires them without a fallback.
     pub fn expired_direct(&mut self) -> Vec<(String, Value, (String, String))> {
         let now = Instant::now();
         let mut fell_back = Vec::new();
@@ -5248,11 +5352,30 @@ impl Conn {
             ));
             self.mark_probe_failed(&pid);
         }
+        // LAN reservations were seeded by local discovery, not by a signaling
+        // offer. Their pid is a fresh local id with no signaling peer to
+        // establish, so expiry must retire the exact attempt and never return a
+        // WebRTC fallback for it. Fleet LAN is still a LAN reservation here.
+        let expired_lan: Vec<String> = self
+            .direct_pending
+            .iter()
+            .filter(|(_, p)| p.lan && now >= p.deadline)
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        for pid in expired_lan {
+            if let Some(pending) = self.direct_pending.remove(&pid) {
+                self.retire_attempt(&pid, pending.attempt, pending.race_task);
+            }
+            self.log.debug(&format!(
+                "tunlion: LAN reservation for {pid} expired; no WebRTC fallback"
+            ));
+        }
         let mut expired: Vec<String> = self
             .direct_pending
             .iter()
             .filter(|(pid, p)| {
                 !p.probe
+                    && !p.lan
                     && now >= p.deadline
                     && !self.links.contains_key(*pid)
                     && !self.promotions.contains_key(*pid)
@@ -6351,6 +6474,7 @@ impl Conn {
                 trusted: upgrade_principal(&carried).0,
                 verified_name: known.as_ref().map(|(n, _)| n.clone()),
                 expected_secret: known,
+                lan_binding: None,
                 presence: Presence::Ready,
                 direct: true,
                 direct_route: route,
@@ -7933,6 +8057,7 @@ mod warm_identity_tests {
             attempts: 0,
             trusted: true,
             expected_secret: Some((petname.to_string(), "s3cret".to_string())),
+            lan_binding: None,
             verified_name: Some(petname.to_string()),
             presence: Presence::Ready,
             direct: true,
@@ -8992,6 +9117,7 @@ mod warm_identity_tests {
                 race_task: None,
                 secret: ("web".into(), "00".into()),
                 fleet: false,
+                lan: false,
                 ephemeral: false,
                 deadline: Instant::now() + Duration::from_secs(30),
                 racing: false,
@@ -9081,6 +9207,7 @@ mod warm_identity_tests {
                 race_task: None,
                 secret: ("other".into(), "11".into()),
                 fleet: false,
+                lan: false,
                 ephemeral: false,
                 deadline: Instant::now() + Duration::from_secs(30),
                 racing: false,
@@ -9132,6 +9259,7 @@ mod warm_identity_tests {
                     race_task: None,
                     secret: (secret.0.into(), secret.1.into()),
                     fleet: false,
+                    lan: false,
                     ephemeral: false,
                     deadline: Instant::now() + Duration::from_secs(30),
                     racing: false,
@@ -9210,6 +9338,7 @@ mod warm_identity_tests {
                 race_task: None,
                 secret: ("box".into(), "00".into()),
                 fleet: false,
+                lan: false,
                 ephemeral: false,
                 deadline: Instant::now() + Duration::from_secs(30),
                 racing: false,
@@ -9382,6 +9511,7 @@ mod warm_identity_tests {
                 race_task: None,
                 secret: (pid.to_string(), "ceremony".into()),
                 fleet: false,
+                lan: false,
                 ephemeral: true,
                 deadline,
                 racing: true,
@@ -9418,6 +9548,7 @@ mod warm_identity_tests {
                 race_task: None,
                 secret: (pid.to_string(), "fleet".into()),
                 fleet: true,
+                lan: false,
                 ephemeral: false,
                 deadline,
                 racing: false,
@@ -9535,6 +9666,39 @@ mod warm_identity_tests {
         assert!(conn.expired_direct().is_empty());
     }
 
+    /// A LAN reservation has no signaling peer to establish: expiry retires its
+    /// exact attempt and never returns a pid for a WebRTC fallback. A fleet LAN
+    /// reservation is still a LAN reservation; an ordinary expired attempt
+    /// still falls back exactly as before.
+    #[tokio::test]
+    async fn expired_lan_reservation_retires_without_webrtc_fallback() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let past = Instant::now() - Duration::from_millis(1);
+        let lan_pid = "sid-lan-expired-device";
+        let lan_attempt = net::AttemptId::next();
+        conn.seed_lan(lan_pid, "dev", "secret", false, lan_attempt);
+        conn.direct_pending.get_mut(lan_pid).unwrap().deadline = past;
+        let fleet_pid = "sid-lan-expired-fleet";
+        let fleet_attempt = net::AttemptId::next();
+        conn.seed_lan(fleet_pid, "fleet", "fleet-rv", true, fleet_attempt);
+        conn.direct_pending.get_mut(fleet_pid).unwrap().deadline = past;
+        let normal_pid = "sid-normal-expired";
+        expired_direct_pending(&mut conn, normal_pid, past);
+
+        let batch = conn.expired_direct();
+        assert!(
+            batch.iter().all(|(pid, _, _)| pid != lan_pid && pid != fleet_pid),
+            "a LAN reservation was handed to the WebRTC fallback"
+        );
+        assert_eq!(batch.len(), 1, "the normal pending must still fall back");
+        assert_eq!(batch[0].0, normal_pid);
+        assert!(!conn.direct_pending.contains_key(lan_pid));
+        assert!(!conn.direct_pending.contains_key(fleet_pid));
+        assert!(conn.retired_attempts.contains_key(&lan_attempt));
+        assert!(conn.retired_attempts.contains_key(&fleet_attempt));
+        assert!(!conn.direct_pending.contains_key(normal_pid));
+    }
+
     /// The dispatch loop's shape: one reaper call and one awaited establish per
     /// iteration, with the watchdog heartbeat stamped at the top. An establish
     /// stand-in is awaited for each fallback; with the batch capped, the
@@ -9626,6 +9790,7 @@ mod warm_identity_tests {
             race_task: None,
             secret: (secret.0.into(), secret.1.into()),
             fleet: false,
+            lan: false,
             ephemeral: false,
             deadline: Instant::now() + Duration::from_secs(30),
             racing: false,
@@ -10317,6 +10482,8 @@ mod warm_identity_tests {
 
     /// A newer same-pid device attempt whose binding the current store holds
     /// survives the old link's forget and adopts without the revoked secret.
+    /// The old primary is replaced whole (Arc, attempt, source, workers), never
+    /// a hybrid epoch that keeps the old transport or worker authority.
     #[tokio::test]
     async fn a_newer_current_store_device_attempt_survives_old_link_forget() {
         let host = Arc::new(TestHost {
@@ -10326,24 +10493,66 @@ mod warm_identity_tests {
         let pid = "sid-new-device-successor";
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let old: Arc<dyn Transport> = Rec::new("old", &log);
-        let mut link = direct_link(pid, "dev", "dev", old);
+        let old_attempt = old.attempt_id().unwrap();
+        let old_source = old.source_id().unwrap();
+        let old_worker: Arc<dyn Transport> = Rec::new("old-worker", &log);
+        let old_worker_source = old_worker.source_id().unwrap();
+        let mut link = direct_link(pid, "dev", "dev", old.clone());
         link.generation = 7;
         link.expected_secret = Some(("dev".into(), "old-secret".into()));
+        link.workers = vec![old_worker.clone()];
+        link.worker_sources.insert(old_worker_source);
         conn.links.insert(pid.into(), link);
+        conn.active = Some(pid.into());
         let successor: Arc<dyn Transport> = Rec::new("successor", &log);
         let successor_attempt = successor.attempt_id().unwrap();
+        let successor_source = successor.source_id().unwrap();
         let mut pending = direct_pending_with(successor_attempt, ("dev", "new-secret"));
         pending.auth = DirectAuth::device(8, "dev", "new-secret");
         conn.direct_pending.insert(pid.into(), pending);
+        let unrelated_pid = "sid-unrelated-pending";
+        conn.direct_pending.insert(
+            unrelated_pid.into(),
+            direct_pending_with(net::AttemptId::next(), ("dev", "unrelated-secret")),
+        );
         let mut dropped = HashSet::new();
         dropped.insert("old-secret".to_string());
         conn.invalidate_peers(&[(pid.into(), "dev".into())], &dropped);
         assert!(conn.direct_pending.contains_key(pid), "the new store binding was swept");
+        assert_eq!(conn.links[pid].attempt, Some(old_attempt));
+        assert_eq!(conn.links[pid].source, old_source);
         assert!(!conn.retired_attempts.contains_key(&successor_attempt));
         assert!(matches!(
-            conn.adopt_direct(pid, successor, "direct-quic"),
-            DirectAdoption::Adopted { .. }
+            conn.adopt_direct(pid, successor.clone(), "direct-quic"),
+            DirectAdoption::Adopted { attempt, .. } if attempt == successor_attempt
         ));
+        let installed = conn.links[pid].transport.as_ref().unwrap();
+        assert!(Arc::ptr_eq(installed, &successor), "the successor epoch kept the OLD Arc (hybrid)");
+        assert!(!Arc::ptr_eq(installed, &old));
+        assert_eq!(conn.links[pid].attempt, Some(successor_attempt));
+        assert_eq!(conn.links[pid].source, successor_source);
+        assert_ne!(conn.links[pid].source, old_source);
+        assert!(!conn.links[pid].worker_sources.contains(&old_worker_source));
+        assert!(conn.is_active(pid), "active was lost while replacing the primary");
+        assert!(conn.retired_attempts.contains_key(&old_attempt));
+        assert!(
+            !conn.retired_attempts.contains_key(&successor_attempt),
+            "the old link's drop retired the newer attempt"
+        );
+        assert!(!conn.direct_pending.contains_key(pid));
+        assert!(conn.direct_pending.contains_key(unrelated_pid));
+        assert!(
+            conn.stage_event(Ev::Sourced {
+                pid: pid.into(),
+                source: old_worker_source,
+                inner: Box::new(Ev::Control(
+                    pid.into(),
+                    json!({ "type": "old-worker-control" }),
+                )),
+            })
+            .is_none(),
+            "a dropped primary's worker source still forwarded Control"
+        );
         assert_eq!(
             conn.links[pid].expected_secret,
             Some(("dev".to_string(), "new-secret".to_string())),
@@ -10504,6 +10713,53 @@ mod warm_identity_tests {
         ));
         assert!(conn.links.contains_key(pid));
         assert!(Arc::ptr_eq(conn.links[pid].transport.as_ref().unwrap(), &t));
+    }
+
+    /// Cold adoption keys workers from the immutable AUTHORIZATION, exactly
+    /// like upgrade adoption. A fleet rendezvous secret or an ephemeral
+    /// ceremony secret must never become a worker key; a device binding does.
+    #[tokio::test]
+    async fn cold_adoption_keys_only_device_bindings() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let fleet_pid = "sid-cold-fleet";
+        let fleet: Arc<dyn Transport> = Rec::new("fleet-cold", &log);
+        let fleet_attempt = fleet.attempt_id().unwrap();
+        let mut fleet_pending = direct_pending_with(fleet_attempt, ("fleet", "fleet-rv"));
+        fleet_pending.fleet = true;
+        fleet_pending.auth = DirectAuth::fleet(1);
+        conn.direct_pending.insert(fleet_pid.into(), fleet_pending);
+        assert!(matches!(
+            conn.adopt_direct(fleet_pid, fleet, "direct-quic"),
+            DirectAdoption::Adopted { tkey: None, .. }
+        ));
+
+        let ephemeral_pid = "sid-cold-ephemeral";
+        let ephemeral: Arc<dyn Transport> = Rec::new("ephemeral-cold", &log);
+        let ephemeral_attempt = ephemeral.attempt_id().unwrap();
+        let mut ephemeral_pending =
+            direct_pending_with(ephemeral_attempt, ("ceremony", "one-time-code"));
+        ephemeral_pending.ephemeral = true;
+        ephemeral_pending.auth = DirectAuth::ephemeral(2);
+        conn.direct_pending.insert(ephemeral_pid.into(), ephemeral_pending);
+        assert!(matches!(
+            conn.adopt_direct(ephemeral_pid, ephemeral, "direct-quic"),
+            DirectAdoption::Adopted { tkey: None, .. }
+        ));
+
+        let device_pid = "sid-cold-device";
+        let device: Arc<dyn Transport> = Rec::new("device-cold", &log);
+        let device_attempt = device.attempt_id().unwrap();
+        conn.direct_pending.insert(
+            device_pid.into(),
+            direct_pending_with(device_attempt, ("dev", "device-secret")),
+        );
+        assert!(matches!(
+            conn.adopt_direct(device_pid, device, "direct-quic"),
+            DirectAdoption::Adopted { tkey: Some(key), .. }
+                if key == direct::transport_key("device-secret")
+        ));
     }
 
     /// An authorized upgrade adopts the verified standby exactly once.
@@ -10935,6 +11191,11 @@ mod warm_identity_tests {
         assert_eq!(link.direct_route, filament_transport::lan::ROUTE_LAN);
         assert!(!link.trusted, "LAN was born device-trusted");
         assert!(link.expected_secret.is_none());
+        assert_eq!(
+            link.lan_binding.as_ref().and_then(|b| b.device.clone()),
+            Some(("dev".to_string(), "secret".to_string())),
+            "the authenticated LAN device binding was lost"
+        );
         assert!(!t.is_dead());
         assert!(!conn.direct_pending.contains_key(pid), "LAN reservation survived adoption");
         assert!(conn.direct_pending.contains_key(other));
@@ -10945,9 +11206,115 @@ mod warm_identity_tests {
             DirectAdoption::Duplicate
         ));
         assert!(!t.is_dead(), "duplicate LAN ready closed the live transport");
+
+        // The existing-link update path must clear the same field, not restore
+        // it after the LAN exemption. A dead serving transport forces that path.
+        let existing_pid = "sid-lan-existing";
+        let dead: Arc<dyn Transport> = Rec::new("dead-serving", &log);
+        let mut existing = relay_link(existing_pid, "dev", "dev", dead.clone());
+        existing.expected_secret = Some(("dev".into(), "secret".into()));
+        dead.force_close();
+        conn.links.insert(existing_pid.into(), existing);
+        let lan_existing: Arc<dyn Transport> =
+            Rec::with_attempt("lan-existing", &log, net::AttemptId::next());
+        let lan_existing_attempt = lan_existing.attempt_id().unwrap();
+        conn.seed_lan(existing_pid, "dev", "secret", false, lan_existing_attempt);
+        assert!(matches!(
+            conn.adopt_direct(existing_pid, lan_existing.clone(), filament_transport::lan::ROUTE_LAN),
+            DirectAdoption::Adopted { attempt, .. } if attempt == lan_existing_attempt
+        ));
+        assert!(
+            conn.links[existing_pid].expected_secret.is_none(),
+            "existing-link LAN adoption restored a device binding"
+        );
+        assert_eq!(
+            conn.links[existing_pid]
+                .lan_binding
+                .as_ref()
+                .and_then(|b| b.device.clone()),
+            Some(("dev".to_string(), "secret".to_string()))
+        );
+        assert!(Arc::ptr_eq(
+            conn.links[existing_pid].transport.as_ref().unwrap(),
+            &lan_existing
+        ));
+
+        // A LAN fleet reservation keeps its name for dedup but exposes NO
+        // device binding: the shared rendezvous secret never becomes one.
+        let fleet_pid = "sid-lan-fleet";
+        let fleet_lan: Arc<dyn Transport> =
+            Rec::with_attempt("lan-fleet", &log, net::AttemptId::next());
+        let fleet_lan_attempt = fleet_lan.attempt_id().unwrap();
+        conn.seed_lan(fleet_pid, "fleet", "fleet-rv", true, fleet_lan_attempt);
+        assert!(matches!(
+            conn.adopt_direct(fleet_pid, fleet_lan, filament_transport::lan::ROUTE_LAN),
+            DirectAdoption::Adopted { tkey: None, .. }
+        ));
+        let fleet_binding = conn.links[fleet_pid].lan_binding.as_ref().unwrap();
+        assert_eq!(fleet_binding.name, "fleet");
+        assert!(fleet_binding.device.is_none());
+        assert!(conn.links[fleet_pid].expected_secret.is_none());
+        assert!(conn.links[fleet_pid].device_secret().is_none());
         let auth = DirectAuth::lan_device(1, "dev", "secret");
         assert!(auth.device_binding.is_some());
         assert!(auth.transport_key().is_none());
+    }
+
+    /// A live LAN link is deduped by its authenticated reservation even though
+    /// it is deliberately untrusted and unnamed. Its exact device binding drives
+    /// revocation, while a dead LAN link no longer dedups and unrelated device
+    /// or fleet links survive the LAN link's removal.
+    #[tokio::test]
+    async fn lan_binding_dedups_and_drives_revocation_only_for_its_device() {
+        use crate::recv::revocation::{facts_for, link_must_close};
+        let host = Arc::new(TestHost {
+            devices: vec![
+                ("dev".into(), "secret".into()),
+                ("other".into(), "other-secret".into()),
+            ],
+        });
+        let (mut conn, _far, _rx) = test_conn_with_host(host).await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-lan-live";
+        let t: Arc<dyn Transport> = Rec::with_attempt("lan-live", &log, net::AttemptId::next());
+        let attempt = t.attempt_id().unwrap();
+        conn.seed_lan(pid, "dev", "secret", false, attempt);
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), filament_transport::lan::ROUTE_LAN),
+            DirectAdoption::Adopted { .. }
+        ));
+        assert!(!conn.links[pid].trusted);
+        assert!(conn.links[pid].verified_name.is_none());
+        assert!(conn.links[pid].expected_secret.is_none());
+        assert_eq!(
+            conn.links[pid].lan_binding.as_ref().and_then(|b| b.device.clone()),
+            Some(("dev".to_string(), "secret".to_string()))
+        );
+        assert!(conn.has_link_to("dev"));
+        assert!(conn.has_link_to("DEV"));
+
+        let other: Arc<dyn Transport> = Rec::new("other", &log);
+        let mut other_link = relay_link("sid-other-device", "other", "other", other);
+        other_link.expected_secret = Some(("other".into(), "other-secret".into()));
+        conn.links.insert("sid-other-device".into(), other_link);
+        let fleet: Arc<dyn Transport> = Rec::new("fleet", &log);
+        let mut fleet_link = direct_link("sid-fleet", "fleet", "fleet", fleet);
+        fleet_link.expected_secret = Some(("fleet".into(), "fleet-rv".into()));
+        conn.links.insert("sid-fleet".into(), fleet_link);
+
+        let mut forgotten = HashSet::new();
+        forgotten.insert("secret".to_string());
+        let never = |_: &[u8; 32]| false;
+        assert!(link_must_close(&facts_for(&conn, pid), &forgotten, &never));
+        assert!(!link_must_close(&facts_for(&conn, "sid-other-device"), &forgotten, &never));
+        assert!(!link_must_close(&facts_for(&conn, "sid-fleet"), &forgotten, &never));
+
+        t.force_close();
+        assert!(!conn.has_link_to("dev"), "a dead LAN link still deduped");
+        conn.drop_link(pid);
+        assert!(!conn.links.contains_key(pid));
+        assert!(conn.links.contains_key("sid-other-device"));
+        assert!(conn.links.contains_key("sid-fleet"));
     }
 
     /// A retired LAN attempt cannot resurrect, and a withdrawn LAN link retires

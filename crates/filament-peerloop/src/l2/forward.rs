@@ -463,6 +463,7 @@ mod tests {
                 attempts: 0,
                 trusted,
                 expected_secret: None,
+                lan_binding: None,
                 // Avoid ambient device-record/consent I/O: the gate is keyed by
                 // the resolved device key, not the display name.
                 verified_name: None,
