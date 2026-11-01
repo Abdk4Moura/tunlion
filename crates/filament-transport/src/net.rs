@@ -2792,11 +2792,10 @@ mod tests {
         }
     }
 
-    /// The immutable build SourceId a WebRTC `DataChannelTransport` is born
-    /// with. A re-armed readiness event must carry THIS id (not a fresh
-    /// `SourceId::next`, and not the current `Conn` source), or the exact-source
-    /// gate rejects it as untagged/stale and the file offer is never sent.
-    /// `attempt_id` stays `None`: a data-channel build has no direct attempt.
+    /// CONTRACT ONLY: a source-bearing transport's readiness envelope. This
+    /// pins `Ev::sourced_channel_ready`, not the production
+    /// `DataChannelTransport` wiring (it could pass before that fix). The real
+    /// constructor regression is `real_data_channel_transport_exposes_its_build_source`.
     struct SourcedWebRtcStub {
         source: SourceId,
     }
@@ -2841,6 +2840,89 @@ mod tests {
         };
         assert_eq!(inner_pid, "webrtc");
         assert!(Arc::ptr_eq(&inner_transport, &transport), "the callback transport was replaced");
+    }
+
+    /// REAL constructor regression: build an actual `webrtc-data` channel over
+    /// an in-memory SCTP association pair (the public `webrtc::util` Bridge
+    /// seam, no ICE/network), wrap it in the production
+    /// `DataChannelTransport`, and prove the getter returns the build source.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_data_channel_transport_exposes_its_build_source() {
+        use webrtc::data::data_channel::Config as DataChannelConfig;
+        use webrtc::sctp::association::{Association as SctpAssociation, Config as SctpConfig};
+        use webrtc::util::conn::conn_bridge::Bridge;
+
+        let (bridge, ca, cb) = Bridge::new(0, None, None);
+        let ticker = {
+            let bridge = bridge.clone();
+            tokio::spawn(async move {
+                loop {
+                    bridge.tick().await;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let config = |name: &str, net_conn: Arc<dyn webrtc::util::Conn + Send + Sync>| SctpConfig {
+            net_conn,
+            max_receive_buffer_size: 0,
+            max_message_size: 0,
+            name: name.into(),
+            remote_port: 5000,
+            local_port: 5000,
+        };
+        let (client, server) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                SctpAssociation::client(config("client", Arc::new(ca))),
+                SctpAssociation::server(config("server", Arc::new(cb))),
+            )
+        }).await.expect("in-memory SCTP handshake timed out");
+        let client = Arc::new(client.expect("sctp client handshake"));
+        let _server = Arc::new(server.expect("sctp server handshake"));
+        let raw = tokio::time::timeout(Duration::from_secs(5), RawDataChannel::dial(
+            &client,
+            100,
+            DataChannelConfig { label: "filament".into(), ..Default::default() },
+        ))
+        .await
+        .expect("in-memory data channel timed out")
+        .expect("a real data channel");
+        ticker.abort();
+        let _ = ticker.await;
+
+        let source = SourceId::next();
+        let (l3_out_tx, _l3_out_rx) = mpsc::channel(1);
+        let (_l3_in_tx, l3_in_rx) = mpsc::channel(1);
+        let transport: Arc<dyn Transport> = Arc::new(DataChannelTransport {
+            raw: Arc::new(raw),
+            source,
+            drained: Arc::new(Notify::new()),
+            dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_activity: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_heard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            first_data: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            answerer: false,
+            write_gate: Arc::new(WriteGate::new()),
+            l3_in: Mutex::new(l3_in_rx),
+            l3_out: l3_out_tx,
+        });
+        assert!(
+            transport.as_any().is::<DataChannelTransport>(),
+            "the fixture built a different transport"
+        );
+        assert_eq!(transport.source_id(), Some(source), "the build source was not exposed");
+        assert_eq!(transport.attempt_id(), None, "WebRTC invented a direct attempt identity");
+
+        let ready = Ev::sourced_channel_ready("webrtc".into(), transport.clone());
+        let Ev::Sourced { pid, source: tagged, inner } = ready else {
+            panic!("an untagged readiness event is dropped by the exact-source gate");
+        };
+        assert_eq!(pid, "webrtc");
+        assert_eq!(tagged, source, "readiness did not carry the build source");
+        let Ev::ChannelReady(inner_pid, inner_transport) = *inner else {
+            panic!("the sourced envelope must wrap ChannelReady");
+        };
+        assert_eq!(inner_pid, "webrtc");
+        assert!(Arc::ptr_eq(&inner_transport, &transport), "re-emit swapped the transport");
     }
 
 

@@ -11738,7 +11738,7 @@ mod warm_identity_tests {
         let (mut conn, _far, mut rx) = test_conn().await;
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pid = "sid-readiness-source";
-        let t = Rec::new("webrtc", &log);
+        let t: Arc<dyn Transport> = Rec::new("webrtc", &log);
         let source = t.source_id().unwrap();
         let mut link = relay_link(pid, "peer", "peer", t.clone());
         link.source = source;
