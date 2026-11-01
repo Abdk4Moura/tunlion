@@ -11733,6 +11733,46 @@ mod warm_identity_tests {
         assert!(matches!(conn.stage_event(ev), Some((Ev::Control(..), Some(s))) if s == source));
     }
 
+    #[tokio::test]
+    async fn retained_webrtc_readiness_is_tagged_and_stale_readiness_rejected() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-readiness-source";
+        let t = Rec::new("webrtc", &log);
+        let source = t.source_id().unwrap();
+        let mut link = relay_link(pid, "peer", "peer", t.clone());
+        link.source = source;
+        conn.links.insert(pid.to_string(), link);
+
+        conn.tx
+            .send(Ev::sourced_channel_ready(pid.into(), t.clone()))
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        match conn.stage_event(ev) {
+            Some((Ev::ChannelReady(got_pid, got), Some(seen))) => {
+                assert_eq!(got_pid, pid);
+                assert!(Arc::ptr_eq(&got, &t), "the callback transport was replaced");
+                assert_eq!(seen, source, "readiness did not carry the build source");
+            }
+            _ => panic!("retained WebRTC readiness was dropped by the exact-source gate"),
+        }
+
+        // The same immutable callback after the pid gains a newer build source
+        // must be refused: it cannot re-attach the retired transport or open a
+        // transfer on the replacement link.
+        let new = Rec::new("webrtc-new", &log);
+        let new_source = new.source_id().unwrap();
+        let mut link = relay_link(pid, "peer", "peer", new);
+        link.source = new_source;
+        conn.links.insert(pid.to_string(), link);
+        conn.tx.send(Ev::sourced_channel_ready(pid.into(), t)).unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert!(
+            conn.stage_event(ev).is_none(),
+            "stale readiness reopened a replaced link"
+        );
+    }
+
     /// Envelope/inner pid mismatch, nesting, and untagged transport events are
     /// all refused; the explicit internal variant is accepted.
     #[tokio::test]

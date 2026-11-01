@@ -758,6 +758,11 @@ async fn write_within<R>(
 
 pub struct DataChannelTransport {
     raw: Arc<RawDataChannel>,
+    // The immutable SourceId allocated for this build, before its first event
+    // was enqueued. Re-armed readiness must carry THIS id, never a fresh one:
+    // the exact-source gate accepts a transport only while its build source is
+    // still the link's current source.
+    source: SourceId,
     drained: Arc<Notify>,
     dead: Arc<std::sync::atomic::AtomicBool>, // set by the read loop on EOF/error
     // Monotonic ms-stamp of the last byte that actually moved (send_frame write
@@ -1044,6 +1049,14 @@ impl Transport for DataChannelTransport {
 
     fn sid_answerer(&self) -> bool {
         self.answerer
+    }
+    /// The build's immutable SourceId. A re-armed `ChannelReady` on this
+    /// transport (e.g. `rearm_channel_ready`) must be tagged with this exact
+    /// id; the untagged default would be rejected by `Conn::stage_event`.
+    /// `attempt_id` deliberately stays the trait default `None`: a WebRTC
+    /// data-channel build has no direct attempt identity.
+    fn source_id(&self) -> Option<SourceId> {
+        Some(self.source)
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -2681,7 +2694,7 @@ async fn wire_channel(
                 }
                 let transport: Arc<dyn Transport> =
                     Arc::new(DataChannelTransport {
-                        raw, drained, dead, last_activity, last_heard, first_data, answerer: polite,
+                        raw, source, drained, dead, last_activity, last_heard, first_data, answerer: polite,
                         write_gate,
                         l3_in: tokio::sync::Mutex::new(l3_in_rx),
                         l3_out: l3_out_tx,
@@ -2778,6 +2791,58 @@ mod tests {
             self.writing.store(false, std::sync::atomic::Ordering::SeqCst);
         }
     }
+
+    /// The immutable build SourceId a WebRTC `DataChannelTransport` is born
+    /// with. A re-armed readiness event must carry THIS id (not a fresh
+    /// `SourceId::next`, and not the current `Conn` source), or the exact-source
+    /// gate rejects it as untagged/stale and the file offer is never sent.
+    /// `attempt_id` stays `None`: a data-channel build has no direct attempt.
+    struct SourcedWebRtcStub {
+        source: SourceId,
+    }
+
+    #[async_trait]
+    impl Transport for SourcedWebRtcStub {
+        async fn send_control(&self, _msg: &Value) -> Result<()> {
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            MAX_DC_PAYLOAD
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn source_id(&self) -> Option<SourceId> {
+            Some(self.source)
+        }
+    }
+
+    #[test]
+    fn data_channel_readiness_carries_the_build_source() {
+        let source = SourceId::next();
+        let transport: Arc<dyn Transport> = Arc::new(SourcedWebRtcStub { source });
+        assert_eq!(transport.source_id(), Some(source), "the build source was not exposed");
+        assert_eq!(transport.attempt_id(), None, "WebRTC invented a direct attempt identity");
+
+        let ready = Ev::sourced_channel_ready("webrtc".into(), transport.clone());
+        let Ev::Sourced { pid, source: tagged, inner } = ready else {
+            panic!("an untagged readiness event is dropped by the exact-source gate");
+        };
+        assert_eq!(pid, "webrtc");
+        assert_eq!(tagged, source, "the callback source is not the transport's build source");
+        let Ev::ChannelReady(inner_pid, inner_transport) = *inner else {
+            panic!("the sourced envelope must wrap ChannelReady");
+        };
+        assert_eq!(inner_pid, "webrtc");
+        assert!(Arc::ptr_eq(&inner_transport, &transport), "the callback transport was replaced");
+    }
+
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writes_keep_one_control_per_message() {
