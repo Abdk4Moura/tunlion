@@ -26,7 +26,16 @@ tar c logs | tunlion send - --name logs.tar --code
 tunlion send x.bin --server https://your-instance.example
 ```
 
-## What it does that the web app can't
+## Fleet devices and permissions
+
+Use the [fleet usage and security guide](../docs/fleet.md) for enrollment,
+automatic sibling connections, grants and removal. `add --for device` enrolls
+one of your devices; ordinary pairing and `--for person` do not make the peer a
+fleet member. Siblings get inbox transfer by default, not shell. Withdrawing an
+owner grant does not terminate an already-open session; cutting off the device
+and propagating its revocation is a different operation.
+
+## CLI-specific transfer features
 
 - **Resume across process restarts.** Receivers keep `<name>.part` +
   `<name>.part.meta`; a re-offer of the same file (name + size) continues

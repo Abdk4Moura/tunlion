@@ -1,7 +1,10 @@
 # Current project state
 
 > **Status:** canonical current-state index  
-> **Last verified:** 2026-09-07 against commit `3c6599f`  
+> **Last full verification:** 2026-09-07 against commit `3c6599f`
+>
+> **Fleet section source-verified:** 2026-11-02 against `a5f525e04577602796034b8add96b7eff8dd0dc0`; other entries retain their earlier verification scope.
+>
 > **Authority:** this file states only source-audited present state. `ROADMAP.md` is the priority backlog; designs are not implementation claims.
 
 ## Product
@@ -16,7 +19,7 @@ The CLI package is `tunlion` **0.9.2** on crates.io (it was `filament-cli` throu
 - **Footprint/startup:** commit `cf5f896` records measurements and reduces binary/startup cost.
 - **Certificate renewal and exit-route safety:** commit `2f434b0`.
 - **Subnet routes:** commits `452356f`, `2f434b0`, and `3c6599f` complete signed route advertisement, scoped route authorization, kernel forwarding/NAT, withdrawal cleanup, and real-machine end-to-end evidence. See `docs/design-subnet-routes.md`.
-- **Fleet auto-mesh:** commit `1271f83` adds same-owner device mesh behavior and reliable sibling sends.
+- **Fleet auto-mesh and trust:** #291 established sibling connections; #609 added roster-bound admission/removal and reliability fixes; #616 introduced `FleetSibling` inbox-only defaults and target-specific owner grants. See [the current fleet guide](../fleet.md) for shipped behavior and session/propagation limits. #657 later fixed the stale ICE-cache refresh deadlock; it did not change fleet authorization.
 - **Capability CI:** commit `96de120` ratchets deterministic core checks; GitHub workflows cover browser, capability, mount, proof, release, and platform test paths.
 
 ## Current boundaries

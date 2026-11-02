@@ -6,6 +6,12 @@ tunlion are never touched. This runbook is the operational contract.
 
 ## Hard invariants (never violated)
 
+Execution location is part of isolation: follow the workspace's worker/CI
+policy. Under worker-only operation, all lab builds and execution occur on a
+verified leased worker or CI, not the control VPS or production host. “Local”
+paths below refer to that worker's checkout. Verify the carrier's actual binary
+path and record the source head and binary hash before citing a result.
+
 1. **No host-network mutation.** Every iface/address/route/qdisc lives inside a
    `lab-`-prefixed netns, applied via `ip netns exec`. The only host-namespace
    operations are `ip netns add/del` and creating a veth pair that is

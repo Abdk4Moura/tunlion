@@ -9,10 +9,11 @@ A reproducible **lab as code** (netlab-inspired, no heavy deps). Nodes are Linux
 **network namespaces** on this host; links are **pluggable providers**. The same
 topology runs over a bare veth, real WireGuard, or tunlion's data channel.
 
-**Canonical CLI:** `lab/lab` (repo: `/root/stunning-tribble/lab`). This skill is a
-symlink of `lab/skill/`; the source of truth is version-controlled in the repo.
+**Canonical CLI:** `lab/lab` in the checked-out tunlion repository. Locate that
+checkout rather than assuming a machine-specific path. The source of truth is
+version-controlled under `lab/skill/`.
 
-Full reference: `/root/stunning-tribble/lab/README.md`. Resources:
+Full reference: `lab/README.md` relative to the checkout. Resources:
 `lab/resources/{topology-schema.md, primitives-reference.md, safety-runbook.md}`.
 
 ## When to use
@@ -27,12 +28,20 @@ Full reference: `/root/stunning-tribble/lab/README.md`. Resources:
 
 ## Hard safety rules (do not violate)
 
+- **Execution location:** obey the workspace's worker/CI policy before running
+  anything. Under the worker-only policy, all builds, tests and lab execution
+  run on verified leased workers or CI, never on the control VPS or production
+  host. The commands below run inside that approved worker's checkout; “local”
+  means local to the worker, not permission to use the agent's current host.
+
 - **Root required** (netns/tun/wg). Run `lab` commands with `sudo` if not root.
 - The lab **only** touches `lab-`-prefixed network namespaces. NEVER modify host
   networking, the running `tunlion up` daemon, the installed
   `~/.local/bin/tunlion`, `~/.config/tunlion`, the live site, or the live T4.
-- The `tunlion` link uses the **locally-built** `cli/target/release/tunlion`
-  and **isolated** `TUNLION_CONFIG_DIR` identities only.
+- The `tunlion` link uses a worker-built binary and **isolated**
+  `TUNLION_CONFIG_DIR` identities only. Verify the carrier's binary path and the
+  checkout's target directory before execution; do not assume the installed
+  production binary is the test artifact. Record source head and binary hash.
 - Always `lab down` (or `lab down --all`) when finished — teardown is leak-free
   and idempotent.
 
