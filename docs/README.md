@@ -30,6 +30,7 @@ Use `Last verified` and `Verified against` for documents that make source-level 
 | Need | Canonical location |
 |---|---|
 | Product use and installation | `../README.md`, `../cli/README.md` |
+| Fleet enrollment, default access, grants and removal | [`fleet.md`](fleet.md) |
 | Protocol and browser/CLI interface | `../CONTRACT.md` |
 | Routing reference / `tunlion man routing` source | `../cli/docs/tunlion-routing.md` |
 | Architecture and platform rules | `architecture/`, `adr-*.md` |

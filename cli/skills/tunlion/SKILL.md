@@ -1,6 +1,6 @@
 ---
 name: tunlion
-description: Move files, run commands, and reach ports between the user's own paired devices with the tunlion CLI (peer to peer, end-to-end encrypted, no cloud upload). Use when the user asks to send or receive a file to/from one of their devices or a one-time code, run a command or open a shell on another machine they own, check whether a device is reachable, tunnel to or publish a port, or pair a new device. Do not use for uploading to cloud services, emailing files, or machines that are not paired with tunlion.
+description: Move files, run commands, and reach ports using the tunlion CLI (peer to peer, end-to-end encrypted, no cloud upload). Use for sending or receiving with a one-time code, reaching known paired or fleet devices, running an authorized command on another machine, forwarding or publishing a port, enrolling a device, or managing tunlion access. Fleet siblings need no pairwise pairing. New enrollment and external transfers require the user's explicit intent. Do not use for cloud uploads, email delivery, or accessing machines without authorization.
 ---
 
 # tunlion
@@ -18,7 +18,7 @@ the exit codes that command can return.
 2. Decide by exit code, never by parsing human text. Under `--json`,
    `ok` is true exactly when the exit code is 0, and a failure is one object:
    `{"ok":false,"error":{"code":"unknown_device","exit":3,"message":"..."}}`.
-3. You are never at a TTY. Prompts do not appear; commands that need
+3. In a noninteractive tool session, prompts do not appear; commands that need
    confirmation (`down`, `reset`, `revoke`, `devices forget`, `demote`,
    `expose --off`) fail unless you pass `-y`. Pass `-y` only when the user asked for that exact
    action. `reset` wipes this machine's identity: never run it unless the user
@@ -81,17 +81,52 @@ refuses every claim with it (`--json` reports what was withdrawn). Devices
 that already joined with it keep their access; cut one off with
 `tunlion demote <device> --to cut -y`.
 
+### Fleet permissions and limits
+
+An ordinary pairing is not fleet enrollment. `add --for device` (also
+`add <name>`) enrolls one of the user's devices; `add --for person` is external;
+`add --for runner` is temporary unattended enrollment, not lasting membership.
+Never enroll someone else's or a borrowed machine as the user's own device just
+to avoid a refusal. Invitation ceilings cannot be widened by a later grant.
+
+Fleet siblings prove their own certificate under the same owner and are admitted
+against the owner's signed roster. They need no pairwise pairing. Their one
+default is file transfer into the receiver's configured inbox, not arbitrary
+filesystem writes. Shell/exec, mount, forwarding and routes are not implied.
+Other relationship types have their own bounds; do not generalize sibling
+defaults to an owner link or an invitation-bounded device.
+
+The target can grant locally. The owner can distribute `transfer`, `mount` or
+`shell` with `grant <subject> <cap> --on <target>`. A successful owner command
+records intent, not delivery or effective access. On the target,
+`fleet.owner_grants` defaults to `files` (transfer/mount only); `all` permits
+owner shell grants; `off` refuses owner sets but does not remove the sibling
+inbox default. Do not change this setting or add grants to bypass a denial.
+Local denies, device revocation and certificate expiry override grants.
+
+Owner sets expire without refresh (15 minutes by default). Withdrawing one or
+narrowing the target policy refuses new sessions once effective, but does NOT
+terminate an already-open session. Whole-device revocation closes affected
+sibling links, but owner roster removal must reach each sibling first. Do not
+claim a global cut before delivery/link closure is verified. A held roster can
+remain the admission input past its validity timestamp; unlike owner-grant sets,
+it does not automatically remove an offline-from-owner sibling on expiry.
+No rendezvous-secret
+rotation or multi-hop routing is implemented. Different versions enforce their
+own receiver policy.
+
 ### Check what is available
 
 ```bash
 tunlion status --json           # is the daemon up on this machine (exit 11 if not)
-tunlion devices --json          # paired devices, their names, open invitations
+tunlion devices --json          # known devices, fleet siblings, open invitations
 tunlion reach <device> --json   # reachable? direct or relay, and rtt
 ```
 
 ### Send a file
 
-To a paired device (no code, the device must be running `tunlion up`):
+To a known paired device or fleet sibling (no code; the receiver must be running
+`tunlion up`, and its authorization still applies):
 
 ```bash
 tunlion send <path>... --to <device> --json
@@ -158,8 +193,9 @@ tunlion forward <device>:<port> --stdio      # stdin/stdout, e.g. ssh ProxyComma
 ```
 
 `forward` runs until stopped; start it in the background and stop it by its
-pid when done. If refused for lack of `shell`, the port may already be
-published with `expose`: try `<device>.mesh:<port>` directly.
+pid when done. A refusal is not permission to try another access path.
+An explicitly published service may be a separate authorized path; use it only
+when that access is within the user's request and the service's policy permits it.
 
 ### Publish a local port to the mesh
 
@@ -188,6 +224,7 @@ On this machine:
 
 ```bash
 tunlion add <name> --out <file> --json     # one of the user's devices
+tunlion add --name <name> --json          # ordinary pairing, no fleet membership
 tunlion add --for person --out <file> --json
 ```
 
@@ -196,6 +233,12 @@ Get the file to the other machine; there the user (or you) runs
 try to pair silently.
 
 ### Change what a device may do
+
+Distinguish revoking a capability from cutting off a device. Withdrawing an
+invitation stops future claims, not devices already enrolled. An invitation's
+own capability ceiling cannot be narrowed with a capability revoke; follow the
+command's refusal rather than reporting success. Owner-grant withdrawal is
+delivery/expiry bounded and does not close existing sessions (see above).
 
 ```bash
 tunlion demote <device> --to cut -y --json   # cut it off now
