@@ -51,6 +51,14 @@ pub enum Incoming {
 /// Connection ids, unique for the life of the process. Zero is never issued.
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
+/// A websocket write is small (a control event), so five seconds is already
+/// pathological. More importantly, the daemon event loop calls `emit` inline
+/// during roster/reconciliation work: an unbounded `SinkExt::send` on a
+/// half-open or buffer-stuck socket froze the whole loop for the watchdog's
+/// 20s window (seen on Android after a signaling reconnect). A timed-out write
+/// is treated as a dead socket; the signaling health check then redials.
+const SIGNALING_WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn next_conn_id() -> u64 {
     NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -77,14 +85,23 @@ async fn send_writer_message(
     tokio::select! {
         biased;
         _ = stopping.changed() => bail!("signaling connection is stopping"),
-        result = async {
-            let mut sink = writer.lock().await;
-            sink.as_mut()
-                .ok_or_else(|| anyhow!("signaling connection is closed"))?
-                .send(message)
-                .await
-                .map_err(anyhow::Error::from)
-        } => result,
+        result = tokio::time::timeout(
+            SIGNALING_WRITE_STALL,
+            async {
+                let mut sink = writer.lock().await;
+                sink.as_mut()
+                    .ok_or_else(|| anyhow!("signaling connection is closed"))?
+                    .send(message)
+                    .await
+                    .map_err(anyhow::Error::from)
+            },
+        ) => match result {
+            Ok(result) => result,
+            Err(_) => bail!(
+                "signaling write stalled for {}s; the socket is no longer usable",
+                SIGNALING_WRITE_STALL.as_secs()
+            ),
+        },
     }
 }
 
