@@ -3014,7 +3014,14 @@ impl Conn {
         // re-pair therefore supersedes an older deferred retry instead of
         // racing it; the older generation remains retired.
         self.current_intent.insert(peer_id.clone(), generation);
-        let config = match lock_ice(&self.ice_cache).cfg.clone() {
+        // Bind the cached value, not the guard: a `match lock_ice(...).cfg.clone()`
+        // keeps the temporary MutexGuard alive for the whole match, and the
+        // stale arm calls refresh_ice_config_off_loop(), which locks the SAME
+        // non-reentrant std::Mutex. That self-deadlocked the daemon loop for the
+        // watchdog's 20 s window once the cache aged past ICE_CONFIG_FRESH
+        // (caught live on the Android emulator during a stuck-link retry).
+        let cached = lock_ice(&self.ice_cache).cfg.clone();
+        let config = match cached {
             Some((at, cfg)) if at.elapsed() < ICE_CONFIG_FRESH => {
                 self.chunk_size = cfg.chunk_size;
                 BuildIce::Cached(cfg)
