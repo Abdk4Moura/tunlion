@@ -11,7 +11,7 @@
 #
 # Gates:
 #   A  #226 grant refuses — a device enrolled with the default ceiling
-#      (transfer, mount) cannot be granted shell; refusal names the ceiling.
+#      (transfer) cannot be granted shell; refusal names the ceiling.
 #   B  #228 revoke refuses — a capability inside the ceiling cannot be revoked;
 #      refusal names `demote <device> --to cut`.
 #   C  devices shows the ceiling — the row and the --json caps field list the
@@ -110,13 +110,13 @@ rows = {d['name']: d['caps'] for d in doc['data']['devices']}
 foxtrot = rows.get('foxtrot', [])
 if 'shell' in foxtrot:
     print('## foxtrot caps include shell (WRONG):', foxtrot); sys.exit(1)
-if set(['transfer','mount']) != set(foxtrot):
+if set(['transfer']) != set(foxtrot):
     print('## foxtrot caps not the ceiling:', foxtrot); sys.exit(1)
 print('## foxtrot caps =', foxtrot)
 " 2>/dev/null
 rcC=$?
 if [ "$rcC" = "0" ]; then
-  ok "gateC: devices --json shows the ceiling (transfer, mount), no inert shell"
+  ok "gateC: devices --json shows the ceiling (transfer), no inert shell"
 else
   bad "gateC: devices --json does NOT show the enforcement-honoured ceiling"
 fi

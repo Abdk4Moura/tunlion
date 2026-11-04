@@ -94,9 +94,9 @@ pub struct CoreInvitationInput {
     pub owner_name: String,
     pub invitee_name: Option<String>,
     pub kind: CoreInvitationKind,
-    /// Empty means the kind's current default (device: transfer+mount,
-    /// person/runner: transfer). The requested ceiling, never an effective
-    /// access claim.
+    /// Empty means the kind's current default (inbox transfer only). Mount is
+    /// an explicit opt-in. The requested ceiling, never an effective access
+    /// claim.
     pub capabilities: Vec<String>,
     pub expires_secs: u64,
     pub reuse: CoreInvitationReuse,
@@ -493,10 +493,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let core = Core::open(root.path()).unwrap();
         let preview = core.preview_invitation_request(input(CoreInvitationKind::Device)).unwrap();
-        assert_eq!(
-            preview.requested_capabilities,
-            vec!["mount".to_string(), "transfer".to_string()]
-        );
+        assert_eq!(preview.requested_capabilities, vec!["transfer".to_string()]);
         assert_eq!(preview.relationship, EnrollmentRelationship::OwnDevice);
         assert!(preview.max_uses == Some(1));
         assert!(!root.path().join("armed.json").exists());
@@ -513,10 +510,7 @@ mod tests {
         let token = core.create_invitation(input(CoreInvitationKind::Device)).unwrap();
         let preview = core.preview_invitation(token).unwrap();
         assert_eq!(preview.owner_name, "alice");
-        assert_eq!(
-            preview.requested_capabilities,
-            vec!["mount".to_string(), "transfer".to_string()]
-        );
+        assert_eq!(preview.requested_capabilities, vec!["transfer".to_string()]);
         assert_eq!(core.invitations().unwrap().len(), 1);
         assert!(!preview.requested_capabilities.iter().any(|c| c == "shell"));
     }
