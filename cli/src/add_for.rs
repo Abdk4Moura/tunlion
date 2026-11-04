@@ -10,9 +10,9 @@
 //! `resolve_for_kind`, `format_approval_expiry`, `write_owner_only_file`,
 //! `prompt_line`) is private at the root and therefore already visible to this
 //! module. There are no cfg branches, no spawns and no awaits in these bodies.
-//! `add_for_cmd` keeps its own function-local `use base64::Engine`,
-//! `use std::io::Write as _` and `use crossterm::{execute, terminal}`, which is
-//! why no trait is imported at module level.
+//! `add_for_cmd` keeps its own function-local `use std::io::Write as _` and
+//! `use crossterm::{execute, terminal}`, which is why no trait is imported at
+//! module level.
 use crate::{
     UiCapability, Zeroizing, cancelled, codeentry, daemon_alive, devices_path, display_name,
     fmt_short_duration, format_approval_expiry, identity, invite_path_for, mint_capability,
@@ -77,11 +77,6 @@ fn report_invitation_uptake(ttl_abs: u64) {
     }
 }
 
-
-/// How long a runner (an ephemeral CI or borrowed box) may be unreachable
-/// before the owner forgets it: long enough for a daemon restart or a network
-/// blip, short enough that a cancelled job does not linger in device lists.
-pub(crate) const RUNNER_MAX_OFFLINE_SECS: u64 = 15 * 60;
 
 pub(crate) async fn add_for_cmd(
     caps: &UiCapability,
@@ -224,13 +219,10 @@ pub(crate) async fn add_for_cmd(
     ceiling.dedup();
     let ttl_text = expires.unwrap_or_else(|| default_ttl.to_string());
     let ttl = parse_mint_ttl(&ttl_text)?;
-    if ttl == 0 || ttl > 30 * 24 * 3600 {
-        bail!("invitations must expire between 1 second and 30 days");
-    }
-    if ceiling
+    let confirm_remote_authority = ceiling
         .iter()
-        .any(|capability| capability == "shell" || capability == "all-ports")
-    {
+        .any(|capability| capability == "shell" || capability == "all-ports");
+    if confirm_remote_authority {
         caps.confirm("include deliberate remote authority in this invitation ceiling")?;
     }
     if !caps.interactive && out.is_none() {
@@ -264,74 +256,31 @@ pub(crate) async fn add_for_cmd(
         );
     }
     let owner_key = crate::identity_flow::ensure_user_key(caps.json)?;
-    let mut enroll_seed = [0u8; 32];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut enroll_seed)
-        .map_err(|_| anyhow!("failed to generate invitation possession key"))?;
-    // #186: the v2 invitation is a compact binary token (base64url) with a
-    // self-contained signature, not hex-inside-JSON-inside-base64. ~530 chars
-    // became ~210, and the QR fits a normal terminal.
-    let ttl_abs = identity::now_secs().saturating_add(ttl);
-    // AN INVITATION IS AN AUTH KEY WITH DIFFERENT CONFIG. The two were separate
-    // artifacts in separate formats reached by separate verbs, and the fields
-    // say otherwise: enroll_pub, caps, expires, reuse, ephemeral and sig are the
-    // same in both, and Invitation already CARRIES the `ephemeral` flag that
-    // is the whole difference. It was hardcoded `false` here, so the only way to
-    // get the ephemeral variant was a different command writing a different file
-    // format that a different claim verb could read.
-    //
-    // So `runner` is not a third artifact. It is this one, minted ephemeral:
-    // removed on disconnect, no persistent record, which is exactly what an
-    // unattended CI box should leave behind.
-    let ephemeral = kind == "runner";
-    // The offline budget is what removes a runner that vanished without a
-    // goodbye (a cancelled job, a killed VM): its record lapses this long after
-    // its last live link, and a lapsed ephemeral record is deleted. A runner
-    // has no laptop lid to close, so the budget is short.
-    let max_offline = if ephemeral {
-        RUNNER_MAX_OFFLINE_SECS
-    } else {
-        30 * 24 * 3600
+    // ONE MINT POLICY. TTL bounds, reuse bounds, route scoping, the owner
+    // name, the deliberate shell/all-ports confirmation and the signed
+    // artifact itself are all decided by `filament_peerloop::invitation`, which
+    // is also what the Core APIs call. The CLI keeps only how the question was
+    // asked and how the answer is rendered.
+    let request = filament_peerloop::invitation::InvitationRequest {
+        owner_name: display_name(),
+        invitee_name: _invitee_name.clone(),
+        kind: filament_peerloop::invitation::InvitationKind::parse(&kind)?,
+        capabilities: ceiling.clone(),
+        expires_secs: ttl,
+        reuse: mint_reuse.clone(),
+        ephemeral: kind == "runner",
+        routes: route_prefixes.clone(),
+        confirm_remote_authority,
     };
-    let inv = crate::ephemeral::Invitation::mint(
+    let minted = filament_peerloop::invitation::mint_armed(
+        &crate::devices_store::store(),
         owner_key.keypair(),
-        enroll_seed,
-        ceiling.clone(),
-        ttl_abs,
-        max_offline,
-        mint_reuse.clone(),
-        ephemeral,
-        display_name(),
-        route_prefixes.clone(),
+        &request,
+        identity::now_secs(),
     )?;
-    enroll_seed.fill(0);
-    let token = Zeroizing::new(format!(
-        // `v2:` IS PART OF THE WIRE FORMAT, not decoration. 0.8.4 and 0.8.5 --
-        // the releases in users' hands -- parse only `filament-invite:v2:`, so a
-        // token minted without it reads as "unknown format" on every device that
-        // has not upgraded. #291 dropped the segment with no payload change,
-        // which silently broke enrolment across the release boundary in both
-        // directions. Keep minting it until no supported release needs it.
-        // PROTOCOL LITERAL: frozen, do not rename (file_io::INVITE_PREFIX_V2).
-        "{}{}",
-        crate::file_io::INVITE_PREFIX_V2,
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_token())
-    ));
-    // #205/#211: arming is a FILE WRITE, not IPC. The mint records the key in
-    // armed.json directly; the daemon's per-tick arm-gate reads it. No socket,
-    // no bind race, no platform branch, no control channel. The only thing the
-    // mint cannot guarantee is that a RECEIVER is actually running to pick the
-    // key up - check that, and offer to start one.
-    crate::armed::arm(
-        hex::encode(inv.enroll_pub),
-        inv.expires,
-        crate::armed::ArmMeta {
-            name: _invitee_name.clone(),
-            kind: Some(kind.clone()),
-            allow: ceiling.clone(),
-            reuse: Some(mint_reuse.clone()),
-            created: identity::now_secs(),
-        },
-    );
+    let inv = minted.invitation.clone();
+    let ttl_abs = inv.expires;
+    let token = Zeroizing::new(minted.token_text());
     // Make the daemon subscribe the enrollment channel NOW rather than on its next
     // idle tick, so a joiner that arrives within a second (a QR scan, a script) is
     // not left waiting on an empty channel. Measured: ~1.0-1.2 s back-to-back vs
