@@ -1050,6 +1050,31 @@ pub fn report_sync_join(log: &dyn LogSink, pid: &str, sid: u32, result: Result<(
     }
 }
 
+/// Is this the peer a transfer's explicit consent names, for identity
+/// settling purposes? A pair-trusted link is consent by construction (its MAC
+/// proved the paired device); a code send names its ceremony peer; a room send
+/// is consented by -y or a daemon, which accepts every offer it receives.
+fn consented_identity_peer(
+    conn: &Conn,
+    pid: &str,
+    recv_code_path: bool,
+    recv_pake_done: bool,
+    yes: bool,
+    daemon: bool,
+) -> bool {
+    if conn.link(pid).is_some_and(|l| l.trusted) {
+        return true;
+    }
+    if recv_code_path {
+        recv_pake_done && conn.is_bound_active_peer(pid)
+    } else {
+        // A room with -y / a daemon accepts every offer it consents to, so
+        // each such link settles its own identity; no single active slot is
+        // required to decide which peer the consent names.
+        yes || daemon
+    }
+}
+
 async fn recv_run(
     server: &str,
     mut code: Option<String>,
@@ -5138,12 +5163,18 @@ async fn recv_run(
                 // would then decide a legacy-trusted offer with
                 // cert_revoked_for(None)=false, letting a revoked device push a
                 // transfer before its revoked cert resolves.
-                let room_consent = !recv_code_path && (yes || daemon) && conn.is_active(&pid);
+                let consent_identity = consented_identity_peer(
+                    &conn,
+                    &pid,
+                    recv_code_path,
+                    recv_pake_done,
+                    yes,
+                    daemon,
+                );
                 let needs_challenge = if host.cap_authoritative() {
-                    (idev_known && !proven)
-                        || (!idev_known && (recv_code_path || room_consent))
+                    (idev_known && !proven) || (!idev_known && consent_identity)
                 } else {
-                    (recv_code_path || room_consent) && !idev_known
+                    consent_identity && !idev_known
                 };
                 if needs_challenge {
                     // Shared issue-and-hold (hold-then-await; see the helper). This
@@ -5236,8 +5267,14 @@ async fn recv_run(
                 // normal WebRTC path (ChannelReady BEFORE PAKE) never gets an
                 // early challenge the sender cannot answer - only the case
                 // where the channel arrived after the ceremony.
-                let consent_identity = (recv_code_path && recv_pake_done)
-                    || ((yes || daemon) && conn.is_active(&pid));
+                let consent_identity = consented_identity_peer(
+                    &conn,
+                    &pid,
+                    recv_code_path,
+                    recv_pake_done,
+                    yes,
+                    daemon,
+                );
                 if consent_identity {
                     if let Some(l) = conn.link_mut(&pid) {
                         crate::identity::resolve_peer_identity(l);
@@ -6311,11 +6348,14 @@ async fn recv_run(
                     // bystander cannot answer for it, and an unanswered
                     // challenge must stay Pending (hold then fail closed), never
                     // quietly become anonymous.
-                    let consented_peer = if recv_code_path {
-                        recv_pake_done && conn.is_bound_active_peer(&pid)
-                    } else {
-                        (yes || daemon) && conn.is_active(&pid)
-                    };
+                    let consented_peer = consented_identity_peer(
+                        &conn,
+                        &pid,
+                        recv_code_path,
+                        recv_pake_done,
+                        yes,
+                        daemon,
+                    );
                     if ours && consented_peer {
                         let anonymous = conn.link(&pid).is_some_and(|l| {
                             l.identity_state != cap::IdentityState::Resolved
@@ -7998,11 +8038,14 @@ async fn recv_run(
                         // is the ceremony itself; on a room it is -y/daemon plus
                         // the active peer selection. Explicit anonymous is a
                         // settled fact and skips the hold.
-                        let consented_peer = if recv_code_path {
-                            recv_pake_done && conn.is_bound_active_peer(&pid)
-                        } else {
-                            (yes || daemon) && conn.is_active(&pid)
-                        };
+                        let consented_peer = consented_identity_peer(
+                            &conn,
+                            &pid,
+                            recv_code_path,
+                            recv_pake_done,
+                            yes,
+                            daemon,
+                        );
                         let identity_hold = consented_peer
                             && identity_state == cap::IdentityState::Pending;
                         let expired = if identity_hold && link_ready {
