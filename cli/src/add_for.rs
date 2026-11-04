@@ -227,6 +227,12 @@ pub(crate) async fn add_for_cmd(
     if ttl == 0 || ttl > 30 * 24 * 3600 {
         bail!("invitations must expire between 1 second and 30 days");
     }
+    let relationship = match kind.as_str() {
+        "device" => identity::enrollment::Relationship::OwnDevice,
+        "runner" => identity::enrollment::Relationship::TemporaryWorker,
+        _ => identity::enrollment::Relationship::OtherPerson,
+    };
+    crate::enrollment_review::show(relationship, &ceiling);
     if ceiling
         .iter()
         .any(|capability| capability == "shell" || capability == "all-ports")

@@ -1069,6 +1069,10 @@ async fn pair_with_purpose(
         ui::say(&note);
     }
     if internal {
+        if code.is_none() {
+            let requested = if posture.is_empty() { default_device_ceiling() } else { posture.clone() };
+            crate::enrollment_review::show(identity::enrollment::Relationship::OwnDevice, &requested);
+        }
         // Action-first setup: use the existing atomic, owner-only key store.
         // Guided cancellation and invalid input above cannot mint an identity.
         crate::identity_flow::ensure_user_key(false)?;
