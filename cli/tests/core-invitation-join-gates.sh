@@ -122,4 +122,8 @@ else
   bad "J3: the owner did not record the joined device"
 fi
 
+if [ "$FAIL" -ne 0 ]; then
+  echo "FAILED:${FAILED}"
+  exit 1
+fi
 exit 0
