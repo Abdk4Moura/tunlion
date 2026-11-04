@@ -43,8 +43,8 @@
 
 use anyhow::{Context, Result};
 use filament_cap::capability::{
-    apply_header, now_secs as cap_now_secs, superseded_by_tombstone, CapHeader, CapOp,
-    PrincipalKind, CAP_TOMBSTONE_TYPE,
+    apply_header, now_secs as cap_now_secs, superseded_by_tombstone, update_ratchet, CapHeader,
+    CapOp, PrincipalKind, CAP_TOMBSTONE_TYPE,
 };
 use filament_cap::ephemeral::Reuse;
 use filament_id::{now_secs, DeviceCert, KeyStore, UserKey};
@@ -1652,9 +1652,20 @@ impl DeviceStore {
         if already {
             return Ok(false);
         }
-        // `apply_header` verifies the genesis signature and the self-certifying
-        // resource id before it writes; a bad header leaves the store intact.
-        apply_header(&mut store, &header)?;
+        if header.resource == "self" {
+            // The legacy fleet header names the owner's own resource `self`,
+            // not the self-certifying id `verify_genesis` requires. Its
+            // authenticity is the owner signature over the canonical bytes;
+            // verify that before writing, then advance the same ratchet the
+            // ordered `apply_header` path would.
+            header.verify_signed_by(owner_pub)?;
+            store.push(header.to_json());
+            update_ratchet(&mut store, owner_pub, header.issued_at)?;
+        } else {
+            // A real resource header must be a genesis with a self-certifying
+            // id; `apply_header` verifies it before writing.
+            apply_header(&mut store, &header)?;
+        }
         self.save_cap_store(&store)
             .map_err(|e| anyhow::anyhow!("owner capability header not stored: {e}"))?;
         Ok(true)

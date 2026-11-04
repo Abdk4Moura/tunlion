@@ -1182,6 +1182,15 @@ impl CapHeader {
     }
 
     /// Verify a header's signature under the expected signer pubkey.
+    ///
+    /// Public for the join path: the fleet header's resource is the legacy
+    /// `self` alias, so `verify_genesis` cannot be used (it also requires a
+    /// self-certifying resource id), but the owner signature can still be
+    /// checked before the header is stored.
+    pub fn verify_signed_by(&self, signer: &[u8; 32]) -> Result<()> {
+        self.verify_sig(signer)
+    }
+
     fn verify_sig(&self, signer: &[u8; 32]) -> Result<()> {
         let canonical = self.canonical_for_signing();
         let peer_pub = UnparsedPublicKey::new(&ED25519, signer);
