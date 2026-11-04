@@ -754,32 +754,12 @@ pub(crate) fn is_self_uid(my_uid: &str, peer_uid: Option<&str>) -> bool {
     peer_uid.map(|p| p.contains(&format!("-{id}-"))).unwrap_or(false)
 }
 
-fn config_path() -> PathBuf {
-    devices_path().with_file_name("config")
-}
-
-/// Tiny `key value` per-line config; no toml dependency for three keys.
 fn config_get(key: &str) -> Option<String> {
-    std::fs::read_to_string(config_path()).ok()?.lines().find_map(|l| {
-        let (k, v) = l.split_once(char::is_whitespace)?;
-        (k == key && !v.trim().is_empty()).then(|| v.trim().to_string())
-    })
+    crate::devices_store::store().config_value(key)
 }
 
 fn config_set(key: &str, value: &str) -> Result<()> {
-    let p = config_path();
-    crate::state_files::before_write(&p)?;
-    let mut lines: Vec<String> = std::fs::read_to_string(&p)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| l.split_whitespace().next() != Some(key))
-        .map(|l| l.to_string())
-        .collect();
-    lines.push(format!("{key} {value}"));
-    // Owner-only (0600) in an owner-only directory, whatever the umask, and
-    // atomic. A plain `fs::write` here created `config` 0666 under umask 0000.
-    crate::platform::SecretFile::write_str(&p, &(lines.join("\n") + "\n"))?;
-    Ok(())
+    crate::devices_store::store().set_config(key, value)
 }
 
 pub(crate) fn display_name() -> String {
