@@ -2347,6 +2347,38 @@ mod owned_enrollment_state_tests {
         [n; 32]
     }
 
+    fn gen_keypair() -> ring::signature::Ed25519KeyPair {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let rng = SystemRandom::new();
+        let mut seed = [0u8; 32];
+        rng.fill(&mut seed).unwrap();
+        ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap()
+    }
+
+    fn owner_pub(owner: &ring::signature::Ed25519KeyPair) -> [u8; 32] {
+        use ring::signature::KeyPair;
+        owner.public_key().as_ref().try_into().unwrap()
+    }
+
+    fn mint_v2(owner: &ring::signature::Ed25519KeyPair) -> Invitation {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let rng = SystemRandom::new();
+        let mut seed = [0u8; 32];
+        rng.fill(&mut seed).unwrap();
+        Invitation::mint(
+            owner,
+            seed,
+            vec!["transfer".into(), "mount".into()],
+            1_800_000_000,
+            30 * 24 * 3600,
+            Reuse::Once,
+            false,
+            "alice".into(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn two_instances_do_not_share_nonces_burn_or_rate_limits() {
         let a = EnrollmentState::default();
@@ -2408,9 +2440,9 @@ mod owned_enrollment_state_tests {
             assert_eq!(parsed.enroll_pub, inv.enroll_pub);
             assert_eq!(parsed.issuer_fp, inv.issuer_fp);
         }
-        let err = parse_invitation("filament-invite:v1:AAAA").unwrap_err().to_string();
+        let err = parse_invitation("filament-invite:v1:AAAA").err().expect("v1 is refused").to_string();
         assert!(err.contains("pre-0.8.4"), "{err}");
-        let err = parse_invitation("brave-otter-3141").unwrap_err().to_string();
+        let err = parse_invitation("brave-otter-3141").err().expect("a code is not an invitation").to_string();
         assert!(err.contains("filament-invite:"), "{err}");
     }
 
