@@ -116,12 +116,12 @@ impl IdentityService {
 
     async fn send_identity_challenge(
         &self,
-        conn: &Conn,
+        t: &Arc<dyn Transport>,
         pid: &str,
         identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
     ) {
         if let Ok(own_dpub) = self.overlay.public_key_bytes() {
-            if let Some(t) = conn.transport_of(pid) {
+            {
                 use ring::rand::{SecureRandom, SystemRandom};
                 let rng = SystemRandom::new();
                 let mut nonce = [0u8; 32];
@@ -145,7 +145,7 @@ impl IdentityService {
     /// readiness sites call this one method so their ordering cannot diverge.
     pub async fn issue_proven_challenge_and_hold(
         &self,
-        conn: &Conn,
+        _conn: &Conn,
         pid: &str,
         t: &Arc<dyn Transport>,
         pending_proven: &Arc<Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>>,
@@ -163,21 +163,21 @@ impl IdentityService {
                 (t.clone(), Instant::now() + PROVEN_CHALLENGE_DEADLINE),
             );
         }
-        self.send_identity_challenge(conn, pid, identity_nonces)
+        self.send_identity_challenge(t, pid, identity_nonces)
             .await;
     }
 
-    /// Re-send the challenge already held for this link, SAME nonce.
+    /// Re-send the challenge already held for this link, SAME nonce, on the
+    /// transport that owns the waiting offer. Using the link's current
+    /// transport instead can target the other side of a make-before-break
+    /// promotion, where the response is lost with the old path.
     pub async fn resend_identity_challenge(
         &self,
-        conn: &Conn,
+        t: &Arc<dyn Transport>,
         pid: &str,
         identity_nonces: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
     ) -> bool {
         let Some((nonce, _issued, recv_dpub)) = identity_nonces.get(pid) else {
-            return false;
-        };
-        let Some(t) = conn.transport_of(pid) else {
             return false;
         };
         let challenge = json!({

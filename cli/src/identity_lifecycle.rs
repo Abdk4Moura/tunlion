@@ -83,12 +83,12 @@ pub(crate) fn hold_expired(deadline: Instant, now: Instant) -> bool {
 
 pub(crate) async fn resend_identity_challenge(
     identity: &IdentityService,
-    conn: &crate::Conn,
+    t: &Arc<dyn Transport>,
     pid: &str,
     identity_nonces: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
 ) -> bool {
     identity
-        .resend_identity_challenge(conn, pid, identity_nonces)
+        .resend_identity_challenge(t, pid, identity_nonces)
         .await
 }
 
