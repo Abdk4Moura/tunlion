@@ -27,8 +27,10 @@ after a committed pop, not when a gesture merely starts.
 `TunlionCore` is the app boundary. `MainActivity` and `AvailabilityService` use
 one process-owned `NativeTunlionCore`, backed by the generated UniFFI
 `CoreSession`. Blocking calls run off the UI thread. The previous CLI adapter
-and its acceptance harness remain source-only regression material; the app
-workflow does not package a CLI executable or launch one.
+and its acceptance harness are quarantined under `android/legacy-cli/`, outside
+every Gradle source set, and are not compiled or run. The app packages no CLI
+executable and never starts a subprocess; the app workflow rejects an APK that
+contains `libtunlion_cli.so` or an executable `assets/` payload.
 
 The `Android app` workflow builds both `libtunlion_core.so` ABIs and generates
 Kotlin bindings from the same checkout. JNA uses the Android AAR so native
@@ -77,10 +79,17 @@ or device verification; use the workflow or an approved leased Android worker.
 
 `NativeCoreAcceptanceTest` checks real native identity confirmation, mismatch
 rejection without writes, duplicate identity refusal and malformed-code refusal.
+`NativeAdapterAcceptanceTest` drives a real desktop sender through the app
+adapter, verifies the published bytes against the sender's SHA-256, and checks
+the typed `devices()` projection without exporting pair secrets.
+`DeviceAuthorityUiTest` checks the relationship and action-state UI contract,
+including that an unknown remote send permission permits only an explicit
+attempt and that removal controls stay disabled and labelled unavailable.
 `NativePeerAcceptanceTest` requires a real sender plus `code`, `sha256`, `bytes`
 instrumentation arguments and verifies exact stored bytes against the digest.
-These tests are newly added and must run on a leased worker or CI. The older
-`CliAndroidAcceptanceTest` is not evidence for the new native adapter.
+These tests must run on a leased worker or CI. `CliAndroidAcceptanceTest` is
+quarantined under `android/legacy-cli/` and is not evidence for the native
+adapter.
 
 ## Preview feedback
 

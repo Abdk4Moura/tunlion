@@ -125,6 +125,19 @@ jobs:
       - name: Build debug APK
         working-directory: android
         run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest
+      - name: Assert the APK packages only the shared native core
+        run: |
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          entries="$(unzip -Z1 "$apk")"
+          if printf '%s\n' "$entries" | grep -Eq '(^|/)libtunlion_cli\.so$'; then
+            echo "The APK must not package a CLI executable." >&2
+            exit 1
+          fi
+          if printf '%s\n' "$entries" | grep -q '^assets/'; then
+            echo "The APK must not package executable assets." >&2
+            exit 1
+          fi
+          printf '%s\n' "$entries" | grep -Eq '(^|/)lib/(arm64-v8a|x86_64)/libtunlion_core\.so$'
       - name: Record exact source and artifact checksums
         run: |
           git rev-parse HEAD > android/app/build/outputs/apk/SOURCE_HEAD

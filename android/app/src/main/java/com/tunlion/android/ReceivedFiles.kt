@@ -13,8 +13,7 @@ import java.io.File
 import java.security.MessageDigest
 
 /** Only checksum-verified CLI history entries may be published. Keep private originals on failure. */
-internal class ReceivedFiles(private val context: Context, private val config: File = CliPaths(context).config,
-    private val inbox: File = CliPaths(context).inbox) {
+internal class ReceivedFiles(private val context: Context, private val config: File, private val inbox: File) {
     private val journal = context.getSharedPreferences("received_files", Context.MODE_PRIVATE)
     companion object { private val lock = Mutex() }
     fun records(): List<org.json.JSONObject> {
