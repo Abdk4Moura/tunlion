@@ -68,11 +68,16 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
         val devices = session.devices().map(::coreDevice)
         val history = receivedFiles()
         try { publishInbox() } catch (_: java.io.IOException) { /* The publication error is included in this snapshot. */ }
-        cached = CoreStatus(identityLoaded = true, deviceName = Build.MODEL,
+        cached = CoreStatus(statusLoaded = true,
+            identityLoaded = snapshot.fingerprint != null || devices.isNotEmpty(),
+            deviceName = Build.MODEL,
             fingerprint = snapshot.fingerprint, engineLinked = true,
             engineRunning = EngineState.phase.value == EnginePhase.AVAILABLE && snapshot.engine == NativeEngineState.RUNNING,
             engineError = EngineState.error ?: publicationError,
             devices = devices, lastSend = lastSend,
+            // CoreSession has no enrollment preview/commit/ack surface yet.
+            // Leave controls disabled rather than inferring a relationship.
+            enrollmentSupported = false,
             transfers = history.records().takeLast(20).reversed().map {
                 CoreTransfer(it.optString("file"), it.optString("direction") == "in", it.optBoolean("ok"), history.saved(it))
             })

@@ -201,7 +201,7 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                     verticalArrangement = Arrangement.spacedBy(24.dp)) {
                     when (destination) {
                         Screen.HOME -> {
-                            if (!status.identityLoaded) {
+                            if (!status.statusLoaded) {
                                 if (loadFailed) {
                                     SecondaryText("Your identity could not be opened. You can retry without replacing it.")
                                     PrimaryButton("Try again", busy) {
@@ -219,29 +219,29 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                                         SecondaryText("Opening this phone…")
                                     }
                                 }
+                            } else if (!status.identityLoaded) {
+                                FirstConnection(onJoin = { navigate(Screen.PAIR) }, onSetup = { navigate(Screen.SETUP) })
                             } else {
                             Availability(status, busy, onChange = { turnOn ->
-                                if (status.fingerprint == null && status.devices.isEmpty() && turnOn) navigate(Screen.SETUP)
-                                else { if (turnOn) requestNotifications(); perform({ if (turnOn) core.start() else core.stop() }) }
+                                if (turnOn) requestNotifications()
+                                perform({ if (turnOn) core.start() else core.stop() })
                             })
                             status.engineError?.let { SecondaryText(it) }
                             if (enginePhase == EnginePhase.FAILED) {
                                 OutlinedButton(onClick = { perform({ core.stop() }) }, enabled = !busy) { Text("Confirm receiver is off") }
                             }
-                            if (status.fingerprint == null && status.devices.isEmpty()) {
-                                FirstConnection(onJoin = { navigate(Screen.PAIR) }, onSetup = { navigate(Screen.SETUP) })
-                            } else {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Eyebrow("DEVICES", Modifier.weight(1f))
-                                    TextButton(onClick = { navigate(Screen.PAIR) }) { Text("Add device") }
-                                }
-                                if (status.devices.isEmpty()) {
-                                    Text("No other devices yet.", style = MaterialTheme.typography.titleMedium)
-                                    SecondaryText("No stored device relationships. Fleet discovery and enrollment are not connected yet. File codes work without adding a device.")
-                                }
-                                status.devices.forEach { device ->
-                                    key(device.id) { DeviceRow(device) { selectedDevice = device; navigate(Screen.DEVICE) } }
-                                }
+                            if (status.identityState == CoreIdentityState.JOINED)
+                                SecondaryText("This phone is joined through stored device records. No local owner identity fingerprint is present.")
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Eyebrow("DEVICES", Modifier.weight(1f))
+                                TextButton(onClick = { navigate(Screen.PAIR) }) { Text("Add device") }
+                            }
+                            if (status.devices.isEmpty()) {
+                                Text("No other devices yet.", style = MaterialTheme.typography.titleMedium)
+                                SecondaryText("No stored device relationships. Fleet discovery and enrollment are not connected yet. File codes work without adding a device.")
+                            }
+                            status.devices.forEach { device ->
+                                key(device.id) { DeviceRow(device) { selectedDevice = device; navigate(Screen.DEVICE) } }
                             }
                             HorizontalDivider(color = colors.outline)
                             ActionRow(Icons.Outlined.FolderOpen, "Files", "Send a file or receive with a code") { navigate(Screen.FILES) }
@@ -250,9 +250,6 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                         Screen.PAIR -> PairScreen(busy, status.enrollmentSupported, onJoin = { code, remember ->
                             requestNotifications()
                             perform({ core.joinCode(code, remember) }) { navigate(Screen.HOME) }
-                        }, onInvitation = { bytes ->
-                            requestNotifications()
-                            perform({ core.joinInvitation(bytes) }) { navigate(Screen.HOME) }
                         })
                         Screen.SETUP -> {
                             Title("Make this phone yours.", "Your identity lives on this phone. No account or sign-in.")
@@ -301,7 +298,12 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                         Screen.SETTINGS -> {
                             Eyebrow("THIS PHONE")
                             DetailRow("Name", status.deviceName ?: android.os.Build.MODEL)
-                            DetailRow("Identity", status.fingerprint ?: "Not set up")
+                            DetailRow("Identity", when (status.identityState) {
+                                CoreIdentityState.LOCAL -> status.fingerprint ?: "Local identity"
+                                CoreIdentityState.JOINED -> "Joined device; no local owner fingerprint"
+                                CoreIdentityState.BLANK -> "Not set up"
+                                CoreIdentityState.LOADING -> "Not read yet"
+                            })
                             DetailRow("Notifications", if (notificationsEnabled) "Allowed" else "Off in Android settings")
                             if (!notificationsEnabled) SecondaryText("Transfer and availability notices may not appear in the notification drawer. Android 13+ still lists foreground services in Task Manager.")
                             OutlinedButton(onClick = {
@@ -382,51 +384,61 @@ private fun FirstConnection(onJoin: () -> Unit, onSetup: () -> Unit) {
 }
 
 @Composable
-private fun PairScreen(busy: Boolean, supported: Boolean, onJoin: (String, Boolean) -> Unit, onInvitation: (ByteArray) -> Unit) {
+private fun PairScreen(busy: Boolean, supported: Boolean, onJoin: (String, Boolean) -> Unit) {
     var code by rememberSaveable { mutableStateOf("") }
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val scope = rememberCoroutineScope()
-    var error by remember { mutableStateOf<String?>(null) }
-    val invitation = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) scope.launch {
-            try {
-                val bytes = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(uri)?.use { input ->
-                        val bytes = ByteArray(65537)
-                        var size = 0
-                        while (size < bytes.size) { val n = input.read(bytes, size, bytes.size - size); if (n < 0) break; size += n }
-                        bytes.copyOf(size)
-                    } ?: error("Unreadable invitation")
-                }
-                if (bytes.size > 65536) error = "That invitation file is too large." else onInvitation(bytes)
-            } catch (_: Exception) { error = "Could not read that invitation file." }
-        }
-    }
+    var carrier by rememberSaveable { mutableStateOf("Spoken code") }
     var relationship by rememberSaveable { mutableStateOf("My device") }
-    Title("What are you\nconnecting?", "Choose the relationship first. A code, invitation file or nearby discovery must not change it.")
+    fun selectCarrier(next: String) {
+        carrier = next
+        if (next != "Invitation file" && relationship == "Temporary worker") relationship = "My device"
+    }
+    Title("How are you\nconnecting?", "Carrier first. A spoken code, invitation file or nearby discovery carries the request; only a signed invitation or core acknowledgment can establish a relationship.")
+    Eyebrow("CARRIER")
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        FilterChip(carrier == "Spoken code", { selectCarrier("Spoken code") },
+            label = { Text("Spoken code") }, enabled = !busy)
+        FilterChip(carrier == "Invitation file", { selectCarrier("Invitation file") },
+            label = { Text("Invitation file") }, enabled = !busy)
+    }
+    SecondaryText(when (carrier) {
+        "Spoken code" -> "A spoken code is a carrier fact only. It cannot select or prove a relationship."
+        else -> "An invitation file must be previewed and verified by the shared core before any join. This build cannot read or preview one yet."
+    })
+    if (carrier == "Spoken code") {
+        OutlinedTextField(code, { code = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
+            label = { Text("Device code") }, placeholder = { Text("brave-otter-3141") },
+            textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
+            shape = RoundedCornerShape(7.dp), enabled = supported && !busy,
+            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(autoCorrectEnabled = false))
+        SecondaryText("A spoken code never selects or proves a relationship. Temporary worker requires a signed invitation file.")
+    } else {
+        OutlinedButton(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            shape = RoundedCornerShape(7.dp)) { Text("Preview invitation · unavailable") }
+        SecondaryText("Invitation preview and join are unavailable until the shared core exposes signed enrollment facts. This screen reads no file and writes nothing.")
+    }
+    Eyebrow("INTENDED RELATIONSHIP")
+    SecondaryText("This choice is an intent only, not a signed fact. It records no relationship and grants no permission.")
     listOf("My device", "Someone else's", "Temporary worker").forEach { choice ->
-        Row(Modifier.fillMaxWidth().clickable(enabled = !busy) { relationship = choice }.padding(vertical = 4.dp),
+        val optionEnabled = !busy && (choice != "Temporary worker" || carrier == "Invitation file")
+        Row(Modifier.fillMaxWidth().clickable(enabled = optionEnabled) { relationship = choice }.padding(vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically) {
-            RadioButton(relationship == choice, onClick = { relationship = choice }, enabled = !busy)
-            Text(choice)
+            RadioButton(relationship == choice, onClick = { relationship = choice }, enabled = optionEnabled)
+            Text(choice, color = if (optionEnabled) MaterialTheme.colorScheme.onBackground else MaterialTheme.colorScheme.onSurfaceVariant)
+            if (choice == "Temporary worker" && carrier != "Invitation file") {
+                Spacer(Modifier.width(8.dp))
+                SecondaryText("invitation file only")
+            }
         }
     }
     SecondaryText(when (relationship) {
         "My device" -> "Fleet discovery and inbox transfers by default. No terminal or folder authority."
         "Someone else's" -> "External pair with explicitly confirmed permissions, not fleet membership."
-        else -> "Temporary access must have a bounded expiry confirmed by the core."
+        else -> "Temporary access must have a bounded expiry confirmed by the core. Invitation file only."
     })
     if (!supported) SecondaryText("Enrollment review is unavailable until the shared core exposes enrollment facts. These choices do not record a relationship or grant permission. Use Files for a one-time transfer code.")
-    OutlinedTextField(code, { code = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
-        label = { Text("Device code") }, placeholder = { Text("brave-otter-3141") },
-        textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
-        shape = RoundedCornerShape(7.dp), enabled = supported && !busy,
-        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(autoCorrectEnabled = false))
-    SecondaryText("Confirmation must show effective permissions separately from pending or blocked permissions. Default inbox access is not terminal or folder authority.")
-    PrimaryButton("Review enrollment", busy, enabled = supported && code.isNotBlank(), onClick = { onJoin(code.trim(), true) })
-    OutlinedButton(onClick = { invitation.launch(arrayOf("*/*")) }, enabled = supported && !busy, shape = RoundedCornerShape(7.dp)) { Text("Open an invitation file") }
-    SecondaryText("Nearby enrollment is not supported in this build.")
-    error?.let { SecondaryText(it) }
+    SecondaryText("The actual relationship is shown only after the core verifies signed enrollment facts. Nearby enrollment is not supported in this build.")
+    if (carrier == "Spoken code") PrimaryButton("Review enrollment", busy, enabled = supported && code.isNotBlank(),
+        onClick = { onJoin(code.trim(), true) })
 }
 
 private fun Modifier.toggleableForRemember(checked: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) =

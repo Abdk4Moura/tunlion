@@ -19,6 +19,7 @@ interface TunlionCore {
 }
 
 data class CoreStatus(
+    val statusLoaded: Boolean = false,
     val identityLoaded: Boolean = false,
     val deviceName: String? = null,
     val fingerprint: String? = null,
@@ -28,8 +29,18 @@ data class CoreStatus(
     val transfers: List<CoreTransfer> = emptyList(),
     val lastSend: CoreSendReport? = null,
     val engineError: String? = null,
+    /** Set only from a typed core enrollment surface; never inferred from devices or pairing. */
     val enrollmentSupported: Boolean = false,
-)
+) {
+    val identityState: CoreIdentityState get() = when {
+        !statusLoaded -> CoreIdentityState.LOADING
+        fingerprint != null -> CoreIdentityState.LOCAL
+        devices.isNotEmpty() -> CoreIdentityState.JOINED
+        else -> CoreIdentityState.BLANK
+    }
+}
+
+enum class CoreIdentityState { LOADING, BLANK, LOCAL, JOINED }
 
 data class CoreTransfer(val name: String, val incoming: Boolean, val verified: Boolean, val saved: Boolean)
 

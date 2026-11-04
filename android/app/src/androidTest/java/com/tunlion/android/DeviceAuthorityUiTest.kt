@@ -13,7 +13,7 @@ class DeviceAuthorityUiTest {
     private fun open(snapshot: CoreStatus) {
         compose.setContent {
             TunlionTheme {
-                TunlionApp(SnapshotCore(snapshot), false, {}, {}, {})
+                TunlionApp(SnapshotCore(snapshot.copy(statusLoaded = true)), false, {}, {}, {})
             }
         }
     }
@@ -21,14 +21,34 @@ class DeviceAuthorityUiTest {
     @Test fun enrollmentCannotSilentlyUseLegacyPairing() {
         open(CoreStatus(identityLoaded = true, fingerprint = "12345678", engineLinked = true))
         compose.onNodeWithText("Add device").performClick()
+        compose.onNodeWithText("Spoken code").assertExists()
+        compose.onNodeWithText("Temporary worker").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Invitation file").performClick()
+        compose.onNodeWithText("Temporary worker").performScrollTo().performClick()
+        compose.onNodeWithText("Temporary access must have a bounded expiry confirmed by the core. Invitation file only.").assertExists()
+        compose.onNodeWithText("Preview invitation · unavailable").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText("Someone else's").performScrollTo().performClick()
         compose.onNodeWithText("External pair with explicitly confirmed permissions, not fleet membership.").assertExists()
-        compose.onNodeWithText("Review enrollment").performScrollTo().assertIsNotEnabled()
-        compose.onNodeWithText("Open an invitation file").performScrollTo().assertIsNotEnabled()
-        compose.onNodeWithText("Temporary worker").performScrollTo().performClick()
-        compose.onNodeWithText("Temporary access must have a bounded expiry confirmed by the core.").assertExists()
+        compose.onNodeWithText("Spoken code").performScrollTo().performClick()
         compose.onNodeWithText("Review enrollment").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText("Enrollment review is unavailable until the shared core exposes enrollment facts. These choices do not record a relationship or grant permission. Use Files for a one-time transfer code.").assertExists()
+    }
+
+    @Test fun blankIdentityOffersSetupInsteadOfDevices() {
+        open(CoreStatus(identityLoaded = false))
+        compose.onNodeWithText("Your files,\ndirect to this phone.").assertExists()
+        compose.onNodeWithText("Set up my first device").assertExists()
+        compose.onNodeWithText("DEVICES").assertDoesNotExist()
+    }
+
+    @Test fun joinedDeviceWithoutOwnerFingerprintIsDistinct() {
+        val peer = CoreDevice("peer-key", "Stored laptop", null, null,
+            "Stored facts only, not remote acknowledgment.", false, false,
+            relationship = CoreRelationship.PAIRED)
+        open(CoreStatus(identityLoaded = true, fingerprint = null, engineLinked = true, devices = listOf(peer)))
+        compose.onNodeWithText("This phone is joined through stored device records. No local owner identity fingerprint is present.").assertExists()
+        compose.onNodeWithContentDescription("Settings").performClick()
+        compose.onNodeWithText("Joined device; no local owner fingerprint").assertExists()
     }
 
     @Test fun unknownRemotePermissionDoesNotBecomeSendAuthority() {

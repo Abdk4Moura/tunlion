@@ -56,6 +56,15 @@ or device verification; use the workflow or an approved leased Android worker.
   The integrated core persists a bounded receiver completion journal, so a
   verified receipt and its public copy are separate, checkable facts. No
   directory scan is substituted for verification evidence.
+- Identity state is explicit: not read yet, blank, local owner identity, or joined
+  through stored device records without a local owner fingerprint. A blank phone
+  is offered setup or join, never a fabricated identity or device list.
+- Pairing is carrier-first. The spoken code and invitation file are carrier
+  facts, not relationship facts; the relationship choices are labelled intent
+  only. Temporary worker stays disabled for a spoken code and is invitation
+  file only. Invitation preview and enrollment confirmation are blocked on
+  shared core enrollment facts; this screen reads no invitation and writes
+  nothing.
 - The device list is projected from core `devices()`, not from Kotlin policy or
   CLI output. It shows the stored relationship (paired, fleet, temporary,
   unknown) and every returned action state (effective, pending, blocked,
