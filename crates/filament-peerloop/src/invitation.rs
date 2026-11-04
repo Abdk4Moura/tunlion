@@ -278,12 +278,16 @@ pub fn preview_request(request: &InvitationRequest, now: u64) -> Result<Invitati
 /// Preview an already-signed invitation token. Expiry is reported, not
 /// hidden: a UI may show an expired invitation honestly and refuse to join it.
 pub fn preview_invitation(invitation: &Invitation, now: u64) -> InvitationPreview {
+    // The signed wire records authority and ephemerality, not the owner's
+    // display intent. A non-ephemeral token with mount is necessarily an
+    // owner-device posture; without mount it is ambiguous between a device
+    // default and a person, so do not guess.
     let relationship = if invitation.ephemeral {
         Relationship::TemporaryWorker
     } else if invitation.caps.iter().any(|c| c == "mount") {
         Relationship::OwnDevice
     } else {
-        Relationship::OtherPerson
+        Relationship::Unknown
     };
     let scoped = invitation.scoped_caps();
     InvitationPreview {

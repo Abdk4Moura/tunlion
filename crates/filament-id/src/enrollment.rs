@@ -7,6 +7,10 @@ pub enum Relationship {
     OwnDevice,
     OtherPerson,
     TemporaryWorker,
+    /// The artifact does not carry the owner's intended relationship. A signed
+    /// invitation token records authority and ephemerality, not whether the
+    /// owner called it a device or a person; a reviewer must not guess.
+    Unknown,
 }
 
 impl Relationship {
@@ -47,7 +51,12 @@ mod tests {
     #[test]
     fn only_an_own_device_requests_fleet_membership() {
         assert!(Relationship::OwnDevice.requests_fleet_membership());
-        for relationship in [Relationship::OrdinaryPair, Relationship::OtherPerson, Relationship::TemporaryWorker] {
+        for relationship in [
+            Relationship::OrdinaryPair,
+            Relationship::OtherPerson,
+            Relationship::TemporaryWorker,
+            Relationship::Unknown,
+        ] {
             assert!(!relationship.requests_fleet_membership());
         }
     }

@@ -62,7 +62,7 @@ doc = json.loads(os.environ["PREVIEW"])
 caps = doc["requested_capabilities"]
 assert caps == ["transfer"], caps
 assert "mount" not in caps and "shell" not in caps, caps
-assert doc["relationship"] == "OwnDevice", doc
+assert doc["relationship"] == "Unknown", doc
 assert doc["expired"] is False, doc
 assert "filament-invite:" not in os.environ["PREVIEW"], "preview leaked the token"
 PY
