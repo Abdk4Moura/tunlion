@@ -537,6 +537,58 @@ pub struct DeviceStore {
     owner_pub: Option<[u8; 32]>,
 }
 
+#[cfg(test)]
+mod receive_history_tests {
+    use super::*;
+
+    struct TestRoot(PathBuf);
+    impl TestRoot {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("receive-history-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &Path { &self.0 }
+    }
+    impl Drop for TestRoot {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn receipt(index: u64) -> crate::recv::files::ReceivedFileRecord {
+        crate::recv::files::ReceivedFileRecord {
+            time: index, peer: Some("sender".into()), file: "offered.txt".into(),
+            stored: Some("/inbox/offered.1.txt".into()), bytes: 42,
+            sha256: Some("ab".repeat(32)), ok: true,
+        }
+    }
+
+    #[test]
+    fn verified_receive_facts_are_bounded_and_preserve_stored_name_and_digest() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.path());
+        assert!(!root.path().join("transfers.json").exists());
+        for index in 0..201 { store.record_received_file(&receipt(index)).unwrap(); }
+        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(root.path().join("transfers.json")).unwrap()).unwrap();
+        assert_eq!(rows.len(), 200);
+        assert_eq!(rows[0]["time"], 1);
+        assert_eq!(rows[199]["stored"], "/inbox/offered.1.txt");
+        assert_eq!(rows[199]["sha256"], "ab".repeat(32));
+        assert_eq!(rows[199]["bytes"], 42);
+        assert_eq!(rows[199]["direction"], "in");
+        assert!(!root.path().join("overlay.ed25519").exists());
+    }
+
+    #[test]
+    fn corrupt_history_is_preserved_and_error_is_not_a_successful_receipt() {
+        let root = TestRoot::new();
+        let path = root.path().join("transfers.json");
+        std::fs::write(&path, "[").unwrap();
+        assert!(DeviceStore::open(root.path()).record_received_file(&receipt(1)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[");
+    }
+}
+
 impl DeviceStore {
     /// Open the store rooted at `root`. Does not create or read anything.
     pub fn open(root: impl Into<PathBuf>) -> Self {
@@ -637,6 +689,32 @@ impl DeviceStore {
             .unwrap_or_default()
     }
 
+    /// Persist a receiver completion fact, not a file-existence observation.
+    /// Uses the same bounded JSON schema and stable writer sidecar as CLI
+    /// history. A corrupt journal is preserved and reported, never overwritten.
+    pub fn record_received_file(&self, record: &crate::recv::files::ReceivedFileRecord) -> io::Result<()> {
+        create_private_dir_all(&self.root)?;
+        let path = self.root.join("transfers.json");
+        let _lock = StoreLock::acquire(&path.with_extension("json.lock"))?;
+        let mut rows: Vec<Value> = match std::fs::read(&path) {
+            Ok(raw) => serde_json::from_slice(&raw)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        rows.push(json!({
+            "time": record.time, "direction": "in", "peer": record.peer,
+            "file": record.file, "stored": record.stored, "bytes": record.bytes,
+            "sha256": record.sha256, "ok": record.ok,
+        }));
+        if rows.len() > 200 {
+            rows.drain(..rows.len() - 200);
+        }
+        let body = serde_json::to_string(&rows)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        secret_write::SecretFile::write_str(&path, &body)
+    }
+
     /// `(name, secret)` pairs for records that have a pair secret. A record
     /// without one is a fleet index entry, not a dial target.
     pub fn devices_load(&self) -> Vec<(String, String)> {
@@ -713,6 +791,14 @@ impl DeviceStore {
         self.devices_records()
             .iter()
             .any(|d| d["name"].as_str() == Some(name) && record_is_revoked(d))
+    }
+
+    /// Receiver-local denial, independent of invitation and owner grants.
+    pub fn device_capability_denied(&self, name: &str, capability: &str) -> bool {
+        self.devices_records().iter()
+            .find(|record| record["name"].as_str() == Some(name))
+            .and_then(|record| record["deniedCaps"].as_array())
+            .is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some(capability)))
     }
 
     /// The key revocations at `revoked-keys.json`, fail-closed: absent is

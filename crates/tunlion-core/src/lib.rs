@@ -19,6 +19,8 @@
 //! `fleet` feature. See `docs/engine-driver.md` and `docs/android-ffi.md`.
 
 mod host;
+mod devices;
+pub use devices::{AccessState, DeviceAccess, DevicePresence, DeviceRelationship, EffectiveAction};
 pub mod access;
 
 uniffi::setup_scaffolding!();

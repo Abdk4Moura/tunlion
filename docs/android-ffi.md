@@ -105,6 +105,29 @@ commit first and delete on failure.
 `fingerprint` as above. `engine` is `NotLinked` until `start` installs an
 engine. A missing identity is not an error. It is `fingerprint: None`.
 
+`devices() -> Vec<DeviceAccess>` is a read-only stored-relationship snapshot.
+It never mints identity, probes peers, or returns pair secrets. Records expose
+the name, optional public device key, relationship, composed expiry, revocation,
+presence and direction-named action facts. Personal, external and temporary
+relationships are distinct from their bounded capability ceilings. Expiry does
+not turn a personal device into an external contact.
+
+Presence is currently `Unknown`, not offline. Outbound `send` authorization is
+`Unknown`: a receiver-local grant does not describe the remote receiver's
+permissions. `receive-inbox` reports persisted expiry/revocation/denial as
+`Blocked`; otherwise it remains `Unknown` until authenticated link facts are
+available. Terminal and folder serving are `Unsupported` in this Core profile.
+No state in this snapshot acknowledges remote grant delivery or global removal.
+A corrupt devices store returns `CoreError::Config`, not an empty device list.
+
+The Core receiver also appends completion facts to config `transfers.json`,
+using the CLI schema (`direction: "in"`, offered `file`, receiver `stored` path,
+`bytes`, verified `sha256`, `ok`, time and peer). The journal is atomically
+replaced under a cross-process sidecar lock, bounded to 200 rows, and corrupt
+history is preserved rather than overwritten. This is best-effort persistence,
+not an incoming event stream or proof that Android published to MediaStore.
+The synchronous `ReceiveSummary` remains the current invocation's receipt.
+
 `start() -> Result<(), CoreError>`
 
 Rejects a missing identity, an unreadable `config`, or an explicitly empty

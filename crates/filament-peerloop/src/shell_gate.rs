@@ -212,6 +212,100 @@ pub struct ShellGateInputs {
     pub scoped_default: bool,
 }
 
+/// The authenticated scope of one terminal, not a peer label supplied on wire.
+/// Retained by the session so withdrawal rechecks never tear down unrelated
+/// streams or replace the identity with a newly reused petname.
+#[derive(Clone)]
+pub struct TerminalSessionScope {
+    name: Option<String>,
+    device: Option<[u8; 32]>,
+    user: Option<[u8; 32]>,
+    binding: BindingStrength,
+    expires: Option<u64>,
+    key_caps: Option<Vec<String>>,
+    trusted: bool,
+    policy_allows: bool,
+    sibling: bool,
+    pair_binding: Option<String>,
+    require_name_key: bool,
+}
+
+impl TerminalSessionScope {
+    pub fn capture(conn: &mut Conn, pid: &str, policy: &ShellPolicy) -> Self {
+        let (name, inputs) = gather_shell_gate_inputs(conn, pid, policy, "shell");
+        let require_name_key = name.as_deref().is_some_and(|name| conn.host.device_cert_for(name).is_some());
+        Self {
+            name,
+            device: inputs.idev,
+            user: inputs.iusr,
+            binding: inputs.binding,
+            expires: inputs.expires,
+            key_caps: inputs.ak_caps,
+            trusted: inputs.trusted,
+            policy_allows: inputs.policy_allows,
+            sibling: conn.link(pid).is_some_and(|l| l.is_sibling_link() && l.fleet_proven()),
+            pair_binding: conn.link(pid).and_then(|l| l.device_secret()).map(str::to_owned),
+            require_name_key,
+        }
+    }
+
+    /// Re-run the same admission gate over fresh receiver facts. This is scoped
+    /// to the terminal's proven identity; fleet grants cannot authorize a paired
+    /// browser, and local denial overrides every grant source.
+    pub fn withdrawn(&self, host: &dyn HostServices) -> bool {
+        // Browser pairwise sessions without a persisted identity retain their
+        // existing lifetime policy. Do not invent a fleet identity for them.
+        if self.name.is_none() && self.device.is_none() {
+            return false;
+        }
+        if let Some(secret) = &self.pair_binding {
+            if !host.devices_load().iter().any(|(name, held)| {
+                Some(name) == self.name.as_ref() && held == secret
+            }) {
+                return true;
+            }
+        }
+        if let (Some(name), Some(device)) = (&self.name, self.device.as_ref()) {
+            let current = host.device_cert_for(name);
+            if current.as_ref().is_some_and(|cert| cert.device_pub != *device)
+                || (self.require_name_key && current.is_none()) {
+                return true;
+            }
+        }
+        let now = host.now_secs();
+        let delegated = self.device.as_ref().and_then(|key| host.delegated_access_for(key));
+        let expires = delegated.as_ref().map(|d| d.deadline).or(self.expires);
+        let key_caps = delegated.as_ref().map(|d| {
+            if d.expired(now) { Vec::new() } else { d.ceiling.clone() }
+        }).or_else(|| self.key_caps.clone());
+        let store = host.cap_store();
+        let outcome = authorize_in(&store, "self", "shell", self.device.as_ref(), self.user.as_ref(), key_caps.as_deref(), now);
+        let (own_user, has_grant) = fleet_inputs_in(&store, "self", "shell", self.device.as_ref(), self.user.as_ref(), key_caps.as_deref(), now);
+        let denied = self.name.as_deref().is_some_and(|n| host.device_capability_denied(n, "shell"));
+        let local_grant = self.name.as_deref().is_some_and(|n| host.device_allows(n, "shell"));
+        let owner_grant = self.sibling && self.device.as_ref().is_some_and(|key| host.fleet_grant_applies(key, "shell"));
+        let inputs = ShellGateInputs {
+            trusted: self.trusted,
+            denied,
+            policy_allows: self.policy_allows,
+            store_allows: local_grant || owner_grant,
+            outcome,
+            idev: self.device,
+            iusr: self.user,
+            binding: self.binding,
+            expires,
+            ak_caps: key_caps,
+            own_user,
+            has_grant: has_grant || (self.sibling && (local_grant || owner_grant)),
+            cert_revoked: host.cert_revoked_for(self.device.as_ref()),
+            action: "shell".into(),
+            ceiling_covers: host.ceiling_covers_action(self.device.as_ref(), "shell"),
+            scoped_default: false,
+        };
+        decide(&inputs, host).is_err()
+    }
+}
+
 /// Gather from live state. Both call sites use this; nothing gate-relevant
 /// is resolved anywhere else, so the three paths cannot drift in inputs.
 pub fn gather_shell_gate_inputs(
@@ -455,6 +549,121 @@ pub fn pty_gate_decision(
     host: &dyn HostServices,
 ) -> Result<(), Option<String>> {
     decide(inputs, host)
+}
+
+#[cfg(test)]
+mod terminal_lifecycle_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Facts {
+        owner_grants: HashSet<[u8; 32]>,
+        local_grants: HashSet<String>,
+        denies: HashSet<String>,
+        pairs: Vec<(String, String)>,
+        keys: std::collections::HashMap<String, [u8; 32]>,
+    }
+    #[derive(Default)]
+    struct Host(Mutex<Facts>);
+    impl HostServices for Host {
+        fn settings_get_str(&self, _: &str) -> Option<String> { None }
+        fn devices_load(&self) -> Vec<(String, String)> { self.0.lock().unwrap().pairs.clone() }
+        fn is_self_uid(&self, _: &str, _: Option<&str>) -> bool { false }
+        fn rejoin_unwarned(&self) -> Duration { Duration::from_secs(1) }
+        fn relay_banner(&self) -> String { String::new() }
+        fn relay_forbidden(&self) -> bool { false }
+        fn channel_of(&self, _: &str) -> String { String::new() }
+        fn roster_snapshot_json(&self) -> Option<String> { None }
+        fn fleet_rv_present(&self) -> bool { false }
+        fn device_cert_for(&self, name: &str) -> Option<filament_id::DeviceCert> {
+            self.0.lock().unwrap().keys.get(name).map(|key| filament_id::DeviceCert {
+                device_pub: *key, user_pub: [9; 32], expires: u64::MAX, issued: 1, sig: [0; 64],
+            })
+        }
+        fn fleet_grant_applies(&self, key: &[u8; 32], _: &str) -> bool {
+            self.0.lock().unwrap().owner_grants.contains(key)
+        }
+        fn device_allows(&self, name: &str, _: &str) -> bool {
+            self.0.lock().unwrap().local_grants.contains(name)
+        }
+        fn device_capability_denied(&self, name: &str, _: &str) -> bool {
+            self.0.lock().unwrap().denies.contains(name)
+        }
+        fn cap_gate_effective(&self, gate: CapGate<'_>) -> GateDecision {
+            if gate.legacy_allowed && !gate.denied && !gate.cert_revoked {
+                GateDecision::Allow
+            } else {
+                GateDecision::Deny { cap_reason: Some("access revoked".into()) }
+            }
+        }
+    }
+    fn sibling(name: &str, key: u8) -> TerminalSessionScope {
+        TerminalSessionScope {
+            name: Some(name.into()), device: Some([key; 32]), user: Some([9; 32]),
+            binding: BindingStrength::Proven, expires: Some(u64::MAX), key_caps: None,
+            trusted: true, policy_allows: false, sibling: true, pair_binding: None, require_name_key: false,
+        }
+    }
+
+    #[test]
+    fn owner_withdrawal_only_ends_the_matching_terminal_scope() {
+        let host = Host::default();
+        let alice = sibling("alice", 1);
+        let bob = sibling("bob", 2);
+        host.0.lock().unwrap().owner_grants.extend([[1; 32], [2; 32]]);
+        assert!(!alice.withdrawn(&host));
+        assert!(!bob.withdrawn(&host));
+        host.0.lock().unwrap().owner_grants.remove(&[1; 32]);
+        assert!(alice.withdrawn(&host));
+        assert!(!bob.withdrawn(&host));
+        // A separate receiver-local grant survives owner withdrawal.
+        host.0.lock().unwrap().local_grants.insert("alice".into());
+        assert!(!alice.withdrawn(&host));
+        host.0.lock().unwrap().denies.insert("alice".into());
+        assert!(alice.withdrawn(&host));
+        assert!(!bob.withdrawn(&host));
+    }
+
+    #[test]
+    fn owner_grants_never_widen_pairwise_or_browser_sessions() {
+        let host = Host::default();
+        host.0.lock().unwrap().owner_grants.insert([1; 32]);
+        let mut paired = sibling("paired", 1);
+        paired.sibling = false;
+        assert!(paired.withdrawn(&host));
+        paired.name = None;
+        paired.device = None;
+        assert!(!paired.withdrawn(&host));
+    }
+
+    #[test]
+    fn reused_petname_cannot_keep_a_retired_pair_session_alive() {
+        let host = Host::default();
+        let mut scope = sibling("laptop", 1);
+        scope.sibling = false;
+        scope.pair_binding = Some("old-binding".into());
+        host.0.lock().unwrap().local_grants.insert("laptop".into());
+        host.0.lock().unwrap().pairs.push(("laptop".into(), "old-binding".into()));
+        assert!(!scope.withdrawn(&host));
+        host.0.lock().unwrap().pairs[0].1 = "fresh-binding".into();
+        assert!(scope.withdrawn(&host));
+    }
+
+    #[test]
+    fn a_certless_replacement_record_cannot_inherit_a_fleet_terminal() {
+        let host = Host::default();
+        let mut scope = sibling("laptop", 1);
+        scope.require_name_key = true;
+        host.0.lock().unwrap().keys.insert("laptop".into(), [1; 32]);
+        host.0.lock().unwrap().local_grants.insert("laptop".into());
+        assert!(!scope.withdrawn(&host));
+        host.0.lock().unwrap().keys.remove("laptop");
+        assert!(scope.withdrawn(&host));
+        host.0.lock().unwrap().keys.insert("laptop".into(), [2; 32]);
+        assert!(scope.withdrawn(&host));
+    }
 }
 
 /// Forward-open's entry point: same shared core, but the caller supplies
