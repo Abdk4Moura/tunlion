@@ -227,11 +227,13 @@ pub struct TerminalSessionScope {
     policy_allows: bool,
     sibling: bool,
     pair_binding: Option<String>,
+    require_name_key: bool,
 }
 
 impl TerminalSessionScope {
     pub fn capture(conn: &mut Conn, pid: &str, policy: &ShellPolicy) -> Self {
         let (name, inputs) = gather_shell_gate_inputs(conn, pid, policy, "shell");
+        let require_name_key = name.as_deref().is_some_and(|name| conn.host.device_cert_for(name).is_some());
         Self {
             name,
             device: inputs.idev,
@@ -243,6 +245,7 @@ impl TerminalSessionScope {
             policy_allows: inputs.policy_allows,
             sibling: conn.link(pid).is_some_and(|l| l.is_sibling_link() && l.fleet_proven()),
             pair_binding: conn.link(pid).and_then(|l| l.device_secret()).map(str::to_owned),
+            require_name_key,
         }
     }
 
@@ -263,7 +266,9 @@ impl TerminalSessionScope {
             }
         }
         if let (Some(name), Some(device)) = (&self.name, self.device.as_ref()) {
-            if host.device_cert_for(name).is_some_and(|cert| cert.device_pub != *device) {
+            let current = host.device_cert_for(name);
+            if current.as_ref().is_some_and(|cert| cert.device_pub != *device)
+                || (self.require_name_key && current.is_none()) {
                 return true;
             }
         }
@@ -558,6 +563,7 @@ mod terminal_lifecycle_tests {
         local_grants: HashSet<String>,
         denies: HashSet<String>,
         pairs: Vec<(String, String)>,
+        keys: std::collections::HashMap<String, [u8; 32]>,
     }
     #[derive(Default)]
     struct Host(Mutex<Facts>);
@@ -571,6 +577,11 @@ mod terminal_lifecycle_tests {
         fn channel_of(&self, _: &str) -> String { String::new() }
         fn roster_snapshot_json(&self) -> Option<String> { None }
         fn fleet_rv_present(&self) -> bool { false }
+        fn device_cert_for(&self, name: &str) -> Option<filament_id::DeviceCert> {
+            self.0.lock().unwrap().keys.get(name).map(|key| filament_id::DeviceCert {
+                device_pub: *key, user_pub: [9; 32], expires: u64::MAX, issued: 1, sig: [0; 64],
+            })
+        }
         fn fleet_grant_applies(&self, key: &[u8; 32], _: &str) -> bool {
             self.0.lock().unwrap().owner_grants.contains(key)
         }
@@ -592,7 +603,7 @@ mod terminal_lifecycle_tests {
         TerminalSessionScope {
             name: Some(name.into()), device: Some([key; 32]), user: Some([9; 32]),
             binding: BindingStrength::Proven, expires: Some(u64::MAX), key_caps: None,
-            trusted: true, policy_allows: false, sibling: true, pair_binding: None,
+            trusted: true, policy_allows: false, sibling: true, pair_binding: None, require_name_key: false,
         }
     }
 
@@ -637,6 +648,20 @@ mod terminal_lifecycle_tests {
         host.0.lock().unwrap().pairs.push(("laptop".into(), "old-binding".into()));
         assert!(!scope.withdrawn(&host));
         host.0.lock().unwrap().pairs[0].1 = "fresh-binding".into();
+        assert!(scope.withdrawn(&host));
+    }
+
+    #[test]
+    fn a_certless_replacement_record_cannot_inherit_a_fleet_terminal() {
+        let host = Host::default();
+        let mut scope = sibling("laptop", 1);
+        scope.require_name_key = true;
+        host.0.lock().unwrap().keys.insert("laptop".into(), [1; 32]);
+        host.0.lock().unwrap().local_grants.insert("laptop".into());
+        assert!(!scope.withdrawn(&host));
+        host.0.lock().unwrap().keys.remove("laptop");
+        assert!(scope.withdrawn(&host));
+        host.0.lock().unwrap().keys.insert("laptop".into(), [2; 32]);
         assert!(scope.withdrawn(&host));
     }
 }

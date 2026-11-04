@@ -69,7 +69,7 @@ fn project(record: &Value, store: &DeviceStore, now: u64) -> Result<DeviceAccess
     // an expired personal device remains personal, but access below is blocked.
     } else if cert.as_ref().is_some_and(|cert| cert.verify(0).is_ok()
         && Some(cert.user_pub) == store.owner_pub_for_resources(None))
-        && record["principalKind"].as_str() != Some("delegated") {
+        && record["invitedAs"].as_str() != Some("person") {
         DeviceRelationship::Fleet
     } else if record["secret"].as_str().is_some_and(|secret| !secret.is_empty()) {
         // A pair secret alone never proves fleet membership.
@@ -147,5 +147,11 @@ mod tests {
         let device = project(&record, &store, 3).unwrap();
         assert_eq!(device.relationship, DeviceRelationship::Fleet);
         assert_eq!(device.actions[1].state, AccessState::Blocked);
+        // Personal and external invitations both have delegated bounds; those
+        // bounds are not a relationship classification.
+        let personal = json!({"name":"personal", "deviceCert":cert.to_json(), "principalKind":"delegated", "secret":"pair"});
+        assert_eq!(project(&personal, &store, 3).unwrap().relationship, DeviceRelationship::Fleet);
+        let external = json!({"name":"external", "deviceCert":cert.to_json(), "principalKind":"delegated", "invitedAs":"person", "secret":"pair"});
+        assert_eq!(project(&external, &store, 3).unwrap().relationship, DeviceRelationship::Paired);
     }
 }
