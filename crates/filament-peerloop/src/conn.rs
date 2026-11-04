@@ -53,7 +53,7 @@ use crate::link_manager::{LinkObs, Placement, Work, peer_present, place};
 use crate::present::{NoScreen, Presentation};
 use crate::resilience;
 use crate::test_hooks;
-use filament_cap::capability::{BindingStrength, PrincipalKind};
+use filament_cap::capability::{BindingStrength, IdentityState, PrincipalKind};
 use filament_transport::direct;
 use filament_transport::net::{self, Ev, Peer, Transport};
 
@@ -517,6 +517,11 @@ pub struct Link {
     pub identity_user_pub: Option<[u8; 32]>,
     /// Binding strength of the identity fields (set alongside them).
     pub identity_binding: BindingStrength,
+    /// Whether the identity fields are Pending, Resolved, or the peer
+    /// explicitly answered that it holds no certificate after the code
+    /// ceremony. The gate distinguishes an unfinished resolution (must hold,
+    /// then fail closed) from an explicit anonymous code peer (transfer only).
+    pub identity_state: IdentityState,
     /// Identity cert expiry (unix seconds). None = no cert resolved.
     pub identity_cert_expires: Option<u64>,
     /// Principal kind: OwnerDevice or Delegated { caps }. A Delegated
@@ -611,6 +616,7 @@ impl Link {
         self.identity_user_pub = Some(owner_pub);
         self.identity_device_pub = Some(device_pub);
         self.identity_binding = BindingStrength::Proven;
+        self.identity_state = IdentityState::Resolved;
         self.identity_cert_expires = Some(expires);
         self.principal_kind = PrincipalKind::FleetSibling;
     }
@@ -662,6 +668,7 @@ impl Link {
         self.identity_user_pub = Some(owner_pub);
         self.identity_device_pub = Some(device_pub);
         self.identity_binding = BindingStrength::Proven;
+        self.identity_state = IdentityState::Resolved;
         self.identity_cert_expires = Some(expires);
         self.principal_kind = PrincipalKind::Delegated { caps };
         // NOTE: deliberately do NOT set self.trusted. binding=Proven satisfies
@@ -1917,6 +1924,15 @@ impl Conn {
     }
     pub fn is_active(&self, pid: &str) -> bool {
         self.active.as_deref() == Some(pid)
+    }
+    /// The gate-relevant identity fact for `pid`. A missing link is Pending,
+    /// never anonymous: only an explicit identity-unavailable answer sets the
+    /// anonymous state, and it is stored on the link that received it.
+    pub fn identity_state_of(&self, pid: &str) -> IdentityState {
+        self.links
+            .get(pid)
+            .map(|l| l.identity_state)
+            .unwrap_or(IdentityState::Pending)
     }
     pub fn transport(&self) -> Option<Arc<dyn Transport>> {
         self.active_link().and_then(|l| l.transport.clone())
@@ -3502,6 +3518,10 @@ impl Conn {
                 self.revoked_peers.remove(&built.peer_id);
             }
         }
+        // Room adoption can select this target after its asynchronous build
+        // captured active_on_apply. Keep that current selection across the
+        // old-link cleanup, which also clears the active slot.
+        let selected_while_building = self.is_active(&built.peer_id);
         self.drop_link(&built.peer_id);
         if webrtc_only {
             self.webrtc_only.insert(built.peer_id.clone());
@@ -3531,12 +3551,13 @@ impl Conn {
                 identity_device_pub: None,
                 identity_user_pub: None,
                 identity_binding: BindingStrength::None,
+                identity_state: IdentityState::Pending,
                 identity_cert_expires: None,
                 principal_kind: PrincipalKind::OwnerDevice,
                 host: self.host.clone(),
             },
         );
-        if built.active_on_apply || pending_active {
+        if built.active_on_apply || pending_active || selected_while_building {
             self.active = Some(built.peer_id.clone());
         }
         self.log.debug(&format!(
@@ -5665,6 +5686,7 @@ impl Conn {
                     identity_device_pub: None,
                     identity_user_pub: None,
                     identity_binding: BindingStrength::None,
+                    identity_state: IdentityState::Pending,
                     identity_cert_expires: None,
                     principal_kind: if fleet || lan {
                         PrincipalKind::Delegated { caps: Vec::new() }
@@ -6991,6 +7013,7 @@ impl Conn {
                 identity_device_pub: None,
                 identity_user_pub: None,
                 identity_binding: BindingStrength::None,
+                identity_state: IdentityState::Pending,
                 identity_cert_expires: None,
                 principal_kind: upgrade_principal(&carried).1,
                 host: self.host.clone(),
@@ -8755,6 +8778,7 @@ mod warm_identity_tests {
             identity_device_pub: None,
             identity_user_pub: None,
             identity_binding: BindingStrength::None,
+            identity_state: IdentityState::Pending,
             identity_cert_expires: None,
             principal_kind: PrincipalKind::OwnerDevice,
             host: Arc::new(crate::host::NoHost),
@@ -10744,6 +10768,76 @@ mod warm_identity_tests {
             "the shipping task path never installed its link"
         );
         assert!(conn.builds.is_empty());
+    }
+
+    /// Room adoption chooses its target after spawning the build. Installing
+    /// that candidate must not erase the newer choice, or ChannelReady becomes
+    /// a responder-only event and no file is ever offered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn room_target_selected_during_build_survives_installation() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-room-target";
+        test_inline::set(false);
+        let result = conn
+            .maybe_adopt(
+                &json!({ "id": pid, "name": "receiver", "uid": "cli-r-room-target" }),
+                true,
+            )
+            .await;
+        // Restore the convenience path even if the assertion below fails.
+        test_inline::set(true);
+        assert!(result.expect("room adoption"));
+        assert!(conn.is_active(pid), "adoption never selected the room target");
+        assert!(
+            !conn.links.contains_key(pid),
+            "the build was not asynchronous"
+        );
+        for _ in 0..100 {
+            conn.pump_builds();
+            if conn.links.contains_key(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            conn.links.contains_key(pid),
+            "the room candidate was not installed"
+        );
+        assert!(
+            conn.is_active(pid),
+            "installing the room candidate erased its target slot"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn installing_a_room_responder_preserves_another_target() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-room-responder";
+        conn.active = Some("selected-target".to_string());
+        test_inline::set(false);
+        let result = conn
+            .maybe_adopt(
+                &json!({ "id": pid, "name": "bystander", "uid": "cli-r-bystander" }),
+                false,
+            )
+            .await;
+        test_inline::set(true);
+        assert!(!result.expect("room responder adoption"));
+        for _ in 0..100 {
+            conn.pump_builds();
+            if conn.links.contains_key(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            conn.links.contains_key(pid),
+            "the responder candidate was not installed"
+        );
+        assert!(
+            conn.is_active("selected-target"),
+            "a responder stole another target's slot"
+        );
     }
 
     /// A failed build reports its cause, releases the slot and is retried with

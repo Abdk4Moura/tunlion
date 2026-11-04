@@ -468,6 +468,7 @@ pub async fn admit_sync_open(
             scoped_in_bounds,
             has_explicit_grant: has_grant,
             cert_revoked,
+            identity_state: conn.identity_state_of(pid),
             denied: sibling.denied,
             ceiling_authorizes: false,
         });
@@ -2248,6 +2249,7 @@ mod tests {
                 identity_device_pub: Some(DEVICE),
                 identity_user_pub: Some(USER),
                 identity_binding: cap::BindingStrength::Proven,
+                identity_state: cap::IdentityState::Resolved,
                 identity_cert_expires: Some(1000),
                 principal_kind: cap::PrincipalKind::OwnerDevice,
                 host,

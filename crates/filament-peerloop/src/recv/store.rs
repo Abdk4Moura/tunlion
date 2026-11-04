@@ -1071,6 +1071,21 @@ impl DeviceStore {
         self.devices_store_new(name, secret, None)
     }
 
+    /// Store a `pair-keep` secret idempotently. The same secret can arrive more
+    /// than once when the sender retries across a path handoff; each repeat
+    /// must return the existing record instead of minting a suffixed duplicate.
+    pub fn devices_store_remembered(&self, name: &str, secret: &str) -> Result<String> {
+        if let Some(existing) = self
+            .devices_records()
+            .iter()
+            .find(|d| d["secret"].as_str() == Some(secret))
+            .and_then(|d| d["name"].as_str())
+        {
+            return Ok(existing.to_string());
+        }
+        self.devices_store(name, secret)
+    }
+
     pub fn devices_store_new(
         &self,
         name: &str,
@@ -4564,6 +4579,41 @@ mod forget_admission_precedence {
         let r = Refusal::from_shell_gate(forgotten, revoked, false, None, Some("guest".into()));
         assert_eq!(r.code, Code::CertRevoked);
         assert_eq!(r.reason, "device revoked");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod remembered_store_tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_remember_secret_is_idempotent_but_a_new_secret_is_a_new_record() {
+        let root = std::env::temp_dir().join(format!(
+            "fil-remember-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DeviceStore::open(&root);
+        let one = "a".repeat(64);
+        let two = "b".repeat(64);
+        let first = store.devices_store_remembered("boxa", &one).unwrap();
+        let repeated = store.devices_store_remembered("boxa", &one).unwrap();
+        assert_eq!(first, repeated, "a retried pair-keep must not mint a suffix");
+        assert_eq!(
+            store
+                .devices_records()
+                .iter()
+                .filter(|d| d["secret"].as_str() == Some(one.as_str()))
+                .count(),
+            1
+        );
+        let other = store.devices_store_remembered("boxa", &two).unwrap();
+        assert_ne!(
+            first, other,
+            "a different secret is a different device and still gets its own record"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

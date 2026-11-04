@@ -486,6 +486,55 @@ pub fn cap_gate_effective(
     // alarm (the flip PERMITS this open, it does not break it).
     ceiling_authorizes: bool,
 ) -> GateDecision {
+    // Callers that do not carry a link identity (permission previews, tests
+    // constructing a resolved principal directly) keep the old ordering
+    // semantics: an unresolved identity is Pending, and the #161 probe stays
+    // strict for it.
+    cap_gate_effective_with_identity(
+        legacy_allowed,
+        outcome,
+        action,
+        resource,
+        device_pub,
+        user_pub,
+        binding,
+        cert_expires,
+        auth_key_caps,
+        own_user_pub,
+        scoped_in_bounds,
+        has_explicit_grant,
+        cert_revoked,
+        denied,
+        ceiling_authorizes,
+        IdentityState::Pending,
+    )
+}
+
+/// The link-aware form: same policy site, plus the identity fact the link
+/// actually carries. Only `ExplicitlyUnavailableAnonymous` changes semantics:
+/// the peer answered the possession challenge after the code ceremony, so it
+/// has no certificate to revoke and the code itself is the authorization for
+/// TRANSFER only. `Pending` remains strict, so an unfinished resolution can
+/// never quietly become the anonymous class.
+#[allow(clippy::too_many_arguments)]
+pub fn cap_gate_effective_with_identity(
+    legacy_allowed: bool,
+    outcome: &CapOutcome,
+    action: &str,
+    resource: &str,
+    device_pub: Option<&[u8; 32]>,
+    user_pub: Option<&[u8; 32]>,
+    binding: BindingStrength,
+    cert_expires: Option<u64>,
+    auth_key_caps: Option<&[String]>,
+    own_user_pub: Option<&[u8; 32]>,
+    scoped_in_bounds: bool,
+    has_explicit_grant: bool,
+    cert_revoked: bool,
+    denied: bool,
+    ceiling_authorizes: bool,
+    identity_state: IdentityState,
+) -> GateDecision {
     let authoritative = cap_authoritative();
 
     // === #161 probe: the revocation ordering window =====================
@@ -504,9 +553,122 @@ pub fn cap_gate_effective(
     // `gate_live()` scopes the probe to real flows (binary + harness); unit
     // tests construct the state directly and must not trip it.
     debug_assert!(
-        !(gate_live() && legacy_allowed && device_pub.is_none() && !cert_revoked),
+        !(gate_live()
+            && legacy_allowed
+            && device_pub.is_none()
+            && !cert_revoked
+            && identity_state != IdentityState::ExplicitlyUnavailableAnonymous),
         "gate reached before identity resolution: legacy trust with no resolved device identity"
     );
+
+    // === Transfer: ONE shared pure policy ===============================
+    // The allow/deny decision lives in filament-cap so the CLI, Core and
+    // future clients cannot drift. Everything below this branch is the generic
+    // policy for the other actions (shell, mount, route, ...).
+    if action.eq_ignore_ascii_case(CAP_TRANSFER) {
+        let peer_user = user_pub.copied().unwrap_or([0u8; 32]);
+        let same_owner =
+            own_user_pub.is_some_and(|own| own == &peer_user) && peer_user != [0u8; 32];
+        let decision = transfer_decision(&TransferGateInput {
+            authoritative,
+            legacy_allowed,
+            outcome,
+            cert_revoked,
+            denied,
+            auth_key_caps,
+            cert_expires,
+            now: now_secs(),
+            same_owner,
+            binding,
+            scoped_in_bounds,
+            has_explicit_grant,
+            ceiling_authorizes,
+            identity_state,
+        });
+        if matches!(decision.deny, Some(TransferDeny::Ceiling)) {
+            CEILING_DENIED.fetch_add(1, Ordering::Relaxed);
+            pa_inc(
+                PA_CEILING_DENIED.get_or_init(|| Mutex::new(HashMap::new())),
+                action,
+            );
+        }
+        record_gate_observation(
+            authoritative,
+            legacy_allowed,
+            &decision.observable_outcome,
+            action,
+            resource,
+            device_pub,
+            user_pub,
+            same_owner,
+            binding,
+            cert_revoked,
+            ceiling_authorizes,
+            has_explicit_grant,
+            decision.fleet_ok,
+            decision.ceiling_ok,
+        );
+        if decision.allowed {
+            return GateDecision::Allow;
+        }
+        return match decision.deny {
+            Some(TransferDeny::Expired { at }) => GateDecision::Deny {
+                cap_reason: Some(expired_reason_for(at, device_pub)),
+            },
+            Some(reason) => GateDecision::Deny {
+                cap_reason: reason.reason(),
+            },
+            None => GateDecision::Deny { cap_reason: None },
+        };
+    }
+
+    // === Explicit anonymous code peer ==================================
+    // The peer answered our possession challenge with `identity-unavailable`
+    // AFTER a one-time code ceremony or explicit local transfer consent
+    // (`-y`/daemon room acceptance) selected it. There is no device
+    // certificate, so revocation cannot be consulted: that consent is the
+    // human authorization, and it authorizes a TRANSFER only. Shell, mount,
+    // forwarding, routes and fleet services all stay denied. This is NOT the
+    // pending case above: callers must never map a timeout or an unanswered
+    // challenge to this state.
+    if identity_state == IdentityState::ExplicitlyUnavailableAnonymous {
+        if cert_revoked {
+            return GateDecision::Deny {
+                cap_reason: Some("device revoked".into()),
+            };
+        }
+        if denied {
+            return GateDecision::Deny {
+                cap_reason: Some("explicitly denied by owner (deniedCaps)".into()),
+            };
+        }
+        if !action.eq_ignore_ascii_case(CAP_TRANSFER) {
+            return GateDecision::Deny {
+                cap_reason: Some(
+                    "anonymous code peer is authorized for transfer only".into(),
+                ),
+            };
+        }
+        if !scoped_in_bounds {
+            return GateDecision::Deny {
+                cap_reason: Some(
+                    "anonymous code transfer must land inside the receiver's inbox".into(),
+                ),
+            };
+        }
+        // Boundary: an anonymous peer has no device key, so it cannot be
+        // matched against a revoked record. The explicit consent (the code, or
+        // the operator's -y/daemon room acceptance) is the authority here, and
+        // it extends ONLY to this bounded transfer. Do not widen this class to
+        // silent Pending or to any other action.
+        return if legacy_allowed {
+            GateDecision::Allow
+        } else {
+            GateDecision::Deny {
+                cap_reason: Some("anonymous code peer has no transfer consent".into()),
+            }
+        };
+    }
 
     // === Delegated-principal ceiling (check 2 of 2) ===================
     // Auth key ceiling applies UNCONDITIONALLY in both modes. Purely restrictive
@@ -635,20 +797,6 @@ pub fn cap_gate_effective(
     // measure it before requiring Proven for grants. Tightening without first
     // making identity-expose universal is the 0.7.0 "worked yesterday, denied
     // today" breakage in a new costume.
-    if same_owner && !fleet_ok && has_explicit_grant && binding != BindingStrength::Proven {
-        let dev = device_pub.copied().unwrap_or([0u8; 32]);
-        log_once(
-            format!("infgrant|{action}|{}", hex::encode(dev)),
-            &format!(
-                "CAP-INFERRED-GRANT: fleet device dev={} authorized '{action}' via an explicit grant on a {binding:?} (non-Proven) binding. Fleet auto-trust requires Proven; explicit grants are still honored on Inferred pending universal identity-expose. Measured so Proven can be required for grants without silently revoking established devices.",
-                hex::encode(dev),
-            ),
-            // Debug, not loud: this is a measurement of an ALLOWED request, and
-            // a first-time-user test read it in the daemon log as an error. The
-            // access decision is unchanged; -v still shows the measurement.
-            true,
-        );
-    }
     // An explicit deny outranks EVERYTHING on this branch, including the
     // fleet auto-trust recomputation below: without this, a covered-but-
     // denied device would be re-authorized by fleet_ok two lines down,
@@ -688,6 +836,99 @@ pub fn cap_gate_effective(
             cap_authorize_expired(&CapOutcome::Authorized, cert_expires, true),
             CapOutcome::Authorized
         );
+    let effective = if fleet_allow {
+        true
+    } else if authoritative {
+        matches!(outcome, CapOutcome::Authorized)
+    } else {
+        legacy_allowed
+    };
+
+    record_gate_observation(
+        authoritative,
+        legacy_allowed,
+        outcome,
+        action,
+        resource,
+        device_pub,
+        user_pub,
+        same_owner,
+        binding,
+        cert_revoked,
+        ceiling_authorizes,
+        has_explicit_grant,
+        fleet_ok,
+        ceiling_ok,
+    );
+
+    if effective {
+        GateDecision::Allow
+    } else if authoritative {
+        let reason = match outcome {
+            CapOutcome::Denied(r) => r.clone(),
+            CapOutcome::Unprovisioned => {
+                "resource unprovisioned (no capability header); run tunlion grant/init".to_string()
+            }
+            CapOutcome::Authorized => String::new(),
+        };
+        GateDecision::Deny {
+            cap_reason: Some(reason),
+        }
+    } else {
+        GateDecision::Deny { cap_reason: None }
+    }
+}
+
+/// Compute the set of devices whose managed authorized_keys blocks must be
+/// removed because the capability layer no longer authorizes `shell`.
+/// Returns petnames. Called by the shell-key reconciler on daemon start
+/// and on cap-store change. Idempotent — running it with no drift is a no-op.
+///
+/// Uses `evaluate_grants_only` (NOT `evaluate`) DELIBERATELY. `shell` is a
+/// deliberate-tier action: it is authorized only by an explicit owner-signed
+/// grant, never by the owner shortcut. A same-owner FLEET device shares the
+/// owner's `user_pub`, so plain `evaluate` would apply the owner shortcut and
+/// return Authorized for it unconditionally — the device would then NEVER appear
+/// in the revoked set, so the reconciler would NEVER strip its authorized_keys.
+/// Net effect of that bug: grant shell to a fleet device (key installs), revoke
+/// the grant, and the key STAYS — permanent SSH on the one surface that bypasses
+/// every tunlion gate. That is the exact revocation gap the reconciler exists to
+/// close (#24), reopened for fleet devices. `evaluate_grants_only` removes the
+/// owner shortcut so key presence tracks the explicit shell grant for fleet
+/// devices exactly as it does for external ones. (The live shell OPEN is gated
+/// separately at cap_gate_effective with scoped_in_bounds=false, i.e. grant-only;
+/// this keeps the KEY surface consistent with that gate.)
+
+/// Shadow counters and the flip diagnostics. Kept out of the decision so the
+/// one transfer policy can be shared while the CLI retains its observability.
+#[allow(clippy::too_many_arguments)]
+fn record_gate_observation(
+    authoritative: bool,
+    legacy_allowed: bool,
+    outcome: &CapOutcome,
+    action: &str,
+    resource: &str,
+    device_pub: Option<&[u8; 32]>,
+    user_pub: Option<&[u8; 32]>,
+    same_owner: bool,
+    binding: BindingStrength,
+    cert_revoked: bool,
+    ceiling_authorizes: bool,
+    has_explicit_grant: bool,
+    fleet_ok: bool,
+    ceiling_ok: bool,
+) {
+    if same_owner && !fleet_ok && has_explicit_grant && binding != BindingStrength::Proven {
+        let dev = device_pub.copied().unwrap_or([0u8; 32]);
+        log_once(
+            format!("infgrant|{action}|{}", hex::encode(dev)),
+            &format!(
+                "CAP-INFERRED-GRANT: fleet device dev={} authorized '{action}' via an explicit grant on a {binding:?} (non-Proven) binding. Fleet auto-trust requires Proven; explicit grants are still honored on Inferred pending universal identity-expose. Measured so Proven can be required for grants without silently revoking established devices.",
+                hex::encode(dev),
+            ),
+            true,
+        );
+    }
     // Counted on the CEILING's own precondition, mode-independently: the
     // population the flip newly permits is "covered by the owner-signed
     // enrolment ceiling, with no explicit grant", and it must be visible in
@@ -758,14 +999,6 @@ pub fn cap_gate_effective(
             );
         }
     }
-
-    let effective = if fleet_allow {
-        true
-    } else if authoritative {
-        matches!(outcome, CapOutcome::Authorized)
-    } else {
-        legacy_allowed
-    };
 
     let dev = device_pub.copied().unwrap_or([0u8; 32]);
     let usr = user_pub.copied().unwrap_or([0u8; 32]);
@@ -873,43 +1106,8 @@ pub fn cap_gate_effective(
         // the real reason through GateDecision::deny_reason().
     }
 
-    if effective {
-        GateDecision::Allow
-    } else if authoritative {
-        let reason = match outcome {
-            CapOutcome::Denied(r) => r.clone(),
-            CapOutcome::Unprovisioned => {
-                "resource unprovisioned (no capability header); run tunlion grant/init".to_string()
-            }
-            CapOutcome::Authorized => String::new(),
-        };
-        GateDecision::Deny {
-            cap_reason: Some(reason),
-        }
-    } else {
-        GateDecision::Deny { cap_reason: None }
-    }
 }
 
-/// Compute the set of devices whose managed authorized_keys blocks must be
-/// removed because the capability layer no longer authorizes `shell`.
-/// Returns petnames. Called by the shell-key reconciler on daemon start
-/// and on cap-store change. Idempotent — running it with no drift is a no-op.
-///
-/// Uses `evaluate_grants_only` (NOT `evaluate`) DELIBERATELY. `shell` is a
-/// deliberate-tier action: it is authorized only by an explicit owner-signed
-/// grant, never by the owner shortcut. A same-owner FLEET device shares the
-/// owner's `user_pub`, so plain `evaluate` would apply the owner shortcut and
-/// return Authorized for it unconditionally — the device would then NEVER appear
-/// in the revoked set, so the reconciler would NEVER strip its authorized_keys.
-/// Net effect of that bug: grant shell to a fleet device (key installs), revoke
-/// the grant, and the key STAYS — permanent SSH on the one surface that bypasses
-/// every tunlion gate. That is the exact revocation gap the reconciler exists to
-/// close (#24), reopened for fleet devices. `evaluate_grants_only` removes the
-/// owner shortcut so key presence tracks the explicit shell grant for fleet
-/// devices exactly as it does for external ones. (The live shell OPEN is gated
-/// separately at cap_gate_effective with scoped_in_bounds=false, i.e. grant-only;
-/// this keeps the KEY surface consistent with that gate.)
 pub fn devices_with_shell_revoked(config_dir: &std::path::Path) -> Vec<String> {
     let cap_store = load_cap_store(config_dir);
     let devices_path = config_dir.join("devices.json");
@@ -1291,6 +1489,117 @@ mod tests {
             "documents the window: with no resolved identity the gate allows on \
              legacy trust, because revocation is unknowable rather than absent. \
              If this ever flips, the ordering was fixed and 1v can be closed."
+        );
+    }
+
+    /// A code ceremony with no device certificate is authorized by the code
+    /// itself, but only for a transfer: shell, mount, route and every other
+    /// action stay denied. This is the explicit anonymous class, distinct from
+    /// a merely Pending resolution.
+    #[test]
+    fn explicit_anonymous_code_peer_is_transfer_only() {
+        let outcome = CapOutcome::Denied("no capability header".into());
+        let transfer = cap_gate_effective_with_identity(
+            true,
+            &outcome,
+            CAP_TRANSFER,
+            "self",
+            None,
+            None,
+            BindingStrength::None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
+            false,
+            IdentityState::ExplicitlyUnavailableAnonymous,
+        );
+        assert!(
+            transfer.allowed(),
+            "the code is the human authorization for an anonymous transfer"
+        );
+        for action in [CAP_SHELL, CAP_MOUNT, CAP_ROUTE] {
+            let denied = cap_gate_effective_with_identity(
+                true,
+                &outcome,
+                action,
+                "self",
+                None,
+                None,
+                BindingStrength::None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+                false,
+                false,
+                IdentityState::ExplicitlyUnavailableAnonymous,
+            );
+            assert!(
+                matches!(denied, GateDecision::Deny { .. }),
+                "anonymous code peer must not reach {action}"
+            );
+        }
+        let no_consent = cap_gate_effective_with_identity(
+            false,
+            &outcome,
+            CAP_TRANSFER,
+            "self",
+            None,
+            None,
+            BindingStrength::None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
+            false,
+            IdentityState::ExplicitlyUnavailableAnonymous,
+        );
+        assert!(
+            matches!(no_consent, GateDecision::Deny { .. }),
+            "without the code consent there is no anonymous transfer"
+        );
+        let outside_inbox = cap_gate_effective_with_identity(
+            true,
+            &outcome,
+            CAP_TRANSFER,
+            "self",
+            None,
+            None,
+            BindingStrength::None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            IdentityState::ExplicitlyUnavailableAnonymous,
+        );
+        assert!(
+            matches!(outside_inbox, GateDecision::Deny { .. }),
+            "anonymous code transfer must not bypass the receiver path bound"
+        );
+    }
+
+    /// Pending is not the anonymous class: the default and the wrapper both
+    /// keep it, so only an explicit `identity-unavailable` answer can reach the
+    /// transfer-only exemption.
+    #[test]
+    fn pending_identity_is_not_explicitly_anonymous() {
+        assert_eq!(IdentityState::default(), IdentityState::Pending);
+        assert_ne!(
+            IdentityState::Pending,
+            IdentityState::ExplicitlyUnavailableAnonymous
         );
     }
 

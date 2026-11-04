@@ -13,7 +13,7 @@
 //! crate's.
 #![allow(unused_imports)]
 
-use filament_cap::capability::{BindingStrength, CapOutcome, GateDecision, PrincipalKind};
+use filament_cap::capability::{BindingStrength, CapOutcome, GateDecision, IdentityState, PrincipalKind};
 
 pub(crate) use filament_peerloop::shell_gate::{
     PeerAuthz, ShellGateInputs, ShellPolicy, exec_gate_decision as gate_exec_decision,
@@ -121,6 +121,7 @@ mod tests {
                                                 has_grant,
                                                 cert_revoked,
                                                 ceiling_covers,
+                                                identity_state: IdentityState::Resolved,
                                                 scoped_default,
                                                 action: CAP_SHELL.to_string(),
                                             };
@@ -330,6 +331,7 @@ mod tests {
             has_grant: false,
             cert_revoked,
             ceiling_covers: false,
+            identity_state: IdentityState::Resolved,
             scoped_default: false,
             action: CAP_SHELL.to_string(),
         };

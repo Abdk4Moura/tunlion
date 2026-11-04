@@ -140,7 +140,7 @@ pub trait RecvIdentity: Send + Sync {
     /// Re-issue a challenge for a parked open.
     async fn resend_identity_challenge(
         &self,
-        conn: &Conn,
+        t: &Arc<dyn Transport>,
         pid: &str,
         identity_nonces: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
     ) -> bool;

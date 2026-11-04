@@ -852,6 +852,10 @@ pub struct CapGate<'a> {
     pub scoped_in_bounds: bool,
     pub has_explicit_grant: bool,
     pub cert_revoked: bool,
+    /// Whether the link's identity is Pending, Resolved, or explicitly absent
+    /// after a code ceremony. The policy site uses this to keep the ordering
+    /// probe strict while allowing the one anonymous-transfer class.
+    pub identity_state: filament_cap::capability::IdentityState,
     pub denied: bool,
     pub ceiling_authorizes: bool,
 }

@@ -13,6 +13,7 @@
 //! landed (or, only for a source with no digest, that every byte was written
 //! and acknowledged at the transport).
 
+use crate::send::gate::{adopt_wants_active, code_peer_event_allowed, CodePeerEvent};
 use crate::conn::Conn;
 use crate::driver::{Cancellation, DriverOutcome};
 use crate::host::{HostServices, LogSink};
@@ -253,10 +254,6 @@ fn build_outgoing(request: &SendRequest, log: &dyn LogSink) -> Result<Vec<Outgoi
         outgoing.push(out);
     }
     Ok(outgoing)
-}
-
-fn adopt_wants_active(code_claimed: bool, use_code: bool, pake_done: bool) -> bool {
-    code_claimed && (!use_code || pake_done)
 }
 
 fn code_partner(
@@ -679,6 +676,35 @@ async fn drive_over(
         let Some(ev) = ev else { continue };
         last_activity = Instant::now();
         let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
+        // A spent code authenticates only its ceremony peer, never a new room
+        // member claiming the same install UID after the receiver disappears.
+        if use_code {
+            match &ev {
+                Ev::Control(pid, _)
+                    if !code_peer_event_allowed(
+                        use_code,
+                        pake_done,
+                        pake_peer.as_deref(),
+                        pid,
+                        CodePeerEvent::Control,
+                    ) =>
+                {
+                    continue
+                }
+                Ev::ChannelReady(pid, _)
+                    if !code_peer_event_allowed(
+                        use_code,
+                        pake_done,
+                        pake_peer.as_deref(),
+                        pid,
+                        CodePeerEvent::Channel,
+                    ) =>
+                {
+                    continue
+                }
+                _ => {}
+            }
+        }
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -686,6 +712,15 @@ async fn drive_over(
                 }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
+                        if !code_peer_event_allowed(
+                            use_code,
+                            pake_done,
+                            pake_peer.as_deref(),
+                            p["id"].as_str().unwrap_or_default(),
+                            CodePeerEvent::Adoption,
+                        ) {
+                            continue;
+                        }
                         conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done))
                             .await
                             .map_err(internal)?;
@@ -696,6 +731,15 @@ async fn drive_over(
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
+                        if !code_peer_event_allowed(
+                            use_code,
+                            pake_done,
+                            pake_peer.as_deref(),
+                            p["id"].as_str().unwrap_or_default(),
+                            CodePeerEvent::Adoption,
+                        ) {
+                            continue;
+                        }
                         conn.maybe_adopt_from(
                             p,
                             adopt_wants_active(code_used, use_code, pake_done),
@@ -761,6 +805,15 @@ async fn drive_over(
                 ports.log.say("code claimed, connecting...");
             }
             Ev::PeerJoined(v) => {
+                if !code_peer_event_allowed(
+                    use_code,
+                    pake_done,
+                    pake_peer.as_deref(),
+                    v["id"].as_str().unwrap_or_default(),
+                    CodePeerEvent::Adoption,
+                ) {
+                    continue;
+                }
                 conn.maybe_adopt(&v, adopt_wants_active(code_used, use_code, pake_done))
                     .await
                     .map_err(internal)?;

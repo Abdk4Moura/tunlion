@@ -205,6 +205,9 @@ pub struct ShellGateInputs {
     /// engine's `ceiling_authorizes`, which decides only under authoritative
     /// mode (shadow must decide exactly as it did before this feature).
     pub ceiling_covers: bool,
+    /// The link's identity fact at gate time. `ExplicitlyUnavailableAnonymous`
+    /// denies every shell-class action; it is transfer-only by policy.
+    pub identity_state: filament_cap::capability::IdentityState,
     /// The SCOPE-DEFAULT class for this open (transfer into the drop dir,
     /// forward to an exposed port). Distinct from the ceiling: this class has
     /// always auto-authorized same-owner Proven devices in BOTH modes.
@@ -228,6 +231,7 @@ pub struct TerminalSessionScope {
     sibling: bool,
     pair_binding: Option<String>,
     require_name_key: bool,
+    identity_state: filament_cap::capability::IdentityState,
 }
 
 impl TerminalSessionScope {
@@ -246,6 +250,7 @@ impl TerminalSessionScope {
             sibling: conn.link(pid).is_some_and(|l| l.is_sibling_link() && l.fleet_proven()),
             pair_binding: conn.link(pid).and_then(|l| l.device_secret()).map(str::to_owned),
             require_name_key,
+            identity_state: inputs.identity_state,
         }
     }
 
@@ -300,6 +305,7 @@ impl TerminalSessionScope {
             cert_revoked: host.cert_revoked_for(self.device.as_ref()),
             action: "shell".into(),
             ceiling_covers: host.ceiling_covers_action(self.device.as_ref(), "shell"),
+            identity_state: self.identity_state,
             scoped_default: false,
         };
         decide(&inputs, host).is_err()
@@ -364,6 +370,7 @@ pub fn gather_shell_gate_inputs(
         has_grant,
         cert_revoked,
         ceiling_covers,
+        identity_state: conn.identity_state_of(pid),
         scoped_default: false,
         action: action.to_string(),
     };
@@ -526,6 +533,7 @@ fn decide_with_legacy(
         scoped_in_bounds: inputs.scoped_default,
         has_explicit_grant: inputs.has_grant,
         cert_revoked: inputs.cert_revoked,
+        identity_state: inputs.identity_state,
         denied: inputs.denied,
         ceiling_authorizes: inputs.ceiling_covers,
     });
@@ -604,6 +612,7 @@ mod terminal_lifecycle_tests {
             name: Some(name.into()), device: Some([key; 32]), user: Some([9; 32]),
             binding: BindingStrength::Proven, expires: Some(u64::MAX), key_caps: None,
             trusted: true, policy_allows: false, sibling: true, pair_binding: None, require_name_key: false,
+            identity_state: filament_cap::capability::IdentityState::Resolved,
         }
     }
 

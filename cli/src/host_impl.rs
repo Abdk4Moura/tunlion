@@ -371,7 +371,7 @@ impl HostServices for CliHost {
         crate::identity_state::ceiling_covers_action(device_pub, action)
     }
     fn cap_gate_effective(&self, gate: CapGate<'_>) -> GateDecision {
-        crate::capability::cap_gate_effective(
+        crate::capability::cap_gate_effective_with_identity(
             gate.legacy_allowed,
             gate.outcome,
             gate.action,
@@ -387,6 +387,7 @@ impl HostServices for CliHost {
             gate.cert_revoked,
             gate.denied,
             gate.ceiling_authorizes,
+            gate.identity_state,
         )
     }
     fn now_secs(&self) -> u64 {
