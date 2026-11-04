@@ -118,7 +118,7 @@ pub struct InvitationPreview {
 
 /// A minted invitation. The token is a credential: never log it, never put it
 /// in an argument list, and never return the possession seed separately.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MintedInvitation {
     pub invitation: Invitation,
     pub token: Vec<u8>,
