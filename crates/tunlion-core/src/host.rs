@@ -282,6 +282,14 @@ impl HostServices for CoreHost {
         self.store.devices_load()
     }
 
+    fn record_received_file(&self, record: &filament_peerloop::recv::files::ReceivedFileRecord) {
+        // History is best-effort, like the CLI adapter. The verified completion
+        // summary remains the synchronous receipt if the journal cannot write.
+        if let Err(error) = self.store.record_received_file(record) {
+            eprintln!("receive history could not be persisted: {error}");
+        }
+    }
+
     fn device_record_revoked(&self, name: &str) -> bool {
         self.store.device_record_revoked(name)
     }
