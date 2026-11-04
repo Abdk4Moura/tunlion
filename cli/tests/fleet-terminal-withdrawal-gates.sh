@@ -12,6 +12,15 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/fleet-terminal-cut.XXXXXX")"
 DA="$WORK/alpha"
 source "$HERE/lib/fixture.sh"
 trap fixture_cleanup EXIT
+# Which sources produced this run. A gate failure that names its exact tree is
+# reproducible; one that says only which assertion fired is not.
+SOURCE_HASHES="$WORK/source-hashes.txt"
+{
+    printf 'head=%s\n' "$(git -C "$CLI_DIR/.." rev-parse HEAD 2>/dev/null || echo unknown)"
+    sha256sum "$(readlink -f "$0")" "$HERE/lib/fixture.sh" \
+        "$CLI_DIR/../crates/filament-peerloop/src/shell_gate.rs"
+} > "$SOURCE_HASHES"
+cat "$SOURCE_HASHES"
 as_node() {
     local node=$1
     shift
@@ -21,6 +30,82 @@ wait_file() {
     local path=$1
     for _ in $(seq 1 60); do [ -s "$path" ] && return 0; sleep 0.5; done
     return 1
+}
+# The cold one-shot path resolves a fleet sibling through the index record a
+# verified fleet-hello writes. A roster NAME alone is not dialable, and a
+# private rendezvous is brokered only over a certificate-verified link. Wait
+# for that exact fact instead of starting a terminal into a setup race.
+fleet_indexed() {
+    python3 - "$WORK/$1/devices.json" <<'PY'
+import json,sys
+try: arr=json.load(open(sys.argv[1]))
+except (OSError,ValueError): raise SystemExit(1)
+assert any(d.get('name')=='charlie' and not d.get('secret') for d in arr)
+PY
+}
+wait_fleet_link() {
+    local node=$1
+    for _ in $(seq 1 12); do
+        if fleet_indexed "$node" \
+            && as_node "$node" reach charlie --json --timeout 2 \
+                >"$WORK/$node-reach.json" 2>"$WORK/$node-reach.err"
+        then
+            ok "$node: certificate-verified fleet link to charlie before terminal"
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+# Failure evidence lives here because the job's sealed artifact has only this
+# transcript. Print the per-process stderr/stdout and both daemons' decisions,
+# never a device secret.
+node_facts() {
+    local node=$1
+    python3 - "$WORK/$node/devices.json" "$WORK/$node/settings.json" <<'PY'
+import json,sys
+try: arr=json.load(open(sys.argv[1]))
+except (OSError,ValueError) as e:
+    print('devices unreadable:', e); arr=[]
+print('devices:', json.dumps([{
+    'name': d.get('name'), 'hasSecret': bool(d.get('secret')),
+    'devicePub': ((d.get('deviceCert') or {}).get('devicePub') or '')[:16],
+    'principalKind': d.get('principalKind'),
+    'principalCeiling': d.get('principalCeiling'),
+    'certRevoked': d.get('certRevoked'),
+} for d in arr]))
+try:
+    s=json.load(open(sys.argv[2]))
+except (OSError,ValueError):
+    s={}
+print('fleet.owner_grants:', s.get('fleet.owner_grants'))
+PY
+}
+diagnose() {
+    local why=$1
+    {
+        echo "===== TERMINAL DIAGNOSTICS: $why"
+        echo "work=$WORK"
+        echo "--- source"; cat "$SOURCE_HASHES" 2>/dev/null
+        echo "--- work directory"; ls -la "$WORK" 2>/dev/null
+        echo "--- per-process output"
+        for f in "$WORK"/*.err "$WORK"/*.out "$WORK"/*-reach.json "$WORK"/*-reach.err; do
+            [ -f "$f" ] || continue
+            echo "### ${f##*/}"; tail -80 "$f"
+        done
+        echo "--- daemon logs"
+        for f in "$WORK"/up-*.log "$WORK"/backend.log; do
+            [ -f "$f" ] || continue
+            echo "### ${f##*/}"; tail -120 "$f"
+        done
+        echo "--- node facts"
+        for node in bravo charlie delta; do
+            echo "### $node"; node_facts "$node"
+        done
+        echo "--- live processes"
+        ps -eo pid,ppid,stat,etimes,args | grep -E 'tunlion|fleet-terminal-cut' | grep -v grep | head -40
+        echo "===== END TERMINAL DIAGNOSTICS"
+    } >&2
 }
 start_terminal() {
     local node=$1 mode=$2 tag=$3
@@ -36,7 +121,7 @@ export HOME="$WORK/home-alpha"
 start_backend
 init_owner "$DA"
 start_acceptor "$DA"
-for node in bravo charlie delta; do enroll_delegate "$node"; done
+for node in bravo charlie delta; do enroll_delegate "$node" --allow transfer,mount,shell; done
 as_node charlie set fleet.owner_grants all >/dev/null || fixture_die "target owner grant policy setup"
 for node in bravo charlie delta; do
     env HOME="$WORK/home-$node" TUNLION_CONFIG_DIR="$WORK/$node" TUNLION_L2=1 TUNLION_LOG=debug \
@@ -60,12 +145,24 @@ PY
         sleep 0.5
     done
     [ "$delivered" = 1 ] || fixture_die "$mode: both owner shell grants not delivered"
+    # A delegated device carries its invitation ceiling into every gate, so a
+    # terminal scenario enrolls the whole participating fleet with shell in the
+    # ceiling. The owner's per-device grant below is still the only thing that
+    # authorizes these terminals: the ceiling is a cap, not a grant.
+    for node in bravo delta; do
+        wait_fleet_link "$node" || {
+            diagnose "$mode: $node has no verified fleet link to charlie"
+            fixture_die "$mode: $node has no certificate-verified fleet link to charlie"
+        }
+    done
     start_terminal bravo "$mode" "$mode-match" >"$WORK/$mode-match.out" 2>"$WORK/$mode-match.err" &
     matching=$!; FIX_PIDS+=("$matching")
     start_terminal delta "$mode" "$mode-control" >"$WORK/$mode-control.out" 2>"$WORK/$mode-control.err" &
     control=$!; FIX_PIDS+=("$control")
-    wait_file "$WORK/$mode-match.child" && wait_file "$WORK/$mode-control.child" \
-        || fixture_die "$mode: terminal positive controls failed before withdrawal"
+    if ! wait_file "$WORK/$mode-match.child" || ! wait_file "$WORK/$mode-control.child"; then
+        diagnose "$mode: terminal positive controls before withdrawal"
+        fixture_die "$mode: terminal positive controls failed before withdrawal"
+    fi
     match_child=$(cat "$WORK/$mode-match.child")
     control_child=$(cat "$WORK/$mode-control.child")
     # A healthy owner-granted terminal must survive the existing 5s recheck.
@@ -109,5 +206,8 @@ PY
     kill "$control" 2>/dev/null || true
     wait "$control" 2>/dev/null || true
 done
+if [ "$FAIL" != 0 ]; then
+    diagnose "gate failures:$FAILED"
+fi
 printf 'fleet terminal withdrawal: %s passed, %s failed; evidence=%s\n' "$PASS" "$FAIL" "$WORK"
 [ "$FAIL" = 0 ]
