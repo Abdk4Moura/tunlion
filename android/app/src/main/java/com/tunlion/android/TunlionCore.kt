@@ -63,13 +63,14 @@ data class CoreDevice(
     val actions: List<CoreAction> = emptyList(),
 ) : java.io.Serializable {
     // An explicit attempt is not a claim that the remote receiver authorized us.
-    val canAttemptSend: Boolean get() = actions.any { it.action == "send" && it.state == CoreAccessState.UNKNOWN }
+    val canAttemptSend: Boolean get() = actions.any { it.kind == CoreActionKind.SEND && it.state == CoreAccessState.UNKNOWN }
 }
 
 enum class CoreRelationship { PAIRED, FLEET, TEMPORARY, UNKNOWN }
 enum class CoreAccessState { AVAILABLE, PENDING, BLOCKED, UNSUPPORTED, UNKNOWN }
+enum class CoreActionKind { SEND, RECEIVE_INBOX, TERMINAL, FOLDER }
 /** One direction-named core action fact, preserved for rendering. */
-data class CoreAction(val action: String, val state: CoreAccessState, val reason: String) : java.io.Serializable
+data class CoreAction(val kind: CoreActionKind, val state: CoreAccessState, val reason: String) : java.io.Serializable
 
 sealed interface CoreResult {
     data object Success : CoreResult

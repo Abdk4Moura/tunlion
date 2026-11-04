@@ -63,9 +63,9 @@ class NativeAdapterAcceptanceTest {
             assertNull("Presence is not inferred from a stored record", facts.online)
             assertFalse(facts.canSendFiles)
             assertTrue("Unknown remote send permission permits an explicit attempt only", facts.canAttemptSend)
-            assertEquals(CoreAccessState.UNKNOWN, facts.actions.single { it.action == "send" }.state)
-            assertEquals(CoreAccessState.BLOCKED, facts.actions.single { it.action == "receive-inbox" }.state)
-            assertEquals(CoreAccessState.UNSUPPORTED, facts.actions.single { it.action == "terminal" }.state)
+            assertEquals(CoreAccessState.UNKNOWN, facts.actions.single { it.kind == CoreActionKind.SEND }.state)
+            assertEquals(CoreAccessState.BLOCKED, facts.actions.single { it.kind == CoreActionKind.RECEIVE_INBOX }.state)
+            assertEquals(CoreAccessState.UNSUPPORTED, facts.actions.single { it.kind == CoreActionKind.TERMINAL }.state)
             assertFalse(facts.plainLine.contains("must-not-cross-ffi"))
         } finally {
             withContext(NonCancellable) { core.stop() }

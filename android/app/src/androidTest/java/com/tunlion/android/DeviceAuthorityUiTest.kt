@@ -56,7 +56,7 @@ class DeviceAuthorityUiTest {
         val peer = CoreDevice("peer-key", "Stored laptop", null, null,
             "Stored facts only, not remote acknowledgment.", false, false,
             relationship = CoreRelationship.PAIRED,
-            actions = listOf(CoreAction("send", CoreAccessState.UNKNOWN, "Remote receiver authorization is not observed")))
+            actions = listOf(CoreAction(CoreActionKind.SEND, CoreAccessState.UNKNOWN, "Remote receiver authorization is not observed")))
         open(CoreStatus(identityLoaded = true, fingerprint = "12345678", engineLinked = true, devices = listOf(peer)))
         compose.onNodeWithText("Stored laptop").performClick()
         compose.onNodeWithText("No action is confirmed effective by this snapshot.").performScrollTo().assertIsDisplayed()
@@ -76,10 +76,10 @@ class DeviceAuthorityUiTest {
             relationship = CoreRelationship.FLEET,
             revoked = true,
             actions = listOf(
-                CoreAction("send", CoreAccessState.UNKNOWN, "Remote receiver authorization is not observed"),
-                CoreAction("receive-inbox", CoreAccessState.BLOCKED, "Device access is revoked on this receiver"),
-                CoreAction("terminal", CoreAccessState.UNSUPPORTED, "This core profile does not serve terminals"),
-                CoreAction("folder", CoreAccessState.PENDING, "Waiting for a core fact"),
+                CoreAction(CoreActionKind.SEND, CoreAccessState.UNKNOWN, "Remote receiver authorization is not observed"),
+                CoreAction(CoreActionKind.RECEIVE_INBOX, CoreAccessState.BLOCKED, "Device access is revoked on this receiver"),
+                CoreAction(CoreActionKind.TERMINAL, CoreAccessState.UNSUPPORTED, "This core profile does not serve terminals"),
+                CoreAction(CoreActionKind.FOLDER, CoreAccessState.PENDING, "Waiting for a core fact"),
             ))
         open(CoreStatus(identityLoaded = true, fingerprint = "12345678", engineLinked = true, devices = listOf(peer)))
         compose.onNodeWithText("Fleet device · revoked locally").assertExists()
@@ -99,8 +99,8 @@ class DeviceAuthorityUiTest {
             "Stored facts only, not remote acknowledgment.", true, false,
             relationship = CoreRelationship.FLEET,
             actions = listOf(
-                CoreAction("send", CoreAccessState.AVAILABLE, "Authenticated link and receiver grant"),
-                CoreAction("receive-inbox", CoreAccessState.UNKNOWN, "Authenticated link facts are not available here"),
+                CoreAction(CoreActionKind.SEND, CoreAccessState.AVAILABLE, "Authenticated link and receiver grant"),
+                CoreAction(CoreActionKind.RECEIVE_INBOX, CoreAccessState.UNKNOWN, "Authenticated link facts are not available here"),
             ))
         open(CoreStatus(identityLoaded = true, fingerprint = "12345678", engineLinked = true, devices = listOf(peer)))
         compose.onNodeWithText("Send: available · Receive inbox: unknown").assertExists()

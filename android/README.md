@@ -68,9 +68,11 @@ or device verification; use the workflow or an approved leased Android worker.
 - The device list is projected from core `devices()`, not from Kotlin policy or
   CLI output. It shows the stored relationship (paired, fleet, temporary,
   unknown) and every returned action state (effective, pending, blocked,
-  unsupported, unknown), including expiry and local revocation. Presence stays
-  unknown because the snapshot does not probe peers. A stored relationship or
-  recorded grant is never shown as proof that a remote action currently works.
+  unsupported, unknown), keyed by the core `ActionKind` enum rather than a
+  display string, including expiry and local revocation. Presence stays
+  unknown unless the core reports `Live`; the snapshot does not probe peers. A
+  stored relationship or recorded grant is never shown as proof that a remote
+  action currently works.
 - Sending to a stored device is offered as an explicit attempt only when the
   core reports outbound authorization as unknown. The result screen reports the
   receiver's per-file delivery acknowledgment from `SendResult`; an attempt

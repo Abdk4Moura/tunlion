@@ -602,19 +602,18 @@ private fun actionGroup(device: CoreDevice, title: String, state: CoreAccessStat
     val actions = device.actions.filter { it.state == state }
     if (actions.isEmpty()) { empty?.let { SecondaryText(it) }; return }
     Eyebrow(title)
-    actions.forEach { DetailRow(actionLabel(it.action), it.reason) }
+    actions.forEach { DetailRow(actionLabel(it.kind), it.reason) }
 }
 
 private fun actionSummary(device: CoreDevice) = device.actions.joinToString(" · ") {
-    "${actionShortLabel(it.action)}: ${stateLabel(it.state)}"
+    "${actionShortLabel(it.kind)}: ${stateLabel(it.state)}"
 }
 
-private fun actionShortLabel(action: String) = when (action) {
-    "send" -> "Send"
-    "receive-inbox" -> "Receive inbox"
-    "terminal" -> "Terminal"
-    "folder" -> "Folders"
-    else -> action
+private fun actionShortLabel(kind: CoreActionKind) = when (kind) {
+    CoreActionKind.SEND -> "Send"
+    CoreActionKind.RECEIVE_INBOX -> "Receive inbox"
+    CoreActionKind.TERMINAL -> "Terminal"
+    CoreActionKind.FOLDER -> "Folders"
 }
 
 private fun stateLabel(state: CoreAccessState) = when (state) {
@@ -632,12 +631,11 @@ private fun relationshipLabel(relationship: CoreRelationship) = when (relationsh
     CoreRelationship.UNKNOWN -> "Relationship unknown"
 }
 
-private fun actionLabel(action: String) = when (action) {
-    "send" -> "Send files to this device"
-    "receive-inbox" -> "This device sending to this phone's inbox"
-    "terminal" -> "This phone serving a terminal"
-    "folder" -> "This phone exposing folders"
-    else -> action
+private fun actionLabel(kind: CoreActionKind) = when (kind) {
+    CoreActionKind.SEND -> "Send files to this device"
+    CoreActionKind.RECEIVE_INBOX -> "This device sending to this phone's inbox"
+    CoreActionKind.TERMINAL -> "This phone serving a terminal"
+    CoreActionKind.FOLDER -> "This phone exposing folders"
 }
 
 @Composable

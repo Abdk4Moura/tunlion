@@ -9,6 +9,7 @@ import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import uniffi.tunlion_core.AccessState
+import uniffi.tunlion_core.ActionKind
 import uniffi.tunlion_core.CoreException
 import uniffi.tunlion_core.CoreSession
 import uniffi.tunlion_core.DeviceRelationship
@@ -50,11 +51,11 @@ class NativeCoreAcceptanceTest {
                 val devices = core.devices()
                 val external = devices.single { it.name == "external" }
                 assertEquals(DeviceRelationship.PAIRED, external.relationship)
-                assertEquals(AccessState.UNKNOWN, external.actions.single { it.action == "send" }.state)
-                assertEquals(AccessState.UNSUPPORTED, external.actions.single { it.action == "terminal" }.state)
+                assertEquals(AccessState.UNKNOWN, external.actions.single { it.action == ActionKind.SEND }.state)
+                assertEquals(AccessState.UNSUPPORTED, external.actions.single { it.action == ActionKind.TERMINAL }.state)
                 val worker = devices.single { it.name == "worker" }
                 assertEquals(DeviceRelationship.TEMPORARY, worker.relationship)
-                assertEquals(AccessState.BLOCKED, worker.actions.single { it.action == "receive-inbox" }.state)
+                assertEquals(AccessState.BLOCKED, worker.actions.single { it.action == ActionKind.RECEIVE_INBOX }.state)
                 assertFalse(File(config, "identity.ed25519").exists())
                 assertFalse(File(config, "overlay.ed25519").exists())
                 assertFalse(devices.toString().contains("must-not-cross-ffi"))

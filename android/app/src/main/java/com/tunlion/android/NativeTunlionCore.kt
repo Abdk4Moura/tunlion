@@ -13,6 +13,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import uniffi.tunlion_core.AccessState as NativeAccessState
+import uniffi.tunlion_core.ActionKind as NativeActionKind
 import uniffi.tunlion_core.CoreException
 import uniffi.tunlion_core.CoreSession
 import uniffi.tunlion_core.DeviceAccess as NativeDeviceAccess
@@ -205,12 +206,17 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
 
     /**
      * Project the core's read-only device facts. Relationship and stored
-     * records are never promoted to remote authority; presence is unknown
-     * because the snapshot does not probe peers.
+     * records are never promoted to remote authority; presence is projected
+     * only from the core enum and never probed by the client.
      */
     private fun coreDevice(access: NativeDeviceAccess): CoreDevice {
         val actions = access.actions.map { action ->
-            CoreAction(action.action, when (action.state) {
+            CoreAction(when (action.action) {
+                NativeActionKind.SEND -> CoreActionKind.SEND
+                NativeActionKind.RECEIVE_INBOX -> CoreActionKind.RECEIVE_INBOX
+                NativeActionKind.TERMINAL -> CoreActionKind.TERMINAL
+                NativeActionKind.FOLDER -> CoreActionKind.FOLDER
+            }, when (action.state) {
                 NativeAccessState.AVAILABLE -> CoreAccessState.AVAILABLE
                 NativeAccessState.BLOCKED -> CoreAccessState.BLOCKED
                 NativeAccessState.UNSUPPORTED -> CoreAccessState.UNSUPPORTED
@@ -220,11 +226,14 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
         return CoreDevice(
             id = access.deviceKey ?: "name:${access.name}",
             name = access.name,
-            online = when (access.presence) { NativeDevicePresence.UNKNOWN -> null },
+            online = when (access.presence) {
+                NativeDevicePresence.UNKNOWN -> null
+                NativeDevicePresence.LIVE -> true
+            },
             route = null,
             plainLine = "Stored device record from the shared core. Remote grants, reachability and delivered files are not observed.",
-            canSendFiles = actions.any { it.action == "send" && it.state == CoreAccessState.AVAILABLE },
-            canOpenShell = actions.any { it.action == "terminal" && it.state == CoreAccessState.AVAILABLE },
+            canSendFiles = actions.any { it.kind == CoreActionKind.SEND && it.state == CoreAccessState.AVAILABLE },
+            canOpenShell = actions.any { it.kind == CoreActionKind.TERMINAL && it.state == CoreAccessState.AVAILABLE },
             relationship = when (access.relationship) {
                 NativeDeviceRelationship.PAIRED -> CoreRelationship.PAIRED
                 NativeDeviceRelationship.FLEET -> CoreRelationship.FLEET
