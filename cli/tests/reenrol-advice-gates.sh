@@ -42,7 +42,7 @@ A_ENV=(env TUNLION_CONFIG_DIR="$DA")
 start_backend
 init_owner "$DA"
 start_acceptor "$DA"
-# The default ceiling (transfer, mount): no shell.
+# The default ceiling (transfer): no shell.
 enroll_delegate "$DEV"
 start_spoke "$DD" "$DEV"
 sleep 4

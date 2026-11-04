@@ -204,55 +204,37 @@ pub(crate) fn parse_mint_ttl(raw: &str) -> Result<u64> {
 // PROTOCOL LITERAL: frozen, do not rename. Invitation token prefixes: released
 // builds mint and parse exactly these bytes (see the forms listed in
 // `parse_invitation`). Pinned by `invitation_prefixes_are_frozen`.
-pub(crate) const INVITE_PREFIX: &str = "filament-invite:";
-pub(crate) const INVITE_PREFIX_V1: &str = "filament-invite:v1:";
-pub(crate) const INVITE_PREFIX_V2: &str = "filament-invite:v2:";
+//
+// The constants and the token parser live beside `Invitation` in filament-cap
+// so a library caller (Core/Android) cannot grow a second, subtly different
+// prefix rule. This module keeps only the CLI's extra sentence for a pairing
+// code handed to the invitation reader.
+pub(crate) use filament_cap::ephemeral::{INVITE_PREFIX, INVITE_PREFIX_V1, INVITE_PREFIX_V2};
 
 pub(crate) fn parse_invitation(raw: &str) -> Result<crate::ephemeral::Invitation> {
-    use base64::Engine;
-    let token = raw.trim();
-    // Three forms exist in the wild, and they are the same v2 payload except v1:
-    //
-    //   filament-invite:v1:...    0.8.0-0.8.3, a JSON token replaced in 0.8.4.
-    //                             Stale, not malformed: say so, as 0.8.5 does.
-    //   filament-invite:v2:<b64>  0.8.4-0.8.5 and current. The canonical form.
-    //   filament-invite:<b64>     minted by unreleased builds between #291 and
-    //                             the fix that restored `v2:`. Same bytes.
-    //
-    // Before this, only the third was accepted, so an invitation from the
-    // RELEASED 0.8.5 failed as "not valid base64url": the parser decoded
-    // `v2:...` and choked on the colon.
-    if token.starts_with(INVITE_PREFIX_V1) {
-        bail!(
-            "this invitation uses the pre-0.8.4 format; ask the owner to mint a new one with `tunlion add --for`"
-        );
-    }
-    let encoded = token
-        .strip_prefix(INVITE_PREFIX_V2)
-        .or_else(|| token.strip_prefix(INVITE_PREFIX))
-        .ok_or_else(|| {
+    match filament_cap::ephemeral::parse_invitation(raw) {
+        Ok(inv) => Ok(inv),
+        Err(error) => {
+            let message = error.to_string();
             // A pairing code handed to an invitation reader is the common
             // case (the guided menu used to do exactly that): name the verb
             // that takes it instead of only refusing.
-            let code = crate::pake::norm_code(token);
-            if crate::token_is_pairing_code(code.trim_matches('-')) {
-                anyhow!(
-                    "invitation has an unknown format: that is a pairing code, not an invitation. Accept it with:  tunlion join {}",
-                    code.trim_matches('-')
-                )
-            } else {
-                anyhow!(
-                    "invitation has an unknown format: an invitation starts with `{INVITE_PREFIX}`. A pairing code (like brave-otter-3141) is accepted with:  tunlion join <code>"
-                )
+            if message.contains("unknown format") {
+                let token = raw.trim();
+                let code = crate::pake::norm_code(token);
+                if crate::token_is_pairing_code(code.trim_matches('-')) {
+                    return Err(anyhow!(
+                        "invitation has an unknown format: that is a pairing code, not an invitation. Accept it with:  tunlion join {}",
+                        code.trim_matches('-')
+                    ));
+                }
+                return Err(anyhow!(
+                    "{message}. A pairing code (like brave-otter-3141) is accepted with:  tunlion join <code>"
+                ));
             }
-        })?;
-    let bytes = Zeroizing::new(
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(|_| anyhow!("invitation is not valid base64url"))?,
-    );
-    crate::ephemeral::Invitation::from_token(bytes.as_slice())
-        .ok_or_else(|| anyhow!("invitation payload is not a valid v2 invitation"))
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]

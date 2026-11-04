@@ -756,11 +756,13 @@ pub(crate) fn invitation_not_a_code_msg() -> String {
 }
 
 /// The default enrolment ceiling for a device added over a spoken code when
-/// `--allow` was not given: the same transfer+mount the invitation path gives a
-/// device. Shell is owner-equivalent and stays a deliberate `--allow ...shell`,
-/// because pairing alone never yields a shell.
+/// `--allow` was not given: the same inbox-transfer default the invitation path
+/// gives a device. Mount and shell are deliberate `--allow` opt-ins, because
+/// pairing alone never yields a shell.
 pub(crate) fn default_device_ceiling() -> Vec<String> {
-    vec!["transfer".to_string(), "mount".to_string()]
+    // The shared invitation default is inbox transfer only. Mount is an
+    // explicit opt-in; existing enrolled devices keep the ceiling they have.
+    vec!["transfer".to_string()]
 }
 
 /// `--expires` for the spoken-code path, parsed and bounded exactly like the
@@ -1069,6 +1071,10 @@ async fn pair_with_purpose(
         ui::say(&note);
     }
     if internal {
+        if code.is_none() {
+            let requested = if posture.is_empty() { default_device_ceiling() } else { posture.clone() };
+            crate::enrollment_review::show(identity::enrollment::Relationship::OwnDevice, &requested);
+        }
         // Action-first setup: use the existing atomic, owner-only key store.
         // Guided cancellation and invalid input above cannot mint an identity.
         crate::identity_flow::ensure_user_key(false)?;
@@ -2689,14 +2695,14 @@ mod promise_tests {
         assert_eq!(newer.winner(), Some(PairCarrier::Lan));
     }
 
-    // `add <device>` over a spoken code: --allow omitted must mean the
-    // documented transfer+mount, never shell ("pairing alone never yields a
-    // shell", `grant` help).
+    // `add <device>` over a spoken code: --allow omitted means the shared
+    // inbox-transfer default, never shell ("pairing alone never yields a
+    // shell", `grant` help). Mount is an explicit opt-in.
     #[test]
-    fn code_path_default_ceiling_has_no_shell() {
+    fn code_path_default_ceiling_has_no_shell_or_mount() {
         let caps = default_device_ceiling();
-        assert_eq!(caps, vec!["transfer", "mount"]);
-        assert!(!caps.iter().any(|c| c == "shell"));
+        assert_eq!(caps, vec!["transfer"]);
+        assert!(!caps.iter().any(|c| c == "shell" || c == "mount"));
     }
 
     // --expires reaches the enrolment, parsed and bounded like `add --out`.
@@ -2747,7 +2753,7 @@ mod promise_tests {
         let hint = shell_not_granted_hint("laptop", &caps, Some(caps.as_slice())).expect("a hint");
         assert!(!hint.contains("tunlion grant"), "{hint}");
         let argv = parse(&hint, "tunlion add");
-        assert_eq!(argv.last().map(String::as_str), Some("transfer,mount,shell"));
+        assert_eq!(argv.last().map(String::as_str), Some("transfer,shell"));
         assert_eq!(
             grant_vs_ceiling(Some(caps.as_slice()), "shell", false),
             GrantVsCeiling::OutsideCeiling
@@ -3198,7 +3204,8 @@ mod enrol_flow_tests {
         let caps = default_device_ceiling();
         let own = ui::strip_ansi(&code_screen_promise(Some("pop-os"), true, false, true, &caps));
         assert!(own.contains("pop-os will be one of YOUR devices"), "{own}");
-        assert!(own.contains("send you files and open your shared folder"), "{own}");
+        assert!(own.contains("send you files"), "{own}");
+        assert!(!own.contains("shared folder"), "mount is not in the default: {own}");
         let person = code_screen_promise(None, false, true, true, &caps);
         assert!(person.contains("a person's device, not one of yours"), "{person}");
         let plain = code_screen_promise(None, false, false, true, &caps);
@@ -3222,7 +3229,7 @@ mod enrol_flow_tests {
 
     #[test]
     fn capabilities_read_as_words() {
-        assert_eq!(plain_caps(&default_device_ceiling()), "send you files and open your shared folder");
+        assert_eq!(plain_caps(&default_device_ceiling()), "send you files");
         assert_eq!(plain_caps(&[]), "do nothing yet");
         assert!(plain_caps(&["shell".into()]).contains("acts as you"));
     }
