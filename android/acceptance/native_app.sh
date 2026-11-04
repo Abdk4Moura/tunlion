@@ -10,6 +10,14 @@ mkdir -p "$RESULTS"
 PIDS=()
 cleanup() {
     adb logcat -d -v threadtime > "$RESULTS/native-logcat.txt" 2>/dev/null || true
+    if [ -s "$WORK/send.err" ]; then
+        echo '--- desktop sender stderr ---'
+        tail -80 "$WORK/send.err"
+    fi
+    if [ -s "$WORK/send.json" ]; then
+        echo '--- desktop sender events ---'
+        tail -40 "$WORK/send.json"
+    fi
     for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
 }
 trap 'status=$?; cleanup || true; exit "$status"' EXIT
