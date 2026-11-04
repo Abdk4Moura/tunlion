@@ -308,6 +308,8 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     catch (_: CoreException.PhraseMismatch) { CoreResult.Failure(CoreErrorKind.INVALID_INPUT, "The recovery words did not match. Nothing was saved.") }
     catch (_: CoreException.Io) { CoreResult.Failure(CoreErrorKind.LOCAL_RESOURCE, "The native core could not read or save local data. Check free space and reopen Files. Private inbox files have been kept.") }
     catch (_: CoreException.Stop) { CoreResult.Failure(CoreErrorKind.INTERNAL, "The native engine has not confirmed stopping. Turn availability off again before retrying.") }
+    catch (error: CoreException) { CoreResult.Failure(CoreErrorKind.INTERNAL,
+        "The native core could not finish (${error.javaClass.simpleName}: ${error.message}). Your identity has not been replaced.") }
     catch (_: java.io.IOException) { CoreResult.Failure(CoreErrorKind.LOCAL_RESOURCE, "Could not read or save a file. Check free space and folder access. Private inbox files have been kept.") }
     catch (_: Exception) { CoreResult.Failure(CoreErrorKind.INTERNAL, "The native core could not finish. Your identity has not been replaced. Check storage and availability before retrying.") }
 }

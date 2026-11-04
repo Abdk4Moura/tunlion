@@ -8,7 +8,10 @@ WORK="$(mktemp -d "${RUNNER_TEMP:-/tmp}/android-native-app.XXXXXX")"
 RESULTS="$ROOT/android/acceptance/results"
 mkdir -p "$RESULTS"
 PIDS=()
-cleanup() { for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done; }
+cleanup() {
+    adb logcat -d -v threadtime > "$RESULTS/native-logcat.txt" 2>/dev/null || true
+    for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+}
 trap 'status=$?; cleanup || true; exit "$status"' EXIT
 export TUNLION_NONINTERACTIVE=1
 adb wait-for-device
