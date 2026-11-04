@@ -1498,6 +1498,9 @@ mod tests {
     /// a merely Pending resolution.
     #[test]
     fn explicit_anonymous_code_peer_is_transfer_only() {
+        let _counter_guard = CAP_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let outcome = CapOutcome::Denied("no capability header".into());
         let transfer = cap_gate_effective_with_identity(
             true,
