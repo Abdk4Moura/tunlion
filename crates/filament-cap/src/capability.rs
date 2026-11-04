@@ -4696,6 +4696,7 @@ mod transfer_decision_tests {
         gate.same_owner = true;
         gate.binding = BindingStrength::Proven;
         gate.scoped_in_bounds = true;
+        gate.cert_expires = Some(u64::MAX);
         assert!(transfer_decision(&gate).allowed);
         gate.authoritative = false;
         assert!(transfer_decision(&gate).allowed);
@@ -4711,6 +4712,7 @@ mod transfer_decision_tests {
         gate.binding = BindingStrength::Proven;
         gate.scoped_in_bounds = false;
         gate.ceiling_authorizes = true;
+        gate.cert_expires = Some(u64::MAX);
         assert!(transfer_decision(&gate).allowed);
         gate.authoritative = false;
         assert_eq!(
@@ -4726,6 +4728,7 @@ mod transfer_decision_tests {
         gate.same_owner = true;
         gate.binding = BindingStrength::Inferred;
         gate.has_explicit_grant = true;
+        gate.cert_expires = Some(u64::MAX);
         assert!(transfer_decision(&gate).allowed);
         gate.cert_revoked = true;
         assert_eq!(transfer_decision(&gate).deny, Some(TransferDeny::Revoked));
