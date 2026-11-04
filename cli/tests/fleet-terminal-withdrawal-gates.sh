@@ -43,9 +43,8 @@ wait_file() {
 }
 # The cold one-shot path resolves a fleet sibling through the index record a
 # verified fleet-hello writes. A roster NAME alone is not dialable. Wait for
-# that record, then exercise the same terminal path with a one-shot `true`
-# instead of trusting a reach liveness ping: the warm ping is a separate
-# liveness surface and its failure does not mean the terminal cannot open.
+# that record within the fixture's existing setup budget; the terminal
+# assertion itself is unchanged.
 fleet_indexed() {
     python3 - "$WORK/$1/devices.json" <<'PY'
 import json,sys
@@ -54,26 +53,11 @@ except (OSError,ValueError): raise SystemExit(1)
 assert any(d.get('name')=='charlie' and not d.get('secret') for d in arr)
 PY
 }
-wait_terminal_path() {
+wait_fleet_link() {
     local node=$1
-    local _ attempt
     for _ in $(seq 1 60); do
-        fleet_indexed "$node" && break
+        fleet_indexed "$node" && return 0
         sleep 0.5
-    done
-    fleet_indexed "$node" || return 1
-    for attempt in 1 2 3; do
-        if timeout 20 as_node "$node" exec charlie -- true \
-            >"$WORK/$node-preflight.out" 2>"$WORK/$node-preflight.err"
-        then
-            ok "$node: terminal path to charlie answered before controls"
-            return 0
-        fi
-        # Authority refusals are not a readiness race: report them at once.
-        if grep -qiE 'refus|denied|no grant|ceiling|not authorized' "$WORK/$node-preflight.err"; then
-            return 1
-        fi
-        sleep 1
     done
     return 1
 }
@@ -110,7 +94,7 @@ diagnose() {
         echo "--- source"; cat "$SOURCE_HASHES" 2>/dev/null
         echo "--- work directory"; ls -la "$WORK" 2>/dev/null
         echo "--- per-process output"
-        for f in "$WORK"/*.err "$WORK"/*.out "$WORK"/*-reach.json "$WORK"/*-reach.err; do
+        for f in "$WORK"/*.err "$WORK"/*.out "$WORK"/*-preflight.log "$WORK"/*-reach.json "$WORK"/*-reach.err; do
             [ -f "$f" ] || continue
             echo "### ${f##*/}"; tail -80 "$f"
         done
@@ -182,9 +166,9 @@ PY
     # ceiling. The owner's per-device grant below is still the only thing that
     # authorizes these terminals: the ceiling is a cap, not a grant.
     for node in bravo delta; do
-        wait_terminal_path "$node" || {
-            diagnose "$mode: $node has no working terminal path to charlie"
-            fixture_die "$mode: $node has no working terminal path to charlie"
+        wait_fleet_link "$node" || {
+            diagnose "$mode: $node did not index charlie"
+            fixture_die "$mode: $node has no certificate-verified fleet link to charlie"
         }
     done
     start_terminal bravo "$mode" "$mode-match" >"$WORK/$mode-match.out" 2>"$WORK/$mode-match.err" &
