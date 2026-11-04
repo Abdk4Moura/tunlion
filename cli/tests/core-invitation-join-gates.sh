@@ -119,7 +119,8 @@ rows = {d["name"]: d for d in doc["data"]["devices"]}
 guest = rows.get("guest")
 assert guest is not None, rows.keys()
 assert guest.get("caps") == ["transfer"], guest
-assert guest.get("devicePub") or guest.get("deviceKey"), guest
+assert guest.get("certExpires"), guest
+assert guest.get("channel"), guest
 PY
 then
   ok "J3: the owner lists guest with the same transfer-only ceiling"
