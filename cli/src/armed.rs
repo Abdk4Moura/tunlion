@@ -29,7 +29,9 @@
 
 use serde_json::{Value, json};
 
-use filament_peerloop::invitation::{withdraw as withdraw_from_store, Outstanding};
+pub use filament_peerloop::invitation::Outstanding;
+
+use filament_peerloop::invitation::withdraw as withdraw_from_store;
 use filament_peerloop::recv::store::ArmedInvitation;
 
 /// What a mint records about an invitation besides its key and expiry.

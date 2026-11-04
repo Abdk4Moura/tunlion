@@ -543,7 +543,7 @@ mod tests {
         let error = core
             .join_invitation(b"not an invitation".to_vec(), "phone".into(), Some(1))
             .unwrap_err();
-        assert!(matches!(error, CoreError::Usage(_)), "{error:?}");
+        assert!(matches!(&error, CoreError::Usage(_)), "{error:?}");
         assert!(!root.path().join("identity.ed25519").exists());
         assert!(!root.path().join("identity/device-cert.json").exists());
     }
