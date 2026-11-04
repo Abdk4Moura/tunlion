@@ -96,6 +96,17 @@
       ]
     },
     {
+      "path": "cli/tests/core-invitation-join-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion TUNLION_CORE_JOIN_BIN=target/release/join-invitation bash cli/tests/core-invitation-join-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/core-receive-e2e-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion TUNLION_CORE_BIN=target/release/receive-code bash cli/tests/core-receive-e2e-gates.sh",
