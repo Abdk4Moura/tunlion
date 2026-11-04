@@ -1,21 +1,19 @@
 //! The enrolment command surface, lifted out of `main.rs`.
 //!
 //! `tunlion enroll` (join an owner's mesh with an invitation) and
-//! `tunlion enroll --send` (enrol a device and then hand it a file), plus the
-//! two helpers they share: `persist_join_ack`, which writes the join
-//! acknowledgement into the local device store, and `enrollment_timeout`, the
-//! shared long-op budget. Both helpers are called only from inside this module,
-//! so they are module-private rather than re-exported.
+//! `tunlion enroll --send` (enrol a device and then hand it a file). The join
+//! acknowledgement's persistence lives in
+//! `filament_peerloop::recv::enrollment::persist_join_ack`, so the CLI and Core
+//! run the same bound checks and write the local certificate last.
 //!
 //! Two `tokio::spawn`s live here (one per command) and are self-contained: each
 //! command owns its own event loop and spawns only owned values. No cfg
-//! branches, no test hooks, no dlog. `base64::Engine` is imported once, inside
-//! `enroll_cmd`, and travels with the body.
+//! branches, no test hooks, no dlog.
 use crate::net::{self, Ev};
-use crate::{AdoptSource, Conn, direct, fleet, identity, session, shutdown, ui};
+use crate::{AdoptSource, Conn, direct, session, shutdown, ui};
 use crate::{
-    capability_list_summary, config_set, display_name, fresh_secret,
-    is_self_uid, load_delegation, local_device_cert_path, merge_owner_cap_ops, mk_uid,
+    capability_list_summary, display_name, fresh_secret,
+    is_self_uid, load_delegation, local_device_cert_path, mk_uid,
     open_enrollment,
 };
 use anyhow::{Result, anyhow, bail};
@@ -32,12 +30,6 @@ use tokio::sync::mpsc;
 const ESTABLISH_BUDGET: Duration = Duration::from_secs(45);
 
 
-/// Store the certificates a join acknowledgement carried, and return the name.
-///
-/// ONE of these. There were two, `persist_join_ack` and `persist_join_ack_v2`,
-/// identical but for a hoisted local: one took an AuthKey and one an Invitation,
-/// which made them look like different functions. Once the two credentials
-/// collapsed into one, the signatures became the same and so did the bodies.
 /// The warning for a join the owner filed under a different name than the one
 /// asked for (None when it kept the name). The owner only does that when the
 /// name is held by another key, which after a reset is this machine's own
@@ -53,161 +45,6 @@ pub(crate) fn renamed_note(asked: &str, stored: &str) -> Option<String> {
     ))
 }
 
-fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<String> {
-    if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
-        bail!(
-            "this device already holds an identity key; join only from a clean Tunlion identity"
-        );
-    }
-    if local_device_cert_path().exists() {
-        bail!("this device already holds a joined certificate; refusing to overwrite it");
-    }
-    let assigned_name = v["name"]
-        .as_str()
-        .ok_or_else(|| anyhow!("join acknowledgement omitted the device name"))?;
-    // The owner name comes from the SIGNED invitation, never from the
-    // acknowledgement frame: a network peer must not choose whose fleet
-    // we think we joined.
-    let owner_name = inv.owner_name.as_str();
-    let secret = v["secret"]
-        .as_str()
-        .ok_or_else(|| anyhow!("join acknowledgement omitted the reconnect secret"))?;
-    if hex::decode(secret).map(|bytes| bytes.len()).ok() != Some(32) {
-        bail!("join acknowledgement carried an invalid reconnect secret");
-    }
-    let expires = v["expires"]
-        .as_u64()
-        .ok_or_else(|| anyhow!("join acknowledgement omitted its expiry"))?;
-    let ceiling = v["ceiling"]
-        .as_array()
-        .ok_or_else(|| anyhow!("join acknowledgement omitted its capability ceiling"))?
-        .iter()
-        .map(|item| {
-            item.as_str()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("join ceiling contains a non-string capability"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let max_offline = v["max_offline"]
-        .as_u64()
-        .ok_or_else(|| anyhow!("join acknowledgement omitted its offline budget ceiling"))?;
-    let persistent = v["persistent"].as_bool().unwrap_or(false);
-    // An ephemeral device's access ends at its lease, which the owner may set
-    // EARLIER than the invitation's end, never later. A persistent device's
-    // end is the invitation's, exactly.
-    let expires_ok = if inv.ephemeral {
-        expires <= inv.expires
-    } else {
-        expires == inv.expires
-    };
-    if !expires_ok
-        || ceiling != inv.caps
-        || max_offline != inv.max_offline
-        || persistent != !inv.ephemeral
-    {
-        bail!(
-            "join acknowledgement changed a signed principal bound (ceiling, expiry, offline budget, or persistence)"
-        );
-    }
-    let local_cert = identity::DeviceCert::from_json(&v["device_cert"])
-        .ok_or_else(|| anyhow!("join acknowledgement omitted the local device certificate"))?;
-    let owner_cert = identity::DeviceCert::from_json(&v["owner_cert"])
-        .ok_or_else(|| anyhow!("join acknowledgement omitted the owner certificate"))?;
-    let overlay_pub = crate::overlay::overlay_pubkey_bytes()?;
-    let fp = crate::ephemeral::issuer_fingerprint(&owner_cert.user_pub);
-    if local_cert.device_pub != overlay_pub
-        || crate::ephemeral::issuer_fingerprint(&local_cert.user_pub) != inv.issuer_fp
-        || local_cert.expires != expires
-        || local_cert.verify(identity::now_secs()).is_err()
-    {
-        bail!("join acknowledgement carried an invalid local device certificate");
-    }
-    if fp != inv.issuer_fp || owner_cert.verify(identity::now_secs()).is_err() {
-        bail!("join acknowledgement carried an invalid owner certificate");
-    }
-    let cert_path = local_device_cert_path();
-    crate::platform::SecretFile::write_str(
-        &cert_path,
-        &serde_json::to_string_pretty(&if inv.ephemeral {
-            // The daemon reads this: an ephemeral device departs (and so is
-            // removed at the owner) when it stops, instead of waiting out
-            // its offline budget.
-            json!({ "name": assigned_name, "cert": local_cert.to_json(), "ephemeral": true })
-        } else {
-            json!({ "name": assigned_name, "cert": local_cert.to_json() })
-        })?,
-    )?;
-    let transfer_caps = vec!["transfer".to_string()];
-    // The invitation names the fleet, but the name is presentation: it must
-    // not re-key a DIFFERENT fleet already recorded under it (stale join, or
-    // a hostile invitation), and it must not re-key a certless record that
-    // merely shares the name either (that record's grants would pass to the
-    // owner's identity). Only a record pinned to the owner's own device key
-    // is updated in place; anything else gets a new, suffixed record. See
-    // devices_store::place_joined_owner.
-    crate::devices_store::devices_store_joined_owner(
-        owner_name,
-        secret,
-        &owner_cert,
-        &transfer_caps,
-        identity::IntroScope::Device.to_byte(),
-    )?;
-    // Fleet auto-mesh: keep the rendezvous secret the owner sent. Its ABSENCE is
-    // not a failure, it just means no auto-mesh (an older owner, or a join that
-    // was not persistent).
-    if let Some(rv) = v["fleet_rv"].as_str() {
-        if let Err(e) = fleet::store_rv(rv) {
-            ui::debug(&format!("fleet rendezvous secret not stored: {e}"));
-        }
-    }
-    // Same-owner fleet-trust: keep the owner's signed capability header so this
-    // device knows which owner its policy answers to. Absence is not a failure
-    // (an older owner simply does not send one); it just leaves the capability
-    // layer unprovisioned here, which is the previous behaviour.
-    if let Some(hdr) = v["cap_header"].as_object() {
-        let dir = crate::settings::config_dir();
-        let mut store = crate::capability::load_cap_store(&dir);
-        let already = store.iter().any(|e| {
-            e.get("type").and_then(|x| x.as_str()) == Some("cap_header")
-                && e["resource"].as_str() == Some("self")
-        });
-        if !already {
-            store.push(Value::Object(hdr.clone()));
-            // The header alone is HALF of what an owner device has:
-            // `ensure_self_genesis_header` writes a header AND a cap_ratchet, and
-            // evaluation needs both. Measured with only the header delivered:
-            // `own_user` resolved (so the header does its job) but the gate still
-            // denied. The ratchet is a LOCAL anti-rollback record keyed on
-            // owner_pub, carries no signature, and owner_pub is right here in the
-            // header, so the joined device can create its own.
-            let owner_pub = hdr
-                .get("owner_pub")
-                .and_then(|v| v.as_str())
-                .and_then(|h| hex::decode(h).ok())
-                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
-            if let Some(owner_pub) = owner_pub {
-                let issued = hdr.get("issued_at").and_then(|v| v.as_u64()).unwrap_or(0);
-                if let Err(e) = crate::capability::update_ratchet(&mut store, &owner_pub, issued) {
-                    ui::debug(&format!("capability ratchet not initialised: {e}"));
-                }
-            }
-            if let Err(e) = crate::capability::save_cap_store(&dir, &store) {
-                ui::debug(&format!("owner capability header not stored: {e}"));
-            }
-        }
-    }
-    // Fleet policy from the owner. Verified against the owner key in the header
-    // just stored, so an unverifiable or foreign-grantor entry is dropped.
-    if let Some(ops) = v["cap_ops"].as_array() {
-        let n = merge_owner_cap_ops(ops);
-        if n > 0 {
-            ui::debug(&format!("stored {n} owner-signed capability op(s)"));
-        }
-    }
-    config_set("name", assigned_name)?;
-    Ok(assigned_name.to_string())
-}
-
 pub(crate) async fn enroll_cmd(
     server: &str,
     inv: crate::ephemeral::Invitation,
@@ -216,11 +53,7 @@ pub(crate) async fn enroll_cmd(
     proposed_name: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
-    use base64::Engine;
-    let enroll_seed = inv.enroll_private_key;
-    let device_pub = crate::overlay::overlay_pubkey_bytes()?;
     let lease = lease_from_env()?;
-
     if !json_output {
         ui::say(&format!(
             "{} invitation loaded (caps: {})",
@@ -229,302 +62,74 @@ pub(crate) async fn enroll_cmd(
         ));
     }
 
-    let my_uid = mk_uid("e");
     let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
-    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(&transport_context, server, tx.clone()).await?;
-
-    // Join enrollment rendezvous channel derived from the owner's key
-    // FINGERPRINT: the compact invitation carries only the 8-byte fp (#186),
-    // and the owner's daemon derives the same channel from its full key.
-    let enroll_chan = crate::ephemeral::enroll_channel_fp(&inv.issuer_fp);
-    let local_name = proposed_name
-        .map(str::to_string)
-        .unwrap_or_else(display_name);
-    let mut sess = session::Session::new(&local_name, &my_uid);
-    sess.room = Some(format!("enrollup-{}", fresh_secret()));
-    sess.channels = vec![enroll_chan.clone()];
-    sess.emit(
-        &sio,
-        "join",
-        json!({ "room": sess.room.as_ref().unwrap(), "name": local_name, "uid": my_uid }),
-    )
-    .await;
-    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] }))
-        .await;
-
-    let mut conn = Conn::for_command(
-        transport_context,
-        server,
-        sio.clone(),
-        tx.clone(),
-        my_uid,
-        relay,
-        to_name,
-        false,
-        direct::direct_enabled(),
-        crate::host_impl::cli_log(),
-        crate::host_impl::cli_host(),
+    let overlay = filament_peerloop::recv::store::OverlayKey::new(
+        crate::platform::Paths::config_path("overlay.ed25519"),
     );
-
+    let cancel = filament_peerloop::driver::Cancellation::default();
     {
-        let tx = tx.clone();
+        let cancel = cancel.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             shutdown::arm_force_exit(130, shutdown::grace());
-            let _ = tx.send(Ev::Interrupted);
+            cancel.cancel();
         });
     }
+    let asked_name = proposed_name
+        .map(str::to_string)
+        .unwrap_or_else(display_name);
+    let request = filament_peerloop::recv::join::JoinRequest {
+        server: server.to_string(),
+        invitation: inv.clone(),
+        proposed_name: asked_name.clone(),
+        peer_name: to_name,
+        relay,
+        lease,
+        timeout: filament_peerloop::recv::join::JOIN_BUDGET,
+        quiet: json_output,
+    };
+    let outcome = filament_peerloop::recv::join::drive(
+        request,
+        &crate::devices_store::store(),
+        &overlay,
+        transport_context,
+        crate::host_impl::cli_log(),
+        crate::host_impl::cli_host(),
+        &cancel,
+    )
+    .await
+    .map_err(|failure| anyhow!("{failure}"))?;
 
-    let started = Instant::now();
-    let enroll_deadline = Duration::from_secs(60);
-
-    loop {
-        conn.pump_builds();
-        let elapsed = started.elapsed();
-        if elapsed >= enroll_deadline {
-            return Err(enrollment_timeout(enroll_deadline.as_secs()));
-        }
-
-        let slice = Duration::from_secs(2).min(enroll_deadline.saturating_sub(elapsed));
-        let ev = match tokio::time::timeout(slice, rx.recv()).await {
-            Ok(Some(ev)) => Some(ev),
-            Ok(None) => bail!("signaling channel closed"),
-            Err(_) => None,
-        };
-
-        sess.tick(&sio).await;
-
-        let Some(ev) = ev else { continue };
-
-        let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
-        match ev {
-            Ev::Welcome(v) => {
-                if let Some(id) = v["id"].as_str() {
-                    conn.my_id = id.to_string();
-                }
-                if let Some(peers) = v["peers"].as_array() {
-                    for p in peers {
-                        conn.maybe_adopt(p, false).await?;
-                    }
-                }
-            }
-            Ev::PeerJoined(v) => {
-                conn.maybe_adopt(&v, false).await?;
-            }
-            Ev::Synced(v) => {
-                if let Some(roster) = sess.on_synced(&v) {
-                    for p in &roster.peers {
-                        conn.maybe_adopt_from(p, false, AdoptSource::Digest).await?;
-                    }
-                    for p in &roster.channel_peers {
-                        if p["channel"].as_str() == Some(enroll_chan.as_str())
-                            && !is_self_uid(&conn.my_uid, p["uid"].as_str())
-                        {
-                            conn.maybe_adopt_from(p, false, AdoptSource::Digest).await?;
-                        }
-                    }
-                }
-            }
-            Ev::KnownPeer(v) => {
-                // The owner daemon is present on the enroll channel. DIAL it as
-                // the IMPOLITE peer (offerer): the owner answers via
-                // ensure_responder (forced polite) and cannot reliably learn of
-                // a late-arriving enroller from server presence, so the enroller
-                // MUST drive the offer regardless of uid ordering.
-                if !is_self_uid(&conn.my_uid, v["uid"].as_str())
-                    && v["channel"].as_str() == Some(enroll_chan.as_str())
-                {
-                    let pid = v["id"].as_str().unwrap_or_default().to_string();
-                    if !pid.is_empty()
-                        && !conn.links.contains_key(&pid)
-                        && !conn.direct_pending.contains_key(&pid)
-                    {
-                        conn.roster.insert(pid.clone(), v.clone());
-                        // BOUNDED, because this is the event loop. `establish_as`
-                        // is awaited by the only handler for Signal, DirectReady,
-                        // ChannelReady and Control, so while it runs no signalling
-                        // reaches anyone. It returns promptly today -- its last act
-                        // is the ESTABLISH trace, after the link is inserted -- but
-                        // "promptly" is a property of what it happens to await
-                        // (`fetch_config`, an HTTP round trip, and `Peer::connect`,
-                        // which ends in a socket.io emit), not something this code
-                        // enforces. A peer that can start an enrolment must not be
-                        // able to hold the loop, so bound it and say so when the
-                        // bound fires (#350): a timeout that reports beats silence.
-                        match tokio::time::timeout(
-                            ESTABLISH_BUDGET,
-                            conn.establish_as(v.clone(), Some(false)),
-                        )
-                        .await
-                        {
-                            // Propagate a real establish error exactly as `?` did
-                            // before the bound was added. Only the TIMEOUT arm is
-                            // new behaviour.
-                            Ok(result) => result?,
-                            Err(_) => {
-                                ui::say(&format!(
-                                    "tunlion: establish for '{pid}' exceeded {}s and was abandoned; the event loop was released (#350)",
-                                    ESTABLISH_BUDGET.as_secs()
-                                ));
-                                continue;
-                            }
-                        }
-                        if conn.active.is_none() {
-                            conn.active = Some(pid);
-                        }
-                    }
-                }
-            }
-            Ev::Signal(v) => {
-                if conn.stage_signal(&v) { continue; }
-                let from = v["from"].as_str().unwrap_or_default().to_string();
-                let data = v["data"].clone();
-                conn.ensure_responder(&from, &data).await?;
-                if conn.build_pending(&from) {
-                    conn.stage_signal(&v);
-                    continue;
-                }
-                conn.apply_signal(&from, data).await;
-            }
-            Ev::DirectReady(pid, t, route) => {
-                if !matches!(
-                    conn.adopt_direct(&pid, t.clone(), route),
-                    crate::conn::DirectAdoption::Adopted { .. }
-                ) {
-                    continue;
-                }
-                let _ = tx.send(Ev::sourced_channel_ready(pid, t));
-            }
-            Ev::ChannelReady(pid, t) => {
-                conn.mark_ready(&pid, &t, true);
-
-                crate::ephemeral::register_enrollment(
-                    pid.clone(),
-                    enroll_seed,
-                    device_pub,
-                    inv.clone(),
-                );
-
-                let _ = t.send_control(&json!({
-                    "type": "identity-auth-key-enroll-request",
-                    "auth_key_v2": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_payload()),
-                    "device_pub": hex::encode(device_pub),
-                })).await;
-                if !json_output {
-                    // The inviting device by name, never its signaling id
-                    // (the lab read "sent enrollment request to lP0Pn2H9kZSCcpZ0AAXj").
-                    let to = conn
-                        .display_name_of(&pid)
-                        .map(|n| format!("'{n}'"))
-                        .unwrap_or_else(|| "the inviting device".to_string());
-                    ui::debug(&format!("enrollment request sent on pid {pid}"));
-                    ui::say(&format!(
-                        "  {} sent enrollment request to {to}",
-                        ui::paint(ui::Tone::Dim, "->"),
-                    ));
-                }
-            }
-            Ev::Control(pid, v) => match v["type"].as_str() {
-                Some("identity-auth-key-enroll-challenge") => {
-                    if let Some(t) = conn.transport_of(&pid) {
-                        let nonce_hex = v["nonce"].as_str().unwrap_or_default();
-                        let verifier_hex = v["verifier_pub"].as_str().unwrap_or_default();
-                        if let (Ok(nonce_bytes), Ok(verifier_bytes)) =
-                            (hex::decode(nonce_hex), hex::decode(verifier_hex))
-                        {
-                            if let (Ok(nonce_arr), Ok(verifier_pub)) = (
-                                nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
-                                verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
-                            ) {
-                                let device_cert = v
-                                    .get("device_cert")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null);
-                                if let Some(response) = crate::ephemeral::build_enrollment_response(
-                                    &pid,
-                                    nonce_arr,
-                                    verifier_pub,
-                                    &device_cert,
-                                ) {
-                                    let mut msg =
-                                        json!({ "type": "identity-auth-key-enroll-response" });
-                                    if let Some(obj) = response.as_object() {
-                                        for (k, v) in obj {
-                                            msg[k] = v.clone();
-                                        }
-                                    }
-                                    // A lease only narrows an ephemeral
-                                    // device's access; the owner ignores it
-                                    // for anything else.
-                                    if let Some(lease) = lease {
-                                        msg["lease"] = json!(lease);
-                                    }
-                                    let _ = t.send_control(&msg).await;
-                                }
-                            }
-                        }
-                    }
-                }
-                Some("identity-auth-key-enroll-ack") => {
-                    let name = persist_join_ack(&v, &inv)?;
-                    if json_output {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&json!({
-                                "ok": true,
-                                "verb": "join",
-                                "joined": true,
-                                "name": name,
-                                "devicePub": hex::encode(device_pub),
-                                "ceiling": inv.caps,
-                                "expires": v["expires"].as_u64().unwrap_or(inv.expires),
-                                "ephemeral": inv.ephemeral,
-                                "persistsAcrossReconnect": true,
-                            }))?
-                        );
-                    } else {
-                        ui::say(&format!(
-                            "{} joined as '{}' with a persisted ceiling (device_pub: {})",
-                            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                            name,
-                            hex::encode(device_pub)
-                        ));
-                    }
-                    // The owner files a new key under a free name when the one
-                    // asked for is held by another key (a stale record of this
-                    // same machine, usually). That used to pass silently: `join
-                    // --name beta` printed "joined as 'beta-2'" and exited 0,
-                    // and the re-enrolment recipe's "rejoins under the same
-                    // name" was false. Say so, with the way back.
-                    if let Some(note) = proposed_name.and_then(|asked| renamed_note(asked, &name)) {
-                        ui::critical(&note);
-                    }
-                    return Ok(());
-                }
-                Some("identity-auth-key-enroll-error") => {
-                    // #222: name the reason the way the expired path does. The
-                    // server sends a specific fact (already used / use limit
-                    // reached / rate-limited) instead of a generic denial.
-                    let reason = v["reason"].as_str().unwrap_or("unknown");
-                    bail!(match reason {
-                        "already used" => "this invitation has already been used".to_string(),
-                        "use limit reached" =>
-                            "this invitation has reached its use limit".to_string(),
-                        filament_peerloop::recv::store::WITHDRAWN_WIRE_REASON =>
-                            "the owner withdrew this invitation, so it can no longer be used; ask them for a new one".to_string(),
-                        _ => format!("enrollment denied: {reason}"),
-                    });
-                }
-                _ => {}
-            },
-            Ev::Interrupted => bail!("cancelled"),
-            Ev::SignalingDown(reason, _) => {
-                bail!("signaling connection lost: {reason}");
-            }
-            _ => {}
-        }
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "verb": "join",
+                "joined": true,
+                "name": outcome.name,
+                "devicePub": hex::encode(outcome.device_pub),
+                "ceiling": outcome.ceiling,
+                "expires": outcome.expires,
+                "ephemeral": outcome.ephemeral,
+                "persistsAcrossReconnect": true,
+            }))?
+        );
+    } else {
+        ui::say(&format!(
+            "{} joined as '{}' with a persisted ceiling (device_pub: {})",
+            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+            outcome.name,
+            hex::encode(outcome.device_pub)
+        ));
     }
+    // The owner files a new key under a free name when the one asked for is
+    // held by another key (a stale record of this same machine, usually). Say
+    // so, with the way back.
+    if let Some(note) = proposed_name.and_then(|asked| renamed_note(asked, &outcome.name)) {
+        ui::critical(&note);
+    }
+    Ok(())
 }
 
 /// Loads auth key, joins enrollment channel, completes handshake, then sends
@@ -745,7 +350,12 @@ pub(crate) async fn enroll_and_send_cmd(
                     }
                 }
                 Some("identity-auth-key-enroll-ack") => {
-                    let name = persist_join_ack(&v, &ak)?;
+                    let name = filament_peerloop::recv::enrollment::persist_join_ack(
+                        &crate::devices_store::store(),
+                        &device_pub,
+                        &ak,
+                        &v,
+                    )?;
                     ui::say(&format!(
                         "  {} joined as {name}",
                         ui::paint(ui::Tone::Ok, ui::glyph_ok())
