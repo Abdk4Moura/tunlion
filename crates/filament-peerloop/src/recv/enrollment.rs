@@ -24,7 +24,7 @@ use crate::recv::store::{
     sanitize_device_name, DeviceStore, InvitationRefusal, OverlayKey, PRINCIPAL_STATE_LAPSED,
     PRINCIPAL_STATE_REVOKED,
 };
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use base64::Engine;
 use filament_cap::ephemeral::{
     EnrollmentPayload, EnrollmentPrincipal, EnrollmentState, Invitation,
