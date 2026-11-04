@@ -139,7 +139,7 @@ impl HostServices for CliHost {
     ) -> std::result::Result<usize, String> {
         crate::settings::extract_archive(path, dir).map_err(|e| e.to_string())
     }
-    fn record_received_file(&self, record: &filament_peerloop::recv::files::ReceivedFileRecord) {
+    fn record_received_file(&self, record: &filament_peerloop::recv::store::ReceivedFileRecord) {
         crate::transfer_history::append(&[crate::transfer_history::Record {
             time: record.time,
             direction: "in",

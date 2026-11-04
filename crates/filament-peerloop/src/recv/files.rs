@@ -19,16 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
-/// One structured receive-history row. The host maps it onto its own store.
-pub struct ReceivedFileRecord {
-    pub time: u64,
-    pub peer: Option<String>,
-    pub file: String,
-    pub stored: Option<String>,
-    pub bytes: u64,
-    pub sha256: Option<String>,
-    pub ok: bool,
-}
+/// One structured receive-history row. Shared with the device store because a
+/// host can persist receipts without compiling the dispatch receive path.
+pub use crate::recv::store::ReceivedFileRecord;
 
 /// The delivery-ack for transfer `id`, carrying the name it was stored under
 /// when this invocation knows it. `stored` is additive: an older sender ignores

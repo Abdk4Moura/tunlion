@@ -112,13 +112,17 @@ presence and direction-named action facts. Personal, external and temporary
 relationships are distinct from their bounded capability ceilings. Expiry does
 not turn a personal device into an external contact.
 
-Presence is currently `Unknown`, not offline. Outbound `send` authorization is
-`Unknown`: a receiver-local grant does not describe the remote receiver's
-permissions. `receive-inbox` reports persisted expiry/revocation/denial as
-`Blocked`; otherwise it remains `Unknown` until authenticated link facts are
-available. Terminal and folder serving are `Unsupported` in this Core profile.
-No state in this snapshot acknowledges remote grant delivery or global removal.
-A corrupt devices store returns `CoreError::Config`, not an empty device list.
+Presence is currently `Unknown`, not offline; the enum also carries `Live` so a
+later authenticated-presence source can express it without changing the record
+shape. Outbound `send` authorization is `Unknown`: a receiver-local grant does
+not describe the remote receiver's permissions. `receive-inbox` reports
+persisted expiry/revocation/denial as `Blocked`; otherwise it remains `Unknown`
+until authenticated link facts are available. Every action carries the typed
+`ActionKind` (`Send`, `ReceiveInbox`, `Terminal`, `Folder`) in a stable order;
+clients switch on that enum, never on a display string. Terminal and folder
+serving are `Unsupported` in this Core profile. No state in this snapshot
+acknowledges remote grant delivery or global removal. A corrupt devices store
+returns `CoreError::Config`, not an empty device list.
 
 The Core receiver also appends completion facts to config `transfers.json`,
 using the CLI schema (`direction: "in"`, offered `file`, receiver `stored` path,

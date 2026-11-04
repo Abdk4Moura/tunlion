@@ -20,7 +20,7 @@
 
 mod host;
 mod devices;
-pub use devices::{AccessState, DeviceAccess, DevicePresence, DeviceRelationship, EffectiveAction};
+pub use devices::{AccessState, ActionKind, DeviceAccess, DevicePresence, DeviceRelationship, EffectiveAction};
 pub mod access;
 
 uniffi::setup_scaffolding!();

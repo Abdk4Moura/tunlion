@@ -9,15 +9,39 @@ use serde_json::Value;
 pub enum DeviceRelationship { Paired, Fleet, Temporary, Unknown }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum DevicePresence { Unknown }
+pub enum DevicePresence { Unknown, Live }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum AccessState { Available, Blocked, Unsupported, Unknown }
 
+/// The stable direction/kind of one effective action. Clients switch on this
+/// enum, never on the display string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ActionKind { Send, ReceiveInbox, Terminal, Folder }
+
+impl ActionKind {
+    /// Stable wire/display token. CLI text may use this; policy and client
+    /// logic must match the enum variant instead.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActionKind::Send => "send",
+            ActionKind::ReceiveInbox => "receive-inbox",
+            ActionKind::Terminal => "terminal",
+            ActionKind::Folder => "folder",
+        }
+    }
+}
+
+impl std::fmt::Display for ActionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct EffectiveAction {
     /// Direction is explicit: `send` is outbound; `receive-inbox` is local.
-    pub action: String,
+    pub action: ActionKind,
     pub state: AccessState,
     pub reason: String,
 }
@@ -33,8 +57,8 @@ pub struct DeviceAccess {
     pub actions: Vec<EffectiveAction>,
 }
 
-fn action(action: &str, state: AccessState, reason: &str) -> EffectiveAction {
-    EffectiveAction { action: action.into(), state, reason: reason.into() }
+fn action(action: ActionKind, state: AccessState, reason: &str) -> EffectiveAction {
+    EffectiveAction { action, state, reason: reason.into() }
 }
 
 impl Core {
@@ -83,22 +107,22 @@ fn project(record: &Value, store: &DeviceStore, now: u64) -> Result<DeviceAccess
     ).0).or_else(|| record["principalExpires"].as_u64());
     let denied = record["deniedCaps"].as_array().is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some("transfer")));
     let receive = if revoked {
-        action("receive-inbox", AccessState::Blocked, "Device access is revoked on this receiver")
+        action(ActionKind::ReceiveInbox, AccessState::Blocked, "Device access is revoked on this receiver")
     } else if expires_at.is_some_and(|at| at <= now) {
-        action("receive-inbox", AccessState::Blocked, "Device access has expired")
+        action(ActionKind::ReceiveInbox, AccessState::Blocked, "Device access has expired")
     } else if denied {
-        action("receive-inbox", AccessState::Blocked, "Transfer is explicitly denied on this receiver")
+        action(ActionKind::ReceiveInbox, AccessState::Blocked, "Transfer is explicitly denied on this receiver")
     } else {
-        action("receive-inbox", AccessState::Unknown, "Stored relationship only; the receive gate requires authenticated link facts")
+        action(ActionKind::ReceiveInbox, AccessState::Unknown, "Stored relationship only; the receive gate requires authenticated link facts")
     };
     Ok(DeviceAccess {
         name: name.into(), device_key: key.map(hex::encode), relationship, expires_at, revoked,
         presence: DevicePresence::Unknown,
         actions: vec![
-            action("send", AccessState::Unknown, "Remote receiver authorization and reachability are not observed"),
+            action(ActionKind::Send, AccessState::Unknown, "Remote receiver authorization and reachability are not observed"),
             receive,
-            action("terminal", AccessState::Unsupported, "This core profile does not serve terminals"),
-            action("folder", AccessState::Unsupported, "This core profile does not serve folder mounts"),
+            action(ActionKind::Terminal, AccessState::Unsupported, "This core profile does not serve terminals"),
+            action(ActionKind::Folder, AccessState::Unsupported, "This core profile does not serve folder mounts"),
         ],
     })
 }
@@ -119,6 +143,9 @@ mod tests {
         ]).to_string()).unwrap();
         let devices = core.devices().unwrap();
         assert_eq!(devices[0].relationship, DeviceRelationship::Paired);
+        assert_eq!(devices[0].actions.iter().map(|a| a.action).collect::<Vec<_>>(),
+            vec![ActionKind::Send, ActionKind::ReceiveInbox, ActionKind::Terminal, ActionKind::Folder]);
+        assert_eq!(ActionKind::ReceiveInbox.to_string(), "receive-inbox");
         assert_eq!(devices[0].actions[0].state, AccessState::Unknown);
         assert_eq!(devices[0].actions[2].state, AccessState::Unsupported);
         assert_eq!(devices[1].relationship, DeviceRelationship::Temporary);
