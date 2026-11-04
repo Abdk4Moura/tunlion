@@ -13,7 +13,11 @@ PYV="${TUNLION_TEST_VENV:-python3}"
 # direct-QUIC sibling stall is reported by the fleet-automesh gates that own it,
 # not as a terminal failure here. The session is still authenticated by the
 # daemon-brokered private secret before any open is sent.
+# `TUNLION_DIRECT=0` alone is not enough: a long-lived acceptor forces the
+# direct rung on to avoid glare, so the test-hooks build exposes the explicit
+# no-direct switch this worker binary is built with.
 export TUNLION_DIRECT=0
+export TUNLION_TEST_NO_DIRECT=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fleet-terminal-cut.XXXXXX")"
 DA="$WORK/alpha"
 source "$HERE/lib/fixture.sh"
@@ -38,9 +42,10 @@ wait_file() {
     return 1
 }
 # The cold one-shot path resolves a fleet sibling through the index record a
-# verified fleet-hello writes. A roster NAME alone is not dialable, and a
-# private rendezvous is brokered only over a certificate-verified link. Wait
-# for that exact fact instead of starting a terminal into a setup race.
+# verified fleet-hello writes. A roster NAME alone is not dialable. Wait for
+# that record, then exercise the same terminal path with a one-shot `true`
+# instead of trusting a reach liveness ping: the warm ping is a separate
+# liveness surface and its failure does not mean the terminal cannot open.
 fleet_indexed() {
     python3 - "$WORK/$1/devices.json" <<'PY'
 import json,sys
@@ -49,17 +54,26 @@ except (OSError,ValueError): raise SystemExit(1)
 assert any(d.get('name')=='charlie' and not d.get('secret') for d in arr)
 PY
 }
-wait_fleet_link() {
+wait_terminal_path() {
     local node=$1
-    for _ in $(seq 1 12); do
-        if fleet_indexed "$node" \
-            && as_node "$node" reach charlie --json --timeout 2 \
-                >"$WORK/$node-reach.json" 2>"$WORK/$node-reach.err"
-        then
-            ok "$node: certificate-verified fleet link to charlie before terminal"
+    local _ attempt
+    for _ in $(seq 1 60); do
+        fleet_indexed "$node" && break
+        sleep 0.5
+    done
+    fleet_indexed "$node" || return 1
+    for attempt in 1 2 3; do
+        fs_bounded 20 as_node "$node" exec charlie -- true \
+            >"$WORK/$node-preflight.log" 2>&1
+        if [ "$(fs_state)" = ok ] && [ "$(fs_rc)" = 0 ]; then
+            ok "$node: terminal path to charlie answered before controls"
             return 0
         fi
-        sleep 0.5
+        # Authority refusals are not a readiness race: report them at once.
+        if grep -qiE 'refus|denied|no grant|ceiling|not authorized' "$WORK/$node-preflight.log"; then
+            return 1
+        fi
+        sleep 1
     done
     return 1
 }
@@ -96,7 +110,7 @@ diagnose() {
         echo "--- source"; cat "$SOURCE_HASHES" 2>/dev/null
         echo "--- work directory"; ls -la "$WORK" 2>/dev/null
         echo "--- per-process output"
-        for f in "$WORK"/*.err "$WORK"/*.out "$WORK"/*-reach.json "$WORK"/*-reach.err; do
+        for f in "$WORK"/*.err "$WORK"/*.out "$WORK"/*-preflight.log "$WORK"/*-reach.json "$WORK"/*-reach.err; do
             [ -f "$f" ] || continue
             echo "### ${f##*/}"; tail -80 "$f"
         done
@@ -129,6 +143,17 @@ start_backend
 init_owner "$DA"
 start_acceptor "$DA"
 for node in bravo charlie delta; do enroll_delegate "$node" --allow transfer,mount,shell; done
+# Premise: the terminal is not refused or admitted by the enrollment ceiling.
+# Every participant's invited ceiling includes shell, so the only remaining
+# authorization fact these controls can be measuring is the owner grant.
+python3 - "$WORK/alpha/devices.json" <<'PY'
+import json,sys
+arr=json.load(open(sys.argv[1]))
+for name in ('bravo','charlie','delta'):
+    rec=next(d for d in arr if d.get('name')==name)
+    assert 'shell' in (rec.get('principalCeiling') or []), name
+PY
+ok "premise: every terminal participant's invitation ceiling includes shell"
 as_node charlie set fleet.owner_grants all >/dev/null || fixture_die "target owner grant policy setup"
 for node in bravo charlie delta; do
     env HOME="$WORK/home-$node" TUNLION_CONFIG_DIR="$WORK/$node" TUNLION_L2=1 TUNLION_LOG=debug \
@@ -157,9 +182,9 @@ PY
     # ceiling. The owner's per-device grant below is still the only thing that
     # authorizes these terminals: the ceiling is a cap, not a grant.
     for node in bravo delta; do
-        wait_fleet_link "$node" || {
-            diagnose "$mode: $node has no verified fleet link to charlie"
-            fixture_die "$mode: $node has no certificate-verified fleet link to charlie"
+        wait_terminal_path "$node" || {
+            diagnose "$mode: $node has no working terminal path to charlie"
+            fixture_die "$mode: $node has no working terminal path to charlie"
         }
     done
     start_terminal bravo "$mode" "$mode-match" >"$WORK/$mode-match.out" 2>"$WORK/$mode-match.err" &
@@ -180,12 +205,44 @@ PY
     as_node alpha revoke bravo shell --on charlie >"$WORK/$mode-withdraw.log" 2>&1 \
         || fixture_die "$mode: owner withdrawal failed"
     # Same 12s bound as existing PTY revocation gates, no timeout widening.
-    for _ in $(seq 1 24); do kill -0 "$match_child" 2>/dev/null || break; sleep 0.5; done
+    # The target's held grant set is the receiver fact a running session
+    # rechecks, so wait for both that removal and the child's exit in one bound.
+    cleared=0
+    for _ in $(seq 1 24); do
+        if [ "$cleared" = 0 ] && python3 - "$WORK/alpha/devices.json" "$WORK/charlie/fleet-grants-held.json" <<'PY'
+import json,sys
+try:
+    recs=json.load(open(sys.argv[1]))
+    held=json.load(open(sys.argv[2]))
+except (OSError,ValueError):
+    raise SystemExit(1)
+pub={d['name']: (d.get('deviceCert') or {}).get('devicePub') for d in recs}
+subjects={g.get('subject_pub') for g in held.get('grants') or [] if g.get('cap')=='shell'}
+assert pub['bravo'] not in subjects and pub['delta'] in subjects
+PY
+        then cleared=1; fi
+        kill -0 "$match_child" 2>/dev/null || break
+        sleep 0.5
+    done
     if kill -0 "$match_child" 2>/dev/null; then
         bad "$mode: matching terminal child survived owner withdrawal"
     else
         ok "$mode: matching terminal child was terminated within 12s"
     fi
+    if [ "$cleared" = 1 ]; then
+        ok "$mode: target holds no shell grant for the withdrawn subject"
+    else
+        bad "$mode: target still holds the withdrawn subject's shell grant"
+    fi
+    # The ceiling still includes shell, so the terminated session proves the
+    # owner grant was the authorizing fact, not the enrollment ceiling.
+    python3 - "$WORK/alpha/devices.json" <<'PY'
+import json,sys
+recs=json.load(open(sys.argv[1]))
+rec=next(d for d in recs if d.get('name')=='bravo')
+assert 'shell' in (rec.get('principalCeiling') or [])
+PY
+    ok "$mode: matching terminal ended while its shell ceiling remained"
     if kill -0 "$control_child" 2>/dev/null && kill -0 "$control" 2>/dev/null; then
         ok "$mode: unrelated sibling terminal remains active"
     else

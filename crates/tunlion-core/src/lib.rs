@@ -21,7 +21,9 @@
 mod host;
 mod devices;
 mod enrollment;
-pub use devices::{AccessState, DeviceAccess, DevicePresence, DeviceRelationship, EffectiveAction};
+pub use devices::{
+    AccessState, ActionKind, DeviceAccess, DevicePresence, DeviceRelationship, EffectiveAction,
+};
 pub use enrollment::{
     CoreInvitationInput, CoreInvitationKind, CoreInvitationPreview, CoreInvitationReuse,
     CoreJoinResult, CoreOutstandingInvitation, EnrollmentRelationship,

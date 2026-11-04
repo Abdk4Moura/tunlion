@@ -87,6 +87,22 @@ pub enum InvitationRefusal {
 /// whole sentence that reads correctly there too.
 pub const WITHDRAWN_WIRE_REASON: &str = "the owner withdrew this invitation";
 
+/// One structured receive-history row.
+///
+/// Lives here, not in `recv::files`, because a host that persists receipts
+/// without the dispatch feature still needs the shape. The dispatch receive
+/// path re-exports it from `recv::files` for its existing callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedFileRecord {
+    pub time: u64,
+    pub peer: Option<String>,
+    pub file: String,
+    pub stored: Option<String>,
+    pub bytes: u64,
+    pub sha256: Option<String>,
+    pub ok: bool,
+}
+
 impl InvitationRefusal {
     pub fn wire_reason(self) -> &'static str {
         match self {
@@ -585,8 +601,8 @@ mod receive_history_tests {
         fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
     }
 
-    fn receipt(index: u64) -> crate::recv::files::ReceivedFileRecord {
-        crate::recv::files::ReceivedFileRecord {
+    fn receipt(index: u64) -> ReceivedFileRecord {
+        ReceivedFileRecord {
             time: index, peer: Some("sender".into()), file: "offered.txt".into(),
             stored: Some("/inbox/offered.1.txt".into()), bytes: 42,
             sha256: Some("ab".repeat(32)), ok: true,
@@ -750,11 +766,7 @@ impl DeviceStore {
     /// Persist a receiver completion fact, not a file-existence observation.
     /// Uses the same bounded JSON schema and stable writer sidecar as CLI
     /// history. A corrupt journal is preserved and reported, never overwritten.
-    /// This is a dispatch-path writer: the reduced peerloop profile has no
-    /// `recv::files` type to accept, so the method is compiled only with
-    /// `dispatch` instead of breaking the feature boundary.
-    #[cfg(feature = "dispatch")]
-    pub fn record_received_file(&self, record: &crate::recv::files::ReceivedFileRecord) -> io::Result<()> {
+    pub fn record_received_file(&self, record: &ReceivedFileRecord) -> io::Result<()> {
         create_private_dir_all(&self.root)?;
         let path = self.root.join("transfers.json");
         let _lock = StoreLock::acquire(&path.with_extension("json.lock"))?;
