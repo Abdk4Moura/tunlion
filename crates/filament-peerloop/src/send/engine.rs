@@ -255,6 +255,41 @@ fn build_outgoing(request: &SendRequest, log: &dyn LogSink) -> Result<Vec<Outgoi
     Ok(outgoing)
 }
 
+/// Which event class a code sender is deciding for. All three are tied to the
+/// one signaling peer the PAKE ceremony authenticated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodePeerEvent {
+    /// Transport control frames: never accepted before the ceremony settles,
+    /// and after it only from the ceremony peer.
+    Control,
+    /// A ready channel. Allowed before the ceremony so the PAKE itself can
+    /// run; after it only the ceremony peer may ever become the receiver.
+    Channel,
+    /// Room/roster adoption. Same rule as a ready channel.
+    Adoption,
+}
+
+/// May a code sender process an event from `pid`? Pure: a spent code
+/// authorizes exactly the peer whose ceremony completed, never a replacement
+/// room member, even one claiming the same install UID or holding a partial.
+fn code_peer_event_allowed(
+    use_code: bool,
+    pake_done: bool,
+    ceremony_peer: Option<&str>,
+    pid: &str,
+    kind: CodePeerEvent,
+) -> bool {
+    if !use_code {
+        return true;
+    }
+    match kind {
+        CodePeerEvent::Control => pake_done && ceremony_peer == Some(pid),
+        CodePeerEvent::Channel | CodePeerEvent::Adoption => {
+            !pake_done || ceremony_peer == Some(pid)
+        }
+    }
+}
+
 fn adopt_wants_active(code_claimed: bool, use_code: bool, _pake_done: bool) -> bool {
     code_claimed && !use_code
 }
@@ -683,8 +718,28 @@ async fn drive_over(
         // member claiming the same install UID after the receiver disappears.
         if use_code {
             match &ev {
-                Ev::Control(pid, _) if !pake_done || pake_peer.as_deref() != Some(pid.as_str()) => continue,
-                Ev::ChannelReady(pid, _) if pake_done && pake_peer.as_deref() != Some(pid.as_str()) => continue,
+                Ev::Control(pid, _)
+                    if !code_peer_event_allowed(
+                        use_code,
+                        pake_done,
+                        pake_peer.as_deref(),
+                        pid,
+                        CodePeerEvent::Control,
+                    ) =>
+                {
+                    continue
+                }
+                Ev::ChannelReady(pid, _)
+                    if !code_peer_event_allowed(
+                        use_code,
+                        pake_done,
+                        pake_peer.as_deref(),
+                        pid,
+                        CodePeerEvent::Channel,
+                    ) =>
+                {
+                    continue
+                }
                 _ => {}
             }
         }
@@ -695,7 +750,13 @@ async fn drive_over(
                 }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
-                        if use_code && pake_done && p["id"].as_str() != pake_peer.as_deref() {
+                        if !code_peer_event_allowed(
+                            use_code,
+                            pake_done,
+                            pake_peer.as_deref(),
+                            p["id"].as_str().unwrap_or_default(),
+                            CodePeerEvent::Adoption,
+                        ) {
                             continue;
                         }
                         conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done))
@@ -708,7 +769,13 @@ async fn drive_over(
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
-                        if use_code && pake_done && p["id"].as_str() != pake_peer.as_deref() {
+                        if !code_peer_event_allowed(
+                            use_code,
+                            pake_done,
+                            pake_peer.as_deref(),
+                            p["id"].as_str().unwrap_or_default(),
+                            CodePeerEvent::Adoption,
+                        ) {
                             continue;
                         }
                         conn.maybe_adopt_from(
@@ -776,7 +843,13 @@ async fn drive_over(
                 ports.log.say("code claimed, connecting...");
             }
             Ev::PeerJoined(v) => {
-                if use_code && pake_done && v["id"].as_str() != pake_peer.as_deref() {
+                if !code_peer_event_allowed(
+                    use_code,
+                    pake_done,
+                    pake_peer.as_deref(),
+                    v["id"].as_str().unwrap_or_default(),
+                    CodePeerEvent::Adoption,
+                ) {
                     continue;
                 }
                 conn.maybe_adopt(&v, adopt_wants_active(code_used, use_code, pake_done))
@@ -1157,6 +1230,50 @@ fn no_peer_message(device: Option<&str>, use_code: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_non_ceremony_room_peer_cannot_receive_after_the_authentic_receiver_dies() {
+        let authentic = "sid-authentic";
+        let replacement = "sid-replacement";
+        let peer = Some(authentic);
+        for kind in [
+            CodePeerEvent::Control,
+            CodePeerEvent::Channel,
+            CodePeerEvent::Adoption,
+        ] {
+            assert!(code_peer_event_allowed(true, true, peer, authentic, kind));
+            assert!(
+                !code_peer_event_allowed(true, true, peer, replacement, kind),
+                "a spent code must not authorize a replacement room peer: {kind:?}"
+            );
+        }
+        assert!(!adopt_wants_active(true, true, true));
+    }
+
+    #[test]
+    fn an_unclaimed_code_still_accepts_the_room_channel_that_carries_the_ceremony() {
+        assert!(code_peer_event_allowed(
+            true,
+            false,
+            None,
+            "sid-room",
+            CodePeerEvent::Channel
+        ));
+        assert!(code_peer_event_allowed(
+            true,
+            false,
+            None,
+            "sid-room",
+            CodePeerEvent::Adoption
+        ));
+        assert!(!code_peer_event_allowed(
+            true,
+            false,
+            None,
+            "sid-room",
+            CodePeerEvent::Control
+        ));
+    }
 
     #[test]
     fn a_claimed_code_is_not_expired_by_its_ttl_or_claim_bound() {
