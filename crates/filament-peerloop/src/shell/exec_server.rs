@@ -241,6 +241,7 @@ async fn end_session_tree(
 /// in [`handle_exec_open`]; the ticker below re-reads the STORE each tick.
 #[derive(Clone)]
 pub struct ExecSessionAuthz {
+    pub terminal_scope: Option<crate::shell_gate::TerminalSessionScope>,
     pub dev_name: Option<String>,
     pub idev: Option<[u8; 32]>,
     pub policy_allows: bool,
@@ -639,13 +640,13 @@ pub async fn serve_exec(
                 // Revocation and the delegated deadline, from the one live
                 // re-check every serving loop shares.
                 let cut = host.live_session_cut(authz.idev.as_ref());
-                let grant_gone = match authz.dev_name.as_deref() {
+                let grant_gone = authz.terminal_scope.as_ref().map(|scope| scope.withdrawn(host.as_ref())).unwrap_or_else(|| match authz.dev_name.as_deref() {
                     Some(n) => {
                         host.device_capability_denied(n, "shell")
                             || !(authz.policy_allows || host.device_allows(n, "shell"))
                     }
                     None => false,
-                };
+                });
                 // A ceiling narrowed under a ceiling-admitted session ends
                 // it (re-read fresh; grant-admitted sessions ignore this).
                 let ceiling_gone = authz.admitted_via_ceiling
@@ -890,6 +891,7 @@ pub async fn handle_exec_open(
         .unwrap_or(false);
     let idev = device_pub;
     let authz = ExecSessionAuthz {
+        terminal_scope: Some(crate::shell_gate::TerminalSessionScope::capture(conn, pid, shell_policy)),
         dev_name,
         idev,
         policy_allows,
@@ -1202,6 +1204,7 @@ mod tests {
                 ExecSessionAuthz {
                     dev_name: Some("phone".into()),
                     idev: None,
+                    terminal_scope: None,
                     policy_allows: true,
                     admitted_via_ceiling: false,
                 },

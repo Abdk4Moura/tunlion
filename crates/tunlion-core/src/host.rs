@@ -423,8 +423,8 @@ impl HostServices for CoreHost {
         delegated_access_for(&self.store, device_pub)
     }
 
-    fn device_capability_denied(&self, _name: &str, _capability: &str) -> bool {
-        false
+    fn device_capability_denied(&self, name: &str, capability: &str) -> bool {
+        self.store.device_capability_denied(name, capability)
     }
 
     fn device_allows(&self, _name: &str, _capability: &str) -> bool {

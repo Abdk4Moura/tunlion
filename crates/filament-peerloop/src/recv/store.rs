@@ -715,6 +715,14 @@ impl DeviceStore {
             .any(|d| d["name"].as_str() == Some(name) && record_is_revoked(d))
     }
 
+    /// Receiver-local denial, independent of invitation and owner grants.
+    pub fn device_capability_denied(&self, name: &str, capability: &str) -> bool {
+        self.devices_records().iter()
+            .find(|record| record["name"].as_str() == Some(name))
+            .and_then(|record| record["deniedCaps"].as_array())
+            .is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some(capability)))
+    }
+
     /// The key revocations at `revoked-keys.json`, fail-closed: absent is
     /// empty, unreadable or unparseable is an error.
     pub fn key_revocations_path(&self) -> PathBuf {

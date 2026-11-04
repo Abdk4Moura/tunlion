@@ -334,6 +334,7 @@ pub async fn spawn_pty_session(
     // tick, exactly like a revocation. Grant-admitted sessions ignore the
     // ceiling (the grant authorizes); uncovered sessions never set this.
     admitted_via_ceiling: bool,
+    terminal_scope: Option<filament_peerloop::shell_gate::TerminalSessionScope>,
 ) -> Option<PtySessionHandle> {
     use std::io::{Read as _, Write as _};
     // The backend (portable-pty, or the Windows token relay) is chosen in the
@@ -499,7 +500,10 @@ pub async fn spawn_pty_session(
                     let lapsed =
                         matches!(crate::identity_state::peer_liveness_alive(idev.as_ref()), Some(false));
                     let cut = crate::identity_state::live_session_cut(idev.as_ref());
-                    if cut.is_some() || ceiling_gone || lapsed {
+                    let grant_gone = terminal_scope.as_ref().is_some_and(|scope| {
+                        scope.withdrawn(&crate::host_impl::CliHost)
+                    });
+                    if cut.is_some() || ceiling_gone || lapsed || grant_gone {
                         let reason = match cut {
                             Some(c) => c.reason_for(idev.as_ref()),
                             None => crate::capability::REVOKED_REASON.to_string(),
@@ -6131,6 +6135,7 @@ mod h1_tests {
             guard,
             None,
             false,
+            None,
         )
         .await
         .expect("spawn");
@@ -6215,6 +6220,7 @@ mod h1_tests {
             guard,
             None,
             false,
+            None,
         )
         .await
         .expect("spawn");
@@ -6268,6 +6274,7 @@ mod h1_tests {
             guard,
             None,
             false,
+            None,
         )
         .await
         .expect("spawn");
@@ -6338,7 +6345,7 @@ mod h1_tests {
                 sessions.clone(), id.clone(), ta.clone(), sid_a, 80, 24,
                 "xterm-256color",
                 argv,
-                PtyGuard::try_acquire().expect("slot"), None, false,
+                PtyGuard::try_acquire().expect("slot"), None, false, None,
             ).await.expect("spawn");
             tokio::time::timeout(Duration::from_secs(5), async {
                 while ta.bytes_for(sid_a).len() < before.len() {
