@@ -104,6 +104,10 @@
 #                              allocates a real code and delivers bytes to the
 #                              normal CLI receiver; the CLI inbox matches and
 #                              the library summary reports the delivery
+#   core-invitation-join-gates.sh  a real CLI owner mints an invitation file
+#                              and a blank Core joins it through
+#                              `Core::join_invitation`: preview, stored transfer
+#                              ceiling, local cert/name, and the owner's record
 #   promote-mbb-gates.sh       a code transfer starts on the WebRTC link the
 #                              ceremony authenticated instead of waiting for
 #                              direct QUIC, moves to QUIC mid-file at a frame
@@ -168,6 +172,7 @@ on:
       - 'cli/tests/core-receive-e2e-gates.sh'
       - 'cli/tests/core-receive-relay-nat-gates.sh'
       - 'cli/tests/core-send-e2e-gates.sh'
+      - 'cli/tests/core-invitation-join-gates.sh'
       - 'cli/tests/dashboard-gates.sh'
       - 'cli/tests/demo-gates.sh'
       - 'cli/tests/pair-bystander-gates.sh'
@@ -281,11 +286,17 @@ jobs:
       - name: Build Core send helper
         run: cargo build --release -p tunlion-core --bin send-code
 
+      # The library joiner arm of the invitation E2E gate. It runs the real
+      # shared `recv::join::drive`, not the CLI join command.
+      - name: Build Core join helper
+        run: cargo build --release -p tunlion-core --bin join-invitation
+
       - name: Run gates
         env:
           TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
           TUNLION_CORE_BIN: ${{ github.workspace }}/target/release/receive-code
           TUNLION_CORE_SEND_BIN: ${{ github.workspace }}/target/release/send-code
+          TUNLION_CORE_JOIN_BIN: ${{ github.workspace }}/target/release/join-invitation
         run: |
           set -uo pipefail
           declare -A EXPECT=(
@@ -329,6 +340,9 @@ jobs:
             # 5: P1 library delivery, P2 CLI receiver exit, P3 inbox bytes,
             # P4 code not logged by the library sender, P5 code path ran.
             [cli/tests/core-send-e2e-gates.sh]=5
+            # 4: P1 preview, J1 join, J2 local cert/name and no owner key,
+            # J3 the owner records the same transfer-only ceiling.
+            [cli/tests/core-invitation-join-gates.sh]=4
             # 10: H O S A W I G C C2 X (feat/dashboard; C2: the owner holds a
             # code claimer's certificate).
             [cli/tests/dashboard-gates.sh]=10
@@ -388,6 +402,7 @@ jobs:
                    cli/tests/core-receive-e2e-gates.sh \
                    cli/tests/core-receive-relay-nat-gates.sh \
                    cli/tests/core-send-e2e-gates.sh \
+                   cli/tests/core-invitation-join-gates.sh \
                    cli/tests/dashboard-gates.sh \
                    cli/tests/demo-gates.sh \
                    cli/tests/pair-bystander-gates.sh \
