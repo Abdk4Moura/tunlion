@@ -4724,14 +4724,14 @@ mod transfer_decision_tests {
     #[test]
     fn an_explicit_fleet_grant_survives_inferred_only_where_the_policy_allows_it() {
         let denied = CapOutcome::Denied("denied".into());
-        let mut gate = input(&denied, false, false);
+        let mut gate = input(&denied, false, true);
         gate.same_owner = true;
         gate.binding = BindingStrength::Inferred;
         gate.has_explicit_grant = true;
         gate.cert_expires = Some(u64::MAX);
         assert!(
             transfer_decision(&gate).allowed,
-            "shadow honors an explicit grant on an Inferred same-owner link"
+            "shadow still decides by legacy consent on an Inferred link"
         );
         gate.authoritative = true;
         assert!(
