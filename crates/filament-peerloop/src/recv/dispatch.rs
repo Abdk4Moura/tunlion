@@ -5075,12 +5075,12 @@ async fn recv_run(
                 filament_transport::lan::LanEvent::PairingNearby { .. } => {}
             },
             Ev::DirectReady(pid, t, route) => {
+                let named_before = conn.link(&pid).and_then(|l| l.verified_name.clone());
                 let verdict = conn.adopt_direct(&pid, t.clone(), route);
                 let tkey = match verdict {
                     crate::conn::DirectAdoption::Adopted { tkey, .. } => tkey,
                     _ => continue,
                 };
-                let named_before = conn.link(&pid).and_then(|l| l.verified_name.clone());
                 // A direct link to a REMEMBERED device was authenticated by its
                 // pair secret (the QUIC keying-material MAC), the proof a
                 // WebRTC link gets from `pair-proof`. Only the pair-proof path
