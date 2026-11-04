@@ -8,6 +8,12 @@ BIN="${TUNLION_BIN:?TUNLION_BIN must name the exact-head worker binary}"
 PORT=${PORT:-8137}
 SERVER="http://127.0.0.1:$PORT"
 PYV="${TUNLION_TEST_VENV:-python3}"
+# This proof is about terminal authorization and withdrawal, not the transport
+# race that carries it. Pin the fixture to the supported WebRTC path so a
+# direct-QUIC sibling stall is reported by the fleet-automesh gates that own it,
+# not as a terminal failure here. The session is still authenticated by the
+# daemon-brokered private secret before any open is sent.
+export TUNLION_DIRECT=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fleet-terminal-cut.XXXXXX")"
 DA="$WORK/alpha"
 source "$HERE/lib/fixture.sh"
@@ -83,6 +89,7 @@ PY
 }
 diagnose() {
     local why=$1
+    local node f
     {
         echo "===== TERMINAL DIAGNOSTICS: $why"
         echo "work=$WORK"
