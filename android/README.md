@@ -10,11 +10,12 @@ Build a debug APK with:
 gradle :app:assembleDebug
 ```
 
-The preview uses one journey: set up this phone, connect a device, select it,
-then send a file. Home contains this phone's availability and known devices;
-code entry is a dedicated task, Files is contextual, and Settings lives in the
-header. There is no bottom navigation bar. Screen changes use short slide/fade
-transitions and in-flight actions prevent repeated submission.
+The current native slice is identity setup and file-code send/receive. Fleet
+enrollment is required follow-up, not a completed feature. Relationship choices
+(my device, someone else's, temporary worker) are explained independently of
+code/file/nearby methods, but enrollment controls remain unavailable until the
+shared core exposes confirmation and permissions APIs. No Kotlin policy engine
+or browser fleet behavior is implied.
 
 Navigation uses Jetpack's `NavHost`, with Android predictive back enabled. Back
 gestures seek the destination transition before release; cancelling keeps the
@@ -23,31 +24,49 @@ including Files or setup, rather than always jumping home. Recovery words and
 capture protection remain active until the recovery destination is disposed
 after a committed pop, not when a gesture merely starts.
 
-`TunlionCore` is the app boundary. The temporary `CliTunlionCore` backend drives
-the real Rust CLI for all operations. There is no FFI dependency in this preview.
-The workflow builds the ARM64 and x86_64 CLI from the same revision as the app,
-packages it as `libtunlion_cli.so`, and enables Android native-library extraction
-so the signed executable can run from `nativeLibraryDir`. Local builds require
-the same ABI binaries under `app/src/main/jniLibs/` and a standard Android debug
-keystore under `.signing/preview.keystore`.
+`TunlionCore` is the app boundary. `MainActivity` and `AvailabilityService` use
+one process-owned `NativeTunlionCore`, backed by the generated UniFFI
+`CoreSession`. Blocking calls run off the UI thread. The previous CLI adapter
+and its acceptance harness remain source-only regression material; the app
+workflow does not package a CLI executable or launch one.
 
-- Commands use argument arrays, private explicit config paths, structured JSON
-  and exit codes. Stdout and stderr are drained separately without logging
-  invitation material or codes. Cancellation terminates and reaps the child.
-- CLI identity setup happens in a private draft directory. Confirmation promotes
-  the complete state directory; cancelling discards it. Capture is blocked while
-  recovery words are visible. Existing identities and pairings are never replaced.
-- Availability owns an attached `up --userspace` child in a foreground service,
-  with bounded restart backoff. Off waits for shutdown and removes its notification.
-- User-started pair/transfer operations have a foreground service while the app
-  is backgrounded. UI snapshots are polled only while the Activity is started.
-- Invitations are copied into owner-only private files and passed by path, never
-  as invitation bytes in argv. Picker content is staged privately for sending.
-- Verified receive history drives publication into `Download/Tunlion` through
-  MediaStore on Android 10+, with an export journal to avoid duplicate saves.
-  Android 8/9 uses a user-selected SAF folder. No storage permission is requested.
-- The UI reports verified completion only from CLI outcomes/history. Unknown
-  peer presence and routes are left unknown, not invented from stored names.
+The `Android app` workflow builds both `libtunlion_core.so` ABIs and generates
+Kotlin bindings from the same checkout. JNA uses the Android AAR so native
+dispatch is packaged. The APK, instrumentation APK, source head and SHA256
+manifest are separate artifacts. Source-only edits do not constitute a build
+or device verification; use the workflow or an approved leased Android worker.
+
+- Identity setup uses core-owned `PendingIdentity`. Confirmation writes through
+  `commitIdentity`; going back closes the pending object without saving. Existing
+  preview config directories are reused without replacing or parsing keys.
+- Availability starts the native reduced receiver in a foreground service. It
+  does not grant terminal or folder authority. Off waits for the native join.
+- One native engine slot exists. Turn availability off before code transfers.
+  Code sends allocate with `createCode`, show the actual code, then `waitSend`
+  checks receiver acknowledgments. Code receive uses `receiveCode`.
+- File selection uses SAF document URIs, stages only the selected files in
+  private cache, and keeps staging until the blocking sender returns.
+  Cancellation requests native stop independently of the blocked caller, holding
+  the operation lease until cleanup. No resume after process death is promised.
+- Verified core receive history drives publication into `Download/Tunlion` via
+  MediaStore on Android 10+; Android 8/9 uses a user-selected SAF folder. Private
+  originals are kept on publication failure and publication retries on refresh.
+  **The base core does not yet persist this receive history.** The history/event
+  core change must be integrated and verified before public receive export or
+  background receive completion is considered complete. No directory scan is
+  substituted for verification evidence.
+- Discovery, effective access, enrollment, revocation, session termination,
+  expiry enforcement and recovery import need core APIs. No successful stub or
+  inferred remote permission is used. Offline and route facts remain unknown.
+
+## Native acceptance
+
+`NativeCoreAcceptanceTest` checks real native identity confirmation, mismatch
+rejection without writes, duplicate identity refusal and malformed-code refusal.
+`NativePeerAcceptanceTest` requires a real sender plus `code`, `sha256`, `bytes`
+instrumentation arguments and verifies exact stored bytes against the digest.
+These tests are newly added and must run on a leased worker or CI. The older
+`CliAndroidAcceptanceTest` is not evidence for the new native adapter.
 
 ## Preview feedback
 

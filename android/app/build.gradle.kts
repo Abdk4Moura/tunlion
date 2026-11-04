@@ -15,7 +15,6 @@ android {
     }
     defaultConfig.ndk.abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
     packaging.jniLibs.useLegacyPackaging = true
-    packaging.jniLibs.keepDebugSymbols.add("**/libtunlion_cli.so")
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -41,6 +40,7 @@ android {
 }
 
 dependencies {
+    implementation("net.java.dev.jna:jna:5.17.0@aar")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test:core-ktx:1.6.1")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")

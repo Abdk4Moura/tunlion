@@ -1,8 +1,8 @@
 package com.tunlion.android
 
 /**
- * The UI depends on this boundary. The temporary Android CLI backend can be
- * replaced by UniFFI without moving protocol logic into Kotlin.
+ * The UI depends on this boundary. Protocol and authority decisions belong to
+ * the shared core, not the Android adapter.
  */
 interface TunlionCore {
     fun status(): CoreStatus
@@ -27,6 +27,7 @@ data class CoreStatus(
     val devices: List<CoreDevice> = emptyList(),
     val transfers: List<CoreTransfer> = emptyList(),
     val engineError: String? = null,
+    val enrollmentSupported: Boolean = false,
 )
 
 data class CoreTransfer(val name: String, val incoming: Boolean, val verified: Boolean, val saved: Boolean)
