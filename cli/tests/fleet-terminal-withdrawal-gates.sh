@@ -129,6 +129,17 @@ start_backend
 init_owner "$DA"
 start_acceptor "$DA"
 for node in bravo charlie delta; do enroll_delegate "$node" --allow transfer,mount,shell; done
+# Premise: the terminal is not refused or admitted by the enrollment ceiling.
+# Every participant's invited ceiling includes shell, so the only remaining
+# authorization fact these controls can be measuring is the owner grant.
+python3 - "$WORK/alpha/devices.json" <<'PY'
+import json,sys
+arr=json.load(open(sys.argv[1]))
+for name in ('bravo','charlie','delta'):
+    rec=next(d for d in arr if d.get('name')==name)
+    assert 'shell' in (rec.get('principalCeiling') or []), name
+PY
+ok "premise: every terminal participant's invitation ceiling includes shell"
 as_node charlie set fleet.owner_grants all >/dev/null || fixture_die "target owner grant policy setup"
 for node in bravo charlie delta; do
     env HOME="$WORK/home-$node" TUNLION_CONFIG_DIR="$WORK/$node" TUNLION_L2=1 TUNLION_LOG=debug \
@@ -180,12 +191,44 @@ PY
     as_node alpha revoke bravo shell --on charlie >"$WORK/$mode-withdraw.log" 2>&1 \
         || fixture_die "$mode: owner withdrawal failed"
     # Same 12s bound as existing PTY revocation gates, no timeout widening.
-    for _ in $(seq 1 24); do kill -0 "$match_child" 2>/dev/null || break; sleep 0.5; done
+    # The target's held grant set is the receiver fact a running session
+    # rechecks, so wait for both that removal and the child's exit in one bound.
+    cleared=0
+    for _ in $(seq 1 24); do
+        if [ "$cleared" = 0 ] && python3 - "$WORK/alpha/devices.json" "$WORK/charlie/fleet-grants-held.json" <<'PY'
+import json,sys
+try:
+    recs=json.load(open(sys.argv[1]))
+    held=json.load(open(sys.argv[2]))
+except (OSError,ValueError):
+    raise SystemExit(1)
+pub={d['name']: (d.get('deviceCert') or {}).get('devicePub') for d in recs}
+subjects={g.get('subject_pub') for g in held.get('grants') or [] if g.get('cap')=='shell'}
+assert pub['bravo'] not in subjects and pub['delta'] in subjects
+PY
+        then cleared=1; fi
+        kill -0 "$match_child" 2>/dev/null || break
+        sleep 0.5
+    done
     if kill -0 "$match_child" 2>/dev/null; then
         bad "$mode: matching terminal child survived owner withdrawal"
     else
         ok "$mode: matching terminal child was terminated within 12s"
     fi
+    if [ "$cleared" = 1 ]; then
+        ok "$mode: target holds no shell grant for the withdrawn subject"
+    else
+        bad "$mode: target still holds the withdrawn subject's shell grant"
+    fi
+    # The ceiling still includes shell, so the terminated session proves the
+    # owner grant was the authorizing fact, not the enrollment ceiling.
+    python3 - "$WORK/alpha/devices.json" <<'PY'
+import json,sys
+recs=json.load(open(sys.argv[1]))
+rec=next(d for d in recs if d.get('name')=='bravo')
+assert 'shell' in (rec.get('principalCeiling') or [])
+PY
+    ok "$mode: matching terminal ended while its shell ceiling remained"
     if kill -0 "$control_child" 2>/dev/null && kill -0 "$control" 2>/dev/null; then
         ok "$mode: unrelated sibling terminal remains active"
     else
