@@ -1337,6 +1337,12 @@ async fn recv_run(
     // pending, bounded by RECV_IDENTITY_HOLD_DEADLINE from first sight so a
     // ceremony that never resolves cannot wedge the transfer.
     let mut recv_identity_hold: HashMap<String, std::time::Instant> = HashMap::new();
+    // Last time the held identity challenge was re-sent. The first copy can
+    // race the peer's control channel becoming ready (measured on a room
+    // transfer: the challenge was issued at ChannelReady but the sender had not
+    // installed the link yet), and a lost challenge must not turn into a
+    // fail-closed refusal. Re-sending the SAME nonce is idempotent.
+    let mut recv_identity_resent: HashMap<String, std::time::Instant> = HashMap::new();
     // #161: how long the offer waits for identity to resolve before deciding.
     // Identity resolution normally settles in well under a second on a working
     // link; the window exists so a revoked device's cert (which resolves via
@@ -8022,6 +8028,40 @@ async fn recv_run(
                             host.cap_authoritative() && challenge_in_flight && !proven
                         };
                         if hold {
+                            if identity_hold {
+                                let due = recv_identity_resent
+                                    .get(&pid)
+                                    .map(|at| at.elapsed() >= Duration::from_millis(500))
+                                    .unwrap_or(true);
+                                if !identity_nonces.contains_key(&pid) {
+                                    // The readiness site may have run before this
+                                    // peer became the consented target (a room
+                                    // adoption can select it later), so no
+                                    // challenge exists yet. Issue one now.
+                                    ports
+                                        .identity
+                                        .issue_proven_challenge_and_hold(
+                                            &conn,
+                                            &pid,
+                                            &t,
+                                            &st.pending_proven,
+                                            &mut identity_nonces,
+                                        )
+                                        .await;
+                                    recv_identity_resent.insert(pid.clone(), Instant::now());
+                                } else if due
+                                    && ports
+                                        .identity
+                                        .resend_identity_challenge(
+                                            &conn,
+                                            &pid,
+                                            &identity_nonces,
+                                        )
+                                        .await
+                                {
+                                    recv_identity_resent.insert(pid.clone(), Instant::now());
+                                }
+                            }
                             let rtx = tx.clone();
                             let rpid = pid.clone();
                             let rv = v.clone();
@@ -8044,7 +8084,7 @@ async fn recv_run(
                             // identity fact to decide on. Refuse rather than
                             // reach the policy site in the ordering window.
                             log.say(
-                                "the sender's identity did not settle after the code ceremony; refusing the transfer, ask for a fresh code",
+                                "the sender's identity did not settle after consent; refusing the transfer, retry the send",
                             );
                             let reason =
                                 "the sender's identity could not be established; a fresh code is required";
