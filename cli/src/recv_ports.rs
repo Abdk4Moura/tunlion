@@ -187,6 +187,7 @@ impl PtyBackend for CliPty {
             *guard,
             spec.device_pub,
             spec.admitted_via_ceiling,
+            spec.terminal_scope,
         )
         .await?;
         Some(Arc::new(handle))
@@ -321,12 +322,12 @@ impl RecvIdentity for CliRecv {
     }
     async fn resend_identity_challenge(
         &self,
-        conn: &Conn,
+        t: &Arc<dyn Transport>,
         pid: &str,
         identity_nonces: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
     ) -> bool {
         self.identity()
-            .resend_identity_challenge(conn, pid, identity_nonces)
+            .resend_identity_challenge(t, pid, identity_nonces)
             .await
     }
     fn device_name_for_pub(&self, device_pub: &[u8; 32]) -> Option<String> {

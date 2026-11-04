@@ -40,6 +40,19 @@ use tokio::sync::{Mutex, mpsc};
 // stays re-exported for completeness even though this file no longer reads it;
 // the mux is its only consumer.
 #[allow(unused_imports)]
+/// Test-only transport selector for the L2/exec authorization proofs. The L2
+/// dialer normally races direct-QUIC unconditionally because the long-lived
+/// acceptor forces that rung; the test hook must still be able to exercise the
+/// WebRTC authorization path while a separate control runs direct.
+#[cfg(feature = "test-hooks")]
+fn direct_race_allowed() -> bool {
+    !crate::test_hooks::no_direct()
+}
+#[cfg(not(feature = "test-hooks"))]
+fn direct_race_allowed() -> bool {
+    true
+}
+
 pub(crate) use filament_peerloop::l2::mux::{
     L2_SID_BASE, MAX_STREAMS_PER_LINK, Mux, OpenOutcome, OpenVerdict, PipeItem, is_l2_sid,
     serve_stream, wire_sid,
@@ -334,6 +347,7 @@ pub async fn spawn_pty_session(
     // tick, exactly like a revocation. Grant-admitted sessions ignore the
     // ceiling (the grant authorizes); uncovered sessions never set this.
     admitted_via_ceiling: bool,
+    terminal_scope: Option<filament_peerloop::shell_gate::TerminalSessionScope>,
 ) -> Option<PtySessionHandle> {
     use std::io::{Read as _, Write as _};
     // The backend (portable-pty, or the Windows token relay) is chosen in the
@@ -499,7 +513,10 @@ pub async fn spawn_pty_session(
                     let lapsed =
                         matches!(crate::identity_state::peer_liveness_alive(idev.as_ref()), Some(false));
                     let cut = crate::identity_state::live_session_cut(idev.as_ref());
-                    if cut.is_some() || ceiling_gone || lapsed {
+                    let grant_gone = terminal_scope.as_ref().is_some_and(|scope| {
+                        scope.withdrawn(&crate::host_impl::CliHost)
+                    });
+                    if cut.is_some() || ceiling_gone || lapsed || grant_gone {
                         let reason = match cut {
                             Some(c) => c.reason_for(idev.as_ref()),
                             None => crate::capability::REVOKED_REASON.to_string(),
@@ -1103,6 +1120,7 @@ pub(crate) async fn bring_up_to_known(
                 // --relay: no offer at all, it would carry our host/public
                 // candidates to the peer (`direct_permitted`).
                 if !direct_racing
+                    && direct_race_allowed()
                     && crate::conn::direct_permitted(relay, crate::direct::direct_enabled())
                 {
                     if endpoint.is_none() {
@@ -1276,6 +1294,9 @@ pub(crate) async fn bring_up_to_known(
                 // so the DirectTransport's reader funnels Chunk/Control/PcState to
                 // the rx the caller hands to `pump_initiator`.
                 if data["type"].as_str() == Some("transport-offer") {
+                    if !direct_race_allowed() {
+                        continue;
+                    }
                     // --relay hides our address from the peer: dialing its
                     // direct candidates would hand it our IP as the source.
                     if !crate::conn::direct_permitted(relay, true) {
@@ -6131,6 +6152,7 @@ mod h1_tests {
             guard,
             None,
             false,
+            None,
         )
         .await
         .expect("spawn");
@@ -6215,6 +6237,7 @@ mod h1_tests {
             guard,
             None,
             false,
+            None,
         )
         .await
         .expect("spawn");
@@ -6268,6 +6291,7 @@ mod h1_tests {
             guard,
             None,
             false,
+            None,
         )
         .await
         .expect("spawn");
@@ -6338,7 +6362,7 @@ mod h1_tests {
                 sessions.clone(), id.clone(), ta.clone(), sid_a, 80, 24,
                 "xterm-256color",
                 argv,
-                PtyGuard::try_acquire().expect("slot"), None, false,
+                PtyGuard::try_acquire().expect("slot"), None, false, None,
             ).await.expect("spawn");
             tokio::time::timeout(Duration::from_secs(5), async {
                 while ta.bytes_for(sid_a).len() < before.len() {

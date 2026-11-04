@@ -68,6 +68,10 @@ impl CoreSession {
         self.inner.status()
     }
 
+    pub fn devices(&self) -> Result<Vec<crate::DeviceAccess>, CoreError> {
+        self.inner.devices()
+    }
+
     /// Start the real receive engine for this config directory. Synchronous
     /// across the FFI boundary: the library owns the runtime, and readiness is
     /// observed before this returns.

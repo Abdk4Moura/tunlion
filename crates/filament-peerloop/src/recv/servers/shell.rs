@@ -111,6 +111,7 @@ pub trait PtySession: Send + Sync {
 
 /// Everything the host needs to create one PTY session.
 pub struct PtySpawnSpec {
+    pub terminal_scope: Option<crate::shell_gate::TerminalSessionScope>,
     pub session_id: String,
     pub transport: Arc<dyn Transport>,
     pub sid: u32,
@@ -250,6 +251,7 @@ pub async fn attach_pty(
     argv: Vec<String>,
     device_pub: Option<[u8; 32]>,
     admitted_via_ceiling: bool,
+    terminal_scope: Option<crate::shell_gate::TerminalSessionScope>,
     backend: &dyn PtyBackend,
     before_spawn: impl FnOnce() -> Result<(), String>,
 ) -> Result<Arc<dyn PtySession>, PtyAttachError> {
@@ -291,6 +293,7 @@ pub async fn attach_pty(
         .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
         .await;
     let spec = PtySpawnSpec {
+        terminal_scope,
         session_id,
         transport,
         sid,
@@ -648,9 +651,10 @@ pub async fn open_pty(
     } else {
         shell_host.exec_cmd_args(&pty_cmd)
     };
+    let terminal_scope = crate::shell_gate::TerminalSessionScope::capture(conn, &pid, shell_policy);
     let _sess = match attach_pty(
         &mux, t.clone(), sid, session_id.clone(), cols, rows, term, argv,
-        device_pub, admitted_via_ceiling, backend, || Ok(()),
+        device_pub, admitted_via_ceiling, Some(terminal_scope), backend, || Ok(()),
     )
     .await
     {
@@ -1000,6 +1004,7 @@ mod tests {
             identity_device_pub: Some(DEVICE),
             identity_user_pub: Some([3; 32]),
             identity_binding: BindingStrength::Proven,
+            identity_state: cap::IdentityState::Resolved,
             identity_cert_expires: Some(1000),
             principal_kind: cap::PrincipalKind::OwnerDevice,
             host,

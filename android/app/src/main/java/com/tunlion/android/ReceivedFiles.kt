@@ -13,12 +13,11 @@ import java.io.File
 import java.security.MessageDigest
 
 /** Only checksum-verified CLI history entries may be published. Keep private originals on failure. */
-internal class ReceivedFiles(private val context: Context) {
-    private val paths = CliPaths(context)
+internal class ReceivedFiles(private val context: Context, private val config: File, private val inbox: File) {
     private val journal = context.getSharedPreferences("received_files", Context.MODE_PRIVATE)
     companion object { private val lock = Mutex() }
     fun records(): List<org.json.JSONObject> {
-        val history = File(paths.config, "transfers.json")
+        val history = File(config, "transfers.json")
         if (!history.exists()) return emptyList()
         val array = JSONArray(history.readText())
         return (0 until array.length()).map { array.getJSONObject(it) }
@@ -36,7 +35,7 @@ internal class ReceivedFiles(private val context: Context) {
             if (!hash.matches(Regex("[0-9a-fA-F]{64}"))) continue
             val stored = record.optString("stored")
             val source = File(stored).canonicalFile
-            if (!source.toPath().startsWith(paths.inbox.canonicalFile.toPath()) || !source.isFile) continue
+            if (!source.toPath().startsWith(inbox.canonicalFile.toPath()) || !source.isFile) continue
             val name = File(record.optString("file")).name.takeIf { it.isNotBlank() && it != "." && it != ".." } ?: "Received file"
             val token = id(record)
             var uri = journal.getString("uri-$token", null)?.let(Uri::parse)

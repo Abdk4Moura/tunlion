@@ -73,9 +73,14 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
     val scope = rememberCoroutineScope()
     val colors = MaterialTheme.colorScheme
     val context = androidx.compose.ui.platform.LocalContext.current
+    var notificationsEnabled by remember { mutableStateOf(androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val enginePhase by EngineState.phase.collectAsState()
     var operation by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
-    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        notificationsEnabled = granted
+        if (!granted) notice = "Notifications are off. Foreground work can still run, but Android 13+ shows its notice in Task Manager rather than the notification drawer."
+    }
     fun requestNotifications() {
         if (android.os.Build.VERSION.SDK_INT >= 33 && androidx.core.content.ContextCompat.checkSelfPermission(context,
                 android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
@@ -94,6 +99,7 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
     LaunchedEffect(core, lifecycle) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
+                notificationsEnabled = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()
                 if (!busy) try { status = core.refresh(); loadFailed = false }
                 catch (cancelled: CancellationException) { throw cancelled }
                 catch (error: Exception) {
@@ -195,7 +201,7 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                     verticalArrangement = Arrangement.spacedBy(24.dp)) {
                     when (destination) {
                         Screen.HOME -> {
-                            if (!status.identityLoaded) {
+                            if (!status.statusLoaded) {
                                 if (loadFailed) {
                                     SecondaryText("Your identity could not be opened. You can retry without replacing it.")
                                     PrimaryButton("Try again", busy) {
@@ -213,37 +219,37 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                                         SecondaryText("Opening this phone…")
                                     }
                                 }
-                            } else {
-                            Availability(status, busy, onChange = { turnOn ->
-                                if (status.fingerprint == null && status.devices.isEmpty() && turnOn) navigate(Screen.SETUP)
-                                else { if (turnOn) requestNotifications(); perform({ if (turnOn) core.start() else core.stop() }) }
-                            })
-                            status.engineError?.let { SecondaryText(it) }
-                            if (status.fingerprint == null && status.devices.isEmpty()) {
+                            } else if (!status.identityLoaded) {
                                 FirstConnection(onJoin = { navigate(Screen.PAIR) }, onSetup = { navigate(Screen.SETUP) })
                             } else {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Eyebrow("MY DEVICES", Modifier.weight(1f))
-                                    TextButton(onClick = { navigate(Screen.PAIR) }) { Text("Add device") }
-                                }
-                                if (status.devices.isEmpty()) {
-                                    Text("No other devices yet.", style = MaterialTheme.typography.titleMedium)
-                                    SecondaryText("Open Tunlion on your other device and enter its code here.")
-                                }
-                                status.devices.forEach { device ->
-                                    key(device.id) { DeviceRow(device) { selectedDevice = device; navigate(Screen.DEVICE) } }
-                                }
+                            Availability(status, busy, onChange = { turnOn ->
+                                if (turnOn) requestNotifications()
+                                perform({ if (turnOn) core.start() else core.stop() })
+                            })
+                            status.engineError?.let { SecondaryText(it) }
+                            if (enginePhase == EnginePhase.FAILED) {
+                                OutlinedButton(onClick = { perform({ core.stop() }) }, enabled = !busy) { Text("Confirm receiver is off") }
+                            }
+                            if (status.identityState == CoreIdentityState.JOINED)
+                                SecondaryText("This phone is joined through stored device records. No local owner identity fingerprint is present.")
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Eyebrow("DEVICES", Modifier.weight(1f))
+                                TextButton(onClick = { navigate(Screen.PAIR) }) { Text("Add device") }
+                            }
+                            if (status.devices.isEmpty()) {
+                                Text("No other devices yet.", style = MaterialTheme.typography.titleMedium)
+                                SecondaryText("No stored device relationships. Fleet discovery and enrollment are not connected yet. File codes work without adding a device.")
+                            }
+                            status.devices.forEach { device ->
+                                key(device.id) { DeviceRow(device) { selectedDevice = device; navigate(Screen.DEVICE) } }
                             }
                             HorizontalDivider(color = colors.outline)
                             ActionRow(Icons.Outlined.FolderOpen, "Files", "Send a file or receive with a code") { navigate(Screen.FILES) }
                             }
                         }
-                        Screen.PAIR -> PairScreen(busy, onJoin = { code, remember ->
+                        Screen.PAIR -> PairScreen(busy, status.enrollmentSupported, onJoin = { code, remember ->
                             requestNotifications()
                             perform({ core.joinCode(code, remember) }) { navigate(Screen.HOME) }
-                        }, onInvitation = { bytes ->
-                            requestNotifications()
-                            perform({ core.joinInvitation(bytes) }) { navigate(Screen.HOME) }
                         })
                         Screen.SETUP -> {
                             Title("Make this phone yours.", "Your identity lives on this phone. No account or sign-in.")
@@ -279,7 +285,10 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                             onConnect = { navigate(Screen.PAIR) }, onPickDevice = { device ->
                                 selectedDevice = device; navigate(Screen.SEND)
                             })
-                        Screen.DEVICE -> selectedDevice?.let { device ->
+                        Screen.DEVICE -> selectedDevice?.let { selected ->
+                            val device = status.devices.firstOrNull { it.id == selected.id }
+                            if (device == null) SecondaryText("This device is no longer in the current core snapshot. Return to Devices and refresh.")
+                            else
                             DeviceDetails(device, onSend = { navigate(Screen.SEND) })
                         }
                         Screen.SEND -> SendScreen(selectedDevice, busy) { files, onCode ->
@@ -289,7 +298,18 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                         Screen.SETTINGS -> {
                             Eyebrow("THIS PHONE")
                             DetailRow("Name", status.deviceName ?: android.os.Build.MODEL)
-                            DetailRow("Identity", status.fingerprint ?: "Not set up")
+                            DetailRow("Identity", when (status.identityState) {
+                                CoreIdentityState.LOCAL -> status.fingerprint ?: "Local identity"
+                                CoreIdentityState.JOINED -> "Joined device; no local owner fingerprint"
+                                CoreIdentityState.BLANK -> "Not set up"
+                                CoreIdentityState.LOADING -> "Not read yet"
+                            })
+                            DetailRow("Notifications", if (notificationsEnabled) "Allowed" else "Off in Android settings")
+                            if (!notificationsEnabled) SecondaryText("Transfer and availability notices may not appear in the notification drawer. Android 13+ still lists foreground services in Task Manager.")
+                            OutlinedButton(onClick = {
+                                context.startActivity(android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                    .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName))
+                            }) { Text("Notification settings") }
                             if (android.os.Build.VERSION.SDK_INT < 29) ReceiveFolderSetting()
                             HorizontalDivider(color = colors.outline)
                             Eyebrow("EXPERIMENTAL")
@@ -306,7 +326,9 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                             HorizontalDivider(color = colors.outline)
                             Eyebrow("ABOUT")
                             SecondaryText("Tunlion for Android · Preview\nNo account. Your devices, your permissions.")
-                            SecondaryText(if (status.engineLinked) "Backend: Android CLI (temporary)" else "Packaged Android CLI is missing.")
+                            SecondaryText(if (status.engineLinked) "Backend: shared native core (UniFFI). No CLI subprocess." else "Native core has not been opened yet.")
+                            SecondaryText("Availability uses a foreground notification. Android can still stop the app or enforce background limits. Transfers do not resume automatically after process death. Reopen Tunlion, inspect Files, then retry any unacknowledged transfer.")
+                            SecondaryText("Recovery phrase import is not connected yet. Do not uninstall or clear app storage to troubleshoot an existing identity.")
                         }
                     }
                 }
@@ -323,6 +345,7 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
 @Composable
 private fun Availability(status: CoreStatus, busy: Boolean, onChange: (Boolean) -> Unit) {
     val colors = MaterialTheme.colorScheme
+    val phase by EngineState.phase.collectAsState()
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(42.dp).background(colors.surfaceVariant, RoundedCornerShape(9.dp)), contentAlignment = Alignment.Center) {
             Icon(Icons.Outlined.Smartphone, null, Modifier.size(22.dp))
@@ -330,7 +353,12 @@ private fun Availability(status: CoreStatus, busy: Boolean, onChange: (Boolean) 
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(status.deviceName ?: android.os.Build.MODEL, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
-            val label = if (busy) { if (status.engineRunning) "Stopping…" else "Starting…" } else if (status.engineRunning) "Available" else "Off"
+            val label = when (phase) {
+                EnginePhase.STARTING -> "Starting…"
+                EnginePhase.STOPPING -> "Stopping…"
+                EnginePhase.FAILED -> "Needs attention"
+                else -> if (status.engineRunning) "Available" else "Off"
+            }
             AnimatedContent(label, label = "availability") { text ->
                 Text(text, color = if (status.engineRunning) colors.primary else colors.onSurfaceVariant,
                     style = MaterialTheme.typography.bodyMedium)
@@ -340,14 +368,15 @@ private fun Availability(status: CoreStatus, busy: Boolean, onChange: (Boolean) 
             colors = tunlionSwitchColors(),
             modifier = Modifier.semantics { contentDescription = "Make this phone available" })
     }
+    SecondaryText("Availability accepts inbox transfers only. This phone does not serve a terminal or expose folders. Turn it off before using a file code; the native core currently runs one engine at a time.")
 }
 
 @Composable
 private fun FirstConnection(onJoin: () -> Unit, onSetup: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     Column(Modifier.fillMaxWidth().padding(top = 20.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
-        Title("Your other devices,\njust a code away.", "Connect this phone to your computer. Send files directly, and keep your devices within reach.")
-        PrimaryButton("I have a code", onClick = onJoin)
+        Title("Your files,\ndirect to this phone.", "Create an identity, then send or receive files with a transfer code. Native device enrollment is still being connected.")
+        PrimaryButton("Device enrollment options", onClick = onJoin)
         OutlinedButton(onClick = onSetup, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
             shape = RoundedCornerShape(7.dp), border = BorderStroke(1.dp, colors.outline)) { Text("Set up my first device", color = colors.onBackground) }
         SecondaryText("No account. Nothing uploaded to a cloud drive.")
@@ -355,36 +384,61 @@ private fun FirstConnection(onJoin: () -> Unit, onSetup: () -> Unit) {
 }
 
 @Composable
-private fun PairScreen(busy: Boolean, onJoin: (String, Boolean) -> Unit, onInvitation: (ByteArray) -> Unit) {
+private fun PairScreen(busy: Boolean, supported: Boolean, onJoin: (String, Boolean) -> Unit) {
     var code by rememberSaveable { mutableStateOf("") }
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val scope = rememberCoroutineScope()
-    var error by remember { mutableStateOf<String?>(null) }
-    val invitation = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) scope.launch {
-            try {
-                val bytes = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(uri)?.use { input ->
-                        val bytes = ByteArray(65537)
-                        var size = 0
-                        while (size < bytes.size) { val n = input.read(bytes, size, bytes.size - size); if (n < 0) break; size += n }
-                        bytes.copyOf(size)
-                    } ?: error("Unreadable invitation")
-                }
-                if (bytes.size > 65536) error = "That invitation file is too large." else onInvitation(bytes)
-            } catch (_: Exception) { error = "Could not read that invitation file." }
+    var carrier by rememberSaveable { mutableStateOf("Spoken code") }
+    var relationship by rememberSaveable { mutableStateOf("My device") }
+    fun selectCarrier(next: String) {
+        carrier = next
+        if (next != "Invitation file" && relationship == "Temporary worker") relationship = "My device"
+    }
+    Title("How are you\nconnecting?", "Carrier first. A spoken code, invitation file or nearby discovery carries the request; only a signed invitation or core acknowledgment can establish a relationship.")
+    Eyebrow("CARRIER")
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        FilterChip(carrier == "Spoken code", { selectCarrier("Spoken code") },
+            label = { Text("Spoken code") }, enabled = !busy)
+        FilterChip(carrier == "Invitation file", { selectCarrier("Invitation file") },
+            label = { Text("Invitation file") }, enabled = !busy)
+    }
+    SecondaryText(when (carrier) {
+        "Spoken code" -> "A spoken code is a carrier fact only. It cannot select or prove a relationship."
+        else -> "An invitation file must be previewed and verified by the shared core before any join. This build cannot read or preview one yet."
+    })
+    if (carrier == "Spoken code") {
+        OutlinedTextField(code, { code = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
+            label = { Text("Device code") }, placeholder = { Text("brave-otter-3141") },
+            textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
+            shape = RoundedCornerShape(7.dp), enabled = supported && !busy,
+            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(autoCorrectEnabled = false))
+        SecondaryText("A spoken code never selects or proves a relationship. Temporary worker requires a signed invitation file.")
+    } else {
+        OutlinedButton(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            shape = RoundedCornerShape(7.dp)) { Text("Preview invitation · unavailable") }
+        SecondaryText("Invitation preview and join are unavailable until the shared core exposes signed enrollment facts. This screen reads no file and writes nothing.")
+    }
+    Eyebrow("INTENDED RELATIONSHIP")
+    SecondaryText("This choice is an intent only, not a signed fact. It records no relationship and grants no permission.")
+    listOf("My device", "Someone else's", "Temporary worker").forEach { choice ->
+        val optionEnabled = !busy && (choice != "Temporary worker" || carrier == "Invitation file")
+        Row(Modifier.fillMaxWidth().clickable(enabled = optionEnabled) { relationship = choice }.padding(vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            RadioButton(relationship == choice, onClick = { relationship = choice }, enabled = optionEnabled)
+            Text(choice, color = if (optionEnabled) MaterialTheme.colorScheme.onBackground else MaterialTheme.colorScheme.onSurfaceVariant)
+            if (choice == "Temporary worker" && carrier != "Invitation file") {
+                Spacer(Modifier.width(8.dp))
+                SecondaryText("invitation file only")
+            }
         }
     }
-    Title("Enter the code\nfrom your other device.", "Open Tunlion there and choose to add a device. Keep both devices open while they connect.")
-    OutlinedTextField(code, { code = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
-        label = { Text("Device code") }, placeholder = { Text("brave-otter-3141") },
-        textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
-        shape = RoundedCornerShape(7.dp), enabled = !busy,
-        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(autoCorrectEnabled = false))
-    SecondaryText("Connecting remembers the device on both ends. It does not grant shell access.")
-    PrimaryButton("Connect device", busy, enabled = code.isNotBlank(), onClick = { onJoin(code.trim(), true) })
-    OutlinedButton(onClick = { invitation.launch(arrayOf("*/*")) }, enabled = !busy, shape = RoundedCornerShape(7.dp)) { Text("Open an invitation file") }
-    error?.let { SecondaryText(it) }
+    SecondaryText(when (relationship) {
+        "My device" -> "Fleet discovery and inbox transfers by default. No terminal or folder authority."
+        "Someone else's" -> "External pair with explicitly confirmed permissions, not fleet membership."
+        else -> "Temporary access must have a bounded expiry confirmed by the core. Invitation file only."
+    })
+    if (!supported) SecondaryText("Enrollment review is unavailable until the shared core exposes enrollment facts. These choices do not record a relationship or grant permission. Use Files for a one-time transfer code.")
+    SecondaryText("The actual relationship is shown only after the core verifies signed enrollment facts. Nearby enrollment is not supported in this build.")
+    if (carrier == "Spoken code") PrimaryButton("Review enrollment", busy, enabled = supported && code.isNotBlank(),
+        onClick = { onJoin(code.trim(), true) })
 }
 
 private fun Modifier.toggleableForRemember(checked: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) =
@@ -419,9 +473,9 @@ private fun FilesScreen(status: CoreStatus, busy: Boolean, onReceive: (String) -
     onConnect: () -> Unit, onPickDevice: (CoreDevice) -> Unit) {
     var receiveExpanded by rememberSaveable { mutableStateOf(false) }
     var code by rememberSaveable { mutableStateOf("") }
-    Title("Files, straight\nto your device.", "Choose a connected device to send a file. Received files are verified before they are saved.")
+    Title("Files, straight\nto your device.", "Choose a stored device to attempt a send, or use a file code. The real receiver checks permission and reachability.")
     Eyebrow("SEND TO")
-    val recipients = status.devices.filter { it.canSendFiles }
+    val recipients = status.devices.filter { it.canSendFiles || it.canAttemptSend }
     if (recipients.isEmpty()) {
         SecondaryText("Connect another device to send your first file.")
         OutlinedButton(onClick = onConnect, shape = RoundedCornerShape(7.dp)) { Text("Connect a device") }
@@ -437,6 +491,20 @@ private fun FilesScreen(status: CoreStatus, busy: Boolean, onReceive: (String) -
         }
     }
     SecondaryText(if (android.os.Build.VERSION.SDK_INT >= 29) "Received files are saved to Download/Tunlion after verification." else "Choose a receiving folder in Settings. Files remain in the private inbox until a folder is chosen.")
+    status.lastSend?.let { report ->
+        Eyebrow("LAST SEND RESULT")
+        SecondaryText(report.target?.let { "To $it" } ?: "Code transfer")
+        report.files.forEach { file ->
+            Column {
+                Text(file.name, fontWeight = FontWeight.Medium)
+                SecondaryText(
+                    if (!file.delivered) "Receiver did not acknowledge delivery"
+                    else (file.storedName?.let { "Receiver acknowledged delivery · stored as $it" }
+                        ?: "Receiver acknowledged delivery"))
+            }
+        }
+        SecondaryText("Only receiver acknowledgments from the completed send appear here. A recorded device grant is not a delivery.")
+    }
     if (status.transfers.isNotEmpty()) {
         Eyebrow("RECENT FILES")
         status.transfers.forEach { transfer ->
@@ -461,7 +529,7 @@ private fun ReceiveFolderSetting() {
                 check(androidx.documentfile.provider.DocumentFile.fromTreeUri(context, uri)?.canWrite() == true)
                 context.getSharedPreferences("received_files", android.content.Context.MODE_PRIVATE).edit().putString("folder", uri.toString()).apply()
                 scope.launch {
-                    try { withContext(Dispatchers.IO) { ReceivedFiles(context).publish() }; message = "Receiving folder saved." }
+                    try { withContext(Dispatchers.IO) { NativeTunlionCore.get(context).publishInbox() }; message = "Receiving folder saved." }
                     catch (_: Exception) { message = "The folder is saved, but an inbox file could not be published yet." }
                 }
             } catch (_: Exception) { message = "Choose a folder this app can write to." }
@@ -482,6 +550,8 @@ private fun DeviceRow(device: CoreDevice, onClick: () -> Unit) {
             Text(device.name, fontWeight = FontWeight.Medium,
                 color = if (device.online == true) colors.onBackground else colors.onSurfaceVariant)
             SecondaryText(when (device.online) { true -> "Online"; false -> "Offline"; null -> "Availability unknown" })
+            SecondaryText(relationshipLabel(device.relationship) + if (device.revoked) " · revoked locally" else "")
+            if (device.actions.isNotEmpty()) SecondaryText(actionSummary(device))
         }
         if (device.online == true && device.route != null) {
             Text(if (device.route == "relayed") "RELAYED" else if (device.route == "direct") "DIRECT" else "",
@@ -497,11 +567,75 @@ private fun DeviceRow(device: CoreDevice, onClick: () -> Unit) {
 @Composable
 private fun DeviceDetails(device: CoreDevice, onSend: () -> Unit) {
     SecondaryText(when (device.online) { true -> "Online"; false -> "Offline"; null -> "Availability unknown" })
-    Eyebrow("ACCESS")
+    DetailRow("Relationship", relationshipLabel(device.relationship))
+    device.expiry?.let { DetailRow("Expiry recorded by core", it) }
+    if (device.revoked) SecondaryText("Revoked on this receiver. This does not acknowledge remote removal or termination of every active session.")
+    Eyebrow("ACCESS FACTS")
     SecondaryText(device.plainLine)
+    SecondaryText("A stored relationship or recorded grant is not proof that an action currently works. This snapshot does not probe the remote device.")
+    if (device.actions.isNotEmpty()) {
+        actionGroup(device, "EFFECTIVE", CoreAccessState.AVAILABLE, "No action is confirmed effective by this snapshot.")
+        actionGroup(device, "PENDING", CoreAccessState.PENDING, null)
+        actionGroup(device, "BLOCKED", CoreAccessState.BLOCKED, null)
+        actionGroup(device, "UNKNOWN", CoreAccessState.UNKNOWN, null)
+        actionGroup(device, "UNAVAILABLE", CoreAccessState.UNSUPPORTED, null)
+    }
+    SecondaryText("Only actions reported by the shared core appear here. Permission editing, terminal clients and folder clients are not connected in this build.")
     if (device.route == "relayed") SecondaryText("On relay, not a direct link. Still end-to-end encrypted.")
     if (device.canSendFiles) PrimaryButton("Send a file", onClick = onSend)
-    if (device.canOpenShell) SecondaryText("Shell access granted. The terminal is not connected in this preview.")
+    else if (device.canAttemptSend) {
+        SecondaryText("Remote permission and reachability have not been checked. You can attempt a transfer; the receiver may refuse it. This is not an effective permission grant.")
+        OutlinedButton(onClick = onSend, shape = RoundedCornerShape(7.dp)) { Text("Try sending a file") }
+    } else SecondaryText("Sending is not available for this device in the current core snapshot. The reason above is the core's own fact, not a client guess.")
+    if (device.canOpenShell) SecondaryText("The core reports terminal service as effective. A terminal client is not connected in this build.")
+    Eyebrow("REMOVAL")
+    SecondaryText("Revoking one capability removes a single permission. Cutting a device off ends its whole stored relationship. Neither operation is connected to the shared core in this build, so this app cannot perform either or claim completion.")
+    OutlinedButton(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        shape = RoundedCornerShape(7.dp)) { Text("Revoke a capability · unavailable") }
+    OutlinedButton(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        shape = RoundedCornerShape(7.dp)) { Text("Cut device off · unavailable") }
+    SecondaryText("Pending deliveries, offline peers and active sessions cannot be resolved from this snapshot. A removal is not acknowledged, and an existing session is not shown as ended.")
+}
+
+@Composable
+private fun actionGroup(device: CoreDevice, title: String, state: CoreAccessState, empty: String?) {
+    val actions = device.actions.filter { it.state == state }
+    if (actions.isEmpty()) { empty?.let { SecondaryText(it) }; return }
+    Eyebrow(title)
+    actions.forEach { DetailRow(actionLabel(it.kind), it.reason) }
+}
+
+private fun actionSummary(device: CoreDevice) = device.actions.joinToString(" · ") {
+    "${actionShortLabel(it.kind)}: ${stateLabel(it.state)}"
+}
+
+private fun actionShortLabel(kind: CoreActionKind) = when (kind) {
+    CoreActionKind.SEND -> "Send"
+    CoreActionKind.RECEIVE_INBOX -> "Receive inbox"
+    CoreActionKind.TERMINAL -> "Terminal"
+    CoreActionKind.FOLDER -> "Folders"
+}
+
+private fun stateLabel(state: CoreAccessState) = when (state) {
+    CoreAccessState.AVAILABLE -> "available"
+    CoreAccessState.PENDING -> "pending"
+    CoreAccessState.BLOCKED -> "blocked"
+    CoreAccessState.UNSUPPORTED -> "unsupported"
+    CoreAccessState.UNKNOWN -> "unknown"
+}
+
+private fun relationshipLabel(relationship: CoreRelationship) = when (relationship) {
+    CoreRelationship.PAIRED -> "Paired device"
+    CoreRelationship.FLEET -> "Fleet device"
+    CoreRelationship.TEMPORARY -> "Temporary worker"
+    CoreRelationship.UNKNOWN -> "Relationship unknown"
+}
+
+private fun actionLabel(kind: CoreActionKind) = when (kind) {
+    CoreActionKind.SEND -> "Send files to this device"
+    CoreActionKind.RECEIVE_INBOX -> "This device sending to this phone's inbox"
+    CoreActionKind.TERMINAL -> "This phone serving a terminal"
+    CoreActionKind.FOLDER -> "This phone exposing folders"
 }
 
 @Composable
@@ -513,6 +647,7 @@ private fun SendScreen(device: CoreDevice?, busy: Boolean, onSend: (List<android
     var sendCode by remember { mutableStateOf<String?>(null) }
     var reading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(busy) { if (!busy) sendCode = null }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) scope.launch {
             selected = uris
@@ -531,7 +666,12 @@ private fun SendScreen(device: CoreDevice?, busy: Boolean, onSend: (List<android
             finally { reading = false }
         }
     }
-    Title(if (device == null) "Send with a code" else "Send to ${device.name}", "Choose files with Android's file picker. They stay on this phone until you send them.")
+    val sendable = device == null || device.canSendFiles || device.canAttemptSend
+    Title(if (device == null) "Send with a code" else if (device.canSendFiles) "Send to ${device.name}"
+        else if (device.canAttemptSend) "Try sending to ${device.name}" else "Sending unavailable",
+        "Choose files with Android's file picker. They stay on this phone until you send them.")
+    if (device != null && !device.canSendFiles && device.canAttemptSend) SecondaryText("Remote permission is unknown, not granted. The receiver will decide whether to accept this attempt.")
+    if (!sendable) SecondaryText("The current core snapshot does not allow a send attempt to this device. Nothing will be sent.")
     sendCode?.let { code ->
         Eyebrow("YOUR FILE CODE")
         Text(code, fontFamily = FontFamily.Monospace, fontSize = 22.sp)
@@ -547,7 +687,13 @@ private fun SendScreen(device: CoreDevice?, busy: Boolean, onSend: (List<android
         }
     }
     OutlinedButton(onClick = { picker.launch(arrayOf("*/*")) }, enabled = !busy && !reading, shape = RoundedCornerShape(7.dp)) { Text(if (names.isEmpty()) "Choose files" else "Choose different files") }
-    PrimaryButton(if (device == null) "Make a file code" else "Send files", busy, selected.isNotEmpty() && !reading) {
+    val sendLabel = when {
+        !sendable -> "Sending unavailable"
+        device == null -> "Make a file code"
+        device?.canSendFiles == true -> "Send files"
+        else -> "Try sending files"
+    }
+    PrimaryButton(sendLabel, busy, selected.isNotEmpty() && !reading && sendable) {
         onSend(selected) { sendCode = it }
     }
     error?.let { SecondaryText(it) }

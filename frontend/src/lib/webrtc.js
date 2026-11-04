@@ -855,6 +855,13 @@ export class PeerLink {
 
   _onControl(msg) {
     switch (msg.type) {
+      case 'identity-nonce-challenge':
+        // A code ceremony asks the sender to prove a device certificate. The
+        // browser holds no certificate, so answer explicitly. The CLI can then
+        // classify this peer as an anonymous code transfer instead of leaving
+        // identity Pending until the code's hold expires.
+        this._control({ type: 'identity-unavailable', nonce: msg.nonce })
+        return
       case 'caps':
         this.peerShell = !!msg.shell
         this.onCaps({ shell: this.peerShell })

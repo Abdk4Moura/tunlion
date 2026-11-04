@@ -139,7 +139,7 @@ impl HostServices for CliHost {
     ) -> std::result::Result<usize, String> {
         crate::settings::extract_archive(path, dir).map_err(|e| e.to_string())
     }
-    fn record_received_file(&self, record: &filament_peerloop::recv::files::ReceivedFileRecord) {
+    fn record_received_file(&self, record: &filament_peerloop::recv::store::ReceivedFileRecord) {
         crate::transfer_history::append(&[crate::transfer_history::Record {
             time: record.time,
             direction: "in",
@@ -371,7 +371,7 @@ impl HostServices for CliHost {
         crate::identity_state::ceiling_covers_action(device_pub, action)
     }
     fn cap_gate_effective(&self, gate: CapGate<'_>) -> GateDecision {
-        crate::capability::cap_gate_effective(
+        crate::capability::cap_gate_effective_with_identity(
             gate.legacy_allowed,
             gate.outcome,
             gate.action,
@@ -387,6 +387,7 @@ impl HostServices for CliHost {
             gate.cert_revoked,
             gate.denied,
             gate.ceiling_authorizes,
+            gate.identity_state,
         )
     }
     fn now_secs(&self) -> u64 {
