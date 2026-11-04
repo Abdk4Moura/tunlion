@@ -193,7 +193,18 @@ fn uid() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    format!("join-{}-{:x}", std::process::id(), nanos)
+    // Role election is lexicographic over (uid, sid). The enroller must sort
+    // BELOW the owner's `cli-r-...` uid so the owner is the polite answerer;
+    // a neutral `join-...` prefix sorted above it and left both sides
+    // impolite, so neither answered and the join timed out. Keep the released
+    // `cli-e-` shape.
+    let install = crate::secret::fresh_secret();
+    format!(
+        "cli-e-{}-{}-{:x}",
+        install.get(..8).unwrap_or("00000000"),
+        std::process::id(),
+        nanos
+    )
 }
 
 fn localized_denial(reason: &str) -> String {
@@ -237,17 +248,14 @@ async fn run(
     let seed = invitation.enroll_private_key;
     let enroll_chan = enroll_channel_fp(&invitation.issuer_fp);
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    // Match the CLI command loop exactly: the pre-existing compatibility
-    // adapter detaches the signaling forwarder into this call's event channel.
-    // The join is one-shot and owns its socket through the client; there is no
-    // long-lived engine here that needs a separate joinable signaling task.
-    let sio = filament_transport::net::connect_signaling(
+    let signaling = filament_transport::net::connect_signaling_owned(
         &transport_context,
         &request.server,
         tx.clone(),
     )
     .await
     .map_err(|e| JoinFailure::Signaling(format!("signaling: {e}")))?;
+    let sio = signaling.client().clone();
 
     let mut sess = Session::new(&request.proposed_name, &uid());
     sess.room = Some(format!("enrollup-{}", crate::secret::fresh_secret()));
@@ -326,11 +334,6 @@ async fn run(
                     .map_err(|e| JoinFailure::Signaling(e.to_string()))?;
             }
             Ev::Synced(v) => {
-                log.debug(&format!(
-                    "join sync: peers={} channel_peers={}",
-                    v["peers"].as_array().map_or(0, |a| a.len()),
-                    v["channel_peers"].as_array().map_or(0, |a| a.len()),
-                ));
                 if let Some(roster) = sess.on_synced(&v) {
                     for peer in &roster.peers {
                         conn.maybe_adopt_from(peer, false, crate::adoption::AdoptSource::Digest)
@@ -390,12 +393,7 @@ async fn run(
                 }
             }
             Ev::Signal(v) => {
-                let staged = conn.stage_signal(&v);
-                log.debug(&format!(
-                    "join signal from={} staged={staged}",
-                    v["from"].as_str().unwrap_or_default(),
-                ));
-                if staged {
+                if conn.stage_signal(&v) {
                     continue;
                 }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
