@@ -8,16 +8,11 @@ BIN="${TUNLION_BIN:?TUNLION_BIN must name the exact-head worker binary}"
 PORT=${PORT:-8137}
 SERVER="http://127.0.0.1:$PORT"
 PYV="${TUNLION_TEST_VENV:-python3}"
-# This proof is about terminal authorization and withdrawal, not the transport
-# race that carries it. Pin the fixture to the supported WebRTC path so a
-# direct-QUIC sibling stall is reported by the fleet-automesh gates that own it,
-# not as a terminal failure here. The session is still authenticated by the
-# daemon-brokered private secret before any open is sent.
-# `TUNLION_DIRECT=0` alone is not enough: a long-lived acceptor forces the
-# direct rung on to avoid glare, so the test-hooks build exposes the explicit
-# no-direct switch this worker binary is built with.
-export TUNLION_DIRECT=0
-export TUNLION_TEST_NO_DIRECT=1
+# Exercise the production transport. A fleet-secret WebRTC link has no
+# initiator-side certificate binding in the current client, so forcing
+# no-direct would test a path the one-shot terminal cannot authenticate. The
+# daemon-brokered private rendezvous still carries the authorization; this
+# fixture does not pin a transport shortcut.
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fleet-terminal-cut.XXXXXX")"
 DA="$WORK/alpha"
 source "$HERE/lib/fixture.sh"
