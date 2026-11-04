@@ -4722,14 +4722,22 @@ mod transfer_decision_tests {
     }
 
     #[test]
-    fn an_explicit_fleet_grant_survives_inferred_but_not_revocation() {
+    fn an_explicit_fleet_grant_survives_inferred_only_where_the_policy_allows_it() {
         let denied = CapOutcome::Denied("denied".into());
-        let mut gate = input(&denied, true, false);
+        let mut gate = input(&denied, false, false);
         gate.same_owner = true;
         gate.binding = BindingStrength::Inferred;
         gate.has_explicit_grant = true;
         gate.cert_expires = Some(u64::MAX);
-        assert!(transfer_decision(&gate).allowed);
+        assert!(
+            transfer_decision(&gate).allowed,
+            "shadow honors an explicit grant on an Inferred same-owner link"
+        );
+        gate.authoritative = true;
+        assert!(
+            !transfer_decision(&gate).allowed,
+            "authoritative fails closed on an Inferred binding"
+        );
         gate.cert_revoked = true;
         assert_eq!(transfer_decision(&gate).deny, Some(TransferDeny::Revoked));
     }
