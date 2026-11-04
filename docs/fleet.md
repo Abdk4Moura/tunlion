@@ -62,8 +62,14 @@ For a **fleet sibling** (same owner, never paired directly with the receiver):
 
 There is no transitive trust across owners and no multi-hop routing through a
 sibling. A connection may use a direct transport or a relay. Discovery does not
-guarantee reachability. Browser pairing supports files and shell but does not
-enroll the browser into the fleet.
+guarantee reachability.
+
+The browser currently supports pairwise files and shell but does not enroll into
+a fleet. That is an implementation gap in the browser client, not a separate
+security model. The target is for every client to consume the same universal
+core semantics, with the browser using a WASM binding. Platform limits remain
+explicit: a browser can be a remote terminal client but cannot serve a native
+PTY, and it cannot serve an OS filesystem mount.
 
 ## Grant on this device or on another device
 
