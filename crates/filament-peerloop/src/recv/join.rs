@@ -326,6 +326,11 @@ async fn run(
                     .map_err(|e| JoinFailure::Signaling(e.to_string()))?;
             }
             Ev::Synced(v) => {
+                log.debug(&format!(
+                    "join sync: peers={} channel_peers={}",
+                    v["peers"].as_array().map_or(0, |a| a.len()),
+                    v["channel_peers"].as_array().map_or(0, |a| a.len()),
+                ));
                 if let Some(roster) = sess.on_synced(&v) {
                     for peer in &roster.peers {
                         conn.maybe_adopt_from(peer, false, crate::adoption::AdoptSource::Digest)
@@ -385,7 +390,12 @@ async fn run(
                 }
             }
             Ev::Signal(v) => {
-                if conn.stage_signal(&v) {
+                let staged = conn.stage_signal(&v);
+                log.debug(&format!(
+                    "join signal from={} staged={staged}",
+                    v["from"].as_str().unwrap_or_default(),
+                ));
+                if staged {
                     continue;
                 }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
