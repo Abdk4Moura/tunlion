@@ -11,7 +11,9 @@
 //! profile; that is a refusal, never an allow.
 
 use async_trait::async_trait;
-use filament_cap::capability::{BindingStrength, GateDecision, CAP_TRANSFER};
+use filament_cap::capability::{
+    BindingStrength, GateDecision, TransferGateInput, CAP_TRANSFER, transfer_decision,
+};
 use filament_id::{now_secs, DeviceCert, UserKey};
 use filament_peerloop::conn::Conn;
 use filament_peerloop::host::{
@@ -342,9 +344,9 @@ impl HostServices for CoreHost {
 
     fn cap_gate_effective(&self, gate: CapGate<'_>) -> GateDecision {
         // The reduced Core composes exactly one capability decision: the
-        // default (shadow) transfer gate. It does not pretend to implement the
-        // authoritative capability policy, and it never lets a shell/exec/
-        // mount/forward open through a policy site that is not composed.
+        // default (shadow) transfer gate. Shell/exec/mount/forward are not
+        // served by this profile. Transfer itself calls the SAME pure policy
+        // as the CLI; this adapter only renders its structured denial.
         if gate.action != CAP_TRANSFER {
             return GateDecision::Deny {
                 cap_reason: Some(format!(
@@ -353,56 +355,36 @@ impl HostServices for CoreHost {
                 )),
             };
         }
-        if gate.cert_revoked {
-            return GateDecision::Deny {
-                cap_reason: Some("device revoked".to_string()),
-            };
-        }
-        if gate.denied {
-            return GateDecision::Deny {
-                cap_reason: Some("explicitly denied by the owner".to_string()),
-            };
-        }
-        if let Some(caps) = gate.auth_key_caps {
-            if !caps
-                .iter()
-                .any(|cap| cap.eq_ignore_ascii_case(CAP_TRANSFER))
-            {
-                return GateDecision::Deny {
-                    cap_reason: Some("delegated ceiling excludes transfer".to_string()),
-                };
-            }
-            if let Some(expires) = gate.cert_expires {
-                if now_secs() >= expires {
-                    return GateDecision::Deny {
-                        cap_reason: Some("delegated access has expired".to_string()),
-                    };
-                }
-            }
-        }
-        if self.cap_authoritative() {
-            return GateDecision::Deny {
-                cap_reason: Some(
-                    "authoritative capability policy is not composed in this core profile"
-                        .to_string(),
-                ),
-            };
-        }
         let same_owner = matches!(
             (gate.own_user_pub, gate.user_pub),
             (Some(own), Some(peer)) if own == peer && *peer != [0u8; 32]
         );
-        let fleet_ok = same_owner
-            && gate.scoped_in_bounds
-            && gate.binding == BindingStrength::Proven
-            && !gate.cert_revoked;
-        if fleet_ok || gate.legacy_allowed {
+        let decision = transfer_decision(&TransferGateInput {
+            authoritative: self.cap_authoritative(),
+            legacy_allowed: gate.legacy_allowed,
+            outcome: gate.outcome,
+            cert_revoked: gate.cert_revoked,
+            denied: gate.denied,
+            auth_key_caps: gate.auth_key_caps,
+            cert_expires: gate.cert_expires,
+            now: now_secs(),
+            same_owner,
+            binding: gate.binding,
+            scoped_in_bounds: gate.scoped_in_bounds,
+            has_explicit_grant: gate.has_explicit_grant,
+            ceiling_authorizes: gate.ceiling_authorizes,
+            identity_state: gate.identity_state,
+        });
+        if decision.allowed {
             GateDecision::Allow
         } else {
             GateDecision::Deny {
-                cap_reason: Some(
-                    "transfer needs legacy consent or a proven same-owner fleet link".to_string(),
-                ),
+                cap_reason: decision.deny_reason().or_else(|| {
+                    Some(
+                        "transfer needs legacy consent or a proven same-owner fleet link"
+                            .to_string(),
+                    )
+                }),
             }
         }
     }
