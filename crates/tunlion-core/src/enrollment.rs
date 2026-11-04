@@ -340,7 +340,7 @@ impl Core {
         let timeout = timeout.unwrap_or(JOIN_BUDGET.as_secs()).max(1);
 
         let mut claim = crate::StartClaim::acquire(self)?;
-        let (parts, lease) = self.prepare_join(&proposed_name)?;
+        let (parts, lease) = self.prepare_join()?;
         let JoinParts {
             server,
             relay,
@@ -414,7 +414,7 @@ impl Core {
         }
     }
 
-    fn prepare_join(&self, proposed_name: &str) -> Result<(JoinParts, CoreLease), CoreError> {
+    fn prepare_join(&self) -> Result<(JoinParts, CoreLease), CoreError> {
         let store = DeviceStore::open(&self.dir);
         let settings =
             CoreSettings::load(&self.dir).map_err(|e| CoreError::Config(e.to_string()))?;
@@ -426,10 +426,6 @@ impl Core {
             .try_acquire_engine_lease()
             .map_err(|e| CoreError::Engine(format!("engine lease: {e}")))?
             .ok_or(CoreError::EngineLease)?;
-        let display_name = settings
-            .get("name")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| proposed_name.to_string());
         let overlay = OverlayKey::new(self.dir.join("overlay.ed25519"));
         let log: Arc<dyn LogSink> = Arc::new(NoLog);
         let host: Arc<dyn HostServices> = Arc::new(CoreHost::new(
