@@ -507,7 +507,7 @@ mod tests {
 
     fn owner() -> ring::signature::Ed25519KeyPair {
         let seed = [3u8; 32];
-        ring::signature::Ed25519KeyPair::from_seed_unchecked(seed).unwrap()
+        ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap()
     }
 
     fn request(kind: InvitationKind) -> InvitationRequest {
