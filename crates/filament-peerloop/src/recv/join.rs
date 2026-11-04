@@ -41,7 +41,7 @@ pub const ESTABLISH_BUDGET: Duration = Duration::from_secs(45);
 pub const JOIN_BUDGET: Duration = Duration::from_secs(60);
 
 /// Everything the joiner needs that is not a host dependency.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JoinRequest {
     pub server: String,
     pub invitation: Invitation,
