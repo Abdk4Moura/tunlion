@@ -63,6 +63,33 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// Offer the remember secret on EVERY live transport for the ceremony peer
+/// (primary plus parallel workers). A make-before-break promotion can have the
+/// receiver reading the new path while `conn.transport()` still names the old
+/// one; a single-transport send was lost exactly there, the sender stored its
+/// half, and neither side remembered the other. Repeats are safe because the
+/// receiver stores a repeated secret idempotently.
+async fn offer_pair_keep(conn: &Conn, pid: &str, secret: &str) -> bool {
+    let Some(link) = conn.link(pid) else {
+        return false;
+    };
+    let mut transports: Vec<Arc<dyn Transport>> = Vec::new();
+    if let Some(t) = &link.transport {
+        transports.push(t.clone());
+    }
+    transports.extend(link.workers.iter().cloned());
+    let mut handed = false;
+    for t in transports {
+        if t.send_control(&json!({ "type": "pair-keep", "secret": secret }))
+            .await
+            .is_ok()
+        {
+            handed = true;
+        }
+    }
+    handed
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_cmd(
     server: &str,
@@ -719,6 +746,13 @@ pub(crate) async fn send_cmd(
     // `--remember <name>` on the code path: the record this send stored for the
     // ceremony peer, once it has been offered (see the `file-accept` arm).
     let mut remembered_as: Option<String> = None;
+    // The secret and name we offered. Keep offering on a short bounded retry
+    // until the receiver's pair-keep-ack arrives: the link can move to a new
+    // direct path between the offer and the receiver's read.
+    let mut remember_offer: Option<(String, String)> = None;
+    let mut remember_acked = false;
+    let mut remember_retry_at: Option<Instant> = None;
+    let mut remember_retries = 0u8;
     // The transfer is allowed to offer once auth is settled: immediately for
     // local / known-device sends; only after the ephemeral PAKE confirms for the
     // code path. The agreed secret is then DISCARDED (never stored).
@@ -1014,6 +1048,20 @@ pub(crate) async fn send_cmd(
         sess.tick(&sio).await;
         // #28: discharge any deferred peer-left whose channel has gone idle/dead.
         conn.reap_deferred();
+        // A remember offer is retried on the live transports until acked. The
+        // old single send could be read on neither path after a direct-path
+        // handoff: the sender kept its half while the receiver never stored.
+        if !remember_acked && remember_retries < 5 {
+            if let Some((_, secret)) = &remember_offer {
+                if remember_retry_at.is_some_and(|at| Instant::now() >= at) {
+                    if let Some(pid) = pake_peer.as_deref() {
+                        let _ = offer_pair_keep(&conn, pid, secret).await;
+                    }
+                    remember_retries = remember_retries.saturating_add(1);
+                    remember_retry_at = Some(Instant::now() + Duration::from_secs(2));
+                }
+            }
+        }
         // A fleet peer that has not proved itself within budget stops holding the
         // target slot. Treated as "not the target" rather than as a failure: it
         // may simply be a sibling that never speaks fleet to us (see the paired
@@ -2203,6 +2251,7 @@ pub(crate) async fn send_cmd(
                 }
                 // C27: the human on the other side answered our remember offer.
                 Some("pair-keep-ack") => {
+                    remember_acked = true;
                     if let Some(name) = remembered_as.clone() {
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         crate::shared_defs::REMEMBER_ANSWERED
@@ -2301,13 +2350,7 @@ pub(crate) async fn send_cmd(
                             && pake_peer.as_deref() == Some(pid.as_str())
                         {
                             let sec = crate::fresh_secret();
-                            let handed = match conn.transport_of(&pid) {
-                                Some(t) => t
-                                    .send_control(&json!({ "type": "pair-keep", "secret": sec }))
-                                    .await
-                                    .is_ok(),
-                                None => false,
-                            };
+                            let handed = offer_pair_keep(&conn, &pid, &sec).await;
                             if handed {
                                 // A NEW record, suffixed when <name> is taken: a
                                 // remember never re-keys an existing device (C1).
@@ -2319,7 +2362,9 @@ pub(crate) async fn send_cmd(
                                 if let Ok(mut g) = crate::shared_defs::REMEMBER_STORED_AS.lock() {
                                     *g = Some(stored.clone());
                                 }
-                                remembered_as = Some(stored);
+                                remembered_as = Some(stored.clone());
+                                remember_offer = Some((stored, sec));
+                                remember_retry_at = Some(Instant::now() + Duration::from_secs(2));
                                 crate::shared_defs::REMEMBER_STORED
                                     .store(true, std::sync::atomic::Ordering::Relaxed);
                             }

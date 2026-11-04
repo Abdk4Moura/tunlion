@@ -2841,7 +2841,7 @@ async fn recv_run(
                     if retry_due {
                         if ports
                             .identity
-                            .resend_identity_challenge(&conn, &p.pid, &mut identity_nonces)
+                            .resend_identity_challenge(&t, &p.pid, &mut identity_nonces)
                             .await
                         {
                             log.debug(&format!(
@@ -7406,7 +7406,7 @@ async fn recv_run(
                         let ceremony_peer =
                             recv_code_path && recv_pake_done && conn.is_bound_active_peer(&pid);
                         let kept = match (&remember, ceremony_peer) {
-                            (Some(name), true) => match ports.store.devices_store(name, &sec) {
+                            (Some(name), true) => match ports.store.devices_store_remembered(name, &sec) {
                                 Ok(stored) => {
                                     ports
                                         .env
@@ -8096,7 +8096,7 @@ async fn recv_run(
                                     && ports
                                         .identity
                                         .resend_identity_challenge(
-                                            &conn,
+                                            &t,
                                             &pid,
                                             &identity_nonces,
                                         )
