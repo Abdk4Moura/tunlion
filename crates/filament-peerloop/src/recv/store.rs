@@ -4947,6 +4947,35 @@ mod invitation_store_tests {
     }
 
     #[test]
+    fn a_legacy_self_header_is_verified_over_its_signed_resource_id() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.0.clone());
+        let seed = [4u8; 32];
+        let owner = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        use ring::signature::KeyPair;
+        let owner_pub: [u8; 32] = owner.public_key().as_ref().try_into().unwrap();
+        let nonce = [9u8; 32];
+        let mut header = filament_cap::capability::CapHeader {
+            resource: filament_cap::capability::self_resource_id(&owner_pub),
+            epoch: 0,
+            owner_pub,
+            nonce,
+            floors: Vec::new(),
+            issued_at: 10,
+            prev_owner_pub: None,
+            prev_header_hash: None,
+            sig: [0u8; 64],
+        };
+        header.sig = filament_cap::capability::sign_cap_header(&header, &owner);
+        let mut stored = header.to_json();
+        stored["resource"] = json!("self");
+        assert!(store.store_owner_cap_header(&stored, &owner_pub).unwrap());
+        assert!(!store.store_owner_cap_header(&stored, &owner_pub).unwrap());
+        assert!(store.owner_cap_header().is_some());
+        let _ = std::fs::remove_dir_all(&root.0);
+    }
+
+    #[test]
     fn an_invalid_owner_header_never_reaches_the_store() {
         let root = TestRoot::new();
         let store = DeviceStore::open(root.0.clone());
