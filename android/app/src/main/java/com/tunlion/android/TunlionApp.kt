@@ -461,9 +461,9 @@ private fun FilesScreen(status: CoreStatus, busy: Boolean, onReceive: (String) -
     onConnect: () -> Unit, onPickDevice: (CoreDevice) -> Unit) {
     var receiveExpanded by rememberSaveable { mutableStateOf(false) }
     var code by rememberSaveable { mutableStateOf("") }
-    Title("Files, straight\nto your device.", "Choose a connected device to send a file. Received files are verified before they are saved.")
+    Title("Files, straight\nto your device.", "Choose a stored device to attempt a send, or use a file code. The real receiver checks permission and reachability.")
     Eyebrow("SEND TO")
-    val recipients = status.devices.filter { it.canSendFiles }
+    val recipients = status.devices.filter { it.canSendFiles || it.canAttemptSend }
     if (recipients.isEmpty()) {
         SecondaryText("Connect another device to send your first file.")
         OutlinedButton(onClick = onConnect, shape = RoundedCornerShape(7.dp)) { Text("Connect a device") }
@@ -571,6 +571,10 @@ private fun DeviceDetails(device: CoreDevice, onSend: () -> Unit) {
     SecondaryText("Revoking a capability and cutting a device are different operations. Offline acknowledgment and active-session termination are not available here. Withdrawing an owner grant must not be assumed to close an existing session.")
     if (device.route == "relayed") SecondaryText("On relay, not a direct link. Still end-to-end encrypted.")
     if (device.canSendFiles) PrimaryButton("Send a file", onClick = onSend)
+    else if (device.canAttemptSend) {
+        SecondaryText("Remote permission and reachability have not been checked. You can attempt a transfer; the receiver may refuse it. This is not an effective permission grant.")
+        OutlinedButton(onClick = onSend) { Text("Try sending a file") }
+    }
     if (device.canOpenShell) SecondaryText("Shell access granted. The terminal is not connected in this preview.")
 }
 
@@ -617,7 +621,9 @@ private fun SendScreen(device: CoreDevice?, busy: Boolean, onSend: (List<android
             finally { reading = false }
         }
     }
-    Title(if (device == null) "Send with a code" else "Send to ${device.name}", "Choose files with Android's file picker. They stay on this phone until you send them.")
+    Title(if (device == null) "Send with a code" else if (device.canSendFiles) "Send to ${device.name}" else "Try sending to ${device.name}",
+        "Choose files with Android's file picker. They stay on this phone until you send them.")
+    if (device != null && !device.canSendFiles) SecondaryText("Remote permission is unknown, not granted. The receiver will decide whether to accept this attempt.")
     sendCode?.let { code ->
         Eyebrow("YOUR FILE CODE")
         Text(code, fontFamily = FontFamily.Monospace, fontSize = 22.sp)
@@ -633,7 +639,7 @@ private fun SendScreen(device: CoreDevice?, busy: Boolean, onSend: (List<android
         }
     }
     OutlinedButton(onClick = { picker.launch(arrayOf("*/*")) }, enabled = !busy && !reading, shape = RoundedCornerShape(7.dp)) { Text(if (names.isEmpty()) "Choose files" else "Choose different files") }
-    PrimaryButton(if (device == null) "Make a file code" else "Send files", busy, selected.isNotEmpty() && !reading) {
+    PrimaryButton(if (device == null) "Make a file code" else if (device.canSendFiles) "Send files" else "Try sending files", busy, selected.isNotEmpty() && !reading) {
         onSend(selected) { sendCode = it }
     }
     error?.let { SecondaryText(it) }

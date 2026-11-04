@@ -145,7 +145,8 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     }
 
     override suspend fun sendFiles(deviceId: String?, files: List<Uri>, onCode: (String) -> Unit): CoreResult {
-        if (deviceId != null) return CoreResult.Failure(CoreErrorKind.FEATURE_NOT_LINKED, "Native device discovery is not connected. Use a file code instead.")
+        val device = deviceId?.let { id -> cached.devices.firstOrNull { it.id == id } }
+        if (deviceId != null && device == null) return CoreResult.Failure(CoreErrorKind.UNKNOWN_DEVICE, "The device is not in the current core snapshot. Return to Devices and refresh.")
         if (files.isEmpty()) return CoreResult.Failure(CoreErrorKind.INVALID_INPUT, "Choose files first.")
         return runTransfer {
             val staging = File(context.cacheDir, "send-${UUID.randomUUID()}")
@@ -173,10 +174,12 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
                     }.absolutePath
                 }
                 currentCoroutineContext().ensureActive()
-                val created = session.createCode(paths, 300uL)
-                withContext(Dispatchers.Main) { onCode(created.code) }
-                val sent = session.waitSend()
-                if (sent.files.any { !it.delivered }) CoreResult.Failure(CoreErrorKind.PARTIAL, "Some files were not acknowledged by the receiver.")
+                val sent = if (device == null) {
+                    val created = session.createCode(paths, 300uL)
+                    withContext(Dispatchers.Main) { onCode(created.code) }
+                    session.waitSend()
+                } else session.sendToDevice(paths, device.name, 300uL)
+                if (sent.files.size != paths.size || sent.files.any { !it.delivered }) CoreResult.Failure(CoreErrorKind.PARTIAL, "Some files were not acknowledged by the receiver.")
                 else CoreResult.Success
             } finally { staging.deleteRecursively() }
         }

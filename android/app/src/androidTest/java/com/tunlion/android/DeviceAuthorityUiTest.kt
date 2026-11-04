@@ -41,6 +41,10 @@ class DeviceAuthorityUiTest {
         compose.onNodeWithText("Send files to this device · Unknown").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Send a file").assertDoesNotExist()
         compose.onNodeWithText("Availability unknown").assertExists()
+        compose.onNodeWithText("Try sending a file").performScrollTo().performClick()
+        compose.onNodeWithText("Try sending to Stored laptop").assertExists()
+        compose.onNodeWithText("Remote permission is unknown, not granted. The receiver will decide whether to accept this attempt.").assertExists()
+        compose.onNodeWithText("Try sending files").performScrollTo().assertIsNotEnabled()
     }
 }
 

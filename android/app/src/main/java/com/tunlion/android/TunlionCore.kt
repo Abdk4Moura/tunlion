@@ -44,7 +44,10 @@ data class CoreDevice(
     val expiry: String? = null,
     val revoked: Boolean = false,
     val actions: List<CoreAction> = emptyList(),
-) : java.io.Serializable
+) : java.io.Serializable {
+    // An explicit attempt is not a claim that the remote receiver authorized us.
+    val canAttemptSend: Boolean get() = actions.any { it.action == "send" && it.state == CoreAccessState.UNKNOWN }
+}
 
 enum class CoreRelationship { PAIRED, FLEET, TEMPORARY, UNKNOWN }
 enum class CoreAccessState { AVAILABLE, PENDING, BLOCKED, UNSUPPORTED, UNKNOWN }
