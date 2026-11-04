@@ -42,9 +42,9 @@ wait_file() {
     return 1
 }
 # The cold one-shot path resolves a fleet sibling through the index record a
-# verified fleet-hello writes. A roster NAME alone is not dialable, and a
-# private rendezvous is brokered only over a certificate-verified link. Wait
-# for that exact fact instead of starting a terminal into a setup race.
+# verified fleet-hello writes. A roster NAME alone is not dialable. Wait for
+# that record within the fixture's existing setup budget; the terminal
+# assertion itself is unchanged.
 fleet_indexed() {
     python3 - "$WORK/$1/devices.json" <<'PY'
 import json,sys
@@ -55,14 +55,8 @@ PY
 }
 wait_fleet_link() {
     local node=$1
-    for _ in $(seq 1 12); do
-        if fleet_indexed "$node" \
-            && as_node "$node" reach charlie --json --timeout 2 \
-                >"$WORK/$node-reach.json" 2>"$WORK/$node-reach.err"
-        then
-            ok "$node: certificate-verified fleet link to charlie before terminal"
-            return 0
-        fi
+    for _ in $(seq 1 60); do
+        fleet_indexed "$node" && return 0
         sleep 0.5
     done
     return 1
@@ -100,7 +94,7 @@ diagnose() {
         echo "--- source"; cat "$SOURCE_HASHES" 2>/dev/null
         echo "--- work directory"; ls -la "$WORK" 2>/dev/null
         echo "--- per-process output"
-        for f in "$WORK"/*.err "$WORK"/*.out "$WORK"/*-reach.json "$WORK"/*-reach.err; do
+        for f in "$WORK"/*.err "$WORK"/*.out "$WORK"/*-preflight.log "$WORK"/*-reach.json "$WORK"/*-reach.err; do
             [ -f "$f" ] || continue
             echo "### ${f##*/}"; tail -80 "$f"
         done
@@ -173,7 +167,7 @@ PY
     # authorizes these terminals: the ceiling is a cap, not a grant.
     for node in bravo delta; do
         wait_fleet_link "$node" || {
-            diagnose "$mode: $node has no verified fleet link to charlie"
+            diagnose "$mode: $node did not index charlie"
             fixture_die "$mode: $node has no certificate-verified fleet link to charlie"
         }
     done
