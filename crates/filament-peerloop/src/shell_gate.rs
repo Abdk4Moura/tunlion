@@ -612,6 +612,7 @@ mod terminal_lifecycle_tests {
             name: Some(name.into()), device: Some([key; 32]), user: Some([9; 32]),
             binding: BindingStrength::Proven, expires: Some(u64::MAX), key_caps: None,
             trusted: true, policy_allows: false, sibling: true, pair_binding: None, require_name_key: false,
+            identity_state: filament_cap::capability::IdentityState::Resolved,
         }
     }
 
