@@ -1451,6 +1451,31 @@ pub enum BindingStrength {
     Inferred,
 }
 
+/// The identity fact a link carries at gate time.
+///
+/// `Pending` and `Resolved` are the ordering states the #161 probe guards: a
+/// legacy-trusted open must never be decided while identity resolution is
+/// merely unfinished. `ExplicitlyUnavailableAnonymous` is different in kind:
+/// the peer answered our possession challenge with `identity-unavailable`
+/// AFTER a one-time code ceremony or an explicit local transfer consent
+/// (`-y`/daemon room acceptance) selected it, so the absence of a certificate
+/// is a fact, not a race. Only a transfer consents to that class; every other
+/// action remains denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdentityState {
+    /// Not resolved yet, or the peer never answered. Fail closed: hold, then
+    /// deny, rather than decide with revocation unknowable.
+    #[default]
+    Pending,
+    /// The link carries a device certificate (Inferred or Proven).
+    Resolved,
+    /// The peer explicitly said it holds no certificate, after the one-time
+    /// code ceremony or the operator's explicit room consent selected it. That
+    /// consent is the authority; revocation cannot be consulted because there
+    /// is no device identity to consult.
+    ExplicitlyUnavailableAnonymous,
+}
+
 /// A delegated principal CANNOT exist without its caps ceiling — the compiler
 /// enforces what convention previously did.
 #[derive(Debug, Clone, PartialEq, Eq)]

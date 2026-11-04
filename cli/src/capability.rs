@@ -486,6 +486,55 @@ pub fn cap_gate_effective(
     // alarm (the flip PERMITS this open, it does not break it).
     ceiling_authorizes: bool,
 ) -> GateDecision {
+    // Callers that do not carry a link identity (permission previews, tests
+    // constructing a resolved principal directly) keep the old ordering
+    // semantics: an unresolved identity is Pending, and the #161 probe stays
+    // strict for it.
+    cap_gate_effective_with_identity(
+        legacy_allowed,
+        outcome,
+        action,
+        resource,
+        device_pub,
+        user_pub,
+        binding,
+        cert_expires,
+        auth_key_caps,
+        own_user_pub,
+        scoped_in_bounds,
+        has_explicit_grant,
+        cert_revoked,
+        denied,
+        ceiling_authorizes,
+        IdentityState::Pending,
+    )
+}
+
+/// The link-aware form: same policy site, plus the identity fact the link
+/// actually carries. Only `ExplicitlyUnavailableAnonymous` changes semantics:
+/// the peer answered the possession challenge after the code ceremony, so it
+/// has no certificate to revoke and the code itself is the authorization for
+/// TRANSFER only. `Pending` remains strict, so an unfinished resolution can
+/// never quietly become the anonymous class.
+#[allow(clippy::too_many_arguments)]
+pub fn cap_gate_effective_with_identity(
+    legacy_allowed: bool,
+    outcome: &CapOutcome,
+    action: &str,
+    resource: &str,
+    device_pub: Option<&[u8; 32]>,
+    user_pub: Option<&[u8; 32]>,
+    binding: BindingStrength,
+    cert_expires: Option<u64>,
+    auth_key_caps: Option<&[String]>,
+    own_user_pub: Option<&[u8; 32]>,
+    scoped_in_bounds: bool,
+    has_explicit_grant: bool,
+    cert_revoked: bool,
+    denied: bool,
+    ceiling_authorizes: bool,
+    identity_state: IdentityState,
+) -> GateDecision {
     let authoritative = cap_authoritative();
 
     // === #161 probe: the revocation ordering window =====================
@@ -504,9 +553,56 @@ pub fn cap_gate_effective(
     // `gate_live()` scopes the probe to real flows (binary + harness); unit
     // tests construct the state directly and must not trip it.
     debug_assert!(
-        !(gate_live() && legacy_allowed && device_pub.is_none() && !cert_revoked),
+        !(gate_live()
+            && legacy_allowed
+            && device_pub.is_none()
+            && !cert_revoked
+            && identity_state != IdentityState::ExplicitlyUnavailableAnonymous),
         "gate reached before identity resolution: legacy trust with no resolved device identity"
     );
+
+    // === Explicit anonymous code peer ==================================
+    // The peer answered our possession challenge with `identity-unavailable`
+    // AFTER a one-time code ceremony or explicit local transfer consent
+    // (`-y`/daemon room acceptance) selected it. There is no device
+    // certificate, so revocation cannot be consulted: that consent is the
+    // human authorization, and it authorizes a TRANSFER only. Shell, mount,
+    // forwarding, routes and fleet services all stay denied. This is NOT the
+    // pending case above: callers must never map a timeout or an unanswered
+    // challenge to this state.
+    if identity_state == IdentityState::ExplicitlyUnavailableAnonymous {
+        if cert_revoked {
+            return GateDecision::Deny {
+                cap_reason: Some("device revoked".into()),
+            };
+        }
+        if denied {
+            return GateDecision::Deny {
+                cap_reason: Some("explicitly denied by owner (deniedCaps)".into()),
+            };
+        }
+        if !action.eq_ignore_ascii_case(CAP_TRANSFER) {
+            return GateDecision::Deny {
+                cap_reason: Some(
+                    "anonymous code peer is authorized for transfer only".into(),
+                ),
+            };
+        }
+        if !scoped_in_bounds {
+            return GateDecision::Deny {
+                cap_reason: Some(
+                    "anonymous code transfer must land inside the receiver's inbox".into(),
+                ),
+            };
+        }
+        return if legacy_allowed {
+            GateDecision::Allow
+        } else {
+            GateDecision::Deny {
+                cap_reason: Some("anonymous code peer has no transfer consent".into()),
+            }
+        };
+    }
 
     // === Delegated-principal ceiling (check 2 of 2) ===================
     // Auth key ceiling applies UNCONDITIONALLY in both modes. Purely restrictive
@@ -1291,6 +1387,117 @@ mod tests {
             "documents the window: with no resolved identity the gate allows on \
              legacy trust, because revocation is unknowable rather than absent. \
              If this ever flips, the ordering was fixed and 1v can be closed."
+        );
+    }
+
+    /// A code ceremony with no device certificate is authorized by the code
+    /// itself, but only for a transfer: shell, mount, route and every other
+    /// action stay denied. This is the explicit anonymous class, distinct from
+    /// a merely Pending resolution.
+    #[test]
+    fn explicit_anonymous_code_peer_is_transfer_only() {
+        let outcome = CapOutcome::Denied("no capability header".into());
+        let transfer = cap_gate_effective_with_identity(
+            true,
+            &outcome,
+            CAP_TRANSFER,
+            "self",
+            None,
+            None,
+            BindingStrength::None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
+            false,
+            IdentityState::ExplicitlyUnavailableAnonymous,
+        );
+        assert!(
+            transfer.allowed(),
+            "the code is the human authorization for an anonymous transfer"
+        );
+        for action in [CAP_SHELL, CAP_MOUNT, CAP_ROUTE] {
+            let denied = cap_gate_effective_with_identity(
+                true,
+                &outcome,
+                action,
+                "self",
+                None,
+                None,
+                BindingStrength::None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+                false,
+                false,
+                IdentityState::ExplicitlyUnavailableAnonymous,
+            );
+            assert!(
+                matches!(denied, GateDecision::Deny { .. }),
+                "anonymous code peer must not reach {action}"
+            );
+        }
+        let no_consent = cap_gate_effective_with_identity(
+            false,
+            &outcome,
+            CAP_TRANSFER,
+            "self",
+            None,
+            None,
+            BindingStrength::None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
+            false,
+            IdentityState::ExplicitlyUnavailableAnonymous,
+        );
+        assert!(
+            matches!(no_consent, GateDecision::Deny { .. }),
+            "without the code consent there is no anonymous transfer"
+        );
+        let outside_inbox = cap_gate_effective_with_identity(
+            true,
+            &outcome,
+            CAP_TRANSFER,
+            "self",
+            None,
+            None,
+            BindingStrength::None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            IdentityState::ExplicitlyUnavailableAnonymous,
+        );
+        assert!(
+            matches!(outside_inbox, GateDecision::Deny { .. }),
+            "anonymous code transfer must not bypass the receiver path bound"
+        );
+    }
+
+    /// Pending is not the anonymous class: the default and the wrapper both
+    /// keep it, so only an explicit `identity-unavailable` answer can reach the
+    /// transfer-only exemption.
+    #[test]
+    fn pending_identity_is_not_explicitly_anonymous() {
+        assert_eq!(IdentityState::default(), IdentityState::Pending);
+        assert_ne!(
+            IdentityState::Pending,
+            IdentityState::ExplicitlyUnavailableAnonymous
         );
     }
 

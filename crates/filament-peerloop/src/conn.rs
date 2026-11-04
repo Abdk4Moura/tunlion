@@ -53,7 +53,7 @@ use crate::link_manager::{LinkObs, Placement, Work, peer_present, place};
 use crate::present::{NoScreen, Presentation};
 use crate::resilience;
 use crate::test_hooks;
-use filament_cap::capability::{BindingStrength, PrincipalKind};
+use filament_cap::capability::{BindingStrength, IdentityState, PrincipalKind};
 use filament_transport::direct;
 use filament_transport::net::{self, Ev, Peer, Transport};
 
@@ -517,6 +517,11 @@ pub struct Link {
     pub identity_user_pub: Option<[u8; 32]>,
     /// Binding strength of the identity fields (set alongside them).
     pub identity_binding: BindingStrength,
+    /// Whether the identity fields are Pending, Resolved, or the peer
+    /// explicitly answered that it holds no certificate after the code
+    /// ceremony. The gate distinguishes an unfinished resolution (must hold,
+    /// then fail closed) from an explicit anonymous code peer (transfer only).
+    pub identity_state: IdentityState,
     /// Identity cert expiry (unix seconds). None = no cert resolved.
     pub identity_cert_expires: Option<u64>,
     /// Principal kind: OwnerDevice or Delegated { caps }. A Delegated
@@ -611,6 +616,7 @@ impl Link {
         self.identity_user_pub = Some(owner_pub);
         self.identity_device_pub = Some(device_pub);
         self.identity_binding = BindingStrength::Proven;
+        self.identity_state = IdentityState::Resolved;
         self.identity_cert_expires = Some(expires);
         self.principal_kind = PrincipalKind::FleetSibling;
     }
@@ -662,6 +668,7 @@ impl Link {
         self.identity_user_pub = Some(owner_pub);
         self.identity_device_pub = Some(device_pub);
         self.identity_binding = BindingStrength::Proven;
+        self.identity_state = IdentityState::Resolved;
         self.identity_cert_expires = Some(expires);
         self.principal_kind = PrincipalKind::Delegated { caps };
         // NOTE: deliberately do NOT set self.trusted. binding=Proven satisfies
@@ -1917,6 +1924,15 @@ impl Conn {
     }
     pub fn is_active(&self, pid: &str) -> bool {
         self.active.as_deref() == Some(pid)
+    }
+    /// The gate-relevant identity fact for `pid`. A missing link is Pending,
+    /// never anonymous: only an explicit identity-unavailable answer sets the
+    /// anonymous state, and it is stored on the link that received it.
+    pub fn identity_state_of(&self, pid: &str) -> IdentityState {
+        self.links
+            .get(pid)
+            .map(|l| l.identity_state)
+            .unwrap_or(IdentityState::Pending)
     }
     pub fn transport(&self) -> Option<Arc<dyn Transport>> {
         self.active_link().and_then(|l| l.transport.clone())
@@ -3535,6 +3551,7 @@ impl Conn {
                 identity_device_pub: None,
                 identity_user_pub: None,
                 identity_binding: BindingStrength::None,
+                identity_state: IdentityState::Pending,
                 identity_cert_expires: None,
                 principal_kind: PrincipalKind::OwnerDevice,
                 host: self.host.clone(),
@@ -5669,6 +5686,7 @@ impl Conn {
                     identity_device_pub: None,
                     identity_user_pub: None,
                     identity_binding: BindingStrength::None,
+                    identity_state: IdentityState::Pending,
                     identity_cert_expires: None,
                     principal_kind: if fleet || lan {
                         PrincipalKind::Delegated { caps: Vec::new() }
@@ -6995,6 +7013,7 @@ impl Conn {
                 identity_device_pub: None,
                 identity_user_pub: None,
                 identity_binding: BindingStrength::None,
+                identity_state: IdentityState::Pending,
                 identity_cert_expires: None,
                 principal_kind: upgrade_principal(&carried).1,
                 host: self.host.clone(),
@@ -8759,6 +8778,7 @@ mod warm_identity_tests {
             identity_device_pub: None,
             identity_user_pub: None,
             identity_binding: BindingStrength::None,
+            identity_state: IdentityState::Pending,
             identity_cert_expires: None,
             principal_kind: PrincipalKind::OwnerDevice,
             host: Arc::new(crate::host::NoHost),

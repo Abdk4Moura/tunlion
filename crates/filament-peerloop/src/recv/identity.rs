@@ -27,7 +27,7 @@ use crate::recv::store::{
     effective_principal_deadline, DeviceStore, OverlayKey, PRINCIPAL_STATE_LAPSED,
     PRINCIPAL_STATE_REVOKED,
 };
-use filament_cap::capability::BindingStrength;
+use filament_cap::capability::{BindingStrength, IdentityState};
 use filament_id::{now_secs, DeviceCert, IntroScope, UserKey, CERT_TTL_SECS};
 use filament_transport::net::Transport;
 use serde_json::{json, Value};
@@ -273,6 +273,7 @@ impl IdentityService {
             l.identity_device_pub = Some(cert.device_pub);
             l.identity_user_pub = Some(cert.user_pub);
             l.identity_binding = BindingStrength::Proven;
+            l.identity_state = IdentityState::Resolved;
             let (deadline, _clock) =
                 effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
             l.identity_cert_expires = Some(deadline);

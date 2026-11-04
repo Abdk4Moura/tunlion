@@ -123,6 +123,7 @@ pub async fn handle_mount_open(
             scoped_in_bounds: mount_scoped_default,
             has_explicit_grant: has_grant,
             cert_revoked,
+            identity_state: conn.identity_state_of(pid),
             denied,
             ceiling_authorizes: false,
         });
@@ -389,6 +390,7 @@ mod tests {
             direct_route: "direct-quic", established_at: None,
             identity_device_pub: Some(DEVICE), identity_user_pub: Some([3; 32]),
             identity_binding: cap::BindingStrength::Proven, identity_cert_expires: Some(1000),
+            identity_state: cap::IdentityState::Resolved,
             principal_kind: cap::PrincipalKind::OwnerDevice, host,
         });
         (conn, far)

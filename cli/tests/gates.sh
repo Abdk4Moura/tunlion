@@ -266,8 +266,9 @@ D="$WORK/g2"; mkdir -p "$D"
 # 0.5s poll, and the receiver finished before it could be killed (measured:
 # "delivered" at 160 MB/s). 3ms per chunk stretches it to ~5s, the same remedy
 # and the same arithmetic as gate 11b.
+G2ROOM="g2room$$"
 TUNLION_TEST_TRANSFER_STALL_MS=${TUNLION_TEST_TRANSFER_STALL_MS:-3} \
-  "$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g2-send.log" 2>&1 &
+  "$BIN" send "$BIG" --word "$CODE_WORD" --room "$G2ROOM" --server "$SERVER" >"$WORK/g2-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g2-send.log") || { bad "kill-resume (no code minted)"; tail -n 3 "$WORK/g2-send.log"; }
 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv1.log" 2>&1 &
@@ -300,12 +301,21 @@ fi
 # A claimed code cannot authorize a different receiver. The interrupted send
 # must fail honestly, and the spent code must stay burned. Resume is a fresh
 # send and fresh authenticated claim into the same folder, not a room bypass.
+# Adversarial: a non-ceremony peer joins the sender's own room while the
+# authentic receiver is dead. It has no PAKE claim on this code, so it must
+# receive nothing; only a fresh send with a fresh code can move the partial.
+D2="$WORK/g2-replacement"; mkdir -p "$D2"
+timeout 60 "$BIN" receive -y --dir "$D2" --room "$G2ROOM" --server "$SERVER" >"$WORK/g2-roompeer.log" 2>&1 &
+R2=$!; pids+=($R2)
 bounded_wait $SP 60 "interrupted code sender" "$WORK/g2-send.log"; RCS1=$?
 timeout 30 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g2-replay.log" 2>&1
 RCREPLAY=$?
+G2ROOMPEER=$(ls -A "$D2" 2>/dev/null | tr '\n' ' ')
+kill -9 $R2 2>/dev/null; wait $R2 2>/dev/null
 G2AUTH=0
 if [ $RCS1 -eq 6 ] && [ $RCREPLAY -ne 0 ] && [ $RCREPLAY -ne 124 ] \
    && grep -q "code rejected" "$WORK/g2-replay.log" \
+   && [ -z "$G2ROOMPEER" ] \
    && [ "$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)" -eq "$G2SZ" ]; then
   G2AUTH=1
 fi
