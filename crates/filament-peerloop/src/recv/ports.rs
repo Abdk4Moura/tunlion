@@ -140,7 +140,7 @@ pub trait RecvIdentity: Send + Sync {
     /// Re-issue a challenge for a parked open.
     async fn resend_identity_challenge(
         &self,
-        conn: &Conn,
+        t: &Arc<dyn Transport>,
         pid: &str,
         identity_nonces: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
     ) -> bool;
@@ -220,6 +220,11 @@ pub trait RecvStore: Send + Sync {
     );
     fn devices_remove(&self, name: &str) -> anyhow::Result<()>;
     fn devices_store(&self, name: &str, secret: &str) -> anyhow::Result<String>;
+    /// Remember a `pair-keep` secret idempotently. The default keeps the old
+    /// behavior for test mocks; the real store dedupes repeats by secret.
+    fn devices_store_remembered(&self, name: &str, secret: &str) -> anyhow::Result<String> {
+        self.devices_store(name, secret)
+    }
     fn devices_store_new(
         &self,
         name: &str,
@@ -559,7 +564,7 @@ pub(crate) mod test_support {
         }
         async fn resend_identity_challenge(
             &self,
-            _: &Conn,
+            _: &Arc<dyn Transport>,
             _: &str,
             _: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
         ) -> bool {

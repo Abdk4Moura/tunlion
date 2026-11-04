@@ -49,6 +49,7 @@ use crate::session;
 use crate::shutdown;
 use crate::test_hooks;
 use crate::ui;
+use filament_peerloop::send::gate::{adopt_wants_active, code_peer_event_allowed, CodePeerEvent};
 use crate::exit_codes::{self, ExitKind};
 use anyhow::{Context, Result, anyhow, bail};
 use filament_transfer::Outgoing;
@@ -61,6 +62,33 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// Offer the remember secret on EVERY live transport for the ceremony peer
+/// (primary plus parallel workers). A make-before-break promotion can have the
+/// receiver reading the new path while `conn.transport()` still names the old
+/// one; a single-transport send was lost exactly there, the sender stored its
+/// half, and neither side remembered the other. Repeats are safe because the
+/// receiver stores a repeated secret idempotently.
+async fn offer_pair_keep(conn: &Conn, pid: &str, secret: &str) -> bool {
+    let Some(link) = conn.link(pid) else {
+        return false;
+    };
+    let mut transports: Vec<Arc<dyn Transport>> = Vec::new();
+    if let Some(t) = &link.transport {
+        transports.push(t.clone());
+    }
+    transports.extend(link.workers.iter().cloned());
+    let mut handed = false;
+    for t in transports {
+        if t.send_control(&json!({ "type": "pair-keep", "secret": secret }))
+            .await
+            .is_ok()
+        {
+            handed = true;
+        }
+    }
+    handed
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_cmd(
@@ -718,6 +746,13 @@ pub(crate) async fn send_cmd(
     // `--remember <name>` on the code path: the record this send stored for the
     // ceremony peer, once it has been offered (see the `file-accept` arm).
     let mut remembered_as: Option<String> = None;
+    // The secret and name we offered. Keep offering on a short bounded retry
+    // until the receiver's pair-keep-ack arrives: the link can move to a new
+    // direct path between the offer and the receiver's read.
+    let mut remember_offer: Option<(String, String)> = None;
+    let mut remember_acked = false;
+    let mut remember_retry_at: Option<Instant> = None;
+    let mut remember_retries = 0u8;
     // The transfer is allowed to offer once auth is settled: immediately for
     // local / known-device sends; only after the ephemeral PAKE confirms for the
     // code path. The agreed secret is then DISCARDED (never stored).
@@ -1013,6 +1048,20 @@ pub(crate) async fn send_cmd(
         sess.tick(&sio).await;
         // #28: discharge any deferred peer-left whose channel has gone idle/dead.
         conn.reap_deferred();
+        // A remember offer is retried on the live transports until acked. The
+        // old single send could be read on neither path after a direct-path
+        // handoff: the sender kept its half while the receiver never stored.
+        if !remember_acked && remember_retries < 5 {
+            if let Some((_, secret)) = &remember_offer {
+                if remember_retry_at.is_some_and(|at| Instant::now() >= at) {
+                    if let Some(pid) = pake_peer.as_deref() {
+                        let _ = offer_pair_keep(&conn, pid, secret).await;
+                    }
+                    remember_retries = remember_retries.saturating_add(1);
+                    remember_retry_at = Some(Instant::now() + Duration::from_secs(2));
+                }
+            }
+        }
         // A fleet peer that has not proved itself within budget stops holding the
         // target slot. Treated as "not the target" rather than as a failure: it
         // may simply be a sibling that never speaks fleet to us (see the paired
@@ -1169,6 +1218,35 @@ pub(crate) async fn send_cmd(
         let Some(ev) = ev else { continue };
 
         let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
+        // The ceremony authenticates one signaling peer, not its room or the
+        // UID a later room member advertises. A replacement needs a fresh code.
+        if use_code {
+            match &ev {
+                Ev::Control(pid, _)
+                    if !code_peer_event_allowed(
+                        use_code,
+                        pake_done,
+                        pake_peer.as_deref(),
+                        pid,
+                        CodePeerEvent::Control,
+                    ) =>
+                {
+                    continue
+                }
+                Ev::ChannelReady(pid, _)
+                    if !code_peer_event_allowed(
+                        use_code,
+                        pake_done,
+                        pake_peer.as_deref(),
+                        pid,
+                        CodePeerEvent::Channel,
+                    ) =>
+                {
+                    continue
+                }
+                _ => {}
+            }
+        }
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -1180,6 +1258,15 @@ pub(crate) async fn send_cmd(
                 conn.reprobe_on_network_event();
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
+                        if !code_peer_event_allowed(
+                            use_code,
+                            pake_done,
+                            pake_peer.as_deref(),
+                            p["id"].as_str().unwrap_or_default(),
+                            CodePeerEvent::Adoption,
+                        ) {
+                            continue;
+                        }
                         conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done)).await?;
                     }
                 }
@@ -1197,6 +1284,15 @@ pub(crate) async fn send_cmd(
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
+                        if !code_peer_event_allowed(
+                            use_code,
+                            pake_done,
+                            pake_peer.as_deref(),
+                            p["id"].as_str().unwrap_or_default(),
+                            CodePeerEvent::Adoption,
+                        ) {
+                            continue;
+                        }
                         conn.maybe_adopt_from(p, adopt_wants_active(code_used, use_code, pake_done), AdoptSource::Digest)
                             .await?;
                     }
@@ -1341,6 +1437,15 @@ pub(crate) async fn send_cmd(
                 code_used = true;
             }
             Ev::PeerJoined(v) => {
+                if !code_peer_event_allowed(
+                    use_code,
+                    pake_done,
+                    pake_peer.as_deref(),
+                    v["id"].as_str().unwrap_or_default(),
+                    CodePeerEvent::Adoption,
+                ) {
+                    continue;
+                }
                 conn.maybe_adopt(&v, adopt_wants_active(code_used, use_code, pake_done)).await?;
             }
             Ev::KnownPeer(v) => {
@@ -1575,11 +1680,9 @@ pub(crate) async fn send_cmd(
                                         };
                                         // THE AUTHENTICATED PEER IS THE TARGET: it
                                         // takes the slot, which no peer was given
-                                        // before this point on the code path. Not
-                                        // `bind_active`: after a hard-killed
-                                        // receiver, a replacement that kept the
-                                        // partial must still be able to take the
-                                        // slot over and resume (gates.sh gate 2).
+                                        // before this point on the code path.
+                                        // A different receiver must authenticate
+                                        // a fresh send, even if it kept a partial.
                                         if let Some(old) = conn.active.clone().filter(|a| a != &from) {
                                             ui::debug(&format!(
                                                 "send: {from} authenticated this code; releasing the slot held by {old}"
@@ -2148,6 +2251,7 @@ pub(crate) async fn send_cmd(
                 }
                 // C27: the human on the other side answered our remember offer.
                 Some("pair-keep-ack") => {
+                    remember_acked = true;
                     if let Some(name) = remembered_as.clone() {
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         crate::shared_defs::REMEMBER_ANSWERED
@@ -2246,13 +2350,7 @@ pub(crate) async fn send_cmd(
                             && pake_peer.as_deref() == Some(pid.as_str())
                         {
                             let sec = crate::fresh_secret();
-                            let handed = match conn.transport_of(&pid) {
-                                Some(t) => t
-                                    .send_control(&json!({ "type": "pair-keep", "secret": sec }))
-                                    .await
-                                    .is_ok(),
-                                None => false,
-                            };
+                            let handed = offer_pair_keep(&conn, &pid, &sec).await;
                             if handed {
                                 // A NEW record, suffixed when <name> is taken: a
                                 // remember never re-keys an existing device (C1).
@@ -2264,7 +2362,9 @@ pub(crate) async fn send_cmd(
                                 if let Ok(mut g) = crate::shared_defs::REMEMBER_STORED_AS.lock() {
                                     *g = Some(stored.clone());
                                 }
-                                remembered_as = Some(stored);
+                                remembered_as = Some(stored.clone());
+                                remember_offer = Some((stored, sec));
+                                remember_retry_at = Some(Instant::now() + Duration::from_secs(2));
                                 crate::shared_defs::REMEMBER_STORED
                                     .store(true, std::sync::atomic::Ordering::Relaxed);
                             }
@@ -3206,14 +3306,6 @@ pub(crate) fn pake_expiry(partner_latched: bool, any_pake_heard: bool) -> PakeEx
     }
 }
 
-/// May an adopted room peer take the transfer slot? On the code path, no peer
-/// is the target until one authenticated (it takes the slot at confirm); after
-/// that the slot behaves as a room send's does (a rejoin, or a replacement
-/// receiver resuming a killed one's partial). Pure.
-pub(crate) fn adopt_wants_active(code_claimed: bool, use_code: bool, pake_done: bool) -> bool {
-    code_claimed && (!use_code || pake_done)
-}
-
 /// What to check when nobody connected, worded for who we were waiting for.
 /// A device name is another tunlion; only a code can be opened in a browser.
 pub(crate) fn no_peer_hint(to: Option<&str>, use_code: bool, room: Option<&str>) -> String {
@@ -3408,8 +3500,8 @@ impl Drop for SendSpan {
 #[cfg(test)]
 mod code_window_tests {
     use super::{
-        adopt_wants_active, code_establish_window, code_expiry_secs, code_expiry_words, pake_expiry,
-        pake_partner, PakeExpiry, PakePartner,
+        code_establish_window, code_expiry_secs, code_expiry_words, pake_expiry, pake_partner,
+        PakeExpiry, PakePartner,
     };
     use std::time::Duration;
 
@@ -3440,17 +3532,6 @@ mod code_window_tests {
         assert_eq!(pake_expiry(false, true), PakeExpiry::KeepWaiting);
         assert_eq!(pake_expiry(true, true), PakeExpiry::Unfinished);
         assert_eq!(pake_expiry(true, false), PakeExpiry::Unfinished);
-    }
-
-    #[test]
-    fn a_code_send_binds_the_slot_only_after_authentication() {
-        // Room send (no code): the first peer may take the slot, as before.
-        assert!(adopt_wants_active(true, false, false));
-        // Code send: nobody before the ceremony confirms, claimed or not.
-        assert!(!adopt_wants_active(true, true, false));
-        assert!(!adopt_wants_active(false, true, false));
-        // After it: a rejoining or replacement receiver may take it over.
-        assert!(adopt_wants_active(true, true, true));
     }
 
     /// A code send advertised "expires in 10 min" and gave up after 60 s.

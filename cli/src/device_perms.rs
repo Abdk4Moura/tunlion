@@ -14,7 +14,7 @@
 //! `device_cert_for` skips expiry by design (#266). This view shows the row the
 //! way `devices` files it and adds the "cert expired" caveat beside it rather
 //! than masking the tier.
-use crate::capability::{self, BindingStrength, CAP_SHELL, GateDecision};
+use crate::capability::{self, BindingStrength, IdentityState, CAP_SHELL, GateDecision};
 use crate::device_caps::{device_allows, device_capability_denied};
 use crate::device_view::{same_owner_key, tier_for};
 use crate::devices_store::devices_path;
@@ -122,6 +122,11 @@ fn gate_inputs(
         has_grant,
         cert_revoked: cert_revoked_for(idev.as_ref()),
         ceiling_covers: crate::identity_state::ceiling_covers_action(idev.as_ref(), action),
+        identity_state: if idev.is_some() {
+            IdentityState::Resolved
+        } else {
+            IdentityState::Pending
+        },
         scoped_default: capability::is_scoped_default_action(action),
         action: action.to_string(),
     }
@@ -138,7 +143,7 @@ fn decide(action: &str, resource: &str, inputs: &ShellGateInputs) -> Result<(), 
     }
     let legacy_ok =
         inputs.trusted && !inputs.denied && (inputs.policy_allows || inputs.store_allows);
-    match capability::cap_gate_effective(
+    match capability::cap_gate_effective_with_identity(
         legacy_ok,
         &inputs.outcome,
         action,
@@ -154,6 +159,7 @@ fn decide(action: &str, resource: &str, inputs: &ShellGateInputs) -> Result<(), 
         inputs.cert_revoked,
         inputs.denied,
         inputs.ceiling_covers,
+        inputs.identity_state,
     ) {
         GateDecision::Allow => Ok(()),
         GateDecision::Deny { cap_reason } => Err(cap_reason),
