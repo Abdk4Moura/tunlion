@@ -205,6 +205,9 @@ pub struct ShellGateInputs {
     /// engine's `ceiling_authorizes`, which decides only under authoritative
     /// mode (shadow must decide exactly as it did before this feature).
     pub ceiling_covers: bool,
+    /// The link's identity fact at gate time. `ExplicitlyUnavailableAnonymous`
+    /// denies every shell-class action; it is transfer-only by policy.
+    pub identity_state: filament_cap::capability::IdentityState,
     /// The SCOPE-DEFAULT class for this open (transfer into the drop dir,
     /// forward to an exposed port). Distinct from the ceiling: this class has
     /// always auto-authorized same-owner Proven devices in BOTH modes.
@@ -270,6 +273,7 @@ pub fn gather_shell_gate_inputs(
         has_grant,
         cert_revoked,
         ceiling_covers,
+        identity_state: conn.identity_state_of(pid),
         scoped_default: false,
         action: action.to_string(),
     };
@@ -432,6 +436,7 @@ fn decide_with_legacy(
         scoped_in_bounds: inputs.scoped_default,
         has_explicit_grant: inputs.has_grant,
         cert_revoked: inputs.cert_revoked,
+        identity_state: inputs.identity_state,
         denied: inputs.denied,
         ceiling_authorizes: inputs.ceiling_covers,
     });

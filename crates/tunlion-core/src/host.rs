@@ -1074,7 +1074,7 @@ impl RecvPrompt for CorePrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filament_cap::capability::CapOutcome;
+    use filament_cap::capability::{CapOutcome, IdentityState};
 
     fn host() -> CoreHost {
         let dir = tempfile::tempdir().unwrap().keep();
@@ -1101,6 +1101,7 @@ mod tests {
             scoped_in_bounds: true,
             has_explicit_grant: false,
             cert_revoked: false,
+            identity_state: IdentityState::Pending,
             denied: false,
             ceiling_authorizes: false,
         }

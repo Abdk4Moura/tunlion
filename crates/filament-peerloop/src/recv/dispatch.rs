@@ -5132,10 +5132,12 @@ async fn recv_run(
                 // would then decide a legacy-trusted offer with
                 // cert_revoked_for(None)=false, letting a revoked device push a
                 // transfer before its revoked cert resolves.
+                let room_consent = !recv_code_path && (yes || daemon) && conn.is_active(&pid);
                 let needs_challenge = if host.cap_authoritative() {
-                    idev_known && !proven
+                    (idev_known && !proven)
+                        || (!idev_known && (recv_code_path || room_consent))
                 } else {
-                    recv_code_path && !idev_known
+                    (recv_code_path || room_consent) && !idev_known
                 };
                 if needs_challenge {
                     // Shared issue-and-hold (hold-then-await; see the helper). This
@@ -5228,7 +5230,9 @@ async fn recv_run(
                 // normal WebRTC path (ChannelReady BEFORE PAKE) never gets an
                 // early challenge the sender cannot answer - only the case
                 // where the channel arrived after the ceremony.
-                if recv_code_path && recv_pake_done {
+                let consent_identity = (recv_code_path && recv_pake_done)
+                    || ((yes || daemon) && conn.is_active(&pid));
+                if consent_identity {
                     if let Some(l) = conn.link_mut(&pid) {
                         crate::identity::resolve_peer_identity(l);
                     }
@@ -6295,16 +6299,37 @@ async fn recv_run(
                         .get(&pid)
                         .map(|(n, _, _)| hex::encode(n))
                         .is_some_and(|n| Some(n.as_str()) == v["nonce"].as_str());
-                    if ours {
+                    // Only the peer the transfer consent names can be
+                    // classified: the code ceremony's bound peer, or the active
+                    // room peer the operator accepted with -y / a daemon. A room
+                    // bystander cannot answer for it, and an unanswered
+                    // challenge must stay Pending (hold then fail closed), never
+                    // quietly become anonymous.
+                    let consented_peer = if recv_code_path {
+                        recv_pake_done && conn.is_bound_active_peer(&pid)
+                    } else {
+                        (yes || daemon) && conn.is_active(&pid)
+                    };
+                    if ours && consented_peer {
+                        let anonymous = conn.link(&pid).is_some_and(|l| {
+                            l.identity_state != cap::IdentityState::Resolved
+                        });
                         identity_nonces.remove(&pid);
                         st.pending_proven.lock().unwrap().remove(&pid);
-                        if let Some(expired) =
-                            Instant::now().checked_sub(RECV_IDENTITY_HOLD_DEADLINE)
-                        {
-                            recv_identity_hold.insert(pid.clone(), expired);
+                        if anonymous {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                l.identity_state = cap::IdentityState::ExplicitlyUnavailableAnonymous;
+                            }
+                            log.debug(&format!(
+                                "  {pid} cannot prove an identity; explicit transfer consent makes it an anonymous transfer peer"
+                            ));
                         }
+                    } else if ours {
+                        // The challenge was answered, but this is not the
+                        // consented peer. Do not let it clear the real peer's
+                        // hold or change any identity state.
                         log.debug(&format!(
-                            "  {pid} cannot prove an identity; deciding its offers without waiting"
+                            "  ignoring identity-unavailable from non-consented peer {pid}"
                         ));
                     }
                 }
@@ -6928,6 +6953,7 @@ async fn recv_run(
                                 scoped_in_bounds: false,
                                 has_explicit_grant: has_grant,
                                 cert_revoked,
+                                identity_state: conn.identity_state_of(&pid),
                                 denied,
                                 ceiling_authorizes: false,
                             })
@@ -7713,6 +7739,7 @@ async fn recv_run(
                                                                                 l.identity_device_pub = Some(cert.device_pub);
                                                                                 l.identity_user_pub = Some(cert.user_pub);
                                                                                 l.identity_binding = cap::BindingStrength::Proven;
+                                                                                l.identity_state = cap::IdentityState::Resolved;
                                                                                 l.identity_cert_expires = Some(cert.expires);
                                                                             }
                                                                             // The peer by name, not its raw signaling id.
@@ -7948,20 +7975,40 @@ async fn recv_run(
                     // hold is either revoked or on a link the ceremony does not
                     // complete on; both must be refused, not admitted.
                     {
-                        let (proven, idev_known, link_ready) = conn
+                        let (proven, link_ready, identity_state) = conn
                             .link(&pid)
                             .map(|l| {
                                 (
                                     l.identity_binding == cap::BindingStrength::Proven,
-                                    l.identity_device_pub.is_some(),
                                     l.presence == Presence::Ready,
+                                    l.identity_state,
                                 )
                             })
-                            .unwrap_or((false, false, false));
+                            .unwrap_or((false, false, cap::IdentityState::Pending));
                         let challenge_in_flight =
                             st.pending_proven.lock().unwrap().contains_key(&pid);
-                        let code_hold = recv_code_path && !proven && !idev_known;
-                        let hold = if code_hold {
+                        // A consented transfer may not be decided while its
+                        // identity is merely Pending. On the code path consent
+                        // is the ceremony itself; on a room it is -y/daemon plus
+                        // the active peer selection. Explicit anonymous is a
+                        // settled fact and skips the hold.
+                        let consented_peer = if recv_code_path {
+                            recv_pake_done && conn.is_bound_active_peer(&pid)
+                        } else {
+                            (yes || daemon) && conn.is_active(&pid)
+                        };
+                        let identity_hold = consented_peer
+                            && identity_state == cap::IdentityState::Pending;
+                        let expired = if identity_hold && link_ready {
+                            recv_identity_hold
+                                .entry(pid.clone())
+                                .or_insert_with(std::time::Instant::now)
+                                .elapsed()
+                                >= RECV_IDENTITY_HOLD_DEADLINE
+                        } else {
+                            false
+                        };
+                        let hold = if identity_hold {
                             if !link_ready {
                                 // Transport still establishing (the direct-blocked
                                 // fallback brings WebRTC up AFTER PAKE, and the
@@ -7969,10 +8016,7 @@ async fn recv_run(
                                 // it does). Hold without starting the clock.
                                 true
                             } else {
-                                let deadline = *recv_identity_hold
-                                    .entry(pid.clone())
-                                    .or_insert_with(std::time::Instant::now);
-                                deadline.elapsed() < RECV_IDENTITY_HOLD_DEADLINE
+                                !expired
                             }
                         } else {
                             host.cap_authoritative() && challenge_in_flight && !proven
@@ -7991,19 +8035,25 @@ async fn recv_run(
                             });
                             continue;
                         }
-                        // #161: the hold expires into a DECISION, not a denial.
-                        // Revocation binds wherever identity resolves: a revoked
-                        // device's cert resolves via the challenge and the gate's
-                        // absolute Deny fires. A peer whose identity does NOT
-                        // resolve within the hold (a slow fallback link, or a
-                        // lost challenge on a transport that came up late) is
-                        // decided by the normal gate - consent and grants in
-                        // shadow, the capability layer under authoritative. The
-                        // residual (a revoked device whose identity ceremony does
-                        // not complete on a given path being admitted) is
-                        // precondition-bounded and documented in the changelog;
-                        // the terminal-outcome model that closes it entirely is
-                        // the next iteration, not a 0.8.0 change.
+                        if identity_hold && expired {
+                            // #161 FAIL-CLOSED EXPIRY. The consented path held the
+                            // offer while identity was merely Pending. If that
+                            // deadline passes without either a certificate
+                            // (Resolved) or an explicit identity-unavailable
+                            // (ExplicitlyUnavailableAnonymous), there is no
+                            // identity fact to decide on. Refuse rather than
+                            // reach the policy site in the ordering window.
+                            log.say(
+                                "the sender's identity did not settle after the code ceremony; refusing the transfer, ask for a fresh code",
+                            );
+                            let reason =
+                                "the sender's identity could not be established; a fresh code is required";
+                            let r = t
+                                .send_control(&policy_decline_msg(&id, Some(reason)))
+                                .await;
+                            peer_step(daemon, &pid, "identity-timeout decline", r, log.as_ref())?;
+                            continue;
+                        }
                     }
 
                     // C14/C22: consent. -y accepts everything; a resume of a
@@ -8122,6 +8172,7 @@ async fn recv_run(
                             scoped_in_bounds,
                             has_explicit_grant: has_grant,
                             cert_revoked,
+                            identity_state: conn.identity_state_of(&pid),
                             // A sibling's local deny wins over its kind default and grants;
                             // no deny list is consulted for anyone else on this path.
                             denied: sibling.denied,
