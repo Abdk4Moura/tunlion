@@ -1169,6 +1169,15 @@ pub(crate) async fn send_cmd(
         let Some(ev) = ev else { continue };
 
         let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
+        // The ceremony authenticates one signaling peer, not its room or the
+        // UID a later room member advertises. A replacement needs a fresh code.
+        if use_code {
+            match &ev {
+                Ev::Control(pid, _) if !pake_done || pake_peer.as_deref() != Some(pid.as_str()) => continue,
+                Ev::ChannelReady(pid, _) if pake_done && pake_peer.as_deref() != Some(pid.as_str()) => continue,
+                _ => {}
+            }
+        }
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -1180,6 +1189,9 @@ pub(crate) async fn send_cmd(
                 conn.reprobe_on_network_event();
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
+                        if use_code && pake_done && p["id"].as_str() != pake_peer.as_deref() {
+                            continue;
+                        }
                         conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done)).await?;
                     }
                 }
@@ -1197,6 +1209,9 @@ pub(crate) async fn send_cmd(
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
+                        if use_code && pake_done && p["id"].as_str() != pake_peer.as_deref() {
+                            continue;
+                        }
                         conn.maybe_adopt_from(p, adopt_wants_active(code_used, use_code, pake_done), AdoptSource::Digest)
                             .await?;
                     }
@@ -1341,6 +1356,9 @@ pub(crate) async fn send_cmd(
                 code_used = true;
             }
             Ev::PeerJoined(v) => {
+                if use_code && pake_done && v["id"].as_str() != pake_peer.as_deref() {
+                    continue;
+                }
                 conn.maybe_adopt(&v, adopt_wants_active(code_used, use_code, pake_done)).await?;
             }
             Ev::KnownPeer(v) => {
@@ -1575,11 +1593,9 @@ pub(crate) async fn send_cmd(
                                         };
                                         // THE AUTHENTICATED PEER IS THE TARGET: it
                                         // takes the slot, which no peer was given
-                                        // before this point on the code path. Not
-                                        // `bind_active`: after a hard-killed
-                                        // receiver, a replacement that kept the
-                                        // partial must still be able to take the
-                                        // slot over and resume (gates.sh gate 2).
+                                        // before this point on the code path.
+                                        // A different receiver must authenticate
+                                        // a fresh send, even if it kept a partial.
                                         if let Some(old) = conn.active.clone().filter(|a| a != &from) {
                                             ui::debug(&format!(
                                                 "send: {from} authenticated this code; releasing the slot held by {old}"
@@ -3207,11 +3223,10 @@ pub(crate) fn pake_expiry(partner_latched: bool, any_pake_heard: bool) -> PakeEx
 }
 
 /// May an adopted room peer take the transfer slot? On the code path, no peer
-/// is the target until one authenticated (it takes the slot at confirm); after
-/// that the slot behaves as a room send's does (a rejoin, or a replacement
-/// receiver resuming a killed one's partial). Pure.
-pub(crate) fn adopt_wants_active(code_claimed: bool, use_code: bool, pake_done: bool) -> bool {
-    code_claimed && (!use_code || pake_done)
+/// is the target until one authenticated (it takes the slot at confirm). Room
+/// presence never authorizes a replacement after that code has been consumed.
+pub(crate) fn adopt_wants_active(code_claimed: bool, use_code: bool, _pake_done: bool) -> bool {
+    code_claimed && !use_code
 }
 
 /// What to check when nobody connected, worded for who we were waiting for.
@@ -3443,14 +3458,14 @@ mod code_window_tests {
     }
 
     #[test]
-    fn a_code_send_binds_the_slot_only_after_authentication() {
+    fn a_room_peer_never_claims_a_code_sends_authenticated_slot() {
         // Room send (no code): the first peer may take the slot, as before.
         assert!(adopt_wants_active(true, false, false));
         // Code send: nobody before the ceremony confirms, claimed or not.
         assert!(!adopt_wants_active(true, true, false));
         assert!(!adopt_wants_active(false, true, false));
-        // After it: a rejoining or replacement receiver may take it over.
-        assert!(adopt_wants_active(true, true, true));
+        // After it: room presence still cannot replace the ceremony peer.
+        assert!(!adopt_wants_active(true, true, true));
     }
 
     /// A code send advertised "expires in 10 min" and gave up after 60 s.

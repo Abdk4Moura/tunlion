@@ -255,8 +255,8 @@ fn build_outgoing(request: &SendRequest, log: &dyn LogSink) -> Result<Vec<Outgoi
     Ok(outgoing)
 }
 
-fn adopt_wants_active(code_claimed: bool, use_code: bool, pake_done: bool) -> bool {
-    code_claimed && (!use_code || pake_done)
+fn adopt_wants_active(code_claimed: bool, use_code: bool, _pake_done: bool) -> bool {
+    code_claimed && !use_code
 }
 
 fn code_partner(
@@ -679,6 +679,15 @@ async fn drive_over(
         let Some(ev) = ev else { continue };
         last_activity = Instant::now();
         let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
+        // A spent code authenticates only its ceremony peer, never a new room
+        // member claiming the same install UID after the receiver disappears.
+        if use_code {
+            match &ev {
+                Ev::Control(pid, _) if !pake_done || pake_peer.as_deref() != Some(pid.as_str()) => continue,
+                Ev::ChannelReady(pid, _) if pake_done && pake_peer.as_deref() != Some(pid.as_str()) => continue,
+                _ => {}
+            }
+        }
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -686,6 +695,9 @@ async fn drive_over(
                 }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
+                        if use_code && pake_done && p["id"].as_str() != pake_peer.as_deref() {
+                            continue;
+                        }
                         conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done))
                             .await
                             .map_err(internal)?;
@@ -696,6 +708,9 @@ async fn drive_over(
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
+                        if use_code && pake_done && p["id"].as_str() != pake_peer.as_deref() {
+                            continue;
+                        }
                         conn.maybe_adopt_from(
                             p,
                             adopt_wants_active(code_used, use_code, pake_done),
@@ -761,6 +776,9 @@ async fn drive_over(
                 ports.log.say("code claimed, connecting...");
             }
             Ev::PeerJoined(v) => {
+                if use_code && pake_done && v["id"].as_str() != pake_peer.as_deref() {
+                    continue;
+                }
                 conn.maybe_adopt(&v, adopt_wants_active(code_used, use_code, pake_done))
                     .await
                     .map_err(internal)?;
