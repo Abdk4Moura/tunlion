@@ -43,8 +43,8 @@
 
 use anyhow::{Context, Result};
 use filament_cap::capability::{
-    apply_header, now_secs as cap_now_secs, superseded_by_tombstone, update_ratchet, CapHeader,
-    CapOp, PrincipalKind, CAP_TOMBSTONE_TYPE,
+    apply_header, now_secs as cap_now_secs, self_resource_id, superseded_by_tombstone,
+    update_ratchet, CapHeader, CapOp, PrincipalKind, CAP_TOMBSTONE_TYPE,
 };
 use filament_cap::ephemeral::Reuse;
 use filament_id::{now_secs, DeviceCert, KeyStore, UserKey};
@@ -1653,12 +1653,13 @@ impl DeviceStore {
             return Ok(false);
         }
         if header.resource == "self" {
-            // The legacy fleet header names the owner's own resource `self`,
-            // not the self-certifying id `verify_genesis` requires. Its
-            // authenticity is the owner signature over the canonical bytes;
-            // verify that before writing, then advance the same ratchet the
-            // ordered `apply_header` path would.
-            header.verify_signed_by(owner_pub)?;
+            // The legacy fleet header is STORED under the caller-facing alias
+            // `self`, but its signature commits to the self-certifying derived
+            // resource id. Rebuild that signed view before verifying; do not
+            // weaken the check to the stored alias.
+            let mut signed = header.clone();
+            signed.resource = self_resource_id(owner_pub);
+            signed.verify_signed_by(owner_pub)?;
             store.push(header.to_json());
             update_ratchet(&mut store, owner_pub, header.issued_at)?;
         } else {
