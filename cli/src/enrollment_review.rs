@@ -7,6 +7,7 @@ pub(crate) fn lines(review: &EnrollmentReview) -> Vec<String> {
         Relationship::OwnDevice => "your device (requests fleet membership)",
         Relationship::OtherPerson => "someone else's device (no fleet membership)",
         Relationship::TemporaryWorker => "temporary worker (not a lasting fleet member)",
+        Relationship::Unknown => "relationship not stated by this invitation",
     };
     let mut lines = vec![format!("  Relationship: {relationship}")];
     if review.relationship.requests_fleet_membership() {

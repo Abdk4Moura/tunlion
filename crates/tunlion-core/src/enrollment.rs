@@ -34,6 +34,8 @@ pub enum EnrollmentRelationship {
     OwnDevice,
     OtherPerson,
     TemporaryWorker,
+    /// The token does not carry the owner's intended relationship.
+    Unknown,
 }
 
 impl From<filament_id::enrollment::Relationship> for EnrollmentRelationship {
@@ -43,6 +45,7 @@ impl From<filament_id::enrollment::Relationship> for EnrollmentRelationship {
             filament_id::enrollment::Relationship::OwnDevice => Self::OwnDevice,
             filament_id::enrollment::Relationship::OtherPerson => Self::OtherPerson,
             filament_id::enrollment::Relationship::TemporaryWorker => Self::TemporaryWorker,
+            filament_id::enrollment::Relationship::Unknown => Self::Unknown,
         }
     }
 }
