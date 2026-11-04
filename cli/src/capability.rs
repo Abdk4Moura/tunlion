@@ -588,6 +588,13 @@ pub fn cap_gate_effective_with_identity(
                 ),
             };
         }
+        if !scoped_in_bounds {
+            return GateDecision::Deny {
+                cap_reason: Some(
+                    "anonymous code transfer must land inside the receiver's inbox".into(),
+                ),
+            };
+        }
         return if legacy_allowed {
             GateDecision::Allow
         } else {
@@ -1457,6 +1464,28 @@ mod tests {
         assert!(
             matches!(no_consent, GateDecision::Deny { .. }),
             "without the code consent there is no anonymous transfer"
+        );
+        let outside_inbox = cap_gate_effective_with_identity(
+            true,
+            &outcome,
+            CAP_TRANSFER,
+            "self",
+            None,
+            None,
+            BindingStrength::None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            IdentityState::ExplicitlyUnavailableAnonymous,
+        );
+        assert!(
+            matches!(outside_inbox, GateDecision::Deny { .. }),
+            "anonymous code transfer must not bypass the receiver path bound"
         );
     }
 
