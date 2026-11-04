@@ -6213,11 +6213,13 @@ mod h1_tests {
         let pid = "sid-direct";
         let selected = net::SourceId::next();
         let stale = net::SourceId::next();
-        let control = Ev::Control(pid.to_string(), json!({ "type": "l2-open-ack" }));
         let tagged = |source| Ev::Sourced {
             pid: pid.to_string(),
             source,
-            inner: Box::new(control.clone()),
+            inner: Box::new(Ev::Control(
+                pid.to_string(),
+                json!({ "type": "l2-open-ack" }),
+            )),
         };
 
         assert!(matches!(
@@ -6230,7 +6232,10 @@ mod h1_tests {
         );
         // Untagged events keep the pre-attribution behaviour.
         assert!(matches!(
-            selected_event(control, None),
+            selected_event(
+                Ev::Control(pid.to_string(), json!({ "type": "l2-open-ack" })),
+                None
+            ),
             Some(Ev::Control(..))
         ));
     }
