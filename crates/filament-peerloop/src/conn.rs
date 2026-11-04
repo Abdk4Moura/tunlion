@@ -5967,11 +5967,24 @@ impl Conn {
         // upgrade cutover consuming it.
         // A promotion's pending is EXCLUDED too: it coexists with the serving
         // WebRTC link by design (make-before-break), and its adoption needs it.
+        // A FLEET pending is excluded while its link is still unproven for the
+        // same reason: a fleet-secret WebRTC link exposes no channel binding, so
+        // it can never carry the certificate proof a one-shot dialer must present.
+        // Reaping the direct race here retired the only attempt that could ever
+        // verify that dialer, and adopt_direct then refused the late but valid
+        // QUIC connection as `attempt retired`. The pending still dies at its
+        // deadline (the two filters above/below never leave it parked).
         let linked: Vec<String> = self
             .direct_pending
             .iter()
             .filter(|(pid, p)| {
-                !p.probe && self.links.contains_key(*pid) && !self.promotions.contains_key(*pid)
+                if p.probe || self.promotions.contains_key(*pid) {
+                    return false;
+                }
+                let Some(link) = self.links.get(*pid) else {
+                    return false;
+                };
+                !(p.fleet && !link.fleet_proven() && now < p.deadline)
             })
             .map(|(pid, _)| pid.clone())
             .collect();
@@ -10575,6 +10588,62 @@ mod warm_identity_tests {
         assert!(conn.retired_attempts.contains_key(&lan_attempt));
         assert!(conn.retired_attempts.contains_key(&fleet_attempt));
         assert!(!conn.direct_pending.contains_key(normal_pid));
+    }
+
+    /// A fleet one-shot's direct race must outlive the fleet-secret WebRTC link
+    /// that lands beside it. That WebRTC link exposes no channel binding, so it
+    /// can never carry the certificate proof the one-shot must present. Reaping
+    /// the race here retired the only attempt able to prove the dialer, and
+    /// `adopt_direct` then rejected the valid QUIC connection as `attempt
+    /// retired` (the one-shot saw `direct connection closed` right after
+    /// `tunnel up`).
+    #[tokio::test]
+    async fn a_fleet_direct_attempt_outlives_its_unbound_webrtc_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-fleet-oneshot";
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        expired_direct_pending(&mut conn, pid, soon());
+        let attempt = conn.direct_pending[pid].attempt;
+
+        assert!(conn.expired_direct().is_empty(), "a live link armed a fallback");
+        assert!(
+            conn.direct_pending.contains_key(pid),
+            "the fleet race was reaped by an unproven WebRTC link"
+        );
+        assert!(
+            !conn.retired_attempts.contains_key(&attempt),
+            "the direct attempt was retired before its connection could be adopted"
+        );
+
+        // The exception is bounded by the attempt's own budget: once it has
+        // expired the pending is retired (no fallback is needed, a link exists).
+        conn.direct_pending.get_mut(pid).unwrap().deadline =
+            Instant::now() - Duration::from_millis(1);
+        assert!(conn.expired_direct().is_empty());
+        assert!(!conn.direct_pending.contains_key(pid), "an expired fleet pending leaked");
+        assert!(
+            conn.retired_attempts.contains_key(&attempt),
+            "an expired fleet attempt was not retired"
+        );
+    }
+
+    /// The fleet exception must not change the ordinary cleanup: for any other
+    /// attempt, a link that landed by another route makes the direct race
+    /// redundant and it is retired exactly as before.
+    #[tokio::test]
+    async fn a_normal_direct_attempt_is_still_reaped_by_its_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-normal-linked";
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        expired_direct_pending(&mut conn, pid, soon());
+        conn.direct_pending.get_mut(pid).unwrap().fleet = false;
+        let attempt = conn.direct_pending[pid].attempt;
+
+        assert!(conn.expired_direct().is_empty());
+        assert!(!conn.direct_pending.contains_key(pid), "a redundant direct attempt survived");
+        assert!(conn.retired_attempts.contains_key(&attempt));
     }
 
     /// The dispatch loop's shape: one reaper call and one awaited establish per
