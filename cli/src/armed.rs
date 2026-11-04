@@ -196,6 +196,8 @@ mod armed_lifecycle_tests {
 
 #[cfg(test)]
 mod withdraw_tests {
+    use super::*;
+
     /// The library owns the listing and withdrawal policy; this adapter must
     /// not grow a second copy. The pure cases live beside that policy.
     #[test]
