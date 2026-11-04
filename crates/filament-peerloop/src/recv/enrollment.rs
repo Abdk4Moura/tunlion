@@ -749,6 +749,156 @@ mod tests {
         assert!(enrollment_refusal(&lapsed).is_none());
     }
 
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "enroll-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn join_fixture(label: &str) -> ([u8; 32], Invitation, Value, Value, [u8; 32]) {
+        use ring::rand::{SecureRandom, SystemRandom};
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let owner_root = temp_root(&format!("{label}-owner"));
+        let owner_store = DeviceStore::open(&owner_root);
+        let owner = UserKey::generate(&owner_store.keystore()).unwrap();
+        let now = now_secs();
+        let invitation = Invitation::mint(
+            owner.keypair(),
+            [9u8; 32],
+            vec!["transfer".into(), "mount".into()],
+            now + 3600,
+            600,
+            filament_cap::ephemeral::Reuse::Once,
+            false,
+            "alice".into(),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut joiner_pub = [0u8; 32];
+        SystemRandom::new().fill(&mut joiner_pub).unwrap();
+        let mut owner_device_pub = [0u8; 32];
+        SystemRandom::new().fill(&mut owner_device_pub).unwrap();
+        let local_cert = DeviceCert::certify(&owner, joiner_pub, now, 3600).unwrap();
+        let owner_cert = DeviceCert::certify(&owner, owner_device_pub, now, 3600).unwrap();
+        let ack = json!({
+            "name": "beta",
+            "secret": "ab".repeat(32),
+            "ceiling": invitation.scoped_caps(),
+            "expires": invitation.expires,
+            "max_offline": invitation.max_offline,
+            "persistent": true,
+            "device_cert": local_cert.to_json(),
+            "owner_cert": owner_cert.to_json(),
+            "cap_ops": [],
+        });
+        (joiner_pub, invitation, ack, owner_cert.to_json(), owner.public_key_bytes())
+    }
+
+    #[test]
+    fn a_join_ack_stores_the_signed_ceiling_and_writes_the_cert_last() {
+        let (joiner_pub, invitation, ack, _owner_cert, _owner_pub) = join_fixture("good");
+        let root = temp_root("good-joiner");
+        let store = DeviceStore::open(&root);
+        let name = persist_join_ack(&store, &joiner_pub, &invitation, &ack).unwrap();
+        assert_eq!(name, "beta");
+        assert_eq!(store.device_name().as_deref(), Some("beta"));
+        assert!(store.local_device_cert_path().exists());
+        assert!(UserKey::load(&store.keystore()).unwrap().is_none());
+        let records = store.devices_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0]["caps"],
+            json!(invitation.scoped_caps()),
+            "the stored ceiling is the signed one, not a transfer-only literal"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_route_ceiling_compares_in_its_scoped_spelling() {
+        use ring::signature::KeyPair;
+        let owner_root = temp_root("route-owner");
+        let owner_store = DeviceStore::open(&owner_root);
+        let owner = UserKey::generate(&owner_store.keystore()).unwrap();
+        let now = now_secs();
+        let invitation = Invitation::mint(
+            owner.keypair(),
+            [4u8; 32],
+            vec!["transfer".into(), "route".into()],
+            now + 3600,
+            600,
+            filament_cap::ephemeral::Reuse::Once,
+            false,
+            "alice".into(),
+            vec!["10.2.0.0/16".into()],
+        )
+        .unwrap();
+        let joiner_pub = [5u8; 32];
+        let local_cert = DeviceCert::certify(&owner, joiner_pub, now, 3600).unwrap();
+        let owner_cert = DeviceCert::certify(&owner, [6u8; 32], now, 3600).unwrap();
+        let ack = json!({
+            "name": "beta",
+            "secret": "cd".repeat(32),
+            "ceiling": ["transfer", "route:10.2.0.0/16"],
+            "expires": invitation.expires,
+            "max_offline": invitation.max_offline,
+            "persistent": true,
+            "device_cert": local_cert.to_json(),
+            "owner_cert": owner_cert.to_json(),
+        });
+        let root = temp_root("route-joiner");
+        let store = DeviceStore::open(&root);
+        persist_join_ack(&store, &joiner_pub, &invitation, &ack).unwrap();
+        assert_eq!(
+            store.devices_records()[0]["caps"],
+            json!(["transfer", "route:10.2.0.0/16"])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_changed_signed_bound_is_refused_before_the_local_certificate() {
+        let (joiner_pub, invitation, mut ack, _owner_cert, _owner_pub) = join_fixture("bound");
+        ack["ceiling"] = json!(["transfer"]);
+        let root = temp_root("bound-joiner");
+        let store = DeviceStore::open(&root);
+        let error = persist_join_ack(&store, &joiner_pub, &invitation, &ack).unwrap_err();
+        assert!(error.to_string().contains("changed a signed principal bound"), "{error:#}");
+        assert!(!store.local_device_cert_path().exists());
+        assert!(store.devices_records().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_foreign_owner_certificate_cannot_carry_this_invitation() {
+        let (joiner_pub, invitation, mut ack, _owner_cert, _owner_pub) = join_fixture("foreign");
+        use ring::rand::{SecureRandom, SystemRandom};
+        use ring::signature::Ed25519KeyPair;
+        let mut seed = [0u8; 32];
+        SystemRandom::new().fill(&mut seed).unwrap();
+        let mallory = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        use ring::signature::KeyPair;
+        let mallory_pub: [u8; 32] = mallory.public_key().as_ref().try_into().unwrap();
+        // Build a certificate that claims the invitation's issuer fingerprint
+        // is impossible without the owner key, so the signature check is what
+        // refuses a certificate signed by someone else.
+        let mut cert_json = ack["owner_cert"].clone();
+        cert_json["userPub"] = json!(hex::encode(mallory_pub));
+        ack["owner_cert"] = cert_json;
+        let root = temp_root("foreign-joiner");
+        let store = DeviceStore::open(&root);
+        assert!(persist_join_ack(&store, &joiner_pub, &invitation, &ack).is_err());
+        assert!(!store.local_device_cert_path().exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn invitation_refusal_reasons_are_the_wire_reasons() {
         assert_eq!(InvitationRefusal::AlreadyUsed.wire_reason(), "already used");
