@@ -721,18 +721,19 @@ mod tests {
         ));
         std::fs::create_dir(&root).unwrap();
         let store = DeviceStore::open(&root);
-        let minted = mint_armed(&store, &owner(), &request(InvitationKind::Person), 100).unwrap();
-        let listed = outstanding(&store, 101);
+        let now = filament_id::now_secs();
+        let minted = mint_armed(&store, &owner(), &request(InvitationKind::Person), now).unwrap();
+        let listed = outstanding(&store, now + 1);
         assert_eq!(listed.len(), 1);
-        withdraw(&store, &listed[0], 101).unwrap();
-        assert!(outstanding(&store, 102).is_empty());
+        withdraw(&store, &listed[0], now + 1).unwrap();
+        assert!(outstanding(&store, now + 2).is_empty());
         assert!(store.is_armed(), "the receiver must answer a late claimer");
         assert_eq!(
             store.record_invitation_use(
                 &hex::encode(minted.invitation.enroll_pub),
                 &Reuse::Once,
                 minted.preview.expires,
-                102
+                now + 2
             ),
             Err(crate::recv::store::InvitationRefusal::Withdrawn)
         );
