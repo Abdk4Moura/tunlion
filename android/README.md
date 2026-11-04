@@ -10,12 +10,12 @@ Build a debug APK with:
 gradle :app:assembleDebug
 ```
 
-The current native slice is identity setup and file-code send/receive. Fleet
-enrollment is required follow-up, not a completed feature. Relationship choices
-(my device, someone else's, temporary worker) are explained independently of
-code/file/nearby methods, but enrollment controls remain unavailable until the
-shared core exposes confirmation and permissions APIs. No Kotlin policy engine
-or browser fleet behavior is implied.
+The current native slice is identity setup, read-only stored-device facts, and
+file-code send/receive. Fleet enrollment is required follow-up, not a completed
+feature. Relationship choices (my device, someone else's, temporary worker) are
+explained independently of code/file/nearby methods, but enrollment controls
+remain unavailable until the shared core exposes confirmation and permissions
+APIs. No Kotlin policy engine or browser fleet behavior is implied.
 
 Navigation uses Jetpack's `NavHost`, with Android predictive back enabled. Back
 gestures seek the destination transition before release; cancelling keeps the
@@ -51,13 +51,27 @@ or device verification; use the workflow or an approved leased Android worker.
 - Verified core receive history drives publication into `Download/Tunlion` via
   MediaStore on Android 10+; Android 8/9 uses a user-selected SAF folder. Private
   originals are kept on publication failure and publication retries on refresh.
-  **The base core does not yet persist this receive history.** The history/event
-  core change must be integrated and verified before public receive export or
-  background receive completion is considered complete. No directory scan is
-  substituted for verification evidence.
-- Discovery, effective access, enrollment, revocation, session termination,
-  expiry enforcement and recovery import need core APIs. No successful stub or
-  inferred remote permission is used. Offline and route facts remain unknown.
+  The integrated core persists a bounded receiver completion journal, so a
+  verified receipt and its public copy are separate, checkable facts. No
+  directory scan is substituted for verification evidence.
+- The device list is projected from core `devices()`, not from Kotlin policy or
+  CLI output. It shows the stored relationship (paired, fleet, temporary,
+  unknown) and every returned action state (effective, pending, blocked,
+  unsupported, unknown), including expiry and local revocation. Presence stays
+  unknown because the snapshot does not probe peers. A stored relationship or
+  recorded grant is never shown as proof that a remote action currently works.
+- Sending to a stored device is offered as an explicit attempt only when the
+  core reports outbound authorization as unknown. The result screen reports the
+  receiver's per-file delivery acknowledgment from `SendResult`; an attempt
+  that was not acknowledged is never shown as delivered.
+- Enrollment, capability revocation, device removal and active-session
+  termination are not exposed by the integrated core. Their controls are
+  disabled and labelled unavailable rather than simulated. Enrollment is
+  expected to use shared `filament-id::enrollment` facts when that surface
+  exists; this client does not mint relationship or permission authority.
+- Discovery, expiry enforcement beyond stored facts, and recovery import still
+  need core APIs. No successful stub or inferred remote permission is used.
+  Offline and route facts remain unknown.
 
 ## Native acceptance
 

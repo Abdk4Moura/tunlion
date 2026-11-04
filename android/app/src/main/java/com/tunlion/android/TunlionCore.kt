@@ -26,11 +26,16 @@ data class CoreStatus(
     val engineLinked: Boolean = false,
     val devices: List<CoreDevice> = emptyList(),
     val transfers: List<CoreTransfer> = emptyList(),
+    val lastSend: CoreSendReport? = null,
     val engineError: String? = null,
     val enrollmentSupported: Boolean = false,
 )
 
 data class CoreTransfer(val name: String, val incoming: Boolean, val verified: Boolean, val saved: Boolean)
+
+/** Per-file receiver acknowledgment from the most recent send in this process. */
+data class CoreSendReport(val files: List<CoreSentFile>, val target: String? = null) : java.io.Serializable
+data class CoreSentFile(val name: String, val delivered: Boolean, val storedName: String?) : java.io.Serializable
 
 data class CoreDevice(
     val id: String,

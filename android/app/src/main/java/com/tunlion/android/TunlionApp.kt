@@ -416,7 +416,7 @@ private fun PairScreen(busy: Boolean, supported: Boolean, onJoin: (String, Boole
         "Someone else's" -> "External pair with explicitly confirmed permissions, not fleet membership."
         else -> "Temporary access must have a bounded expiry confirmed by the core."
     })
-    if (!supported) SecondaryText("Enrollment is not connected to the native core yet. These choices do not enroll a device or grant permissions. Use Files for a one-time transfer code.")
+    if (!supported) SecondaryText("Enrollment review is unavailable until the shared core exposes enrollment facts. These choices do not record a relationship or grant permission. Use Files for a one-time transfer code.")
     OutlinedTextField(code, { code = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
         label = { Text("Device code") }, placeholder = { Text("brave-otter-3141") },
         textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
@@ -479,6 +479,20 @@ private fun FilesScreen(status: CoreStatus, busy: Boolean, onReceive: (String) -
         }
     }
     SecondaryText(if (android.os.Build.VERSION.SDK_INT >= 29) "Received files are saved to Download/Tunlion after verification." else "Choose a receiving folder in Settings. Files remain in the private inbox until a folder is chosen.")
+    status.lastSend?.let { report ->
+        Eyebrow("LAST SEND RESULT")
+        SecondaryText(report.target?.let { "To $it" } ?: "Code transfer")
+        report.files.forEach { file ->
+            Column {
+                Text(file.name, fontWeight = FontWeight.Medium)
+                SecondaryText(
+                    if (!file.delivered) "Receiver did not acknowledge delivery"
+                    else (file.storedName?.let { "Receiver acknowledged delivery · stored as $it" }
+                        ?: "Receiver acknowledged delivery"))
+            }
+        }
+        SecondaryText("Only receiver acknowledgments from the completed send appear here. A recorded device grant is not a delivery.")
+    }
     if (status.transfers.isNotEmpty()) {
         Eyebrow("RECENT FILES")
         status.transfers.forEach { transfer ->
@@ -524,7 +538,8 @@ private fun DeviceRow(device: CoreDevice, onClick: () -> Unit) {
             Text(device.name, fontWeight = FontWeight.Medium,
                 color = if (device.online == true) colors.onBackground else colors.onSurfaceVariant)
             SecondaryText(when (device.online) { true -> "Online"; false -> "Offline"; null -> "Availability unknown" })
-            if (device.actions.isNotEmpty()) SecondaryText(relationshipLabel(device.relationship) + if (device.revoked) " · revoked locally" else "")
+            SecondaryText(relationshipLabel(device.relationship) + if (device.revoked) " · revoked locally" else "")
+            if (device.actions.isNotEmpty()) SecondaryText(actionSummary(device))
         }
         if (device.online == true && device.route != null) {
             Text(if (device.route == "relayed") "RELAYED" else if (device.route == "direct") "DIRECT" else "",
@@ -543,39 +558,59 @@ private fun DeviceDetails(device: CoreDevice, onSend: () -> Unit) {
     DetailRow("Relationship", relationshipLabel(device.relationship))
     device.expiry?.let { DetailRow("Expiry recorded by core", it) }
     if (device.revoked) SecondaryText("Revoked on this receiver. This does not acknowledge remote removal or termination of every active session.")
-    Eyebrow("ACCESS")
+    Eyebrow("ACCESS FACTS")
     SecondaryText(device.plainLine)
+    SecondaryText("A stored relationship or recorded grant is not proof that an action currently works. This snapshot does not probe the remote device.")
     if (device.actions.isNotEmpty()) {
-        val effective = device.actions.filter { it.state == CoreAccessState.AVAILABLE }
-        Eyebrow("EFFECTIVE SUPPORTED ACTIONS")
-        if (effective.isEmpty()) SecondaryText("No action is confirmed effective by this snapshot.")
-        effective.forEach { DetailRow(actionLabel(it.action), it.reason) }
-        val pending = device.actions.filter { it.state == CoreAccessState.PENDING }
-        if (pending.isNotEmpty()) {
-            Eyebrow("PENDING")
-            pending.forEach { DetailRow(actionLabel(it.action), it.reason) }
-        }
-        val unavailable = device.actions.filter { it.state != CoreAccessState.AVAILABLE && it.state != CoreAccessState.PENDING }
-        if (unavailable.isNotEmpty()) {
-            Eyebrow("BLOCKED, UNKNOWN OR UNSUPPORTED")
-            unavailable.forEach {
-                DetailRow(actionLabel(it.action) + " · " + when (it.state) {
-                    CoreAccessState.BLOCKED -> "Blocked"
-                    CoreAccessState.UNSUPPORTED -> "Unsupported"
-                    else -> "Unknown"
-                }, it.reason)
-            }
-        }
+        actionGroup(device, "EFFECTIVE", CoreAccessState.AVAILABLE, "No action is confirmed effective by this snapshot.")
+        actionGroup(device, "PENDING", CoreAccessState.PENDING, null)
+        actionGroup(device, "BLOCKED", CoreAccessState.BLOCKED, null)
+        actionGroup(device, "UNKNOWN", CoreAccessState.UNKNOWN, null)
+        actionGroup(device, "UNAVAILABLE", CoreAccessState.UNSUPPORTED, null)
     }
-    SecondaryText("Only actions confirmed effective by the core appear here. Missing terminal, folder, permission editing and removal actions are not supported in this build.")
-    SecondaryText("Revoking a capability and cutting a device are different operations. Offline acknowledgment and active-session termination are not available here. Withdrawing an owner grant must not be assumed to close an existing session.")
+    SecondaryText("Only actions reported by the shared core appear here. Permission editing, terminal clients and folder clients are not connected in this build.")
     if (device.route == "relayed") SecondaryText("On relay, not a direct link. Still end-to-end encrypted.")
     if (device.canSendFiles) PrimaryButton("Send a file", onClick = onSend)
     else if (device.canAttemptSend) {
         SecondaryText("Remote permission and reachability have not been checked. You can attempt a transfer; the receiver may refuse it. This is not an effective permission grant.")
-        OutlinedButton(onClick = onSend) { Text("Try sending a file") }
-    }
-    if (device.canOpenShell) SecondaryText("Shell access granted. The terminal is not connected in this preview.")
+        OutlinedButton(onClick = onSend, shape = RoundedCornerShape(7.dp)) { Text("Try sending a file") }
+    } else SecondaryText("Sending is not available for this device in the current core snapshot. The reason above is the core's own fact, not a client guess.")
+    if (device.canOpenShell) SecondaryText("The core reports terminal service as effective. A terminal client is not connected in this build.")
+    Eyebrow("REMOVAL")
+    SecondaryText("Revoking one capability removes a single permission. Cutting a device off ends its whole stored relationship. Neither operation is connected to the shared core in this build, so this app cannot perform either or claim completion.")
+    OutlinedButton(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        shape = RoundedCornerShape(7.dp)) { Text("Revoke a capability · unavailable") }
+    OutlinedButton(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        shape = RoundedCornerShape(7.dp)) { Text("Cut device off · unavailable") }
+    SecondaryText("Pending deliveries, offline peers and active sessions cannot be resolved from this snapshot. A removal is not acknowledged, and an existing session is not shown as ended.")
+}
+
+@Composable
+private fun actionGroup(device: CoreDevice, title: String, state: CoreAccessState, empty: String?) {
+    val actions = device.actions.filter { it.state == state }
+    if (actions.isEmpty()) { empty?.let { SecondaryText(it) }; return }
+    Eyebrow(title)
+    actions.forEach { DetailRow(actionLabel(it.action), it.reason) }
+}
+
+private fun actionSummary(device: CoreDevice) = device.actions.joinToString(" · ") {
+    "${actionShortLabel(it.action)}: ${stateLabel(it.state)}"
+}
+
+private fun actionShortLabel(action: String) = when (action) {
+    "send" -> "Send"
+    "receive-inbox" -> "Receive inbox"
+    "terminal" -> "Terminal"
+    "folder" -> "Folders"
+    else -> action
+}
+
+private fun stateLabel(state: CoreAccessState) = when (state) {
+    CoreAccessState.AVAILABLE -> "available"
+    CoreAccessState.PENDING -> "pending"
+    CoreAccessState.BLOCKED -> "blocked"
+    CoreAccessState.UNSUPPORTED -> "unsupported"
+    CoreAccessState.UNKNOWN -> "unknown"
 }
 
 private fun relationshipLabel(relationship: CoreRelationship) = when (relationship) {
@@ -621,9 +656,12 @@ private fun SendScreen(device: CoreDevice?, busy: Boolean, onSend: (List<android
             finally { reading = false }
         }
     }
-    Title(if (device == null) "Send with a code" else if (device.canSendFiles) "Send to ${device.name}" else "Try sending to ${device.name}",
+    val sendable = device == null || device.canSendFiles || device.canAttemptSend
+    Title(if (device == null) "Send with a code" else if (device.canSendFiles) "Send to ${device.name}"
+        else if (device.canAttemptSend) "Try sending to ${device.name}" else "Sending unavailable",
         "Choose files with Android's file picker. They stay on this phone until you send them.")
-    if (device != null && !device.canSendFiles) SecondaryText("Remote permission is unknown, not granted. The receiver will decide whether to accept this attempt.")
+    if (device != null && !device.canSendFiles && device.canAttemptSend) SecondaryText("Remote permission is unknown, not granted. The receiver will decide whether to accept this attempt.")
+    if (!sendable) SecondaryText("The current core snapshot does not allow a send attempt to this device. Nothing will be sent.")
     sendCode?.let { code ->
         Eyebrow("YOUR FILE CODE")
         Text(code, fontFamily = FontFamily.Monospace, fontSize = 22.sp)
@@ -639,7 +677,13 @@ private fun SendScreen(device: CoreDevice?, busy: Boolean, onSend: (List<android
         }
     }
     OutlinedButton(onClick = { picker.launch(arrayOf("*/*")) }, enabled = !busy && !reading, shape = RoundedCornerShape(7.dp)) { Text(if (names.isEmpty()) "Choose files" else "Choose different files") }
-    PrimaryButton(if (device == null) "Make a file code" else if (device.canSendFiles) "Send files" else "Try sending files", busy, selected.isNotEmpty() && !reading) {
+    val sendLabel = when {
+        !sendable -> "Sending unavailable"
+        device == null -> "Make a file code"
+        device?.canSendFiles == true -> "Send files"
+        else -> "Try sending files"
+    }
+    PrimaryButton(sendLabel, busy, selected.isNotEmpty() && !reading && sendable) {
         onSend(selected) { sendCode = it }
     }
     error?.let { SecondaryText(it) }

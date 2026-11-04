@@ -56,6 +56,17 @@ class NativeAdapterAcceptanceTest {
             withTimeout(10_000) {
                 while (context.getSystemService(NotificationManager::class.java).activeNotifications.any { it.id == 1003 }) delay(100)
             }
+            File(root, "devices.json").writeText(
+                """[{"name":"fixture-peer","secret":"must-not-cross-ffi","caps":["shell"],"deniedCaps":["transfer"],"principalExpires":1}]""")
+            val facts = core.refresh().devices.single { it.name == "fixture-peer" }
+            assertEquals(CoreRelationship.PAIRED, facts.relationship)
+            assertNull("Presence is not inferred from a stored record", facts.online)
+            assertFalse(facts.canSendFiles)
+            assertTrue("Unknown remote send permission permits an explicit attempt only", facts.canAttemptSend)
+            assertEquals(CoreAccessState.UNKNOWN, facts.actions.single { it.action == "send" }.state)
+            assertEquals(CoreAccessState.BLOCKED, facts.actions.single { it.action == "receive-inbox" }.state)
+            assertEquals(CoreAccessState.UNSUPPORTED, facts.actions.single { it.action == "terminal" }.state)
+            assertFalse(facts.plainLine.contains("must-not-cross-ffi"))
         } finally {
             withContext(NonCancellable) { core.stop() }
             scenario.close()

@@ -12,8 +12,12 @@ import kotlin.coroutines.resume
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
+import uniffi.tunlion_core.AccessState as NativeAccessState
 import uniffi.tunlion_core.CoreException
 import uniffi.tunlion_core.CoreSession
+import uniffi.tunlion_core.DeviceAccess as NativeDeviceAccess
+import uniffi.tunlion_core.DevicePresence as NativeDevicePresence
+import uniffi.tunlion_core.DeviceRelationship as NativeDeviceRelationship
 import uniffi.tunlion_core.EngineState as NativeEngineState
 import uniffi.tunlion_core.PendingIdentity
 
@@ -35,6 +39,7 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     private val transfer = Mutex()
     private var pending: PendingIdentity? = null
     @Volatile private var publicationError: String? = null
+    @Volatile private var lastSend: CoreSendReport? = null
     @Volatile private var cached = CoreStatus(deviceName = Build.MODEL)
     override fun status() = cached
 
@@ -60,12 +65,14 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
 
     override suspend fun refresh(): CoreStatus = withContext(Dispatchers.IO) {
         val snapshot = session.status()
+        val devices = session.devices().map(::coreDevice)
         val history = receivedFiles()
         try { publishInbox() } catch (_: java.io.IOException) { /* The publication error is included in this snapshot. */ }
         cached = CoreStatus(identityLoaded = true, deviceName = Build.MODEL,
             fingerprint = snapshot.fingerprint, engineLinked = true,
             engineRunning = EngineState.phase.value == EnginePhase.AVAILABLE && snapshot.engine == NativeEngineState.RUNNING,
             engineError = EngineState.error ?: publicationError,
+            devices = devices, lastSend = lastSend,
             transfers = history.records().takeLast(20).reversed().map {
                 CoreTransfer(it.optString("file"), it.optString("direction") == "in", it.optBoolean("ok"), history.saved(it))
             })
@@ -147,8 +154,15 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     override suspend fun sendFiles(deviceId: String?, files: List<Uri>, onCode: (String) -> Unit): CoreResult {
         val device = deviceId?.let { id -> cached.devices.firstOrNull { it.id == id } }
         if (deviceId != null && device == null) return CoreResult.Failure(CoreErrorKind.UNKNOWN_DEVICE, "The device is not in the current core snapshot. Return to Devices and refresh.")
+        if (device != null) {
+            val send = device.actions.firstOrNull { it.action == "send" }
+            if (send != null && send.state != CoreAccessState.UNKNOWN && send.state != CoreAccessState.AVAILABLE)
+                return CoreResult.Failure(CoreErrorKind.DENIED,
+                    "The current core snapshot does not allow a send attempt to ${device.name}: ${send.reason}")
+        }
         if (files.isEmpty()) return CoreResult.Failure(CoreErrorKind.INVALID_INPUT, "Choose files first.")
         return runTransfer {
+            lastSend = null
             val staging = File(context.cacheDir, "send-${UUID.randomUUID()}")
             check(staging.mkdirs())
             try {
@@ -179,10 +193,49 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
                     withContext(Dispatchers.Main) { onCode(created.code) }
                     session.waitSend()
                 } else session.sendToDevice(paths, device.name, 300uL)
-                if (sent.files.size != paths.size || sent.files.any { !it.delivered }) CoreResult.Failure(CoreErrorKind.PARTIAL, "Some files were not acknowledged by the receiver.")
+                lastSend = CoreSendReport(sent.files.map { CoreSentFile(it.name, it.delivered, it.storedName) }, device?.name)
+                val missing = sent.files.filterNot { it.delivered }
+                if (sent.files.size != paths.size || missing.isNotEmpty())
+                    CoreResult.Failure(CoreErrorKind.PARTIAL,
+                        "${sent.files.count { it.delivered }} of ${paths.size} files were acknowledged as delivered by the receiver." +
+                            missing.joinToString(prefix = " Not acknowledged: ", separator = ", ") { it.name })
                 else CoreResult.Success
             } finally { staging.deleteRecursively() }
         }
+    }
+
+    /**
+     * Project the core's read-only device facts. Relationship and stored
+     * records are never promoted to remote authority; presence is unknown
+     * because the snapshot does not probe peers.
+     */
+    private fun coreDevice(access: NativeDeviceAccess): CoreDevice {
+        val actions = access.actions.map { action ->
+            CoreAction(action.action, when (action.state) {
+                NativeAccessState.AVAILABLE -> CoreAccessState.AVAILABLE
+                NativeAccessState.BLOCKED -> CoreAccessState.BLOCKED
+                NativeAccessState.UNSUPPORTED -> CoreAccessState.UNSUPPORTED
+                NativeAccessState.UNKNOWN -> CoreAccessState.UNKNOWN
+            }, action.reason)
+        }
+        return CoreDevice(
+            id = access.deviceKey ?: "name:${access.name}",
+            name = access.name,
+            online = when (access.presence) { NativeDevicePresence.UNKNOWN -> null },
+            route = null,
+            plainLine = "Stored device record from the shared core. Remote grants, reachability and delivered files are not observed.",
+            canSendFiles = actions.any { it.action == "send" && it.state == CoreAccessState.AVAILABLE },
+            canOpenShell = actions.any { it.action == "terminal" && it.state == CoreAccessState.AVAILABLE },
+            relationship = when (access.relationship) {
+                NativeDeviceRelationship.PAIRED -> CoreRelationship.PAIRED
+                NativeDeviceRelationship.FLEET -> CoreRelationship.FLEET
+                NativeDeviceRelationship.TEMPORARY -> CoreRelationship.TEMPORARY
+                NativeDeviceRelationship.UNKNOWN -> CoreRelationship.UNKNOWN
+            },
+            expiry = access.expiresAt?.let { java.time.Instant.ofEpochSecond(it.toLong()).toString() },
+            revoked = access.revoked,
+            actions = actions,
+        )
     }
 
     /** Blocking FFI owns its files until it returns. Cancellation calls core.stop on another thread. */

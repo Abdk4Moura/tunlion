@@ -28,6 +28,7 @@ class DeviceAuthorityUiTest {
         compose.onNodeWithText("Temporary worker").performScrollTo().performClick()
         compose.onNodeWithText("Temporary access must have a bounded expiry confirmed by the core.").assertExists()
         compose.onNodeWithText("Review enrollment").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Enrollment review is unavailable until the shared core exposes enrollment facts. These choices do not record a relationship or grant permission. Use Files for a one-time transfer code.").assertExists()
     }
 
     @Test fun unknownRemotePermissionDoesNotBecomeSendAuthority() {
@@ -38,13 +39,51 @@ class DeviceAuthorityUiTest {
         open(CoreStatus(identityLoaded = true, fingerprint = "12345678", engineLinked = true, devices = listOf(peer)))
         compose.onNodeWithText("Stored laptop").performClick()
         compose.onNodeWithText("No action is confirmed effective by this snapshot.").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("Send files to this device · Unknown").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("UNKNOWN").assertExists()
+        compose.onNodeWithText("Send files to this device").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Send a file").assertDoesNotExist()
         compose.onNodeWithText("Availability unknown").assertExists()
         compose.onNodeWithText("Try sending a file").performScrollTo().performClick()
         compose.onNodeWithText("Try sending to Stored laptop").assertExists()
         compose.onNodeWithText("Remote permission is unknown, not granted. The receiver will decide whether to accept this attempt.").assertExists()
         compose.onNodeWithText("Try sending files").performScrollTo().assertIsNotEnabled()
+    }
+
+    @Test fun deviceListShowsRelationshipAndEveryActionState() {
+        val peer = CoreDevice("peer-key", "Stored laptop", null, null,
+            "Stored facts only, not remote acknowledgment.", false, false,
+            relationship = CoreRelationship.FLEET,
+            revoked = true,
+            actions = listOf(
+                CoreAction("send", CoreAccessState.UNKNOWN, "Remote receiver authorization is not observed"),
+                CoreAction("receive-inbox", CoreAccessState.BLOCKED, "Device access is revoked on this receiver"),
+                CoreAction("terminal", CoreAccessState.UNSUPPORTED, "This core profile does not serve terminals"),
+                CoreAction("folder", CoreAccessState.PENDING, "Waiting for a core fact"),
+            ))
+        open(CoreStatus(identityLoaded = true, fingerprint = "12345678", engineLinked = true, devices = listOf(peer)))
+        compose.onNodeWithText("Fleet device · revoked locally").assertExists()
+        compose.onNodeWithText("Send: unknown · Receive inbox: blocked · Terminal: unsupported · Folders: pending").assertExists()
+        compose.onNodeWithText("Stored laptop").performClick()
+        compose.onNodeWithText("A stored relationship or recorded grant is not proof that an action currently works. This snapshot does not probe the remote device.").performScrollTo().assertExists()
+        compose.onNodeWithText("PENDING").performScrollTo().assertExists()
+        compose.onNodeWithText("BLOCKED").performScrollTo().assertExists()
+        compose.onNodeWithText("UNKNOWN").performScrollTo().assertExists()
+        compose.onNodeWithText("UNAVAILABLE").performScrollTo().assertExists()
+        compose.onNodeWithText("Revoke a capability · unavailable").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Cut device off · unavailable").performScrollTo().assertIsNotEnabled()
+    }
+
+    @Test fun sendResultShowsOnlyReceiverAcknowledgedDelivery() {
+        open(CoreStatus(identityLoaded = true, fingerprint = "12345678", engineLinked = true,
+            lastSend = CoreSendReport(listOf(
+                CoreSentFile("sent.txt", true, "sent.1.txt"),
+                CoreSentFile("lost.txt", false, null),
+            ))))
+        compose.onAllNodesWithText("Files")[0].performClick()
+        compose.onNodeWithText("LAST SEND RESULT").performScrollTo().assertExists()
+        compose.onNodeWithText("Code transfer").performScrollTo().assertExists()
+        compose.onNodeWithText("Receiver acknowledged delivery · stored as sent.1.txt").performScrollTo().assertExists()
+        compose.onNodeWithText("Receiver did not acknowledge delivery").performScrollTo().assertExists()
     }
 }
 
