@@ -4815,22 +4815,29 @@ mod invitation_store_tests {
     fn arm_list_disarm_and_expiry_share_one_locked_store() {
         let root = TestRoot::new();
         let store = DeviceStore::open(root.0.clone());
-        store.arm_invitation(armed("aa", "beta", 1_000), 100).unwrap();
-        store.arm_invitation(armed("bb", "old", 50), 100).unwrap();
-        let listed = store.armed_invitations(100).unwrap();
+        let now = cap_now_secs();
+        store
+            .arm_invitation(armed("aa", "beta", now + 1_000), now)
+            .unwrap();
+        store
+            .arm_invitation(armed("bb", "old", now.saturating_sub(50)), now)
+            .unwrap();
+        let listed = store.armed_invitations(now).unwrap();
         assert_eq!(listed.len(), 1, "expired entries are not listed");
         assert_eq!(listed[0].label(), "beta");
         assert_eq!(store.invitee_name(&"aa".repeat(32)).as_deref(), Some("beta"));
         assert!(store.is_armed());
 
         // Re-arming one key replaces its record instead of duplicating it.
-        store.arm_invitation(armed("aa", "beta-2", 1_000), 100).unwrap();
-        let listed = store.armed_invitations(100).unwrap();
+        store
+            .arm_invitation(armed("aa", "beta-2", now + 1_000), now)
+            .unwrap();
+        let listed = store.armed_invitations(now).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].label(), "beta-2");
 
         store.disarm_invitation(&"aa".repeat(32)).unwrap();
-        assert!(store.armed_invitations(100).unwrap().is_empty());
+        assert!(store.armed_invitations(now).unwrap().is_empty());
         assert!(!store.is_armed());
     }
 
