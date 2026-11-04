@@ -220,6 +220,11 @@ pub trait RecvStore: Send + Sync {
     );
     fn devices_remove(&self, name: &str) -> anyhow::Result<()>;
     fn devices_store(&self, name: &str, secret: &str) -> anyhow::Result<String>;
+    /// Remember a `pair-keep` secret idempotently. The default keeps the old
+    /// behavior for test mocks; the real store dedupes repeats by secret.
+    fn devices_store_remembered(&self, name: &str, secret: &str) -> anyhow::Result<String> {
+        self.devices_store(name, secret)
+    }
     fn devices_store_new(
         &self,
         name: &str,
