@@ -154,12 +154,6 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     override suspend fun sendFiles(deviceId: String?, files: List<Uri>, onCode: (String) -> Unit): CoreResult {
         val device = deviceId?.let { id -> cached.devices.firstOrNull { it.id == id } }
         if (deviceId != null && device == null) return CoreResult.Failure(CoreErrorKind.UNKNOWN_DEVICE, "The device is not in the current core snapshot. Return to Devices and refresh.")
-        if (device != null) {
-            val send = device.actions.firstOrNull { it.action == "send" }
-            if (send != null && send.state != CoreAccessState.UNKNOWN && send.state != CoreAccessState.AVAILABLE)
-                return CoreResult.Failure(CoreErrorKind.DENIED,
-                    "The current core snapshot does not allow a send attempt to ${device.name}: ${send.reason}")
-        }
         if (files.isEmpty()) return CoreResult.Failure(CoreErrorKind.INVALID_INPUT, "Choose files first.")
         return runTransfer {
             lastSend = null
@@ -295,7 +289,7 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     catch (_: CoreException.Usage) { CoreResult.Failure(CoreErrorKind.INVALID_INPUT, "Check the complete file code and selected files.") }
     catch (_: CoreException.Unreachable) { CoreResult.Failure(CoreErrorKind.UNREACHABLE, "The other device did not answer. Keep Tunlion open there and retry.") }
     catch (_: CoreException.Refused) { CoreResult.Failure(CoreErrorKind.DENIED, "The receiver refused the transfer.") }
-    catch (_: CoreException.Partial) { CoreResult.Failure(CoreErrorKind.PARTIAL, "Not all files were acknowledged. Check Files before retrying.") }
+    catch (_: CoreException.Partial) { CoreResult.Failure(CoreErrorKind.PARTIAL, "Not all files were acknowledged. The core did not return per-file delivery facts; check the receiver before retrying.") }
     catch (_: CoreException.Cancelled) { CoreResult.Failure(CoreErrorKind.CANCELLED, "Transfer cancelled.") }
     catch (_: CoreException.PhraseMismatch) { CoreResult.Failure(CoreErrorKind.INVALID_INPUT, "The recovery words did not match. Nothing was saved.") }
     catch (_: CoreException.Io) { CoreResult.Failure(CoreErrorKind.LOCAL_RESOURCE, "The native core could not read or save local data. Check free space and reopen Files. Private inbox files have been kept.") }

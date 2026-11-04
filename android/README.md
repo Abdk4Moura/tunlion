@@ -75,6 +75,16 @@ or device verification; use the workflow or an approved leased Android worker.
   need core APIs. No successful stub or inferred remote permission is used.
   Offline and route facts remain unknown.
 
+## Client parity
+
+Android is an adapter over the shared core, not a second fleet model. It
+projects the core's identity, device snapshot and transfer receipts; it does
+not evaluate access, enroll devices or perform removal. The instrumentation
+suite exercises the same core facts as the CLI (identity, relationship versus
+access, expiry/denial, verified receipt). Enrollment, capability removal,
+device removal, active-session termination, and browser/WASM parity remain
+blocked on the shared core surface and are not reimplemented in Kotlin.
+
 ## Native acceptance
 
 `NativeCoreAcceptanceTest` checks real native identity confirmation, mismatch

@@ -73,6 +73,22 @@ class DeviceAuthorityUiTest {
         compose.onNodeWithText("Cut device off · unavailable").performScrollTo().assertIsNotEnabled()
     }
 
+    @Test fun effectiveCoreActionIsRenderedOnlyWhenCoreReportsIt() {
+        val peer = CoreDevice("peer-key", "Stored laptop", null, null,
+            "Stored facts only, not remote acknowledgment.", true, false,
+            relationship = CoreRelationship.FLEET,
+            actions = listOf(
+                CoreAction("send", CoreAccessState.AVAILABLE, "Authenticated link and receiver grant"),
+                CoreAction("receive-inbox", CoreAccessState.UNKNOWN, "Authenticated link facts are not available here"),
+            ))
+        open(CoreStatus(identityLoaded = true, fingerprint = "12345678", engineLinked = true, devices = listOf(peer)))
+        compose.onNodeWithText("Send: available · Receive inbox: unknown").assertExists()
+        compose.onNodeWithText("Stored laptop").performClick()
+        compose.onNodeWithText("EFFECTIVE").performScrollTo().assertExists()
+        compose.onNodeWithText("Send a file").assertExists()
+        compose.onNodeWithText("Try sending a file").assertDoesNotExist()
+    }
+
     @Test fun sendResultShowsOnlyReceiverAcknowledgedDelivery() {
         open(CoreStatus(identityLoaded = true, fingerprint = "12345678", engineLinked = true,
             lastSend = CoreSendReport(listOf(

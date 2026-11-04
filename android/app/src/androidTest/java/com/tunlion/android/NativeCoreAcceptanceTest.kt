@@ -8,8 +8,10 @@ import java.util.UUID
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
+import uniffi.tunlion_core.AccessState
 import uniffi.tunlion_core.CoreException
 import uniffi.tunlion_core.CoreSession
+import uniffi.tunlion_core.DeviceRelationship
 import uniffi.tunlion_core.EngineState
 
 /** Exercises the exact bindings and library shipped inside the Compose application. */
@@ -33,6 +35,31 @@ class NativeCoreAcceptanceTest {
                 }
                 core.stop()
                 assertNotEquals(EngineState.RUNNING, core.status().engine)
+            }
+        } finally { config.deleteRecursively() }
+    }
+
+    @Test fun deviceSnapshotKeepsRelationshipSeparateFromAccess() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val config = File(context.cacheDir, "native-devices-${UUID.randomUUID()}")
+        try {
+            CoreSession.open(config.absolutePath).use { core ->
+                File(config, "devices.json").writeText(
+                    """[{"name":"external","secret":"must-not-cross-ffi","caps":["shell"]},""" +
+                        """{"name":"worker","ephemeral":true,"principalExpires":1}]""")
+                val devices = core.devices()
+                val external = devices.single { it.name == "external" }
+                assertEquals(DeviceRelationship.PAIRED, external.relationship)
+                assertEquals(AccessState.UNKNOWN, external.actions.single { it.action == "send" }.state)
+                assertEquals(AccessState.UNSUPPORTED, external.actions.single { it.action == "terminal" }.state)
+                val worker = devices.single { it.name == "worker" }
+                assertEquals(DeviceRelationship.TEMPORARY, worker.relationship)
+                assertEquals(AccessState.BLOCKED, worker.actions.single { it.action == "receive-inbox" }.state)
+                assertFalse(File(config, "identity.ed25519").exists())
+                assertFalse(File(config, "overlay.ed25519").exists())
+                assertFalse(devices.toString().contains("must-not-cross-ffi"))
+                File(config, "devices.json").writeText("[")
+                assertThrows(CoreException.Config::class.java) { core.devices() }
             }
         } finally { config.deleteRecursively() }
     }

@@ -37,6 +37,7 @@ data class CoreTransfer(val name: String, val incoming: Boolean, val verified: B
 data class CoreSendReport(val files: List<CoreSentFile>, val target: String? = null) : java.io.Serializable
 data class CoreSentFile(val name: String, val delivered: Boolean, val storedName: String?) : java.io.Serializable
 
+/** Rendering projection of one core `DeviceAccess` record. It evaluates no authority. */
 data class CoreDevice(
     val id: String,
     val name: String,
@@ -56,6 +57,7 @@ data class CoreDevice(
 
 enum class CoreRelationship { PAIRED, FLEET, TEMPORARY, UNKNOWN }
 enum class CoreAccessState { AVAILABLE, PENDING, BLOCKED, UNSUPPORTED, UNKNOWN }
+/** One direction-named core action fact, preserved for rendering. */
 data class CoreAction(val action: String, val state: CoreAccessState, val reason: String) : java.io.Serializable
 
 sealed interface CoreResult {
