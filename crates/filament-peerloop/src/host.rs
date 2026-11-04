@@ -371,7 +371,7 @@ pub trait HostServices: Send + Sync + 'static {
     }
     /// Append the receiver's structured transfer-history record.
     #[cfg(feature = "dispatch")]
-    fn record_received_file(&self, _record: &crate::recv::files::ReceivedFileRecord) {}
+    fn record_received_file(&self, _record: &crate::recv::store::ReceivedFileRecord) {}
     /// Append one line to the daemon's upload log, if it keeps one.
     #[cfg(feature = "dispatch")]
     fn append_receive_log(&self, _line: &str) {}
