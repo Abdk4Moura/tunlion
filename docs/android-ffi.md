@@ -246,6 +246,46 @@ TTL and claim timeout stop applying, and a separate idle/progress bound prevents
 a silent hang. There is no resume after a link loss in this slice, and the
 engine uses the same direct-QUIC/WebRTC transports as the CLI.
 
+`preview_invitation(bytes) -> InvitationPreview` and
+`preview_invitation_request(request) -> InvitationPreview`
+
+Parse or preview a signed invitation without minting. The preview reports the
+exact requested ceiling, with `route` expanded to `route:<cidr>`, plus the
+owner name, relationship, expiry, offline budget and reuse shape. It is a
+request review, never a claim that access was granted. The default ceiling is
+inbox transfer only; mount is an explicit opt-in. No seed or recovery words are
+returned.
+
+`create_invitation(request) -> ByteArray`
+
+Mints and arms an invitation through the shared `filament-peerloop::invitation`
+policy. Requires an owner identity. Lifetime is 1 second to 30 days, bounded
+reuse is 1 to 250 or reusable, `route` needs explicit prefixes, and shell or
+all-ports requires `confirm_remote_authority`. Returns the opaque token bytes;
+never log them or pass them in an argument list.
+
+`join_invitation(bytes, name, timeout) -> JoinResult`
+
+Runs the real shared join driver on this Core's engine slot from a blank config
+directory. It mints no owner identity. The acknowledgement persistence checks
+every signed bound, verifies the invitation against the owner certificate, and
+writes the local certificate last. Blocking; call it off the UI thread.
+
+`invitations() -> Vec<OutstandingInvitation>` and
+`withdraw_invitation(selector) -> Vec<String>`
+
+List claimable invitations and withdraw them by name or id prefix. Withdrawal is
+durable and immediate for a running receiver.
+
+`servable_capabilities() -> Vec<String>`
+
+The invitation ceiling vocabulary this core can express and enforce. It is not
+a claim that every serving backend is compiled into this profile.
+
+`device_name() -> Option<String>` and `set_device_name(name)`
+
+The name in the explicit config directory, written under the config lock.
+
 `status().engine` is the slot state a UI polls: `NotLinked` (nothing started),
 `Starting` (startup claimed the Core, or the dispatch is spawned and readiness
 is pending), `Running`, `Stopping` (a stop is joining), `FinishedUnjoined` (the task returned
