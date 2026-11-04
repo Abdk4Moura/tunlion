@@ -595,6 +595,11 @@ pub fn cap_gate_effective_with_identity(
                 ),
             };
         }
+        // Boundary: an anonymous peer has no device key, so it cannot be
+        // matched against a revoked record. The explicit consent (the code, or
+        // the operator's -y/daemon room acceptance) is the authority here, and
+        // it extends ONLY to this bounded transfer. Do not widen this class to
+        // silent Pending or to any other action.
         return if legacy_allowed {
             GateDecision::Allow
         } else {
