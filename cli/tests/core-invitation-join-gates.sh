@@ -111,8 +111,9 @@ else
 fi
 
 # --------------------------------------------------------------- J3 owner record
+JOIN_PUB=$(JOINED="$JOINED" "$PYV" -c 'import json, os; print(json.loads(os.environ["JOINED"])["device_pub"])')
 if JSON=$(timeout 30 env TUNLION_CONFIG_DIR="$DA" "$BIN" devices --json 2>/dev/null) \
-   && JSON="$JSON" "$PYV" - <<'PY'
+   && JSON="$JSON" JOIN_PUB="$JOIN_PUB" DA="$DA" "$PYV" - <<'PY'
 import json, os
 doc = json.loads(os.environ["JSON"])
 rows = {d["name"]: d for d in doc["data"]["devices"]}
@@ -121,6 +122,11 @@ assert guest is not None, rows.keys()
 assert guest.get("caps") == ["transfer"], guest
 assert guest.get("certExpires"), guest
 assert guest.get("channel"), guest
+# The public view deliberately omits the device key. Read the owner's store
+# to prove the saved certificate names exactly the key the join returned.
+store = json.load(open(os.path.join(os.environ["DA"], "devices.json")))
+record = next(r for r in store if r.get("name") == "guest")
+assert record["deviceCert"]["devicePub"] == os.environ["JOIN_PUB"], record
 PY
 then
   ok "J3: the owner lists guest with the same transfer-only ceiling"
