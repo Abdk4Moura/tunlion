@@ -36,36 +36,9 @@
 //! Entries minted by 0.9.2 and later also carry the ceiling, the reuse limit
 //! and the mint time, for the listing only.
 
-use std::path::PathBuf;
-
 use serde_json::{Value, json};
 
-fn armed_path() -> PathBuf {
-    crate::platform::Paths::config_path("armed.json")
-}
-
-struct ArmedEntry {
-    key_id: String,
-    expires: u64,
-    /// The name the owner gave the invitee (`add <name> --out`), if any. Not
-    /// secret, not signed: it decides only what THIS store calls the device
-    /// that enrols with this key.
-    name: Option<String>,
-    /// What the owner invited: `person` or `device` (`add --for ...`). Not
-    /// secret, not signed: like `name`, it decides only how THIS store files
-    /// the device that enrols with this key. The signed ceiling still bounds
-    /// what it may do.
-    kind: Option<String>,
-    /// What the owner saw when minting, kept so `devices` can list the
-    /// invitation honestly while it is outstanding: the ceiling it carries,
-    /// how many claims it admits, and when it was made. Not secret, not
-    /// signed, and never consulted for admission: the signed invitation and
-    /// the durable use file decide that. Absent on entries minted before
-    /// 0.9.2, which the listing shows as unknown rather than guesses.
-    allow: Option<Vec<String>>,
-    reuse: Option<Value>,
-    created: Option<u64>,
-}
+use filament_peerloop::recv::store::ArmedInvitation;
 
 /// What a mint records about an invitation besides its key and expiry.
 #[derive(Debug, Clone, Default)]
@@ -97,65 +70,11 @@ fn reuse_total(v: Option<&Value>) -> Result<Option<u64>, ()> {
     }
 }
 
-fn load() -> Vec<ArmedEntry> {
-    let raw = match std::fs::read_to_string(armed_path()) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { return Vec::new() };
-    let arr = v.as_array().cloned().unwrap_or_default();
-    arr.iter()
-        .filter_map(|e| {
-            let key_id = e["key_id"].as_str()?.to_string();
-            let expires = e["expires"].as_u64()?;
-            let name = e["name"].as_str().map(str::to_string);
-            let kind = e["kind"].as_str().map(str::to_string);
-            let allow = e["allow"].as_array().map(|a| {
-                a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect()
-            });
-            let reuse = e.get("reuse").cloned().filter(|v| !v.is_null());
-            let created = e["created"].as_u64();
-            Some(ArmedEntry { key_id, expires, name, kind, allow, reuse, created })
-        })
-        .collect()
-}
-
-fn save(entries: &[ArmedEntry]) {
-    let arr: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|e| {
-            let mut v = json!({ "key_id": e.key_id, "expires": e.expires });
-            if let Some(n) = &e.name {
-                v["name"] = json!(n);
-            }
-            if let Some(k) = &e.kind {
-                v["kind"] = json!(k);
-            }
-            if let Some(a) = &e.allow {
-                v["allow"] = json!(a);
-            }
-            if let Some(r) = &e.reuse {
-                v["reuse"] = r.clone();
-            }
-            if let Some(c) = e.created {
-                v["created"] = json!(c);
-            }
-            v
-        })
-        .collect();
-    let Ok(body) = serde_json::to_string_pretty(&arr) else { return };
-    // SecretFile::write_str is owner-only (0600) and atomic on POSIX, so the
-    // daemon never reads a half-written array.
-    let _ = crate::platform::SecretFile::write_str(&armed_path(), &body);
-}
-
 /// Record that an auth key is outstanding until `expires_at` (absolute unix
-/// seconds). Dedupes by key_id. The mint writes this directly; the daemon's
-/// per-tick arm-gate reads it.
+/// seconds). The store owns the locked read/modify/write of `armed.json`; this
+/// adapter only names the fields the CLI shows.
 pub fn arm(key_id: String, expires_at: u64, meta: ArmMeta) {
-    let mut entries = load();
-    entries.retain(|e| e.key_id != key_id);
-    entries.push(ArmedEntry {
+    let entry = ArmedInvitation {
         key_id,
         expires: expires_at,
         name: meta.name,
@@ -163,8 +82,10 @@ pub fn arm(key_id: String, expires_at: u64, meta: ArmMeta) {
         allow: Some(meta.allow),
         reuse: meta.reuse.as_ref().map(reuse_to_json),
         created: Some(meta.created),
-    });
-    save(&entries);
+    };
+    // The daemon reads armed.json on its next tick; a failed write means the
+    // invitation is not armed, which the mint reports through its own result.
+    let _ = crate::devices_store::store().arm_invitation(entry, crate::identity::now_secs());
 }
 
 /// An invitation that can still be claimed: unexpired, not withdrawn, and
@@ -232,7 +153,7 @@ impl Outstanding {
 /// Pure core of [`outstanding`]: join the armed entries with the durable
 /// ledger and keep what can still be claimed at `now`.
 fn outstanding_from(
-    entries: &[ArmedEntry],
+    entries: &[ArmedInvitation],
     ledger: &[filament_peerloop::recv::store::InvitationLedgerEntry],
     now: u64,
 ) -> Vec<Outstanding> {
@@ -276,8 +197,12 @@ fn outstanding_from(
 /// "withdrawn" or "use limit reached" instead of waiting on a silent room.
 pub fn outstanding() -> Vec<Outstanding> {
     let now = crate::identity::now_secs();
-    let ledger = crate::devices_store::store().invitation_ledger(now);
-    outstanding_from(&load(), &ledger, now)
+    let store = crate::devices_store::store();
+    let ledger = store.invitation_ledger(now);
+    // An unreadable armed file means no invitation is listed; admission still
+    // fails closed on its own, and the owner can see the file is damaged.
+    let entries = store.armed_invitations(now).unwrap_or_default();
+    outstanding_from(&entries, &ledger, now)
 }
 
 /// Which outstanding invitations a selector names: every one with that
@@ -331,9 +256,7 @@ pub fn invitee_name(key_id: &str) -> Option<String> {
 
 /// Drop a key from the armed set (called when it burns, or on explicit disarm).
 pub fn disarm(key_id: &str) {
-    let mut entries = load();
-    entries.retain(|e| e.key_id != key_id);
-    save(&entries);
+    let _ = crate::devices_store::store().disarm_invitation(key_id);
 }
 
 /// Any unexpired armed key? Prunes expired entries on read, so the file self-
@@ -418,8 +341,8 @@ mod outstanding_tests {
     use filament_cap::ephemeral::Reuse;
     use filament_peerloop::recv::store::InvitationLedgerEntry;
 
-    fn entry(key: &str, name: &str, reuse: Option<Value>, expires: u64) -> ArmedEntry {
-        ArmedEntry {
+    fn entry(key: &str, name: &str, reuse: Option<Value>, expires: u64) -> ArmedInvitation {
+        ArmedInvitation {
             key_id: key.repeat(32),
             expires,
             name: Some(name.to_string()),
