@@ -18,7 +18,7 @@ use crate::{
     fmt_short_duration, format_approval_expiry, identity, invite_path_for, mint_capability,
     parse_mint_ttl, prompt_line, resolve_for_kind, ui, write_owner_only_file,
 };
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
