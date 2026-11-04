@@ -24,7 +24,7 @@ use crate::recv::store::{
     sanitize_device_name, DeviceStore, InvitationRefusal, OverlayKey, PRINCIPAL_STATE_LAPSED,
     PRINCIPAL_STATE_REVOKED,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 use filament_cap::ephemeral::{
     EnrollmentPayload, EnrollmentPrincipal, EnrollmentState, Invitation,
@@ -514,6 +514,160 @@ pub fn build_enrolment(
         "persistent": persistent,
     });
     Ok((cert, payload))
+}
+
+/// Persist the certificates and policy a join acknowledgement carried, and
+/// return the name the owner filed this device under.
+///
+/// This is the JOINER's one write path, shared by the CLI and Core. It keeps
+/// every exact bound check the CLI performed:
+///
+/// * a blank identity: no owner key and no local certificate may already exist;
+/// * the acknowledgement may not change the signed ceiling, expiry, offline
+///   budget or persistence;
+/// * the owner name comes from the signed invitation, never the frame;
+/// * the local certificate's device key is this machine's overlay key, its
+///   issuer fingerprint is the invitation's issuer, and it verifies at now;
+/// * the owner certificate verifies AND the invitation signature verifies
+///   against that certificate's user key;
+/// * the reconnect secret is 32 bytes of hex.
+///
+/// The local certificate is written LAST: until every other record is durable
+/// this machine is not a joined device, so a partial failure can be retried
+/// without pretending the join completed. The whole sequence runs under the
+/// same `identity.lock` as owner-key bootstrap, so a blank device cannot race
+/// its own first-run identity into existence between the checks and the write.
+pub fn persist_join_ack(
+    store: &DeviceStore,
+    overlay_pub: &[u8; 32],
+    inv: &Invitation,
+    ack: &Value,
+) -> Result<String> {
+    store.with_identity_lock(|store| {
+        if UserKey::load(&store.keystore())?.is_some() {
+            bail!(
+                "this device already holds an identity key; join only from a clean Tunlion identity"
+            );
+        }
+        if store.local_device_cert_path().exists() {
+            bail!("this device already holds a joined certificate; refusing to overwrite it");
+        }
+        let assigned_name = ack["name"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("join acknowledgement omitted the device name"))?;
+        let owner_name = inv.owner_name.as_str();
+        let secret = ack["secret"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("join acknowledgement omitted the reconnect secret"))?;
+        if hex::decode(secret).map(|bytes| bytes.len()).ok() != Some(32) {
+            bail!("join acknowledgement carried an invalid reconnect secret");
+        }
+        let expires = ack["expires"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("join acknowledgement omitted its expiry"))?;
+        let ceiling = ack["ceiling"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("join acknowledgement omitted its capability ceiling"))?
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("join ceiling contains a non-string capability"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let max_offline = ack["max_offline"].as_u64().ok_or_else(|| {
+            anyhow::anyhow!("join acknowledgement omitted its offline budget ceiling")
+        })?;
+        let persistent = ack["persistent"].as_bool().unwrap_or(false);
+        // An ephemeral device's access ends at its lease, which the owner may
+        // set EARLIER than the invitation's end, never later. A persistent
+        // device's end is the invitation's, exactly. The signed ceiling is the
+        // SCOPED one (`route:<cidr>`), so a route invitation compares equal to
+        // the acknowledgement instead of failing on the bare spelling.
+        let expires_ok = if inv.ephemeral {
+            expires <= inv.expires
+        } else {
+            expires == inv.expires
+        };
+        let expected_ceiling = inv.scoped_caps();
+        if !expires_ok
+            || ceiling != expected_ceiling
+            || max_offline != inv.max_offline
+            || persistent != !inv.ephemeral
+        {
+            bail!(
+                "join acknowledgement changed a signed principal bound (ceiling, expiry, offline budget, or persistence)"
+            );
+        }
+        let local_cert = DeviceCert::from_json(&ack["device_cert"]).ok_or_else(|| {
+            anyhow::anyhow!("join acknowledgement omitted the local device certificate")
+        })?;
+        let owner_cert = DeviceCert::from_json(&ack["owner_cert"]).ok_or_else(|| {
+            anyhow::anyhow!("join acknowledgement omitted the owner certificate")
+        })?;
+        if local_cert.device_pub != *overlay_pub
+            || filament_cap::ephemeral::issuer_fingerprint(&local_cert.user_pub) != inv.issuer_fp
+            || local_cert.expires != expires
+            || local_cert.verify(now_secs()).is_err()
+        {
+            bail!("join acknowledgement carried an invalid local device certificate");
+        }
+        if filament_cap::ephemeral::issuer_fingerprint(&owner_cert.user_pub) != inv.issuer_fp
+            || owner_cert.verify(now_secs()).is_err()
+        {
+            bail!("join acknowledgement carried an invalid owner certificate");
+        }
+        // The certificate says who the owner is; the invitation signature must
+        // agree. Without this a peer could forward a valid certificate beside a
+        // token signed by a different key and have the ceiling stored.
+        if !inv.verify_against_owner(&owner_cert.user_pub) {
+            bail!("join acknowledgement's owner certificate does not verify this invitation");
+        }
+
+        // Verify the owner-signed capability header BEFORE any of it is stored.
+        // `store_owner_cap_header` parses it, requires resource "self" and the
+        // verified owner key, runs the genesis check, and only then applies it.
+        if let Some(hdr) = ack["cap_header"].as_object() {
+            store
+                .store_owner_cap_header(&Value::Object(hdr.clone()), &owner_cert.user_pub)
+                .context("verify owner capability header")?;
+        }
+        // Owner-signed policy ops are verified by the store against the owner
+        // key the acknowledgement just proved.
+        let cap_ops = ack["cap_ops"].as_array().cloned().unwrap_or_default();
+
+        // Durable principal record first: it is the owner-side relationship.
+        store.devices_store_joined_owner(
+            owner_name,
+            secret,
+            &owner_cert,
+            &ceiling,
+            IntroScope::Device.to_byte(),
+        )?;
+        // Fleet rendezvous is optional (an older owner, or a non-persistent
+        // join). Its absence is not a failed join; a malformed value is ignored
+        // exactly as before.
+        if let Some(rv) = ack["fleet_rv"].as_str() {
+            let _ = store.store_fleet_rv(rv);
+        }
+        let owner_store = store.clone().with_owner_pub(Some(owner_cert.user_pub));
+        let _ = owner_store.merge_owner_cap_ops_outcome(&cap_ops);
+        // The local name is presentation; write it before the certificate so a
+        // joined device reports itself by the name the owner filed.
+        store.set_device_name(assigned_name)?;
+        // LOCAL CERTIFICATE LAST. Reaching this line means every bound was
+        // checked and every other record was written.
+        let record = if inv.ephemeral {
+            // The daemon reads this: an ephemeral device departs (and so is
+            // removed at the owner) when it stops, instead of waiting out its
+            // offline budget.
+            json!({ "name": assigned_name, "cert": local_cert.to_json(), "ephemeral": true })
+        } else {
+            json!({ "name": assigned_name, "cert": local_cert.to_json() })
+        };
+        store.write_local_device_cert_record(&record)?;
+        Ok(assigned_name.to_string())
+    })
 }
 
 /// The default lease of an ephemeral device that did not ask for one: the
