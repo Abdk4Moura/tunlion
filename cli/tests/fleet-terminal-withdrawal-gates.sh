@@ -13,7 +13,11 @@ PYV="${TUNLION_TEST_VENV:-python3}"
 # direct-QUIC sibling stall is reported by the fleet-automesh gates that own it,
 # not as a terminal failure here. The session is still authenticated by the
 # daemon-brokered private secret before any open is sent.
+# `TUNLION_DIRECT=0` alone is not enough: a long-lived acceptor forces the
+# direct rung on to avoid glare, so the test-hooks build exposes the explicit
+# no-direct switch this worker binary is built with.
 export TUNLION_DIRECT=0
+export TUNLION_TEST_NO_DIRECT=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fleet-terminal-cut.XXXXXX")"
 DA="$WORK/alpha"
 source "$HERE/lib/fixture.sh"
