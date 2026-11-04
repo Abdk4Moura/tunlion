@@ -43,6 +43,11 @@ init_owner "$DA"
 start_acceptor "$DA"
 OWNER_PID="${FIX_PIDS[-1]}"
 
+# The Core reads only its explicit config directory. Give it the fixture
+# signaling endpoint; the preview needs no network.
+mkdir -p "$DG"
+printf 'server %s\n' "$SERVER" >"$DG/config"
+
 INV="$WORK/guest-invite.txt"
 OUT=$(timeout 45 env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" \
   add --for guest --out "$INV" --yes 2>&1)
