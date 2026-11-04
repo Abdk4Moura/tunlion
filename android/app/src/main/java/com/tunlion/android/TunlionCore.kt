@@ -40,7 +40,15 @@ data class CoreDevice(
     val plainLine: String,
     val canSendFiles: Boolean,
     val canOpenShell: Boolean,
+    val relationship: CoreRelationship = CoreRelationship.UNKNOWN,
+    val expiry: String? = null,
+    val revoked: Boolean = false,
+    val actions: List<CoreAction> = emptyList(),
 ) : java.io.Serializable
+
+enum class CoreRelationship { PAIRED, FLEET, TEMPORARY, UNKNOWN }
+enum class CoreAccessState { AVAILABLE, PENDING, BLOCKED, UNSUPPORTED, UNKNOWN }
+data class CoreAction(val action: String, val state: CoreAccessState, val reason: String) : java.io.Serializable
 
 sealed interface CoreResult {
     data object Success : CoreResult

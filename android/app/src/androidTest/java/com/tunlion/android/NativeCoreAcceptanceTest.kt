@@ -49,8 +49,10 @@ class NativePeerAcceptanceTest {
         val expectedBytes = requireNotNull(args.getString("bytes")).toULong()
         val root = File(instrumentation.targetContext.cacheDir, "native-peer-${UUID.randomUUID()}")
         val inbox = File(root, "inbox").apply { mkdirs() }
+        val config = File(root, "config").apply { mkdirs() }
+        File(config, "config").writeText("server ${args.getString("server", "http://10.0.2.2:8188")}\nname android-native-proof\n")
         try {
-            CoreSession.open(File(root, "config").absolutePath).use { core ->
+            CoreSession.open(config.absolutePath).use { core ->
                 core.beginIdentity().use { core.commitIdentity(it, it.phrase()) }
                 try {
                     val summary = core.receiveCode(code, inbox.absolutePath, true, 90uL)

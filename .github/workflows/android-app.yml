@@ -145,3 +145,51 @@ jobs:
           name: tunlion-android-acceptance
           path: android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
           if-no-files-found: error
+  emulator:
+    name: Native Compose client acceptance
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tunlion-android-debug
+          path: app-apk
+      - uses: actions/download-artifact@v4
+        with:
+          name: tunlion-android-acceptance
+          path: test-apk
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install signaling fixture dependencies
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: app-native-peer-${{ hashFiles('Cargo.lock') }}
+      - name: Build desktop reference peer only
+        run: cargo build --release --locked -p tunlion --bin tunlion
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          script: bash android/acceptance/native_app.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-native-client-acceptance-results
+          path: android/acceptance/results
+          if-no-files-found: warn

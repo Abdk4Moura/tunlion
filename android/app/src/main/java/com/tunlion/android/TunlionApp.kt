@@ -73,9 +73,14 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
     val scope = rememberCoroutineScope()
     val colors = MaterialTheme.colorScheme
     val context = androidx.compose.ui.platform.LocalContext.current
+    var notificationsEnabled by remember { mutableStateOf(androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val enginePhase by EngineState.phase.collectAsState()
     var operation by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
-    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        notificationsEnabled = granted
+        if (!granted) notice = "Notifications are off. Foreground work can still run, but Android 13+ shows its notice in Task Manager rather than the notification drawer."
+    }
     fun requestNotifications() {
         if (android.os.Build.VERSION.SDK_INT >= 33 && androidx.core.content.ContextCompat.checkSelfPermission(context,
                 android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
@@ -94,6 +99,7 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
     LaunchedEffect(core, lifecycle) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
+                notificationsEnabled = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()
                 if (!busy) try { status = core.refresh(); loadFailed = false }
                 catch (cancelled: CancellationException) { throw cancelled }
                 catch (error: Exception) {
@@ -219,6 +225,9 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                                 else { if (turnOn) requestNotifications(); perform({ if (turnOn) core.start() else core.stop() }) }
                             })
                             status.engineError?.let { SecondaryText(it) }
+                            if (enginePhase == EnginePhase.FAILED) {
+                                OutlinedButton(onClick = { perform({ core.stop() }) }, enabled = !busy) { Text("Confirm receiver is off") }
+                            }
                             if (status.fingerprint == null && status.devices.isEmpty()) {
                                 FirstConnection(onJoin = { navigate(Screen.PAIR) }, onSetup = { navigate(Screen.SETUP) })
                             } else {
@@ -228,7 +237,7 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                                 }
                                 if (status.devices.isEmpty()) {
                                     Text("No other devices yet.", style = MaterialTheme.typography.titleMedium)
-                                    SecondaryText("Native device discovery and enrollment are not connected yet. File codes work without adding a device.")
+                                    SecondaryText("No stored device relationships. Fleet discovery and enrollment are not connected yet. File codes work without adding a device.")
                                 }
                                 status.devices.forEach { device ->
                                     key(device.id) { DeviceRow(device) { selectedDevice = device; navigate(Screen.DEVICE) } }
@@ -279,7 +288,10 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                             onConnect = { navigate(Screen.PAIR) }, onPickDevice = { device ->
                                 selectedDevice = device; navigate(Screen.SEND)
                             })
-                        Screen.DEVICE -> selectedDevice?.let { device ->
+                        Screen.DEVICE -> selectedDevice?.let { selected ->
+                            val device = status.devices.firstOrNull { it.id == selected.id }
+                            if (device == null) SecondaryText("This device is no longer in the current core snapshot. Return to Devices and refresh.")
+                            else
                             DeviceDetails(device, onSend = { navigate(Screen.SEND) })
                         }
                         Screen.SEND -> SendScreen(selectedDevice, busy) { files, onCode ->
@@ -290,6 +302,12 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                             Eyebrow("THIS PHONE")
                             DetailRow("Name", status.deviceName ?: android.os.Build.MODEL)
                             DetailRow("Identity", status.fingerprint ?: "Not set up")
+                            DetailRow("Notifications", if (notificationsEnabled) "Allowed" else "Off in Android settings")
+                            if (!notificationsEnabled) SecondaryText("Transfer and availability notices may not appear in the notification drawer. Android 13+ still lists foreground services in Task Manager.")
+                            OutlinedButton(onClick = {
+                                context.startActivity(android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                    .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName))
+                            }) { Text("Notification settings") }
                             if (android.os.Build.VERSION.SDK_INT < 29) ReceiveFolderSetting()
                             HorizontalDivider(color = colors.outline)
                             Eyebrow("EXPERIMENTAL")
@@ -485,7 +503,7 @@ private fun ReceiveFolderSetting() {
                 check(androidx.documentfile.provider.DocumentFile.fromTreeUri(context, uri)?.canWrite() == true)
                 context.getSharedPreferences("received_files", android.content.Context.MODE_PRIVATE).edit().putString("folder", uri.toString()).apply()
                 scope.launch {
-                    try { withContext(Dispatchers.IO) { NativeTunlionCore.get(context).receivedFiles().publish() }; message = "Receiving folder saved." }
+                    try { withContext(Dispatchers.IO) { NativeTunlionCore.get(context).publishInbox() }; message = "Receiving folder saved." }
                     catch (_: Exception) { message = "The folder is saved, but an inbox file could not be published yet." }
                 }
             } catch (_: Exception) { message = "Choose a folder this app can write to." }
@@ -506,6 +524,7 @@ private fun DeviceRow(device: CoreDevice, onClick: () -> Unit) {
             Text(device.name, fontWeight = FontWeight.Medium,
                 color = if (device.online == true) colors.onBackground else colors.onSurfaceVariant)
             SecondaryText(when (device.online) { true -> "Online"; false -> "Offline"; null -> "Availability unknown" })
+            if (device.actions.isNotEmpty()) SecondaryText(relationshipLabel(device.relationship) + if (device.revoked) " · revoked locally" else "")
         }
         if (device.online == true && device.route != null) {
             Text(if (device.route == "relayed") "RELAYED" else if (device.route == "direct") "DIRECT" else "",
@@ -521,13 +540,53 @@ private fun DeviceRow(device: CoreDevice, onClick: () -> Unit) {
 @Composable
 private fun DeviceDetails(device: CoreDevice, onSend: () -> Unit) {
     SecondaryText(when (device.online) { true -> "Online"; false -> "Offline"; null -> "Availability unknown" })
+    DetailRow("Relationship", relationshipLabel(device.relationship))
+    device.expiry?.let { DetailRow("Expiry recorded by core", it) }
+    if (device.revoked) SecondaryText("Revoked on this receiver. This does not acknowledge remote removal or termination of every active session.")
     Eyebrow("ACCESS")
     SecondaryText(device.plainLine)
+    if (device.actions.isNotEmpty()) {
+        val effective = device.actions.filter { it.state == CoreAccessState.AVAILABLE }
+        Eyebrow("EFFECTIVE SUPPORTED ACTIONS")
+        if (effective.isEmpty()) SecondaryText("No action is confirmed effective by this snapshot.")
+        effective.forEach { DetailRow(actionLabel(it.action), it.reason) }
+        val pending = device.actions.filter { it.state == CoreAccessState.PENDING }
+        if (pending.isNotEmpty()) {
+            Eyebrow("PENDING")
+            pending.forEach { DetailRow(actionLabel(it.action), it.reason) }
+        }
+        val unavailable = device.actions.filter { it.state != CoreAccessState.AVAILABLE && it.state != CoreAccessState.PENDING }
+        if (unavailable.isNotEmpty()) {
+            Eyebrow("BLOCKED, UNKNOWN OR UNSUPPORTED")
+            unavailable.forEach {
+                DetailRow(actionLabel(it.action) + " · " + when (it.state) {
+                    CoreAccessState.BLOCKED -> "Blocked"
+                    CoreAccessState.UNSUPPORTED -> "Unsupported"
+                    else -> "Unknown"
+                }, it.reason)
+            }
+        }
+    }
     SecondaryText("Only actions confirmed effective by the core appear here. Missing terminal, folder, permission editing and removal actions are not supported in this build.")
     SecondaryText("Revoking a capability and cutting a device are different operations. Offline acknowledgment and active-session termination are not available here. Withdrawing an owner grant must not be assumed to close an existing session.")
     if (device.route == "relayed") SecondaryText("On relay, not a direct link. Still end-to-end encrypted.")
     if (device.canSendFiles) PrimaryButton("Send a file", onClick = onSend)
     if (device.canOpenShell) SecondaryText("Shell access granted. The terminal is not connected in this preview.")
+}
+
+private fun relationshipLabel(relationship: CoreRelationship) = when (relationship) {
+    CoreRelationship.PAIRED -> "Paired device"
+    CoreRelationship.FLEET -> "Fleet device"
+    CoreRelationship.TEMPORARY -> "Temporary worker"
+    CoreRelationship.UNKNOWN -> "Relationship unknown"
+}
+
+private fun actionLabel(action: String) = when (action) {
+    "send" -> "Send files to this device"
+    "receive-inbox" -> "This device sending to this phone's inbox"
+    "terminal" -> "This phone serving a terminal"
+    "folder" -> "This phone exposing folders"
+    else -> action
 }
 
 @Composable

@@ -33,9 +33,9 @@ class AvailabilityService : Service() {
             EngineState.phase.value = EnginePhase.STOPPING
             scope.launch {
                 try {
-                    receiver?.cancel()
                     core.stopReceiver()
-                    receiver?.join()
+                    receiver?.cancelAndJoin()
+                    EngineState.error = null
                     EngineState.phase.value = EnginePhase.OFF
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
@@ -56,8 +56,8 @@ class AvailabilityService : Service() {
                 getSystemService(NotificationManager::class.java).notify(1001, notification("Available for inbox transfers"))
                 while (isActive) {
                     check(core.receiverState() == NativeEngineState.RUNNING)
-                    try { core.receivedFiles().publish() }
-                    catch (_: Exception) { EngineState.error = "A verified file remains in the private inbox. Check storage and receiving-folder access, then retry from Files." }
+                    try { core.publishInbox() }
+                    catch (_: java.io.IOException) { /* The adapter exposes the storage error without replacing engine state. */ }
                     delay(2_000)
                 }
             } catch (cancelled: CancellationException) { throw cancelled }
@@ -67,7 +67,11 @@ class AvailabilityService : Service() {
                 getSystemService(NotificationManager::class.java).notify(1001, notification("Receiver needs attention. Open Tunlion."))
             } finally {
                 withContext(NonCancellable) {
-                    try { core.stopReceiver() }
+                    try {
+                        core.stopReceiver()
+                        if (EngineState.phase.value == EnginePhase.AVAILABLE || EngineState.phase.value == EnginePhase.STARTING)
+                            EngineState.phase.value = EnginePhase.OFF
+                    }
                     catch (_: Exception) {
                         EngineState.phase.value = EnginePhase.FAILED
                         EngineState.error = "The native receiver has not confirmed stopping. Turn availability off again."

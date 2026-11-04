@@ -34,20 +34,26 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     private val worker = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val transfer = Mutex()
     private var pending: PendingIdentity? = null
+    @Volatile private var publicationError: String? = null
     @Volatile private var cached = CoreStatus(deviceName = Build.MODEL)
     override fun status() = cached
 
     internal fun receivedFiles() = ReceivedFiles(context, config, inbox)
+    internal suspend fun publishInbox(): List<String> = try {
+        receivedFiles().publish().also { publicationError = null }
+    } catch (error: Exception) {
+        publicationError = "A received file remains in the private inbox. Check free space and receiving-folder access, then reopen Files to retry."
+        throw java.io.IOException("Could not publish verified inbox files", error)
+    }
 
     override suspend fun refresh(): CoreStatus = withContext(Dispatchers.IO) {
         val snapshot = session.status()
         val history = receivedFiles()
-        try { history.publish() }
-        catch (_: Exception) { EngineState.error = "A verified file remains in the private inbox. Check free space and receiving-folder access, then reopen Files to retry." }
+        try { publishInbox() } catch (_: java.io.IOException) { /* The publication error is included in this snapshot. */ }
         cached = CoreStatus(identityLoaded = true, deviceName = Build.MODEL,
             fingerprint = snapshot.fingerprint, engineLinked = true,
             engineRunning = EngineState.phase.value == EnginePhase.AVAILABLE && snapshot.engine == NativeEngineState.RUNNING,
-            engineError = EngineState.error,
+            engineError = EngineState.error ?: publicationError,
             transfers = history.records().takeLast(20).reversed().map {
                 CoreTransfer(it.optString("file"), it.optString("direction") == "in", it.optBoolean("ok"), history.saved(it))
             })
@@ -73,9 +79,19 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     override suspend fun start(): CoreResult = guarded {
         if (transfer.isLocked) return@guarded CoreResult.Failure(CoreErrorKind.DENIED, "Wait for the transfer to finish before turning availability on.")
         if (EngineState.phase.value == EnginePhase.AVAILABLE) return@guarded CoreResult.Success
+        if (EngineState.phase.value != EnginePhase.OFF) return@guarded CoreResult.Failure(CoreErrorKind.DENIED,
+            "Confirm the receiver is off before restarting it.")
         EngineState.phase.value = EnginePhase.STARTING
-        ContextCompat.startForegroundService(context, Intent(context, AvailabilityService::class.java))
-        EngineState.phase.first { it == EnginePhase.AVAILABLE || it == EnginePhase.FAILED }
+        try {
+            ContextCompat.startForegroundService(context, Intent(context, AvailabilityService::class.java))
+            EngineState.phase.first { it == EnginePhase.AVAILABLE || it == EnginePhase.FAILED || it == EnginePhase.OFF }
+        } catch (cancelled: CancellationException) {
+            withContext(NonCancellable) { stop() }
+            throw cancelled
+        } catch (error: Exception) {
+            EngineState.phase.value = EnginePhase.FAILED
+            throw error
+        }
         if (EngineState.phase.value == EnginePhase.AVAILABLE) CoreResult.Success
         else CoreResult.Failure(CoreErrorKind.INTERNAL, EngineState.error ?: "The receiver could not start.")
     }
@@ -83,6 +99,7 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     override suspend fun stop(): CoreResult = guarded {
         if (EngineState.phase.value == EnginePhase.OFF) {
             withContext(Dispatchers.IO) { session.stop() }
+            EngineState.error = null
             return@guarded CoreResult.Success
         }
         EngineState.phase.value = EnginePhase.STOPPING
@@ -103,9 +120,15 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
 
     override suspend fun receiveCode(code: String): CoreResult = runTransfer {
         val summary = session.receiveCode(code, inbox.absolutePath, true, 300uL)
-        receivedFiles().publish()
+        val receipts = receivedFiles().records()
+        if (summary.stored.any { stored -> receipts.none { record ->
+                record.optString("stored") == File(inbox, stored.storedName).absolutePath &&
+                    record.optString("sha256").equals(stored.sha256, ignoreCase = true) && record.optBoolean("ok")
+            } }) return@runTransfer CoreResult.Failure(CoreErrorKind.LOCAL_RESOURCE,
+            "Files arrived in the private inbox, but their durable receipt is unavailable. They have not been exported. Do not clear app storage.")
+        publishInbox()
         if (summary.refused.isNotEmpty()) CoreResult.Failure(CoreErrorKind.PARTIAL,
-            "${summary.stored.size} saved privately; ${summary.refused.size} refused. " + summary.refused.joinToString { it.message })
+            "${summary.stored.size} received; ${summary.refused.size} refused. " + summary.refused.joinToString { it.message })
         else CoreResult.Success
     }
 
@@ -150,7 +173,7 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     /** Blocking FFI owns its files until it returns. Cancellation calls core.stop on another thread. */
     private suspend fun runTransfer(action: suspend () -> CoreResult): CoreResult {
         if (!transfer.tryLock()) return CoreResult.Failure(CoreErrorKind.DENIED, "A transfer is still running or stopping.")
-        if (EngineState.phase.value != EnginePhase.OFF && EngineState.phase.value != EnginePhase.FAILED) {
+        if (EngineState.phase.value != EnginePhase.OFF) {
             transfer.unlock()
             return CoreResult.Failure(CoreErrorKind.DENIED, "Turn availability off before a code transfer. The core currently supports one engine at a time.")
         }
