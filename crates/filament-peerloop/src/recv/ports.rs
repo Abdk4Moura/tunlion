@@ -564,7 +564,7 @@ pub(crate) mod test_support {
         }
         async fn resend_identity_challenge(
             &self,
-            _: &Conn,
+            _: &Arc<dyn Transport>,
             _: &str,
             _: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
         ) -> bool {
