@@ -541,6 +541,20 @@ pub struct DeviceStore {
 mod receive_history_tests {
     use super::*;
 
+    struct TestRoot(PathBuf);
+    impl TestRoot {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("receive-history-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &Path { &self.0 }
+    }
+    impl Drop for TestRoot {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
     fn receipt(index: u64) -> crate::recv::files::ReceivedFileRecord {
         crate::recv::files::ReceivedFileRecord {
             time: index, peer: Some("sender".into()), file: "offered.txt".into(),
@@ -551,7 +565,7 @@ mod receive_history_tests {
 
     #[test]
     fn verified_receive_facts_are_bounded_and_preserve_stored_name_and_digest() {
-        let root = tempfile::tempdir().unwrap();
+        let root = TestRoot::new();
         let store = DeviceStore::open(root.path());
         assert!(!root.path().join("transfers.json").exists());
         for index in 0..201 { store.record_received_file(&receipt(index)).unwrap(); }
@@ -567,7 +581,7 @@ mod receive_history_tests {
 
     #[test]
     fn corrupt_history_is_preserved_and_error_is_not_a_successful_receipt() {
-        let root = tempfile::tempdir().unwrap();
+        let root = TestRoot::new();
         let path = root.path().join("transfers.json");
         std::fs::write(&path, "[").unwrap();
         assert!(DeviceStore::open(root.path()).record_received_file(&receipt(1)).is_err());

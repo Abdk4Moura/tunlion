@@ -65,7 +65,9 @@ fn project(record: &Value, store: &DeviceStore, now: u64) -> Result<DeviceAccess
         || record["invitedAs"].as_str() == Some("runner");
     let relationship = if temporary {
         DeviceRelationship::Temporary
-    } else if cert.as_ref().is_some_and(|cert| cert.verify(now).is_ok()
+    // Verify historical issuer provenance separately from current permission:
+    // an expired personal device remains personal, but access below is blocked.
+    } else if cert.as_ref().is_some_and(|cert| cert.verify(0).is_ok()
         && Some(cert.user_pub) == store.owner_pub_for_resources(None))
         && record["principalKind"].as_str() != Some("delegated") {
         DeviceRelationship::Fleet
@@ -132,5 +134,18 @@ mod tests {
         let core = Core::open(root.path()).unwrap();
         std::fs::write(root.path().join("devices.json"), "[").unwrap();
         assert!(core.devices().is_err());
+    }
+
+    #[test]
+    fn expired_personal_device_keeps_relationship_but_not_access() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DeviceStore::open(root.path());
+        store.ensure_identity_on_mutation().unwrap();
+        let owner = filament_id::UserKey::load(&store.keystore()).unwrap().unwrap();
+        let cert = DeviceCert::certify(&owner, [7; 32], 1, 1).unwrap();
+        let record = json!({"name":"old-laptop", "deviceCert":cert.to_json()});
+        let device = project(&record, &store, 3).unwrap();
+        assert_eq!(device.relationship, DeviceRelationship::Fleet);
+        assert_eq!(device.actions[1].state, AccessState::Blocked);
     }
 }
