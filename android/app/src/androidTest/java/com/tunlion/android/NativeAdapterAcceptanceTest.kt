@@ -37,6 +37,8 @@ class NativeAdapterAcceptanceTest {
             val record = core.refresh().transfers.single { it.incoming && it.name == expectedName }
             assertTrue("Core receipt must establish verification", record.verified)
             assertTrue("Verified bytes must be published, not merely left in private storage", record.saved)
+            assertTrue("Verified publication must produce its completion notification",
+                context.getSystemService(NotificationManager::class.java).activeNotifications.any { it.id == 1002 })
             context.contentResolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
                 arrayOf(MediaStore.MediaColumns._ID),
                 "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} = ?",

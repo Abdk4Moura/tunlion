@@ -39,11 +39,23 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     override fun status() = cached
 
     internal fun receivedFiles() = ReceivedFiles(context, config, inbox)
-    internal suspend fun publishInbox(): List<String> = try {
-        receivedFiles().publish().also { publicationError = null }
-    } catch (error: Exception) {
-        publicationError = "A received file remains in the private inbox. Check free space and receiving-folder access, then reopen Files to retry."
-        throw java.io.IOException("Could not publish verified inbox files", error)
+    internal suspend fun publishInbox(): List<String> {
+        val published = try {
+            receivedFiles().publish().also { publicationError = null }
+        } catch (error: Exception) {
+            publicationError = "A received file remains in the private inbox. Check free space and receiving-folder access, then reopen Files to retry."
+            throw java.io.IOException("Could not publish verified inbox files", error)
+        }
+        if (published.isNotEmpty() && androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()) {
+            val manager = context.getSystemService(android.app.NotificationManager::class.java)
+            manager.createNotificationChannel(android.app.NotificationChannel("received", "Received files", android.app.NotificationManager.IMPORTANCE_DEFAULT))
+            val open = android.app.PendingIntent.getActivity(context, 0, Intent(context, MainActivity::class.java),
+                android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT)
+            manager.notify(1002, androidx.core.app.NotificationCompat.Builder(context, "received")
+                .setSmallIcon(R.drawable.ic_tunlion).setContentTitle("Files received and verified")
+                .setContentText(published.joinToString()).setContentIntent(open).setAutoCancel(true).build())
+        }
+        return published
     }
 
     override suspend fun refresh(): CoreStatus = withContext(Dispatchers.IO) {
