@@ -41,6 +41,7 @@ use filament_transfer::{
     pwrite_at, record_range, safe_incoming_name, 
 };
 mod fleet_enrollment;
+mod enrollment_review;
 mod fleet_renewal;
 mod exit_route;
 mod exec_recv;

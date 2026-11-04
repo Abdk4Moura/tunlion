@@ -43,7 +43,7 @@ pub const MAX_REUSE: u32 = 250;
 /// What the owner intends the invitation to add.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvitationKind {
-    /// The owner's own device: fleet membership with mount by default.
+    /// The owner's own device: fleet membership, inbox transfer by default.
     Device,
     /// Another person: transfer by default, no fleet membership.
     Person,
@@ -85,9 +85,8 @@ pub struct InvitationRequest {
     pub owner_name: String,
     pub invitee_name: Option<String>,
     pub kind: InvitationKind,
-    /// Empty means the kind's current default (device: transfer+mount,
-    /// person: transfer, runner: transfer). An empty default is deliberately
-    /// not changed here; see `default_capabilities`.
+    /// Empty means the kind's current default (inbox transfer only).
+    /// Mount is an explicit opt-in; see `default_capabilities`.
     pub capabilities: Vec<String>,
     /// A relative lifetime in seconds, measured from the mint.
     pub expires_secs: u64,
@@ -137,12 +136,14 @@ impl MintedInvitation {
     }
 }
 
-/// The current default ceiling for a kind. The device default stays
-/// transfer+mount until one shared core-policy change says otherwise.
+/// The current default ceiling for a kind. The device default is inbox
+/// transfer only; mount is an explicit opt-in. Existing enrolled devices keep
+/// the ceiling they already hold.
 pub fn default_capabilities(kind: InvitationKind) -> Vec<String> {
     match kind {
-        InvitationKind::Device => vec!["transfer".into(), "mount".into()],
-        InvitationKind::Person | InvitationKind::Runner => vec!["transfer".into()],
+        InvitationKind::Device | InvitationKind::Person | InvitationKind::Runner => {
+            vec!["transfer".into()]
+        }
     }
 }
 
@@ -524,13 +525,10 @@ mod tests {
     }
 
     #[test]
-    fn the_device_default_is_still_transfer_and_mount() {
+    fn the_device_default_is_inbox_transfer_only() {
         let preview = preview_request(&request(InvitationKind::Device), 100).unwrap();
-        assert_eq!(
-            preview.capabilities,
-            vec!["mount".to_string(), "transfer".to_string()]
-        );
-        assert!(preview.review.requests("mount"));
+        assert_eq!(preview.capabilities, vec!["transfer".to_string()]);
+        assert!(!preview.review.requests("mount"));
         assert!(!preview.review.requests("shell"));
     }
 

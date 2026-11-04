@@ -129,16 +129,19 @@ pub(crate) async fn add_for_cmd(
     // because owner-equivalent access to a stranger should stay a deliberate
     // flag rather than a menu item one keypress away.
     let mut interactive_shell = false;
+    let mut interactive_mount = false;
     // Prefixes pulled out of `--allow route:<cidr>`; empty for every other kind
     // of invitation, which keeps those tokens byte-identical v2.
     let mut route_prefixes: Vec<String> = Vec::new();
     if allow.is_empty() && kind == "device" && caps.interactive {
         let choices = vec![
+            "Send files only  (DEFAULT)".to_string(),
             "Send files, and mount my folders".to_string(),
             "...and open a terminal here  (OWNER-EQUIVALENT)".to_string(),
         ];
         match codeentry::pick("WHAT THIS DEVICE MAY DO", &choices)? {
-            Some(1) => interactive_shell = true,
+            Some(1) => interactive_mount = true,
+            Some(2) => interactive_shell = true,
             Some(_) => {}
             None => return Err(cancelled()),
         }
@@ -184,7 +187,10 @@ pub(crate) async fn add_for_cmd(
             // --allow, deliberately, the same as for anyone else.
             vec!["transfer".to_string()]
         } else if kind == "device" {
-            let mut c = vec!["transfer".to_string(), "mount".to_string()];
+            let mut c = vec!["transfer".to_string()];
+            if interactive_mount {
+                c.push("mount".to_string());
+            }
             if interactive_shell {
                 c.push("shell".to_string());
             }
@@ -255,7 +261,6 @@ pub(crate) async fn add_for_cmd(
             .join("\n")
         );
     }
-    let owner_key = crate::identity_flow::ensure_user_key(caps.json)?;
     // ONE MINT POLICY. TTL bounds, reuse bounds, route scoping, the owner
     // name, the deliberate shell/all-ports confirmation and the signed
     // artifact itself are all decided by `filament_peerloop::invitation`, which
@@ -272,6 +277,9 @@ pub(crate) async fn add_for_cmd(
         routes: route_prefixes.clone(),
         confirm_remote_authority,
     };
+    let preview = filament_peerloop::invitation::preview_request(&request, identity::now_secs())?;
+    crate::enrollment_review::show(preview.relationship, &preview.capabilities);
+    let owner_key = crate::identity_flow::ensure_user_key(caps.json)?;
     let minted = filament_peerloop::invitation::mint_armed(
         &crate::devices_store::store(),
         owner_key.keypair(),

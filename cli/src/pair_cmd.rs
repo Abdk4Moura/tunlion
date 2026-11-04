@@ -760,7 +760,9 @@ pub(crate) fn invitation_not_a_code_msg() -> String {
 /// device. Shell is owner-equivalent and stays a deliberate `--allow ...shell`,
 /// because pairing alone never yields a shell.
 pub(crate) fn default_device_ceiling() -> Vec<String> {
-    vec!["transfer".to_string(), "mount".to_string()]
+    // The shared invitation default is inbox transfer only. Mount is an
+    // explicit opt-in; existing enrolled devices keep the ceiling they have.
+    vec!["transfer".to_string()]
 }
 
 /// `--expires` for the spoken-code path, parsed and bounded exactly like the
@@ -1069,6 +1071,10 @@ async fn pair_with_purpose(
         ui::say(&note);
     }
     if internal {
+        if code.is_none() {
+            let requested = if posture.is_empty() { default_device_ceiling() } else { posture.clone() };
+            crate::enrollment_review::show(identity::enrollment::Relationship::OwnDevice, &requested);
+        }
         // Action-first setup: use the existing atomic, owner-only key store.
         // Guided cancellation and invalid input above cannot mint an identity.
         crate::identity_flow::ensure_user_key(false)?;

@@ -2612,15 +2612,13 @@ fn clean_joiner_dir(h: &Harness, name: &str) -> PathBuf {
     dir
 }
 
-/// `add --for device` and `add --for person` mint different SIGNED ceilings:
-/// device carries transfer+mount, person carries transfer only. The difference
+/// The default SIGNED ceiling for every invitation kind is inbox transfer
+/// only. Mount is an explicit `--allow transfer,mount` opt-in; the difference
 /// lives in the signed auth-key caps, which is exactly what the delegated-
-/// ceiling gate (`cap_gate_effective`'s `action in auth_key_caps` check) enforces
-/// at serve time. So the difference is enforced, not just displayed: a
-/// person-joined device is denied `mount` because `mount` is not in its signed
-/// caps.
+/// ceiling gate (`cap_gate_effective`'s `action in auth_key_caps` check)
+/// enforces at serve time.
 #[test]
-fn add_for_device_and_person_carry_different_caps() {
+fn add_for_default_is_transfer_only_and_mount_needs_an_opt_in() {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use filament_cap::ephemeral::Invitation;
@@ -2631,6 +2629,7 @@ fn add_for_device_and_person_carry_different_caps() {
 
     let device_file = h.work_dir.join("inv-device.txt");
     let person_file = h.work_dir.join("inv-person.txt");
+    let device_mount_file = h.work_dir.join("inv-device-mount.txt");
 
     for (for_, file) in [("device", &device_file), ("person", &person_file)] {
         let out = Command::new(&bin)
@@ -2667,19 +2666,41 @@ fn add_for_device_and_person_carry_different_caps() {
             .expect("from_token")
     };
 
-    let mut device_caps = parse(&device_file).caps;
-    device_caps.sort();
-    assert_eq!(
-        device_caps,
-        vec!["mount".to_string(), "transfer".to_string()],
-        "device invitation must carry transfer+mount in the SIGNED ceiling"
+    for file in [&device_file, &person_file] {
+        assert_eq!(
+            parse(file).caps,
+            vec!["transfer".to_string()],
+            "the default invitation ceiling is inbox transfer only"
+        );
+    }
+
+    let out = Command::new(&bin)
+        .env("TUNLION_CONFIG_DIR", &h.a_dir)
+        .args([
+            "--server",
+            &server,
+            "add",
+            "--for",
+            "device",
+            "--allow",
+            "transfer,mount",
+            "--out",
+        ])
+        .arg(&device_mount_file)
+        .arg("--yes")
+        .output()
+        .expect("explicit mount mint");
+    assert!(
+        out.status.success(),
+        "explicit mount mint failed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let person_caps = parse(&person_file).caps;
+    let mut mount_caps = parse(&device_mount_file).caps;
+    mount_caps.sort();
     assert_eq!(
-        person_caps,
-        vec!["transfer".to_string()],
-        "person invitation must carry transfer only: the mount difference is \
-         what the gate enforces for a person-joined device"
+        mount_caps,
+        vec!["mount".to_string(), "transfer".to_string()],
+        "mount is carried only when the caller opts in"
     );
 }
 
