@@ -750,6 +750,10 @@ impl DeviceStore {
     /// Persist a receiver completion fact, not a file-existence observation.
     /// Uses the same bounded JSON schema and stable writer sidecar as CLI
     /// history. A corrupt journal is preserved and reported, never overwritten.
+    /// This is a dispatch-path writer: the reduced peerloop profile has no
+    /// `recv::files` type to accept, so the method is compiled only with
+    /// `dispatch` instead of breaking the feature boundary.
+    #[cfg(feature = "dispatch")]
     pub fn record_received_file(&self, record: &crate::recv::files::ReceivedFileRecord) -> io::Result<()> {
         create_private_dir_all(&self.root)?;
         let path = self.root.join("transfers.json");
