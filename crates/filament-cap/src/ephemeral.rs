@@ -388,6 +388,14 @@ pub struct Invitation {
 /// A byte that does not match is refused rather than guessed at.
 const INV_FORMAT: u8 = 0x03;
 
+/// Invitation token prefixes. These are PROTOCOL LITERALS: released builds
+/// mint and parse exactly these bytes, and a find-and-replace must not move
+/// them. They live beside the parser so a second parser cannot grow an
+/// independent idea of what an invitation starts with.
+pub const INVITE_PREFIX: &str = "filament-invite:";
+pub const INVITE_PREFIX_V1: &str = "filament-invite:v1:";
+pub const INVITE_PREFIX_V2: &str = "filament-invite:v2:";
+
 const INV_CAP_TRANSFER: u8 = 1 << 0;
 const INV_CAP_MOUNT: u8 = 1 << 1;
 const INV_CAP_SHELL: u8 = 1 << 2;
@@ -465,6 +473,22 @@ fn inv_reuse_from_byte(b: u8) -> Reuse {
         0 => Reuse::Once,
         255 => Reuse::Reusable,
         n => Reuse::N(n as u32),
+    }
+}
+
+/// Normalise a capability name for an INVITATION ceiling.
+///
+/// The invitation wire has bits for `all-ports`, and `write` is the released
+/// spelling for folder writes. `canonical_capability` deliberately knows only
+/// the cap-store action vocabulary, so using it here refused an invitation
+/// that named `all-ports` even though the encoder could carry it. The mapping
+/// is kept in this one function so the mint and the preview cannot disagree.
+pub fn canonical_invitation_capability(name: &str) -> Result<String> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "send" => Ok("transfer".to_string()),
+        "write" => Ok("mount".to_string()),
+        "all-ports" => Ok("all-ports".to_string()),
+        other => super::capability::canonical_capability(other),
     }
 }
 
@@ -551,7 +575,7 @@ impl Invitation {
         owner_name: String,
         routes: Vec<String>,
     ) -> Result<Self> {
-        let caps = caps.iter().map(|c| super::capability::canonical_capability(c)).collect::<Result<Vec<_>>>()?;
+        let caps = caps.iter().map(|c| canonical_invitation_capability(c)).collect::<Result<Vec<_>>>()?;
         // A route ceiling MUST name its prefixes, and prefixes without the
         // capability are meaningless. Before this, `route` in a ceiling carried
         // no scope at all, so it authorised every prefix the member chose to
@@ -778,6 +802,26 @@ impl Invitation {
         pubkey.verify(&prefix, &self.sig).is_ok()
     }
 
+    /// The signed ceiling as the rest of the system names it: a bare `route`
+    /// is expanded to one `route:<cidr>` per signed prefix.
+    ///
+    /// This is the ONLY conversion from the invitation's on-wire shape to the
+    /// capability vocabulary downstream, so a join acknowledgement, a stored
+    /// device record and a displayed ceiling cannot disagree about whether the
+    /// invitation carried `route` or `route:10.0.0.0/24`.
+    pub fn scoped_caps(&self) -> Vec<String> {
+        self.caps
+            .iter()
+            .flat_map(|c| {
+                if c == super::capability::CAP_ROUTE {
+                    self.routes.iter().map(|r| format!("route:{r}")).collect::<Vec<_>>()
+                } else {
+                    vec![c.clone()]
+                }
+            })
+            .collect()
+    }
+
     /// Reconstruct a full AuthKey for the verifying owner (its own issuer),
     /// for the daemon's principal registration. The signature is the compact
     /// token's (a different domain than the legacy canonical); nothing re-verifies
@@ -790,17 +834,7 @@ impl Invitation {
         // everything downstream, so scoping here means the ceiling that gets
         // stored, displayed and enforced all say which prefix without any of
         // them needing a second field to look up.
-        let caps = self
-            .caps
-            .iter()
-            .flat_map(|c| {
-                if c == super::capability::CAP_ROUTE {
-                    self.routes.iter().map(|r| format!("route:{r}")).collect::<Vec<_>>()
-                } else {
-                    vec![c.clone()]
-                }
-            })
-            .collect();
+        let caps = self.scoped_caps();
         AuthKey {
             issuer: *owner_pub,
             enroll_pub: self.enroll_pub,
@@ -815,6 +849,37 @@ impl Invitation {
             version: 2,
         }
     }
+}
+
+/// Parse the TEXT form of an invitation: one of the three released prefixes
+/// around a base64url v2 token. Returns the token with the possession seed,
+/// so this is the JOINER's parser; the verifier must use [`Invitation::from_payload`]
+/// after decoding the payload field.
+///
+/// It does NOT verify the owner signature: the token carries only the owner
+/// fingerprint, not the owner key. A joiner binds the owner through the join
+/// acknowledgement's certificate, whose fingerprint must match this token.
+pub fn parse_invitation(raw: &str) -> Result<Invitation> {
+    use base64::Engine;
+    let token = raw.trim();
+    if token.starts_with(INVITE_PREFIX_V1) {
+        bail!(
+            "this invitation uses the pre-0.8.4 format; ask the owner to mint a new one with `tunlion add --for`"
+        );
+    }
+    let encoded = token
+        .strip_prefix(INVITE_PREFIX_V2)
+        .or_else(|| token.strip_prefix(INVITE_PREFIX))
+        .ok_or_else(|| {
+            anyhow!(
+                "invitation has an unknown format: an invitation starts with `{INVITE_PREFIX}`"
+            )
+        })?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| anyhow!("invitation is not valid base64url"))?;
+    Invitation::from_token(bytes.as_slice())
+        .ok_or_else(|| anyhow!("invitation payload is not a valid v2 invitation"))
 }
 
 impl serde::Serialize for Reuse {
@@ -2326,5 +2391,74 @@ mod owned_enrollment_state_tests {
             state.burn_auth_key_at(&k, &Reuse::N(3), 0).unwrap();
         }
         assert!(state.burn_auth_key_at(&k, &Reuse::N(3), 0).is_err());
+    }
+
+    #[test]
+    fn invitation_text_prefixes_round_trip_and_v1_is_named() {
+        use base64::Engine;
+        let owner = gen_keypair();
+        let inv = mint_v2(&owner);
+        let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_token());
+        for text in [
+            format!("{INVITE_PREFIX_V2}{body}"),
+            format!("{INVITE_PREFIX}{body}"),
+            format!("  {INVITE_PREFIX_V2}{body}\n"),
+        ] {
+            let parsed = parse_invitation(&text).expect("released prefix parses");
+            assert_eq!(parsed.enroll_pub, inv.enroll_pub);
+            assert_eq!(parsed.issuer_fp, inv.issuer_fp);
+        }
+        let err = parse_invitation("filament-invite:v1:AAAA").unwrap_err().to_string();
+        assert!(err.contains("pre-0.8.4"), "{err}");
+        let err = parse_invitation("brave-otter-3141").unwrap_err().to_string();
+        assert!(err.contains("filament-invite:"), "{err}");
+    }
+
+    #[test]
+    fn a_route_ceiling_has_one_scoped_spelling() {
+        let owner = gen_keypair();
+        let inv = Invitation::mint(
+            &owner,
+            [7u8; 32],
+            vec!["transfer".into(), "route".into()],
+            1_800_000_000,
+            600,
+            Reuse::Once,
+            false,
+            "alice".into(),
+            vec!["10.2.0.0/16".into(), "fd00::/64".into()],
+        )
+        .unwrap();
+        assert_eq!(inv.caps, vec!["transfer".to_string(), "route".to_string()]);
+        assert_eq!(
+            inv.scoped_caps(),
+            vec![
+                "transfer".to_string(),
+                "route:10.2.0.0/16".to_string(),
+                "route:fd00::/64".to_string()
+            ]
+        );
+        assert_eq!(inv.to_auth_key(&owner_pub(&owner)).caps, inv.scoped_caps());
+    }
+
+    #[test]
+    fn an_invitation_ceiling_accepts_the_released_capability_aliases() {
+        let owner = gen_keypair();
+        let inv = Invitation::mint(
+            &owner,
+            [8u8; 32],
+            vec!["send".into(), "write".into(), "all-ports".into()],
+            1_800_000_000,
+            600,
+            Reuse::Once,
+            false,
+            "alice".into(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            inv.caps,
+            vec!["transfer".to_string(), "mount".to_string(), "all-ports".to_string()]
+        );
     }
 }
