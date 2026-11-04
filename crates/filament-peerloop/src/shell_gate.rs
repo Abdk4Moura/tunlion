@@ -231,6 +231,7 @@ pub struct TerminalSessionScope {
     sibling: bool,
     pair_binding: Option<String>,
     require_name_key: bool,
+    identity_state: filament_cap::capability::IdentityState,
 }
 
 impl TerminalSessionScope {
@@ -249,6 +250,7 @@ impl TerminalSessionScope {
             sibling: conn.link(pid).is_some_and(|l| l.is_sibling_link() && l.fleet_proven()),
             pair_binding: conn.link(pid).and_then(|l| l.device_secret()).map(str::to_owned),
             require_name_key,
+            identity_state: inputs.identity_state,
         }
     }
 
@@ -303,6 +305,7 @@ impl TerminalSessionScope {
             cert_revoked: host.cert_revoked_for(self.device.as_ref()),
             action: "shell".into(),
             ceiling_covers: host.ceiling_covers_action(self.device.as_ref(), "shell"),
+            identity_state: self.identity_state,
             scoped_default: false,
         };
         decide(&inputs, host).is_err()
