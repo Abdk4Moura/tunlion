@@ -6382,7 +6382,8 @@ async fn recv_run(
                 // #30: respond to identity nonce challenge by producing a
                 // possession_sig (0x02) over the peer-provided nonce. The
                 // challenger verifies and upgrades our binding to Proven.
-                #[cfg(feature = "mesh")]
+                // Receive identity is not a mesh-only feature: the reduced
+                // dispatch profile needs it to settle code-transfer identity.
                 Some("identity-nonce-challenge") => {
                     // #30: shared responder (also used by send_cmd) proves
                     // device-key possession so the challenger upgrades us to Proven.
@@ -6399,7 +6400,7 @@ async fn recv_run(
                 }
                 // #30: received possession-sig from peer after our challenge.
                 // Verify, upgrade binding to Proven so capability gates pass.
-                #[cfg(feature = "mesh")]
+                // Needed by the dispatch-only Core profile, not just mesh.
                 Some("identity-expose") => {
                     log.debug(&format!("identity-expose received on {pid}"));
                     if ports.identity.handle_identity_expose(
