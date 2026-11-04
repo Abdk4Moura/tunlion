@@ -869,11 +869,21 @@ pub(crate) async fn bring_up_to_known(
             // daemon holds up that end: it brokers only over a link with a
             // Proven identity binding (`warm_link_for`), never on presence, so a
             // stranger on the fleet channel cannot obtain one.
-            let brokered = if crate::fleet_indexed_name(peer_name) && crate::fleet::rv().is_some() {
-                crate::ctl::try_fleet_rendezvous(peer_name).await
-            } else {
-                None
-            };
+            // A zombie warm link can make the daemon's first broker attempt
+            // fail (it drops the link and needs a moment to re-verify a fresh
+            // one). Retry briefly before giving up: falling back to the shared
+            // fleet secret is not equivalent, because a fleet-secret WebRTC
+            // link cannot carry the certificate binding this path requires.
+            let mut brokered = None;
+            if crate::fleet_indexed_name(peer_name) && crate::fleet::rv().is_some() {
+                for _ in 0..4 {
+                    brokered = crate::ctl::try_fleet_rendezvous(peer_name).await;
+                    if brokered.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                }
+            }
             match brokered {
                 Some(sec) => {
                     crate::ui::debug(&format!(

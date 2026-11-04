@@ -4231,6 +4231,13 @@ async fn recv_run(
                     // exists to stop.
                     bind_ours.remove(&pid);
                     bind_theirs.remove(&pid);
+                    // A zombie drop must be repaired now, not at the next 10s
+                    // warm-hold tick: a control request (a brokered rendezvous,
+                    // a warm exec) can arrive in between and find no verified
+                    // link, forcing the caller onto a path that cannot prove
+                    // this peer's certificate.
+                    let auto_warm = l3.is_some() || host.settings_get_bool("auto-warm");
+                    let _ = conn.warm_hold_tick(auto_warm).await;
                 }
             }
             Ev::PairMatched(v) => {
