@@ -1,4 +1,5 @@
 //! User identity layer: SSH-CA shaped user-key over device-certs.
+pub mod enrollment;
 use anyhow::{anyhow, bail, Context, Result};
 use bip39::{Language, Mnemonic};
 use hkdf::Hkdf;
