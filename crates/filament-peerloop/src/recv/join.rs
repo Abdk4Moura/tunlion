@@ -237,14 +237,17 @@ async fn run(
     let seed = invitation.enroll_private_key;
     let enroll_chan = enroll_channel_fp(&invitation.issuer_fp);
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let signaling = filament_transport::net::connect_signaling_owned(
+    // Match the CLI command loop exactly: the pre-existing compatibility
+    // adapter detaches the signaling forwarder into this call's event channel.
+    // The join is one-shot and owns its socket through the client; there is no
+    // long-lived engine here that needs a separate joinable signaling task.
+    let sio = filament_transport::net::connect_signaling(
         &transport_context,
         &request.server,
         tx.clone(),
     )
     .await
     .map_err(|e| JoinFailure::Signaling(format!("signaling: {e}")))?;
-    let sio = signaling.client().clone();
 
     let mut sess = Session::new(&request.proposed_name, &uid());
     sess.room = Some(format!("enrollup-{}", crate::secret::fresh_secret()));
