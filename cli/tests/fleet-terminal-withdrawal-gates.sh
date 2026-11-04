@@ -63,14 +63,14 @@ wait_terminal_path() {
     done
     fleet_indexed "$node" || return 1
     for attempt in 1 2 3; do
-        if timeout 20 as_node "$node" exec charlie -- true \
-            >"$WORK/$node-preflight.out" 2>"$WORK/$node-preflight.err"
-        then
+        fs_bounded 20 as_node "$node" exec charlie -- true \
+            >"$WORK/$node-preflight.log" 2>&1
+        if [ "$(fs_state)" = ok ] && [ "$(fs_rc)" = 0 ]; then
             ok "$node: terminal path to charlie answered before controls"
             return 0
         fi
         # Authority refusals are not a readiness race: report them at once.
-        if grep -qiE 'refus|denied|no grant|ceiling|not authorized' "$WORK/$node-preflight.err"; then
+        if grep -qiE 'refus|denied|no grant|ceiling|not authorized' "$WORK/$node-preflight.log"; then
             return 1
         fi
         sleep 1
@@ -110,7 +110,7 @@ diagnose() {
         echo "--- source"; cat "$SOURCE_HASHES" 2>/dev/null
         echo "--- work directory"; ls -la "$WORK" 2>/dev/null
         echo "--- per-process output"
-        for f in "$WORK"/*.err "$WORK"/*.out "$WORK"/*-reach.json "$WORK"/*-reach.err; do
+        for f in "$WORK"/*.err "$WORK"/*.out "$WORK"/*-preflight.log "$WORK"/*-reach.json "$WORK"/*-reach.err; do
             [ -f "$f" ] || continue
             echo "### ${f##*/}"; tail -80 "$f"
         done
