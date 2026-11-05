@@ -810,9 +810,15 @@ impl RecvDaemon for CliRecv {
     }
     async fn reach_ping(&mut self, conn: &Conn, pid: &str, v: &Value) {
         if let Some(t) = conn.transport_of(pid) {
-            let _ = t
+            let result = t
                 .send_control(&filament_peerloop::daemon_ctl::liveness_pong(v))
                 .await;
+            self.log.debug(&format!(
+                "reach-pong send pid={pid} source={:?} result={result:?}",
+                t.source_id(),
+            ));
+        } else {
+            self.log.debug(&format!("reach-pong not sent pid={pid}: no current transport"));
         }
     }
     async fn reach_pong(&mut self, conn: &Conn, pid: &str, v: &Value) {
@@ -820,7 +826,11 @@ impl RecvDaemon for CliRecv {
         // link. Never the display/roster name: a pong may only wake the probe
         // for the peer that link actually reaches.
         let peer = conn.link_peer_name(pid);
-        self.liveness.answered(peer.as_deref(), pid, v);
+        let answered = self.liveness.answered(peer.as_deref(), pid, v);
+        self.log.debug(&format!(
+            "reach-pong receive pid={pid} peer={peer:?} matched={answered} outstanding={}",
+            self.liveness.outstanding(),
+        ));
     }
     fn peer_present(&self, alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool {
         crate::link_manager::peer_present(alive, direct, heard_ms, idle_ms)
