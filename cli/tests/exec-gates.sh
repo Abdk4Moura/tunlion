@@ -525,40 +525,6 @@ else
   echo "SKIP gateQ1/Q2: the parent-death signal and /proc process checks are Linux"
 fi
 
-# ===================================================================== GATE R ==
-# FORGET ENDS EXEC, AS AN IDENTITY REFUSAL. Found by the blind acceptance run:
-# after `devices forget bravo`, bravo's exec printed "tunnel up to 'alpha'" and
-# alpha refused with "shell serving is off", a fix that cannot apply to a
-# device alpha no longer knows. Positive control first (granted, exec runs),
-# then the forget, then the same exec: refused within seconds, exit 4
-# (denied), naming the identity, with no "tunnel up" claim and nothing run.
-say R
-env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxa shell >"$WORK/grantR.log" 2>&1
-OUTR0=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$ECHO_BIN" BEFORE-FORGET 2>"$WORK/R0.err" </dev/null)
-rcR0=$?
-cp "$DB/devices.json" "$WORK/devices.before-forget.json"
-env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" devices forget boxa -y >"$WORK/forgetR.log" 2>&1
-rcRF=$?
-sleep 3
-t0=$(date +%s)
-OUTR=$(timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$ECHO_BIN" SHOULD-NOT-RUN 2>"$WORK/R.err" </dev/null)
-rcR=$?
-elR=$(( $(date +%s) - t0 ))
-echo "## (before forget) rc=$rcR0 out='$OUTR0'; (forget) rc=$rcRF; (after forget) rc=$rcR in ${elR}s out='$OUTR'"
-if [ "$rcR0" = "0" ] && [ "$OUTR0" = "BEFORE-FORGET" ] && [ "$rcRF" = "0" ] \
-   && [ "$rcR" = "4" ] && [ "$elR" -lt 20 ] \
-   && ! echo "$OUTR" | grep -q "SHOULD-NOT-RUN" \
-   && grep -q "not recognized" "$WORK/R.err" \
-   && ! grep -qi "tunnel up\|serving is off\|tunlion grant" "$WORK/R.err"; then
-  ok "gateR: after forget, exec was refused as an unrecognized device in ${elR}s (exit 4, no tunnel claim, nothing ran)"
-else
-  echo "-- R0.err --"; cat "$WORK/R0.err"; echo "-- forgetR.log --"; cat "$WORK/forgetR.log"
-  echo "-- R.err --"; cat "$WORK/R.err"; tail -15 "$WORK/up-Q.log" 2>/dev/null
-  bad "gateR: a forgotten device's exec was not refused as unrecognized (before rc=$rcR0, after rc=$rcR in ${elR}s)"
-fi
-# Gate L below re-uses boxb's pairing with boxa.
-cp "$WORK/devices.before-forget.json" "$DB/devices.json"
-
 # ================================================================ GATE W1-W6 ==
 # WARM REUSE, as a REAL two-process path: an `up` daemon on A holds the link,
 # and a separate `exec` process rides it over the Unix control socket. These
@@ -773,6 +739,42 @@ PY
     bad "gateW6: deferred wait line timing/erase was not observed on a PTY"
   fi
 fi
+
+# Forget runs after warm controls: restoring devices.json does not undo the
+# live daemon's revocation state, and must not reauthorize a forgotten secret.
+# ===================================================================== GATE R ==
+# FORGET ENDS EXEC, AS AN IDENTITY REFUSAL. Found by the blind acceptance run:
+# after `devices forget bravo`, bravo's exec printed "tunnel up to 'alpha'" and
+# alpha refused with "shell serving is off", a fix that cannot apply to a
+# device alpha no longer knows. Positive control first (granted, exec runs),
+# then the forget, then the same exec: refused within seconds, exit 4
+# (denied), naming the identity, with no "tunnel up" claim and nothing run.
+say R
+env TUNLION_CONFIG_DIR="$DB" "$BIN" grant boxa shell >"$WORK/grantR.log" 2>&1
+OUTR0=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$ECHO_BIN" BEFORE-FORGET 2>"$WORK/R0.err" </dev/null)
+rcR0=$?
+cp "$DB/devices.json" "$WORK/devices.before-forget.json"
+env TUNLION_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" devices forget boxa -y >"$WORK/forgetR.log" 2>&1
+rcRF=$?
+sleep 3
+t0=$(date +%s)
+OUTR=$(timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxb -- "$ECHO_BIN" SHOULD-NOT-RUN 2>"$WORK/R.err" </dev/null)
+rcR=$?
+elR=$(( $(date +%s) - t0 ))
+echo "## (before forget) rc=$rcR0 out='$OUTR0'; (forget) rc=$rcRF; (after forget) rc=$rcR in ${elR}s out='$OUTR'"
+if [ "$rcR0" = "0" ] && [ "$OUTR0" = "BEFORE-FORGET" ] && [ "$rcRF" = "0" ] \
+   && [ "$rcR" = "4" ] && [ "$elR" -lt 20 ] \
+   && ! echo "$OUTR" | grep -q "SHOULD-NOT-RUN" \
+   && grep -q "not recognized" "$WORK/R.err" \
+   && ! grep -qi "tunnel up\|serving is off\|tunlion grant" "$WORK/R.err"; then
+   ok "gateR: after forget, exec was refused as an unrecognized device in ${elR}s (exit 4, no tunnel claim, nothing ran)"
+else
+   echo "-- R0.err --"; cat "$WORK/R0.err"; echo "-- forgetR.log --"; cat "$WORK/forgetR.log"
+   echo "-- R.err --"; cat "$WORK/R.err"; tail -15 "$WORK/up-Q.log" 2>/dev/null
+   bad "gateR: a forgotten device's exec was not refused as unrecognized (before rc=$rcR0, after rc=$rcR in ${elR}s)"
+fi
+# Gate L below re-uses boxb's pairing with boxa.
+cp "$WORK/devices.before-forget.json" "$DB/devices.json"
 
 # ===================================================================== GATE L ==
 # --shell-user REACHES EXEC: a ROOT acceptor started with `--shell-user nobody`
