@@ -686,7 +686,7 @@ mod terminal_lifecycle_tests {
         scope.trusted = true;
         scope.device = None;
         scope.identity_state = IdentityState::Pending;
-        assert_eq!(scope.evaluate(&host), Err(Some("identity-not-proven".into())));
+        assert!(scope.withdrawn(&host), "unresolved identity must not retain shell access");
     }
 
     #[test]
