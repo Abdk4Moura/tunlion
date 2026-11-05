@@ -529,6 +529,7 @@ fn decide_with_legacy(
     legacy_ok: bool,
     host: &dyn HostServices,
 ) -> Result<(), Option<String>> {
+    require_shell_identity(inputs.identity_state, inputs.idev.as_ref())?;
     // Two auto-trust classes travel separately: `scoped_default` (mode
     // independent, pre-existing) and `ceiling_covers` (authoritative-only
     // for the decision; counted as would-allow in shadow so the ceiling
@@ -555,6 +556,19 @@ fn decide_with_legacy(
         GateDecision::Allow => Ok(()),
         GateDecision::Deny { cap_reason } => Err(cap_reason),
     }
+}
+
+/// Pair-secret trust does not settle the identity needed for certificate
+/// revocation. Refuse before capability evaluation until that identity exists;
+/// anonymous consent is transfer-only, never authority for a shell.
+pub fn require_shell_identity(
+    state: filament_cap::capability::IdentityState,
+    device_pub: Option<&[u8; 32]>,
+) -> Result<(), Option<String>> {
+    if state != filament_cap::capability::IdentityState::Resolved || device_pub.is_none() {
+        return Err(Some("identity-not-proven".to_string()));
+    }
+    Ok(())
 }
 
 /// Exec-open's entry point: delegates to the shared core (no local logic).
@@ -614,6 +628,7 @@ mod terminal_lifecycle_tests {
             self.0.lock().unwrap().denies.contains(name)
         }
         fn cap_gate_effective(&self, gate: CapGate<'_>) -> GateDecision {
+            assert!(require_shell_identity(gate.identity_state, gate.device_pub).is_ok());
             if gate.legacy_allowed && !gate.denied && !gate.cert_revoked {
                 GateDecision::Allow
             } else {
@@ -647,6 +662,31 @@ mod terminal_lifecycle_tests {
         host.0.lock().unwrap().denies.insert("alice".into());
         assert!(alice.withdrawn(&host));
         assert!(!bob.withdrawn(&host));
+    }
+
+    #[test]
+    fn unresolved_shell_identity_is_refused_before_legacy_authorization() {
+        use filament_cap::capability::IdentityState;
+        let key = [1; 32];
+        for state in [IdentityState::Pending, IdentityState::ExplicitlyUnavailableAnonymous] {
+            for device_pub in [None, Some(&key)] {
+                assert_eq!(
+                    require_shell_identity(state, device_pub),
+                    Err(Some("identity-not-proven".into()))
+                );
+            }
+        }
+        assert!(require_shell_identity(IdentityState::Resolved, None).is_err());
+        assert!(require_shell_identity(IdentityState::Resolved, Some(&key)).is_ok());
+
+        let host = Host::default();
+        host.0.lock().unwrap().owner_grants.insert(key);
+        host.0.lock().unwrap().local_grants.insert("alice".into());
+        let mut scope = sibling("alice", 1);
+        scope.trusted = true;
+        scope.device = None;
+        scope.identity_state = IdentityState::Pending;
+        assert_eq!(scope.evaluate(&host), Err(Some("identity-not-proven".into())));
     }
 
     #[test]

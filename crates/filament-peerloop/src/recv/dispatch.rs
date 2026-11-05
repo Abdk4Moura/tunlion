@@ -6986,7 +6986,12 @@ async fn recv_run(
                                 .as_deref()
                                 .map(|n| host.device_capability_denied(n, "shell"))
                                 .unwrap_or(false);
-                            host.cap_gate_effective(CapGate {
+                            match crate::shell_gate::require_shell_identity(
+                                conn.identity_state_of(&pid),
+                                idev,
+                            ) {
+                                Err(cap_reason) => cap::GateDecision::Deny { cap_reason },
+                                Ok(()) => host.cap_gate_effective(CapGate {
                                 legacy_allowed: legacy_ok,
                                 outcome: &outcome,
                                 action: cap::CAP_SHELL,
@@ -7003,7 +7008,8 @@ async fn recv_run(
                                 identity_state: conn.identity_state_of(&pid),
                                 denied,
                                 ceiling_authorizes: false,
-                            })
+                            }),
+                            }
                         }
                     };
                     if !granted.allowed() {
