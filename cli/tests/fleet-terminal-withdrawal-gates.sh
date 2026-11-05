@@ -199,8 +199,10 @@ PY
     control_child=$(cat "$WORK/$mode-control.child")
     # A healthy owner-granted terminal must survive the existing 5s recheck.
     sleep 6
-    kill -0 "$match_child" 2>/dev/null && kill -0 "$control_child" 2>/dev/null \
-        || fixture_die "$mode: healthy terminal falsely ended at recheck"
+    if ! kill -0 "$match_child" 2>/dev/null || ! kill -0 "$control_child" 2>/dev/null; then
+        diagnose "$mode: healthy terminal falsely ended at recheck"
+        fixture_die "$mode: healthy terminal falsely ended at recheck"
+    fi
     ok "$mode: both authenticated owner-granted terminal trees survive recheck"
     as_node alpha revoke bravo shell --on charlie >"$WORK/$mode-withdraw.log" 2>&1 \
         || fixture_die "$mode: owner withdrawal failed"

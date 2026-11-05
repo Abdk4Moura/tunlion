@@ -234,10 +234,24 @@ pub struct TerminalSessionScope {
     identity_state: filament_cap::capability::IdentityState,
 }
 
+fn terminal_pair_binding(sibling: bool, secret: Option<&str>) -> Option<String> {
+    // A sibling's transport may have used the shared rendezvous secret. It
+    // is not a device pair record and cannot be rechecked as one.
+    if sibling {
+        return None;
+    }
+    secret.map(str::to_owned)
+}
+
 impl TerminalSessionScope {
     pub fn capture(conn: &mut Conn, pid: &str, policy: &ShellPolicy) -> Self {
         let (name, inputs) = gather_shell_gate_inputs(conn, pid, policy, "shell");
         let require_name_key = name.as_deref().is_some_and(|name| conn.host.device_cert_for(name).is_some());
+        let sibling = conn.link(pid).is_some_and(|l| l.is_sibling_link() && l.fleet_proven());
+        let pair_binding = terminal_pair_binding(
+            sibling,
+            conn.link(pid).and_then(|l| l.device_secret()),
+        );
         Self {
             name,
             device: inputs.idev,
@@ -247,8 +261,8 @@ impl TerminalSessionScope {
             key_caps: inputs.ak_caps,
             trusted: inputs.trusted,
             policy_allows: inputs.policy_allows,
-            sibling: conn.link(pid).is_some_and(|l| l.is_sibling_link() && l.fleet_proven()),
-            pair_binding: conn.link(pid).and_then(|l| l.device_secret()).map(str::to_owned),
+            sibling,
+            pair_binding,
             require_name_key,
             identity_state: inputs.identity_state,
         }
@@ -633,6 +647,20 @@ mod terminal_lifecycle_tests {
         host.0.lock().unwrap().denies.insert("alice".into());
         assert!(alice.withdrawn(&host));
         assert!(!bob.withdrawn(&host));
+    }
+
+    #[test]
+    fn fleet_rendezvous_is_not_rechecked_as_a_device_pair_record() {
+        let host = Host::default();
+        let mut scope = sibling("alice", 1);
+        scope.pair_binding = terminal_pair_binding(true, Some("fleet-rendezvous"));
+        assert!(scope.pair_binding.is_none());
+        host.0.lock().unwrap().owner_grants.insert([1; 32]);
+        assert!(host.devices_load().is_empty());
+        assert!(!scope.withdrawn(&host), "a held owner grant must survive the recheck");
+        host.0.lock().unwrap().owner_grants.remove(&[1; 32]);
+        assert!(scope.withdrawn(&host), "withdrawal must still end the terminal");
+        assert_eq!(terminal_pair_binding(false, Some("paired-device")), Some("paired-device".into()));
     }
 
     #[test]
