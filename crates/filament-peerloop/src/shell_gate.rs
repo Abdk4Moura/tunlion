@@ -237,12 +237,18 @@ impl CertlessPair {
     }
 
     fn from_link(conn: &Conn, pid: &str) -> Option<Self> {
+        if conn.link(pid)?.identity_state == filament_cap::capability::IdentityState::ExplicitlyUnavailableAnonymous {
+            return None;
+        }
+        Self::authenticated_binding(conn, pid)
+    }
+
+    fn authenticated_binding(conn: &Conn, pid: &str) -> Option<Self> {
         let link = conn.link(pid)?;
         if !link.trusted
             || link.identity_device_pub.is_some()
             || link.identity_user_pub.is_some()
             || !matches!(link.principal_kind, PrincipalKind::OwnerDevice)
-            || link.identity_state == filament_cap::capability::IdentityState::ExplicitlyUnavailableAnonymous
         {
             return None;
         }
@@ -271,6 +277,29 @@ pub struct TerminalSessionScope {
     pair_binding: Option<String>,
     require_name_key: bool,
     identity_state: filament_cap::capability::IdentityState,
+}
+
+/// An unavailable certificate does not erase a separately proven pair. Recover
+/// only from exact, current-store pair evidence, never from consent or timeout.
+pub(crate) fn preserve_authenticated_pair(conn: &mut Conn, pid: &str) -> bool {
+    if CertlessPair::authenticated_binding(conn, pid).is_none() {
+        return false;
+    }
+    if let Some(link) = conn.link_mut(pid) {
+        link.identity_state = pair_identity_state(link.identity_state, true);
+    }
+    true
+}
+
+fn pair_identity_state(
+    state: filament_cap::capability::IdentityState,
+    authenticated_pair: bool,
+) -> filament_cap::capability::IdentityState {
+    use filament_cap::capability::IdentityState;
+    if authenticated_pair && state == IdentityState::ExplicitlyUnavailableAnonymous {
+        return IdentityState::Pending;
+    }
+    state
 }
 
 fn terminal_pair_binding(sibling: bool, secret: Option<&str>) -> Option<String> {
@@ -757,6 +786,16 @@ mod terminal_lifecycle_tests {
         scope.device = None;
         scope.identity_state = IdentityState::Pending;
         assert!(scope.withdrawn(&host), "unresolved identity must not retain shell access");
+    }
+
+    #[test]
+    fn unavailable_certificate_does_not_erase_an_independently_authenticated_pair() {
+        use filament_cap::capability::IdentityState;
+        let anonymous = IdentityState::ExplicitlyUnavailableAnonymous;
+        assert_eq!(pair_identity_state(anonymous, false), anonymous);
+        assert_eq!(pair_identity_state(anonymous, true), IdentityState::Pending);
+        assert_eq!(pair_identity_state(IdentityState::Resolved, true), IdentityState::Resolved);
+        assert!(require_shell_identity(pair_identity_state(anonymous, true), None).is_err());
     }
 
     fn legacy_pair_scope() -> TerminalSessionScope {

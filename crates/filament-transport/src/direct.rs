@@ -1062,7 +1062,7 @@ fn keep_endpoint_alive(ep: Endpoint, conn: &quinn::Connection) {
     tokio::spawn(async move {
         c.closed().await;
         #[cfg(debug_assertions)]
-        eprintln!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?}: connection closed, dropping endpoint");
+        crate::hooks::trace(&format!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?}: connection closed, dropping endpoint"));
         drop(ep);
     });
 }
@@ -1163,8 +1163,8 @@ impl Drop for DirectTransport {
     fn drop(&mut self) {
         let ep_info = self.ep.as_ref().map(|e| format!("ep={:?}", e.local_addr())).unwrap_or_else(|| "ep=None".to_string());
         #[cfg(debug_assertions)]
-        eprintln!("[DROP] DirectTransport stable_id={} answerer={} {ep_info} close_reason={:?}",
-            self.conn.stable_id(), self.answerer, self.conn.close_reason());
+        crate::hooks::trace(&format!("[DROP] DirectTransport stable_id={} answerer={} {ep_info} close_reason={:?}",
+            self.conn.stable_id(), self.answerer, self.conn.close_reason()));
     }
 }
 
@@ -2376,14 +2376,14 @@ pub async fn race_connect_labeled(
         tokio::spawn(async move {
             conn2.closed().await;
             #[cfg(debug_assertions)]
-            eprintln!("[KEEP-EP-DROP] endpoint for primary conn_stable={} ep={:?}",
-                conn2.stable_id(), endpoint.local_addr());
+            crate::hooks::trace(&format!("[KEEP-EP-DROP] endpoint for primary conn_stable={} ep={:?}",
+                conn2.stable_id(), endpoint.local_addr()));
             drop(endpoint);
         });
     }
     let conn_id = conn.stable_id();
     #[cfg(debug_assertions)]
-    eprintln!("[PRIMARY-MADE] conn_stable={conn_id} answerer={answerer}");
+    crate::hooks::trace(&format!("[PRIMARY-MADE] conn_stable={conn_id} answerer={answerer}"));
     // Unread: the caller announces it (DirectReady) and only then does the
     // reader start, so no frame from the peer can be queued ahead of it.
     Some(make_transport_unread(

@@ -6357,8 +6357,9 @@ async fn recv_run(
                         daemon,
                     );
                     if ours && consented_peer {
+                        let paired = crate::shell_gate::preserve_authenticated_pair(&mut conn, &pid);
                         let anonymous = conn.link(&pid).is_some_and(|l| {
-                            l.identity_state != cap::IdentityState::Resolved
+                            !paired && l.identity_state != cap::IdentityState::Resolved
                         });
                         identity_nonces.remove(&pid);
                         st.pending_proven.lock().unwrap().remove(&pid);
@@ -7420,6 +7421,7 @@ async fn recv_run(
                             l.expected_secret = Some((n.clone(), secret.clone()));
                             crate::identity::resolve_peer_identity(l);
                         }
+                        crate::shell_gate::preserve_authenticated_pair(&mut conn, &pid);
                         // #39: identity just RESOLVED on the WebRTC/relay path — verified_name
                         // is set above and resolve_peer_identity populated device_pub. This is
                         // the resolution point for NON-direct links (ChannelReady fired before
