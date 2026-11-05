@@ -784,6 +784,21 @@ fn selected_event(ev: Ev, source: Option<net::SourceId>) -> Option<Ev> {
     }
 }
 
+/// Read replies from the selected transport without accepting late frames
+/// from a losing candidate. Exec and SSH bootstrap use the same source gate
+/// as the L2 pump, including while waiting for their first acknowledgment.
+pub(crate) async fn recv_selected_event(
+    rx: &mut mpsc::UnboundedReceiver<Ev>,
+    source: Option<net::SourceId>,
+) -> Option<Ev> {
+    while let Some(ev) = rx.recv().await {
+        if let Some(ev) = selected_event(ev, source) {
+            return Some(ev);
+        }
+    }
+    None
+}
+
 async fn verify_fleet_identity_inner(
     t: &Arc<dyn Transport>,
     rx: &mut mpsc::UnboundedReceiver<Ev>,
@@ -4959,7 +4974,7 @@ async fn shell_bootstrap(
                  `tunlion up`, the shell acceptor may be off there (`tunlion up --shell`)."
             ));
         }
-        match tokio::time::timeout(remaining, rx.recv()).await {
+        match tokio::time::timeout(remaining, recv_selected_event(&mut rx, t.source_id())).await {
             Ok(Some(Ev::Control(_pid, v))) => match v["type"].as_str() {
                 // #30: the acceptor challenges us to prove device-key possession
                 // before it decides the shell gate. Answer it (shared responder)
@@ -6238,6 +6253,31 @@ mod h1_tests {
             ),
             Some(Ev::Control(..))
         ));
+    }
+
+    #[tokio::test]
+    async fn selected_reply_reader_accepts_exec_and_bootstrap_replies_not_stale_closes() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let selected = net::SourceId::next();
+        let stale = net::SourceId::next();
+        for kind in ["exec-open-ack", "shell-bootstrap-ack", "exec-close"] {
+            tx.send(Ev::Sourced {
+                pid: "peer".into(),
+                source: stale,
+                inner: Box::new(Ev::Control("peer".into(), json!({"type": "l2-close"}))),
+            }).unwrap();
+            tx.send(Ev::Sourced {
+                pid: "peer".into(),
+                source: selected,
+                inner: Box::new(Ev::Control("peer".into(), json!({"type": kind}))),
+            }).unwrap();
+            match recv_selected_event(&mut rx, Some(selected)).await {
+                Some(Ev::Control(_, value)) => assert_eq!(value["type"], kind),
+                other => panic!("selected reply was not delivered: {other:?}"),
+            }
+        }
+        drop(tx);
+        assert!(recv_selected_event(&mut rx, Some(selected)).await.is_none());
     }
 
     /// `push_ring` keeps the buffer bounded by `cap`, evicting the OLDEST bytes,
