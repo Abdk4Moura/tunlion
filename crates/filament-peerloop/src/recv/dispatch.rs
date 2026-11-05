@@ -6925,92 +6925,14 @@ async fn recv_run(
                             continue;
                         }
                     }
-                    let (trusted, fleet_proven) = conn
-                        .link(&pid)
-                        .map(|l| (l.trusted, l.fleet_proven()))
-                        .unwrap_or((false, false));
-                    // Cap lookup keys on the PROVEN petname, not the presence name.
-                    let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
-                    // Granted if the device was explicitly `grant`ed shell OR an
-                    // active `up --shell[-only]` policy auto-allows it. Trust
-                    // (pair-proof) is still required for the grant; the policy
-                    // also accepts a proven fleet link to the same PAIRED
-                    // record, which is what the direct dial proves (see
-                    // `shell_gate::policy_trusted`).
-                    let legacy_ok = dev
-                        .as_deref()
-                        .map(|n| {
-                            !host.device_capability_denied(n, "shell")
-                                && ((crate::shell_gate::policy_trusted(
-                                    trusted,
-                                    fleet_proven,
-                                    n,
-                                    host.as_ref(),
-                                ) && shell_policy.auto_allows(n))
-                                    || (trusted && host.device_allows(n, "shell")))
-                        })
-                        .unwrap_or(false);
-                    // Capability layer evaluated unconditionally (shadow samples the
-                    // legacy-allowed population); legacy stands in shadow, cap gates
-                    // under TUNLION_CAP_AUTHORITATIVE.
-                    let granted = {
-                        let az = crate::shell_gate::peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-                        let store = host.cap_store();
-                        let now = host.now_secs();
-                        let outcome = cap::authorize_in(
-                            &store,
-                            "self",
-                            cap::CAP_SHELL,
-                            idev,
-                            iusr,
-                            ak_caps,
-                            now,
-                        );
-                        {
-                            let (own_user, has_grant) = cap::fleet_inputs_in(
-                                &store,
-                                "self",
-                                cap::CAP_SHELL,
-                                idev,
-                                iusr,
-                                ak_caps,
-                                now,
-                            );
-                            // Deliberate tier: `shell` is never a scoped default, so a
-                            // same-owner device gets it ONLY via an explicit grant
-                            // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
-                            // The explicit deny travels too: denied short-circuits
-                            // fleet auto-trust, matching the legacy fold above.
-                            let denied = dev
-                                .as_deref()
-                                .map(|n| host.device_capability_denied(n, "shell"))
-                                .unwrap_or(false);
-                            match crate::shell_gate::require_shell_identity(
-                                conn.identity_state_of(&pid),
-                                idev,
-                            ) {
-                                Err(cap_reason) => cap::GateDecision::Deny { cap_reason },
-                                Ok(()) => host.cap_gate_effective(CapGate {
-                                legacy_allowed: legacy_ok,
-                                outcome: &outcome,
-                                action: cap::CAP_SHELL,
-                                resource: "self",
-                                device_pub: idev,
-                                user_pub: iusr,
-                                binding,
-                                cert_expires: expires,
-                                auth_key_caps: ak_caps,
-                                own_user_pub: own_user.as_ref(),
-                                scoped_in_bounds: false,
-                                has_explicit_grant: has_grant,
-                                cert_revoked,
-                                identity_state: conn.identity_state_of(&pid),
-                                denied,
-                                ceiling_authorizes: false,
-                            }),
-                            }
-                        }
+                    // Bootstrap asks the same core gate as exec, PTY and the
+                    // certificate signer, including authenticated legacy pairs.
+                    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(
+                        &mut conn, &pid, &shell_policy, cap::CAP_SHELL,
+                    );
+                    let granted = match crate::shell_gate::ssh_gate_decision(&inputs, host.as_ref()) {
+                        Ok(()) => cap::GateDecision::Allow,
+                        Err(cap_reason) => cap::GateDecision::Deny { cap_reason },
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -7491,10 +7413,11 @@ async fn recv_run(
                                 == mac
                         })
                     };
-                    let ok = if let Some((n, _)) = hit {
+                    let ok = if let Some((n, secret)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
                             l.trusted = true;
                             l.verified_name = Some(n.clone());
+                            l.expected_secret = Some((n.clone(), secret.clone()));
                             crate::identity::resolve_peer_identity(l);
                         }
                         // #39: identity just RESOLVED on the WebRTC/relay path — verified_name
