@@ -767,11 +767,11 @@ if [ "$rcR0" = "0" ] && [ "$OUTR0" = "BEFORE-FORGET" ] && [ "$rcRF" = "0" ] \
    && ! echo "$OUTR" | grep -q "SHOULD-NOT-RUN" \
    && grep -q "not recognized" "$WORK/R.err" \
    && ! grep -qi "tunnel up\|serving is off\|tunlion grant" "$WORK/R.err"; then
-   ok "gateR: after forget, exec was refused as an unrecognized device in ${elR}s (exit 4, no tunnel claim, nothing ran)"
+  ok "gateR: after forget, exec was refused as an unrecognized device in ${elR}s (exit 4, no tunnel claim, nothing ran)"
 else
-   echo "-- R0.err --"; cat "$WORK/R0.err"; echo "-- forgetR.log --"; cat "$WORK/forgetR.log"
-   echo "-- R.err --"; cat "$WORK/R.err"; tail -15 "$WORK/up-Q.log" 2>/dev/null
-   bad "gateR: a forgotten device's exec was not refused as unrecognized (before rc=$rcR0, after rc=$rcR in ${elR}s)"
+  echo "-- R0.err --"; cat "$WORK/R0.err"; echo "-- forgetR.log --"; cat "$WORK/forgetR.log"
+  echo "-- R.err --"; cat "$WORK/R.err"; tail -15 "$WORK/up-Q.log" 2>/dev/null
+  bad "gateR: a forgotten device's exec was not refused as unrecognized (before rc=$rcR0, after rc=$rcR in ${elR}s)"
 fi
 # Gate L below re-uses boxb's pairing with boxa.
 cp "$WORK/devices.before-forget.json" "$DB/devices.json"
