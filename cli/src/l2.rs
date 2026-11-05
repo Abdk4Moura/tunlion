@@ -6260,7 +6260,7 @@ mod h1_tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let selected = net::SourceId::next();
         let stale = net::SourceId::next();
-        for kind in ["exec-open-ack", "shell-bootstrap-ack", "exec-close"] {
+        for kind in ["exec-open-ack", "shell-bootstrap-ack", "exec-close", "ssh-sign-response", "l2-close"] {
             tx.send(Ev::Sourced {
                 pid: "peer".into(),
                 source: stale,
