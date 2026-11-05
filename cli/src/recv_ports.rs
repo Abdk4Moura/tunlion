@@ -810,15 +810,9 @@ impl RecvDaemon for CliRecv {
     }
     async fn reach_ping(&mut self, conn: &Conn, pid: &str, v: &Value) {
         if let Some(t) = conn.transport_of(pid) {
-            let result = t
+            let _ = t
                 .send_control(&filament_peerloop::daemon_ctl::liveness_pong(v))
                 .await;
-            self.log.debug(&format!(
-                "reach-pong send pid={pid} source={:?} result={result:?}",
-                t.source_id(),
-            ));
-        } else {
-            self.log.debug(&format!("reach-pong not sent pid={pid}: no current transport"));
         }
     }
     async fn reach_pong(&mut self, conn: &Conn, pid: &str, v: &Value) {

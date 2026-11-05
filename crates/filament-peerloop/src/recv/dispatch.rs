@@ -6740,7 +6740,14 @@ async fn recv_run(
                 // L2: it opens nothing and only proves this end is here.
                 Some("reach-ping") => {
                     if let Some(t) = conn.transport_of(&pid) {
-                        let _ = t.send_control(&crate::daemon_ctl::liveness_pong(&v)).await;
+                        log.debug(&format!(
+                            "reach-pong start pid={pid} incoming={event_source:?} outgoing={:?}",
+                            t.source_id(),
+                        ));
+                        let result = t.send_control(&crate::daemon_ctl::liveness_pong(&v)).await;
+                        log.debug(&format!("reach-pong sent pid={pid} result={result:?}"));
+                    } else {
+                        log.debug(&format!("reach-pong not sent pid={pid}: no current transport"));
                     }
                 }
                 Some("reach-pong") => {
