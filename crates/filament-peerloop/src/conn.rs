@@ -5611,12 +5611,16 @@ impl Conn {
             for worker in old_workers {
                 worker.force_close();
             }
-            if existing
-                .transport
-                .as_ref()
-                .map(|t2| t2.is_dead())
-                .unwrap_or(true)
+            if !existing.direct
+                || existing
+                    .transport
+                    .as_ref()
+                    .map(|t2| t2.is_dead())
+                    .unwrap_or(true)
             {
+                // A live WebRTC predecessor is not the adopted direct
+                // transport. Retaining it while installing the direct source
+                // drops the incoming connection and leaves a hybrid link.
                 existing.transport = Some(t);
             }
             existing.direct = true;
@@ -11811,10 +11815,14 @@ mod warm_identity_tests {
         conn.direct_pending.insert(pid.into(), pending);
 
         assert!(matches!(
-            conn.adopt_direct(pid, t, "direct-quic"),
+            conn.adopt_direct(pid, t.clone(), "direct-quic"),
             DirectAdoption::Adopted { attempt: seen, .. } if seen == attempt
         ));
         let link = &conn.links[pid];
+        assert!(
+            Arc::ptr_eq(link.transport.as_ref().unwrap(), &t),
+            "adopted fleet direct transport was discarded for its live WebRTC predecessor"
+        );
         assert!(link.direct, "the fleet transport was not installed");
         assert!(
             !link.trusted,
