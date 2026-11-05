@@ -5625,7 +5625,14 @@ impl Conn {
             existing.source = source;
             existing.attempt = Some(attempt);
             existing.attempts = 0;
-            if !ephemeral {
+            // A FLEET direct link is not pair-authenticated. The new-link branch
+            // below already keeps `trusted: false` and no petname until a verified
+            // fleet-hello names it; the update branch used to grant both anyway when
+            // the one-shot already had an unverified WebRTC link on this pid. That
+            // made `is_sibling_link()` false, so the target ignored the owner grant
+            // for the very device its certificate named and refused the terminal as
+            // "shell not granted".
+            if !ephemeral && !fleet {
                 existing.trusted = true;
                 if let Some((n, _)) = &expected_secret {
                     existing.verified_name = Some(n.clone());
@@ -11781,6 +11788,42 @@ mod warm_identity_tests {
             DirectAdoption::Adopted { tkey: Some(key), .. }
                 if key == direct::transport_key("device-secret")
         ));
+    }
+
+    /// A fleet one-shot's direct connection usually replaces the unverified
+    /// WebRTC link already held for the same signaling id. Adoption must not
+    /// turn that into a pair-trusted link: `trusted` is what makes
+    /// `is_sibling_link()` false, and then the target ignores the owner grant
+    /// for the device its certificate just named (observed as "shell not
+    /// granted to 'bravo' here" on an otherwise verified direct link).
+    #[tokio::test]
+    async fn fleet_direct_adoption_over_webrtc_does_not_gain_pair_trust() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-fleet-oneshot-adopt";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+
+        let t: Arc<dyn Transport> = Rec::new("direct", &log);
+        let attempt = t.attempt_id().unwrap();
+        let mut pending = direct_pending_with(attempt, (FLEET_LINK_NAME, "fleet-rv"));
+        pending.fleet = true;
+        pending.auth = DirectAuth::fleet(1);
+        conn.direct_pending.insert(pid.into(), pending);
+
+        assert!(matches!(
+            conn.adopt_direct(pid, t, "direct-quic"),
+            DirectAdoption::Adopted { attempt: seen, .. } if seen == attempt
+        ));
+        let link = &conn.links[pid];
+        assert!(link.direct, "the fleet transport was not installed");
+        assert!(
+            !link.trusted,
+            "fleet direct adoption inherited pair trust from the unverified WebRTC link"
+        );
+        assert!(
+            link.verified_name.is_none(),
+            "fleet direct adoption minted a petname before fleet-hello"
+        );
     }
 
     /// An authorized upgrade adopts the verified standby exactly once.
