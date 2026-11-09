@@ -2009,6 +2009,10 @@ async fn recv_run(
     //   theirs[pid] what THEY chose: sign messages we send to them.
     let mut bind_ours: HashMap<String, Vec<u8>> = HashMap::new();
     let mut bind_theirs: HashMap<String, Vec<u8>> = HashMap::new();
+    // The transport source each pid's nonces were exchanged on. A replacement
+    // transport can reuse the same peer id; nonces from the previous transport
+    // must not be carried across (see the reset in `ChannelReady`).
+    let mut bind_source: HashMap<String, net::SourceId> = HashMap::new();
     let mut fleet_pending: std::collections::HashSet<String> = Default::default();
     let mut fleet_verified: std::collections::HashSet<String> = Default::default();
     // Offers that arrived while this link's `fleet-hello` was still in flight.
@@ -4231,6 +4235,7 @@ async fn recv_run(
                     // exists to stop.
                     bind_ours.remove(&pid);
                     bind_theirs.remove(&pid);
+                    bind_source.remove(&pid);
                 }
             }
             Ev::PairMatched(v) => {
@@ -5324,6 +5329,21 @@ async fn recv_run(
                 // Fleet auto-mesh: this link came off the fleet channel, so there
                 // is no pair secret to prove. Present the owner-signed certificate
                 // bound to THIS link instead.
+                // A nonce belongs to the TRANSPORT it was exchanged on. A
+                // re-established transport can reuse the same peer id (warm
+                // re-dial after a zombie drop), so carrying the previous
+                // transport's nonce forward makes each side sign a value the
+                // other no longer expects: both fleet hellos fail verification
+                // and the link stays unverified forever. Drop both directions
+                // when the transport source changes; a genuinely same-transport
+                // re-announce keeps its nonce.
+                if let Some(source) = event_source {
+                    if bind_source.get(&pid).copied() != Some(source) {
+                        bind_source.insert(pid.clone(), source);
+                        bind_ours.remove(&pid);
+                        bind_theirs.remove(&pid);
+                    }
+                }
                 // No exporter on this transport: open the challenge. Our nonce
                 // goes out now; anything we SEND waits until theirs arrives.
                 if t.channel_binding().is_none() {
