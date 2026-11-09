@@ -4151,6 +4151,22 @@ async fn recv_run(
 
         let Some((ev, event_source)) = ev else { continue };
 
+        // A fleet verdict, a hello marker and a nonce all belong to the
+        // TRANSPORT they were earned on. Links are dropped from several places
+        // (health scan, zombie warm link, peer-left, revocation); trusting each
+        // site to remember these sets let the periodic health scan keep a dead
+        // link's `fleet_verified`, so a replacement that reused the peer id
+        // skipped its hello and inherited the old transport's verdict. Retire
+        // them centrally for any peer that no longer has a link, so every drop
+        // path, including future ones, starts the replacement unverified.
+        fleet_pending.retain(|p| conn.links.contains_key(p));
+        fleet_verified.retain(|p| conn.links.contains_key(p));
+        fleet_greeted.retain(|p| conn.links.contains_key(p));
+        bind_ours.retain(|p, _| conn.links.contains_key(p));
+        bind_theirs.retain(|p, _| conn.links.contains_key(p));
+        bind_source.retain(|p, _| conn.links.contains_key(p));
+        fleet_deferred_offers.retain(|(p, _, _)| conn.links.contains_key(p));
+
         // C23: questions from links that died (supersede/peer-left) are
         // moot, the sender re-offers on its new link. Purge them so a 'y'
         // can never accept a ghost (the duplicate-stream ENOENT crash).
