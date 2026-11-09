@@ -5333,6 +5333,14 @@ async fn recv_run(
                 // Fleet auto-mesh: this link came off the fleet channel, so there
                 // is no pair secret to prove. Present the owner-signed certificate
                 // bound to THIS link instead.
+                // Send link control on the transport actually installed for this
+                // link, not on the one a possibly superseded ChannelReady event
+                // carried. With two transports racing for one peer id, the loser
+                // can deliver this event while the winner is installed; signing
+                // and sending our fleet hello down the loser made the peer never
+                // receive it, while we accepted the peer's hello. That showed up
+                // as a link that stays fleet-unverified on one side only.
+                let t = conn.transport_of(&pid).unwrap_or(t);
                 // A nonce belongs to the TRANSPORT it was exchanged on. A
                 // re-established transport can reuse the same peer id (warm
                 // re-dial after a zombie drop), so carrying the previous
