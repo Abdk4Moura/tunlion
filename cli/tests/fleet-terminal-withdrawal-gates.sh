@@ -250,6 +250,15 @@ PY
     else
         bad "$mode: withdrawal ended unrelated sibling terminal"
     fi
+    # The initiator learns the closure asynchronously over the link: the remote
+    # child check above proves the TREE is gone, not that the client process has
+    # been scheduled to observe it. Give the client a bounded window to exit,
+    # then require the same scoped nonzero reason. This observes the promised
+    # fact instead of a scheduler race; it does not widen any product bound.
+    for _ in $(seq 1 20); do
+        kill -0 "$matching" 2>/dev/null || break
+        sleep 0.25
+    done
     if kill -0 "$matching" 2>/dev/null; then
         bad "$mode: initiator did not acknowledge terminal closure"
     else
