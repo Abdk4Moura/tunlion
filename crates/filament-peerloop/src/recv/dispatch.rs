@@ -5221,7 +5221,11 @@ async fn recv_run(
                         let _ = tx.send(Ev::sourced_channel_ready(pid, t));
                     }
                 } else {
-                    let _ = tx.send(Ev::ChannelReady(pid, t));
+                    // Keep the transport's own source on the re-emit. An
+                    // unsourced ChannelReady hides which transport it belongs
+                    // to, so a replacement cannot retire the previous
+                    // transport's fleet nonces.
+                    let _ = tx.send(Ev::sourced_channel_ready(pid, t));
                 }
             }
             Ev::DirectWorkersReady(pid, workers, primary_source) => {
