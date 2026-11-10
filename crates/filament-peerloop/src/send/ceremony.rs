@@ -580,6 +580,8 @@ impl Ceremony {
             "caps": self.caps.clone(),
             "scope": self.scope,
             "np": self.nameplate,
+            "direct": true,
+            "handoff": 1,
         }))))
     }
 
@@ -1090,6 +1092,25 @@ mod tests {
         from_browser.as_object_mut().unwrap().remove("direct");
         assert!(matches!(cli.on_signal(&from_browser, None), Inbound::Consumed));
         assert!(!cli.peer_supports_direct());
+    }
+
+    /// A `pake-msg` lost in the relay leaves the peer deriving K from our
+    /// confirmation's element. The direct/handoff advertisement must ride that
+    /// frame too, or the peer never races and the promotion is skipped.
+    #[test]
+    fn the_direct_advertisement_rides_the_confirmation_when_the_element_is_lost() {
+        let (mut a, mut b) = honest();
+        let am = a.take_msg_payload().unwrap();
+        // `b`'s element never reaches `a`: the relay lost that frame.
+        assert!(matches!(b.on_signal(&am, None), Inbound::Consumed));
+        assert!(!a.peer_supports_direct() && !a.peer_supports_handoff());
+        let bc = b.take_confirm_payload(B_FPS.0, B_FPS.1).unwrap();
+        assert_eq!(bc["direct"], json!(true), "the confirmation carries the advertisement");
+        assert_eq!(bc["handoff"], json!(1));
+        assert!(matches!(a.on_signal(&bc, Some(A_FPS)), Inbound::Consumed));
+        assert!(a.secret().is_some(), "K came from the confirmation's element");
+        assert!(a.peer_supports_direct(), "direct is known without the element frame");
+        assert!(a.peer_supports_handoff(), "handoff is known without the element frame");
     }
 
     // ---- C30: the ceremony over a relay that loses or repeats frames --------
