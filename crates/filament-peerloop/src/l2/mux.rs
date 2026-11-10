@@ -646,6 +646,13 @@ impl Mux {
         self.close_err.lock().await.remove(&sid)
     }
 
+    /// Observe a recorded close reason without consuming it. The bridge
+    /// watcher needs it as soon as it lands, before the trailing close send
+    /// can stall; the one-shot client still takes it later.
+    pub async fn peek_close_err(&self, sid: u32) -> Option<String> {
+        self.close_err.lock().await.get(&sid).cloned()
+    }
+
     /// Data-channel died (or a send errored): tear down EVERY live stream so no
     /// pump hangs forever waiting on a peer that will never speak again.
     pub async fn shutdown_all(&self) {

@@ -714,9 +714,30 @@ pub async fn handle_warm_pty(
             .await
         {
             crate::l2::WarmPtyVerdict::Opened(sid, first, rx_pipe) => {
+                // A new bridge owns this session's reason slot: never let a
+                // previous run's scoped close answer a later clean exit.
+                let _ = take_warm_pty_end(&session);
                 if let Ok(mut m) = warm_ptys.lock() {
                     m.insert(session.clone(), (pid, sid));
                 }
+                // Record the reason the moment the mux receives it. Waiting
+                // until `serve_verified_stream` returns includes its trailing
+                // close send, which can stall on a dying link while the client
+                // has already stopped polling.
+                let watch_mux = mux.clone();
+                let watch_session = session.clone();
+                let watcher = tokio::spawn(async move {
+                    loop {
+                        if let Some(reason) = watch_mux.peek_close_err(sid).await {
+                            record_warm_pty_end(&watch_session, reason);
+                            break;
+                        }
+                        if watch_mux.transport().is_dead() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                });
                 let sock = req.accept().await;
                 // Keep a handle so the peer's scoped close reason can be read
                 // after the bridge ends. The bridge records it in the mux but
@@ -724,6 +745,7 @@ pub async fn handle_warm_pty(
                 // report a clean EOF (rc 0) for an access-revoked session.
                 let ended = mux.clone();
                 crate::l2::serve_verified_stream(mux, sid, sock, first, rx_pipe).await;
+                watcher.abort();
                 if let Some(reason) = ended.take_close_err(sid).await {
                     record_warm_pty_end(&session, reason);
                 }
