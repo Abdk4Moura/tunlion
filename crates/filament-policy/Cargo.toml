@@ -1,0 +1,23 @@
+# filament-policy — the pure transfer-admission decision.
+#
+# This crate exists so the ONE transfer allow/deny policy can be compiled for
+# hosts that have no filesystem, no runtime and no network stack: the CLI and
+# Core keep using filament-cap (which re-exports these items under their
+# original `filament_cap::capability::*` paths), while a browser can call the
+# same function through the JSON surface in `crates/tunlion-policy-wasm`.
+#
+# Deliberately dependency-free. No crypto, no clock, no serde: `now` is an
+# explicit input, which is what makes the decision replayable from vectors.
+[package]
+name = "filament-policy"
+version = "0.2.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/tunlion"
+description = "Pure, host-free transfer-admission policy shared by native and WASM clients"
+readme = "README.md"
+keywords = ["policy", "authorization", "transfer", "wasm"]
+categories = ["authentication"]
+
+[dependencies]
