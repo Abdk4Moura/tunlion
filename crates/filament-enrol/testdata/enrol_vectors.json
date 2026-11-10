@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "description": "Shared enrolment-ceremony vectors. Native tests reconstruct these frames deterministically with filament-enrol and assert the expected verdict; a browser harness can replay the same seeds, nonces and ceremonies through the DeviceIdentity API. Nothing here is a captured ciphertext: the nonce and the 32-byte Ed25519 seeds are the inputs, so both sides derive identical bytes.",
+  "ceremonies": {
+    "primary": {
+      "k": "0707070707070707070707070707070707070707070707070707070707070707",
+      "deviceFp": "AA:11",
+      "ownerFp": "BB:22",
+      "capsCanon": "transfer",
+      "scope": 1
+    },
+    "replayed": {
+      "k": "0808080808080808080808080808080808080808080808080808080808080808",
+      "deviceFp": "CC:33",
+      "ownerFp": "DD:44",
+      "capsCanon": "transfer",
+      "scope": 1
+    }
+  },
+  "identities": {
+    "device": "0101010101010101010101010101010101010101010101010101010101010101",
+    "owner": "0202020202020202020202020202020202020202020202020202020202020202",
+    "otherDevice": "0303030303030303030303030303030303030303030303030303030303030303",
+    "otherOwner": "0404040404040404040404040404040404040404040404040404040404040404"
+  },
+  "nonces": {
+    "offer": "000102030405060708090a0b",
+    "grant": "0c0d0e0f1011121314151617",
+    "expose": "18191a1b1c1d1e1f20212223"
+  },
+  "times": {
+    "now": 1700000000,
+    "grantIssued": 1700000000,
+    "grantTtl": 7776000,
+    "expiredIssued": 0,
+    "expiredTtl": 100,
+    "expiredNow": 200
+  },
+  "cases": [
+    {
+      "name": "valid offer and grant round trip",
+      "kind": "valid_round_trip",
+      "expect": "accepted"
+    },
+    {
+      "name": "forged possession proof",
+      "kind": "forged_possession_proof",
+      "expect": "possession-proof-invalid"
+    },
+    {
+      "name": "wrong device key",
+      "kind": "wrong_device_key",
+      "expect": "wrong-device-key"
+    },
+    {
+      "name": "wrong owner",
+      "kind": "wrong_owner",
+      "expect": "wrong-owner"
+    },
+    {
+      "name": "expired certificate",
+      "kind": "expired_cert",
+      "expect": "cert-expired"
+    },
+    {
+      "name": "replayed offer in another ceremony",
+      "kind": "replayed_offer",
+      "expect": "offer-sealed"
+    },
+    {
+      "name": "replayed offer within one ceremony is declined once already asked",
+      "kind": "replayed_offer_within_ceremony",
+      "expect": "decline"
+    }
+  ]
+}

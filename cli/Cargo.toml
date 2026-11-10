@@ -122,6 +122,9 @@ authkeys-managed = { path = "../crates/authkeys-managed", version = "0.1.3" }
 # Multi-device user identity (user key over device certs, no CA). Aliased as
 # `crate::identity`; key persistence is injected via `platform::PlatformKeyStore`.
 filament-id = { path = "../crates/filament-id", version = "0.1.3" }
+# Host-free enrolment ceremony: offer/grant frames, the owner decision, pure
+# certificate verification and the browser-facing DeviceIdentity API.
+filament-enrol = { path = "../crates/filament-enrol", version = "0.1.0" }
 # Capability primitives + pure authorization evaluation. `crate::capability` and
 # `crate::ephemeral` re-export it; the host-bound orchestration (store I/O, mode
 # flag, observability counters, DeviceCert-reading glue) stays in those modules.

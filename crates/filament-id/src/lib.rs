@@ -621,15 +621,29 @@ pub fn sealing_key_from_k(k: &[u8]) -> [u8; 32] {
 /// Seal plaintext with AEAD (ChaCha20-Poly1305) using key derived from K.
 /// Returns (nonce 12 bytes, ciphertext+tag).
 pub fn seal_plaintext(key: &[u8; 32], plaintext: &[u8]) -> Result<([u8; 12], Vec<u8>)> {
-    use ring::aead::{self, BoundKey, Nonce, SealingKey, UnboundKey, CHACHA20_POLY1305};
     use ring::rand::SecureRandom;
     let rng = SystemRandom::new();
     let mut nonce_bytes = [0u8; 12];
     rng.fill(&mut nonce_bytes)
         .map_err(|_| anyhow!("CSPRNG failed for nonce"))?;
+    let sealed = seal_plaintext_with_nonce(key, &nonce_bytes, plaintext)?;
+    Ok((nonce_bytes, sealed))
+}
+
+/// Seal plaintext with a caller-supplied nonce. The only difference from
+/// [`seal_plaintext`] is where the nonce comes from: this form exists for hosts
+/// that own their randomness (a browser's `crypto.getRandomValues`, a wasm test
+/// harness producing replayable vectors). The AEAD, key derivation and output
+/// layout are identical; never call this twice with the same key and nonce.
+pub fn seal_plaintext_with_nonce(
+    key: &[u8; 32],
+    nonce_bytes: &[u8; 12],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    use ring::aead::{self, BoundKey, Nonce, SealingKey, UnboundKey, CHACHA20_POLY1305};
     let unbound = UnboundKey::new(&CHACHA20_POLY1305, key)
         .map_err(|_| anyhow!("failed to create sealing key"))?;
-    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let nonce = Nonce::assume_unique_for_key(*nonce_bytes);
     let mut sealing_key = SealingKey::new(unbound, OneNonce::new(nonce));
     let mut in_out = plaintext.to_vec();
     let tag = sealing_key
@@ -638,7 +652,7 @@ pub fn seal_plaintext(key: &[u8; 32], plaintext: &[u8]) -> Result<([u8; 12], Vec
     let mut sealed = Vec::with_capacity(in_out.len() + 16);
     sealed.extend_from_slice(&in_out);
     sealed.extend_from_slice(tag.as_ref());
-    Ok((nonce_bytes, sealed))
+    Ok(sealed)
 }
 
 /// Open sealed ciphertext with AEAD key.

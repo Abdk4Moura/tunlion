@@ -23,6 +23,12 @@ use crate::{
     shutdown, store_provisional_identity, test_hooks, ui,
 };
 use anyhow::{Context, Result, anyhow, bail};
+use filament_enrol::{
+    EnrolGrant, EnrolOffer, EnrolOfferDecision, EnrolOfferInputs, EnrolOutcome, EnrolOutcomeInputs,
+    IdentityExpose, browser_hint, build_enrol_offer, build_identity_expose, enrol_offer_decision,
+    enrolment_outcome, open_enrol_grant, open_enrol_offer, open_identity_expose,
+    verify_mesh_grant,
+};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -34,33 +40,40 @@ use tokio::sync::mpsc;
 /// says who sent it and nothing about whether it is well-formed. A certificate
 /// that does not name OUR device key, or does not verify, is refused rather than
 /// written: the whole value of the certificate is that it names one key.
-fn persist_mesh_grant(grant: &Value) -> Result<()> {
+///
+/// `pinned_owner` is the owner key of the peer that presented a certificate
+/// during this ceremony, when it did. `None` is the trust-on-first-use case
+/// where the sealed PAKE channel is the only authenticator.
+fn persist_mesh_grant(grant: &Value, pinned_owner: Option<[u8; 32]>) -> Result<()> {
     if local_device_cert_path().exists() {
         bail!("this device already holds a certificate; refusing to overwrite it");
     }
     let our_pub = crate::overlay::overlay_pubkey_bytes()
         .map_err(|e| anyhow!("cannot read this device's key: {e}"))?;
-    let cert = identity::DeviceCert::from_json(&grant["device_cert"])
-        .ok_or_else(|| anyhow!("the enrolment carried no certificate"))?;
-    if cert.device_pub != our_pub {
-        bail!("the certificate names a different device; refusing it");
-    }
-    cert.verify(identity::now_secs())
-        .map_err(|e| anyhow!("the certificate does not verify: {e}"))?;
-    let owner_name = grant["owner_name"].as_str().unwrap_or("owner");
+    let verified = verify_mesh_grant(grant, our_pub, pinned_owner, identity::now_secs())
+        .map_err(|e| match e {
+            filament_enrol::EnrolError::WrongDeviceKey { .. } => {
+                anyhow!("the certificate names a different device; refusing it")
+            }
+            filament_enrol::EnrolError::NoCertificateInGrant => {
+                anyhow!("the enrolment carried no certificate")
+            }
+            other => anyhow!("the certificate does not verify: {other}"),
+        })?;
+    let cert = verified.cert;
     crate::platform::SecretFile::write_str(
         &local_device_cert_path(),
-        &serde_json::to_string_pretty(&json!({ "name": owner_name, "cert": cert.to_json() }))?,
+        &serde_json::to_string_pretty(&json!({ "name": verified.owner_name, "cert": cert.to_json() }))?,
     )?;
     // The meeting point, and the owner-signed policy that makes it useful. Each
     // op is verified against the owner key in the header, so this is a relay of
     // the owner's decisions rather than trust in whoever transmitted them.
-    if let Some(rv) = grant["fleet_rv"].as_str() {
+    if let Some(rv) = verified.fleet_rv.as_deref() {
         if let Err(e) = fleet::store_rv(rv) {
             ui::debug(&format!("fleet rendezvous secret not stored: {e}"));
         }
     }
-    if let Some(hdr) = grant["cap_header"].as_object() {
+    if let Some(hdr) = verified.cap_header.as_ref().and_then(|v| v.as_object()) {
         let dir = crate::settings::config_dir();
         let mut store = crate::capability::load_cap_store(&dir);
         let already = store.iter().any(|e| {
@@ -72,8 +85,8 @@ fn persist_mesh_grant(grant: &Value) -> Result<()> {
             let _ = crate::capability::save_cap_store(&dir, &store);
         }
     }
-    if let Some(ops) = grant.get("cap_ops").and_then(|v| v.as_array()) {
-        let added = merge_owner_cap_ops(ops);
+    if !verified.cap_ops.is_empty() {
+        let added = merge_owner_cap_ops(&verified.cap_ops);
         ui::debug(&format!("mesh grant: merged {added} owner-signed ops"));
     }
     Ok(())
@@ -203,116 +216,14 @@ const ENROL_OFFER_RESEND: Duration = Duration::from_millis(1000);
 /// key exchange, for a certless device's offer before saying it did not come.
 const ENROL_OFFER_WAIT: Duration = Duration::from_secs(20);
 
-/// The sealed `enrol-offer` a certless device sends: its device key, proven by
-/// a signature over this ceremony's confirmation MAC (so it cannot be replayed
-/// into another ceremony), sealed under the PAKE key. `sign` signs with the
-/// device key. Pure over its inputs.
-pub(crate) fn build_enrol_offer(
-    k: &[u8],
-    my_fp: &str,
-    their_fp: &str,
-    caps_canon: &str,
-    scope: u8,
-    device_pub: [u8; 32],
-    name: &str,
-    sign: &dyn Fn(&[u8]) -> Option<[u8; 64]>,
-) -> Option<Value> {
-    let cmv: [u8; 32] = crate::pake::our_confirm(k, my_fp, their_fp, caps_canon, scope).try_into().ok()?;
-    let pmsg = identity::possession_msg(
-        0x01,
-        &cmv,
-        scope,
-        &identity::caps_digest(caps_canon),
-        &[0u8; 32],
-        &device_pub,
-        &[0u8; 32],
-    );
-    let psig = sign(&pmsg)?;
-    let inner = json!({
-        "device_pub": hex::encode(device_pub),
-        "possession_sig": hex::encode(psig),
-        "name": name,
-    });
-    let (n, sealed) = identity::seal_plaintext(&identity::sealing_key_from_k(k), inner.to_string().as_bytes()).ok()?;
-    Some(json!({"type": "enrol-offer", "v": 1, "hold": true, "nonce": hex::encode(n), "sealed": hex::encode(sealed)}))
-}
-
-/// What a finished pairing did about "one of my devices", from either side.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum EnrolOutcome {
-    /// Nothing to report: enrolled, already the same owner's, or never asked.
-    Fine,
-    /// OWNER SIDE, asked for one of its devices: the peer did not become one.
-    OwnerNotEnrolled { offer_seen: bool, failed_proof: bool },
-    /// OWNER SIDE, asked for one of its devices, but the peer identified itself
-    /// as a browser: the pairing is real (files and shell), the fleet
-    /// enrolment is impossible and is not a failure.
-    OwnerBrowserNotFleet,
-    /// OWNER SIDE: certified, but the device never said it stored it.
-    OwnerUnconfirmed,
-    /// DEVICE SIDE: offered its key, nobody answered.
-    DeviceNoAnswer,
-    /// DEVICE SIDE: a certificate arrived and was refused.
-    DeviceGrantRefused(String),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct EnrolOutcomeInputs {
-    pub owner_asked_own: bool,
-    pub certified_here: bool,
-    pub already_same_owner: bool,
-    pub peer_presented_cert: bool,
-    /// The PAKE partner announced, on its transport hint, that it is a browser.
-    /// Advisory device-kind evidence only: it can explain why a pairing is not
-    /// a fleet enrolment, never admit one or excuse a failed key proof.
-    pub peer_is_browser: bool,
-    pub offer_seen: bool,
-    pub offer_failed_proof: bool,
-    pub unconfirmed_grant: bool,
-    pub offered_here: bool,
-    pub joined_here: bool,
-    pub declined: bool,
-    pub grant_refused: Option<String>,
-}
-
-/// Pure. A peer that already holds another identity is the EXTERNAL notice's
-/// case (`external_notice_applies`), not this one.
-pub(crate) fn enrolment_outcome(i: EnrolOutcomeInputs) -> EnrolOutcome {
-    if i.owner_asked_own && !i.certified_here && !i.already_same_owner && !i.peer_presented_cert {
-        // A browser has no device key to offer, so "no offer" is its normal
-        // outcome, not a failed enrolment. Only the explicit browser marker
-        // earns this; a missing or malformed key offer from any other peer
-        // stays the failure below.
-        if i.peer_is_browser && !i.offer_seen && !i.offer_failed_proof && !i.joined_here {
-            return EnrolOutcome::OwnerBrowserNotFleet;
-        }
-        return EnrolOutcome::OwnerNotEnrolled {
-            offer_seen: i.offer_seen,
-            failed_proof: i.offer_failed_proof,
-        };
-    }
-    if i.certified_here && i.unconfirmed_grant {
-        return EnrolOutcome::OwnerUnconfirmed;
-    }
-    if i.offered_here && !i.joined_here {
-        if let Some(why) = i.grant_refused {
-            return EnrolOutcome::DeviceGrantRefused(why);
-        }
-        if !i.declined {
-            return EnrolOutcome::DeviceNoAnswer;
-        }
-    }
-    EnrolOutcome::Fine
-}
-
-/// Whether this signal is the browser's explicit device-kind hint. The hint is
-/// advisory and unauthenticated (it arrives before PAKE); it is used ONLY to
-/// word the outcome of a completed pairing, never to admit a device. `direct`
-/// alone is a transport fact, not a kind: a native peer may run without direct.
-/// Pure.
-pub(crate) fn browser_hint(data: &Value) -> bool {
-    data["type"].as_str() == Some("transport-hint")
-        && data["client"].as_str() == Some("browser")
+/// A fresh 12-byte AEAD nonce for an enrolment frame. The randomness is the
+/// host's: `filament-enrol` takes the nonce as an input so a browser can supply
+/// `crypto.getRandomValues` and a vector can replay exact bytes.
+fn fresh_seal_nonce() -> Option<[u8; 12]> {
+    let rng = ring::rand::SystemRandom::new();
+    let mut nonce = [0u8; 12];
+    ring::rand::SecureRandom::fill(&rng, &mut nonce).ok()?;
+    Some(nonce)
 }
 
 /// Say the outcome. Returns the error to exit with when what was asked for
@@ -424,181 +335,6 @@ pub(crate) fn step_line(text: &str) -> String {
     format!("  {} {text}", ui::paint(ui::Tone::Ok, ui::glyph_ok()))
 }
 
-/// What the owner device does with a certless device's offer of its key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EnrolOfferDecision {
-    /// The operator already said "one of mine" (`add <name>`, `--for device`).
-    Certify,
-    /// Ask the person at THIS (owner) device, once.
-    Ask,
-    /// Refuse: an ordinary pairing.
-    Decline,
-}
-
-/// The facts the decision rests on, named so a test can state each rule.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct EnrolOfferInputs {
-    /// This device holds the owner key, so only it can sign.
-    pub owner_here: bool,
-    /// The operator said "a device of mine" before the code was shown.
-    pub operator_said_own: bool,
-    /// The operator said "someone else" (`--for person`).
-    pub operator_said_person: bool,
-    /// The offer opened under this ceremony's key AND its possession proof
-    /// verified: it came from the ceremony partner, for a key that partner holds.
-    pub offer_opened: bool,
-    /// The device can wait for a person to answer (`hold`).
-    pub peer_can_hold: bool,
-    /// A person is here to ask: a terminal, not a script or `--json`.
-    pub can_ask: bool,
-    /// This ceremony already asked or certified once.
-    pub already_asked: bool,
-}
-
-/// The one rule for turning a pairing into "one of your devices". The owner
-/// key signs only on an explicit owner decision made on the owner device: said
-/// up front, or answered here. Never from what the other side claims, never in
-/// a script, never twice per ceremony. Pure.
-pub(crate) fn enrol_offer_decision(i: EnrolOfferInputs) -> EnrolOfferDecision {
-    if !i.owner_here || !i.offer_opened {
-        return EnrolOfferDecision::Decline;
-    }
-    if i.operator_said_own {
-        return if i.already_asked { EnrolOfferDecision::Decline } else { EnrolOfferDecision::Certify };
-    }
-    if i.operator_said_person || !i.peer_can_hold || !i.can_ask || i.already_asked {
-        return EnrolOfferDecision::Decline;
-    }
-    EnrolOfferDecision::Ask
-}
-
-/// Open a certless device's sealed `enrol-offer` and check that it proves
-/// possession of the key it offers, bound to THIS ceremony (the confirmation
-/// MAC over K and both link fingerprints). Returns the proven device key.
-/// Refuses our own key (a reflection) and fails closed when our own key is
-/// unknown. Pure over its inputs.
-pub(crate) fn open_enrol_offer(
-    k: &[u8],
-    my_fp: &str,
-    their_fp: &str,
-    caps_canon: &str,
-    scope: u8,
-    data: &Value,
-    own_device_pub: Option<[u8; 32]>,
-) -> Option<[u8; 32]> {
-    let nonce = hex::decode(data.get("nonce")?.as_str()?).ok()?;
-    let sealed = hex::decode(data.get("sealed")?.as_str()?).ok()?;
-    let nonce: [u8; 12] = nonce.try_into().ok()?;
-    let pt = identity::open_sealed(&identity::sealing_key_from_k(k), &nonce, &sealed).ok()?;
-    let inner: Value = serde_json::from_slice(&pt).ok()?;
-    let dpub: [u8; 32] = hex::decode(inner.get("device_pub")?.as_str()?).ok()?.try_into().ok()?;
-    let sig: [u8; 64] = hex::decode(inner.get("possession_sig")?.as_str()?).ok()?.try_into().ok()?;
-    let (lo, hi) = crate::pake::sort_fps(my_fp, their_fp);
-    let (_send, expect_dir) = crate::pake::confirm_dirs(my_fp, lo);
-    let expected: [u8; 32] = crate::pake::confirm_mac(k, expect_dir, lo, hi, caps_canon, scope).try_into().ok()?;
-    let msg = identity::possession_msg(
-        0x01,
-        &expected,
-        scope,
-        &identity::caps_digest(caps_canon),
-        &[0u8; 32],
-        &dpub,
-        &[0u8; 32],
-    );
-    identity::verify_possession_sig(&dpub, &msg, &sig).ok()?;
-    match own_device_pub {
-        Some(own) if own != dpub => Some(dpub),
-        _ => None,
-    }
-}
-
-/// Open a peer's sealed `identity-expose` and check everything it claims: the
-/// seal (only this ceremony's K opens it), the certificate's own signature and
-/// lifetime, the possession signature over this session's confirmation MAC,
-/// and that it is not our own device key reflected back. `Err` names the check
-/// that refused it. Pure: the caller supplies the link's fingerprints and our
-/// device key (`None` when it could not be read, which refuses).
-pub(crate) fn open_identity_expose(
-    data: &Value,
-    k: &[u8],
-    fps: Option<(&str, &str)>,
-    caps_canon: &str,
-    scope: u8,
-    own_dpub: Option<[u8; 32]>,
-    now: u64,
-) -> std::result::Result<identity::DeviceCert, &'static str> {
-    let nonce = data["nonce"].as_str().and_then(|h| hex::decode(h).ok()).ok_or("nonce missing")?;
-    let nonce: [u8; 12] = nonce.as_slice().try_into().map_err(|_| "nonce is not 12 bytes")?;
-    let sealed = data["sealed"].as_str().and_then(|h| hex::decode(h).ok()).ok_or("sealed body missing")?;
-    let plain = identity::open_sealed(&identity::sealing_key_from_k(k), &nonce, &sealed)
-        .map_err(|_| "seal does not open under this ceremony's key")?;
-    let inner: Value = serde_json::from_slice(&plain).map_err(|_| "sealed body is not JSON")?;
-    let cert = identity::DeviceCert::from_json(&inner["cert"]).ok_or("no certificate in it")?;
-    cert.verify(now).map_err(|_| "certificate does not verify")?;
-    let sig = inner["possession_sig"].as_str().and_then(|h| hex::decode(h).ok()).ok_or("possession signature missing")?;
-    let sig: [u8; 64] = sig.as_slice().try_into().map_err(|_| "possession signature is not 64 bytes")?;
-    // Session-bound: the MAC binds K, both DTLS fingerprints, caps and scope.
-    let (my_fp, their_fp) = fps.ok_or("this link's fingerprints are not known")?;
-    let (lo, hi) = crate::pake::sort_fps(my_fp, their_fp);
-    let (_send, expect_dir) = crate::pake::confirm_dirs(my_fp, lo);
-    let mac = crate::pake::confirm_mac(k, expect_dir, lo, hi, caps_canon, scope);
-    let cmv: [u8; 32] = mac.as_slice().try_into().map_err(|_| "confirmation MAC is not 32 bytes")?;
-    // Reconstruct cert_hash locally from parsed cert fields (never hash a
-    // sender-framed blob). For the PAKE path receiver_device_pub MUST be zeros.
-    let msg = identity::possession_msg(
-        0x01,
-        &cmv,
-        scope,
-        &identity::caps_digest(caps_canon),
-        &identity::cert_hash(&cert),
-        &cert.device_pub,
-        &[0u8; 32],
-    );
-    identity::verify_possession_sig(&cert.device_pub, &msg, &sig)
-        .map_err(|_| "possession signature does not verify for this session")?;
-    // Anti-reflection, narrowed to device_pub (#41). LOAD-BEARING on this 0x01
-    // (PAKE) path: receiver_device_pub is zeroed in the possession message, so
-    // message binding does NOT carry the receiver identity, and THIS comparison
-    // is the only thing preventing a reflection. Do not remove it as redundant.
-    // A same-owner fleet device has a DIFFERENT device_pub under the same user
-    // key, so it is correctly admitted. Fail closed without our own key.
-    match own_dpub {
-        Some(own) if own == cert.device_pub => Err("it is this device's own key, reflected back"),
-        Some(_) => Ok(cert),
-        None => Err("this device's own key could not be read, so a reflection cannot be ruled out"),
-    }
-}
-
-/// Our sealed `identity-expose`: this device's certificate and a possession
-/// signature over this ceremony's confirmation MAC, sealed under the PAKE key.
-/// `sign` signs with the device key. Pure over its inputs; the caller builds it
-/// once and every copy it sends is these bytes.
-pub(crate) fn build_identity_expose(
-    k: &[u8],
-    my_fp: &str,
-    their_fp: &str,
-    caps_canon: &str,
-    scope: u8,
-    cert: &identity::DeviceCert,
-    sign: &dyn Fn(&[u8]) -> Option<[u8; 64]>,
-) -> Option<Value> {
-    let cmv: [u8; 32] = crate::pake::our_confirm(k, my_fp, their_fp, caps_canon, scope).try_into().ok()?;
-    let dpub = cert.device_pub;
-    let pmsg = identity::possession_msg(
-        0x01,
-        &cmv,
-        scope,
-        &identity::caps_digest(caps_canon),
-        &identity::cert_hash(cert),
-        &dpub,
-        &[0u8; 32],
-    );
-    let psig = sign(&pmsg)?;
-    let inner = json!({"cert": cert.to_json(), "possession_sig": hex::encode(psig), "device_pub": hex::encode(dpub)});
-    let (n, sealed) = identity::seal_plaintext(&identity::sealing_key_from_k(k), inner.to_string().as_bytes()).ok()?;
-    Some(json!({"type": "identity-expose", "v": 2, "nonce": hex::encode(n), "sealed": hex::encode(sealed)}))
-}
-
 // PROTOCOL LITERAL: frozen, do not rename (sealed body of identity-expose-ack).
 const EXPOSE_ACK_PLAIN: &str = "tunlion-identity-expose-ack-v1:";
 
@@ -628,9 +364,9 @@ pub(crate) fn open_expose_ack(k: &[u8], data: &Value) -> Option<String> {
     String::from_utf8(plain).ok()?.strip_prefix(EXPOSE_ACK_PLAIN).map(str::to_string)
 }
 
-/// A refusal from [`open_identity_expose`] as the exchange sees it: the two
-/// that only mean "not yet" are checked again on a later copy; every other
-/// one would refuse every copy, since every copy is the same bytes.
+/// A refusal from [`filament_enrol::open_identity_expose`] as the exchange sees
+/// it: the two that only mean "not yet" are checked again on a later copy;
+/// every other one would refuse every copy, since every copy is the same bytes.
 pub(crate) fn expose_verdict_for_refusal(why: &str) -> filament_peerloop::expose::Verdict {
     use filament_peerloop::expose::Verdict;
     match why {
@@ -697,21 +433,21 @@ fn seal_enrol_grant(
     enrol_ttl: Option<u64>,
 ) -> Option<(identity::DeviceCert, Value)> {
     let expires = identity::now_secs().saturating_add(enrol_ttl.unwrap_or(identity::CERT_TTL_SECS));
-    let (cert, mut grant) = match mesh_enrolment(owner_key, dpub, caps, expires, true) {
+    let (cert, grant) = match mesh_enrolment(owner_key, dpub, caps, expires, true) {
         Ok(v) => v,
         Err(e) => {
             ui::debug(&format!("enrol grant failed: {e}"));
             return None;
         }
     };
-    grant["type"] = json!("enrol-grant");
-    grant["owner_name"] = json!(display_name());
-    let sk = identity::sealing_key_from_k(k);
-    let (gn, gs) = identity::seal_plaintext(&sk, grant.to_string().as_bytes()).ok()?;
-    Some((
-        cert,
-        json!({"type": "enrol-grant", "v": 1, "nonce": hex::encode(gn), "sealed": hex::encode(gs)}),
-    ))
+    let frame = filament_enrol::seal_enrol_grant(
+        k,
+        grant,
+        &display_name(),
+        fresh_seal_nonce()?,
+    )
+    .ok()?;
+    Some((cert, frame.to_value().ok()?))
 }
 
 /// The final line of a pairing that made the peer one of your devices: on the
@@ -1426,9 +1162,15 @@ async fn pair_with_purpose(
                 let dpub = crate::overlay::overlay_pubkey_bytes().ok();
                 if let (Some((my_fp, their_fp)), Some(dpub)) = (fps, dpub) {
                     let sign = |m: &[u8]| crate::overlay::overlay_sign_possession(m).ok();
-                    if let Some(payload) = build_enrol_offer(
-                        k, &my_fp, &their_fp, cer.caps_canon(), cer.scope(), dpub, &display_name(), &sign,
-                    ) {
+                    let payload = fresh_seal_nonce().and_then(|nonce| {
+                        build_enrol_offer(
+                            k, &my_fp, &their_fp, cer.caps_canon(), cer.scope(), dpub,
+                            &display_name(), nonce, &sign,
+                        )
+                        .ok()
+                        .and_then(|frame| frame.to_value().ok())
+                    });
+                    if let Some(payload) = payload {
                         sio.emit("signal", json!({ "to": pid2, "data": payload })).await.ok();
                         if !sent_enrol_offer {
                             enrol_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(15));
@@ -1899,9 +1641,15 @@ async fn pair_with_purpose(
                     };
                     if let Some((my_fp, their_fp)) = fps {
                         let sign = |m: &[u8]| crate::overlay::overlay_sign_possession(m).ok();
-                        if let Some(payload) =
-                            build_identity_expose(k, &my_fp, &their_fp, cer.caps_canon(), cer.scope(), &local_cert, &sign)
-                        {
+                        let payload = fresh_seal_nonce().and_then(|nonce| {
+                            build_identity_expose(
+                                k, &my_fp, &their_fp, cer.caps_canon(), cer.scope(),
+                                &local_cert, nonce, &sign,
+                            )
+                            .ok()
+                            .and_then(|frame| frame.to_value().ok())
+                        });
+                        if let Some(payload) = payload {
                             expose_x.offer(payload);
                         }
                     }
@@ -2234,16 +1982,18 @@ async fn pair_with_purpose(
                         },
                         None => None,
                     };
-                    let opened = match (cer.k(), fps.as_ref(), owner_key.as_ref()) {
-                        (Some(k), Some((my_fp, their_fp)), Some(_)) => open_enrol_offer(
+                    let offer = EnrolOffer::from_value(&data).ok();
+                    let opened = match (cer.k(), fps.as_ref(), owner_key.as_ref(), offer) {
+                        (Some(k), Some((my_fp, their_fp)), Some(_), Some(frame)) => open_enrol_offer(
                             k,
                             my_fp,
                             their_fp,
                             cer.caps_canon(),
                             cer.scope(),
-                            &data,
+                            &frame,
                             crate::overlay::overlay_pubkey_bytes().ok(),
-                        ),
+                        )
+                        .ok(),
                         _ => None,
                     };
                     let owner_here_now = owner_key.is_some();
@@ -2353,44 +2103,32 @@ async fn pair_with_purpose(
                 }
                 if data["type"].as_str() == Some("enrol-grant") {
                     if let Some(k) = cer.k() {
-                        if let (Some(nh), Some(sh)) = (
-                            data.get("nonce").and_then(|v| v.as_str()),
-                            data.get("sealed").and_then(|v| v.as_str()),
-                        ) {
-                            if let (Ok(nb), Ok(sb)) = (hex::decode(nh), hex::decode(sh)) {
-                                if nb.len() == 12 {
-                                    let mut na = [0u8; 12];
-                                    na.copy_from_slice(&nb);
-                                    let sk = identity::sealing_key_from_k(k);
-                                    if let Ok(pt) = identity::open_sealed(&sk, &na, &sb) {
-                                        if let Ok(grant) = serde_json::from_slice::<Value>(&pt) {
-                                            enrol_settled = true;
-                                            match persist_mesh_grant(&grant) {
-                                                Ok(()) => {
-                                                    joined_mesh = true;
-                                                    // The owner asked a person first and
-                                                    // records the certificate only once we
-                                                    // say we stored it.
-                                                    {
-                                                        sio.emit("signal", json!({
-                                                            "to": from,
-                                                            "data": {"type": "enrol-ack", "v": 1}
-                                                        })).await.ok();
-                                                    }
-                                                    ui::say(&step_line(&format!(
-                                                        "Certified by {}'s owner key",
-                                                        ui::paint(
-                                                            ui::Tone::Bold,
-                                                            grant["owner_name"].as_str().unwrap_or("the owner")
-                                                        )
-                                                    )));
-                                                }
-                                                Err(e) => {
-                                                    grant_refused = Some(e.to_string());
-                                                }
-                                            }
-                                        }
-                                    }
+                        let opened = EnrolGrant::from_value(&data)
+                            .ok()
+                            .and_then(|frame| open_enrol_grant(k, &frame).ok());
+                        if let Some(grant) = opened {
+                            enrol_settled = true;
+                            let pinned_owner = peer_identity_cert.as_ref().map(|c| c.user_pub);
+                            match persist_mesh_grant(&grant, pinned_owner) {
+                                Ok(()) => {
+                                    joined_mesh = true;
+                                    // The owner asked a person first and
+                                    // records the certificate only once we
+                                    // say we stored it.
+                                    sio.emit("signal", json!({
+                                        "to": from,
+                                        "data": {"type": "enrol-ack", "v": 1}
+                                    })).await.ok();
+                                    ui::say(&step_line(&format!(
+                                        "Certified by {}'s owner key",
+                                        ui::paint(
+                                            ui::Tone::Bold,
+                                            grant["owner_name"].as_str().unwrap_or("the owner")
+                                        )
+                                    )));
+                                }
+                                Err(e) => {
+                                    grant_refused = Some(e.to_string());
                                 }
                             }
                         }
@@ -2408,17 +2146,19 @@ async fn pair_with_purpose(
                         },
                         None => None,
                     };
-                    let opened = match cer.k() {
-                        Some(k) => open_identity_expose(
-                            &data,
+                    let opened = match (cer.k(), IdentityExpose::from_value(&data)) {
+                        (Some(k), Ok(frame)) => open_identity_expose(
+                            &frame,
                             k,
                             fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
                             cer.caps_canon(),
                             cer.scope(),
                             crate::overlay::overlay_pubkey_bytes().ok(),
                             identity::now_secs(),
-                        ),
-                        None => Err("no key exchange yet"),
+                        )
+                        .map_err(|e| e.to_string()),
+                        (Some(_), Err(e)) => Err(e.to_string()),
+                        (None, _) => Err("no key exchange yet".to_string()),
                     };
                     let verdict = match opened {
                         Ok(cert) => {
@@ -2428,7 +2168,7 @@ async fn pair_with_purpose(
                         }
                         Err(why) => {
                             ui::debug(&format!("pair: identity-expose from {from} refused: {why}"));
-                            expose_verdict_for_refusal(why)
+                            expose_verdict_for_refusal(&why)
                         }
                     };
                     // Only the ceremony's partner is answered, and only a peer
@@ -3045,9 +2785,15 @@ mod enrol_flow_tests {
     // The two ends of one link see the fingerprints the other way round.
     const OWNER_FP: &str = "AA:11";
     const DEVICE_FP: &str = "BB:22";
+    // Vectors take the nonce from the host; tests pin one so failures are the
+    // check under test, not a random nonce.
+    const OFFER_NONCE: [u8; 12] = [0x11; 12];
 
-    fn offer(k: &[u8], dev: &Dev, key: [u8; 32]) -> Value {
-        build_enrol_offer(k, DEVICE_FP, OWNER_FP, CAPS, 1, key, "pop-os", &|m| dev.sign(m)).unwrap()
+    fn offer(k: &[u8], dev: &Dev, key: [u8; 32]) -> EnrolOffer {
+        build_enrol_offer(
+            k, DEVICE_FP, OWNER_FP, CAPS, 1, key, "pop-os", OFFER_NONCE, &|m| dev.sign(m),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3056,22 +2802,41 @@ mod enrol_flow_tests {
         let dev = Dev::new();
         let owner_own = Dev::new().public();
         let data = offer(&k, &dev, dev.public());
-        assert_eq!(data["hold"], json!(true));
+        assert!(data.hold);
+        assert_eq!(data.v, 1);
         assert_eq!(
             open_enrol_offer(&k, OWNER_FP, DEVICE_FP, CAPS, 1, &data, Some(owner_own)),
-            Some(dev.public())
+            Ok(dev.public())
         );
         // Another ceremony's key: does not open.
-        assert_eq!(open_enrol_offer(&[8u8; 32], OWNER_FP, DEVICE_FP, CAPS, 1, &data, Some(owner_own)), None);
+        assert_eq!(
+            open_enrol_offer(&[8u8; 32], OWNER_FP, DEVICE_FP, CAPS, 1, &data, Some(owner_own)),
+            Err(filament_enrol::EnrolError::OfferSealed)
+        );
         // Another link (a relayed / substituted channel): the proof is bound to
         // these fingerprints, so it fails.
-        assert_eq!(open_enrol_offer(&k, OWNER_FP, "CC:33", CAPS, 1, &data, Some(owner_own)), None);
+        assert_eq!(
+            open_enrol_offer(&k, OWNER_FP, "CC:33", CAPS, 1, &data, Some(owner_own)),
+            Err(filament_enrol::EnrolError::PossessionProofInvalid)
+        );
         // Other capabilities or scope than the ceremony agreed: fails.
-        assert_eq!(open_enrol_offer(&k, OWNER_FP, DEVICE_FP, "transfer,shell", 1, &data, Some(owner_own)), None);
-        assert_eq!(open_enrol_offer(&k, OWNER_FP, DEVICE_FP, CAPS, 2, &data, Some(owner_own)), None);
+        assert_eq!(
+            open_enrol_offer(&k, OWNER_FP, DEVICE_FP, "transfer,shell", 1, &data, Some(owner_own)),
+            Err(filament_enrol::EnrolError::PossessionProofInvalid)
+        );
+        assert_eq!(
+            open_enrol_offer(&k, OWNER_FP, DEVICE_FP, CAPS, 2, &data, Some(owner_own)),
+            Err(filament_enrol::EnrolError::PossessionProofInvalid)
+        );
         // Our own key offered back (a reflection), or our key unknown: refused.
-        assert_eq!(open_enrol_offer(&k, OWNER_FP, DEVICE_FP, CAPS, 1, &data, Some(dev.public())), None);
-        assert_eq!(open_enrol_offer(&k, OWNER_FP, DEVICE_FP, CAPS, 1, &data, None), None);
+        assert_eq!(
+            open_enrol_offer(&k, OWNER_FP, DEVICE_FP, CAPS, 1, &data, Some(dev.public())),
+            Err(filament_enrol::EnrolError::OwnKeyReflected)
+        );
+        assert_eq!(
+            open_enrol_offer(&k, OWNER_FP, DEVICE_FP, CAPS, 1, &data, None),
+            Err(filament_enrol::EnrolError::OwnKeyUnknown)
+        );
     }
 
     /// The partner offering a key it does NOT hold (a third device's) cannot
@@ -3082,13 +2847,18 @@ mod enrol_flow_tests {
         let attacker = Dev::new();
         let victim = Dev::new();
         let data = offer(&k, &attacker, victim.public());
-        assert_eq!(open_enrol_offer(&k, OWNER_FP, DEVICE_FP, CAPS, 1, &data, Some(Dev::new().public())), None);
+        assert_eq!(
+            open_enrol_offer(&k, OWNER_FP, DEVICE_FP, CAPS, 1, &data, Some(Dev::new().public())),
+            Err(filament_enrol::EnrolError::PossessionProofInvalid)
+        );
         // Tampered ciphertext.
         let mut bad = offer(&k, &attacker, attacker.public());
-        let sealed = bad["sealed"].as_str().unwrap().to_string();
-        let flipped = format!("{}{}", if sealed.starts_with('0') { "1" } else { "0" }, &sealed[1..]);
-        bad["sealed"] = json!(flipped);
-        assert_eq!(open_enrol_offer(&k, OWNER_FP, DEVICE_FP, CAPS, 1, &bad, Some(Dev::new().public())), None);
+        let sealed = bad.sealed.clone();
+        bad.sealed = format!("{}{}", if sealed.starts_with('0') { "1" } else { "0" }, &sealed[1..]);
+        assert_eq!(
+            open_enrol_offer(&k, OWNER_FP, DEVICE_FP, CAPS, 1, &bad, Some(Dev::new().public())),
+            Err(filament_enrol::EnrolError::OfferSealed)
+        );
     }
 
     fn out() -> EnrolOutcomeInputs {
@@ -3262,21 +3032,23 @@ mod identity_expose_tests {
     fn an_identity_expose_opens_only_for_this_session_and_says_why_not() {
         let k = [5u8; 32];
         let (a, b) = ("AA:11", "BB:22");
-        let (frame, dpub) = expose(&k, a, b, "transfer", 0x01);
+        let (raw, dpub) = expose(&k, a, b, "transfer", 0x01);
+        let frame = IdentityExpose::from_value(&raw).unwrap();
         let now = identity::now_secs();
         let mine = Some([1u8; 32]);
         // The receiver sees the fingerprints the other way round.
         let cert = open_identity_expose(&frame, &k, Some((b, a)), "transfer", 0x01, mine, now).expect("accepted");
         assert_eq!(cert.device_pub, dpub);
-        let why = |r: std::result::Result<identity::DeviceCert, &'static str>| r.err().unwrap();
+        let why = |r: std::result::Result<identity::DeviceCert, filament_enrol::EnrolError>| r.unwrap_err().to_string();
         assert_eq!(why(open_identity_expose(&frame, &[6u8; 32], Some((b, a)), "transfer", 0x01, mine, now)), "seal does not open under this ceremony's key");
         assert_eq!(why(open_identity_expose(&frame, &k, None, "transfer", 0x01, mine, now)), "this link's fingerprints are not known");
         assert_eq!(why(open_identity_expose(&frame, &k, Some((b, "CC:33")), "transfer", 0x01, mine, now)), "possession signature does not verify for this session");
         assert_eq!(why(open_identity_expose(&frame, &k, Some((b, a)), "transfer,shell", 0x01, mine, now)), "possession signature does not verify for this session");
         assert_eq!(why(open_identity_expose(&frame, &k, Some((b, a)), "transfer", 0x01, Some(dpub), now)), "it is this device's own key, reflected back");
         assert!(why(open_identity_expose(&frame, &k, Some((b, a)), "transfer", 0x01, None, now)).contains("reflection"));
-        let mut torn = frame.clone();
+        let mut torn = raw.clone();
         torn["nonce"] = json!("00");
+        let torn = IdentityExpose::from_value(&torn).unwrap();
         assert_eq!(why(open_identity_expose(&torn, &k, Some((b, a)), "transfer", 0x01, mine, now)), "nonce is not 12 bytes");
     }
 
@@ -3291,10 +3063,10 @@ mod identity_expose_tests {
         let owner = identity::UserKey::from_seed(&[3u8; 32]).unwrap();
         let cert = identity::DeviceCert::certify(&owner, dpub, identity::now_secs(), identity::CERT_TTL_SECS).unwrap();
         let sign = |m: &[u8]| dev.sign(m).as_ref().try_into().ok();
-        let frame = build_identity_expose(&k, a, b, "transfer", 0x01, &cert, &sign).unwrap();
+        let frame = build_identity_expose(&k, a, b, "transfer", 0x01, &cert, [0x22; 12], &sign).unwrap();
         let got = open_identity_expose(&frame, &k, Some((b, a)), "transfer", 0x01, Some([1u8; 32]), identity::now_secs()).unwrap();
         assert_eq!(got.device_pub, dpub);
-        let of = frame["nonce"].as_str().unwrap();
+        let of = frame.nonce.as_str();
         let ack = seal_expose_ack(&k, of).unwrap();
         assert_eq!(ack["type"], json!("identity-expose-ack"));
         assert_eq!(open_expose_ack(&k, &ack).as_deref(), Some(of));
@@ -3324,7 +3096,12 @@ mod identity_expose_tests {
         let (peer_acks, a_will, b_will) = (true, true, false);
         let mut ax = ExposeExchange::new();
         let mut bx = ExposeExchange::new();
-        ax.offer(build_identity_expose(&k, a_fp, b_fp, "transfer", 0x01, &cert, &sign).unwrap());
+        ax.offer(
+            build_identity_expose(&k, a_fp, b_fp, "transfer", 0x01, &cert, [0x33; 12], &sign)
+                .unwrap()
+                .to_value()
+                .unwrap(),
+        );
         let mut b_cert = None;
         let mut b_ack: Option<Value> = None;
         let (mut copies, mut acks) = (0usize, 0usize);
@@ -3335,13 +3112,26 @@ mod identity_expose_tests {
             if let Some(f) = ax.take_due(t, peer_acks) {
                 copies += 1;
                 if copies > drop {
-                    let opened = open_identity_expose(&f, &k, Some((b_fp, a_fp)), "transfer", 0x01, Some([1u8; 32]), identity::now_secs());
+                    let opened = IdentityExpose::from_value(&f)
+                        .map_err(|err| err.to_string())
+                        .and_then(|frame| {
+                            open_identity_expose(
+                                &frame,
+                                &k,
+                                Some((b_fp, a_fp)),
+                                "transfer",
+                                0x01,
+                                Some([1u8; 32]),
+                                identity::now_secs(),
+                            )
+                            .map_err(|err| err.to_string())
+                        });
                     let verdict = match opened {
                         Ok(c) => {
                             b_cert = Some(c);
                             filament_peerloop::expose::Verdict::Accepted
                         }
-                        Err(why) => expose_verdict_for_refusal(why),
+                        Err(why) => expose_verdict_for_refusal(&why),
                     };
                     if bx.on_peer_frame(t, verdict, peer_acks) {
                         let ack = b_ack.get_or_insert_with(|| seal_expose_ack(&k, f["nonce"].as_str().unwrap()).unwrap()).clone();
