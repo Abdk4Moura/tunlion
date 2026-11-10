@@ -67,7 +67,7 @@ pub use imp::{
     try_bootstrap, try_cap_status, try_deny_request, try_dial, try_dial_reason, try_fleet_rendezvous,
     try_l3_state, try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping,
     try_pty_reason, try_reconfigure, try_reload, try_reload_expose, try_resize,
-    try_revocation_sync, try_unmount, try_wake, try_depart,
+    try_revocation_sync, try_unmount, try_wake, try_depart, warm_pty_end_reason,
 };
 
 #[cfg(not(unix))]
@@ -1201,6 +1201,12 @@ mod stub {
     /// No control socket here, so no daemon can be asked to reload onto an
     /// updated binary; `update` then prints how to restart it instead.
     pub async fn try_reload() -> Option<Value> {
+        None
+    }
+
+    /// No warm daemon bridge exists on this platform, so there is no recorded
+    /// close reason to ask for.
+    pub async fn warm_pty_end_reason(_session: &str) -> Option<String> {
         None
     }
 
