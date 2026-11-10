@@ -63,7 +63,7 @@ For a **fleet sibling** (same owner, never paired directly with the receiver):
 Validated at integration head `9144ee749`, not yet merged to main:
 
 - A certificate-less authenticated pair retains shell access granted explicitly
-  on the serving machine. Fleet sibling defaults do not remove that local grant.
+  on the serving machine.
 - An anonymous peer is transfer-only.
 - A replacement transport does not inherit the previous transport's fleet
   verification or nonces.
