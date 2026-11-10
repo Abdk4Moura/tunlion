@@ -525,6 +525,18 @@ async fn exec_once(
                         if mux.transport().is_dead() {
                             return Err(crate::identity_flow::link_died_error(peer, "during exec (the output stream ended and the connection is closed)"));
                         }
+                        // A status-less end is authoritative about the stream but not about
+                        // why it ended: when our own certificate has already expired, the
+                        // owner cut us off at its deadline, so name the expiry (exit 4)
+                        // rather than blaming a close frame that the cut pre-empted.
+                        if let Some(at) =
+                            crate::identity_flow::own_access_ended_at(crate::identity::now_secs())
+                        {
+                            return Err(anyhow::anyhow!(
+                                "'{peer}' refused to continue: {}",
+                                crate::capability::expired_reason_for(at, None)
+                            ));
+                        }
                         // TERMINAL AND NAMED, with no timeout involved: the session's stream ended
                         // and no `exec-close` carrying a status will follow, so waiting longer can
                         // only wait on a link that is working and a frame that is not coming.
