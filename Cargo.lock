@@ -1174,6 +1174,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
+ "filament-policy",
  "hex",
  "ring",
  "serde",
@@ -1211,6 +1212,10 @@ dependencies = [
  "spake2",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "filament-policy"
+version = "0.2.0"
 
 [[package]]
 name = "filedescriptor"
@@ -4058,6 +4063,16 @@ dependencies = [
  "webrtc",
  "windows-sys 0.59.0",
  "wintun",
+]
+
+[[package]]
+name = "tunlion-policy-wasm"
+version = "0.2.0"
+dependencies = [
+ "filament-policy",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]

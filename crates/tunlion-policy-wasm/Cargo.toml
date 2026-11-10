@@ -1,0 +1,27 @@
+# tunlion-policy-wasm — JSON bridge to the shared transfer policy.
+#
+# The policy itself lives in `filament-policy` (and is re-exported by
+# `filament-cap`). This crate only owns the browser wire shape: serde DTOs plus
+# one `admitTransfer(input: string) -> string` export. No crypto, no clock, no
+# filesystem, no runtime: `now` is required in the input.
+[package]
+name = "tunlion-policy-wasm"
+version = "0.2.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/tunlion"
+description = "WASM JSON surface for the shared Tunlion transfer-admission policy"
+readme = "README.md"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+filament-policy = { path = "../filament-policy", version = "0.2.0" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"

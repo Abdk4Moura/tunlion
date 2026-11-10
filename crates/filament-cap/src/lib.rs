@@ -7,6 +7,13 @@
 //! unchanged, and keeps the host-bound orchestration (store I/O, mode flag,
 //! observability counters, the DeviceCert-reading glue) alongside those
 //! re-exports.
+//!
+//! The transfer-admission policy (TransferGateInput / TransferDecision /
+//! TransferDeny / BindingStrength / IdentityState / CapOutcome /
+//! transfer_decision / the proven and expiry composers) lives in the
+//! dependency-free `filament-policy` crate and is re-exported by
+//! [`capability`] under its historical paths. That crate has no clock: `now` is
+//! an input, which is what lets the browser compile the same decision.
 
 pub mod capability;
 pub mod ephemeral;

@@ -1,0 +1,168 @@
+{
+  "version": 1,
+  "description": "Shared transfer-admission vectors. Native tests replay these through tunlion_policy_wasm::admit_transfer; a browser test must call admitTransfer(JSON.stringify(case.input)) and compare the parsed result with case.expected.",
+  "cases": [
+    {
+      "name": "allow",
+      "input": {
+        "authoritative": true,
+        "legacyAllowed": true,
+        "outcome": { "kind": "authorized" },
+        "certRevoked": false,
+        "denied": false,
+        "authKeyCaps": null,
+        "certExpires": 2000,
+        "now": 1000,
+        "sameOwner": false,
+        "binding": "proven",
+        "scopedInBounds": true,
+        "hasExplicitGrant": false,
+        "ceilingAuthorizes": false,
+        "identityState": "resolved"
+      },
+      "expected": {
+        "allowed": true,
+        "deny": null,
+        "denyReason": null,
+        "observableOutcome": { "kind": "authorized" },
+        "fleetOk": false,
+        "ceilingOk": false
+      }
+    },
+    {
+      "name": "anonymous-transfer-only",
+      "input": {
+        "authoritative": true,
+        "legacyAllowed": true,
+        "outcome": { "kind": "denied", "reason": "no header" },
+        "certRevoked": false,
+        "denied": false,
+        "authKeyCaps": null,
+        "certExpires": null,
+        "now": 1000,
+        "sameOwner": false,
+        "binding": "none",
+        "scopedInBounds": true,
+        "hasExplicitGrant": false,
+        "ceilingAuthorizes": false,
+        "identityState": "explicitlyUnavailableAnonymous"
+      },
+      "expected": {
+        "allowed": true,
+        "deny": null,
+        "denyReason": null,
+        "observableOutcome": { "kind": "denied", "reason": "no header" },
+        "fleetOk": false,
+        "ceilingOk": false
+      }
+    },
+    {
+      "name": "pending-identity",
+      "input": {
+        "authoritative": true,
+        "legacyAllowed": true,
+        "outcome": { "kind": "denied", "reason": "no header" },
+        "certRevoked": false,
+        "denied": false,
+        "authKeyCaps": null,
+        "certExpires": null,
+        "now": 1000,
+        "sameOwner": false,
+        "binding": "none",
+        "scopedInBounds": true,
+        "hasExplicitGrant": false,
+        "ceilingAuthorizes": false,
+        "identityState": "pending"
+      },
+      "expected": {
+        "allowed": false,
+        "deny": { "kind": "unauthorized", "reason": "no header" },
+        "denyReason": "no header",
+        "observableOutcome": { "kind": "denied", "reason": "no header" },
+        "fleetOk": false,
+        "ceilingOk": false
+      }
+    },
+    {
+      "name": "revoked",
+      "input": {
+        "authoritative": true,
+        "legacyAllowed": true,
+        "outcome": { "kind": "authorized" },
+        "certRevoked": true,
+        "denied": false,
+        "authKeyCaps": null,
+        "certExpires": 2000,
+        "now": 1000,
+        "sameOwner": false,
+        "binding": "proven",
+        "scopedInBounds": true,
+        "hasExplicitGrant": false,
+        "ceilingAuthorizes": false,
+        "identityState": "resolved"
+      },
+      "expected": {
+        "allowed": false,
+        "deny": { "kind": "revoked" },
+        "denyReason": "device revoked",
+        "observableOutcome": { "kind": "authorized" },
+        "fleetOk": false,
+        "ceilingOk": false
+      }
+    },
+    {
+      "name": "ceiling-deny",
+      "input": {
+        "authoritative": true,
+        "legacyAllowed": false,
+        "outcome": { "kind": "authorized" },
+        "certRevoked": false,
+        "denied": false,
+        "authKeyCaps": ["mount"],
+        "certExpires": 2000,
+        "now": 1000,
+        "sameOwner": false,
+        "binding": "proven",
+        "scopedInBounds": true,
+        "hasExplicitGrant": false,
+        "ceilingAuthorizes": false,
+        "identityState": "resolved"
+      },
+      "expected": {
+        "allowed": false,
+        "deny": { "kind": "ceiling" },
+        "denyReason": "this capability is outside the device's invitation ceiling",
+        "observableOutcome": { "kind": "authorized" },
+        "fleetOk": false,
+        "ceilingOk": false
+      }
+    },
+    {
+      "name": "expired",
+      "input": {
+        "authoritative": true,
+        "legacyAllowed": false,
+        "outcome": { "kind": "authorized" },
+        "certRevoked": false,
+        "denied": false,
+        "authKeyCaps": ["transfer"],
+        "certExpires": 1000,
+        "now": 1000,
+        "sameOwner": false,
+        "binding": "proven",
+        "scopedInBounds": true,
+        "hasExplicitGrant": false,
+        "ceilingAuthorizes": false,
+        "identityState": "resolved"
+      },
+      "expected": {
+        "allowed": false,
+        "deny": { "kind": "expired", "at": 1000 },
+        "denyReason": "access expired at 1000",
+        "observableOutcome": { "kind": "authorized" },
+        "fleetOk": false,
+        "ceilingOk": false
+      }
+    }
+  ]
+}
