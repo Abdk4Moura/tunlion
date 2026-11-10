@@ -653,7 +653,9 @@ impl Mux {
         self.open_ack_tx.lock().await.clear();
         self.exec_ctl.lock().await.clear();
         self.exec_init.lock().await.clear();
-        self.close_err.lock().await.clear();
+        // Do NOT clear `close_err`: a denial that raced the transport's death
+        // must still be readable by the pump that is about to end. The map is
+        // bounded by the streams drained here and sids are not reused.
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
             if let Some(h) = s.read_pump {

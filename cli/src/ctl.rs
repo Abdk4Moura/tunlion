@@ -278,6 +278,40 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(s)
     }
 
+    /// The scoped reason a finished warm PTY bridge recorded, if any. The
+    /// daemon stores it around the bridge's socket close, so poll briefly;
+    /// silence is a clean end, not an error.
+    pub async fn warm_pty_end_reason(session: &str) -> Option<String> {
+        for attempt in 0..6 {
+            if let Some(reason) = warm_pty_end_reason_once(session).await {
+                return Some(reason);
+            }
+            if attempt < 5 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        None
+    }
+
+    async fn warm_pty_end_reason_once(session: &str) -> Option<String> {
+        if reuse_disabled() {
+            return None;
+        }
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut line = serde_json::to_vec(&json!({ "op": "warm-pty-reason", "session": session })).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), read_line(&mut s, 4096))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true))
+            .then(|| v["reason"].as_str().map(str::to_string))
+            .flatten()
+    }
+
     /// Relay a window-size change to an already-open warm PTY (by `session`),
     /// over a fresh short control connection. Best-effort and fire-and-forget.
     pub async fn try_resize(session: &str, cols: u16, rows: u16) {
@@ -898,6 +932,10 @@ mod imp {
                     }
                     Some("cap-status") => ReqKind::CapStatus,
                     Some("list-warm") => ReqKind::ListWarm,
+                    Some("warm-pty-reason") => {
+                        let Some(session) = v["session"].as_str().map(str::to_string) else { return };
+                        ReqKind::WarmPtyReason { session }
+                    }
                     Some("fleet-rendezvous") => {
                         let Some(name) = v["name"].as_str().map(str::to_string) else { return };
                         ReqKind::FleetRendezvous { name }

@@ -3097,16 +3097,31 @@ async fn try_warm_pty(
         });
         let r = pump_warm_pty_stdio(sock, stdin_rx, pending, received).await;
         winch.abort();
+        let r = match r {
+            Ok(()) => match crate::ctl::warm_pty_end_reason(session).await {
+                Some(reason) => Err(anyhow::anyhow!("{reason}")),
+                None => Ok(()),
+            },
+            Err(error) => Err(error),
+        };
         Some(r)
     } else {
         // One-shot (scripted): no raw mode, no SIGWINCH, just stream output.
         crate::ui::trace(&format!(
             "tunlion: reusing warm link to '{peer}' for one-shot pty"
         ));
-        // NOTE: neither the cold path nor this warm path propagates the remote
-        // command's exit status - both return Ok(()) regardless. This is a known
-        // limitation / future enhancement.
-        Some(pump_warm_pty_one_shot(sock, stdin_rx, pending).await)
+        // A scoped close (revoked, expired, forgotten) is still recorded by
+        // the daemon bridge even though the socket itself just reaches EOF.
+        // Ask for it so a one-shot exits nonzero with the reason instead of
+        // reporting a clean shell exit.
+        let result = pump_warm_pty_one_shot(sock, stdin_rx, pending).await;
+        match result {
+            Ok(()) => match crate::ctl::warm_pty_end_reason(session).await {
+                Some(reason) => Some(Err(anyhow::anyhow!("{reason}"))),
+                None => Some(Ok(())),
+            },
+            Err(error) => Some(Err(error)),
+        }
     }
 }
 

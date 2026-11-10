@@ -456,6 +456,31 @@ pub fn reap_warm_bootstraps(pending: &mut PendingBootstraps) {
 /// the stream. Shared by the daemon handlers.
 pub type WarmPtys = std::sync::Arc<std::sync::Mutex<HashMap<String, (String, u32)>>>;
 
+/// The scoped reason a finished warm PTY bridge last saw, keyed by session.
+/// The bridge consumes the peer's `l2-close{err}` after the socket ends and
+/// parks it here; the one-shot client asks once so it can exit nonzero with
+/// the reason instead of rendering a clean EOF. Bounded: a new bridge for the
+/// same session overwrites it, and the query removes it.
+static WARM_PTY_END_REASONS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+pub fn record_warm_pty_end(session: &str, reason: String) {
+    let reasons = WARM_PTY_END_REASONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    reasons
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(session.to_string(), reason);
+}
+
+pub fn take_warm_pty_end(session: &str) -> Option<String> {
+    let reasons = WARM_PTY_END_REASONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    reasons
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(session)
+}
+
 /// Dispatch one warm-reuse control request to the right handler. Warm reuse is
 /// unix-only (the control socket is a unix-domain socket); on non-unix `control::Req`
 /// is uninhabited so this is never reached - it only keeps the event loop portable.
@@ -487,6 +512,7 @@ pub async fn handle_warm_req(
         control::ReqKind::Dial { .. } => req.reject("dial not handled here").await,
         control::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, tx, req).await,
         control::ReqKind::Resize { .. } => handle_warm_resize(l2_muxes, warm_ptys, req).await,
+        control::ReqKind::WarmPtyReason { .. } => handle_warm_pty_reason(req).await,
         control::ReqKind::Exec { .. } => {
             crate::l2::warm_exec::handle_warm_exec(conn, l2_muxes, tx, probes, req).await
         }
@@ -692,7 +718,15 @@ pub async fn handle_warm_pty(
                     m.insert(session.clone(), (pid, sid));
                 }
                 let sock = req.accept().await;
+                // Keep a handle so the peer's scoped close reason can be read
+                // after the bridge ends. The bridge records it in the mux but
+                // never consumed it on this path, which made a one-shot PTY
+                // report a clean EOF (rc 0) for an access-revoked session.
+                let ended = mux.clone();
                 crate::l2::serve_verified_stream(mux, sid, sock, first, rx_pipe).await;
+                if let Some(reason) = ended.take_close_err(sid).await {
+                    record_warm_pty_end(&session, reason);
+                }
                 // Bridge ended (shell exit / client gone / link drop): drop our
                 // entry, but only if it is still ours (a reconnect may have
                 // replaced it).
@@ -757,6 +791,18 @@ pub async fn handle_warm_resize(
         }
     }
     req.accept().await; // close the client's short connection cleanly
+}
+
+/// Answer the scoped end reason a finished warm PTY bridge recorded, if any.
+/// Consuming the entry keeps the map bounded; a clean end answers `ok` alone.
+pub async fn handle_warm_pty_reason(req: control::Req) {
+    let control::ReqKind::WarmPtyReason { session } = &req.kind else {
+        return;
+    };
+    match take_warm_pty_end(session) {
+        Some(reason) => req.reply(&json!({ "ok": true, "reason": reason })).await,
+        None => req.reply(&json!({ "ok": true })).await,
+    }
 }
 
 #[cfg(test)]
