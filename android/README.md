@@ -62,9 +62,11 @@ or device verification; use the workflow or an approved leased Android worker.
 - Pairing is carrier-first. The spoken code and invitation file are carrier
   facts, not relationship facts; the relationship choices are labelled intent
   only. Temporary worker stays disabled for a spoken code and is invitation
-  file only. Invitation preview and enrollment confirmation are blocked on
-  shared core enrollment facts; this screen reads no invitation and writes
-  nothing.
+  file only. An invitation file is read once into memory and handed to the
+  core's `previewInvitation`; the screen shows only the core's preview fields
+  and offers Join only when the preview succeeded and the core's `expired` flag
+  is false. Join passes the same bytes to `joinInvitation`. Spoken-code
+  enrollment is still not linked.
 - The device list is projected from core `devices()`, not from Kotlin policy or
   CLI output. It shows the stored relationship (paired, fleet, temporary,
   unknown) and every returned action state (effective, pending, blocked,

@@ -14,7 +14,10 @@ interface TunlionCore {
     suspend fun stop(): CoreResult
     suspend fun joinCode(code: String, remember: Boolean): CoreResult
     suspend fun receiveCode(code: String): CoreResult
-    suspend fun joinInvitation(bytes: ByteArray): CoreResult
+    /** Ask the shared core to read an invitation. Kotlin never parses or validates the bytes. */
+    suspend fun previewInvitation(bytes: ByteArray): InvitationPreviewResult
+    /** Join with the exact bytes the core previewed. Blocking work runs off the main thread. */
+    suspend fun joinInvitation(bytes: ByteArray, name: String): CoreResult
     suspend fun sendFiles(deviceId: String?, files: List<android.net.Uri>, onCode: (String) -> Unit): CoreResult
 }
 
@@ -29,8 +32,13 @@ data class CoreStatus(
     val transfers: List<CoreTransfer> = emptyList(),
     val lastSend: CoreSendReport? = null,
     val engineError: String? = null,
-    /** Set only from a typed core enrollment surface; never inferred from devices or pairing. */
+    /**
+     * Invitation preview and join are linked. Set only from a typed core
+     * enrollment surface; never inferred from devices or pairing.
+     */
     val enrollmentSupported: Boolean = false,
+    /** Spoken-code enrollment is linked. Separate from invitations: the core has no code-enrollment surface yet. */
+    val codeEnrollmentSupported: Boolean = false,
 ) {
     val identityState: CoreIdentityState get() = when {
         !statusLoaded -> CoreIdentityState.LOADING
@@ -71,6 +79,30 @@ enum class CoreAccessState { AVAILABLE, PENDING, BLOCKED, UNSUPPORTED, UNKNOWN }
 enum class CoreActionKind { SEND, RECEIVE_INBOX, TERMINAL, FOLDER }
 /** One direction-named core action fact, preserved for rendering. */
 data class CoreAction(val kind: CoreActionKind, val state: CoreAccessState, val reason: String) : java.io.Serializable
+
+/** Rendering mirror of the core's `CoreInvitationPreview`. Every field is the core's value, unmodified. */
+data class InvitationPreview(
+    val ownerName: String,
+    val relationship: InvitationRelationship,
+    val requestedCapabilities: List<String>,
+    /** Unix seconds, as signed. */
+    val expires: Long,
+    /** Seconds, as signed. */
+    val maxOffline: Long,
+    val maxUses: Long?,
+    val reusable: Boolean,
+    val ephemeral: Boolean,
+    /** The core's expiry verdict. Kotlin never compares clocks. */
+    val expired: Boolean,
+)
+
+/** Mirror of the core's `EnrollmentRelationship`. */
+enum class InvitationRelationship { ORDINARY_PAIR, OWN_DEVICE, OTHER_PERSON, TEMPORARY_WORKER, UNKNOWN }
+
+sealed interface InvitationPreviewResult {
+    data class Previewed(val preview: InvitationPreview) : InvitationPreviewResult
+    data class Failed(val failure: CoreResult.Failure) : InvitationPreviewResult
+}
 
 sealed interface CoreResult {
     data object Success : CoreResult

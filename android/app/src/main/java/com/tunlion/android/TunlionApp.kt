@@ -247,10 +247,15 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                             ActionRow(Icons.Outlined.FolderOpen, "Files", "Send a file or receive with a code") { navigate(Screen.FILES) }
                             }
                         }
-                        Screen.PAIR -> PairScreen(busy, status.enrollmentSupported, onJoin = { code, remember ->
-                            requestNotifications()
-                            perform({ core.joinCode(code, remember) }) { navigate(Screen.HOME) }
-                        })
+                        Screen.PAIR -> PairScreen(core, busy, status.enrollmentSupported, status.codeEnrollmentSupported,
+                            status.deviceName, onJoin = { code, remember ->
+                                requestNotifications()
+                                perform({ core.joinCode(code, remember) }) { navigate(Screen.HOME) }
+                            }, onJoinInvitation = { bytes, name ->
+                                requestNotifications()
+                                // The exact array the core previewed. Never re-read or rebuilt.
+                                perform({ core.joinInvitation(bytes, name) }) { navigate(Screen.HOME) }
+                            })
                         Screen.SETUP -> {
                             Title("Make this phone yours.", "Your identity lives on this phone. No account or sign-in.")
                             Step("01", "Keep your recovery words", "Confirm them before the identity is saved.")
@@ -384,8 +389,26 @@ private fun FirstConnection(onJoin: () -> Unit, onSetup: () -> Unit) {
 }
 
 @Composable
-private fun PairScreen(busy: Boolean, supported: Boolean, onJoin: (String, Boolean) -> Unit) {
+private fun PairScreen(core: TunlionCore, busy: Boolean, supported: Boolean, codeSupported: Boolean, deviceName: String?,
+    onJoin: (String, Boolean) -> Unit, onJoinInvitation: (ByteArray, String) -> Unit) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
     var code by rememberSaveable { mutableStateOf("") }
+    // Read once per pick. This same instance goes to preview and to join.
+    var invitation by remember { mutableStateOf<ByteArray?>(null) }
+    var readError by remember { mutableStateOf<String?>(null) }
+    val invitationPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            invitation = null
+            readError = null
+            scope.launch {
+                try {
+                    invitation = withContext(Dispatchers.IO) { readInvitationFile(context, uri) }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { readError = "Could not read that file. Nothing was previewed or joined." }
+            }
+        }
+    }
     var carrier by rememberSaveable { mutableStateOf("Spoken code") }
     var relationship by rememberSaveable { mutableStateOf("My device") }
     fun selectCarrier(next: String) {
@@ -402,19 +425,21 @@ private fun PairScreen(busy: Boolean, supported: Boolean, onJoin: (String, Boole
     }
     SecondaryText(when (carrier) {
         "Spoken code" -> "A spoken code is a carrier fact only. It cannot select or prove a relationship."
-        else -> "An invitation file must be previewed and verified by the shared core before any join. This build cannot read or preview one yet."
+        else -> if (supported) "The shared core reads and verifies the invitation file. You see its signed facts before anything is joined."
+            else "Invitation preview is not linked in this build. No file is read and nothing is joined."
     })
     if (carrier == "Spoken code") {
         OutlinedTextField(code, { code = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
             label = { Text("Device code") }, placeholder = { Text("brave-otter-3141") },
             textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
-            shape = RoundedCornerShape(7.dp), enabled = supported && !busy,
+            shape = RoundedCornerShape(7.dp), enabled = codeSupported && !busy,
             keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(autoCorrectEnabled = false))
         SecondaryText("A spoken code never selects or proves a relationship. Temporary worker requires a signed invitation file.")
+        if (!codeSupported) SecondaryText("Spoken-code enrollment is not linked in this build. Use an invitation file, or Files for a one-time transfer code.")
     } else {
-        OutlinedButton(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-            shape = RoundedCornerShape(7.dp)) { Text("Preview invitation · unavailable") }
-        SecondaryText("Invitation preview and join are unavailable until the shared core exposes signed enrollment facts. This screen reads no file and writes nothing.")
+        InvitationReview(core, invitation, deviceName, busy, enabled = supported,
+            onChooseFile = { invitationPicker.launch(arrayOf("*/*")) }, onJoin = onJoinInvitation)
+        readError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
     }
     Eyebrow("INTENDED RELATIONSHIP")
     SecondaryText("This choice is an intent only, not a signed fact. It records no relationship and grants no permission.")
@@ -437,8 +462,93 @@ private fun PairScreen(busy: Boolean, supported: Boolean, onJoin: (String, Boole
     })
     if (!supported) SecondaryText("Enrollment review is unavailable until the shared core exposes enrollment facts. These choices do not record a relationship or grant permission. Use Files for a one-time transfer code.")
     SecondaryText("The actual relationship is shown only after the core verifies signed enrollment facts. Nearby enrollment is not supported in this build.")
-    if (carrier == "Spoken code") PrimaryButton("Review enrollment", busy, enabled = supported && code.isNotBlank(),
+    if (carrier == "Spoken code") PrimaryButton("Review enrollment", busy, enabled = codeSupported && code.isNotBlank(),
         onClick = { onJoin(code.trim(), true) })
+}
+
+/** Memory guard for the picker only. The core alone decides whether the bytes are an invitation. */
+private const val INVITATION_READ_LIMIT = 1 shl 20
+
+private fun readInvitationFile(context: android.content.Context, uri: android.net.Uri): ByteArray {
+    val input = checkNotNull(context.contentResolver.openInputStream(uri)) { "The selected file is not readable" }
+    return input.use { stream ->
+        val out = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(8 * 1024)
+        while (true) {
+            val count = stream.read(buffer)
+            if (count < 0) break
+            out.write(buffer, 0, count)
+            check(out.size() <= INVITATION_READ_LIMIT) { "The selected file is too large to read" }
+        }
+        out.toByteArray()
+    }
+}
+
+/**
+ * Preview, then confirm. Renders only the fields the core returned. Join is
+ * offered only after a successful core preview whose `expired` flag is false,
+ * and it hands back the very array that was previewed.
+ */
+@Composable
+internal fun InvitationReview(core: TunlionCore, invitation: ByteArray?, defaultName: String?, busy: Boolean,
+    enabled: Boolean, onChooseFile: () -> Unit, onJoin: (ByteArray, String) -> Unit) {
+    var result by remember(invitation) { mutableStateOf<InvitationPreviewResult?>(null) }
+    var name by rememberSaveable { mutableStateOf(defaultName.orEmpty()) }
+    LaunchedEffect(invitation) {
+        result = null
+        val bytes = invitation ?: return@LaunchedEffect
+        result = try { core.previewInvitation(bytes) }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { InvitationPreviewResult.Failed(CoreResult.Failure(CoreErrorKind.INTERNAL,
+            "The invitation could not be previewed. Nothing was joined.")) }
+    }
+    OutlinedButton(onClick = onChooseFile, enabled = enabled && !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        shape = RoundedCornerShape(7.dp)) { Text(if (invitation == null) "Choose invitation file" else "Choose another invitation file") }
+    // The carrier text above already explains an unlinked build.
+    if (!enabled) return
+    val preview = (result as? InvitationPreviewResult.Previewed)?.preview
+    when (val current = result) {
+        null -> SecondaryText(if (invitation == null) "Nothing is joined until the core shows the invitation and you confirm."
+            else "The core is reading the invitation…")
+        is InvitationPreviewResult.Failed -> {
+            Eyebrow("CORE COULD NOT PREVIEW")
+            Text(current.failure.message, color = MaterialTheme.colorScheme.error)
+        }
+        is InvitationPreviewResult.Previewed -> {
+            val facts = current.preview
+            Eyebrow("INVITATION PREVIEW")
+            DetailRow("Owner", facts.ownerName)
+            DetailRow("Relationship", invitationRelationshipLabel(facts.relationship))
+            DetailRow("Requested capabilities",
+                if (facts.requestedCapabilities.isEmpty()) "None listed" else facts.requestedCapabilities.joinToString("\n"))
+            DetailRow("Expires", java.time.Instant.ofEpochSecond(facts.expires).toString())
+            DetailRow("Max offline", "${facts.maxOffline} seconds")
+            DetailRow("Uses", if (facts.reusable) "Reusable" else facts.maxUses?.toString() ?: "Not stated")
+            DetailRow("Ephemeral", if (facts.ephemeral) "Yes" else "No")
+            DetailRow("Expired", if (facts.expired) "Yes" else "No")
+            if (facts.relationship == InvitationRelationship.TEMPORARY_WORKER)
+                SecondaryText("The core reports temporary-worker access. It is bounded by the signed expiry above.")
+            if (facts.expired) Text("The core reports this invitation has expired. It cannot be joined.",
+                color = MaterialTheme.colorScheme.error)
+            SecondaryText("These are the requested capabilities as signed, not a confirmation that any action will work. The intended relationship on this screen records nothing.")
+        }
+    }
+    OutlinedTextField(name, { name = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
+        label = { Text("This device's name") }, shape = RoundedCornerShape(7.dp), enabled = !busy,
+        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(autoCorrectEnabled = false))
+    val joinable = preview != null && !preview.expired
+    PrimaryButton("Join with this invitation", busy, enabled = joinable, onClick = {
+        val bytes = invitation
+        if (bytes != null && preview != null && !preview.expired) onJoin(bytes, name)
+    })
+}
+
+private fun invitationRelationshipLabel(relationship: InvitationRelationship) = when (relationship) {
+    InvitationRelationship.ORDINARY_PAIR -> "Ordinary pair"
+    InvitationRelationship.OWN_DEVICE -> "Own device"
+    InvitationRelationship.OTHER_PERSON -> "Other person"
+    InvitationRelationship.TEMPORARY_WORKER -> "Temporary worker"
+    InvitationRelationship.UNKNOWN -> "Not stated in the invitation"
 }
 
 private fun Modifier.toggleableForRemember(checked: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) =

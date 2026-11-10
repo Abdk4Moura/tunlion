@@ -20,6 +20,7 @@ import uniffi.tunlion_core.DeviceAccess as NativeDeviceAccess
 import uniffi.tunlion_core.DevicePresence as NativeDevicePresence
 import uniffi.tunlion_core.DeviceRelationship as NativeDeviceRelationship
 import uniffi.tunlion_core.EngineState as NativeEngineState
+import uniffi.tunlion_core.EnrollmentRelationship as NativeEnrollmentRelationship
 import uniffi.tunlion_core.PendingIdentity
 
 /** Android resource adapter only. No subprocess, enrollment policy or key parsing. */
@@ -76,9 +77,12 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
             engineRunning = EngineState.phase.value == EnginePhase.AVAILABLE && snapshot.engine == NativeEngineState.RUNNING,
             engineError = EngineState.error ?: publicationError,
             devices = devices, lastSend = lastSend,
-            // CoreSession has no enrollment preview/commit/ack surface yet.
-            // Leave controls disabled rather than inferring a relationship.
-            enrollmentSupported = false,
+            // The linked CoreSession exposes preview_invitation and
+            // join_invitation. This is a fact about the binding, never
+            // inferred from devices or pairing.
+            enrollmentSupported = true,
+            // CoreSession has no spoken-code enrollment surface.
+            codeEnrollmentSupported = false,
             transfers = history.records().takeLast(20).reversed().map {
                 CoreTransfer(it.optString("file"), it.optString("direction") == "in", it.optBoolean("ok"), history.saved(it))
             })
@@ -139,9 +143,74 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     internal fun receiverState() = session.status().engine
 
     override suspend fun joinCode(code: String, remember: Boolean) = enrollmentUnavailable()
-    override suspend fun joinInvitation(bytes: ByteArray) = enrollmentUnavailable()
     private fun enrollmentUnavailable() = CoreResult.Failure(CoreErrorKind.FEATURE_NOT_LINKED,
         "Native pairing and fleet enrollment are not connected yet. No device or permission has been changed.")
+
+    /** The core parses, verifies and judges expiry. This only projects its record. */
+    override suspend fun previewInvitation(bytes: ByteArray): InvitationPreviewResult = withContext(Dispatchers.IO) {
+        try {
+            val preview = session.previewInvitation(bytes)
+            InvitationPreviewResult.Previewed(InvitationPreview(
+                ownerName = preview.ownerName,
+                relationship = when (preview.relationship) {
+                    NativeEnrollmentRelationship.ORDINARY_PAIR -> InvitationRelationship.ORDINARY_PAIR
+                    NativeEnrollmentRelationship.OWN_DEVICE -> InvitationRelationship.OWN_DEVICE
+                    NativeEnrollmentRelationship.OTHER_PERSON -> InvitationRelationship.OTHER_PERSON
+                    NativeEnrollmentRelationship.TEMPORARY_WORKER -> InvitationRelationship.TEMPORARY_WORKER
+                    NativeEnrollmentRelationship.UNKNOWN -> InvitationRelationship.UNKNOWN
+                },
+                requestedCapabilities = preview.requestedCapabilities,
+                expires = preview.expires.toLong(),
+                maxOffline = preview.maxOffline.toLong(),
+                maxUses = preview.maxUses?.toLong(),
+                reusable = preview.reusable,
+                ephemeral = preview.ephemeral,
+                expired = preview.expired,
+            ))
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (error: CoreException) { InvitationPreviewResult.Failed(coreFailure(error)) }
+        catch (_: Exception) { InvitationPreviewResult.Failed(CoreResult.Failure(CoreErrorKind.INTERNAL,
+            "The native core could not preview the invitation. Nothing was joined.")) }
+    }
+
+    /**
+     * Join on the core's engine slot with the caller's exact bytes. The core
+     * re-verifies the token and its expiry; this adapter decides nothing.
+     */
+    override suspend fun joinInvitation(bytes: ByteArray, name: String): CoreResult = runTransfer {
+        try {
+            session.joinInvitation(bytes, name, null)
+            CoreResult.Success
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (error: CoreException) { coreFailure(error) }
+    }
+
+    /** Invitation errors carry the core's own text. Show it verbatim. */
+    private fun coreFailure(error: CoreException): CoreResult.Failure {
+        val text = when (error) {
+            is CoreException.Io -> error.v1
+            is CoreException.Identity -> error.v1
+            is CoreException.Config -> error.v1
+            is CoreException.Usage -> error.v1
+            is CoreException.Unreachable -> error.v1
+            is CoreException.Refused -> error.v1
+            is CoreException.Partial -> error.v1
+            is CoreException.Engine -> error.v1
+            is CoreException.Stop -> error.v1
+            // Unit variants carry no text across the binding; name the variant.
+            else -> "The core reported ${error.javaClass.simpleName}."
+        }
+        val kind = when (error) {
+            is CoreException.Usage -> CoreErrorKind.INVALID_INPUT
+            is CoreException.Unreachable -> CoreErrorKind.UNREACHABLE
+            is CoreException.Refused -> CoreErrorKind.DENIED
+            is CoreException.Partial -> CoreErrorKind.PARTIAL
+            is CoreException.Cancelled -> CoreErrorKind.CANCELLED
+            is CoreException.Io -> CoreErrorKind.LOCAL_RESOURCE
+            else -> CoreErrorKind.INTERNAL
+        }
+        return CoreResult.Failure(kind, text)
+    }
 
     override suspend fun receiveCode(code: String): CoreResult = runTransfer {
         val summary = session.receiveCode(code, inbox.absolutePath, true, 300uL)
