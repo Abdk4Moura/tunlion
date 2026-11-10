@@ -20,7 +20,14 @@
 
 mod host;
 mod devices;
-pub use devices::{AccessState, ActionKind, DeviceAccess, DevicePresence, DeviceRelationship, EffectiveAction};
+mod enrollment;
+pub use devices::{
+    AccessState, ActionKind, DeviceAccess, DevicePresence, DeviceRelationship, EffectiveAction,
+};
+pub use enrollment::{
+    CoreInvitationInput, CoreInvitationKind, CoreInvitationPreview, CoreInvitationReuse,
+    CoreJoinResult, CoreOutstandingInvitation, EnrollmentRelationship,
+};
 pub mod access;
 
 uniffi::setup_scaffolding!();

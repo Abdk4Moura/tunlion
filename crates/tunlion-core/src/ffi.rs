@@ -152,6 +152,62 @@ impl CoreSession {
     ) -> Result<SendResult, CoreError> {
         self.inner.send_to_device(paths, device, timeout)
     }
+
+    /// Preview an invitation token. The bytes are the file's text contents;
+    /// no seed or recovery words are ever returned.
+    pub fn preview_invitation(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<crate::CoreInvitationPreview, CoreError> {
+        self.inner.preview_invitation(bytes)
+    }
+
+    /// Preview exactly what a mint request would ask for, without minting.
+    pub fn preview_invitation_request(
+        &self,
+        request: crate::CoreInvitationInput,
+    ) -> Result<crate::CoreInvitationPreview, CoreError> {
+        self.inner.preview_invitation_request(request)
+    }
+
+    /// Mint and arm an invitation. Returns opaque token bytes, never the
+    /// possession seed separately.
+    pub fn create_invitation(
+        &self,
+        request: crate::CoreInvitationInput,
+    ) -> Result<Vec<u8>, CoreError> {
+        self.inner.create_invitation(request)
+    }
+
+    /// Join with an invitation file's bytes. Blocking; call off the UI thread.
+    pub fn join_invitation(
+        &self,
+        bytes: Vec<u8>,
+        name: String,
+        timeout: Option<u64>,
+    ) -> Result<crate::CoreJoinResult, CoreError> {
+        self.inner.join_invitation(bytes, name, timeout)
+    }
+
+    pub fn invitations(&self) -> Result<Vec<crate::CoreOutstandingInvitation>, CoreError> {
+        self.inner.invitations()
+    }
+
+    pub fn withdraw_invitation(&self, selector: String) -> Result<Vec<String>, CoreError> {
+        self.inner.withdraw_invitation(selector)
+    }
+
+    pub fn servable_capabilities(&self) -> Vec<String> {
+        self.inner.servable_capabilities()
+    }
+
+    pub fn device_name(&self) -> Option<String> {
+        self.inner.device_name()
+    }
+
+    pub fn set_device_name(&self, name: String) -> Result<(), CoreError> {
+        self.inner.set_device_name(name)
+    }
 }
 
 #[uniffi::export]

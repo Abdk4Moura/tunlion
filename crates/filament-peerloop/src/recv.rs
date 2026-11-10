@@ -73,6 +73,8 @@ pub mod fleet_rv;
 #[cfg(feature = "dispatch")]
 pub mod identity;
 #[cfg(feature = "dispatch")]
+pub mod join;
+#[cfg(feature = "dispatch")]
 pub mod lifecycle;
 #[cfg(feature = "dispatch")]
 pub mod membership;
