@@ -82,7 +82,6 @@ use crate::reset_cmd;
 use crate::resolve_for_kind;
 use crate::resolve_mount_plan;
 use crate::send_cmd::send_cmd;
-use crate::set_device_revoked;
 use crate::settings;
 use crate::sshkeys;
 use crate::status_cmd;
