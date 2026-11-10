@@ -96,8 +96,7 @@ filesystem writes. Shell/exec, mount, forwarding and routes are not implied.
 Other relationship types have their own bounds; do not generalize sibling
 defaults to an owner link or an invitation-bounded device. A certificate-less
 authenticated pair keeps shell access granted explicitly on the serving
-machine. An anonymous peer (for example a one-time code transfer) is
-transfer-only. A replacement transport does not inherit the previous one's
+machine. An anonymous peer is transfer-only. A replacement transport does not inherit the previous one's
 fleet verification or nonces.
 
 The target can grant locally. The owner can distribute `transfer`, `mount` or
