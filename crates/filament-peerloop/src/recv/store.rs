@@ -612,9 +612,11 @@ mod receive_history_tests {
             store.revocation_snapshot(),
             Some((String::new(), String::new()))
         );
+        // A missing store is empty content, so every held secret loses trust:
+        // fail closed, never keep a secret a deleted store cannot vouch for.
         let mut held = vec![("a".into(), "s-a".into()), ("b".into(), "s-b".into())];
-        assert!(store.prune_held(&mut held).is_empty());
-        assert_eq!(held.len(), 2);
+        assert_eq!(store.prune_held(&mut held).len(), 2);
+        assert!(held.is_empty());
 
         std::fs::write(
             root.path().join("devices.json"),
@@ -627,6 +629,17 @@ mod receive_history_tests {
             ["s-b".to_string()].into_iter().collect()
         );
         assert_eq!(held, vec![("a".to_string(), "s-a".to_string())]);
+
+        // A rename of the same secret follows the current name; it is not a
+        // removal and must not leave the old name authorizing the new record.
+        std::fs::write(
+            root.path().join("devices.json"),
+            r#"[{"name":"renamed","secret":"s-a"}]"#,
+        )
+        .unwrap();
+        let mut held = vec![("a".into(), "s-a".into())];
+        assert!(store.prune_held(&mut held).is_empty());
+        assert_eq!(held, vec![("renamed".to_string(), "s-a".to_string())]);
 
         std::fs::write(root.path().join("devices.json"), "not-json").unwrap();
         let mut held = vec![("a".into(), "s-a".into())];
@@ -700,18 +713,40 @@ impl DeviceStore {
     /// nothing: absence of evidence is not a removal. Matching is on the
     /// secret, the fact that proves, never on the display name.
     pub fn prune_held(&self, held: &mut Vec<(String, String)>) -> std::collections::HashSet<String> {
-        if self.revocation_snapshot().is_none() {
+        // Parse the SAME snapshot that decided the sweep may run. Re-reading the
+        // store here let a file change between the two reads prune everything.
+        let Some((devices, _)) = self.revocation_snapshot() else {
             return std::collections::HashSet::new();
-        }
-        let current: std::collections::HashSet<String> =
-            self.devices_load().into_iter().map(|(_, secret)| secret).collect();
-        let mut removed = std::collections::HashSet::new();
-        held.retain(|(_, secret)| {
-            let keep = current.contains(secret);
-            if !keep {
-                removed.insert(secret.clone());
+        };
+        let records: Vec<Value> = if devices.trim().is_empty() {
+            Vec::new()
+        } else {
+            match serde_json::from_str(&devices) {
+                Ok(records) => records,
+                Err(_) => return std::collections::HashSet::new(),
             }
-            keep
+        };
+        // A matching secret keeps its trust but follows the store's CURRENT
+        // name: the held name keys certificates, grants and dialing one layer
+        // down, so a rename must not let an old name resolve a new record.
+        let current: std::collections::HashMap<String, String> = records
+            .iter()
+            .filter_map(|record| {
+                let name = record["name"].as_str()?.to_string();
+                let secret = record["secret"].as_str()?.to_string();
+                Some((secret, name))
+            })
+            .collect();
+        let mut removed = std::collections::HashSet::new();
+        held.retain_mut(|(name, secret)| match current.get(secret) {
+            Some(current_name) => {
+                *name = current_name.clone();
+                true
+            }
+            None => {
+                removed.insert(secret.clone());
+                false
+            }
         });
         removed
     }
