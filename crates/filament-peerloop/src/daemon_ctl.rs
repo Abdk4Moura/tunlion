@@ -728,7 +728,7 @@ pub async fn handle_warm_pty(
                 let watch_session = session.clone();
                 let watcher = tokio::spawn(async move {
                     loop {
-                        if let Some(reason) = watch_mux.peek_close_err(sid).await {
+                        if let Some(reason) = watch_mux.take_close_err(sid).await {
                             record_warm_pty_end(&watch_session, reason);
                             break;
                         }
