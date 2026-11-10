@@ -60,16 +60,25 @@ For a **fleet sibling** (same owner, never paired directly with the receiver):
 - Ordinary paired devices, owner links and invitation-bounded devices have
   their own policies. Do not infer their permissions from sibling defaults.
 
+Validated at integration head `9144ee749`, not yet merged to main:
+
+- A certificate-less authenticated pair retains shell access granted explicitly
+  on the serving machine. Fleet sibling defaults do not remove that local grant.
+- An anonymous peer is transfer-only.
+- A replacement transport does not inherit the previous transport's fleet
+  verification or nonces.
+
 There is no transitive trust across owners and no multi-hop routing through a
 sibling. A connection may use a direct transport or a relay. Discovery does not
 guarantee reachability.
 
 The browser currently supports pairwise files and shell but does not enroll into
 a fleet. That is an implementation gap in the browser client, not a separate
-security model. The target is for every client to consume the same universal
-core semantics, with the browser using a WASM binding. Platform limits remain
-explicit: a browser can be a remote terminal client but cannot serve a native
-PTY, and it cannot serve an OS filesystem mount.
+security model. Browser parity is a target, not current behavior: the goal is
+for every client to consume the same universal core semantics, with the browser
+using a WASM binding. Platform limits remain explicit: a browser can be a remote
+terminal client but cannot serve a native PTY, and it cannot serve an OS
+filesystem mount.
 
 ## Grant on this device or on another device
 
@@ -115,9 +124,10 @@ an already-open session.** It refuses new sessions once effective. An existing
 session ends normally or when its link closes. Do not report that all access has
 ended merely because a grant was withdrawn.
 
-Whole-device revocation and certificate expiry close affected sibling links.
-Owner revocation is not instant global delivery: a sibling unreachable from the
-owner cannot learn a new roster until contact. The fleet rendezvous secret is
+Whole-device revocation and certificate expiry close affected sibling links;
+this guide does not claim that a cut or a capability revoke terminates every
+session kind. Owner revocation is not instant global delivery: a sibling
+unreachable from the owner cannot learn a new roster until contact. The fleet rendezvous secret is
 not rotated on revocation; removal denies admission, not all presence visibility.
 For sibling admission, the newest held roster remains in use even past its
 validity timestamp; do not confuse it with the expiring owner-grant sets.
@@ -130,6 +140,8 @@ effective everywhere. Do not silently restart services as a workaround.
   inbox delivery to the named device, refusal, revocation and unaffected peers.
 - `cli/tests/fleet-trust-gates.sh`: owner grants, target policy, local deny,
   withdrawal, expiry, and mixed versions.
+- At integration head `9144ee749`, the exec (29/29), SSH (8/8) and terminal
+  withdrawal (19/19) suites were green. That run covers those suites only.
 - `proofs/fleet_automesh_model.py` and `proofs/fleet_trust_model.py`: modeled
   admission and grant invariants, with mutation controls. Models are not proof
   of every runtime path or network topology.

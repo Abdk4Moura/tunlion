@@ -94,7 +94,11 @@ against the owner's signed roster. They need no pairwise pairing. Their one
 default is file transfer into the receiver's configured inbox, not arbitrary
 filesystem writes. Shell/exec, mount, forwarding and routes are not implied.
 Other relationship types have their own bounds; do not generalize sibling
-defaults to an owner link or an invitation-bounded device.
+defaults to an owner link or an invitation-bounded device. A certificate-less
+authenticated pair keeps shell access granted explicitly on the serving
+machine. An anonymous peer (for example a one-time code transfer) is
+transfer-only. A replacement transport does not inherit the previous one's
+fleet verification or nonces.
 
 The target can grant locally. The owner can distribute `transfer`, `mount` or
 `shell` with `grant <subject> <cap> --on <target>`. A successful owner command
@@ -107,9 +111,10 @@ Local denies, device revocation and certificate expiry override grants.
 Owner sets expire without refresh (15 minutes by default). Withdrawing one or
 narrowing the target policy refuses new sessions once effective, but does NOT
 terminate an already-open session. Whole-device revocation closes affected
-sibling links, but owner roster removal must reach each sibling first. Do not
-claim a global cut before delivery/link closure is verified. A held roster can
-remain the admission input past its validity timestamp; unlike owner-grant sets,
+sibling links, but owner roster removal must reach each sibling first, and
+neither a cut nor a capability revoke is known to end every session kind. Do
+not claim a global cut before delivery/link closure is verified. A held roster
+can remain the admission input past its validity timestamp; unlike owner-grant sets,
 it does not automatically remove an offline-from-owner sibling on expiry.
 No rendezvous-secret
 rotation or multi-hop routing is implemented. Different versions enforce their
@@ -241,7 +246,7 @@ command's refusal rather than reporting success. Owner-grant withdrawal is
 delivery/expiry bounded and does not close existing sessions (see above).
 
 ```bash
-tunlion demote <device> --to cut -y --json   # cut it off now
+tunlion demote <device> --to cut -y --json   # cut it off (limits above)
 tunlion promote <device> -y --json           # one step up (from cut off: back to where it was)
 ```
 
