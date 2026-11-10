@@ -603,6 +603,37 @@ mod receive_history_tests {
         assert!(DeviceStore::open(root.path()).record_received_file(&receipt(1)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[");
     }
+
+    #[test]
+    fn revocation_snapshot_is_fail_closed_and_prunes_only_absent_secrets() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.path());
+        assert_eq!(
+            store.revocation_snapshot(),
+            Some((String::new(), String::new()))
+        );
+        let mut held = vec![("a".into(), "s-a".into()), ("b".into(), "s-b".into())];
+        assert!(store.prune_held(&mut held).is_empty());
+        assert_eq!(held.len(), 2);
+
+        std::fs::write(
+            root.path().join("devices.json"),
+            r#"[{"name":"a","secret":"s-a"}]"#,
+        )
+        .unwrap();
+        let mut held = vec![("a".into(), "s-a".into()), ("b".into(), "s-b".into())];
+        assert_eq!(
+            store.prune_held(&mut held),
+            ["s-b".to_string()].into_iter().collect()
+        );
+        assert_eq!(held, vec![("a".to_string(), "s-a".to_string())]);
+
+        std::fs::write(root.path().join("devices.json"), "not-json").unwrap();
+        let mut held = vec![("a".into(), "s-a".into())];
+        assert_eq!(store.revocation_snapshot(), None);
+        assert!(store.prune_held(&mut held).is_empty());
+        assert_eq!(held.len(), 1, "an unreadable store must remove nothing");
+    }
 }
 
 impl DeviceStore {
@@ -640,6 +671,49 @@ impl DeviceStore {
 
     pub fn devices_path(&self) -> PathBuf {
         self.root.join(DEVICES_FILE)
+    }
+
+    /// The exact two store files the revocation sweep compares: `devices.json`
+    /// and the key-revocation block. `None` means unreadable or malformed, so a
+    /// sweep must do nothing rather than treat it as "everything was removed".
+    /// Missing files are empty content, not an error.
+    pub fn revocation_snapshot(&self) -> Option<(String, String)> {
+        let read_or_empty = |path: &Path| -> Option<String> {
+            match std::fs::read_to_string(path) {
+                Ok(content) => Some(content),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Some(String::new()),
+                Err(_) => None,
+            }
+        };
+        let devices = read_or_empty(&self.devices_path())?;
+        if !devices.trim().is_empty()
+            && !matches!(serde_json::from_str::<Value>(&devices), Ok(Value::Array(_)))
+        {
+            return None;
+        }
+        let revoked = read_or_empty(&self.key_revocations_path())?;
+        Some((devices, revoked))
+    }
+
+    /// Remove from `held` every pair whose secret the current store no longer
+    /// holds, returning the removed SECRETS. An unreadable store removes
+    /// nothing: absence of evidence is not a removal. Matching is on the
+    /// secret, the fact that proves, never on the display name.
+    pub fn prune_held(&self, held: &mut Vec<(String, String)>) -> std::collections::HashSet<String> {
+        if self.revocation_snapshot().is_none() {
+            return std::collections::HashSet::new();
+        }
+        let current: std::collections::HashSet<String> =
+            self.devices_load().into_iter().map(|(_, secret)| secret).collect();
+        let mut removed = std::collections::HashSet::new();
+        held.retain(|(_, secret)| {
+            let keep = current.contains(secret);
+            if !keep {
+                removed.insert(secret.clone());
+            }
+            keep
+        });
+        removed
     }
 
     pub fn devices_lock_path(&self) -> PathBuf {
