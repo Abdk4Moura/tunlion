@@ -1092,6 +1092,32 @@ pub struct DirectPending {
     pub cancel: Arc<AtomicBool>,
 }
 
+/// A transport-offer held until its peer has a pending or a link:
+/// (candidates, srflx, server_public, proto, ch). `ch` is the meeting place
+/// the offer named (absent from a one-shot dialer), kept so a replay goes
+/// through the same forgotten-channel and fleet checks as the original.
+pub type BufferedOffer = (Vec<String>, Option<String>, Option<String>, u8, Option<String>);
+
+/// Rebuild the server envelope of a buffered transport-offer so a replay is
+/// handled by the driver's ordinary `Ev::Signal` transport-offer arm. `from`
+/// is the pid the offer was buffered under, never a payload field, so a replay
+/// cannot be attributed to another peer. `probe` is deliberately not carried:
+/// the upgrade-probe answer already ran when the offer first arrived.
+fn buffered_offer_signal(pid: &str, offer: BufferedOffer) -> Value {
+    let (cands, srflx, server_public, proto, ch) = offer;
+    let mut data = json!({ "type": "transport-offer", "v": 1, "proto": proto, "addrs": cands });
+    if let Some(s) = srflx {
+        data["srflx"] = json!(s);
+    }
+    if let Some(s) = server_public {
+        data["server_public"] = json!(s);
+    }
+    if let Some(c) = ch {
+        data["ch"] = json!(c);
+    }
+    json!({ "from": pid, "data": data })
+}
+
 /// One prepared establish that has done only loop-local work: guards, role,
 /// generation and the ICE cache decision. No network call has run yet.
 #[derive(Clone)]
@@ -1547,9 +1573,12 @@ pub struct Conn {
     pub webrtc_only: HashSet<String>,
     /// Bug 2: transport-offers that arrived before the receiver's DirectPending
     /// was created (peer's re-dial after a mid-transfer death). Same class as Bug
-    /// 1 (pre-PAKE offers): buffered here and replayed once `start_direct` creates
-    /// the pending. pid → (candidates, srflx).
-    pub buffered_offers: HashMap<String, (Vec<String>, Option<String>, Option<String>, u8)>,
+    /// 1 (pre-PAKE offers): buffered here and replayed once a pending OR a link
+    /// for that peer appears: `start_direct` replays it into the new pending,
+    /// and installing a built link re-queues it through the driver's ordinary
+    /// transport-offer handler (`install_built`). pid → (candidates, srflx,
+    /// server_public, proto, ch).
+    pub buffered_offers: HashMap<String, BufferedOffer>,
     /// Post-PAKE promotions in progress (make-before-break; see `handoff`),
     /// keyed by peer sid. Each pairs with an ephemeral `direct_pending` entry
     /// that must survive beside the serving link until the handoff resolves.
@@ -3522,6 +3551,12 @@ impl Conn {
         // captured active_on_apply. Keep that current selection across the
         // old-link cleanup, which also clears the active slot.
         let selected_while_building = self.is_active(&built.peer_id);
+        // A transport-offer buffered while this candidate was building (no
+        // pending and no link existed, so the driver could not arm one) must
+        // outlive the old-link cleanup below: `drop_link` clears
+        // `buffered_offers`, and nothing else would ever replay it. Take it
+        // here, before the cleanup, and requeue it once the link exists.
+        let buffered_offer = self.buffered_offers.remove(&built.peer_id);
         self.drop_link(&built.peer_id);
         if webrtc_only {
             self.webrtc_only.insert(built.peer_id.clone());
@@ -3569,6 +3604,20 @@ impl Conn {
         }
         for signal in signals {
             let _ = self.tx.send(Ev::Signal(signal));
+        }
+        // Invariant: a buffered offer is replayed when a link or pending for
+        // its peer appears. The link exists now, so hand the offer back to the
+        // driver's own transport-offer arm (refusal, re-arm, answer, or buffer
+        // again). It was removed from the map above, so it replays once, and
+        // its envelope names exactly this pid.
+        if let Some(offer) = buffered_offer {
+            self.log.debug(&format!(
+                "replaying buffered transport-offer from {} on link install",
+                built.peer_id
+            ));
+            let _ = self
+                .tx
+                .send(Ev::Signal(buffered_offer_signal(&built.peer_id, offer)));
         }
     }
 
@@ -5142,7 +5191,7 @@ impl Conn {
         // standby (`on_transport_offer`); upgrade probes keep their relay link.
         // Bug 2: replay any transport-offers that were buffered while we had
         // no DirectPending (the sender re-dialed after a mid-transfer death).
-        if let Some((cands, srflx, server_public, proto)) = self.buffered_offers.remove(pid) {
+        if let Some((cands, srflx, server_public, proto, _ch)) = self.buffered_offers.remove(pid) {
             self.log.debug(&format!("replaying buffered transport-offer from {pid}"));
             self.on_transport_offer(pid, cands, srflx, server_public, proto);
         }
@@ -11297,6 +11346,95 @@ mod warm_identity_tests {
             "data": { "to": pid, "type": "description" }
         })));
         assert_eq!(conn.builds[pid].signals.len(), 1);
+    }
+
+    /// P4: a transport-offer that arrived while the peer had neither a pending
+    /// nor a link (its candidate was still building) is buffered. Installing
+    /// the link must replay it once, under that pid, through the driver's
+    /// ordinary signal path; the old-link cleanup inside the install used to
+    /// discard it, so the offer was never answered.
+    #[tokio::test]
+    async fn a_buffered_offer_is_replayed_once_when_its_link_installs() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let pid = "sid-buffered-offer";
+        let other = "sid-other-offer";
+        conn.buffered_offers.insert(
+            pid.to_string(),
+            (
+                vec!["10.0.0.2:4433".to_string()],
+                Some("203.0.113.7:5000".to_string()),
+                None,
+                2,
+                Some("chan-fleet".to_string()),
+            ),
+        );
+        conn.buffered_offers
+            .insert(other.to_string(), (vec!["10.0.0.3:4433".to_string()], None, None, 1, None));
+        for generation in [5u32, 6u32] {
+            let peer = net::Peer::connect(
+                pid.to_string(),
+                conn.my_uid.clone(),
+                true,
+                Vec::new(),
+                false,
+                conn.sio.clone(),
+                conn.tx.clone(),
+                generation,
+            )
+            .await
+            .expect("local candidate");
+            let source = peer.source();
+            conn.install_built(
+                BuiltPeer {
+                    peer_id: pid.to_string(),
+                    generation,
+                    source,
+                    peer,
+                    info: json!({ "id": pid, "name": "peer" }),
+                    name: "peer".to_string(),
+                    uid: None,
+                    carried_secret: None,
+                    active_on_apply: false,
+                    replace: Replace::NeverLive,
+                    caller: std::panic::Location::caller(),
+                    prior_generation: None,
+                },
+                std::collections::VecDeque::new(),
+                std::collections::VecDeque::new(),
+                None,
+                false,
+            );
+            assert!(conn.links.contains_key(pid), "the candidate was not installed");
+            assert!(
+                !conn.buffered_offers.contains_key(pid),
+                "the replayed offer stayed buffered and could apply twice"
+            );
+            assert!(
+                conn.buffered_offers.contains_key(other),
+                "another peer's buffered offer was consumed by this install"
+            );
+            let mut replayed: Vec<Value> = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                if let Ev::Signal(v) = ev {
+                    if v["data"]["type"].as_str() == Some("transport-offer") {
+                        replayed.push(v);
+                    }
+                }
+            }
+            if generation == 5 {
+                assert_eq!(replayed.len(), 1, "the buffered offer was not replayed on install");
+                let v = &replayed[0];
+                assert_eq!(v["from"].as_str(), Some(pid), "the replay named another peer");
+                assert_eq!(v["data"]["addrs"][0].as_str(), Some("10.0.0.2:4433"));
+                assert_eq!(v["data"]["srflx"].as_str(), Some("203.0.113.7:5000"));
+                assert!(v["data"]["server_public"].is_null());
+                assert_eq!(v["data"]["proto"].as_u64(), Some(2));
+                assert_eq!(v["data"]["ch"].as_str(), Some("chan-fleet"));
+                assert!(v["data"]["probe"].is_null(), "a replay re-answered an upgrade probe");
+            } else {
+                assert!(replayed.is_empty(), "a second install replayed the offer again");
+            }
+        }
     }
 
     /// A dropped/replaced link's queued candidate events are discarded, not
