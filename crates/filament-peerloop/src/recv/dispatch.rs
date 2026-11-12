@@ -4866,8 +4866,8 @@ async fn recv_run(
                                 peer_proto,
                             );
                         } else {
-                            conn.buffered_offers.insert(
-                                from.clone(),
+                            conn.buffer_offer(
+                                &from,
                                 (
                                     cands,
                                     srflx,
