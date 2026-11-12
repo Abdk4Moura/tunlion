@@ -1,0 +1,827 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tunlion Android Redesign</title>
+<meta name="description" content="Annotated phone-frame mockups for the Tunlion Android redesign proposal. Companion to README.md in the same folder.">
+<style>
+:root {
+  --primary: #D55C13;
+  --on-primary: #FFFFFF;
+  --background: #F7F6F2;
+  --surface: #FFFFFF;
+  --surface-variant: #EFEDE6;
+  --on-surface: #1D1C1A;
+  --on-surface-variant: #5D5A53;
+  --outline: #DEDAD0;
+  --error: #AF3B43;
+  --error-bg: rgba(175, 59, 67, 0.09);
+  --ok: #137738;
+  --ok-bg: rgba(19, 119, 56, 0.10);
+  --page: #E9E6DD;
+  --frame: #1D1C1A;
+  --note-bg: #FFFFFF;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --primary: #E36927;
+    --on-primary: #141412;
+    --background: #141412;
+    --surface: #1D1C1A;
+    --surface-variant: #26251F;
+    --on-surface: #F2EFE6;
+    --on-surface-variant: #A29E94;
+    --outline: #33312D;
+    --error: #F58A8B;
+    --error-bg: rgba(245, 138, 139, 0.10);
+    /* The app draws #137738 in both modes. This lighter tint is a proposed dark-mode text value for contrast. */
+    --ok: #5CC283;
+    --ok-bg: rgba(92, 194, 131, 0.12);
+    --page: #0C0C0B;
+    --frame: #33312D;
+    --note-bg: #1D1C1A;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--on-surface);
+  font-family: var(--sans);
+  line-height: 1.45;
+}
+.page { max-width: 1400px; margin: 0 auto; padding: 32px 16px 64px; }
+.page > header { max-width: 760px; margin-bottom: 28px; }
+.page > header h1 { font-size: 28px; letter-spacing: -0.5px; margin: 0 0 8px; }
+.page > header p { color: var(--on-surface-variant); margin: 0 0 10px; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+h2.group { font-size: 13px; font-family: var(--mono); letter-spacing: 1px; color: var(--on-surface-variant); margin: 40px 0 14px; text-transform: uppercase; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 620px), 1fr)); gap: 28px; }
+.card { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; min-width: 0; }
+.notes { flex: 1 1 220px; min-width: 0; background: var(--note-bg); border: 1px solid var(--outline); border-radius: 10px; padding: 14px 16px; font-size: 14px; }
+.notes h3 { margin: 0 0 4px; font-size: 15px; }
+.notes .ref { color: var(--on-surface-variant); font-family: var(--mono); font-size: 12px; margin: 0 0 10px; }
+.notes ol { margin: 0; padding-left: 0; list-style: none; display: grid; gap: 8px; }
+.notes li { display: grid; grid-template-columns: 22px 1fr; gap: 8px; }
+.notes .tag { display: inline-block; font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--error-bg); color: var(--error); margin-top: 8px; }
+
+/* phone frame */
+.phone { width: 360px; max-width: 100%; height: 760px; flex: 0 0 auto; border: 8px solid var(--frame); border-radius: 34px; background: var(--background); overflow: hidden; display: flex; flex-direction: column; position: relative; }
+.statusbar { height: 26px; display: flex; justify-content: space-between; align-items: center; padding: 0 18px; font-size: 11px; color: var(--on-surface-variant); flex: 0 0 auto; }
+.topbar { display: flex; align-items: center; gap: 6px; padding: 4px 8px 4px 12px; min-height: 52px; border-bottom: 1px solid var(--outline); flex: 0 0 auto; }
+.topbar .title { font-weight: 600; font-size: 17px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.topbar .brand { font-weight: 600; font-size: 19px; letter-spacing: -0.5px; flex: 1; display: flex; align-items: center; gap: 8px; }
+.iconbtn { width: 44px; height: 44px; display: inline-grid; place-items: center; border-radius: 50%; color: var(--on-surface); flex: 0 0 auto; }
+.screen { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 20px 18px 24px; display: flex; flex-direction: column; gap: 16px; }
+.screen > * { flex-shrink: 0; }
+.big { font-size: 25px; line-height: 1.22; font-weight: 600; letter-spacing: -0.6px; margin: 0; }
+.sec { color: var(--on-surface-variant); font-size: 13.5px; line-height: 1.5; margin: 0; }
+.eyebrow { font-family: var(--mono); font-size: 10.5px; letter-spacing: 1px; font-weight: 600; color: var(--on-surface-variant); margin: 0; }
+.mono { font-family: var(--mono); }
+.btn { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px; border-radius: 7px; font-weight: 600; font-size: 14.5px; padding: 0 14px; text-align: center; }
+.btn.primary { background: var(--on-surface); color: var(--background); }
+.btn.outline { border: 1px solid var(--outline); color: var(--on-surface); background: transparent; font-weight: 500; }
+.btn.danger { border: 1px solid var(--error); color: var(--error); font-weight: 500; }
+.btn.disabled { opacity: 0.45; }
+.btn.text { color: var(--primary); font-weight: 600; min-height: 44px; }
+.btn small { font-weight: 400; }
+.row { display: flex; align-items: center; gap: 12px; }
+.grow { flex: 1; min-width: 0; }
+.divider { height: 1px; background: var(--outline); }
+.identity { display: flex; gap: 12px; align-items: center; }
+.avatar { width: 42px; height: 42px; border-radius: 9px; background: var(--surface-variant); display: grid; place-items: center; flex: 0 0 auto; }
+.switch { width: 52px; height: 32px; border-radius: 16px; background: var(--primary); position: relative; flex: 0 0 auto; }
+.switch::after { content: ""; position: absolute; width: 24px; height: 24px; border-radius: 50%; background: var(--background); top: 4px; right: 4px; }
+.switch.off { background: var(--surface-variant); border: 2px solid var(--outline); }
+.switch.off::after { left: 4px; right: auto; top: 2px; background: var(--on-surface-variant); }
+.state-line { display: inline-flex; align-items: center; gap: 6px; font-size: 13.5px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
+.dot.filled { background: var(--ok); }
+.dot.hollow { border: 2px solid var(--on-surface-variant); }
+.devrow { display: flex; gap: 12px; align-items: flex-start; padding: 8px 0; min-height: 64px; }
+.devrow .name { font-weight: 600; font-size: 15px; }
+.devrow .meta { color: var(--on-surface-variant); font-size: 13px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.relglyph { width: 36px; height: 36px; border-radius: 8px; background: var(--surface-variant); display: grid; place-items: center; flex: 0 0 auto; color: var(--on-surface); }
+.chev { color: var(--on-surface-variant); align-self: center; }
+
+/* state chips: word + glyph + border style; color is the third signal */
+.chip { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600; padding: 3px 8px 3px 6px; border-radius: 999px; line-height: 1.2; white-space: nowrap; }
+.chip svg { width: 13px; height: 13px; flex: 0 0 auto; }
+.chip.works { background: var(--ok-bg); color: var(--ok); border: 1.5px solid var(--ok); }
+.chip.pending { color: var(--primary); border: 1.5px solid var(--primary); }
+.chip.blocked { color: var(--error); border: 1.5px solid var(--error); }
+.chip.unknown { color: var(--on-surface-variant); border: 1.5px dashed var(--on-surface-variant); }
+.chip.notoffered { color: var(--on-surface-variant); background: var(--surface-variant); border: 1.5px solid transparent; }
+.chip.revoked { color: var(--error); border: 1.5px solid var(--error); background: var(--error-bg); }
+.chip.live { color: var(--ok); border: 1.5px solid var(--ok); }
+.chip.expired { color: var(--error); border: 1.5px solid var(--error); background: var(--error-bg); font-size: 13px; }
+.chip .k { font-weight: 500; }
+
+.card-s { background: var(--surface); border: 1px solid var(--outline); border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.fact { display: flex; flex-direction: column; gap: 2px; }
+.fact .l { color: var(--on-surface-variant); font-size: 12.5px; }
+.fact .v { font-weight: 500; font-size: 14px; overflow-wrap: anywhere; }
+.action { display: flex; flex-direction: column; gap: 4px; padding: 8px 0; border-bottom: 1px solid var(--outline); }
+.action:last-child { border-bottom: 0; }
+.action .top { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.action .label { font-weight: 500; font-size: 14px; }
+.reason { color: var(--on-surface-variant); font-size: 12.5px; }
+.collapsed { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-height: 48px; border-top: 1px solid var(--outline); flex-wrap: wrap; }
+.banner { border: 1.5px solid var(--error); background: var(--error-bg); color: var(--on-surface); border-radius: 8px; padding: 10px 12px; font-size: 13px; display: flex; gap: 8px; align-items: flex-start; }
+.banner svg { color: var(--error); flex: 0 0 auto; margin-top: 2px; }
+.notice { background: var(--surface-variant); padding: 10px 12px; border-radius: 8px; font-size: 13px; }
+.seg { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--outline); border-radius: 8px; overflow: hidden; }
+.seg div { min-height: 48px; display: grid; place-items: center; font-size: 14px; font-weight: 500; }
+.seg .on { background: var(--surface-variant); font-weight: 600; }
+.seg .on::before { content: ""; }
+.field { border: 1px solid var(--outline); border-radius: 7px; padding: 8px 12px; min-height: 52px; background: var(--surface); }
+.field .l { font-size: 11.5px; color: var(--on-surface-variant); }
+.field .v { font-size: 15px; }
+.field.disabled { opacity: 0.5; }
+.caps { display: flex; flex-direction: column; gap: 4px; }
+.caps span { font-family: var(--mono); font-size: 13.5px; background: var(--surface-variant); border-radius: 5px; padding: 3px 8px; align-self: flex-start; }
+.err { color: var(--error); }
+.code { font-family: var(--mono); font-size: 24px; letter-spacing: 1px; }
+.file { display: flex; gap: 10px; align-items: center; font-size: 14px; }
+.file .st { font-size: 12.5px; color: var(--on-surface-variant); display: inline-flex; gap: 4px; align-items: center; }
+.file .st.okc { color: var(--ok); }
+.pin { display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: var(--primary); color: var(--on-primary); font-size: 11px; font-weight: 700; font-family: var(--sans); flex: 0 0 auto; }
+.screen .pin { position: absolute; right: 6px; }
+.anchor { position: relative; }
+.anchor > .pin { position: absolute; right: -6px; top: -8px; }
+.sheet-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.42); display: flex; align-items: flex-end; }
+.sheet { background: var(--surface); width: 100%; border-radius: 18px 18px 0 0; padding: 14px 18px 22px; display: flex; flex-direction: column; gap: 12px; }
+.sheet .handle { width: 36px; height: 4px; border-radius: 2px; background: var(--outline); align-self: center; }
+.radio { display: flex; gap: 10px; align-items: center; min-height: 48px; }
+.radio .c { width: 20px; height: 20px; border-radius: 50%; border: 2px solid var(--on-surface-variant); flex: 0 0 auto; display: grid; place-items: center; }
+.radio .c.on { border-color: var(--primary); }
+.radio .c.on::after { content: ""; width: 10px; height: 10px; border-radius: 50%; background: var(--primary); }
+.notwired { position: absolute; top: 4px; left: 50%; transform: translateX(-50%); background: var(--error); color: var(--background); font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.5px; font-weight: 700; padding: 3px 8px; border-radius: 4px; z-index: 3; white-space: nowrap; }
+.spinner { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--outline); border-top-color: var(--on-surface-variant); flex: 0 0 auto; }
+@media (prefers-reduced-motion: no-preference) {
+  .spinner { animation: spin 1s linear infinite; }
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.footer { margin-top: 48px; color: var(--on-surface-variant); font-size: 13px; max-width: 760px; }
+@media (max-width: 420px) {
+  .phone { border-width: 6px; border-radius: 28px; }
+  .screen { padding: 16px 14px 20px; }
+}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="g-check" viewBox="0 0 16 16"><path d="M3 8.5l3 3 7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="g-q" viewBox="0 0 16 16"><path d="M5.6 6a2.5 2.5 0 1 1 3.4 2.3c-.6.3-1 .8-1 1.5v.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="8" cy="12.8" r="1.1" fill="currentColor"/></symbol>
+    <symbol id="g-block" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.6" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4.2 11.8l7.6-7.6" stroke="currentColor" stroke-width="1.8"/></symbol>
+    <symbol id="g-dash" viewBox="0 0 16 16"><path d="M4 8h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="g-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.6" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8 5v3.3l2.2 1.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="g-key" viewBox="0 0 16 16"><circle cx="5.5" cy="8" r="2.8" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M8.3 8H14M12 8v2.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M2 14L14 2" stroke="currentColor" stroke-width="1.5"/></symbol>
+    <symbol id="g-hourglass" viewBox="0 0 16 16"><path d="M4 2h8M4 14h8M5 2c0 3 6 3 6 6s-6 3-6 6M11 2c0 3-6 3-6 6s6 3 6 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+    <symbol id="g-house" viewBox="0 0 16 16"><path d="M2.5 8L8 3l5.5 5M4 7v6h8V7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></symbol>
+    <symbol id="g-rings" viewBox="0 0 16 16"><circle cx="6" cy="8" r="3.4" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="10" cy="8" r="3.4" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+    <symbol id="g-warn" viewBox="0 0 16 16"><path d="M8 2l6.5 11.5h-13z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8 6.5v3.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="8" cy="11.6" r=".9" fill="currentColor"/></symbol>
+    <symbol id="g-back" viewBox="0 0 24 24"><path d="M20 12H5M11 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="g-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.8 1.8M16.7 16.7l1.8 1.8M5.5 18.5l1.8-1.8M16.7 7.3l1.8-1.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="g-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="g-phone" viewBox="0 0 24 24"><rect x="7" y="3" width="10" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M11 18h2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="g-folder" viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+    <symbol id="g-doc" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z M14 3v4h4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="g-hollow" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
+    <symbol id="g-mark" viewBox="0 0 80 80"><path d="M12 74V24Q12 10 26 10H54Q68 10 68 24V74" fill="none" stroke="currentColor" stroke-width="10"/><rect x="33" y="46" width="14" height="28" style="fill:var(--primary)"/></symbol>
+  </defs>
+</svg>
+
+<div class="page">
+<header>
+  <h1>Tunlion Android Redesign</h1>
+  <p>Static mockups for the proposal in <span class="mono">docs/design/android-redesign/README.md</span>. Each frame is about 360 by 760 CSS pixels. The numbered pins match the notes beside each frame, and every note names the README section it implements.</p>
+  <p>All device names, people and keys are fictional examples. Every state shown comes from a field the shared core returns today, unless the frame is marked <strong>Not wired</strong> or a note says <strong>not available yet</strong>.</p>
+  <div class="legend" role="list" aria-label="Access state chips">
+    <span role="listitem" class="chip works"><svg aria-hidden="true"><use href="#g-check"/></svg>Works</span>
+    <span role="listitem" class="chip pending"><svg aria-hidden="true"><use href="#g-clock"/></svg>Pending (needs core support)</span>
+    <span role="listitem" class="chip blocked"><svg aria-hidden="true"><use href="#g-block"/></svg>Blocked</span>
+    <span role="listitem" class="chip unknown"><svg aria-hidden="true"><use href="#g-q"/></svg>Unknown</span>
+    <span role="listitem" class="chip notoffered"><svg aria-hidden="true"><use href="#g-dash"/></svg>Not offered</span>
+    <span role="listitem" class="chip revoked"><svg aria-hidden="true"><use href="#g-key"/></svg>Revoked on this phone</span>
+    <span role="listitem" class="chip live"><svg aria-hidden="true"><use href="#g-check"/></svg>Live</span>
+  </div>
+</header>
+
+<h2 class="group">Home</h2>
+<div class="grid">
+
+<!-- 1. Home first run -->
+<section class="card" aria-labelledby="t1">
+  <div class="phone" role="img" aria-label="Mockup: Home, first run">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><div class="brand"><svg width="24" height="24" aria-hidden="true"><use href="#g-mark"/></svg>tunlion</div><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-gear"/></svg></span></div>
+    <div class="screen">
+      <div style="height:28px"></div>
+      <p class="big anchor">Your files, direct to this phone.<span class="pin">1</span></p>
+      <p class="sec">No account. Your identity is created and kept on this phone.</p>
+      <div class="anchor"><div class="btn primary">Set up this phone</div><span class="pin">2</span></div>
+      <div class="btn outline">I have an invitation</div>
+      <p class="sec anchor">To receive a single file, use Files. A file code needs no setup.<span class="pin">3</span></p>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t1">Home: first run</h3>
+    <p class="ref">README 4.1 First run</p>
+    <ol>
+      <li><span class="pin">1</span><span>Shown when the core reports no fingerprint and no stored devices (<span class="mono">identityState == BLANK</span>). Stale subtitle about enrollment "still being connected" is removed.</span></li>
+      <li><span class="pin">2</span><span>One filled button. "I have an invitation" is secondary. Which one is primary is open question 4.</span></li>
+      <li><span class="pin">3</span><span>Points to the transfer-only path without implying pairing.</span></li>
+    </ol>
+  </div>
+</section>
+
+<!-- 2. Home normal -->
+<section class="card" aria-labelledby="t2">
+  <div class="phone" role="img" aria-label="Mockup: Home with identity, availability and devices">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><div class="brand"><svg width="24" height="24" aria-hidden="true"><use href="#g-mark"/></svg>tunlion</div><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-gear"/></svg></span></div>
+    <div class="screen">
+      <div class="identity anchor">
+        <div class="avatar"><svg width="22" height="22" aria-hidden="true"><use href="#g-phone"/></svg></div>
+        <div class="grow">
+          <div style="font-weight:600">pixel-example</div>
+          <div class="sec">Owner identity on this phone</div>
+          <div class="mono" style="font-size:12px">fict 4f2a 91c0 7be3</div>
+        </div>
+        <span class="pin">1</span>
+      </div>
+      <div class="card-s anchor">
+        <div class="row">
+          <div class="grow">
+            <div style="font-weight:600">Availability</div>
+            <span class="state-line"><span class="dot filled"></span>Receiving</span>
+          </div>
+          <div class="switch" aria-hidden="true"></div>
+        </div>
+        <p class="sec">Receives files into your inbox while on. <span style="color:var(--primary);font-weight:600">What this allows</span></p>
+        <span class="pin">2</span>
+      </div>
+      <div class="row"><p class="eyebrow grow">DEVICES</p><span class="btn text">Add a device</span></div>
+      <div class="devrow anchor">
+        <div class="relglyph"><svg width="18" height="18" aria-hidden="true"><use href="#g-house"/></svg></div>
+        <div class="grow">
+          <div class="name">kestrel-laptop</div>
+          <div class="meta">My device</div>
+          <div class="chips">
+            <span class="chip unknown"><svg aria-hidden="true"><use href="#g-q"/></svg><span class="k">Send:</span> Unknown</span>
+            <span class="chip unknown"><svg aria-hidden="true"><use href="#g-q"/></svg><span class="k">Receive:</span> Unknown</span>
+          </div>
+        </div>
+        <svg class="chev" width="20" height="20" aria-hidden="true"><use href="#g-chev"/></svg>
+        <span class="pin">3</span>
+      </div>
+      <div class="divider"></div>
+      <div class="devrow">
+        <div class="relglyph"><svg width="18" height="18" aria-hidden="true"><use href="#g-rings"/></svg></div>
+        <div class="grow">
+          <div class="name">ada-tablet</div>
+          <div class="meta">Paired</div>
+          <div class="chips">
+            <span class="chip unknown"><svg aria-hidden="true"><use href="#g-q"/></svg><span class="k">Send:</span> Unknown</span>
+            <span class="chip blocked"><svg aria-hidden="true"><use href="#g-block"/></svg><span class="k">Receive:</span> Blocked</span>
+          </div>
+        </div>
+        <svg class="chev" width="20" height="20" aria-hidden="true"><use href="#g-chev"/></svg>
+      </div>
+      <div class="divider"></div>
+      <div class="devrow anchor">
+        <div class="relglyph"><svg width="18" height="18" aria-hidden="true"><use href="#g-hourglass"/></svg></div>
+        <div class="grow">
+          <div class="name">ci-runner-07</div>
+          <div class="meta">Temporary worker</div>
+          <div class="chips">
+            <span class="chip revoked"><svg aria-hidden="true"><use href="#g-key"/></svg>Revoked on this phone</span>
+            <span class="chip unknown"><svg aria-hidden="true"><use href="#g-q"/></svg><span class="k">Send:</span> Unknown</span>
+            <span class="chip blocked"><svg aria-hidden="true"><use href="#g-block"/></svg><span class="k">Receive:</span> Blocked</span>
+          </div>
+        </div>
+        <svg class="chev" width="20" height="20" aria-hidden="true"><use href="#g-chev"/></svg>
+        <span class="pin">4</span>
+      </div>
+      <div class="divider"></div>
+      <div class="row" style="min-height:56px">
+        <svg width="22" height="22" aria-hidden="true"><use href="#g-folder"/></svg>
+        <div class="grow"><div style="font-weight:500">Files</div><div class="sec">Send or receive with a code</div></div>
+        <svg class="chev" width="20" height="20" aria-hidden="true"><use href="#g-chev"/></svg>
+      </div>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t2">Home: normal</h3>
+    <p class="ref">README 4.1, 4.1.1, 4.1.2, 7</p>
+    <ol>
+      <li><span class="pin">1</span><span>Identity from <span class="mono">status.fingerprint</span>, shown in monospace. A joined phone reads "Joined device. No owner identity on this phone."</span></li>
+      <li><span class="pin">2</span><span>The switch is the primary action. "Receiving" replaces "Available" so it cannot be confused with an access state (open question 2). The long caveat moves behind "What this allows".</span></li>
+      <li><span class="pin">3</span><span>Relationship first (Fleet shown as "My device"), then two chips for <span class="mono">Send</span> and <span class="mono">ReceiveInbox</span>. Today's core always reports Send as Unknown. No Live chip because the core reports presence Unknown. No Offline text: the core has no offline value.</span></li>
+      <li><span class="pin">4</span><span>A revoked temporary worker keeps its relationship label. The Revoked chip comes from <span class="mono">DeviceAccess.revoked</span>; the Blocked Receive chip carries the core reason, shown in detail (frame 6). <span class="mono">ada-tablet</span> shows Receive Blocked with no revoked flag, for example after an explicit transfer denial.</span></li>
+    </ol>
+  </div>
+</section>
+
+<!-- 3. Home empty -->
+<section class="card" aria-labelledby="t3">
+  <div class="phone" role="img" aria-label="Mockup: Home with no devices">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><div class="brand"><svg width="24" height="24" aria-hidden="true"><use href="#g-mark"/></svg>tunlion</div><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-gear"/></svg></span></div>
+    <div class="screen">
+      <div class="identity">
+        <div class="avatar"><svg width="22" height="22" aria-hidden="true"><use href="#g-phone"/></svg></div>
+        <div class="grow">
+          <div style="font-weight:600">pixel-example</div>
+          <div class="sec">Owner identity on this phone</div>
+          <div class="mono" style="font-size:12px">fict 4f2a 91c0 7be3</div>
+        </div>
+      </div>
+      <div class="card-s">
+        <div class="row">
+          <div class="grow">
+            <div style="font-weight:600">Availability</div>
+            <span class="state-line"><span class="dot hollow"></span>Off</span>
+          </div>
+          <div class="switch off" aria-hidden="true"></div>
+        </div>
+        <p class="sec">Receives files into your inbox while on. <span style="color:var(--primary);font-weight:600">What this allows</span></p>
+      </div>
+      <p class="eyebrow">DEVICES</p>
+      <div style="font-weight:600;font-size:16px" class="anchor">No devices yet.<span class="pin">1</span></div>
+      <p class="sec">Add a device with an invitation file from its owner. To move one file without adding a device, use Files.</p>
+      <div class="anchor"><div class="btn primary">Add a device</div><span class="pin">2</span></div>
+      <div class="divider"></div>
+      <div class="row" style="min-height:56px">
+        <svg width="22" height="22" aria-hidden="true"><use href="#g-folder"/></svg>
+        <div class="grow"><div style="font-weight:500">Files</div><div class="sec">Send or receive with a code</div></div>
+        <svg class="chev" width="20" height="20" aria-hidden="true"><use href="#g-chev"/></svg>
+      </div>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t3">Home: no devices</h3>
+    <p class="ref">README 4.1 Empty devices, 8</p>
+    <ol>
+      <li><span class="pin">1</span><span>Replaces the stale copy at <span class="mono">TunlionApp.kt:241</span>, which says enrollment is not connected. Invitation join is linked today.</span></li>
+      <li><span class="pin">2</span><span>One primary action for this state. The availability switch is off, so the filled button is the clear next step.</span></li>
+    </ol>
+  </div>
+</section>
+
+<!-- 4. Home load error -->
+<section class="card" aria-labelledby="t4">
+  <div class="phone" role="img" aria-label="Mockup: Home when the identity cannot be opened">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><div class="brand"><svg width="24" height="24" aria-hidden="true"><use href="#g-mark"/></svg>tunlion</div><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-gear"/></svg></span></div>
+    <div class="screen">
+      <div style="height:20px"></div>
+      <div class="row anchor"><svg width="22" height="22" style="color:var(--error)" aria-hidden="true"><use href="#g-warn"/></svg><p class="big grow" style="font-size:22px">Could not open this phone's identity</p><span class="pin">1</span></div>
+      <p class="sec">Nothing was changed. Your identity is still on this phone.</p>
+      <div class="anchor"><div class="btn primary">Try again</div><span class="pin">2</span></div>
+      <p class="sec">Do not clear app storage or reinstall to fix this. That would remove the identity.</p>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t4">Home: load error</h3>
+    <p class="ref">README 4.1 Load error, 7.3, 8</p>
+    <ol>
+      <li><span class="pin">1</span><span>Shown when the first <span class="mono">refresh()</span> fails (<span class="mono">loadFailed</span>, <span class="mono">TunlionApp.kt:205</span>). Warning glyph plus heading, never color alone.</span></li>
+      <li><span class="pin">2</span><span>Retry only. No setup is offered here, so a read failure can never lead to replacing an identity.</span></li>
+    </ol>
+  </div>
+</section>
+</div>
+
+<h2 class="group">Devices</h2>
+<div class="grid">
+
+<!-- 5. Device detail -->
+<section class="card" aria-labelledby="t5">
+  <div class="phone" role="img" aria-label="Mockup: Device detail for a fleet device">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-back"/></svg></span><div class="title">kestrel-laptop</div></div>
+    <div class="screen">
+      <div class="card-s anchor">
+        <div class="row"><div class="relglyph"><svg width="18" height="18" aria-hidden="true"><use href="#g-house"/></svg></div><div class="grow"><div style="font-weight:600">My device</div><div class="reason">Signed as one of your devices.</div></div></div>
+        <div class="fact"><span class="l">Key</span><span class="v mono">fict a91c 07be 3d51</span></div>
+        <div class="fact"><span class="l">Access ends</span><span class="v">No end recorded</span></div>
+        <div class="fact"><span class="l">Presence</span><span class="v">Not observed</span></div>
+        <span class="pin">1</span>
+      </div>
+      <p class="eyebrow">WHAT WORKS</p>
+      <div class="anchor">
+        <div class="action">
+          <div class="top"><span class="label">Send files to kestrel-laptop</span><span class="chip unknown"><svg aria-hidden="true"><use href="#g-q"/></svg>Unknown</span></div>
+          <span class="reason">Remote receiver authorization and reachability are not observed</span>
+        </div>
+        <div class="action">
+          <div class="top"><span class="label">kestrel-laptop sends to this phone</span><span class="chip unknown"><svg aria-hidden="true"><use href="#g-q"/></svg>Unknown</span></div>
+          <span class="reason">Stored relationship only; the receive gate requires authenticated link facts</span>
+        </div>
+        <div class="collapsed"><span class="label" style="font-weight:500">Terminal and folders</span><span class="chip notoffered"><svg aria-hidden="true"><use href="#g-dash"/></svg>Not offered</span></div>
+        <span class="pin">2</span>
+      </div>
+      <div class="anchor">
+        <div class="btn primary">Try sending a file</div>
+        <p class="sec" style="margin-top:6px">The other device decides whether to accept. This phone has not checked.</p>
+        <span class="pin">3</span>
+      </div>
+      <p class="eyebrow">REMOVAL</p>
+      <div class="anchor" style="display:flex;flex-direction:column;gap:8px">
+        <div class="btn outline disabled" style="flex-direction:column;gap:0">Revoke a capability<small>Not available yet: needs core support</small></div>
+        <div class="btn danger disabled" style="flex-direction:column;gap:0">Cut off this device<small>Not available yet: needs core support</small></div>
+        <p class="sec">These actions are designed but not connected. This app cannot remove access yet.</p>
+        <span class="pin">4</span>
+      </div>
+      <p class="sec">This page shows what this phone has stored. It does not contact kestrel-laptop.</p>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t5">Device: normal</h3>
+    <p class="ref">README 4.3, 6.1, 6.3, 7</p>
+    <ol>
+      <li><span class="pin">1</span><span>Facts from <span class="mono">DeviceAccess</span>: relationship, <span class="mono">device_key</span>, <span class="mono">expires_at</span>, <span class="mono">presence</span>. "Not observed" is the honest rendering of <span class="mono">DevicePresence::Unknown</span>.</span></li>
+      <li><span class="pin">2</span><span>One row per <span class="mono">EffectiveAction</span>, chip plus the core <span class="mono">reason</span> verbatim. Terminal and Folder are <span class="mono">Unsupported</span> today and stay folded away; they expand only if the core reports any other state (explicit opt-in rule). A Pending row would sit here once the core has <span class="mono">AccessState::Pending</span>; not shown until then.</span></li>
+      <li><span class="pin">3</span><span>Primary follows the Send state. Unknown gives an explicit attempt, never "Send".</span></li>
+      <li><span class="pin">4</span><span>Now version: both removal actions disabled, still focusable for TalkBack, with distinct labels.</span></li>
+    </ol>
+    <span class="tag">Removal: not wired, needs core API</span>
+  </div>
+</section>
+
+<!-- 6. Device revoked / expired -->
+<section class="card" aria-labelledby="t6">
+  <div class="phone" role="img" aria-label="Mockup: Device detail for a revoked and expired temporary worker">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-back"/></svg></span><div class="title">ci-runner-07</div></div>
+    <div class="screen">
+      <div class="banner anchor"><svg width="16" height="16" aria-hidden="true"><use href="#g-key"/></svg><span><strong>Revoked on this phone.</strong> The other device may not know yet, and sessions already open are not shown as ended.</span><span class="pin">1</span></div>
+      <div class="card-s">
+        <div class="row"><div class="relglyph"><svg width="18" height="18" aria-hidden="true"><use href="#g-hourglass"/></svg></div><div class="grow"><div style="font-weight:600">Temporary worker</div><div class="reason">Temporary access with an end time.</div></div></div>
+        <div class="fact anchor"><span class="l">Access ends</span><span class="v">3 Nov 2026, 18:00</span><span class="pin">2</span></div>
+        <div class="fact"><span class="l">Key</span><span class="v mono">fict 77c2 0d1e 9b40</span></div>
+        <div class="fact"><span class="l">Presence</span><span class="v">Not observed</span></div>
+      </div>
+      <p class="eyebrow">WHAT WORKS</p>
+      <div class="anchor">
+        <div class="action">
+          <div class="top"><span class="label">Send files to ci-runner-07</span><span class="chip unknown"><svg aria-hidden="true"><use href="#g-q"/></svg>Unknown</span></div>
+          <span class="reason">Remote receiver authorization and reachability are not observed</span>
+        </div>
+        <div class="action">
+          <div class="top"><span class="label">ci-runner-07 sends to this phone</span><span class="chip blocked"><svg aria-hidden="true"><use href="#g-block"/></svg>Blocked</span></div>
+          <span class="reason">Device access is revoked on this receiver</span>
+        </div>
+        <div class="collapsed"><span style="font-weight:500">Terminal and folders</span><span class="chip notoffered"><svg aria-hidden="true"><use href="#g-dash"/></svg>Not offered</span></div>
+        <span class="pin">3</span>
+      </div>
+      <div class="btn primary">Try sending a file</div>
+      <p class="sec">The other device decides whether to accept. This phone has not checked.</p>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t6">Device: revoked and expired</h3>
+    <p class="ref">README 6.1, 7.1, 8, open question 8</p>
+    <ol>
+      <li><span class="pin">1</span><span>From <span class="mono">DeviceAccess.revoked</span>. Key glyph plus error border plus words. No claim about the remote side or open sessions.</span></li>
+      <li><span class="pin">2</span><span><span class="mono">expires_at</span> as a local date. Kotlin does not compare it to the clock; the core's Blocked reason carries the verdict. A typed expired flag is not available yet.</span></li>
+      <li><span class="pin">3</span><span>The core checks revoked first, so the Receive reason is "Device access is revoked on this receiver". The relationship label stays: relationship and access are separate.</span></li>
+    </ol>
+  </div>
+</section>
+
+<!-- 7. Revoke sheet -->
+<section class="card" aria-labelledby="t7">
+  <div class="phone" role="img" aria-label="Mockup: Revoke one capability sheet, not wired">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-back"/></svg></span><div class="title">kestrel-laptop</div></div>
+    <div class="screen"><p class="eyebrow">WHAT WORKS</p><div class="action"><span class="label">Send files to kestrel-laptop</span></div></div>
+    <span class="notwired">NOT WIRED: NEEDS CORE API</span>
+    <div class="sheet-backdrop">
+      <div class="sheet">
+        <div class="handle"></div>
+        <div style="font-weight:600;font-size:18px" class="anchor">Revoke one capability from kestrel-laptop<span class="pin">1</span></div>
+        <div class="anchor">
+          <div class="radio"><span class="c on"></span><span class="mono">transfer</span></div>
+          <div class="radio"><span class="c"></span><span class="mono">mount</span></div>
+          <span class="pin">2</span>
+        </div>
+        <p class="sec anchor">kestrel-laptop loses only the selected capability on this phone. Its other access and the relationship stay. A session that is already open is not ended by this.<span class="pin">3</span></p>
+        <div class="btn primary">Revoke transfer</div>
+        <div class="btn text" style="color:var(--on-surface)">Keep</div>
+      </div>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t7">Revoke one capability (design target)</h3>
+    <p class="ref">README 6.2</p>
+    <ol>
+      <li><span class="pin">1</span><span>Separate action and separate title from cut-off. Never shown in the now version.</span></li>
+      <li><span class="pin">2</span><span>The list of held capabilities is not available yet: <span class="mono">DeviceAccess</span> has no per-device capability list. Values here are examples.</span></li>
+      <li><span class="pin">3</span><span>Does not promise session termination or remote acknowledgment.</span></li>
+    </ol>
+    <span class="tag">Not wired: needs core API</span>
+  </div>
+</section>
+
+<!-- 8. Cut-off sheet -->
+<section class="card" aria-labelledby="t8">
+  <div class="phone" role="img" aria-label="Mockup: Cut off device sheet, not wired">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-back"/></svg></span><div class="title">kestrel-laptop</div></div>
+    <div class="screen"><p class="eyebrow">REMOVAL</p></div>
+    <span class="notwired">NOT WIRED: NEEDS CORE API</span>
+    <div class="sheet-backdrop">
+      <div class="sheet">
+        <div class="handle"></div>
+        <div style="font-weight:600;font-size:18px" class="anchor">Cut off kestrel-laptop?<span class="pin">1</span></div>
+        <p class="sec anchor">This removes every capability kestrel-laptop has on this phone and forgets the relationship. To work together again, it needs a new invitation. A session that is already open is not ended by this, and this phone cannot confirm when kestrel-laptop notices.<span class="pin">2</span></p>
+        <div class="anchor"><div class="btn danger" style="background:var(--error-bg)">Hold to cut off kestrel-laptop</div><span class="pin">3</span></div>
+        <div class="btn text" style="color:var(--on-surface)">Keep</div>
+      </div>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t8">Cut off a device (design target)</h3>
+    <p class="ref">README 6.2, 9</p>
+    <ol>
+      <li><span class="pin">1</span><span>Whole-device action. Distinct wording from revoke.</span></li>
+      <li><span class="pin">2</span><span>States the scope (this phone), the consequence (new invitation needed) and both limits (open sessions, remote notice).</span></li>
+      <li><span class="pin">3</span><span>Hold for 1 second, with a TalkBack double-tap alternative and no motion dependency. Open question 6.</span></li>
+    </ol>
+    <span class="tag">Not wired: needs core API</span>
+  </div>
+</section>
+</div>
+
+<h2 class="group">Add a device</h2>
+<div class="grid">
+
+<!-- 9. Carrier choice -->
+<section class="card" aria-labelledby="t9">
+  <div class="phone" role="img" aria-label="Mockup: Add a device, carrier choice">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-back"/></svg></span><div class="title">Add a device</div></div>
+    <div class="screen">
+      <p class="sec">Ask the owner of the other device for an invitation file. You will see what it asks for before anything is joined.</p>
+      <div class="anchor"><div class="seg" role="presentation"><div class="on">Invitation file</div><div>Spoken code</div></div><span class="pin">1</span></div>
+      <div class="anchor"><div class="btn primary">Choose invitation file</div><span class="pin">2</span></div>
+      <div class="divider"></div>
+      <p class="eyebrow">WHEN SPOKEN CODE IS SELECTED</p>
+      <div class="field disabled anchor"><div class="l">Device code</div><div class="v mono">brave-otter-3141</div><span class="pin">3</span></div>
+      <p class="sec">Spoken codes are not available yet on Android. Use an invitation file, or Files for a one-time transfer.</p>
+      <div class="btn primary disabled">Continue</div>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t9">Add a device: carrier choice</h3>
+    <p class="ref">README 4.2, 5.1, 9</p>
+    <ol>
+      <li><span class="pin">1</span><span>Segmented control at 48dp height replaces 32dp filter chips. Carrier only: it never selects a relationship. The intended-relationship radio group is removed (open question 1).</span></li>
+      <li><span class="pin">2</span><span>The file is read once into one byte array. The same bytes go to preview and join.</span></li>
+      <li><span class="pin">3</span><span>Lower half shows the spoken-code state. Disabled because <span class="mono">codeEnrollmentSupported</span> is false; the core has no spoken-code enrollment API.</span></li>
+    </ol>
+    <span class="tag">Spoken code: not available yet</span>
+  </div>
+</section>
+
+<!-- 10. Preview valid -->
+<section class="card" aria-labelledby="t10">
+  <div class="phone" role="img" aria-label="Mockup: Invitation preview, valid">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-back"/></svg></span><div class="title">Add a device</div></div>
+    <div class="screen">
+      <p class="eyebrow">WHO</p>
+      <div class="card-s anchor">
+        <div class="fact"><span class="l">From</span><span class="v">Morgan Example</span></div>
+        <div class="fact"><span class="l">Relationship</span><span class="v">Your own device</span><span class="reason">Joins Morgan Example's devices as one of theirs.</span></div>
+        <span class="pin">1</span>
+      </div>
+      <p class="eyebrow">WHAT IT ASKS FOR</p>
+      <div class="anchor">
+        <div class="caps"><span>transfer</span><span>mount</span></div>
+        <p class="sec" style="margin-top:8px">This is what the invitation asks for. Each device still decides what it allows.</p>
+        <span class="pin">2</span>
+      </div>
+      <p class="eyebrow">LIMITS</p>
+      <div class="card-s anchor">
+        <div class="fact"><span class="l">Expires</span><span class="v">19 Nov 2026, 09:30</span></div>
+        <div class="fact"><span class="l">Can be offline for</span><span class="v">7 days <span class="reason mono">604800 s</span></span></div>
+        <div class="fact"><span class="l">Uses</span><span class="v">Single use</span></div>
+        <div class="fact"><span class="l">Temporary</span><span class="v">No</span></div>
+        <span class="pin">3</span>
+      </div>
+      <div class="field"><div class="l">This phone's name</div><div class="v">pixel-example</div></div>
+      <div class="anchor"><div class="btn primary">Join</div><span class="pin">4</span></div>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t10">Invitation preview: valid</h3>
+    <p class="ref">README 5.1, 5.2</p>
+    <ol>
+      <li><span class="pin">1</span><span><span class="mono">owner_name</span> and <span class="mono">relationship</span> from <span class="mono">CoreInvitationPreview</span>. <span class="mono">OwnDevice</span> reads "Your own device".</span></li>
+      <li><span class="pin">2</span><span><span class="mono">requested_capabilities</span> verbatim, monospace, labelled as requested. <span class="mono">mount</span> appears only because the signed invitation names it. An extra consent step for powerful capabilities needs a core field and is not available yet.</span></li>
+      <li><span class="pin">3</span><span><span class="mono">expires</span>, <span class="mono">max_offline</span>, <span class="mono">max_uses</span>/<span class="mono">reusable</span>, <span class="mono">ephemeral</span>. Formatting only, no clock comparison.</span></li>
+      <li><span class="pin">4</span><span>Enabled only because the preview returned and <span class="mono">expired</span> is false. Joins with the same bytes.</span></li>
+    </ol>
+  </div>
+</section>
+
+<!-- 11. Preview expired -->
+<section class="card" aria-labelledby="t11">
+  <div class="phone" role="img" aria-label="Mockup: Invitation preview, expired">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-back"/></svg></span><div class="title">Add a device</div></div>
+    <div class="screen">
+      <div class="anchor"><span class="chip expired"><svg aria-hidden="true"><use href="#g-hourglass"/></svg>Expired</span><span class="pin">1</span></div>
+      <p style="margin:0;font-weight:600;font-size:16px">This invitation has expired. Ask Morgan Example for a new one.</p>
+      <p class="eyebrow">WHO</p>
+      <div class="card-s">
+        <div class="fact"><span class="l">From</span><span class="v">Morgan Example</span></div>
+        <div class="fact"><span class="l">Relationship</span><span class="v">Temporary worker</span><span class="reason">Bounded access that ends at the expiry above.</span></div>
+      </div>
+      <p class="eyebrow">WHAT IT ASKS FOR</p>
+      <div class="caps"><span>transfer</span></div>
+      <p class="eyebrow">LIMITS</p>
+      <div class="card-s anchor">
+        <div class="fact"><span class="l">Expires</span><span class="v">2 Nov 2026, 12:00</span></div>
+        <div class="fact"><span class="l">Uses</span><span class="v">Reusable</span></div>
+        <div class="fact"><span class="l">Temporary</span><span class="v">Yes, removed when it expires</span></div>
+        <span class="pin">2</span>
+      </div>
+      <div class="anchor"><div class="btn primary">Choose another file</div><span class="pin">3</span></div>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t11">Invitation preview: expired</h3>
+    <p class="ref">README 5.3</p>
+    <ol>
+      <li><span class="pin">1</span><span>From the core's <span class="mono">expired</span> flag only. Hourglass, border and word.</span></li>
+      <li><span class="pin">2</span><span>Facts stay visible so the person can see what the invitation was.</span></li>
+      <li><span class="pin">3</span><span>No name field and no Join button exist in this state.</span></li>
+    </ol>
+  </div>
+</section>
+
+<!-- 12. Join success -->
+<section class="card" aria-labelledby="t12">
+  <div class="phone" role="img" aria-label="Mockup: Join succeeded">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-back"/></svg></span><div class="title">Add a device</div></div>
+    <div class="screen">
+      <div style="height:8px"></div>
+      <p class="big anchor">Joined<span class="pin">1</span></p>
+      <p class="sec">Morgan Example's device accepted this phone as pixel-example.</p>
+      <div class="card-s anchor">
+        <div class="fact"><span class="l">Device key</span><span class="v mono">fict 3c9e 51a0 b7d2 64f8</span></div>
+        <div class="fact"><span class="l">Allowed at most</span><span class="caps"><span>transfer</span><span>mount</span></span></div>
+        <div class="fact"><span class="l">Until</span><span class="v">19 Nov 2027, 09:30</span></div>
+        <span class="pin">2</span>
+      </div>
+      <p class="sec anchor">Each receiver checks access when you use it. Joining does not confirm any action works yet.<span class="pin">3</span></p>
+      <div class="btn primary">Done</div>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t12">Join succeeded</h3>
+    <p class="ref">README 5.5</p>
+    <ol>
+      <li><span class="pin">1</span><span>A state of Add a device. "Done" returns Home.</span></li>
+      <li><span class="pin">2</span><span><span class="mono">CoreJoinResult</span>: <span class="mono">name</span>, <span class="mono">owner_name</span>, <span class="mono">device_pub</span>, <span class="mono">ceiling</span>, <span class="mono">expires</span>, <span class="mono">ephemeral</span>. The core returns it today; the adapter drops it, so this card needs an adapter change. Until then the screen reads "Joined. Check Devices for the new relationship."</span></li>
+      <li><span class="pin">3</span><span>The ceiling is a maximum, not effective access.</span></li>
+    </ol>
+    <span class="tag">Card: adapter pass-through needed</span>
+  </div>
+</section>
+
+<!-- 13. Join failure -->
+<section class="card" aria-labelledby="t13">
+  <div class="phone" role="img" aria-label="Mockup: Join failed">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-back"/></svg></span><div class="title">Add a device</div></div>
+    <div class="screen">
+      <div style="height:8px"></div>
+      <div class="row anchor"><svg width="22" height="22" style="color:var(--error)" aria-hidden="true"><use href="#g-warn"/></svg><p class="big grow" style="font-size:22px">No answer from the other device</p><span class="pin">1</span></div>
+      <div class="notice mono anchor" style="font-size:12.5px">the owner device did not answer within 60 seconds<span class="pin">2</span></div>
+      <p class="sec anchor">The join did not finish. Check Devices before you try again.<span class="pin">3</span></p>
+      <div class="btn primary">Try again</div>
+      <div class="btn outline">Back to Home</div>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t13">Join failed</h3>
+    <p class="ref">README 5.6, 7.3</p>
+    <ol>
+      <li><span class="pin">1</span><span>Heading from <span class="mono">CoreErrorKind</span> (here UNREACHABLE). Glyph plus words.</span></li>
+      <li><span class="pin">2</span><span>The core's message verbatim. The sample text is illustrative.</span></li>
+      <li><span class="pin">3</span><span>Does not claim "nothing changed": the core cannot rule out a record on the owner side after a timeout. "Try again" reuses the same bytes and is offered only while the preview is valid.</span></li>
+    </ol>
+  </div>
+</section>
+</div>
+
+<h2 class="group">Files</h2>
+<div class="grid">
+
+<!-- 14. Files -->
+<section class="card" aria-labelledby="t14">
+  <div class="phone" role="img" aria-label="Mockup: Files screen">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-back"/></svg></span><div class="title">Files</div></div>
+    <div class="screen">
+      <p class="sec">Send to one of your devices, or use a one-time code.</p>
+      <p class="eyebrow">SEND TO</p>
+      <div class="devrow anchor" style="min-height:56px">
+        <div class="relglyph"><svg width="18" height="18" aria-hidden="true"><use href="#g-house"/></svg></div>
+        <div class="grow"><div class="name">kestrel-laptop</div><div class="chips"><span class="chip unknown"><svg aria-hidden="true"><use href="#g-q"/></svg><span class="k">Send:</span> Unknown</span></div></div>
+        <svg class="chev" width="20" height="20" aria-hidden="true"><use href="#g-chev"/></svg>
+        <span class="pin">1</span>
+      </div>
+      <div class="btn outline">Send with a code</div>
+      <div class="btn outline">Receive with a code</div>
+      <p class="sec anchor">A file code moves files once. It does not add a device and does not give terminal, folder or any other access.<span class="pin">2</span></p>
+      <p class="sec">Received files are saved to Download/Tunlion after verification.</p>
+      <p class="eyebrow">RECENT FILES</p>
+      <div class="file anchor"><svg width="20" height="20" aria-hidden="true"><use href="#g-doc"/></svg><div class="grow"><div>site-plan.pdf</div><span class="st okc"><svg width="12" height="12" aria-hidden="true"><use href="#g-check"/></svg>Received, saved</span></div><span class="pin">3</span></div>
+      <div class="file"><svg width="20" height="20" aria-hidden="true"><use href="#g-doc"/></svg><div class="grow"><div>notes.txt</div><span class="st"><svg width="12" height="12" aria-hidden="true"><use href="#g-hollow"/></svg>Not completed</span></div></div>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t14">Files</h3>
+    <p class="ref">README 4.4</p>
+    <ol>
+      <li><span class="pin">1</span><span>Only devices whose Send state is Available or Unknown are listed. With a sendable device present, the list is primary and both code buttons are outlined. With none, "Receive with a code" becomes the filled button.</span></li>
+      <li><span class="pin">2</span><span>Anonymous consent is transfer only, said every time.</span></li>
+      <li><span class="pin">3</span><span>From the core's verified receive journal. Check or hollow circle plus words.</span></li>
+    </ol>
+  </div>
+</section>
+
+<!-- 15. Send with code in progress -->
+<section class="card" aria-labelledby="t15">
+  <div class="phone" role="img" aria-label="Mockup: Send with a code, waiting">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-back"/></svg></span><div class="title">Send a file</div></div>
+    <div class="screen">
+      <p class="big">Send with a code</p>
+      <p class="sec">Anyone with the code can receive these files once.</p>
+      <p class="eyebrow">YOUR FILE CODE</p>
+      <div class="code anchor">quiet-heron-2718<span class="pin">1</span></div>
+      <div class="row"><span class="spinner" aria-hidden="true"></span><p class="sec grow">Enter this code on the other device. Waiting for it...</p></div>
+      <p class="sec anchor">Works for about 5 minutes.<span class="pin">2</span></p>
+      <p class="eyebrow">SELECTED FILES (2)</p>
+      <div class="file"><svg width="20" height="20" aria-hidden="true"><use href="#g-doc"/></svg><span class="grow">holiday-01.jpg</span></div>
+      <div class="file"><svg width="20" height="20" aria-hidden="true"><use href="#g-doc"/></svg><span class="grow">holiday-02.jpg</span></div>
+      <div class="btn text" style="color:var(--on-surface)">Cancel</div>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t15">Send: code shown</h3>
+    <p class="ref">README 4.5</p>
+    <ol>
+      <li><span class="pin">1</span><span>The real code from <span class="mono">create_code</span>, monospace, large. Code is a fictional example.</span></li>
+      <li><span class="pin">2</span><span>From <span class="mono">CreatedCode.expires_in_secs</span>. The core returns it; the adapter reads only <span class="mono">.code</span> today, so this line needs an adapter change.</span></li>
+    </ol>
+    <span class="tag">Lifetime line: adapter pass-through needed</span>
+  </div>
+</section>
+
+<!-- 16. Send partial result (error state) -->
+<section class="card" aria-labelledby="t16">
+  <div class="phone" role="img" aria-label="Mockup: Send result, partly delivered">
+    <div class="statusbar"><span>9:41</span><span>5G</span></div>
+    <div class="topbar"><span class="iconbtn"><svg width="22" height="22" aria-hidden="true"><use href="#g-back"/></svg></span><div class="title">Send a file</div></div>
+    <div class="screen">
+      <div class="row anchor"><svg width="22" height="22" style="color:var(--error)" aria-hidden="true"><use href="#g-warn"/></svg><p class="big grow" style="font-size:22px">Partly done</p><span class="pin">1</span></div>
+      <p class="sec">1 of 2 files confirmed by the receiver.</p>
+      <p class="eyebrow">TO KESTREL-LAPTOP</p>
+      <div class="file anchor"><svg width="20" height="20" aria-hidden="true"><use href="#g-doc"/></svg><div class="grow"><div>holiday-01.jpg</div><span class="st okc"><svg width="12" height="12" aria-hidden="true"><use href="#g-check"/></svg>Delivered, stored as holiday-01.jpg</span></div><span class="pin">2</span></div>
+      <div class="file"><svg width="20" height="20" aria-hidden="true"><use href="#g-doc"/></svg><div class="grow"><div>holiday-02.jpg</div><span class="st"><svg width="12" height="12" aria-hidden="true"><use href="#g-hollow"/></svg>Not confirmed by the receiver</span></div></div>
+      <p class="sec anchor">Only receiver confirmations count as delivered. Check kestrel-laptop before sending again.<span class="pin">3</span></p>
+      <div class="btn primary">Done</div>
+    </div>
+  </div>
+  <div class="notes">
+    <h3 id="t16">Send: error, partly delivered</h3>
+    <p class="ref">README 4.5, 7.3, 8</p>
+    <ol>
+      <li><span class="pin">1</span><span><span class="mono">CoreErrorKind.PARTIAL</span> heading.</span></li>
+      <li><span class="pin">2</span><span>Per-file <span class="mono">SentFile.delivered</span> and <span class="mono">stored_name</span>. A hollow circle and "Not confirmed" for anything without a delivery acknowledgment.</span></li>
+      <li><span class="pin">3</span><span>A stored device grant is never shown as a delivery.</span></li>
+    </ol>
+  </div>
+</section>
+</div>
+
+<p class="footer">Colors are the app's own tokens from <span class="mono">TunlionApp.kt</span> lines 44 to 56, switched by the system color scheme. Monospace is used only for codes, keys and capability ids. System fonts only; this page loads nothing from the network.</p>
+</div>
+</body>
+</html>
