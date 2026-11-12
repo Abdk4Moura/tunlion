@@ -6524,16 +6524,24 @@ async fn recv_run(
                         yes,
                         daemon,
                     );
-                    if ours && consented_peer {
+                    if consented_peer {
                         // A certificate is the only identity fact this answer can
-                        // settle. An authenticated pair keeps its own evidence for
-                        // the shell gate; it must not turn a consented transfer
-                        // into a Pending hold that expires and refuses.
+                        // settle. It is the PEER's own link saying it cannot
+                        // prove one, so the consent already given (code, -y or
+                        // daemon) names this link whether or not the nonce still
+                        // matches: a challenge re-issued across a link rebuild
+                        // can leave the peer answering an older nonce, and the
+                        // old strict match turned that ordering race into a
+                        // 20 s Pending hold that refused an allowed transfer.
+                        // Identity state only ever becomes anonymous here;
+                        // shell still needs an explicit pair grant.
                         let anonymous = conn
                             .link(&pid)
                             .is_some_and(|l| l.identity_state != cap::IdentityState::Resolved);
-                        identity_nonces.remove(&pid);
-                        st.pending_proven.lock().unwrap().remove(&pid);
+                        if ours {
+                            identity_nonces.remove(&pid);
+                            st.pending_proven.lock().unwrap().remove(&pid);
+                        }
                         if anonymous {
                             if let Some(l) = conn.link_mut(&pid) {
                                 l.identity_state = cap::IdentityState::ExplicitlyUnavailableAnonymous;
