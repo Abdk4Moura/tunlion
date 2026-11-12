@@ -4281,7 +4281,18 @@ async fn recv_run(
             // C30: server confirmed our session digest. Phase 2: reconcile
             // the roster it carries, missed peer-joined/left self-correct.
             Ev::Synced(v) => {
-                if let Some(roster) = sess.on_synced(&v) {
+                let synced = sess.on_synced(&v);
+                // The server's channel cap truncated what we sent: the session
+                // stays unconfirmed (slow re-sync) and this must be seen, since
+                // a cut enrollment channel means no device can enroll.
+                if let Some(w) = sess.take_channel_warning() {
+                    log.critical(&format!(
+                        "  {} {}",
+                        log.paint(Tone::Warn, log.glyph_warn()),
+                        log.paint(Tone::Warn, &w)
+                    ));
+                }
+                if let Some(roster) = synced {
                     // Take the flag before any reconcile work: exactly the first
                     // digest on a fresh signaling sid is exempt from absence
                     // counting (adoption below still runs, so a new sid is

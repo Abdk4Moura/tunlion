@@ -21,6 +21,12 @@ use std::time::{Duration, Instant};
 const SYNC_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// A confirmed digest older than this is re-asserted even if unchanged.
 const CONFIRM_TTL: Duration = Duration::from_secs(30);
+/// Re-sync cadence while the server keeps truncating an UNCHANGED desire.
+/// The cap is deterministic, so a fast retry cannot fix it and every `sync`
+/// re-emits `known-peer` to every channel peer; retrying no faster than a
+/// healthy session re-asserts (CONFIRM_TTL) adds no load over the normal
+/// state. A changed desire, `touch()` or a fresh sid still syncs at once.
+const TRUNCATED_RESYNC_INTERVAL: Duration = CONFIRM_TTL;
 
 /// The signaling server accepts at most this many channels in one `subscribe`
 /// or `sync` and silently drops the rest (`MAX_CHANNELS` in
@@ -61,8 +67,69 @@ pub struct Session {
     /// digest of the last server-confirmed state + when
     confirmed: Option<(String, Instant)>,
     last_attempt: Option<Instant>,
+    /// The channels the last cadence `sync` put on the wire, in wire order:
+    /// what the ack's accepted count is checked against.
+    last_sent: Option<Vec<String>>,
+    /// Set while the server's last ack accepted fewer channels than we sent.
+    truncated: Option<ChannelTruncation>,
+    /// A loud line for the host to log, set when a truncation is first seen
+    /// or its numbers change (see [`Session::take_channel_warning`]).
+    channel_warning: Option<String>,
     rng: u64, // loss-shim PRNG state (deterministic under _SEED)
     loss: f64,
+}
+
+/// The server accepted fewer channels than a `sync` sent: its
+/// [`SIGNALING_MAX_CHANNELS`] cap cut the tail of the list, so those channels
+/// are not registered on this socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelTruncation {
+    /// The `channels` count in the server's ack.
+    pub accepted: usize,
+    /// How many server-valid channels we sent.
+    pub sent: usize,
+    /// The valid channels we sent past the cap, which the server cannot have
+    /// kept (empty when the shortfall has another cause).
+    pub dropped: Vec<String>,
+    /// The digest of the desire that was sent and cut: an unchanged desire re-syncs on
+    /// the slow [`TRUNCATED_RESYNC_INTERVAL`] cadence, a changed one at once.
+    digest: String,
+}
+
+impl ChannelTruncation {
+    /// The line the host logs at critical level.
+    pub fn warning(&self) -> String {
+        const SHOWN: usize = 8;
+        let mut named: Vec<String> = self
+            .dropped
+            .iter()
+            .take(SHOWN)
+            .map(|c| c.chars().take(12).collect::<String>())
+            .collect();
+        if self.dropped.len() > SHOWN {
+            named.push(format!("+{} more", self.dropped.len() - SHOWN));
+        }
+        let dropped = if named.is_empty() {
+            String::new()
+        } else {
+            format!(" (dropped: {})", named.join(", "))
+        };
+        format!(
+            "signaling accepted {} of {} channels: the server's {}-channel cap truncated the \
+             subscription{}; enrollment/fleet channels may be unregistered, re-syncing every {}s",
+            self.accepted,
+            self.sent,
+            SIGNALING_MAX_CHANNELS,
+            dropped,
+            TRUNCATED_RESYNC_INTERVAL.as_secs(),
+        )
+    }
+}
+
+/// The shape the server accepts (`CHAN_RE`, 64 lowercase hex). It counts only
+/// these, so only these are counted as sent.
+fn is_server_channel(c: &str) -> bool {
+    c.len() == 64 && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The server's confirmed view of both discovery surfaces. Room membership and
@@ -109,6 +176,9 @@ impl Session {
             channels: Vec::new(),
             confirmed: None,
             last_attempt: None,
+            last_sent: None,
+            truncated: None,
+            channel_warning: None,
             rng: seed | 1,
             loss,
         }
@@ -147,7 +217,12 @@ impl Session {
 
     /// What we want the server to hold for us, as a comparable string.
     fn desired_digest(&self) -> String {
-        let mut chans = self.channels.clone();
+        self.digest_with(&self.channels)
+    }
+
+    /// The digest our desire would have with `channels` as its channel set.
+    fn digest_with(&self, channels: &[String]) -> String {
+        let mut chans = channels.to_vec();
         chans.sort();
         format!("{}|{}|{}", self.room.as_deref().unwrap_or(""), self.enroll_room.as_deref().unwrap_or(""), chans.join(","))
     }
@@ -173,11 +248,62 @@ impl Session {
         if v["ok"].as_bool() != Some(true) {
             return None; // error digests carry no roster (server contract)
         }
-        self.confirmed = Some((self.desired_digest(), Instant::now()));
-        Some(SyncedRoster {
+        let roster = SyncedRoster {
             peers: v["peers"].as_array().cloned().unwrap_or_default(),
             channel_peers: v["channel_peers"].as_array().cloned().unwrap_or_default(),
-        })
+        };
+        // The server silently keeps only the first SIGNALING_MAX_CHANNELS of
+        // the list and reports how many it accepted. Fewer than we sent means
+        // part of the desired set is NOT registered: never record that as
+        // confirmed. The roster is still the server's truth for what it did
+        // register, so it is returned either way. An ack without the count
+        // (an older server) cannot be checked and confirms as before.
+        if let Some(accepted) = v["channels"].as_u64() {
+            let accepted = usize::try_from(accepted).unwrap_or(usize::MAX);
+            let sent_list: &[String] = self.last_sent.as_deref().unwrap_or(&self.channels);
+            let sent = sent_list.iter().filter(|c| is_server_channel(c)).count();
+            if accepted < sent {
+                let dropped: Vec<String> = sent_list
+                    .iter()
+                    .skip(SIGNALING_MAX_CHANNELS)
+                    .filter(|c| is_server_channel(c))
+                    .cloned()
+                    .collect();
+                let changed = match &self.truncated {
+                    Some(t) => t.accepted != accepted || t.sent != sent,
+                    None => true,
+                };
+                let t = ChannelTruncation {
+                    accepted,
+                    sent,
+                    dropped,
+                    // What was SENT and cut: if desire has moved on since,
+                    // the slow cadence does not apply to the new set.
+                    digest: self.digest_with(sent_list),
+                };
+                if changed {
+                    self.channel_warning = Some(t.warning());
+                }
+                self.truncated = Some(t);
+                self.confirmed = None;
+                return Some(roster);
+            }
+        }
+        self.truncated = None;
+        self.confirmed = Some((self.desired_digest(), Instant::now()));
+        Some(roster)
+    }
+
+    /// The loud line for a channel truncation the last ack revealed, once per
+    /// distinct truncation (a repeat of the same numbers is not re-announced).
+    /// Hosts log it at critical level right after [`Session::on_synced`].
+    pub fn take_channel_warning(&mut self) -> Option<String> {
+        self.channel_warning.take()
+    }
+
+    /// The truncation the server's last ack reported, if it is still current.
+    pub fn channel_truncation(&self) -> Option<&ChannelTruncation> {
+        self.truncated.as_ref()
     }
 
     /// Add a priority channel (the enrollment or fleet meeting point) at the
@@ -265,7 +391,9 @@ impl Session {
         }
         match (&self.confirmed, &self.last_attempt) {
             // never confirmed: retry on the attempt cadence
-            (None, Some(at)) => now.duration_since(*at) >= SYNC_MIN_INTERVAL,
+            // A truncated ack also leaves us unconfirmed; while desire is
+            // unchanged it retries on the slow cadence, never in a loop.
+            (None, Some(at)) => now.duration_since(*at) >= self.unconfirmed_retry_interval(),
             (None, None) => true,
             (Some((digest, at)), _) => {
                 let stale = now.duration_since(*at) >= CONFIRM_TTL;
@@ -279,6 +407,16 @@ impl Session {
         }
     }
 
+    /// How long an unconfirmed session waits between `sync` attempts: the
+    /// slow truncation cadence while the server keeps cutting the SAME
+    /// desire, the normal attempt cadence otherwise.
+    fn unconfirmed_retry_interval(&self) -> Duration {
+        match &self.truncated {
+            Some(t) if t.digest == self.desired_digest() => TRUNCATED_RESYNC_INTERVAL,
+            _ => SYNC_MIN_INTERVAL,
+        }
+    }
+
     /// Called every loop iteration; cheap no-op most ticks.
     pub async fn tick(&mut self, sio: &Client) {
         let now = Instant::now();
@@ -286,6 +424,7 @@ impl Session {
             return;
         }
         self.last_attempt = Some(now);
+        self.last_sent = Some(self.channels.clone());
         self.emit(sio, "sync", self.sync_payload()).await;
     }
 }
@@ -405,6 +544,96 @@ mod tests {
         assert_eq!(s.channels[0], chan(3_000));
         assert_eq!(s.channels.len(), 73);
         assert!(s.channels[..SIGNALING_MAX_CHANNELS].contains(&enroll));
+    }
+
+    fn ack(accepted: usize) -> Value {
+        json!({ "v": 1, "ok": true, "channels": accepted, "peers": [], "channel_peers": [] })
+    }
+
+    /// The server's cap cut the list: the ack says it accepted fewer channels
+    /// than we sent. The set must stay unconfirmed (so it is re-synced), the
+    /// host must get one loud line naming both numbers and the dropped tail,
+    /// and the retry must run on the slow cadence, never in a loop.
+    #[test]
+    fn a_truncated_sync_ack_is_not_confirmation() {
+        let mut s = Session::new("n", "u");
+        s.room = Some("r".into());
+        s.channels = (0..70).map(chan).collect();
+        let t0 = Instant::now();
+        // As `tick` records it when the sync goes on the wire.
+        s.last_attempt = Some(t0);
+        s.last_sent = Some(s.channels.clone());
+
+        let roster = s.on_synced(&ack(64));
+        assert!(roster.is_some(), "the roster of what WAS registered is still returned");
+        assert!(s.confirmed.is_none(), "a truncated set is never confirmed");
+        let t = s.channel_truncation().expect("truncation recorded");
+        assert_eq!((t.accepted, t.sent), (64, 70));
+        assert_eq!(t.dropped, (64..70).map(chan).collect::<Vec<_>>());
+
+        let w = s.take_channel_warning().expect("a loud line for the host");
+        assert!(w.contains("accepted 64 of 70 channels"), "{w}");
+        assert!(w.contains("enrollment/fleet channels may be unregistered"), "{w}");
+        assert!(w.contains(&chan(64)[..12]), "names the dropped channels: {w}");
+        assert!(s.take_channel_warning().is_none(), "taken once");
+
+        // No retry storm: an unchanged desire waits the slow cadence, not
+        // SYNC_MIN_INTERVAL, and the same truncation is not re-announced.
+        assert!(!s.sync_due(t0 + SYNC_MIN_INTERVAL * 2));
+        assert!(s.sync_due(t0 + TRUNCATED_RESYNC_INTERVAL));
+        let _ = s.on_synced(&ack(64));
+        assert!(s.confirmed.is_none());
+        assert!(s.take_channel_warning().is_none(), "same numbers, no repeat line");
+
+        // A changed desire is worth trying at the normal cadence.
+        s.channels.truncate(SIGNALING_MAX_CHANNELS);
+        assert!(s.sync_due(t0 + SYNC_MIN_INTERVAL));
+
+        // A full acceptance confirms and clears the truncation.
+        s.last_sent = Some(s.channels.clone());
+        let _ = s.on_synced(&ack(64));
+        assert!(s.confirmed.is_some());
+        assert!(s.channel_truncation().is_none());
+        assert!(s.take_channel_warning().is_none());
+    }
+
+    /// Without a recorded send (the ack raced the first tick) the check falls
+    /// back to the current desire.
+    #[test]
+    fn a_truncated_ack_is_caught_without_a_recorded_send() {
+        let mut s = Session::new("n", "u");
+        s.room = Some("r".into());
+        s.channels = (0..66).map(chan).collect();
+        let _ = s.on_synced(&ack(64));
+        assert!(s.confirmed.is_none());
+        assert!(s.take_channel_warning().unwrap().contains("accepted 64 of 66"));
+    }
+
+    /// accepted == sent confirms exactly as before; so does an ack from a
+    /// server that reports no count, and channels the server would reject by
+    /// shape are not counted as sent.
+    #[test]
+    fn a_complete_sync_ack_confirms_as_before() {
+        let mut s = Session::new("n", "u");
+        s.room = Some("r".into());
+        s.channels = (0..3).map(chan).collect();
+        s.last_sent = Some(s.channels.clone());
+        let _ = s.on_synced(&ack(3));
+        assert!(s.confirmed.is_some());
+        assert!(s.channel_truncation().is_none());
+        assert!(s.take_channel_warning().is_none());
+
+        let mut old = Session::new("n", "u");
+        old.room = Some("r".into());
+        old.channels = (0..3).map(chan).collect();
+        let _ = old.on_synced(&json!({ "ok": true }));
+        assert!(old.confirmed.is_some(), "no count in the ack: unchanged behavior");
+
+        let mut odd = Session::new("n", "u");
+        odd.room = Some("r".into());
+        odd.channels = vec!["not-a-channel".into(), chan(1)];
+        let _ = odd.on_synced(&ack(1));
+        assert!(odd.confirmed.is_some(), "only server-valid channels count as sent");
     }
 
     #[test]
