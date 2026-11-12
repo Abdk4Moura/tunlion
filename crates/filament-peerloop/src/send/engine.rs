@@ -866,8 +866,7 @@ async fn drive_over(
                         conn.on_transport_offer(&from, cands, srflx, public, proto);
                     } else {
                         let ch = data["ch"].as_str().map(String::from);
-                        conn.buffered_offers
-                            .insert(from.clone(), (cands, srflx, public, proto, ch));
+                        conn.buffer_offer(&from, (cands, srflx, public, proto, ch));
                     }
                     continue;
                 }

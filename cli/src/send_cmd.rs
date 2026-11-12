@@ -1597,8 +1597,8 @@ pub(crate) async fn send_cmd(
                                 peer_proto,
                             );
                         } else {
-                            conn.buffered_offers.insert(
-                                from.clone(),
+                            conn.buffer_offer(
+                                &from,
                                 (
                                     cands,
                                     srflx,
