@@ -817,6 +817,9 @@ pub async fn handle_warm_resize(
 
 /// Answer the scoped end reason a finished warm PTY bridge recorded, if any.
 /// Consuming the entry keeps the map bounded; a clean end answers `ok` alone.
+/// Warm reuse and its `control::Req` are unix-only, so this handler must be
+/// too: the non-unix `Req` has no `kind` field.
+#[cfg(unix)]
 pub async fn handle_warm_pty_reason(req: control::Req) {
     let control::ReqKind::WarmPtyReason { session } = &req.kind else {
         return;
