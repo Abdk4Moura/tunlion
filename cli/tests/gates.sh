@@ -667,7 +667,10 @@ done
 # Freeze (don't kill): the server lease stays alive, so the replacement with
 # the SAME uid joins while the ceremony peer is still present but not moving.
 kill -STOP $R1 2>/dev/null
-sleep 3
+# Twice the 3000 ms idle threshold (conn.rs old_link_survives_reconnect):
+# the frozen link must read as stalled, not merely quiet, when R2 arrives, or
+# the sender keeps it and logs "keeping active link" instead of the refusal.
+sleep 6
 # The replacement is a never-authenticated room listener. It must store nothing.
 TUNLION_UID="samedevice$$" timeout 60 "$BIN" receive -y --dir "$D2" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
 RC2=$?
