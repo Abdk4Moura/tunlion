@@ -84,9 +84,16 @@ EXPECTED_GREEN=(
   "--to bob delivered to bob only|--to selection"
   "relayed transfer via coturn|relay"
   # Gate 11 was rewritten to the spent-code rule (5709eb28e): a replacement
-  # receiver, even with the same uid, must receive nothing. It is the same
-  # strength, not a removed assertion: the old pass text asserted a supersede
-  # the product now refuses on purpose.
+  # receiver, even with the same uid, must receive nothing. It is NOT the same
+  # check as the old supersede gate. It proves the refusal, with positive
+  # evidence: the replacement reached signaling (its listening line), the
+  # sender saw it and logged "refusing to replace the authenticated receiver",
+  # the replacement stored nothing and exited non-zero, and the sender failed
+  # with the partial kept. Same-uid supersede itself, which the spent-code path
+  # no longer does, is covered by the peerloop unit tests
+  # dead_old_link_is_superseded_on_same_uid_reconnect and
+  # frozen_inflight_link_is_still_superseded in
+  # crates/filament-peerloop/src/conn.rs, not by any gate.
   "spent code: replacement receiver got nothing|uid supersede"
   "daemon: verified identity, room-less|daemon"
   "pair ceremony: both exited clean|pair-ceremony"

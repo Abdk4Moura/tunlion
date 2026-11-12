@@ -677,8 +677,28 @@ for _ in $(seq 1 90); do kill -0 $SP 2>/dev/null || { wait $SP; RCS=$?; break; }
 kill -9 $SP 2>/dev/null
 kill -9 $R1 2>/dev/null
 REPLACEMENT="$(ls -A "$D2" 2>/dev/null | tr '\n' ' ')"
-if [ $RCS -ne 0 ] && [ -z "$REPLACEMENT" ] \
-   && grep -qE "receiver is unreachable|could not come back" "$WORK/g11-send.log" \
+# An empty $D2 is proof by absence: it also holds if R2 never reached the
+# server. Three positive checks close that:
+# * R2 printed its room-listener line. recv_run (crates/filament-peerloop/src/
+#   recv/dispatch.rs) prints "listening, same-network devices appear
+#   automatically" only after `net::connect_signaling(..).await?` succeeded
+#   and immediately before it emits "join", so R2 was on signaling.
+# * The sender logged the spent-code refusal. Conn::code_reconnect_kept
+#   (crates/filament-peerloop/src/conn.rs) prints "refusing to replace the
+#   authenticated receiver" (DEBUG, hence -v on the sender) only for a peer
+#   event from a sid other than the ceremony peer that carries the ceremony
+#   link's uid while that link no longer survives. R1 is frozen and cannot
+#   rejoin, so that peer is R2: the sender saw it and refused it.
+# * R2 did not report success. Every Ok exit of recv_run requires
+#   st.completed > 0, so a receiver that stored nothing exits non-zero: an
+#   error code if it bails, or 124 from `timeout` if it is still listening at
+#   60s. Which one depends on R2's own link churn, so only non-zero is asserted.
+# "could not come back" was an alternative here; no string in cli/ or crates/
+# produces it, so it could never match and is gone.
+if [ $RCS -ne 0 ] && [ -z "$REPLACEMENT" ] && [ $RC2 -ne 0 ] \
+   && grep -q "receiver is unreachable" "$WORK/g11-send.log" \
+   && grep -q "refusing to replace the authenticated receiver" "$WORK/g11-send.log" \
+   && grep -q "listening, same-network devices appear automatically" "$WORK/g11-recv2.log" \
    && [ ! -f "$D/big.bin" ] \
    && [ "$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)" -gt $((10 * 1024 * 1024)) ]; then
   ok "spent code: replacement receiver got nothing, sender failed honestly"
@@ -693,9 +713,13 @@ fi
 # socket (same uid, new sid) WHILE the original link is actively transferring,
 # the sender must KEEP the flowing link — the data channel is independent of
 # the socket. Pre-fix, the unconditional C6 supersede tore down the live
-# transfer (issue #28). Same R2 wiring as gate 11, so if R2 ever failed to
-# reach the sender, gate 11 would fail first — keeping this 'no supersede'
-# assertion honest. Default idle threshold (3s) >> a healthy inter-frame gap.
+# transfer (issue #28). Same R2 wiring as gate 11, and gate 11 now requires
+# positive proof that its R2 reached the sender (R2's listening line and the
+# sender's spent-code refusal line), so an R2 that never reaches signaling
+# fails gate 11. This gate also requires "keeping active link", which the
+# sender prints only when it saw R2, so the 'no supersede' assertion here is
+# not satisfied by an R2 that never arrived. Default idle threshold (3s) >> a
+# healthy inter-frame gap.
 say "11b: active same-uid link survives a live reconnect (#28)"
 D1B="$WORK/g11b1"; D2B="$WORK/g11b2"; mkdir -p "$D1B" "$D2B"
 # -v on the sender: "keeping active link" is a DEBUG (resilience-internal) line.
