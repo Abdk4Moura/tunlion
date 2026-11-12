@@ -25,6 +25,7 @@ use crate::settings;
 use crate::shell_policy_from_settings;
 use crate::ui;
 use anyhow::{Result};
+use filament_peerloop::removal::{self, RemovalMode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -91,19 +92,12 @@ pub(crate) fn forget_verdict(
     owner_pub: Option<[u8; 32]>,
     now: u64,
 ) -> ForgetVerdict {
-    let (Some(cert), Some(owner)) = (cert, owner_pub) else {
-        return ForgetVerdict::Remove;
-    };
-    // Same liveness test as `fleet_certificate_warning_for`: a certificate
-    // from another owner, or an expired one, cannot pass fleet-hello.
-    if cert.user_pub != owner || cert.expires <= now {
-        return ForgetVerdict::Remove;
-    }
-    let days_left = cert.expires.saturating_sub(now).div_ceil(86_400);
-    if revoked {
-        ForgetVerdict::KeepRevocationThenRemove { days_left }
-    } else {
-        ForgetVerdict::RevokeThenRemove { days_left }
+    // The owner/expiry policy lives in the removal service, so this mapping
+    // cannot drift from the plan the store actually applies.
+    match (removal::refusal_days(cert, owner_pub, now), revoked) {
+        (None, _) => ForgetVerdict::Remove,
+        (Some(days_left), true) => ForgetVerdict::KeepRevocationThenRemove { days_left },
+        (Some(days_left), false) => ForgetVerdict::RevokeThenRemove { days_left },
     }
 }
 
@@ -136,45 +130,23 @@ pub(crate) struct ForgetOutcome {
     pub verdict: ForgetVerdict,
 }
 
-/// The file that holds revocations by device key, apart from any name.
+/// The file that holds revocations by device key, apart from any name, and
+/// the path-keyed helpers the CLI's tests and re-add path still use.
 ///
 /// PROVENANCE IS PART OF THE FORMAT: an entry here means "FORGOTTEN", and
-/// nothing else. It is written only by `forget_device` (see
-/// [`record_key_revocation_at`]) and lifted by an explicit re-add or
-/// `promote`. Every peer-facing path reads a hit as `Code::Unrecognized`
-/// ("not recognized"), on admission and mid-session alike. A future writer
-/// with any other meaning must carry its own reason; it must not reuse this
-/// list, or a revoke would start reading as a forget (or the reverse).
-pub(crate) const KEY_REVOCATIONS_FILE: &str = "revoked-keys.json";
+/// nothing else. The shared removal service is the only production writer
+/// (Forget); an explicit re-add or `promote` lifts it. Every peer-facing path
+/// reads a hit as `Code::Unrecognized` ("not recognized"), on admission and
+/// mid-session alike. A future writer with any other meaning must carry its own
+/// reason; it must not reuse this list, or a revoke would start reading as a
+/// forget (or the reverse).
+pub(crate) use filament_peerloop::removal::{
+    key_revocation_for, key_revocation_in_force, lift_key_revocations_at,
+    load_key_revocations_at, record_key_revocation_at, KEY_REVOCATIONS_FILE,
+};
 
 fn key_revocations_path() -> PathBuf {
     crate::platform::Paths::config_path(KEY_REVOCATIONS_FILE)
-}
-
-/// The key revocations at `path`. Ok(empty) when the file is absent; Err when
-/// it exists but cannot be read or parsed, which callers treat as "revoked"
-/// (fail closed, the rule `device_cert_revoked` applies to devices.json: a
-/// corrupt store must not silently un-revoke every key in it).
-pub(crate) fn load_key_revocations_at(path: &Path) -> std::result::Result<Vec<Value>, ()> {
-    match std::fs::metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err(()),
-        Ok(_) => {}
-    }
-    let raw = std::fs::read_to_string(path).map_err(|_| ())?;
-    serde_json::from_str::<Vec<Value>>(&raw).map_err(|_| ())
-}
-
-/// Is `device_pub` named by a revocation that is still in force at `now`? An
-/// entry ends when the certificate it revoked expires: past that point the
-/// certificate cannot pass fleet-hello anyway, which is the same horizon the
-/// record-based revocation always had. Pure.
-pub(crate) fn key_revocation_in_force(entries: &[Value], device_pub: &[u8; 32], now: u64) -> bool {
-    let key = hex::encode(device_pub);
-    entries.iter().any(|e| {
-        e["devicePub"].as_str() == Some(key.as_str())
-            && e["certExpires"].as_u64().map_or(true, |exp| exp > now)
-    })
 }
 
 /// Is this device key revoked by a revocation kept apart from any record?
@@ -182,102 +154,9 @@ pub(crate) fn device_key_revoked(device_pub: &[u8; 32], now: u64) -> bool {
     crate::devices_store::store().device_key_revoked(device_pub, now)
 }
 
-/// Record `cert`'s key as revoked until the certificate expires, pruning
-/// entries that have run out. `name` is kept for the reader only; nothing
-/// matches on it.
-///
-/// THE ONLY MEANING OF AN ENTRY IS "FORGOTTEN" (see [`KEY_REVOCATIONS_FILE`]),
-/// and `forget_device` is the only production caller. Do not call this for a
-/// revoke, a demote or an expiry: those keep their record and carry their own
-/// reason, and reusing this list would make them read "not recognized".
-pub(crate) fn record_key_revocation_at(
-    path: &Path,
-    cert: &identity::DeviceCert,
-    name: &str,
-    now: u64,
-) -> Result<()> {
-    let mut entries = load_key_revocations_at(path).map_err(|()| {
-        anyhow::anyhow!(
-            "{} exists but cannot be read; fix or remove it before forgetting a certified device",
-            path.display()
-        )
-    })?;
-    let key = hex::encode(cert.device_pub);
-    entries.retain(|e| {
-        e["devicePub"].as_str() != Some(key.as_str())
-            && e["certExpires"].as_u64().map_or(true, |exp| exp > now)
-    });
-    entries.push(json!({
-        "devicePub": key,
-        "userPub": hex::encode(cert.user_pub),
-        "certExpires": cert.expires,
-        "revokedAt": now,
-        "name": name,
-    }));
-    crate::state_files::keep_backup(path);
-    crate::platform::SecretFile::write_str(path, &serde_json::to_string_pretty(&entries)?)?;
-    Ok(())
-}
-
-/// The key revocation in force for `device_pub` at `now`, as (the name it was
-/// recorded under, when). Pure over `entries`.
-pub(crate) fn key_revocation_for(entries: &[Value], device_pub: &[u8; 32], now: u64) -> Option<(String, u64)> {
-    let key = hex::encode(device_pub);
-    entries
-        .iter()
-        .find(|e| {
-            e["devicePub"].as_str() == Some(key.as_str())
-                && e["certExpires"].as_u64().map_or(true, |exp| exp > now)
-        })
-        .map(|e| (e["name"].as_str().unwrap_or("").to_string(), e["revokedAt"].as_u64().unwrap_or(0)))
-}
-
-/// Remove every entry for `device_pub` (or, with `by_name`, every entry
-/// recorded under that name) from `path`. Returns what was lifted as
-/// (name, revokedAt, devicePub hex). An explicit owner action is the only
-/// caller: a fresh `add` of that device, or `promote <name>`.
-pub(crate) fn lift_key_revocations_at(
-    path: &Path,
-    device_pub: Option<&[u8; 32]>,
-    by_name: Option<&str>,
-) -> Result<Vec<(String, u64, String)>> {
-    let entries = load_key_revocations_at(path).map_err(|()| {
-        anyhow::anyhow!("{} exists but cannot be read; fix or remove it first", path.display())
-    })?;
-    let key = device_pub.map(hex::encode);
-    let matches = |e: &Value| {
-        key.as_deref().is_some_and(|k| e["devicePub"].as_str() == Some(k))
-            || by_name.is_some_and(|n| e["name"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(n)))
-    };
-    let lifted: Vec<(String, u64, String)> = entries
-        .iter()
-        .filter(|e| matches(e))
-        .map(|e| {
-            (
-                e["name"].as_str().unwrap_or("").to_string(),
-                e["revokedAt"].as_u64().unwrap_or(0),
-                e["devicePub"].as_str().unwrap_or("").to_string(),
-            )
-        })
-        .collect();
-    if lifted.is_empty() {
-        return Ok(lifted);
-    }
-    let kept: Vec<Value> = entries.into_iter().filter(|e| !matches(e)).collect();
-    crate::state_files::keep_backup(path);
-    crate::platform::SecretFile::write_str(path, &serde_json::to_string_pretty(&kept)?)?;
-    Ok(lifted)
-}
-
 /// Lift the block a `forget` left on `device_pub`, for an explicit re-add.
 pub(crate) fn lift_key_revocation(device_pub: &[u8; 32]) -> Result<Vec<(String, u64, String)>> {
     lift_key_revocations_at(&key_revocations_path(), Some(device_pub), None)
-}
-
-/// Lift the blocks recorded under `name`, for `promote` of a device
-/// that was forgotten (and so has no record left to restore).
-pub(crate) fn lift_key_revocations_named(name: &str) -> Result<Vec<(String, u64, String)>> {
-    lift_key_revocations_at(&key_revocations_path(), None, Some(name))
 }
 
 /// A date for a revocation line. Pure.
@@ -371,39 +250,51 @@ pub(crate) fn forget_device(name: &str, now: u64) -> Result<ForgetOutcome> {
     if !crate::device_record_exists(name) {
         anyhow::bail!("no device named '{name}', see `tunlion devices`");
     }
-    let was_revoked = std::fs::read_to_string(devices_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
-        .unwrap_or_default()
-        .iter()
-        .any(|d| d["name"].as_str() == Some(name) && crate::device_view::record_is_revoked(d));
-    let cert = device_cert_for(name);
-    let verdict = forget_verdict(cert.as_ref(), was_revoked, fleet::my_owner_pub(), now);
-    if let (ForgetVerdict::RevokeThenRemove { .. } | ForgetVerdict::KeepRevocationThenRemove { .. }, Some(cert)) =
-        (&verdict, cert.as_ref())
-    {
-        record_key_revocation_at(&key_revocations_path(), cert, name, now)?;
-    }
-    // The grants go too. They live in caps.json keyed by the device KEY, not
-    // in the record, so removing the record used to leave a forgotten key
-    // holding `shell` for whoever could present it next. Revoked before the
-    // record goes, so a failure leaves everything where it was.
-    if let Some(cert) = cert.as_ref() {
-        crate::device_caps::revoke_device_grants(cert, now)
-            .map_err(|e| anyhow::anyhow!("could not revoke the grants held by '{name}': {e}"))?;
-    }
-    // And the shell key that grant installed for `shell --ssh`, by name, while
-    // the name still means this device. Only touched when its block is there.
-    let ak = std::fs::read_to_string(crate::sshkeys::authorized_keys_path()).unwrap_or_default();
-    if crate::sshkeys::has_block(&ak, name) {
-        crate::sshkeys::remove_authorized_key(name)?;
-    }
-    crate::device_caps::devices_remove(name)?;
+    // Read the record once: its name is presentation, its certificate's device
+    // key is the identity the removal service will block and de-grant. A
+    // record whose certificate cannot be parsed has no identity to key the
+    // removal by; the service refuses it rather than removing it fail-open.
+    let store = crate::devices_store::store();
+    let record = store
+        .devices_records()
+        .into_iter()
+        .find(|record| record["name"].as_str() == Some(name));
+    let Some(record) = record else {
+        anyhow::bail!("no device named '{name}', see `tunlion devices`");
+    };
+    let cert = identity::DeviceCert::from_json(&record["deviceCert"]);
+    let was_revoked = crate::device_view::record_is_revoked(&record);
+    let owner = fleet::my_owner_pub();
+    let plan = removal::plan_removal(
+        &record,
+        cert.as_ref(),
+        owner,
+        RemovalMode::Forget,
+        now,
+    );
+    let owner_key = load_owner_key();
+    // The ordering (key block FIRST, then grants, then the host's SSH hook,
+    // then the record LAST) is the shared service's, not this caller's.
+    store.apply_removal(&plan, owner_key.as_ref(), |name| {
+        // The shell key that a grant installed for `shell --ssh`, by name,
+        // while the name still means this device. Only touched when its block
+        // is there.
+        let authorized_keys =
+            std::fs::read_to_string(crate::sshkeys::authorized_keys_path()).unwrap_or_default();
+        if crate::sshkeys::has_block(&authorized_keys, name) {
+            crate::sshkeys::remove_authorized_key(name)?;
+        }
+        Ok(())
+    })?;
+    // The service writes caps.json through the same file but not the CLI's
+    // process-local read cache.
+    crate::capability::invalidate_cap_cache();
     // Local discovery's remembered addresses and presence key are part of the
     // device's access too: keeping them would let a forgotten peer still be
     // dialled and recognized on the LAN. Presence-key rotation is a separate
     // spec SHOULD; this removes the record now.
     filament_transport::lan::LanStore::new(&crate::settings::config_dir()).forget(name);
+    let verdict = forget_verdict(cert.as_ref(), was_revoked, owner, now);
     Ok(ForgetOutcome { name: name.to_string(), verdict })
 }
 

@@ -108,6 +108,7 @@ fn gate_inputs(
         &config_dir, resource, action, idev.as_ref(), iusr.as_ref(), ak_caps.as_deref(),
     );
     ShellGateInputs {
+        certless_pair: None,
         trusted: true,
         denied: device_capability_denied(name, action),
         policy_allows: false,

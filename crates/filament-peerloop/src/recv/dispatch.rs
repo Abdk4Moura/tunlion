@@ -2009,6 +2009,10 @@ async fn recv_run(
     //   theirs[pid] what THEY chose: sign messages we send to them.
     let mut bind_ours: HashMap<String, Vec<u8>> = HashMap::new();
     let mut bind_theirs: HashMap<String, Vec<u8>> = HashMap::new();
+    // The transport source each pid's nonces were exchanged on. A replacement
+    // transport can reuse the same peer id; nonces from the previous transport
+    // must not be carried across (see the reset in `ChannelReady`).
+    let mut bind_source: HashMap<String, net::SourceId> = HashMap::new();
     let mut fleet_pending: std::collections::HashSet<String> = Default::default();
     let mut fleet_verified: std::collections::HashSet<String> = Default::default();
     // Offers that arrived while this link's `fleet-hello` was still in flight.
@@ -4147,6 +4151,22 @@ async fn recv_run(
 
         let Some((ev, event_source)) = ev else { continue };
 
+        // A fleet verdict, a hello marker and a nonce all belong to the
+        // TRANSPORT they were earned on. Links are dropped from several places
+        // (health scan, zombie warm link, peer-left, revocation); trusting each
+        // site to remember these sets let the periodic health scan keep a dead
+        // link's `fleet_verified`, so a replacement that reused the peer id
+        // skipped its hello and inherited the old transport's verdict. Retire
+        // them centrally for any peer that no longer has a link, so every drop
+        // path, including future ones, starts the replacement unverified.
+        fleet_pending.retain(|p| conn.links.contains_key(p));
+        fleet_verified.retain(|p| conn.links.contains_key(p));
+        fleet_greeted.retain(|p| conn.links.contains_key(p));
+        bind_ours.retain(|p, _| conn.links.contains_key(p));
+        bind_theirs.retain(|p, _| conn.links.contains_key(p));
+        bind_source.retain(|p, _| conn.links.contains_key(p));
+        fleet_deferred_offers.retain(|(p, _, _)| conn.links.contains_key(p));
+
         // C23: questions from links that died (supersede/peer-left) are
         // moot, the sender re-offers on its new link. Purge them so a 'y'
         // can never accept a ghost (the duplicate-stream ENOENT crash).
@@ -4231,6 +4251,7 @@ async fn recv_run(
                     // exists to stop.
                     bind_ours.remove(&pid);
                     bind_theirs.remove(&pid);
+                    bind_source.remove(&pid);
                 }
             }
             Ev::PairMatched(v) => {
@@ -5216,7 +5237,11 @@ async fn recv_run(
                         let _ = tx.send(Ev::sourced_channel_ready(pid, t));
                     }
                 } else {
-                    let _ = tx.send(Ev::ChannelReady(pid, t));
+                    // Keep the transport's own source on the re-emit. An
+                    // unsourced ChannelReady hides which transport it belongs
+                    // to, so a replacement cannot retire the previous
+                    // transport's fleet nonces.
+                    let _ = tx.send(Ev::sourced_channel_ready(pid, t));
                 }
             }
             Ev::DirectWorkersReady(pid, workers, primary_source) => {
@@ -5324,6 +5349,29 @@ async fn recv_run(
                 // Fleet auto-mesh: this link came off the fleet channel, so there
                 // is no pair secret to prove. Present the owner-signed certificate
                 // bound to THIS link instead.
+                // Send link control on the transport actually installed for this
+                // link, not on the one a possibly superseded ChannelReady event
+                // carried. With two transports racing for one peer id, the loser
+                // can deliver this event while the winner is installed; signing
+                // and sending our fleet hello down the loser made the peer never
+                // receive it, while we accepted the peer's hello. That showed up
+                // as a link that stays fleet-unverified on one side only.
+                let t = conn.transport_of(&pid).unwrap_or(t);
+                // A nonce belongs to the TRANSPORT it was exchanged on. A
+                // re-established transport can reuse the same peer id (warm
+                // re-dial after a zombie drop), so carrying the previous
+                // transport's nonce forward makes each side sign a value the
+                // other no longer expects: both fleet hellos fail verification
+                // and the link stays unverified forever. Drop both directions
+                // when the transport source changes; a genuinely same-transport
+                // re-announce keeps its nonce.
+                if let Some(source) = event_source {
+                    if bind_source.get(&pid).copied() != Some(source) {
+                        bind_source.insert(pid.clone(), source);
+                        bind_ours.remove(&pid);
+                        bind_theirs.remove(&pid);
+                    }
+                }
                 // No exporter on this transport: open the challenge. Our nonce
                 // goes out now; anything we SEND waits until theirs arrives.
                 if t.channel_binding().is_none() {
@@ -6357,8 +6405,9 @@ async fn recv_run(
                         daemon,
                     );
                     if ours && consented_peer {
+                        let paired = crate::shell_gate::preserve_authenticated_pair(&mut conn, &pid);
                         let anonymous = conn.link(&pid).is_some_and(|l| {
-                            l.identity_state != cap::IdentityState::Resolved
+                            !paired && l.identity_state != cap::IdentityState::Resolved
                         });
                         identity_nonces.remove(&pid);
                         st.pending_proven.lock().unwrap().remove(&pid);
@@ -6739,7 +6788,14 @@ async fn recv_run(
                 // L2: it opens nothing and only proves this end is here.
                 Some("reach-ping") => {
                     if let Some(t) = conn.transport_of(&pid) {
-                        let _ = t.send_control(&crate::daemon_ctl::liveness_pong(&v)).await;
+                        log.debug(&format!(
+                            "reach-pong start pid={pid} incoming={event_source:?} outgoing={:?}",
+                            t.source_id(),
+                        ));
+                        let result = t.send_control(&crate::daemon_ctl::liveness_pong(&v)).await;
+                        log.debug(&format!("reach-pong sent pid={pid} result={result:?}"));
+                    } else {
+                        log.debug(&format!("reach-pong not sent pid={pid}: no current transport"));
                     }
                 }
                 Some("reach-pong") => {
@@ -6925,86 +6981,14 @@ async fn recv_run(
                             continue;
                         }
                     }
-                    let (trusted, fleet_proven) = conn
-                        .link(&pid)
-                        .map(|l| (l.trusted, l.fleet_proven()))
-                        .unwrap_or((false, false));
-                    // Cap lookup keys on the PROVEN petname, not the presence name.
-                    let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
-                    // Granted if the device was explicitly `grant`ed shell OR an
-                    // active `up --shell[-only]` policy auto-allows it. Trust
-                    // (pair-proof) is still required for the grant; the policy
-                    // also accepts a proven fleet link to the same PAIRED
-                    // record, which is what the direct dial proves (see
-                    // `shell_gate::policy_trusted`).
-                    let legacy_ok = dev
-                        .as_deref()
-                        .map(|n| {
-                            !host.device_capability_denied(n, "shell")
-                                && ((crate::shell_gate::policy_trusted(
-                                    trusted,
-                                    fleet_proven,
-                                    n,
-                                    host.as_ref(),
-                                ) && shell_policy.auto_allows(n))
-                                    || (trusted && host.device_allows(n, "shell")))
-                        })
-                        .unwrap_or(false);
-                    // Capability layer evaluated unconditionally (shadow samples the
-                    // legacy-allowed population); legacy stands in shadow, cap gates
-                    // under TUNLION_CAP_AUTHORITATIVE.
-                    let granted = {
-                        let az = crate::shell_gate::peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-                        let store = host.cap_store();
-                        let now = host.now_secs();
-                        let outcome = cap::authorize_in(
-                            &store,
-                            "self",
-                            cap::CAP_SHELL,
-                            idev,
-                            iusr,
-                            ak_caps,
-                            now,
-                        );
-                        {
-                            let (own_user, has_grant) = cap::fleet_inputs_in(
-                                &store,
-                                "self",
-                                cap::CAP_SHELL,
-                                idev,
-                                iusr,
-                                ak_caps,
-                                now,
-                            );
-                            // Deliberate tier: `shell` is never a scoped default, so a
-                            // same-owner device gets it ONLY via an explicit grant
-                            // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
-                            // The explicit deny travels too: denied short-circuits
-                            // fleet auto-trust, matching the legacy fold above.
-                            let denied = dev
-                                .as_deref()
-                                .map(|n| host.device_capability_denied(n, "shell"))
-                                .unwrap_or(false);
-                            host.cap_gate_effective(CapGate {
-                                legacy_allowed: legacy_ok,
-                                outcome: &outcome,
-                                action: cap::CAP_SHELL,
-                                resource: "self",
-                                device_pub: idev,
-                                user_pub: iusr,
-                                binding,
-                                cert_expires: expires,
-                                auth_key_caps: ak_caps,
-                                own_user_pub: own_user.as_ref(),
-                                scoped_in_bounds: false,
-                                has_explicit_grant: has_grant,
-                                cert_revoked,
-                                identity_state: conn.identity_state_of(&pid),
-                                denied,
-                                ceiling_authorizes: false,
-                            })
-                        }
+                    // Bootstrap asks the same core gate as exec, PTY and the
+                    // certificate signer, including authenticated legacy pairs.
+                    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(
+                        &mut conn, &pid, &shell_policy, cap::CAP_SHELL,
+                    );
+                    let granted = match crate::shell_gate::ssh_gate_decision(&inputs, host.as_ref()) {
+                        Ok(()) => cap::GateDecision::Allow,
+                        Err(cap_reason) => cap::GateDecision::Deny { cap_reason },
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -7485,12 +7469,14 @@ async fn recv_run(
                                 == mac
                         })
                     };
-                    let ok = if let Some((n, _)) = hit {
+                    let ok = if let Some((n, secret)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
                             l.trusted = true;
                             l.verified_name = Some(n.clone());
+                            l.expected_secret = Some((n.clone(), secret.clone()));
                             crate::identity::resolve_peer_identity(l);
                         }
+                        crate::shell_gate::preserve_authenticated_pair(&mut conn, &pid);
                         // #39: identity just RESOLVED on the WebRTC/relay path — verified_name
                         // is set above and resolve_peer_identity populated device_pub. This is
                         // the resolution point for NON-direct links (ChannelReady fired before

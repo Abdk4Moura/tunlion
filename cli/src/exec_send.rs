@@ -155,7 +155,7 @@ async fn hang_up_remote(
         return;
     }
     let _ = tokio::time::timeout(HANG_UP_WAIT, async {
-        while let Some(ev) = rx.recv().await {
+        while let Some(ev) = crate::l2::recv_selected_event(rx, t.source_id()).await {
             if let crate::net::Ev::Control(_pid, v) = ev {
                 let ty = v.get("type").and_then(|t| t.as_str());
                 if matches!(ty, Some("exec-close") | Some("l2-close"))
@@ -391,7 +391,7 @@ async fn exec_once(
     // confusing transport error); anything else names what actually happened.
     let ack_wait = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let ev = match rx.recv().await {
+            let ev = match crate::l2::recv_selected_event(&mut rx, t.source_id()).await {
                 Some(ev) => ev,
                 None => {
                     break Err(format!("'{peer}' closed the exec stream before answering"));
@@ -569,7 +569,7 @@ async fn exec_once(
                     }
                     None => { stdin_done = true; }
                 },
-                ev = rx.recv() => match ev {
+                ev = crate::l2::recv_selected_event(&mut rx, t.source_id()) => match ev {
                     Some(crate::net::Ev::Control(_pid, v)) => {
                         last_heard = std::time::Instant::now();
                         // Forgotten or revoked there while this ran: the daemon
@@ -666,7 +666,7 @@ async fn exec_once(
                     break;
                 }
                 tokio::select! {
-                    ev = rx.recv() => match ev {
+                    ev = crate::l2::recv_selected_event(&mut rx, t.source_id()) => match ev {
                         Some(crate::net::Ev::Chunk(_pid, got, _offset, data)) => {
                             mux.on_frame(got, data).await;
                         }

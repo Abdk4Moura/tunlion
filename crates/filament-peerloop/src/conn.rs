@@ -5611,12 +5611,16 @@ impl Conn {
             for worker in old_workers {
                 worker.force_close();
             }
-            if existing
-                .transport
-                .as_ref()
-                .map(|t2| t2.is_dead())
-                .unwrap_or(true)
+            if !existing.direct
+                || existing
+                    .transport
+                    .as_ref()
+                    .map(|t2| t2.is_dead())
+                    .unwrap_or(true)
             {
+                // A live WebRTC predecessor is not the adopted direct
+                // transport. Retaining it while installing the direct source
+                // drops the incoming connection and leaves a hybrid link.
                 existing.transport = Some(t);
             }
             existing.direct = true;
@@ -5625,7 +5629,14 @@ impl Conn {
             existing.source = source;
             existing.attempt = Some(attempt);
             existing.attempts = 0;
-            if !ephemeral {
+            // A FLEET direct link is not pair-authenticated. The new-link branch
+            // below already keeps `trusted: false` and no petname until a verified
+            // fleet-hello names it; the update branch used to grant both anyway when
+            // the one-shot already had an unverified WebRTC link on this pid. That
+            // made `is_sibling_link()` false, so the target ignored the owner grant
+            // for the very device its certificate named and refused the terminal as
+            // "shell not granted".
+            if !ephemeral && !fleet {
                 existing.trusted = true;
                 if let Some((n, _)) = &expected_secret {
                     existing.verified_name = Some(n.clone());
@@ -5967,11 +5978,24 @@ impl Conn {
         // upgrade cutover consuming it.
         // A promotion's pending is EXCLUDED too: it coexists with the serving
         // WebRTC link by design (make-before-break), and its adoption needs it.
+        // A FLEET pending is excluded while its link is still unproven for the
+        // same reason: a fleet-secret WebRTC link exposes no channel binding, so
+        // it can never carry the certificate proof a one-shot dialer must present.
+        // Reaping the direct race here retired the only attempt that could ever
+        // verify that dialer, and adopt_direct then refused the late but valid
+        // QUIC connection as `attempt retired`. The pending still dies at its
+        // deadline (the two filters above/below never leave it parked).
         let linked: Vec<String> = self
             .direct_pending
             .iter()
             .filter(|(pid, p)| {
-                !p.probe && self.links.contains_key(*pid) && !self.promotions.contains_key(*pid)
+                if p.probe || self.promotions.contains_key(*pid) {
+                    return false;
+                }
+                let Some(link) = self.links.get(*pid) else {
+                    return false;
+                };
+                !(p.fleet && !link.fleet_proven() && now < p.deadline)
             })
             .map(|(pid, _)| pid.clone())
             .collect();
@@ -10577,6 +10601,62 @@ mod warm_identity_tests {
         assert!(!conn.direct_pending.contains_key(normal_pid));
     }
 
+    /// A fleet one-shot's direct race must outlive the fleet-secret WebRTC link
+    /// that lands beside it. That WebRTC link exposes no channel binding, so it
+    /// can never carry the certificate proof the one-shot must present. Reaping
+    /// the race here retired the only attempt able to prove the dialer, and
+    /// `adopt_direct` then rejected the valid QUIC connection as `attempt
+    /// retired` (the one-shot saw `direct connection closed` right after
+    /// `tunnel up`).
+    #[tokio::test]
+    async fn a_fleet_direct_attempt_outlives_its_unbound_webrtc_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-fleet-oneshot";
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        expired_direct_pending(&mut conn, pid, soon());
+        let attempt = conn.direct_pending[pid].attempt;
+
+        assert!(conn.expired_direct().is_empty(), "a live link armed a fallback");
+        assert!(
+            conn.direct_pending.contains_key(pid),
+            "the fleet race was reaped by an unproven WebRTC link"
+        );
+        assert!(
+            !conn.retired_attempts.contains_key(&attempt),
+            "the direct attempt was retired before its connection could be adopted"
+        );
+
+        // The exception is bounded by the attempt's own budget: once it has
+        // expired the pending is retired (no fallback is needed, a link exists).
+        conn.direct_pending.get_mut(pid).unwrap().deadline =
+            Instant::now() - Duration::from_millis(1);
+        assert!(conn.expired_direct().is_empty());
+        assert!(!conn.direct_pending.contains_key(pid), "an expired fleet pending leaked");
+        assert!(
+            conn.retired_attempts.contains_key(&attempt),
+            "an expired fleet attempt was not retired"
+        );
+    }
+
+    /// The fleet exception must not change the ordinary cleanup: for any other
+    /// attempt, a link that landed by another route makes the direct race
+    /// redundant and it is retired exactly as before.
+    #[tokio::test]
+    async fn a_normal_direct_attempt_is_still_reaped_by_its_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-normal-linked";
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        expired_direct_pending(&mut conn, pid, soon());
+        conn.direct_pending.get_mut(pid).unwrap().fleet = false;
+        let attempt = conn.direct_pending[pid].attempt;
+
+        assert!(conn.expired_direct().is_empty());
+        assert!(!conn.direct_pending.contains_key(pid), "a redundant direct attempt survived");
+        assert!(conn.retired_attempts.contains_key(&attempt));
+    }
+
     /// The dispatch loop's shape: one reaper call and one awaited establish per
     /// iteration, with the watchdog heartbeat stamped at the top. An establish
     /// stand-in is awaited for each fallback; with the batch capped, the
@@ -11712,6 +11792,46 @@ mod warm_identity_tests {
             DirectAdoption::Adopted { tkey: Some(key), .. }
                 if key == direct::transport_key("device-secret")
         ));
+    }
+
+    /// A fleet one-shot's direct connection usually replaces the unverified
+    /// WebRTC link already held for the same signaling id. Adoption must not
+    /// turn that into a pair-trusted link: `trusted` is what makes
+    /// `is_sibling_link()` false, and then the target ignores the owner grant
+    /// for the device its certificate just named (observed as "shell not
+    /// granted to 'bravo' here" on an otherwise verified direct link).
+    #[tokio::test]
+    async fn fleet_direct_adoption_over_webrtc_does_not_gain_pair_trust() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-fleet-oneshot-adopt";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+
+        let t: Arc<dyn Transport> = Rec::new("direct", &log);
+        let attempt = t.attempt_id().unwrap();
+        let mut pending = direct_pending_with(attempt, (FLEET_LINK_NAME, "fleet-rv"));
+        pending.fleet = true;
+        pending.auth = DirectAuth::fleet(1);
+        conn.direct_pending.insert(pid.into(), pending);
+
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), "direct-quic"),
+            DirectAdoption::Adopted { attempt: seen, .. } if seen == attempt
+        ));
+        let link = &conn.links[pid];
+        assert!(
+            Arc::ptr_eq(link.transport.as_ref().unwrap(), &t),
+            "adopted fleet direct transport was discarded for its live WebRTC predecessor"
+        );
+        assert!(link.direct, "the fleet transport was not installed");
+        assert!(
+            !link.trusted,
+            "fleet direct adoption inherited pair trust from the unverified WebRTC link"
+        );
+        assert!(
+            link.verified_name.is_none(),
+            "fleet direct adoption minted a petname before fleet-hello"
+        );
     }
 
     /// An authorized upgrade adopts the verified standby exactly once.

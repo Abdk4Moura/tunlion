@@ -99,6 +99,7 @@ mod tests {
                                                 Some(vec!["transfer".to_string()])
                                             };
                                             let inputs = ShellGateInputs {
+                                                certless_pair: None,
                                                 trusted,
                                                 denied,
                                                 policy_allows: false,
@@ -317,6 +318,7 @@ mod tests {
 
         let owner = [0x11u8; 32];
         let cell = |trusted: bool, store_allows: bool, denied: bool, cert_revoked: bool| ShellGateInputs {
+            certless_pair: None,
             trusted,
             denied,
             policy_allows: false,

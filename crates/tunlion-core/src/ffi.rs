@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    Core, CoreError, CreatedCode, ReceiveSummary, SendResult, Status, UncommittedIdentity,
+    ActionKind, CapabilityReceipt, Core, CoreError, CreatedCode, DevicePolicy, EnrollmentStatus,
+    ReceiveSummary, RemovalReceipt, SendResult, Status, UncommittedIdentity,
 };
 
 /// A core opened on a directory the caller owns.
@@ -70,6 +71,60 @@ impl CoreSession {
 
     pub fn devices(&self) -> Result<Vec<crate::DeviceAccess>, CoreError> {
         self.inner.devices()
+    }
+
+    /// One device's typed local policy: relationship, admission facts,
+    /// delivery state and one row per action. Read-only and local: no network
+    /// work, no identity bootstrap. A corrupt store is an error, never an
+    /// empty policy.
+    pub fn device_policy(&self, name: String) -> Result<DevicePolicy, CoreError> {
+        self.inner.device_policy(&name)
+    }
+
+    /// Forget one device on this phone: the key block is written first, its
+    /// grants are revoked, and the record is removed last. Local only; the
+    /// peer is not contacted and no live session is claimed to have ended.
+    pub fn forget_device(&self, name: String) -> Result<RemovalReceipt, CoreError> {
+        self.inner.forget_device(&name)
+    }
+
+    /// Cut one device off in place: keep the record and grants, write the
+    /// revocation marker. Local only. The peer learns why on its next open.
+    pub fn cut_off_device(&self, name: String) -> Result<RemovalReceipt, CoreError> {
+        self.inner.cut_off_device(&name)
+    }
+
+    /// Lift this phone's refusal for one device. A record removed by a forget
+    /// is not recreated; a key block left by that forget is lifted by name.
+    pub fn restore_device(&self, name: String) -> Result<RemovalReceipt, CoreError> {
+        self.inner.restore_device(&name)
+    }
+
+    /// Grant one action's enforcing capability to a known device. The receipt
+    /// says whether an owner-signed op was written and when it expires.
+    pub fn grant_capability(
+        &self,
+        device: String,
+        action: ActionKind,
+    ) -> Result<CapabilityReceipt, CoreError> {
+        self.inner.grant_capability(&device, action)
+    }
+
+    /// Revoke one action's enforcing capability from a known device. A
+    /// capability held by a delegated enrollment ceiling returns
+    /// `NotRevocableBecauseCeiling`; a grant cannot narrow that ceiling.
+    pub fn revoke_capability(
+        &self,
+        device: String,
+        action: ActionKind,
+    ) -> Result<CapabilityReceipt, CoreError> {
+        self.inner.revoke_capability(&device, action)
+    }
+
+    /// Whether this build links an invitation create/join surface. The
+    /// `Unsupported` reason is a fact, not an empty success.
+    pub fn enrollment_status(&self) -> EnrollmentStatus {
+        self.inner.enrollment_status()
     }
 
     /// Start the real receive engine for this config directory. Synchronous
@@ -302,6 +357,40 @@ mod tests {
             Err(CoreError::Usage(_))
         ));
         assert_eq!(core.status().unwrap().engine, crate::EngineState::NotLinked);
+    }
+
+    #[test]
+    fn lifecycle_calls_cross_the_boundary_without_network_work() {
+        let core = session();
+        let status = core.enrollment_status();
+        assert_eq!(status.state, crate::EnrollmentSupport::Unsupported);
+        assert!(status.reason.is_some());
+        assert!(matches!(
+            core.device_policy("ghost".to_string()),
+            Err(CoreError::Usage(_))
+        ));
+        assert!(matches!(
+            core.forget_device("ghost".to_string()),
+            Err(CoreError::Usage(_))
+        ));
+        assert!(matches!(
+            core.cut_off_device("ghost".to_string()),
+            Err(CoreError::Usage(_))
+        ));
+        assert!(matches!(
+            core.restore_device("ghost".to_string()),
+            Err(CoreError::Usage(_))
+        ));
+        assert!(matches!(
+            core.grant_capability("ghost".to_string(), crate::ActionKind::Send),
+            Err(CoreError::Usage(_))
+        ));
+        assert!(matches!(
+            core.revoke_capability("ghost".to_string(), crate::ActionKind::Send),
+            Err(CoreError::Usage(_))
+        ));
+        assert_eq!(core.status().unwrap().engine, crate::EngineState::NotLinked);
+        assert!(!core.inner.config_dir().join("devices.json").exists());
     }
 }
 

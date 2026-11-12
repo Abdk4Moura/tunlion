@@ -944,10 +944,13 @@ impl RecvDaemon for CoreDaemon {
     async fn complete_warm_bootstrap(&mut self, _conn: &Conn, _pid: &str, _reply: &Value) {}
     fn reap_warm_bootstraps(&mut self) {}
     fn revocation_snapshot(&self) -> Option<(String, String)> {
-        None
+        // The receive sweep polls this every ~2s. Returning None (the old stub)
+        // meant a running Core engine never applied a forget or cut to held
+        // links and secrets, so a removal API would have edited files only.
+        self.store.revocation_snapshot()
     }
-    fn prune_to_store(&self, _held: &mut Vec<(String, String)>) -> HashSet<String> {
-        HashSet::new()
+    fn prune_to_store(&self, held: &mut Vec<(String, String)>) -> HashSet<String> {
+        self.store.prune_held(held)
     }
     fn key_listed(&self, device_pub: &[u8; 32]) -> bool {
         self.store.device_key_revoked(device_pub, now_secs())
@@ -1111,6 +1114,29 @@ mod tests {
             let settings = CoreSettings::load(dir.path()).unwrap();
             assert_eq!(settings.relay_only(), want, "{raw:?}");
         }
+    }
+
+    #[test]
+    fn the_core_daemon_reports_the_real_store_snapshot_and_prunes_held_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(
+            root.join("devices.json"),
+            r#"[{"name":"a","secret":"s-a"}]"#,
+        )
+        .unwrap();
+        let daemon = CoreDaemon::new(
+            root.clone(),
+            DeviceStore::open(&root),
+            OverlayKey::new(root.join("overlay.ed25519")),
+        );
+        assert!(
+            daemon.revocation_snapshot().is_some(),
+            "a running core must not report an unreadable store"
+        );
+        let mut held = vec![("a".into(), "s-a".into()), ("b".into(), "s-b".into())];
+        assert_eq!(daemon.prune_to_store(&mut held).len(), 1);
+        assert_eq!(held, vec![("a".to_string(), "s-a".to_string())]);
     }
 
     #[test]

@@ -14,12 +14,11 @@
 use crate::device_view::device_cert_revoked;
 use crate::devices_store::{devices_load, devices_path, with_devices_mut};
 use crate::{
-    DeadlineClock, PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, fleet_ui, identity,
+    DeadlineClock, PRINCIPAL_STATE_LAPSED, fleet_ui, identity,
     load_owner_key, ui,
 };
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) use filament_peerloop::recv::store::{
     effective_principal_deadline, sanitize_device_name,
@@ -197,36 +196,40 @@ pub(crate) fn set_device_cert_revoked(name: &str, revoked: bool) -> Result<()> {
     })
 }
 
-/// Durable device-level revoke. Writes the SINGLE `certRevoked` marker (a
-/// decision about the device, not a certificate): the gate refuses the device
-/// on every reconnect, and a cert renewal must not clear it (the writer has no
-/// clearing line). `principalState`/`revokedAt` are display only.
+/// Durable device-level revoke. The decision is the single `certRevoked` marker
+/// on the kept record (a decision about the device, not a certificate): the gate
+/// refuses the device on every reconnect, and a cert renewal must not clear it.
+/// `revokedAt`/`principalState` are display only. Goes through the shared
+/// removal service so CutOff ordering and the Restore lift cannot diverge.
 pub(crate) fn set_device_revoked(name: &str, revoked: bool) -> Result<()> {
-    with_devices_mut(|arr| {
-        let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
-            bail!("device '{name}' is not in the device store");
-        };
-        device["certRevoked"] = json!(revoked);
-        if revoked {
-            device["revokedAt"] = json!(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-            );
-            device["principalState"] = json!(PRINCIPAL_STATE_REVOKED);
-        } else {
-            if let Some(map) = device.as_object_mut() {
-                map.remove("revokedAt");
-            }
-            // Restore returns the device to its pre-revoke state: if it was lapsed
-            // the sweeper's marker stays, otherwise clear the terminal state.
-            if device["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED) {
-                device["principalState"] = Value::Null;
-            }
-        }
-        Ok(())
-    })
+    let store = crate::devices_store::store();
+    let record = store
+        .devices_records()
+        .into_iter()
+        .find(|record| record["name"].as_str() == Some(name));
+    let cert = record
+        .as_ref()
+        .and_then(|record| identity::DeviceCert::from_json(&record["deviceCert"]));
+    let now = crate::identity::now_secs();
+    let plan = match (record.as_ref(), revoked) {
+        (Some(record), true) => filament_peerloop::removal::plan_removal(
+            record,
+            cert.as_ref(),
+            crate::fleet::my_owner_pub(),
+            filament_peerloop::removal::RemovalMode::CutOff,
+            now,
+        ),
+        (Some(record), false) => filament_peerloop::removal::plan_removal(
+            record,
+            cert.as_ref(),
+            crate::fleet::my_owner_pub(),
+            filament_peerloop::removal::RemovalMode::Restore,
+            now,
+        ),
+        (None, true) => bail!("device '{name}' is not in the device store"),
+        (None, false) => bail!("device '{name}' is not in the device store"),
+    };
+    store.apply_removal(&plan, None, |_| Ok(())).map(|_| ())
 }
 
 pub(crate) fn certify_local_device(

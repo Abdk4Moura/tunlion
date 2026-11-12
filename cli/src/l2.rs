@@ -724,6 +724,81 @@ async fn verify_fleet_identity(
     r
 }
 
+/// Direct-QUIC (and WebRTC) transports tag every inbound event with the
+/// immutable `SourceId` of the transport that produced it. This dial loop
+/// routes candidates by peer id and checks the direct attempt at `DirectReady`;
+/// before a link is selected there is no single source to compare against, so
+/// unwrap the tag here. The destinations that DO know their owner re-apply the
+/// gate: `verify_fleet_identity_inner` accepts only the source of the transport
+/// it is verifying, and `pump_initiator` accepts only the selected link's
+/// source. Without this, the loop never sees a `ChannelReady` or `Control` at
+/// all (the source-attributed event shape made both invisible).
+fn unsource_event(ev: Ev) -> Ev {
+    match ev {
+        Ev::Sourced { inner, .. } => *inner,
+        other => other,
+    }
+}
+
+/// The control message carried by `ev` for the link being verified, if any.
+///
+/// The direct reader delivers control frames as `Ev::Sourced { inner:
+/// Ev::Control }`; the WebRTC/LAN readers use the untagged shape. A tagged
+/// event is accepted only from the exact transport being verified, otherwise a
+/// hello bound to a losing/superseded QUIC connection could be read as this
+/// link's certificate.
+fn control_for_link<'a>(
+    ev: &'a Ev,
+    link: &str,
+    source: Option<net::SourceId>,
+) -> Option<&'a Value> {
+    match ev {
+        Ev::Control(from, v) if from == link => Some(v),
+        Ev::Sourced { pid, source: event_source, inner } if pid == link => {
+            if source != Some(*event_source) {
+                return None;
+            }
+            match inner.as_ref() {
+                Ev::Control(from, v) if from == link => Some(v),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The event the selected link's pump may act on.
+///
+/// A source-attributed event is only this link's if its `SourceId` matches the
+/// transport the mux selected. Anything else is a callback from a candidate
+/// that lost the race (or an earlier attempt on the same signaling id) and must
+/// not reach the mux after selection: an old `l2-close` would end the wrong
+/// stream. Untagged events keep the pre-attribution behaviour.
+fn selected_event(ev: Ev, source: Option<net::SourceId>) -> Option<Ev> {
+    match ev {
+        Ev::Sourced { source: event_source, inner, .. } if Some(event_source) == source => {
+            Some(*inner)
+        }
+        Ev::Sourced { .. } => None,
+        other => Some(other),
+    }
+}
+
+/// Read replies from the selected transport without accepting late frames
+/// from a losing candidate. Exec and SSH bootstrap use the same source gate
+/// as the L2 pump, including while waiting for their first acknowledgment.
+pub(crate) async fn recv_selected_event(
+    rx: &mut mpsc::UnboundedReceiver<Ev>,
+    source: Option<net::SourceId>,
+) -> Option<Ev> {
+    while let Some(ev) = rx.recv().await {
+        if let Some(ev) = selected_event(ev, source) {
+            return Some(ev);
+        }
+    }
+    None
+}
+
 async fn verify_fleet_identity_inner(
     t: &Arc<dyn Transport>,
     rx: &mut mpsc::UnboundedReceiver<Ev>,
@@ -738,6 +813,7 @@ async fn verify_fleet_identity_inner(
         .ok_or_else(|| anyhow!("cannot verify '{expected}': this device holds no owner key"))?;
     let hello = crate::fleet::make_hello(&cb, &crate::display_name())?;
     t.send_control(&hello).await?;
+    let source = t.source_id();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         // A peer that drops the link (it bound the proof to a different
@@ -756,13 +832,16 @@ async fn verify_fleet_identity_inner(
             Ok(None) => bail!("link closed before '{expected}' presented a certificate"),
             Ok(Some(ev)) => ev,
         };
-        let v = match &ev {
-            Ev::Control(from, v) if from == link => v,
-            Ev::Control(..) | Ev::Chunk(..) => continue,
-            _ => {
-                deferred.push(ev);
-                continue;
-            }
+        let v = match control_for_link(&ev, link, source) {
+            Some(v) => v,
+            None => match &ev {
+                Ev::Control(..) | Ev::Chunk(..) => continue,
+                Ev::Sourced { pid, .. } if pid == link => continue,
+                _ => {
+                    deferred.push(ev);
+                    continue;
+                }
+            },
         };
         if v["type"].as_str() != Some(crate::fleet::HELLO) {
             continue;
@@ -1229,6 +1308,7 @@ pub(crate) async fn bring_up_to_known(
                 continue;
             }
         };
+        let ev = unsource_event(ev);
         match ev {
             Ev::Welcome(v) => {
                 my_id = v["id"].as_str().map(|s| s.to_string());
@@ -1760,7 +1840,11 @@ pub async fn establish_probe_within(
 /// liveness marker so warm-reuse verification passes even for a client-speaks-first
 /// protocol (see `Mux::on_open_ack`).
 async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
+    let source = mux.transport().source_id();
     while let Some(ev) = rx.recv().await {
+        let Some(ev) = selected_event(ev, source) else {
+            continue;
+        };
         match ev {
             Ev::Control(_pid, v) => match v["type"].as_str() {
                 Some("l2-close") => {
@@ -4890,7 +4974,7 @@ async fn shell_bootstrap(
                  `tunlion up`, the shell acceptor may be off there (`tunlion up --shell`)."
             ));
         }
-        match tokio::time::timeout(remaining, rx.recv()).await {
+        match tokio::time::timeout(remaining, recv_selected_event(&mut rx, t.source_id())).await {
             Ok(Some(Ev::Control(_pid, v))) => match v["type"].as_str() {
                 // #30: the acceptor challenges us to prove device-key possession
                 // before it decides the shell gate. Answer it (shared responder)
@@ -6098,6 +6182,102 @@ mod h1_tests {
         // charlie's turn: its held offer comes back exactly once.
         assert_eq!(f.on_dial("sid-charlie"), Some(offer("sid-charlie")));
         assert_eq!(f.on_dial("sid-charlie"), None);
+    }
+
+    /// The one-shot fleet exec path: the target answers the hello on the direct
+    /// QUIC connection, whose reader tags the frame with the transport's
+    /// `SourceId`. Verification must read that shape; it used to see only the
+    /// untagged one and wait out its deadline while the peer had already
+    /// answered.
+    #[test]
+    fn fleet_verify_reads_a_source_attributed_direct_control() {
+        let pid = "sid-direct";
+        let source = net::SourceId::next();
+        let other = net::SourceId::next();
+        let hello = json!({ "type": crate::fleet::HELLO, "name": "charlie" });
+        let ev = Ev::Sourced {
+            pid: pid.to_string(),
+            source,
+            inner: Box::new(Ev::Control(pid.to_string(), hello.clone())),
+        };
+
+        assert_eq!(control_for_link(&ev, pid, Some(source)), Some(&hello));
+        // A control from another candidate is not this link's certificate.
+        assert_eq!(control_for_link(&ev, "sid-other", Some(source)), None);
+        // A lost connection with the same signaling id is not this link either:
+        // its hello was bound to different keying material.
+        assert_eq!(control_for_link(&ev, pid, Some(other)), None);
+        // The untagged WebRTC/LAN shape keeps working.
+        let plain = Ev::Control(pid.to_string(), hello.clone());
+        assert_eq!(control_for_link(&plain, pid, None), Some(&hello));
+
+        // The dial loop itself must see the event, not leave it in `Sourced`.
+        match unsource_event(ev) {
+            Ev::Control(from, v) => {
+                assert_eq!(from, pid);
+                assert_eq!(v, hello);
+            }
+            other => panic!("sourced control was not unwrapped: {other:?}"),
+        }
+    }
+
+    /// After the link is selected, a late callback from a losing transport must
+    /// not reach the mux: an old `l2-close` would end a stream on the live link.
+    #[test]
+    fn the_selected_pump_reads_only_the_selected_transports_source() {
+        let pid = "sid-direct";
+        let selected = net::SourceId::next();
+        let stale = net::SourceId::next();
+        let tagged = |source| Ev::Sourced {
+            pid: pid.to_string(),
+            source,
+            inner: Box::new(Ev::Control(
+                pid.to_string(),
+                json!({ "type": "l2-open-ack" }),
+            )),
+        };
+
+        assert!(matches!(
+            selected_event(tagged(selected), Some(selected)),
+            Some(Ev::Control(..))
+        ));
+        assert!(
+            selected_event(tagged(stale), Some(selected)).is_none(),
+            "a stale transport's control reached the selected link's pump"
+        );
+        // Untagged events keep the pre-attribution behaviour.
+        assert!(matches!(
+            selected_event(
+                Ev::Control(pid.to_string(), json!({ "type": "l2-open-ack" })),
+                None
+            ),
+            Some(Ev::Control(..))
+        ));
+    }
+
+    #[tokio::test]
+    async fn selected_reply_reader_accepts_exec_and_bootstrap_replies_not_stale_closes() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let selected = net::SourceId::next();
+        let stale = net::SourceId::next();
+        for kind in ["exec-open-ack", "shell-bootstrap-ack", "exec-close", "ssh-sign-response", "l2-close"] {
+            tx.send(Ev::Sourced {
+                pid: "peer".into(),
+                source: stale,
+                inner: Box::new(Ev::Control("peer".into(), json!({"type": "l2-close"}))),
+            }).unwrap();
+            tx.send(Ev::Sourced {
+                pid: "peer".into(),
+                source: selected,
+                inner: Box::new(Ev::Control("peer".into(), json!({"type": kind}))),
+            }).unwrap();
+            match recv_selected_event(&mut rx, Some(selected)).await {
+                Some(Ev::Control(_, value)) => assert_eq!(value["type"], kind),
+                other => panic!("selected reply was not delivered: {other:?}"),
+            }
+        }
+        drop(tx);
+        assert!(recv_selected_event(&mut rx, Some(selected)).await.is_none());
     }
 
     /// `push_ring` keeps the buffer bounded by `cap`, evicting the OLDEST bytes,
