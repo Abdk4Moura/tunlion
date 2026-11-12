@@ -1134,6 +1134,8 @@ fn buffered_offer_signal(pid: &str, offer: BufferedOffer) -> Value {
         data["ch"] = json!(c);
     }
     json!({ "from": pid, "data": data })
+}
+
 /// The SDP payloads a building WebRTC candidate consumes: a session
 /// description or an ICE candidate. `envelope` is the server-stamped signal
 /// (`{from, data}`); only these kinds are ever staged for a build.
@@ -11681,6 +11683,8 @@ mod warm_identity_tests {
         assert!(conn.links.contains_key(pid), "the candidate was not installed");
         assert!(offers.is_empty(), "an offer from an older generation was replayed");
         assert!(!conn.buffered_offers.contains_key(pid));
+    }
+
     /// P5: a build stages ONLY its own SDP traffic. A transport-hint,
     /// transport-offer or PAKE frame from the same peer is handed straight
     /// back to the caller's normal handler, so cancelling the build cannot
