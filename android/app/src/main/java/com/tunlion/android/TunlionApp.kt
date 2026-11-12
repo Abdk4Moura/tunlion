@@ -70,6 +70,8 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
     var selectedDevice by rememberSaveable { mutableStateOf<CoreDevice?>(null) }
     var recoveryWords by remember { mutableStateOf<String?>(null) }
     var loadFailed by remember { mutableStateOf(false) }
+    var removalOutcome by remember { mutableStateOf<CoreRemovalNotice?>(null) }
+    var capabilityOutcome by remember { mutableStateOf<CoreCapabilityNotice?>(null) }
     val scope = rememberCoroutineScope()
     val colors = MaterialTheme.colorScheme
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -125,6 +127,52 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                 throw cancelled
             } catch (_: Exception) {
                 notice = "That action could not finish. Your existing devices have not been changed."
+            } finally { busy = false }
+        }
+    }
+
+    // A typed write. The screen shows the core's receipt, or the core's refusal
+    // text; a refusal never reaches `removalNotice`/`capabilityNotice` as success.
+    fun performRemoval(action: suspend () -> CoreRemovalResult) {
+        if (busy) return
+        busy = true
+        notice = null
+        operation = scope.launch {
+            try {
+                when (val result = action()) {
+                    is CoreRemovalResult.Removed -> {
+                        removalOutcome = removalNotice(result.receipt)
+                        capabilityOutcome = null
+                        status = core.refresh()
+                    }
+                    is CoreRemovalResult.Failed -> { notice = result.failure.message; status = core.refresh() }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                notice = "That removal could not finish. The core did not report a change."
+            } finally { busy = false }
+        }
+    }
+
+    fun performCapability(intent: CoreCapabilityIntent, deviceName: String, action: suspend () -> CoreCapabilityResult) {
+        if (busy) return
+        busy = true
+        notice = null
+        operation = scope.launch {
+            try {
+                when (val result = action()) {
+                    is CoreCapabilityResult.Edited -> {
+                        capabilityOutcome = capabilityNotice(deviceName, intent, result.receipt)
+                        removalOutcome = null
+                        status = core.refresh()
+                    }
+                    is CoreCapabilityResult.Failed -> { notice = result.failure.message; status = core.refresh() }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                notice = "That capability change could not finish. The core did not report success."
             } finally { busy = false }
         }
     }
@@ -241,13 +289,18 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                                 SecondaryText("No stored device relationships. Fleet discovery and enrollment are not connected yet. File codes work without adding a device.")
                             }
                             status.devices.forEach { device ->
-                                key(device.id) { DeviceRow(device) { selectedDevice = device; navigate(Screen.DEVICE) } }
+                                key(device.id) { DeviceRow(device) {
+                                    selectedDevice = device
+                                    removalOutcome = null
+                                    capabilityOutcome = null
+                                    navigate(Screen.DEVICE)
+                                } }
                             }
                             HorizontalDivider(color = colors.outline)
                             ActionRow(Icons.Outlined.FolderOpen, "Files", "Send a file or receive with a code") { navigate(Screen.FILES) }
                             }
                         }
-                        Screen.PAIR -> PairScreen(core, busy, status.enrollmentSupported, status.codeEnrollmentSupported,
+                        Screen.PAIR -> PairScreen(core, busy, status.enrollmentSupported, status.enrollmentReason, status.codeEnrollmentSupported,
                             status.deviceName, onJoin = { code, remember ->
                                 requestNotifications()
                                 perform({ core.joinCode(code, remember) }) { navigate(Screen.HOME) }
@@ -290,11 +343,42 @@ fun TunlionApp(core: TunlionCore, feedbackEnabled: Boolean,
                             onConnect = { navigate(Screen.PAIR) }, onPickDevice = { device ->
                                 selectedDevice = device; navigate(Screen.SEND)
                             })
-                        Screen.DEVICE -> selectedDevice?.let { selected ->
-                            val device = status.devices.firstOrNull { it.id == selected.id }
+                        Screen.DEVICE -> {
+                            val device = selectedDevice?.let { selected ->
+                                status.devices.firstOrNull { it.id == selected.id }
+                            }
+                            var pendingRemoval by remember { mutableStateOf<CoreRemovalMode?>(null) }
+                            removalOutcome?.let { notice ->
+                                RemovalOutcome(notice, busy,
+                                    onRestore = { name -> performRemoval { core.restoreDevice(name) } },
+                                    onDismiss = { removalOutcome = null })
+                            }
+                            capabilityOutcome?.let { notice ->
+                                CapabilityOutcomeCard(notice, busy,
+                                    onCutOff = { pendingRemoval = CoreRemovalMode.CUT_OFF },
+                                    onDismiss = { capabilityOutcome = null })
+                            }
                             if (device == null) SecondaryText("This device is no longer in the current core snapshot. Return to Devices and refresh.")
-                            else
-                            DeviceDetails(device, onSend = { navigate(Screen.SEND) })
+                            else DeviceDetails(core, device, busy,
+                                onSend = { navigate(Screen.SEND) },
+                                onRequestForget = { pendingRemoval = CoreRemovalMode.FORGET },
+                                onRequestCutOff = { pendingRemoval = CoreRemovalMode.CUT_OFF },
+                                onRevoke = { action ->
+                                    performCapability(CoreCapabilityIntent.REVOKE, device.name) {
+                                        core.revokeCapability(device.name, action)
+                                    }
+                                })
+                            pendingRemoval?.let { mode ->
+                                RemovalConfirmDialog(mode, device?.name ?: selectedDevice?.name.orEmpty(), busy,
+                                    onDismiss = { pendingRemoval = null },
+                                    onConfirm = {
+                                        pendingRemoval = null
+                                        when (mode) {
+                                            CoreRemovalMode.FORGET -> performRemoval { core.forgetDevice(device?.name ?: selectedDevice?.name.orEmpty()) }
+                                            else -> performRemoval { core.cutOffDevice(device?.name ?: selectedDevice?.name.orEmpty()) }
+                                        }
+                                    })
+                            }
                         }
                         Screen.SEND -> SendScreen(selectedDevice, busy) { files, onCode ->
                             requestNotifications()
@@ -389,7 +473,7 @@ private fun FirstConnection(onJoin: () -> Unit, onSetup: () -> Unit) {
 }
 
 @Composable
-private fun PairScreen(core: TunlionCore, busy: Boolean, supported: Boolean, codeSupported: Boolean, deviceName: String?,
+private fun PairScreen(core: TunlionCore, busy: Boolean, supported: Boolean, unsupportedReason: String?, codeSupported: Boolean, deviceName: String?,
     onJoin: (String, Boolean) -> Unit, onJoinInvitation: (ByteArray, String) -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
@@ -460,7 +544,11 @@ private fun PairScreen(core: TunlionCore, busy: Boolean, supported: Boolean, cod
         "Someone else's" -> "External pair with explicitly confirmed permissions, not fleet membership."
         else -> "Temporary access must have a bounded expiry confirmed by the core. Invitation file only."
     })
-    if (!supported) SecondaryText("Enrollment review is unavailable until the shared core exposes enrollment facts. These choices do not record a relationship or grant permission. Use Files for a one-time transfer code.")
+    if (!supported) {
+        SecondaryText("Enrollment review is unavailable until the shared core exposes enrollment facts. These choices do not record a relationship or grant permission. Use Files for a one-time transfer code.")
+        // The core's own reason. Not a client guess about why invitations are off.
+        unsupportedReason?.let { SecondaryText("The core reports: $it") }
+    }
     SecondaryText("The actual relationship is shown only after the core verifies signed enrollment facts. Nearby enrollment is not supported in this build.")
     if (carrier == "Spoken code") PrimaryButton("Review enrollment", busy, enabled = codeSupported && code.isNotBlank(),
         onClick = { onJoin(code.trim(), true) })
@@ -661,7 +749,7 @@ private fun DeviceRow(device: CoreDevice, onClick: () -> Unit) {
                 color = if (device.online == true) colors.onBackground else colors.onSurfaceVariant)
             SecondaryText(when (device.online) { true -> "Online"; false -> "Offline"; null -> "Availability unknown" })
             SecondaryText(relationshipLabel(device.relationship) + if (device.revoked) " · revoked locally" else "")
-            if (device.actions.isNotEmpty()) SecondaryText(actionSummary(device))
+            if (device.actions.isNotEmpty()) SecondaryText(actionSummary(device.actions))
         }
         if (device.online == true && device.route != null) {
             Text(if (device.route == "relayed") "RELAYED" else if (device.route == "direct") "DIRECT" else "",
@@ -675,7 +763,26 @@ private fun DeviceRow(device: CoreDevice, onClick: () -> Unit) {
 }
 
 @Composable
-private fun DeviceDetails(device: CoreDevice, onSend: () -> Unit) {
+private fun DeviceDetails(
+    core: TunlionCore,
+    device: CoreDevice,
+    busy: Boolean,
+    onSend: () -> Unit,
+    onRequestForget: () -> Unit,
+    onRequestCutOff: () -> Unit,
+    onRevoke: (CoreActionKind) -> Unit,
+) {
+    var policyResult by remember(device.name) { mutableStateOf<CoreDevicePolicyResult?>(null) }
+    var pendingRevoke by remember(device.name) { mutableStateOf<CoreActionKind?>(null) }
+    // Reload after every core call this screen can start (busy falls back to
+    // false), so the rows always show the stores as they are now.
+    LaunchedEffect(device.name, busy) {
+        if (busy) return@LaunchedEffect
+        policyResult = try { core.devicePolicy(device.name) }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { CoreDevicePolicyResult.Failed(CoreResult.Failure(CoreErrorKind.INTERNAL,
+            "The native core could not read this device's local policy. Nothing was changed.")) }
+    }
     SecondaryText(when (device.online) { true -> "Online"; false -> "Offline"; null -> "Availability unknown" })
     DetailRow("Relationship", relationshipLabel(device.relationship))
     device.expiry?.let { DetailRow("Expiry recorded by core", it) }
@@ -683,14 +790,44 @@ private fun DeviceDetails(device: CoreDevice, onSend: () -> Unit) {
     Eyebrow("ACCESS FACTS")
     SecondaryText(device.plainLine)
     SecondaryText("A stored relationship or recorded grant is not proof that an action currently works. This snapshot does not probe the remote device.")
-    if (device.actions.isNotEmpty()) {
-        actionGroup(device, "EFFECTIVE", CoreAccessState.AVAILABLE, "No action is confirmed effective by this snapshot.")
-        actionGroup(device, "PENDING", CoreAccessState.PENDING, null)
-        actionGroup(device, "BLOCKED", CoreAccessState.BLOCKED, null)
-        actionGroup(device, "UNKNOWN", CoreAccessState.UNKNOWN, null)
-        actionGroup(device, "UNAVAILABLE", CoreAccessState.UNSUPPORTED, null)
+    when (val result = policyResult) {
+        null -> SecondaryText("Reading this device's local policy from the shared core…")
+        is CoreDevicePolicyResult.Failed -> {
+            Eyebrow("CORE COULD NOT READ THE POLICY")
+            Text(result.failure.message, color = MaterialTheme.colorScheme.error)
+        }
+        is CoreDevicePolicyResult.Loaded -> {
+            val policy = result.policy
+            DetailRow("Admitted", enrollmentSummary(policy.enrollment))
+            if (policy.enrollment.ceiling.isNotEmpty())
+                SecondaryText("The admission ceiling bounds every action below. It is not a claim that the device is reachable now.")
+            DetailRow("Local policy delivery", deliverySummary(policy.delivery))
+            policy.deviceKey?.let { DetailRow("Device key", it) }
+            policy.expires?.let { DetailRow("Core policy expiry", instantText(it)) }
+            val actions = policy.actions
+            actionGroup("EFFECTIVE", actions.filter { isEffective(it.state) }, EFFECTIVE_GROUP_NOTE)
+            actionGroup("PENDING", actions.filter { it.state == CoreAccessState.PENDING }, PENDING_GROUP_NOTE)
+            actionGroup("BLOCKED", actions.filter { it.state == CoreAccessState.BLOCKED }, null)
+            actionGroup("UNKNOWN", actions.filter { it.state == CoreAccessState.UNKNOWN }, null)
+            actionGroup("UNAVAILABLE", actions.filter { it.state == CoreAccessState.UNSUPPORTED }, null)
+            SecondaryText("Only actions reported by the shared core appear here, with the stored fact each one comes from. Pending is a local record, not confirmed access.")
+            Eyebrow("REVOKE A CAPABILITY")
+            SecondaryText("Revoking one capability records a single deny on this phone. If the access comes from the invitation ceiling, the core refuses and this screen says so instead of reporting success.")
+            val revocable = actions.filter { it.source != CorePolicySource.PROFILE }
+            if (revocable.isEmpty()) SecondaryText("This build's profile serves none of these actions, so there is no capability to revoke here.")
+            revocable.forEach { action ->
+                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(actionLabel(action.kind), fontWeight = FontWeight.Medium)
+                        SecondaryText(accessStateChip(action.state) + " · " + policySourceLabel(action.source).lowercase())
+                    }
+                    OutlinedButton(onClick = { pendingRevoke = action.kind }, enabled = !busy,
+                        shape = RoundedCornerShape(7.dp)) { Text("Revoke") }
+                }
+            }
+        }
     }
-    SecondaryText("Only actions reported by the shared core appear here. Permission editing, terminal clients and folder clients are not connected in this build.")
     if (device.route == "relayed") SecondaryText("On relay, not a direct link. Still end-to-end encrypted.")
     if (device.canSendFiles) PrimaryButton("Send a file", onClick = onSend)
     else if (device.canAttemptSend) {
@@ -699,53 +836,105 @@ private fun DeviceDetails(device: CoreDevice, onSend: () -> Unit) {
     } else SecondaryText("Sending is not available for this device in the current core snapshot. The reason above is the core's own fact, not a client guess.")
     if (device.canOpenShell) SecondaryText("The core reports terminal service as effective. A terminal client is not connected in this build.")
     Eyebrow("REMOVAL")
-    SecondaryText("Revoking one capability removes a single permission. Cutting a device off ends its whole stored relationship. Neither operation is connected to the shared core in this build, so this app cannot perform either or claim completion.")
-    OutlinedButton(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-        shape = RoundedCornerShape(7.dp)) { Text("Revoke a capability · unavailable") }
-    OutlinedButton(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-        shape = RoundedCornerShape(7.dp)) { Text("Cut device off · unavailable") }
-    SecondaryText("Pending deliveries, offline peers and active sessions cannot be resolved from this snapshot. A removal is not acknowledged, and an existing session is not shown as ended.")
+    SecondaryText("Cutting a device off keeps its record on this phone and marks it revoked; the device is refused when it next checks in. Forget removes the record and writes a key block that refuses the old device key. Neither contacts the device, so nothing here claims a remote change or an ended session.")
+    OutlinedButton(onClick = onRequestCutOff, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        shape = RoundedCornerShape(7.dp)) { Text("Cut this device off") }
+    OutlinedButton(onClick = onRequestForget, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        shape = RoundedCornerShape(7.dp)) { Text("Forget this device") }
+    SecondaryText("Pending deliveries, offline peers and active sessions cannot be resolved from this snapshot. A removal is not acknowledged by the device, and an existing session is not shown as ended.")
+    pendingRevoke?.let { kind ->
+        AlertDialog(onDismissRequest = { pendingRevoke = null },
+            title = { Text("Revoke ${actionShortLabel(kind)}?") },
+            text = { Text("This phone records an explicit deny for that capability on ${device.name}. If the access comes from the invitation ceiling, the core refuses and this screen says so instead of reporting success. The device is not contacted.") },
+            confirmButton = { TextButton(onClick = { pendingRevoke = null; onRevoke(kind) }) { Text("Revoke") } },
+            dismissButton = { TextButton(onClick = { pendingRevoke = null }) { Text("Cancel") } })
+    }
+}
+
+/** The receipt the core returned, in the core's own terms. Never a success line for a refusal. */
+@Composable
+private fun RemovalOutcome(notice: CoreRemovalNotice, busy: Boolean, onRestore: (String) -> Unit, onDismiss: () -> Unit) {
+    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(9.dp))
+        .padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Eyebrow("RESULT")
+        Text(notice.title, fontWeight = FontWeight.SemiBold)
+        notice.lines.forEach { SecondaryText(it) }
+        notice.forgottenName?.let { name ->
+            OutlinedButton(onClick = { onRestore(name) }, enabled = !busy, shape = RoundedCornerShape(7.dp)) {
+                Text("Lift the key block for $name")
+            }
+            SecondaryText("A restore lifts this phone's refusal. It does not recreate the record that was removed.")
+        }
+        TextButton(onClick = onDismiss, enabled = !busy) { Text("Dismiss") }
+    }
+}
+
+/** One capability edit's outcome. A ceiling refusal offers cut off instead of success. */
+@Composable
+private fun CapabilityOutcomeCard(notice: CoreCapabilityNotice, busy: Boolean, onCutOff: () -> Unit, onDismiss: () -> Unit) {
+    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(9.dp))
+        .padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Eyebrow(if (notice.applied) "CAPABILITY RESULT" else "CAPABILITY REFUSED")
+        Text(notice.title, fontWeight = FontWeight.SemiBold,
+            color = if (notice.applied) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.error)
+        notice.lines.forEach { SecondaryText(it) }
+        if (notice.offerCutOff) {
+            OutlinedButton(onClick = onCutOff, enabled = !busy, shape = RoundedCornerShape(7.dp)) {
+                Text("Cut this device off")
+            }
+        }
+        TextButton(onClick = onDismiss, enabled = !busy) { Text("Dismiss") }
+    }
 }
 
 @Composable
-private fun actionGroup(device: CoreDevice, title: String, state: CoreAccessState, empty: String?) {
-    val actions = device.actions.filter { it.state == state }
-    if (actions.isEmpty()) { empty?.let { SecondaryText(it) }; return }
+private fun RemovalConfirmDialog(mode: CoreRemovalMode, name: String, busy: Boolean,
+    onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    val forget = mode == CoreRemovalMode.FORGET
+    AlertDialog(onDismissRequest = { if (!busy) onDismiss() },
+        title = { Text(if (forget) "Forget $name?" else "Cut off $name?") },
+        text = { Text(if (forget)
+            "This phone removes the stored device record and writes a key block that refuses the old device key. The device is not contacted and nothing is removed on it. This cannot be undone from this phone."
+            else "This phone keeps the record and marks the device revoked. The device is refused when it next checks in. An active session is not ended by this call.") },
+        confirmButton = { TextButton(onClick = onConfirm, enabled = !busy) { Text(if (forget) "Forget" else "Cut off") } },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") } })
+}
+
+@Composable
+private fun actionGroup(title: String, actions: List<CoreActionPolicy>, note: String?) {
+    if (actions.isEmpty()) { note?.let { SecondaryText(it) }; return }
     Eyebrow(title)
-    actions.forEach { DetailRow(actionLabel(it.kind), it.reason) }
+    actions.forEach { ActionPolicyRow(it) }
 }
 
-private fun actionSummary(device: CoreDevice) = device.actions.joinToString(" · ") {
-    "${actionShortLabel(it.kind)}: ${stateLabel(it.state)}"
+@Composable
+private fun ActionPolicyRow(action: CoreActionPolicy) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(actionLabel(action.kind), fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+            StateChip(action.state)
+        }
+        SecondaryText(policySourceLabel(action.source))
+        // The core's reason is the authority. Shown verbatim, never re-worded.
+        Text(action.reason, fontSize = 14.sp, lineHeight = 21.sp)
+    }
 }
 
-private fun actionShortLabel(kind: CoreActionKind) = when (kind) {
-    CoreActionKind.SEND -> "Send"
-    CoreActionKind.RECEIVE_INBOX -> "Receive inbox"
-    CoreActionKind.TERMINAL -> "Terminal"
-    CoreActionKind.FOLDER -> "Folders"
-}
-
-private fun stateLabel(state: CoreAccessState) = when (state) {
-    CoreAccessState.AVAILABLE -> "available"
-    CoreAccessState.PENDING -> "pending"
-    CoreAccessState.BLOCKED -> "blocked"
-    CoreAccessState.UNSUPPORTED -> "unsupported"
-    CoreAccessState.UNKNOWN -> "unknown"
-}
-
-private fun relationshipLabel(relationship: CoreRelationship) = when (relationship) {
-    CoreRelationship.PAIRED -> "Paired device"
-    CoreRelationship.FLEET -> "Fleet device"
-    CoreRelationship.TEMPORARY -> "Temporary worker"
-    CoreRelationship.UNKNOWN -> "Relationship unknown"
-}
-
-private fun actionLabel(kind: CoreActionKind) = when (kind) {
-    CoreActionKind.SEND -> "Send files to this device"
-    CoreActionKind.RECEIVE_INBOX -> "This device sending to this phone's inbox"
-    CoreActionKind.TERMINAL -> "This phone serving a terminal"
-    CoreActionKind.FOLDER -> "This phone exposing folders"
+@Composable
+private fun StateChip(state: CoreAccessState) {
+    val colors = MaterialTheme.colorScheme
+    val (background, foreground) = when (state) {
+        CoreAccessState.AVAILABLE -> colors.primary to colors.onPrimary
+        CoreAccessState.PENDING -> colors.surfaceVariant to colors.onSurface
+        CoreAccessState.BLOCKED -> colors.error.copy(alpha = .14f) to colors.error
+        else -> colors.surfaceVariant to colors.onSurfaceVariant
+    }
+    Text(accessStateChip(state), color = foreground, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+        fontFamily = FontFamily.Monospace, modifier = Modifier
+            .background(background, RoundedCornerShape(5.dp))
+            .padding(horizontal = 7.dp, vertical = 2.dp)
+            .semantics { contentDescription = "Access ${accessStateChip(state)}" })
 }
 
 @Composable

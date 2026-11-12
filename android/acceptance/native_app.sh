@@ -25,9 +25,9 @@ export TUNLION_NONINTERACTIVE=1
 adb wait-for-device
 adb install -r "$ROOT/app-apk/app-debug.apk"
 adb install -r "$ROOT/test-apk/app-debug-androidTest.apk"
-adb shell am instrument -w -e class com.tunlion.android.NativeCoreAcceptanceTest,com.tunlion.android.DeviceAuthorityUiTest \
+adb shell am instrument -w -e class com.tunlion.android.NativeCoreAcceptanceTest,com.tunlion.android.DevicePolicyFfiTest,com.tunlion.android.DeviceAuthorityUiTest \
     com.tunlion.android.test/androidx.test.runner.AndroidJUnitRunner | tee "$RESULTS/native-core-ui.txt"
-grep -F 'OK (13 tests)' "$RESULTS/native-core-ui.txt"
+grep -F 'OK (22 tests)' "$RESULTS/native-core-ui.txt"
 
 (cd "$ROOT/backend"; exec timeout -k 5 480 env PORT=8188 FIL_ASYNC_MODE=eventlet \
     FIL_SELF_MONKEYPATCH=1 FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 \

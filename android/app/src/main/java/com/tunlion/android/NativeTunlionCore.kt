@@ -12,16 +12,17 @@ import kotlin.coroutines.resume
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
-import uniffi.tunlion_core.AccessState as NativeAccessState
 import uniffi.tunlion_core.ActionKind as NativeActionKind
+import uniffi.tunlion_core.CapabilityReceipt as NativeCapabilityReceipt
 import uniffi.tunlion_core.CoreException
 import uniffi.tunlion_core.CoreSession
 import uniffi.tunlion_core.DeviceAccess as NativeDeviceAccess
-import uniffi.tunlion_core.DevicePresence as NativeDevicePresence
-import uniffi.tunlion_core.DeviceRelationship as NativeDeviceRelationship
+import uniffi.tunlion_core.DevicePolicy as NativeDevicePolicy
 import uniffi.tunlion_core.EngineState as NativeEngineState
 import uniffi.tunlion_core.EnrollmentRelationship as NativeEnrollmentRelationship
+import uniffi.tunlion_core.EnrollmentSupport as NativeEnrollmentSupport
 import uniffi.tunlion_core.PendingIdentity
+import uniffi.tunlion_core.RemovalReceipt as NativeRemovalReceipt
 
 /** Android resource adapter only. No subprocess, enrollment policy or key parsing. */
 class NativeTunlionCore private constructor(private val context: Context) : TunlionCore {
@@ -68,6 +69,10 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     override suspend fun refresh(): CoreStatus = withContext(Dispatchers.IO) {
         val snapshot = session.status()
         val devices = session.devices().map(::coreDevice)
+        // The typed status is the only source for whether invitations are
+        // linked. The binding exposing preview/join is not a claim that this
+        // build enables enrollment, and a hardcoded true would be a guess.
+        val enrollment = session.enrollmentStatus()
         val history = receivedFiles()
         try { publishInbox() } catch (_: java.io.IOException) { /* The publication error is included in this snapshot. */ }
         cached = CoreStatus(statusLoaded = true,
@@ -77,10 +82,8 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
             engineRunning = EngineState.phase.value == EnginePhase.AVAILABLE && snapshot.engine == NativeEngineState.RUNNING,
             engineError = EngineState.error ?: publicationError,
             devices = devices, lastSend = lastSend,
-            // The linked CoreSession exposes preview_invitation and
-            // join_invitation. This is a fact about the binding, never
-            // inferred from devices or pairing.
-            enrollmentSupported = true,
+            enrollmentSupported = enrollment.state == NativeEnrollmentSupport.SUPPORTED,
+            enrollmentReason = enrollment.reason,
             // CoreSession has no spoken-code enrollment surface.
             codeEnrollmentSupported = false,
             transfers = history.records().takeLast(20).reversed().map {
@@ -274,42 +277,86 @@ class NativeTunlionCore private constructor(private val context: Context) : Tunl
     }
 
     /**
+     * One device's typed local policy. The core is strict here: a corrupt
+     * store is an error, never an empty policy. The core's reason strings are
+     * carried through verbatim and the UI shows them as the authority.
+     */
+    override suspend fun devicePolicy(name: String): CoreDevicePolicyResult = withContext(Dispatchers.IO) {
+        try {
+            CoreDevicePolicyResult.Loaded(mapDevicePolicy(session.devicePolicy(name)))
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (error: CoreException) { CoreDevicePolicyResult.Failed(coreFailure(error)) }
+        catch (_: Exception) { CoreDevicePolicyResult.Failed(CoreResult.Failure(CoreErrorKind.INTERNAL,
+            "The native core could not read this device's local policy. Nothing was changed.")) }
+    }
+
+    /** Forget: the core writes the key block, revokes grants, removes the record last. */
+    override suspend fun forgetDevice(name: String): CoreRemovalResult = removal {
+        session.forgetDevice(name)
+    }
+
+    /** Cut off: the core keeps the record and writes the revocation marker. */
+    override suspend fun cutOffDevice(name: String): CoreRemovalResult = removal {
+        session.cutOffDevice(name)
+    }
+
+    /** Restore: lift this phone's refusal by name; a forgotten record is not recreated. */
+    override suspend fun restoreDevice(name: String): CoreRemovalResult = removal {
+        session.restoreDevice(name)
+    }
+
+    /** Grant one action's capability. No screen calls this yet; the receipt is the answer. */
+    override suspend fun grantCapability(device: String, action: CoreActionKind): CoreCapabilityResult =
+        capability { session.grantCapability(device, nativeAction(action)) }
+
+    /** Revoke one action's capability. A ceiling-held action is refused by the core, not faked. */
+    override suspend fun revokeCapability(device: String, action: CoreActionKind): CoreCapabilityResult =
+        capability { session.revokeCapability(device, nativeAction(action)) }
+
+    private suspend fun removal(call: () -> NativeRemovalReceipt): CoreRemovalResult = withContext(Dispatchers.IO) {
+        try {
+            CoreRemovalResult.Removed(mapRemovalReceipt(call()))
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (error: CoreException) { CoreRemovalResult.Failed(coreFailure(error)) }
+        catch (_: Exception) { CoreRemovalResult.Failed(CoreResult.Failure(CoreErrorKind.INTERNAL,
+            "The native core could not finish this removal. Its stores were not reported as changed.")) }
+    }
+
+    private suspend fun capability(call: () -> NativeCapabilityReceipt): CoreCapabilityResult = withContext(Dispatchers.IO) {
+        try {
+            CoreCapabilityResult.Edited(mapCapabilityReceipt(call()))
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (error: CoreException) { CoreCapabilityResult.Failed(coreFailure(error)) }
+        catch (_: Exception) { CoreCapabilityResult.Failed(CoreResult.Failure(CoreErrorKind.INTERNAL,
+            "The native core could not finish this capability change. It did not report success.")) }
+    }
+
+    private fun nativeAction(action: CoreActionKind): NativeActionKind = when (action) {
+        CoreActionKind.SEND -> NativeActionKind.SEND
+        CoreActionKind.RECEIVE_INBOX -> NativeActionKind.RECEIVE_INBOX
+        CoreActionKind.TERMINAL -> NativeActionKind.TERMINAL
+        CoreActionKind.FOLDER -> NativeActionKind.FOLDER
+    }
+
+    /**
      * Project the core's read-only device facts. Relationship and stored
      * records are never promoted to remote authority; presence is projected
      * only from the core enum and never probed by the client.
      */
     private fun coreDevice(access: NativeDeviceAccess): CoreDevice {
         val actions = access.actions.map { action ->
-            CoreAction(when (action.action) {
-                NativeActionKind.SEND -> CoreActionKind.SEND
-                NativeActionKind.RECEIVE_INBOX -> CoreActionKind.RECEIVE_INBOX
-                NativeActionKind.TERMINAL -> CoreActionKind.TERMINAL
-                NativeActionKind.FOLDER -> CoreActionKind.FOLDER
-            }, when (action.state) {
-                NativeAccessState.AVAILABLE -> CoreAccessState.AVAILABLE
-                NativeAccessState.BLOCKED -> CoreAccessState.BLOCKED
-                NativeAccessState.UNSUPPORTED -> CoreAccessState.UNSUPPORTED
-                NativeAccessState.UNKNOWN -> CoreAccessState.UNKNOWN
-            }, action.reason)
+            CoreAction(mapActionKind(action.action), mapAccessState(action.state), action.reason)
         }
         return CoreDevice(
             id = access.deviceKey ?: "name:${access.name}",
             name = access.name,
-            online = when (access.presence) {
-                NativeDevicePresence.UNKNOWN -> null
-                NativeDevicePresence.LIVE -> true
-            },
+            online = mapPresence(access.presence),
             route = null,
             plainLine = "Stored device record from the shared core. Remote grants, reachability and delivered files are not observed.",
-            canSendFiles = actions.any { it.kind == CoreActionKind.SEND && it.state == CoreAccessState.AVAILABLE },
-            canOpenShell = actions.any { it.kind == CoreActionKind.TERMINAL && it.state == CoreAccessState.AVAILABLE },
-            relationship = when (access.relationship) {
-                NativeDeviceRelationship.PAIRED -> CoreRelationship.PAIRED
-                NativeDeviceRelationship.FLEET -> CoreRelationship.FLEET
-                NativeDeviceRelationship.TEMPORARY -> CoreRelationship.TEMPORARY
-                NativeDeviceRelationship.UNKNOWN -> CoreRelationship.UNKNOWN
-            },
-            expiry = access.expiresAt?.let { java.time.Instant.ofEpochSecond(it.toLong()).toString() },
+            canSendFiles = actions.any { it.kind == CoreActionKind.SEND && isEffective(it.state) },
+            canOpenShell = actions.any { it.kind == CoreActionKind.TERMINAL && isEffective(it.state) },
+            relationship = mapRelationship(access.relationship),
+            expiry = access.expiresAt?.let { instantText(it.toLong()) },
             revoked = access.revoked,
             actions = actions,
         )

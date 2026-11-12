@@ -312,13 +312,15 @@ impl Core {
     }
 
     /// Whether this build links an invitation create/join surface.
+    ///
+    /// This branch carries `enrollment.rs` (preview, create, join, list and
+    /// withdraw), so the typed answer is `Supported`. The status is still read
+    /// from the core: a binding that ships without that module must report
+    /// `Unsupported` here rather than infer support from compiled-in calls.
     pub fn enrollment_status(&self) -> EnrollmentStatus {
         EnrollmentStatus {
-            state: EnrollmentSupport::Unsupported,
-            reason: Some(
-                "this core build has no invitation create, join, preview or withdraw surface"
-                    .to_string(),
-            ),
+            state: EnrollmentSupport::Supported,
+            reason: None,
         }
     }
 }
@@ -863,11 +865,11 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_status_is_an_explicit_unsupported_fact() {
+    fn enrollment_status_reports_the_linked_invitation_surface() {
         let root = tempfile::tempdir().unwrap();
         let core = Core::open(root.path()).unwrap();
         let status = core.enrollment_status();
-        assert_eq!(status.state, EnrollmentSupport::Unsupported);
-        assert!(status.reason.is_some());
+        assert_eq!(status.state, EnrollmentSupport::Supported);
+        assert_eq!(status.reason, None);
     }
 }

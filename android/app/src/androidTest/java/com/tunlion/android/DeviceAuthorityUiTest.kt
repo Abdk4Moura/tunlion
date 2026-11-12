@@ -189,8 +189,88 @@ class DeviceAuthorityUiTest {
         compose.onNodeWithText("BLOCKED").performScrollTo().assertExists()
         compose.onNodeWithText("UNKNOWN").performScrollTo().assertExists()
         compose.onNodeWithText("UNAVAILABLE").performScrollTo().assertExists()
-        compose.onNodeWithText("Revoke a capability · unavailable").performScrollTo().assertIsNotEnabled()
-        compose.onNodeWithText("Cut device off · unavailable").performScrollTo().assertIsNotEnabled()
+        // The removal actions are wired to the core now: both are offered.
+        compose.onNodeWithText("Cut this device off").performScrollTo().assertIsEnabled()
+        compose.onNodeWithText("Forget this device").performScrollTo().assertIsEnabled()
+    }
+
+    @Test fun pendingChipIsItsOwnStateAndNeverRenderedAsAvailable() {
+        val peer = CoreDevice("peer-key", "Stored laptop", null, null,
+            "Stored facts only, not remote acknowledgment.", false, false,
+            relationship = CoreRelationship.PAIRED,
+            actions = listOf(
+                CoreAction(CoreActionKind.SEND, CoreAccessState.PENDING, "Granted on this phone; the peer has not acknowledged delivery"),
+            ))
+        val policy = CoreDevicePolicy(
+            name = peer.name, deviceKey = peer.id, relationship = CoreRelationship.PAIRED,
+            expires = null, revoked = false,
+            enrollment = CoreEnrollment(CoreEnrollmentKind.PAIRED, emptyList(), null),
+            delivery = CoreDelivery(CoreDeliveryKind.PENDING, null),
+            actions = listOf(CoreActionPolicy(CoreActionKind.SEND, CoreAccessState.PENDING,
+                CorePolicySource.GRANT_STORE, "Granted on this phone; the peer has not acknowledged delivery")),
+        )
+        compose.setContent {
+            TunlionTheme {
+                TunlionApp(DeviceCore(CoreStatus(identityLoaded = true, fingerprint = "12345678",
+                    engineLinked = true, devices = listOf(peer)), mapOf("Stored laptop" to policy)),
+                    false, {}, {}, {})
+            }
+        }
+        compose.onNodeWithText("Stored laptop").performClick()
+        compose.onNodeWithText("PENDING").performScrollTo().assertExists()
+        compose.onNodeWithText("Waiting for delivery: a grant or invitation ceiling is recorded on this phone, but delivery and live access are not confirmed. Pending is never working access.").performScrollTo().assertExists()
+        // The core's reason is the authority and is shown verbatim.
+        compose.onNodeWithText("Granted on this phone; the peer has not acknowledged delivery").performScrollTo().assertExists()
+        compose.onNodeWithText("From a capability recorded on this phone").performScrollTo().assertExists()
+        // Pending is exactly one chip, and it is not the effective chip.
+        compose.onAllNodesWithText("Pending").assertCountEquals(1)
+        compose.onNodeWithText("Available").assertDoesNotExist()
+        compose.onNodeWithText("EFFECTIVE").assertDoesNotExist()
+        // A pending send is not a working send: no send button, no attempt copy.
+        compose.onNodeWithText("Send a file").assertDoesNotExist()
+        compose.onNodeWithText("Sending is not available for this device in the current core snapshot. The reason above is the core's own fact, not a client guess.").performScrollTo().assertExists()
+    }
+
+    @Test fun forgetAsksForConfirmationAndShowsTheCoreReceipt() {
+        val peer = CoreDevice("peer-key", "Stored laptop", null, null,
+            "Stored facts only, not remote acknowledgment.", false, false,
+            relationship = CoreRelationship.PAIRED)
+        val core = DeviceCore(CoreStatus(identityLoaded = true, fingerprint = "12345678",
+            engineLinked = true, devices = listOf(peer)), mapOf("Stored laptop" to policyOf(peer)))
+        compose.setContent { TunlionTheme { TunlionApp(core, false, {}, {}, {}) } }
+        compose.onNodeWithText("Stored laptop").performClick()
+        compose.onNodeWithText("Forget this device").performScrollTo().performClick()
+        // Nothing is called before the person confirms.
+        assertNull("Forget must not run before confirmation", core.forgotten)
+        compose.onNodeWithText("Forget Stored laptop?").assertExists()
+        compose.onNodeWithText("This phone removes the stored device record and writes a key block that refuses the old device key. The device is not contacted and nothing is removed on it. This cannot be undone from this phone.").assertExists()
+        compose.onNodeWithText("Forget").performClick()
+        compose.waitForIdle()
+        assertEquals("Stored laptop", core.forgotten)
+        compose.onNodeWithText("Forgotten on this phone.").performScrollTo().assertExists()
+        compose.onNodeWithText("The device record was removed from this phone.").performScrollTo().assertExists()
+        compose.onNodeWithText("This phone wrote its own stores only. The device was not contacted and has not acknowledged anything.").performScrollTo().assertExists()
+        compose.onNodeWithText("Lift the key block for Stored laptop").performScrollTo().assertExists()
+    }
+
+    @Test fun cutOffConfirmationNamesTheKeptRecordAndDoesNotCallForget() {
+        val peer = CoreDevice("peer-key", "Rented phone", null, null,
+            "Stored facts only, not remote acknowledgment.", false, false,
+            relationship = CoreRelationship.FLEET)
+        val core = DeviceCore(CoreStatus(identityLoaded = true, fingerprint = "12345678",
+            engineLinked = true, devices = listOf(peer)), mapOf("Rented phone" to policyOf(peer)))
+        compose.setContent { TunlionTheme { TunlionApp(core, false, {}, {}, {}) } }
+        compose.onNodeWithText("Rented phone").performClick()
+        compose.onNodeWithText("Cut this device off").performScrollTo().performClick()
+        assertNull(core.forgotten)
+        compose.onNodeWithText("Cut off Rented phone?").assertExists()
+        compose.onNodeWithText("This phone keeps the record and marks the device revoked. The device is refused when it next checks in. An active session is not ended by this call.").assertExists()
+        compose.onNodeWithText("Cut off").performClick()
+        compose.waitForIdle()
+        assertEquals("Rented phone", core.cutOff)
+        assertNull("Cut off must not use the forget call", core.forgotten)
+        compose.onNodeWithText("Cut off on this phone.").performScrollTo().assertExists()
+        compose.onNodeWithText("The device record was kept on this phone and marked revoked.").performScrollTo().assertExists()
     }
 
     @Test fun effectiveCoreActionIsRenderedOnlyWhenCoreReportsIt() {
@@ -223,10 +303,14 @@ class DeviceAuthorityUiTest {
     }
 }
 
-private class SnapshotCore(private val snapshot: CoreStatus) : TunlionCore {
-    override fun status() = snapshot
-    override suspend fun refresh() = snapshot
-    private fun unsupported(): Nothing = error("This UI test must not call a core operation")
+/**
+ * The UI tests never invent core facts: every operation they do not exercise
+ * fails loudly. Policy and receipts come from the test fixture below.
+ */
+private abstract class FakeCore : TunlionCore {
+    abstract override fun status(): CoreStatus
+    override suspend fun refresh() = status()
+    protected fun unsupported(): Nothing = error("This UI test must not call a core operation")
     override suspend fun prepareIdentity(): String = unsupported()
     override suspend fun confirmIdentity(phrase: String): CoreResult = unsupported()
     override fun discardIdentity() = Unit
@@ -236,25 +320,87 @@ private class SnapshotCore(private val snapshot: CoreStatus) : TunlionCore {
     override suspend fun receiveCode(code: String): CoreResult = unsupported()
     override suspend fun previewInvitation(bytes: ByteArray): InvitationPreviewResult = unsupported()
     override suspend fun joinInvitation(bytes: ByteArray, name: String): CoreResult = unsupported()
+    override suspend fun devicePolicy(name: String): CoreDevicePolicyResult = unsupported()
+    override suspend fun forgetDevice(name: String): CoreRemovalResult = unsupported()
+    override suspend fun cutOffDevice(name: String): CoreRemovalResult = unsupported()
+    override suspend fun restoreDevice(name: String): CoreRemovalResult = unsupported()
+    override suspend fun grantCapability(device: String, action: CoreActionKind): CoreCapabilityResult = unsupported()
+    override suspend fun revokeCapability(device: String, action: CoreActionKind): CoreCapabilityResult = unsupported()
     override suspend fun sendFiles(deviceId: String?, files: List<Uri>, onCode: (String) -> Unit): CoreResult = unsupported()
 }
 
+private class SnapshotCore(private val snapshot: CoreStatus) : FakeCore() {
+    override fun status() = snapshot
+    override suspend fun refresh() = snapshot
+    override suspend fun devicePolicy(name: String): CoreDevicePolicyResult {
+        val device = snapshot.devices.firstOrNull { it.name == name }
+            ?: return CoreDevicePolicyResult.Failed(CoreResult.Failure(CoreErrorKind.UNKNOWN_DEVICE, "no known device named '$name'"))
+        return CoreDevicePolicyResult.Loaded(policyOf(device))
+    }
+}
+
+/** A device screen backed by one policy snapshot, recording the typed calls it receives. */
+private class DeviceCore(private val snapshot: CoreStatus, private val policies: Map<String, CoreDevicePolicy>) : FakeCore() {
+    var forgotten: String? = null
+    var cutOff: String? = null
+    var restored: String? = null
+    var revoked: Pair<String, CoreActionKind>? = null
+    var revokeResult: CoreCapabilityResult? = null
+    override fun status() = snapshot
+    override suspend fun refresh() = snapshot
+    override suspend fun devicePolicy(name: String): CoreDevicePolicyResult =
+        policies[name]?.let { CoreDevicePolicyResult.Loaded(it) }
+            ?: CoreDevicePolicyResult.Failed(CoreResult.Failure(CoreErrorKind.UNKNOWN_DEVICE, "no known device named '$name'"))
+    override suspend fun forgetDevice(name: String): CoreRemovalResult {
+        forgotten = name
+        return CoreRemovalResult.Removed(receipt(CoreRemovalMode.FORGET, name))
+    }
+    override suspend fun cutOffDevice(name: String): CoreRemovalResult {
+        cutOff = name
+        return CoreRemovalResult.Removed(receipt(CoreRemovalMode.CUT_OFF, name))
+    }
+    override suspend fun restoreDevice(name: String): CoreRemovalResult {
+        restored = name
+        return CoreRemovalResult.Removed(receipt(CoreRemovalMode.RESTORE, name))
+    }
+    override suspend fun revokeCapability(device: String, action: CoreActionKind): CoreCapabilityResult {
+        revoked = device to action
+        return revokeResult ?: CoreCapabilityResult.Edited(CoreCapabilityReceipt(action, "transfer",
+            CoreCapabilityOutcome.APPLIED, false, null, emptyList()))
+    }
+}
+
+/** The projection the adapter builds from one device's core policy. */
+internal fun policyOf(device: CoreDevice) = CoreDevicePolicy(
+    name = device.name,
+    deviceKey = device.id.takeUnless { it.startsWith("name:") },
+    relationship = device.relationship,
+    expires = null,
+    revoked = device.revoked,
+    enrollment = CoreEnrollment(CoreEnrollmentKind.PAIRED, emptyList(), null),
+    delivery = CoreDelivery(CoreDeliveryKind.NOT_TRACKED, null),
+    actions = device.actions.map {
+        CoreActionPolicy(it.kind, it.state, CorePolicySource.RECORD, it.reason)
+    },
+)
+
+private fun receipt(mode: CoreRemovalMode, name: String) = when (mode) {
+    CoreRemovalMode.FORGET -> CoreRemovalReceipt(mode, name, "device-key", 1_900_000_000L, 2, true,
+        CoreSessionsSummary.ENDS_ON_RECHECK, true, true, emptyList())
+    CoreRemovalMode.CUT_OFF -> CoreRemovalReceipt(mode, name, "device-key", null, 0, false,
+        CoreSessionsSummary.ENDS_ON_RECHECK, true, false, emptyList())
+    CoreRemovalMode.RESTORE -> CoreRemovalReceipt(mode, name, "device-key", null, 0, false,
+        CoreSessionsSummary.NOT_TOUCHED, true, false, emptyList())
+}
+
 /** Returns a fixed core preview and records the exact arrays it is handed. */
-private class InvitationCore(private val result: InvitationPreviewResult) : TunlionCore {
+private class InvitationCore(private val result: InvitationPreviewResult) : FakeCore() {
     var previewCalls = 0
     var previewed: ByteArray? = null
     var joinCalls = 0
     var joined: Pair<ByteArray, String>? = null
     override fun status() = CoreStatus(statusLoaded = true, enrollmentSupported = true)
     override suspend fun refresh() = status()
-    private fun unsupported(): Nothing = error("This UI test must not call a core operation")
-    override suspend fun prepareIdentity(): String = unsupported()
-    override suspend fun confirmIdentity(phrase: String): CoreResult = unsupported()
-    override fun discardIdentity() = Unit
-    override suspend fun start(): CoreResult = unsupported()
-    override suspend fun stop(): CoreResult = unsupported()
-    override suspend fun joinCode(code: String, remember: Boolean): CoreResult = unsupported()
-    override suspend fun receiveCode(code: String): CoreResult = unsupported()
     override suspend fun previewInvitation(bytes: ByteArray): InvitationPreviewResult {
         previewCalls += 1
         previewed = bytes
@@ -265,5 +411,4 @@ private class InvitationCore(private val result: InvitationPreviewResult) : Tunl
         joined = bytes to name
         return CoreResult.Success
     }
-    override suspend fun sendFiles(deviceId: String?, files: List<Uri>, onCode: (String) -> Unit): CoreResult = unsupported()
 }

@@ -362,9 +362,11 @@ mod tests {
     #[test]
     fn lifecycle_calls_cross_the_boundary_without_network_work() {
         let core = session();
+        // This branch links the invitation module, and the status is still a
+        // typed read of the core, not a constant the binding assumes.
         let status = core.enrollment_status();
-        assert_eq!(status.state, crate::EnrollmentSupport::Unsupported);
-        assert!(status.reason.is_some());
+        assert_eq!(status.state, crate::EnrollmentSupport::Supported);
+        assert_eq!(status.reason, None);
         assert!(matches!(
             core.device_policy("ghost".to_string()),
             Err(CoreError::Usage(_))
