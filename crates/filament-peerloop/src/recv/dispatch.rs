@@ -214,6 +214,65 @@ pub fn fleet_presence_allowed(is_fleet_channel: bool) -> bool {
     cfg!(feature = "fleet") && is_fleet_channel
 }
 
+/// What the receive dispatch does with a transport-offer from a peer whose
+/// pending (if any) is decided by `linked_fleet_offer_action`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkedFleetOffer {
+    /// A pending already exists for this peer: the offer feeds it. A repeat
+    /// offer is a no-op there once the race runs, so nothing is armed twice.
+    Feed,
+    /// Arm one fleet pending for this offer and feed it. Our sid is the
+    /// lower one, so we are the end the fleet adoption arm elects to dial.
+    ArmDial,
+    /// Arm one fleet pending for this offer and feed it, as the answer to
+    /// the peer's dial. Our sid is the higher one: we never dial this peer
+    /// on presence, only reply to the offer it already sent, so the two ends
+    /// still meet on the peer's single attempt and cannot glare.
+    ArmAnswer,
+    /// Not the linked-fleet case: keep buffering, as before.
+    Buffer,
+}
+
+/// A re-dial transport-offer arrived from a fleet sibling we already hold a
+/// link to (typically the WebRTC fallback), with no direct pending here. The
+/// sibling keeps re-offering on the fleet channel, and before this nothing
+/// ever armed a pending to consume it: it was buffered forever and the
+/// direct path, which alone carries the fleet-hello channel binding, never
+/// formed.
+///
+/// Arm only when every fact holds: a link exists, no pending exists, the
+/// offer names a meeting place (`ch`) that is exactly this fleet's channel,
+/// and the link is fleet-shaped (`recv::fleet::shaped_link`). A `ch`-less
+/// unicast offer and an offer for any other channel keep the old behavior.
+pub fn linked_fleet_offer_action(
+    has_link: bool,
+    has_pending: bool,
+    offer_ch: Option<&str>,
+    fleet_ch: Option<&str>,
+    link_is_fleet_shaped: bool,
+    my_id: &str,
+    pid: &str,
+) -> LinkedFleetOffer {
+    if has_pending {
+        return LinkedFleetOffer::Feed;
+    }
+    if !has_link || !link_is_fleet_shaped {
+        return LinkedFleetOffer::Buffer;
+    }
+    let on_fleet_channel = match (offer_ch, fleet_ch) {
+        (Some(offer), Some(fleet)) => !offer.is_empty() && offer == fleet,
+        _ => false,
+    };
+    if !on_fleet_channel {
+        return LinkedFleetOffer::Buffer;
+    }
+    if my_id < pid {
+        LinkedFleetOffer::ArmDial
+    } else {
+        LinkedFleetOffer::ArmAnswer
+    }
+}
+
 /// The settle timeout reason, shared by the expiry deny and the client.
 pub fn settle_timeout_reason(ms: u64) -> String {
     format!("identity not proven within {ms} ms; retry")
@@ -4854,6 +4913,43 @@ async fn recv_run(
                                     "fleet: answering a one-shot dialer's transport-offer from {from}"
                                 ));
                                 conn.start_direct_fleet(&from, &rv).await;
+                            }
+                        }
+                        // A daemon sibling re-dialing on our FLEET channel while
+                        // we already hold a link to it (the WebRTC fallback).
+                        // Neither branch above matches it (its offer names the
+                        // fleet channel and the link carries no pair secret), so
+                        // its offers were buffered forever and the direct path
+                        // never armed. Arm exactly one fleet pending for this
+                        // offer when the link is fleet-shaped; the offer is fed
+                        // into it just below. A repeat offer then finds the
+                        // pending and feeds it instead of arming another.
+                        if !conn.direct_pending.contains_key(&from) && cfg!(feature = "fleet") {
+                            if let Some(rv) = ports.identity.fleet_rv() {
+                                let fleet_ch = host.channel_of(&rv);
+                                let action = linked_fleet_offer_action(
+                                    conn.links.contains_key(&from),
+                                    conn.direct_pending.contains_key(&from),
+                                    data["ch"].as_str(),
+                                    Some(fleet_ch.as_str()),
+                                    crate::recv::fleet::shaped_link(&conn, &from, Some(rv.as_str())),
+                                    conn.my_id.as_str(),
+                                    from.as_str(),
+                                );
+                                if matches!(
+                                    action,
+                                    LinkedFleetOffer::ArmDial | LinkedFleetOffer::ArmAnswer
+                                ) {
+                                    log.debug(&format!(
+                                        "fleet: arming direct for linked sibling {from}'s transport-offer ({})",
+                                        if action == LinkedFleetOffer::ArmDial {
+                                            "dialer"
+                                        } else {
+                                            "answer"
+                                        }
+                                    ));
+                                    conn.start_direct_fleet(&from, &rv).await;
+                                }
                             }
                         }
                         if conn.direct_pending.contains_key(&from) {
@@ -11129,6 +11225,140 @@ mod expiry_redrive_tests {
         assert!(policy_decline_msg("x", Some("unverified peer"))
             .get("reason")
             .is_none());
+    }
+}
+
+/// The linked-fleet re-dial offer decision (`linked_fleet_offer_action`).
+/// Live shape: charlie held an installed WebRTC link to bravo, bravo
+/// re-offered on the fleet channel once a second, and every offer was
+/// buffered with "no pending yet", so the direct path never armed.
+#[cfg(test)]
+mod linked_fleet_offer_tests {
+    use super::{linked_fleet_offer_action as decide, LinkedFleetOffer};
+
+    const FLEET: &str = "chan-fleet";
+    const LOW: &str = "sid-aaa";
+    const HIGH: &str = "sid-zzz";
+
+    /// A fleet-channel offer from a linked, fleet-shaped sibling with no
+    /// pending arms exactly one pending, and which role it takes follows the
+    /// same sid comparison as the fleet adoption arm: the lower sid is the
+    /// dialer, the higher sid only answers the offer it was sent.
+    #[test]
+    fn a_fleet_offer_on_a_shaped_link_with_no_pending_arms_one() {
+        // We are the higher sid: the peer is the elected dialer, we answer.
+        assert_eq!(
+            decide(true, false, Some(FLEET), Some(FLEET), true, HIGH, LOW),
+            LinkedFleetOffer::ArmAnswer
+        );
+        // We are the lower sid: we are the elected dialer.
+        assert_eq!(
+            decide(true, false, Some(FLEET), Some(FLEET), true, LOW, HIGH),
+            LinkedFleetOffer::ArmDial
+        );
+    }
+
+    /// Once that pending exists, the identical offer (the sibling re-emits
+    /// every 1.2 s) is fed into it and never arms a second one, from either
+    /// role and whatever else is true of the link.
+    #[test]
+    fn a_repeat_offer_feeds_the_existing_pending() {
+        for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
+            for has_link in [false, true] {
+                for shaped in [false, true] {
+                    for ch in [None, Some(FLEET), Some("chan-pair")] {
+                        assert_eq!(
+                            decide(has_link, true, ch, Some(FLEET), shaped, me, peer),
+                            LinkedFleetOffer::Feed,
+                            "a pending peer was re-armed (link={has_link} shaped={shaped} ch={ch:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Everything that is not the linked-fleet case keeps buffering: a
+    /// `ch`-less unicast offer, an offer on another channel, an empty `ch`,
+    /// no fleet channel of our own, no link, or a link that is not
+    /// fleet-shaped (a paired or trusted link).
+    #[test]
+    fn every_other_offer_still_buffers() {
+        for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
+            // ch-less unicast offer on a shaped link.
+            assert_eq!(
+                decide(true, false, None, Some(FLEET), true, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+            // Another meeting place (a pair channel) on a shaped link.
+            assert_eq!(
+                decide(true, false, Some("chan-pair"), Some(FLEET), true, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+            // An empty `ch` never matches, even against an empty fleet channel.
+            assert_eq!(
+                decide(true, false, Some(""), Some(""), true, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+            // We are in no fleet.
+            assert_eq!(
+                decide(true, false, Some(FLEET), None, true, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+            // No link to the peer: not this case (the one-shot and
+            // known-device arms own it).
+            assert_eq!(
+                decide(false, false, Some(FLEET), Some(FLEET), true, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+            assert_eq!(
+                decide(false, false, Some(FLEET), Some(FLEET), false, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+            // A link that is not fleet-shaped.
+            assert_eq!(
+                decide(true, false, Some(FLEET), Some(FLEET), false, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+        }
+    }
+
+    /// The whole input space, so no combination slips between the rules:
+    /// arm iff link && !pending && ch == fleet channel (non-empty) && shaped,
+    /// feed iff pending, buffer otherwise; the arm's role is the sid order.
+    #[test]
+    fn the_decision_is_exhaustive() {
+        let chans = [None, Some(""), Some(FLEET), Some("chan-pair")];
+        let fleets = [None, Some(FLEET)];
+        for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
+            for has_link in [false, true] {
+                for has_pending in [false, true] {
+                    for shaped in [false, true] {
+                        for ch in chans {
+                            for fleet in fleets {
+                                let got = decide(has_link, has_pending, ch, fleet, shaped, me, peer);
+                                let on_fleet = ch.is_some_and(|c| !c.is_empty()) && ch == fleet;
+                                let want = if has_pending {
+                                    LinkedFleetOffer::Feed
+                                } else if has_link && shaped && on_fleet {
+                                    if me < peer {
+                                        LinkedFleetOffer::ArmDial
+                                    } else {
+                                        LinkedFleetOffer::ArmAnswer
+                                    }
+                                } else {
+                                    LinkedFleetOffer::Buffer
+                                };
+                                assert_eq!(
+                                    got, want,
+                                    "link={has_link} pending={has_pending} shaped={shaped} ch={ch:?} fleet={fleet:?} me={me}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
