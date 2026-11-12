@@ -1435,19 +1435,17 @@ implement them behaves exactly as before, only slower.
 - B-SIDE ENFORCEMENT, as implemented (the security property; A's cleanup
   above is hygiene, not enforcement). Revocation happens in B's store and
   A may never learn of it, so the guarantee lives on B. What ends an
-  established `shell --ssh` session today:
+  established `shell --ssh` session:
   - Forgetting A, revoking A's device certificate, and A's delegated
     deadline passing all close it. B's L2 revoke ticker calls
     `live_session_cut` for every daemon-served stream, including the one
     `forward --stdio B:22` opens, and that check covers exactly these
-    three: forget, device-certificate revocation and the delegated
-    deadline.
-  - Revoking A's shell grant (`tunlion revoke <A> shell`) does NOT end an
-    established ssh stream. The ticker does not consult the shell grant
-    or denied capabilities. Shell revoke stops new certificate issuance
-    and new bootstrap, and live PTY and exec sessions end through their
-    own rechecks, but a running ssh stream continues until it closes or
-    one of the three cuts above applies.
+    three.
+  - Revoking A's shell grant (`tunlion revoke <A> shell`) also closes it:
+    the same ticker calls `live_capability_cut` for the stream's shell
+    capability, so an established ssh stream ends once B no longer grants
+    A shell.
+  - Live PTY and exec sessions end through their own rechecks.
   - `shell --ssh` prefers L3, so this L2 ticker governs only the tunnel
     fallback.
   The MULTIPLEXING and cert-cache bullets in this section describe a
