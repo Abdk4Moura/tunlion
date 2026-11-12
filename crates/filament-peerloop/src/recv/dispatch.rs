@@ -4868,7 +4868,13 @@ async fn recv_run(
                         } else {
                             conn.buffered_offers.insert(
                                 from.clone(),
-                                (cands, srflx, peer_server_public, peer_proto),
+                                (
+                                    cands,
+                                    srflx,
+                                    peer_server_public,
+                                    peer_proto,
+                                    data["ch"].as_str().map(String::from),
+                                ),
                             );
                             log.debug(&format!(
                                 "buffering re-dial transport-offer from {from} (no pending yet)"

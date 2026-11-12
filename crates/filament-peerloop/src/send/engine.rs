@@ -865,8 +865,9 @@ async fn drive_over(
                     if conn.direct_pending.contains_key(&from) {
                         conn.on_transport_offer(&from, cands, srflx, public, proto);
                     } else {
+                        let ch = data["ch"].as_str().map(String::from);
                         conn.buffered_offers
-                            .insert(from.clone(), (cands, srflx, public, proto));
+                            .insert(from.clone(), (cands, srflx, public, proto, ch));
                     }
                     continue;
                 }
