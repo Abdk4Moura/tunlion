@@ -15,11 +15,14 @@ network stack. `now` is required in the input; there is no implicit
 
 ## Scope
 
-This is a de-risking slice. It moves the pure allow/deny rule onto code the
-browser can compile. It does **not** end the browser's pairwise-only trust
-model by itself: the frontend is not wired to this module yet, and the browser
-still has to supply the surrounding identity, revocation, expiry and fleet
-facts from its own transport path.
+This crate is the browser's only transfer-admission decision. The frontend
+translates its real link facts into the input below and calls
+`admitTransfer`; it keeps no allow rule of its own. The browser still has no
+device certificate and no owner certificate: facts it cannot establish
+(revocation, certificate expiry, same-owner, invitation ceiling) stay
+unestablished (false or null on the wire), and the core decides without them. A
+decision that cannot reach this core is an `unsupported` denial, never an
+allow.
 
 ## Input
 
@@ -78,29 +81,33 @@ function the wasm export calls:
 cargo test -p tunlion-policy-wasm
 ```
 
-A future browser test should fetch that JSON file, call
-`admitTransfer(JSON.stringify(case.input))`, and compare the parsed result with
-`case.expected`.
+The browser gate `frontend/tests/policy-wire.spec.cjs` reads that JSON file,
+calls the committed module's `admitTransfer(JSON.stringify(case.input))`, and
+compares the parsed result with `case.expected` in a real Chromium tab.
 
-## Intended next wiring (not done here)
+## Browser wiring
 
-1. Build the module for the browser:
-   `wasm-pack build crates/tunlion-policy-wasm --target web --out-dir pkg`
-   (or `cargo build -p tunlion-policy-wasm --target wasm32-unknown-unknown`
-   for a compile-only check). The generated `pkg/` directory is not committed.
-2. In the frontend transfer-admission path, replace the local boolean with a
-   call to `admitTransfer`, passing the capability outcome, revocation/expiry,
-   binding, identity state, fleet facts and a caller-supplied `now`.
-3. Run the shared vectors in the browser harness before changing any default.
-4. Only then evaluate the larger question — browser pairwise-only trust — as a
-   separate change. This slice does not answer it.
+`frontend/src/lib/policy.js` is the adapter:
+
+- `toAdmitInput(facts)` builds the complete DTO. There are no defaults on the
+  wire; a missing `now` never calls the core.
+- `admitTransfer(input)` is the raw JSON surface used by the shared-vector
+  gate. It calls the wasm export of the same name.
+- `decideTransfer(facts)` calls the core with an explicit `now` and maps its
+  answer to allow/deny. Core errors become an `unsupported` denial.
+
+`frontend/src/lib/policyCore.js` loads the committed module; the artifact is
+produced by `build-wasm.sh` in CI and committed under `frontend/src/policy/`
+from that run's artifact (see `.github/workflows/policy-wasm.yml`). It is not
+generated in this change.
 
 ## Build commands (for CI or a remote worker)
 
 ```sh
 cargo test -p filament-policy -p filament-cap -p tunlion-policy-wasm
-cargo build -p tunlion-policy-wasm --target wasm32-unknown-unknown
+bash crates/tunlion-policy-wasm/build-wasm.sh
 ```
 
-The second command needs the `wasm32-unknown-unknown` target installed. No
-generated wasm is checked in.
+The second command needs the `wasm32-unknown-unknown` target installed. The
+generated wasm is committed from the CI artifact after review; see
+`frontend/src/policy/README.md`.

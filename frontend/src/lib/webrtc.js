@@ -406,6 +406,16 @@ export class PeerLink {
     this.peerUid = peerUid || null
     this.stores = stores || { partials: new Map(), outgoing: new Map() }
 
+    // Trust facts for THIS link, deliberately separate:
+    //   _proven      a pair-proof matched a stored device secret (a remembered
+    //                relationship);
+    //   _codeAuthed  a one-time code ceremony authenticated this session only.
+    // A code authenticates the session, it does not make the device a known
+    // one, so the state ping reports only _proven.
+    this._proven = false
+    this._codeAuthed = false
+    this._trustReported = false
+
     // Perfect negotiation (docs/resilience.md RED-1): exactly one peer per pair
     // is "impolite" and owns the offer; the polite peer yields on a glare.
     this.polite = polite
@@ -1287,7 +1297,7 @@ export class PeerLink {
     }
     this._control({
       type: CTRL.STATE, v: 1, transfers,
-      trusted: !!this._verified, // set by the hook on proof-ok
+      trusted: !!this._proven, // a pair-proof of a stored device, never code auth
       away: typeof document !== 'undefined' && document.visibilityState === 'hidden',
     })
   }

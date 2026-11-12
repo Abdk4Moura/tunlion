@@ -14,13 +14,15 @@ import { api } from './api.js'
 import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
 import * as linkdiag from './linkdiag.js'
 import { log } from './log.js'
-import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRenameResult, uniqueName, channelOf, proofFor } from './devices.js'
+import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRenameResult, uniqueName, deviceCaps, channelOf, proofFor } from './devices.js'
+import { decideTransfer, admitTransfer } from './policy.js'
 import { mintWords, mintCreatedNameplate } from './words.js'
 import { loadDeviceName, saveDeviceName, loadOwnerToken, tabUid, currentGeneration, rotateGeneration } from './identity.js'
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
 // APPLICATION/resilience-manager — pure recovery decisions (Phase 2).
 import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink, linkIsLive, reconcileDigest } from '../net/app/recovery.js'
 import { shouldAutoAccept, offersCoveredNow } from '../net/app/accept.js'
+import { linkPolicyFacts } from '../net/app/policyFacts.js'
 import { codeStatusAfterTransfer } from '../net/app/codeStatus.js'
 import { localHelperEnabled } from '../net/app/localHelper.js'
 import { pakePartnerFor } from '../net/app/pakePartner.js'
@@ -54,6 +56,22 @@ function beaconSessionClose(gen, token) {
   try {
     fetch(api('/api/session/close'), { method: 'POST', body, keepalive: true }).catch(() => {})
   } catch {}
+}
+
+// Re-check the offers a fresh proof or code ceremony now covers, through the
+// shared policy, and accept only the ids it allows. The offer may arrive before
+// the proof/ceremony finishes, so this runs in both directions.
+async function acceptCoveredByPolicy(link, facts) {
+  if (!link) return
+  try {
+    const ids = await offersCoveredNow(link.transfers.values(), facts)
+    for (const tid of ids) {
+      const t = link.transfers.get(tid)
+      if (t && t.status === 'offered' && !link._closed) link.acceptTransfer(tid)
+    }
+  } catch {
+    // A policy failure accepts nothing; the offers wait for a click.
+  }
 }
 
 export function useTunlion() {
@@ -455,13 +473,27 @@ export function useTunlion() {
         onStatus: (status) => updatePeer(id, { status }),
         onTransfer: (t) => {
           upsertTransfer(t)
-          // Receive with code: typing the code was the consent, as on the CLI
-          // (`tunlion receive <code>` never asks). Accept the authenticated
-          // sender's offer instead of leaving it waiting on a second click
-          // while the sender times out.
-          if (shouldAutoAccept({ ...t, byCode: ephemeralAuthRef.current.has(id), provenKnown: !!link._verified })) {
-            queueMicrotask(() => link.acceptTransfer(t.id))
-          }
+          // Receive with code and a remembered device: the human consented
+          // (typed the code, or remembered the device), and the decision is the
+          // shared core's. The browser supplies only facts it holds; the core
+          // can still deny (cap ceiling, missing consent, explicit deny).
+          if (t.direction !== 'receive' || t.status !== 'offered') return
+          const recordId = provenRef.current.get(id) || expectedSecretRef.current.get(id)?.id || null
+          const facts = linkPolicyFacts({
+            transfer: t,
+            byCode: !!link._codeAuthed,
+            proven: !!link._proven,
+            caps: recordId ? deviceCaps(recordId) : null,
+            now: Math.floor(Date.now() / 1000),
+          })
+          shouldAutoAccept(facts)
+            .then((accept) => {
+              // Re-read the live transfer: a user may have declined while the
+              // core was deciding. Only an offer still awaiting a decision moves.
+              const live = link.transfers.get(t.id)
+              if (accept && live && live.status === 'offered' && !link._closed) link.acceptTransfer(t.id)
+            })
+            .catch(() => {}) // a policy failure leaves the offer waiting for a click
         },
         onRoute: (route) => updatePeer(id, { route }),
         // web-shell: the peer announced whether it offers a terminal, surfaces
@@ -537,12 +569,18 @@ export function useTunlion() {
               if ((await proofFor(d.secret, theirUid, theirUid, uidRef.current, fps.mine, fps.theirs)) === mac) {
                 updatePeer(id, { verified: d.name, knownId: d.id })
                 provenRef.current.set(id, d.id)
-                link._verified = true // C30 ph3: the link's state ping carries this
+                link._proven = true // C30 ph3: the link's state ping carries this
                 tel('proof-ok', { peer: id.slice(-6) })
                 link.sendPairProofAck(true)
                 // The proof is checked asynchronously and a sender's offer can
                 // land first: accept the offers this proof now covers.
-                for (const tid of offersCoveredNow(link.transfers.values(), { provenKnown: true })) link.acceptTransfer(tid)
+                await acceptCoveredByPolicy(link, {
+                  proven: true,
+                  relationship: 'remembered',
+                  caps: deviceCaps(d.id),
+                  consent: true,
+                  now: Math.floor(Date.now() / 1000),
+                })
                 return
               }
             } catch {}
@@ -573,6 +611,7 @@ export function useTunlion() {
           if (!ok) {
             expectedSecretRef.current.delete(id)
             provenRef.current.delete(id)
+            link._proven = false
             updatePeer(id, { verified: null, known: null, knownId: null, oneSided: false }) // drop the badge too
             tel('proof-rejected', { peer: id.slice(-6) })
           }
@@ -673,6 +712,13 @@ export function useTunlion() {
           const e = s?.io?.engine
           const t = e?.transport
           return { id: s?.id, connected: !!s?.connected, suspended: !!sigRef.current?.suspended, engine: e?.readyState, transport: t?.name, tstate: t?.readyState, polling: t?._polling, writable: t?.writable, buffered: e?.writeBuffer?.length }
+        }
+        // The shared transfer-policy surface, so the browser gate drives the
+        // real built adapter and the committed wasm, not a copy in the spec.
+        window.__tunlionTestPolicy = {
+          admit: (json) => admitTransfer(json),
+          decide: (facts) => decideTransfer(facts),
+          autoAccept: (facts) => shouldAutoAccept(facts),
         }
       }
     } catch {}
@@ -1103,18 +1149,25 @@ export function useTunlion() {
       const name = (peerId && linksRef.current.get(peerId)?.name) || 'device'
       // L1-a EPHEMERAL transfer-auth (receiveWithCode): the SAME ceremony runs,
       // but the agreed secret is DISCARDED, it only authenticated the link
-      // (mutual auth, MITM-detectable). NO device is remembered. The peer is now
-      // trusted for THIS session's incoming transfer; mark the link verified so
-      // the existing transfer UI treats it as an authenticated sender.
+      // (mutual auth, MITM-detectable). NO device is remembered. The peer is
+      // authenticated for THIS session's incoming transfer only.
       if (pendingPakeRef.current?.ephemeral) {
         if (peerId) {
           const link = linksRef.current.get(peerId)
-          if (link) link._verified = true
-          updatePeer(peerId, { verified: name })
+          // The code authenticated THIS session only. It is not a pair-proof,
+          // so it must not make the device a remembered/verified one.
+          if (link) link._codeAuthed = true
+          updatePeer(peerId, { codeAuthed: true })
           ephemeralAuthRef.current.add(peerId)
           // The sender may have offered before this ceremony finished on our
           // side: accept what the code now covers instead of leaving it waiting.
-          if (link) for (const tid of offersCoveredNow(link.transfers.values(), { byCode: true })) link.acceptTransfer(tid)
+          if (link) {
+            void acceptCoveredByPolicy(link, {
+              byCode: true,
+              consent: true,
+              now: Math.floor(Date.now() / 1000),
+            })
+          }
         }
         tel('pake-transfer-authed', { peer: String(peerId).slice(-6) })
         setPairStatus('connected') // authenticated; ready to receive (secret discarded)

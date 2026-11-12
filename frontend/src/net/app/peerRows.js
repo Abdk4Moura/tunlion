@@ -6,7 +6,9 @@
 // session. Showing both as two identical rows is wrong (it is one device) and
 // harmful (the copy that is not part of this browser's session cannot take a
 // file from it). Keep the copy this browser has a proven relationship with,
-// then the one whose link is ready, then the newest.
+// then the one whose link is ready, then the newest. Only `verified` (a
+// pair-proof of a stored record) ranks here; `codeAuthed` is a one-time
+// ceremony for this session and must never stand in for a remembered device.
 const rank = (p) => (p.verified ? 4 : 0) + (p.status === 'ready' ? 2 : p.status === 'connecting' ? 1 : 0)
 
 export function oneRowPerDevice(peers) {
