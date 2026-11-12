@@ -26,6 +26,17 @@ class DeviceAuthorityUiTest {
         }
     }
 
+    /** The same entry point, but the caller supplies the fake core (policies, receipts). */
+    private fun open(core: TunlionCore) {
+        compose.setContent { TunlionTheme { TunlionApp(core, false, {}, {}, {}) } }
+    }
+
+    /** A loaded device list: an unloaded snapshot shows the opening spinner instead. */
+    private fun deviceStatus(vararg devices: CoreDevice) = CoreStatus(
+        statusLoaded = true, identityLoaded = true, fingerprint = "12345678",
+        engineLinked = true, devices = devices.toList(),
+    )
+
     @Test fun enrollmentCannotSilentlyUseLegacyPairing() {
         open(CoreStatus(identityLoaded = true, fingerprint = "12345678", engineLinked = true))
         compose.onNodeWithText("Add device").performClick()
@@ -160,7 +171,10 @@ class DeviceAuthorityUiTest {
         compose.onNodeWithText("Stored laptop").performClick()
         compose.onNodeWithText("No action is confirmed effective by this snapshot.").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("UNKNOWN").assertExists()
-        compose.onNodeWithText("Send files to this device").performScrollTo().assertIsDisplayed()
+        // The action row is tagged: the same label also appears in the revoke
+        // list, and a text-only selector would be ambiguous.
+        compose.onNodeWithTag("policy-SEND").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Send files to this device").assertExists()
         compose.onNodeWithText("Send a file").assertDoesNotExist()
         compose.onNodeWithText("Availability unknown").assertExists()
         compose.onNodeWithText("Try sending a file").performScrollTo().performClick()
@@ -209,14 +223,8 @@ class DeviceAuthorityUiTest {
             actions = listOf(CoreActionPolicy(CoreActionKind.SEND, CoreAccessState.PENDING,
                 CorePolicySource.GRANT_STORE, "Granted on this phone; the peer has not acknowledged delivery")),
         )
-        compose.setContent {
-            TunlionTheme {
-                TunlionApp(DeviceCore(CoreStatus(identityLoaded = true, fingerprint = "12345678",
-                    engineLinked = true, devices = listOf(peer)), mapOf("Stored laptop" to policy)),
-                    false, {}, {}, {})
-            }
-        }
-        compose.onNodeWithText("Stored laptop").performClick()
+        open(DeviceCore(deviceStatus(peer), mapOf("Stored laptop" to policy)))
+        compose.onNodeWithText("Stored laptop").performScrollTo().performClick()
         compose.onNodeWithText("PENDING").performScrollTo().assertExists()
         compose.onNodeWithText("Waiting for delivery: a grant or invitation ceiling is recorded on this phone, but delivery and live access are not confirmed. Pending is never working access.").performScrollTo().assertExists()
         // The core's reason is the authority and is shown verbatim.
@@ -235,10 +243,9 @@ class DeviceAuthorityUiTest {
         val peer = CoreDevice("peer-key", "Stored laptop", null, null,
             "Stored facts only, not remote acknowledgment.", false, false,
             relationship = CoreRelationship.PAIRED)
-        val core = DeviceCore(CoreStatus(identityLoaded = true, fingerprint = "12345678",
-            engineLinked = true, devices = listOf(peer)), mapOf("Stored laptop" to policyOf(peer)))
-        compose.setContent { TunlionTheme { TunlionApp(core, false, {}, {}, {}) } }
-        compose.onNodeWithText("Stored laptop").performClick()
+        val core = DeviceCore(deviceStatus(peer), mapOf("Stored laptop" to policyOf(peer)))
+        open(core)
+        compose.onNodeWithText("Stored laptop").performScrollTo().performClick()
         compose.onNodeWithText("Forget this device").performScrollTo().performClick()
         // Nothing is called before the person confirms.
         assertNull("Forget must not run before confirmation", core.forgotten)
@@ -257,10 +264,9 @@ class DeviceAuthorityUiTest {
         val peer = CoreDevice("peer-key", "Rented phone", null, null,
             "Stored facts only, not remote acknowledgment.", false, false,
             relationship = CoreRelationship.FLEET)
-        val core = DeviceCore(CoreStatus(identityLoaded = true, fingerprint = "12345678",
-            engineLinked = true, devices = listOf(peer)), mapOf("Rented phone" to policyOf(peer)))
-        compose.setContent { TunlionTheme { TunlionApp(core, false, {}, {}, {}) } }
-        compose.onNodeWithText("Rented phone").performClick()
+        val core = DeviceCore(deviceStatus(peer), mapOf("Rented phone" to policyOf(peer)))
+        open(core)
+        compose.onNodeWithText("Rented phone").performScrollTo().performClick()
         compose.onNodeWithText("Cut this device off").performScrollTo().performClick()
         assertNull(core.forgotten)
         compose.onNodeWithText("Cut off Rented phone?").assertExists()

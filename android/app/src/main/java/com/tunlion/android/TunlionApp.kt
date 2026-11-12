@@ -20,6 +20,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -816,10 +817,11 @@ private fun DeviceDetails(
             val revocable = actions.filter { it.source != CorePolicySource.PROFILE }
             if (revocable.isEmpty()) SecondaryText("This build's profile serves none of these actions, so there is no capability to revoke here.")
             revocable.forEach { action ->
-                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.fillMaxWidth().testTag("revoke-${action.kind}").padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text(actionLabel(action.kind), fontWeight = FontWeight.Medium)
+                        // The compact name: the access rows above carry the full action sentence.
+                        Text(actionShortLabel(action.kind), fontWeight = FontWeight.Medium)
                         SecondaryText(accessStateChip(action.state) + " · " + policySourceLabel(action.source).lowercase())
                     }
                     OutlinedButton(onClick = { pendingRevoke = action.kind }, enabled = !busy,
@@ -909,7 +911,8 @@ private fun actionGroup(title: String, actions: List<CoreActionPolicy>, note: St
 
 @Composable
 private fun ActionPolicyRow(action: CoreActionPolicy) {
-    Column(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    Column(Modifier.fillMaxWidth().testTag("policy-${action.kind}").padding(vertical = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(actionLabel(action.kind), fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
