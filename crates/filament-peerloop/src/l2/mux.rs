@@ -545,11 +545,44 @@ impl Mux {
     /// broke). The ack is an empty `Some`: `on_frame` maps real empty payloads to
     /// `None`/EOF, so `Some(empty)` never occurs organically and is an unambiguous
     /// marker; replaying it writes zero bytes to the client.
+    ///
+    /// Never parks, like [`Self::on_frame`]: the event loop calls this inline,
+    /// and an awaited send on a full 256-slot pipe (a consumer that stopped
+    /// draining) froze the whole loop. A full pipe resets the stream the same
+    /// way `on_frame` does. An ack only means something for a stream THIS end
+    /// opened, so an ack naming a sid we did not open (the peer's own sid, or
+    /// one we accepted) is ignored: nothing is written and no stream changes.
     pub async fn on_open_ack(&self, sid: u32) {
-        let tx = self.streams.lock().await.get(&sid).map(|s| s.tx.clone());
-        if let Some(tx) = tx {
-            let _ = tx.send(Some(Bytes::new())).await;
+        if !self.opened_here(sid) || self.accepted.lock().await.contains_key(&sid) {
+            hooks::debug(&format!("l2: open-ack for sid {sid:#x} this end did not open, ignored"));
+            return;
         }
+        let tx = self.streams.lock().await.get(&sid).map(|s| s.tx.clone());
+        let Some(tx) = tx else { return };
+        match tx.try_send(Some(Bytes::new())) {
+            Ok(()) => {}
+            // Receiver gone: the stream is already torn down.
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                let _ = self
+                    .transport
+                    .send_control(&json!({
+                        "type": "l2-close",
+                        "sid": sid,
+                        "err": "stream input flooded (consumer stalled)",
+                    }))
+                    .await;
+                self.drop_stream(sid).await;
+            }
+        }
+    }
+
+    /// Was `sid` allocated by THIS end's [`Self::alloc_sid`]? Every sid this end
+    /// opens carries its role bit (`0x4000_0000` iff the transport is the sid
+    /// answerer), and the peer allocates with the opposite bit, so the bit
+    /// names the opener without any per-open record.
+    fn opened_here(&self, sid: u32) -> bool {
+        is_l2_sid(sid) && ((sid & 0x4000_0000 != 0) == self.transport.sid_answerer())
     }
 
     /// Inbound l2-close. `err` set = RST/abort (drop, do NOT deliver clean EOF);
@@ -1620,6 +1653,96 @@ mod tests {
                         .contains("flooded")
             ),
             "reset carries an l2-close naming the flood, got: {controls:?}"
+        );
+    }
+
+    /// The open-ack is delivered from the event loop like a data frame, so it
+    /// must never park on a stalled consumer's full pipe either: it resets the
+    /// stream the way `on_frame` does and returns at once.
+    #[tokio::test]
+    async fn on_open_ack_resets_full_pipe_instead_of_parking() {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        // A sid this end opened: MockTransport is not the sid answerer, and
+        // alloc_sid hands out sids without the answerer bit.
+        let sid = mux.alloc_sid();
+        let _rx = mux.register_stream(sid).await.expect("fresh sid registers");
+        for _ in 0..256 {
+            mux.on_frame(sid, bytes::Bytes::from_static(b"x")).await;
+        }
+        assert!(
+            mux.streams.lock().await.contains_key(&sid),
+            "a full-but-live pipe stays registered"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), mux.on_open_ack(sid))
+            .await
+            .expect("on_open_ack never parks, even on a full pipe");
+        assert!(
+            !mux.streams.lock().await.contains_key(&sid),
+            "a full pipe resets (drops) the stream"
+        );
+        let controls = t.controls.lock().unwrap();
+        assert!(
+            controls.iter().any(|v| v["type"] == "l2-close"
+                && v["sid"].as_u64() == Some(sid as u64)
+                && v["err"].as_str().unwrap_or("").contains("flooded")),
+            "the reset carries an l2-close naming the flood, got: {controls:?}"
+        );
+    }
+
+    /// An ack is the peer answering an open THIS end sent. An ack naming a
+    /// sid this end did not open (one the peer allocated, or one this end
+    /// accepted) must write nothing and leave the stream table unchanged.
+    #[tokio::test]
+    async fn on_open_ack_ignores_a_sid_this_end_did_not_open() {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        // The peer's allocation carries the answerer bit this end lacks.
+        let peer_sid = L2_SID_BASE | 0x4000_0000 | 5;
+        let mut rx = mux.register_stream(peer_sid).await.expect("fresh sid registers");
+        let before = {
+            let mut sids = mux.live_sids().await;
+            sids.sort_unstable();
+            sids
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), mux.on_open_ack(peer_sid))
+            .await
+            .expect("on_open_ack never parks");
+        assert!(
+            rx.try_recv().is_err(),
+            "an ack for a sid this end did not open must deliver nothing"
+        );
+        let after = {
+            let mut sids = mux.live_sids().await;
+            sids.sort_unstable();
+            sids
+        };
+        assert_eq!(before, after, "the stream table is unchanged");
+        assert!(
+            t.controls.lock().unwrap().is_empty(),
+            "an ignored ack sends no control"
+        );
+
+        // A sid with this end's parity that this end ACCEPTED (the peer chose
+        // it) is not ours either.
+        let accepted_sid = L2_SID_BASE | 9;
+        let mut rx2 = mux.register_stream(accepted_sid).await.expect("fresh sid registers");
+        mux.accepted.lock().await.insert(accepted_sid, ());
+        mux.on_open_ack(accepted_sid).await;
+        assert!(
+            rx2.try_recv().is_err(),
+            "an ack for an accepted sid must deliver nothing"
+        );
+        assert!(mux.has_stream(accepted_sid).await, "the accepted stream is untouched");
+
+        // Control: the ack for a sid this end did open is delivered.
+        let ours = mux.alloc_sid();
+        let mut rx3 = mux.register_stream(ours).await.expect("fresh sid registers");
+        mux.on_open_ack(ours).await;
+        assert_eq!(
+            rx3.try_recv().ok(),
+            Some(Some(Bytes::new())),
+            "the ack for our own open is the empty liveness marker"
         );
     }
 
