@@ -232,10 +232,20 @@ const MAX_BUILD_EVENT_BYTES: usize = 256 * 1024;
 const MAX_BUILD_SIGNALS: usize = 64;
 const MAX_BUILD_SIGNAL_BYTES: usize = 256 * 1024;
 /// Terminal-drain tombstones and inbound registrations are bounded. New direct
-/// attempts fail closed when full; a tombstone is never evicted early.
+/// attempts fail closed when full.
 const MAX_RETIRED_ATTEMPTS: usize = 16;
 /// A candidate that never completes is reaped, not left to a detached timer.
 const BUILD_REAP_GRACE: Duration = Duration::from_secs(30);
+/// A retired attempt's readiness producer must be terminal before its drain
+/// barrier is enqueued. That producer can itself hang on a socket that never
+/// answers; waiting forever left 16 tombstones in place and every later direct
+/// attempt was refused ("retirement drain capacity full"), which turns one
+/// stuck build into a permanent direct-path outage. Abort and drain after this.
+const RETIRED_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+/// Even if the drain event is lost, a tombstone older than this cannot still be
+/// protecting a live producer: the budget above already aborted it. Reaping at
+/// 2x the budget keeps the cap from ever wedging the path permanently.
+const RETIRED_TOMBSTONE_TTL: Duration = Duration::from_secs(60);
 /// Direct attempts that expired at the same time are handed to the caller one
 /// per call, not as a batch. The fallback caller awaits a full WebRTC establish
 /// for each entry, and that establish can take up to the ICE config budget plus
@@ -4476,8 +4486,18 @@ impl Conn {
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
                     // Normal return, early return, panic/JoinError: all terminal
-                    // before the barrier is enqueued.
-                    let _ = handle.await;
+                    // before the barrier is enqueued. A producer that never
+                    // returns is aborted after the budget so one hung build
+                    // cannot fill the tombstone cap and refuse every later
+                    // direct attempt.
+                    let mut handle = handle;
+                    if tokio::time::timeout(RETIRED_DRAIN_BUDGET, &mut handle)
+                        .await
+                        .is_err()
+                    {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
                     let _ = tx.send(Ev::AttemptDrained(attempt));
                 });
             }
@@ -5261,10 +5281,18 @@ impl Conn {
             Instant::now() + direct::DIRECT_BUDGET
         };
         if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
-            self.log.debug(&format!(
-                "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
-            ));
-            return;
+            // Liveness backstop: a tombstone older than the abort budget cannot
+            // still be protecting a live producer. If its drain event was lost,
+            // reap it rather than leaving the direct path permanently refused.
+            let now = Instant::now();
+            self.retired_attempts
+                .retain(|_, retired| now.duration_since(retired.at) < RETIRED_TOMBSTONE_TTL);
+            if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
+                self.log.debug(&format!(
+                    "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
+                ));
+                return;
+            }
         }
         self.next_gen += 1;
         let auth = match intent {
