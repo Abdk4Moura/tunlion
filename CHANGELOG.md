@@ -22,10 +22,9 @@ release build failed and nothing was published under it.
   the browser all agree on who may do what.
 - The browser asks the same shared core whether to accept a transfer. If that
   check is missing or returns something unexpected, the transfer is refused.
-- Android app: the phone has its own identity, sends and receives with a code,
-  shows each device's access (including access that is still pending), and can
-  remove a device or take back a single permission, all through the shared
-  core.
+- Android app: the phone loads the shared core directly for its identity and
+  for sending and receiving with a code. Showing each device's access and
+  removing devices from the phone arrive with the device lifecycle update.
 - Invitations are previewed, created, joined and withdrawn through one shared
   set of rules, so an expiry date and a permission limit mean the same thing
   on every device.
