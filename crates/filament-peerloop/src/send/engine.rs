@@ -729,7 +729,11 @@ async fn drive_over(
                 sess.invalidate();
             }
             Ev::Synced(v) => {
-                if let Some(roster) = sess.on_synced(&v) {
+                let synced = sess.on_synced(&v);
+                if let Some(w) = sess.take_channel_warning() {
+                    ports.log.critical(&w);
+                }
+                if let Some(roster) = synced {
                     for p in &roster.peers {
                         if !code_peer_event_allowed(
                             use_code,
