@@ -8042,6 +8042,44 @@ async fn recv_run(
                     let offer_full = v["full"].as_str().map(|s| s.to_string());
                     let is_resume = v["resume"].as_bool().unwrap_or(false);
 
+                    // A retried offer for a file this dispatch already stored is
+                    // not a new transfer. The sender retries the SAME `{uid}-{sid}`
+                    // id when its delivery-ack was lost across a link rebuild;
+                    // accepting it again stored a second copy and doubled the
+                    // reported byte total. Re-ack with the stored name instead.
+                    // Only an exact name/size/digest match counts: a reused id
+                    // for different content falls through to the normal gates.
+                    // Clone out and drop the guard here: the ack below awaits,
+                    // and a std MutexGuard must not be held across it.
+                    let already = ports
+                        .env
+                        .delivery
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&id).cloned());
+                    if let Some(done) = already {
+                        let same = done.name == name
+                            && done.size == size
+                            && match (&done.full, &offer_full) {
+                                (Some(a), Some(b)) => a == b,
+                                _ => true,
+                            };
+                        if same {
+                            if let Some(t) = conn.transport_of(&pid) {
+                                let mut ack = protocol::delivery_ack_msg(&id, sid);
+                                ack["stored"] = serde_json::json!(done.stored_name);
+                                let _ = t.send_control(&ack).await;
+                            }
+                            log.say(&log.paint(
+                                Tone::Dim,
+                                &format!(
+                                    "  {name}: already delivered here; re-acked the sender's retry"
+                                ),
+                            ));
+                            continue;
+                        }
+                    }
+
                     // A pinned receive refuses unverifiable legacy offers and
                     // content with a different advertised digest before writing
                     // any bytes. For a match, the ordinary completion path still

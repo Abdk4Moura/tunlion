@@ -69,8 +69,19 @@ pub struct RecvEnv {
     pub loop_stall_secs: u64,
     /// `--remember` stored a record this invocation.
     pub remember_stored: Arc<std::sync::atomic::AtomicBool>,
-    /// Transfer id -> the final stored name for this invocation's acks.
-    pub delivery: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Transfer id -> what this invocation stored for it. Kept after the ack
+    /// (bounded) so a sender retrying the SAME id because its ack was lost is
+    /// re-acked, never stored a second time.
+    pub delivery: Arc<std::sync::Mutex<HashMap<String, DeliveredFile>>>,
+}
+
+/// One delivered transfer, enough to recognise a retry of the same offer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeliveredFile {
+    pub name: String,
+    pub size: u64,
+    pub full: Option<String>,
+    pub stored_name: String,
 }
 
 impl Default for RecvEnv {

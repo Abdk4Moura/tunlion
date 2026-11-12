@@ -719,6 +719,9 @@ async fn drive_over(
                             p["id"].as_str().unwrap_or_default(),
                             CodePeerEvent::Adoption,
                         ) {
+                            if let Some(ceremony) = pake_peer.as_deref() {
+                                let _ = conn.code_reconnect_kept(ceremony, p["uid"].as_str());
+                            }
                             continue;
                         }
                         conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done))
@@ -742,6 +745,9 @@ async fn drive_over(
                             p["id"].as_str().unwrap_or_default(),
                             CodePeerEvent::Adoption,
                         ) {
+                            if let Some(ceremony) = pake_peer.as_deref() {
+                                let _ = conn.code_reconnect_kept(ceremony, p["uid"].as_str());
+                            }
                             continue;
                         }
                         conn.maybe_adopt_from(

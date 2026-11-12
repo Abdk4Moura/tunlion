@@ -2199,6 +2199,35 @@ impl Conn {
         !self.resil.in_flight_since.contains_key(pid)
     }
 
+    /// A spent code authorizes exactly the peer its PAKE ceremony confirmed.
+    /// A same-device signaling reconnect (same install uid, new sid) is not a
+    /// replacement receiver, but it must not churn a live link either (#28):
+    /// when the code peer's link is still usable, keep it and say so. Returns
+    /// true when the reconnect was deliberately kept; false (including a dead
+    /// or stalled link) means the caller must refuse the new sid, never
+    /// supersede to it.
+    pub fn code_reconnect_kept(&self, ceremony_peer: &str, peer_uid: Option<&str>) -> bool {
+        let Some(uid) = peer_uid else {
+            return false;
+        };
+        let Some(old) = self.links.get(ceremony_peer) else {
+            return false;
+        };
+        if old.uid.as_deref() != Some(uid) {
+            return false; // a different device, not this code's receiver
+        }
+        let name = old.name.clone();
+        if self.old_link_survives_reconnect(ceremony_peer) {
+            self.log
+                .debug(&format!("{name} reconnected, keeping active link"));
+            return true;
+        }
+        self.log.debug(&format!(
+            "{name} reconnected on a spent code; refusing to replace the authenticated receiver"
+        ));
+        false
+    }
+
     /// Attach a freshly-opened channel to its link and mark the peer Ready.
     ///
     /// Every `Ev::ChannelReady` arm opened with these same few lines, copied
