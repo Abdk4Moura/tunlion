@@ -1432,20 +1432,28 @@ implement them behaves exactly as before, only slower.
   so no multiplexed session outlives its authorization.
   `TUNLION_NO_SSH_MUX=1` opts out to one-connection-per-invocation for
   debugging.
-- B-SIDE ENFORCEMENT (the security property; A's cleanup above is
-  hygiene, not enforcement). Revocation happens in B's store and A may
-  never learn of it, so the guarantee lives on B: when B revokes A's
-  shell grant, or A's cert is revoked or expires, B's daemon tears down
-  the L2 stream carrying A's ssh. The stream `forward --stdio B:22`
-  opens is admitted on link trust plus `l2_target_allowed`, and for its
-  lifetime it rides the same revoke ticker as every daemon-served
-  stream: the ticker re-asks `cert_revoked_for` on the stream's resolved
-  peer identity and closes with reason on a hit, so any multiplexed
-  session dies regardless of what A does. The ticker covers cert
-  revocation today; shell-grant revocation is wired into the same tick
-  (a grant check beside the cert check), with a gate pinning it: revoke
-  on B while an ssh session is live -> the session dies within
-  `revoke_recheck_interval`.
+- B-SIDE ENFORCEMENT, as implemented (the security property; A's cleanup
+  above is hygiene, not enforcement). Revocation happens in B's store and
+  A may never learn of it, so the guarantee lives on B. What ends an
+  established `shell --ssh` session today:
+  - Forgetting A, revoking A's device certificate, and A's delegated
+    deadline passing all close it. B's L2 revoke ticker calls
+    `live_session_cut` for every daemon-served stream, including the one
+    `forward --stdio B:22` opens, and that check covers exactly these
+    three: forget, device-certificate revocation and the delegated
+    deadline.
+  - Revoking A's shell grant (`tunlion revoke <A> shell`) does NOT end an
+    established ssh stream. The ticker does not consult the shell grant
+    or denied capabilities. Shell revoke stops new certificate issuance
+    and new bootstrap, and live PTY and exec sessions end through their
+    own rechecks, but a running ssh stream continues until it closes or
+    one of the three cuts above applies.
+  - `shell --ssh` prefers L3, so this L2 ticker governs only the tunnel
+    fallback.
+  The MULTIPLEXING and cert-cache bullets in this section describe a
+  design that is not implemented: there is no ControlMaster or
+  ControlPersist use and no cert cache, so no multiplexed session exists
+  to outlive its authorization.
 - CACHE KEYS: by peer IDENTITY (device_pub fingerprint), never by name;
   a re-paired or renamed device gets a cold cache. Also keyed by B's CA
   public key: a rotated CA deadens the cached cert and the miss reads as
