@@ -22,6 +22,36 @@ const SYNC_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// A confirmed digest older than this is re-asserted even if unchanged.
 const CONFIRM_TTL: Duration = Duration::from_secs(30);
 
+/// The signaling server accepts at most this many channels in one `subscribe`
+/// or `sync` and silently drops the rest (`MAX_CHANNELS` in
+/// backend/signaling.py and edge/signal/src/policy.ts). Whatever must never be
+/// dropped has to sit inside this prefix of the list we send.
+pub const SIGNALING_MAX_CHANNELS: usize = 64;
+
+/// The ONE place a subscription list is ordered: the enrollment channel, then
+/// the fleet channel, then every device channel, de-duplicated (first
+/// occurrence wins, device order otherwise preserved).
+///
+/// The order is load-bearing. The server keeps only the first
+/// [`SIGNALING_MAX_CHANNELS`] entries, so an owner with 64+ paired devices
+/// that listed devices first lost the enrollment and fleet channels on every
+/// new socket: no new device could enroll and the request simply timed out.
+/// The two shared meeting points go first; a truncated tail can then only
+/// cost device channels.
+pub fn subscription_order(
+    enroll: Option<String>,
+    fleet: Option<String>,
+    devices: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    enroll
+        .into_iter()
+        .chain(fleet)
+        .chain(devices)
+        .filter(|c| seen.insert(c.clone()))
+        .collect()
+}
+
 pub struct Session {
     pub room: Option<String>,
     pub enroll_room: Option<String>,
@@ -148,6 +178,18 @@ impl Session {
             peers: v["peers"].as_array().cloned().unwrap_or_default(),
             channel_peers: v["channel_peers"].as_array().cloned().unwrap_or_default(),
         })
+    }
+
+    /// Add a priority channel (the enrollment or fleet meeting point) at the
+    /// FRONT of the desired set, moving it there if it is already present
+    /// further back. Appending would put it past the server's
+    /// [`SIGNALING_MAX_CHANNELS`] cap on a large fleet; see
+    /// [`subscription_order`].
+    pub fn prioritize_channel(&mut self, ch: String) {
+        if let Some(i) = self.channels.iter().position(|c| *c == ch) {
+            self.channels.remove(i);
+        }
+        self.channels.insert(0, ch);
     }
 
     /// Any local change to desire invalidates confirmation timing so the next
@@ -303,6 +345,66 @@ mod tests {
         s.room = Some("matched".into());
         s.resume_room(held);
         assert_eq!(s.room.as_deref(), Some("matched"));
+    }
+
+    fn chan(i: u64) -> String {
+        format!("{i:064x}")
+    }
+
+    /// The production incident: 65 paired devices pushed the enrollment and
+    /// fleet channels past the server's 64-channel cap on every new socket.
+    /// The meeting points must lead the list, and nothing may be lost.
+    #[test]
+    fn enroll_and_fleet_lead_a_list_longer_than_the_server_cap() {
+        let devices: Vec<String> = (0..70).map(chan).collect();
+        let enroll = chan(1_000);
+        let fleet = chan(2_000);
+        // Duplicates (a device listed twice, the fleet channel also among the
+        // devices) collapse to their first occurrence.
+        let mut input = devices.clone();
+        input.push(devices[3].clone());
+        input.push(fleet.clone());
+        let c = subscription_order(Some(enroll.clone()), Some(fleet.clone()), input);
+
+        assert!(c.len() > SIGNALING_MAX_CHANNELS);
+        assert_eq!(c[0], enroll, "enrollment channel first");
+        assert_eq!(c[1], fleet, "fleet channel second");
+        let kept = &c[..SIGNALING_MAX_CHANNELS];
+        assert!(kept.contains(&enroll) && kept.contains(&fleet));
+        // Nothing lost, nothing duplicated, device order preserved.
+        assert_eq!(c.len(), devices.len() + 2);
+        assert_eq!(&c[2..], &devices[..]);
+        let unique: std::collections::HashSet<&String> = c.iter().collect();
+        assert_eq!(unique.len(), c.len());
+
+        // Absent meeting points simply drop out of the prefix.
+        let only_devices = subscription_order(None, None, devices.clone());
+        assert_eq!(only_devices, devices);
+        let fleet_only = subscription_order(None, Some(fleet.clone()), devices.clone());
+        assert_eq!(fleet_only[0], fleet);
+        assert_eq!(&fleet_only[1..], &devices[..]);
+    }
+
+    /// The daemon's arm-gate adds the enrollment channel to a LIVE list long
+    /// after startup; it must land inside the cap, not after 70 devices.
+    #[test]
+    fn a_prioritized_channel_goes_to_the_front_once() {
+        let mut s = Session::new("n", "u");
+        let fleet = chan(2_000);
+        let enroll = chan(1_000);
+        s.channels = subscription_order(None, Some(fleet.clone()), (0..70).map(chan));
+        s.prioritize_channel(enroll.clone());
+        assert_eq!(s.channels[0], enroll);
+        assert_eq!(s.channels[1], fleet);
+        assert_eq!(s.channels.len(), 72);
+        // Re-adding never duplicates; a channel found further back moves up.
+        s.prioritize_channel(enroll.clone());
+        assert_eq!(s.channels.len(), 72);
+        s.channels.push(chan(3_000));
+        s.prioritize_channel(chan(3_000));
+        assert_eq!(s.channels[0], chan(3_000));
+        assert_eq!(s.channels.len(), 73);
+        assert!(s.channels[..SIGNALING_MAX_CHANNELS].contains(&enroll));
     }
 
     #[test]

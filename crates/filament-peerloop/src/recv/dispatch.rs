@@ -1314,18 +1314,21 @@ async fn recv_run(
     // that second link on the roster line under its raw signaling id.
     let code_only = code.is_some() && !daemon;
     if !code_only {
-        sess.channels = devices.iter().map(|(_, s)| host.channel_of(s)).collect();
         // Fleet auto-mesh: one more meeting point, where devices certified by the
         // SAME owner key find each other with no pairwise pairing. Presence there
         // authorizes NOTHING; admission runs on the certificate. See cli/src/fleet.rs
-        // and docs/design-fleet-automesh.md.
-        if cfg!(feature = "fleet") {
-            if let Some(fc) = ports.identity.fleet_channel() {
-                if !sess.channels.contains(&fc) {
-                    sess.channels.push(fc);
-                }
-            }
-        }
+        // and docs/design-fleet-automesh.md. It leads the list so the server's
+        // channel cap can never truncate it away (`subscription_order`).
+        let fleet = if cfg!(feature = "fleet") {
+            ports.identity.fleet_channel()
+        } else {
+            None
+        };
+        sess.channels = crate::session::subscription_order(
+            None,
+            fleet,
+            devices.iter().map(|(_, s)| host.channel_of(s)),
+        );
     }
     // L1-a: the ephemeral SPAKE2 ceremony for a `recv <code>` claim. The typed
     // code is split CLIENT-SIDE; only the numeric nameplate is sent (pair-claim
@@ -1487,29 +1490,31 @@ async fn recv_run(
             } else {
                 log.debug("enrollment closed (no armed keys: mint or arm an auth-key to open)");
             }
-            let chans: Vec<String> = devices.iter().map(|(_, s)| host.channel_of(s)).collect();
-            let mut c = chans;
-            if ports.identity.is_armed() {
-                if let Some(uk) = host.user_key() {
-                    let ek = ports.identity.enroll_channel(&uk.public_key_bytes());
-                    if !c.contains(&ek) {
-                        c.push(ek);
-                    }
-                }
-            }
+            let enroll = if ports.identity.is_armed() {
+                host.user_key()
+                    .map(|uk| ports.identity.enroll_channel(&uk.public_key_bytes()))
+            } else {
+                None
+            };
             // Fleet auto-mesh: the meeting point for same-owner devices goes in
             // the SAME list, because this is the subscribe the daemon actually
             // emits. (It rebuilds `c` from scratch and then overwrites
             // sess.channels, so anything pushed onto sess.channels before this
             // point is discarded.) Presence here authorizes nothing; admission
             // runs on the certificate. See cli/src/fleet.rs.
-            if cfg!(feature = "fleet") {
-                if let Some(fc) = ports.identity.fleet_channel() {
-                    if !c.contains(&fc) {
-                        c.push(fc);
-                    }
-                }
-            }
+            let fleet = if cfg!(feature = "fleet") {
+                ports.identity.fleet_channel()
+            } else {
+                None
+            };
+            // Enrollment and fleet FIRST: the server keeps only the first
+            // SIGNALING_MAX_CHANNELS entries, and with 64+ devices listed
+            // ahead of them no new device could ever enroll.
+            let c = crate::session::subscription_order(
+                enroll,
+                fleet,
+                devices.iter().map(|(_, s)| host.channel_of(s)),
+            );
             sess.emit(&sio, "subscribe", json!({ "channels": c })).await;
             sess.channels = c;
             log.say(&format!(
@@ -3316,7 +3321,9 @@ async fn recv_run(
             let armed = ports.identity.is_armed();
             let subscribed = sess.channels.contains(&ek);
             if armed && !subscribed {
-                sess.channels.push(ek.clone());
+                // At the FRONT: appended after 64+ device channels it would be
+                // cut by the server's channel cap on every re-sync.
+                sess.prioritize_channel(ek.clone());
                 let _ = sio.emit("subscribe", json!({ "channels": [ek] })).await;
             } else if !armed && subscribed {
                 sess.channels.retain(|c| c != &ek);
@@ -6600,15 +6607,20 @@ async fn recv_run(
                     // daemon's live channel set immediately; waiting for restart
                     // would make the persisted ceiling correct but unreachable.
                     devices = host.devices_load();
-                    sess.channels = devices
-                        .iter()
-                        .map(|(_, secret)| host.channel_of(secret))
-                        .collect();
-                    if let Some(fc) = ports.identity.fleet_channel() {
-                        if !sess.channels.contains(&fc) {
-                            sess.channels.push(fc);
-                        }
-                    }
+                    // Keep the enrollment channel if we hold it (the arm-gate
+                    // owns adding and dropping it) and put the meeting points
+                    // first, inside the server's channel cap. This rebuild is
+                    // what the next sync carries, so an owner at the cap must
+                    // not lose enrollment by enrolling one more device.
+                    let enroll = host
+                        .user_key()
+                        .map(|uk| ports.identity.enroll_channel(&uk.public_key_bytes()))
+                        .filter(|ek| sess.channels.contains(ek));
+                    sess.channels = crate::session::subscription_order(
+                        enroll,
+                        ports.identity.fleet_channel(),
+                        devices.iter().map(|(_, secret)| host.channel_of(secret)),
+                    );
                     sess.invalidate();
                 }
                 Some("depart") => {
