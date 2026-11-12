@@ -843,8 +843,14 @@ async fn drive_over(
                 }
             }
             Ev::Signal(v) => {
-                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
+                // A spent code talks only to the peer its PAKE ceremony
+                // confirmed. A replacement sid's signals must not build a link
+                // or reset the send's rejoin window (see send_cmd's twin).
+                if use_code && pake_done && pake_peer.as_deref() != Some(from.as_str()) {
+                    continue;
+                }
+                if conn.stage_signal(&v) { continue; }
                 let data = v["data"].clone();
                 if data["type"].as_str() == Some("not-recognized") {
                     return Err(SendFailure::denied(format!(

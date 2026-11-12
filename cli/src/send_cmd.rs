@@ -1521,8 +1521,19 @@ pub(crate) async fn send_cmd(
                 }
             }
             Ev::Signal(v) => {
-                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
+                // A spent code authorizes exactly the peer its PAKE ceremony
+                // confirmed. A late transport offer or control frame from a
+                // different sid must not build a link, and must not keep the
+                // send alive past its rejoin window: gate 11 measured the
+                // sender still retrying after 90 s because a replacement
+                // receiver's offers kept resetting activity. This is the same
+                // rule the event filter applies to Control/ChannelReady, now
+                // applied before a signal can be staged for a build.
+                if use_code && pake_done && pake_peer.as_deref() != Some(from.as_str()) {
+                    continue;
+                }
+                if conn.stage_signal(&v) { continue; }
                 let data = v["data"].clone();
                 // A browser's PeerLink sends its transport hint BEFORE any SDP.
                 // Apply it first so a WebRTC-only peer does not sit out the
