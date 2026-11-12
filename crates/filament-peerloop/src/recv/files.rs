@@ -284,7 +284,7 @@ pub async fn sweep_completed_streams(
     daemon: bool,
     report: &RecvReport,
     completed: &mut usize,
-    delivery: &std::sync::Arc<Mutex<HashMap<String, String>>>,
+    delivery: &std::sync::Arc<Mutex<HashMap<String, crate::recv::ports::DeliveredFile>>>,
 ) -> Result<()> {
     let done_sids: Vec<(String, u32)> = by_sid
         .iter()
