@@ -3520,7 +3520,11 @@ impl Conn {
         }
         // Room adoption can select this target after its asynchronous build
         // captured active_on_apply. Keep that current selection across the
-        // old-link cleanup, which also clears the active slot.
+        // old-link cleanup, which also clears the active slot. The restore
+        // below is driven ONLY by facts true at install time (this selection,
+        // or a caller's `note_active` intent). `active_on_apply` was captured
+        // at plan time and is stale: another target selected while this one
+        // built must keep the slot.
         let selected_while_building = self.is_active(&built.peer_id);
         self.drop_link(&built.peer_id);
         if webrtc_only {
@@ -3557,12 +3561,19 @@ impl Conn {
                 host: self.host.clone(),
             },
         );
-        if built.active_on_apply || pending_active || selected_while_building {
+        if pending_active || selected_while_building {
             self.active = Some(built.peer_id.clone());
         }
+        // `planned_active` is diagnostic only: the plan-time selection, shown
+        // beside the install-time outcome so a stolen or lost slot is visible.
         self.log.debug(&format!(
-            "tunlion: ESTABLISH peer={} caller={} early={} signals={}",
-            built.peer_id, built.caller, early.len(), signals.len()
+            "tunlion: ESTABLISH peer={} caller={} early={} signals={} planned_active={} active={}",
+            built.peer_id,
+            built.caller,
+            early.len(),
+            signals.len(),
+            built.active_on_apply,
+            self.is_active(&built.peer_id)
         ));
         for ev in early {
             let _ = self.tx.send(ev);
@@ -11297,6 +11308,80 @@ mod warm_identity_tests {
             "data": { "to": pid, "type": "description" }
         })));
         assert_eq!(conn.builds[pid].signals.len(), 1);
+    }
+
+    /// P1: `active_on_apply` is a plan-time snapshot. A target selected while
+    /// peer A's candidate builds keeps the slot when A installs; only an
+    /// install-time fact (A still selected, or a caller's `note_active` for A)
+    /// gives A the slot.
+    #[tokio::test]
+    async fn a_stale_planned_selection_does_not_steal_the_active_slot() {
+        async fn candidate(conn: &Conn, pid: &str, generation: u32) -> BuiltPeer {
+            let peer = net::Peer::connect(
+                pid.to_string(),
+                conn.my_uid.clone(),
+                true,
+                Vec::new(),
+                false,
+                conn.sio.clone(),
+                conn.tx.clone(),
+                generation,
+            )
+            .await
+            .expect("local candidate");
+            let source = peer.source();
+            BuiltPeer {
+                peer_id: pid.to_string(),
+                generation,
+                source,
+                peer,
+                info: json!({ "id": pid, "name": "peer-a" }),
+                name: "peer-a".to_string(),
+                uid: None,
+                carried_secret: None,
+                // A was the selection when its build was planned.
+                active_on_apply: true,
+                replace: Replace::NeverLive,
+                caller: std::panic::Location::caller(),
+                prior_generation: None,
+            }
+        }
+        let (mut conn, _far, _rx) = test_conn().await;
+        let a = "sid-a-building";
+        let b = "sid-b-selected";
+
+        // 1. B is selected while A builds: A's install must not take the slot.
+        conn.builds.insert(a.to_string(), build_state(31));
+        conn.current_intent.insert(a.to_string(), 31);
+        conn.active = Some(b.to_string());
+        let built = candidate(&conn, a, 31).await;
+        conn.apply_built_peer(built);
+        assert!(conn.links.contains_key(a), "A's candidate was not installed");
+        assert!(conn.is_active(b), "A's stale planned selection stole B's slot");
+        assert!(!conn.is_active(a));
+
+        // 2. A caller's install-time intent for A still restores A. (A fresh
+        //    candidate each time: a NeverLive install refuses beside a live
+        //    link, so drop the previous one first.)
+        conn.drop_link(a);
+        conn.builds.insert(a.to_string(), build_state(32));
+        conn.current_intent.insert(a.to_string(), 32);
+        conn.active = Some(b.to_string());
+        conn.note_active(a);
+        let built = candidate(&conn, a, 32).await;
+        conn.apply_built_peer(built);
+        assert!(conn.is_active(a), "a pending_active intent was not restored on install");
+        assert!(!conn.pending_active.contains(a), "the intent outlived its install");
+
+        // 3. A still selected while it builds keeps the slot across the
+        //    old-link cleanup inside the install.
+        conn.drop_link(a);
+        conn.builds.insert(a.to_string(), build_state(33));
+        conn.current_intent.insert(a.to_string(), 33);
+        conn.active = Some(a.to_string());
+        let built = candidate(&conn, a, 33).await;
+        conn.apply_built_peer(built);
+        assert!(conn.is_active(a), "the current selection was lost across install");
     }
 
     /// A dropped/replaced link's queued candidate events are discarded, not
