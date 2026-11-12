@@ -6429,10 +6429,13 @@ async fn recv_run(
                         daemon,
                     );
                     if ours && consented_peer {
-                        let paired = crate::shell_gate::preserve_authenticated_pair(&mut conn, &pid);
-                        let anonymous = conn.link(&pid).is_some_and(|l| {
-                            !paired && l.identity_state != cap::IdentityState::Resolved
-                        });
+                        // A certificate is the only identity fact this answer can
+                        // settle. An authenticated pair keeps its own evidence for
+                        // the shell gate; it must not turn a consented transfer
+                        // into a Pending hold that expires and refuses.
+                        let anonymous = conn
+                            .link(&pid)
+                            .is_some_and(|l| l.identity_state != cap::IdentityState::Resolved);
                         identity_nonces.remove(&pid);
                         st.pending_proven.lock().unwrap().remove(&pid);
                         if anonymous {
@@ -7505,7 +7508,6 @@ async fn recv_run(
                             l.expected_secret = Some((n.clone(), secret.clone()));
                             crate::identity::resolve_peer_identity(l);
                         }
-                        crate::shell_gate::preserve_authenticated_pair(&mut conn, &pid);
                         // #39: identity just RESOLVED on the WebRTC/relay path — verified_name
                         // is set above and resolve_peer_identity populated device_pub. This is
                         // the resolution point for NON-direct links (ChannelReady fired before
