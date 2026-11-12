@@ -20,7 +20,9 @@
 
 mod host;
 mod devices;
-pub use devices::{AccessState, ActionKind, DeviceAccess, DevicePresence, DeviceRelationship, EffectiveAction};
+mod lifecycle;
+pub use devices::{AccessState, ActionKind, ActionPolicy, DeliveryKind, DeliveryState, DeviceAccess, DevicePolicy, DevicePresence, DeviceRelationship, EffectiveAction, EnrollmentKind, EnrollmentState, PolicySource};
+pub use lifecycle::{CapabilityOutcome, CapabilityReceipt, EnrollmentStatus, EnrollmentSupport, LiftedKeyBlock, RemovalMode, RemovalReceipt, SessionsSummary};
 pub mod access;
 
 uniffi::setup_scaffolding!();
@@ -2039,6 +2041,10 @@ fn normalize_phrase(phrase: &str) -> String {
 
 fn io_err(err: io::Error) -> CoreError {
     CoreError::Io(err.to_string())
+}
+
+fn store_err(err: impl ToString) -> CoreError {
+    CoreError::Config(err.to_string())
 }
 
 fn id_err(err: impl ToString) -> CoreError {

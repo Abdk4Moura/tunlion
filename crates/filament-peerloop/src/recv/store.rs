@@ -871,7 +871,7 @@ impl DeviceStore {
     /// The capability store, fail-closed: absent is empty, unreadable or
     /// unparseable is an error. The tolerant [`cap_store`] stays for the
     /// read-only evaluators, which already treat damage as "no grants".
-    pub(crate) fn cap_store_checked(&self) -> Result<Vec<Value>> {
+    pub fn cap_store_checked(&self) -> Result<Vec<Value>> {
         let p = self.cap_store_path();
         match std::fs::read_to_string(&p) {
             Ok(raw) => serde_json::from_str(&raw)
@@ -885,7 +885,7 @@ impl DeviceStore {
     /// returns whether anything changed, so a no-op revoke does not rewrite
     /// the store. `before_write_json_array` refuses to replace a corrupt or
     /// truncated file.
-    pub(crate) fn with_cap_store_mut<T>(
+    pub fn with_cap_store_mut<T>(
         &self,
         f: impl FnOnce(&mut Vec<Value>) -> Result<(T, bool)>,
     ) -> Result<T> {
