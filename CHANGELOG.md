@@ -13,6 +13,52 @@ release build failed and nothing was published under it.
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-11-12
+
+### Added
+
+- Running commands, terminals and SSH on your other devices now goes through
+  one shared access decision, so the command line, the background service and
+  the browser all agree on who may do what.
+- The browser asks the same shared core whether to accept a transfer. If that
+  check is missing or returns something unexpected, the transfer is refused.
+- Android app: the phone has its own identity, sends and receives with a code,
+  shows each device's access (including access that is still pending), and can
+  remove a device or take back a single permission, all through the shared
+  core.
+- Invitations are previewed, created, joined and withdrawn through one shared
+  set of rules, so an expiry date and a permission limit mean the same thing
+  on every device.
+
+### Changed
+
+- A transfer code works for one receiver only: the one that completed the
+  code exchange. Another device that connects afterwards cannot take over the
+  transfer, even from the same install. To send again, start a new send and
+  use its new code.
+- `tunlion revoke <device> shell` now also ends that device's SSH session if
+  one is already open, not just new ones. Terminals and remote commands
+  already stopped when their permission was withdrawn.
+- `tunlion up --shell` lets devices you paired with directly run commands,
+  once their pairing is verified, including devices paired without a
+  certificate. It does not let in other devices in your fleet, devices you
+  never paired, a device whose shell access you denied or whose certificate
+  you revoked, or a device whose identity has not been confirmed. On Linux
+  and macOS it still needs `--i-know` or `--shell-user`.
+
+### Fixed
+
+- A transfer to a device that had just reconnected no longer fails after a
+  20 second wait for its identity.
+- A direct connection offer that arrived before the connection was ready is
+  no longer lost.
+- When terminal access is withdrawn, the open terminal now closes with an
+  error that says access was revoked, and the device can still receive files.
+- `--remember` is no longer lost when the connection switches to a direct path
+  in the middle of pairing.
+- A file whose delivery confirmation was lost is confirmed again instead of
+  being stored a second time.
+
 ## [0.9.3] - 2026-10-30
 
 ### Added
