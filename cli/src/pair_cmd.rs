@@ -219,7 +219,7 @@ const ENROL_OFFER_WAIT: Duration = Duration::from_secs(20);
 /// A fresh 12-byte AEAD nonce for an enrolment frame. The randomness is the
 /// host's: `filament-enrol` takes the nonce as an input so a browser can supply
 /// `crypto.getRandomValues` and a vector can replay exact bytes.
-fn fresh_seal_nonce() -> Option<[u8; 12]> {
+pub(crate) fn fresh_seal_nonce() -> Option<[u8; 12]> {
     let rng = ring::rand::SystemRandom::new();
     let mut nonce = [0u8; 12];
     ring::rand::SecureRandom::fill(&rng, &mut nonce).ok()?;
