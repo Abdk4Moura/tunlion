@@ -9580,6 +9580,115 @@ mod warm_identity_tests {
         assert!(conn.is_active("sid-new"));
     }
 
+    /// The spent-code rule gate 11 and 11b exercise end to end. A peer event
+    /// from a sid other than the ceremony peer is either a same-device
+    /// signaling reconnect whose authenticated link is still usable (kept, and
+    /// said so) or something the spent code must refuse. The answer must never
+    /// touch the ceremony link: the caller only refuses, it never supersedes.
+    #[tokio::test]
+    async fn code_reconnect_kept_keeps_only_a_surviving_same_uid_ceremony_link() {
+        use crate::host::{Level, VecLog};
+
+        const KEEP: &str = "soak-b reconnected, keeping active link";
+        const REFUSE: &str =
+            "soak-b reconnected on a spent code; refusing to replace the authenticated receiver";
+
+        async fn conn_with(
+            t: Arc<FakeQuic>,
+            in_flight: bool,
+        ) -> (Conn, Arc<VecLog>, tokio::net::TcpStream) {
+            let (mut conn, far, _rx) = test_conn().await;
+            let log = Arc::new(VecLog::new());
+            conn.log = log.clone() as Arc<dyn LogSink>;
+            conn.links
+                .insert("sid-old".into(), linked_direct("sid-old", "soak-b", "uid-b", t));
+            conn.bind_active("sid-old");
+            if in_flight {
+                conn.resil
+                    .in_flight_since
+                    .insert("sid-old".into(), Instant::now());
+            }
+            (conn, log, far)
+        }
+
+        fn untouched(conn: &Conn, t: &FakeQuic) {
+            assert_eq!(conn.links.len(), 1, "the check created or removed a link");
+            let l = conn.links.get("sid-old").expect("the ceremony link was dropped");
+            assert_eq!(l.generation, 7, "the ceremony link was replaced");
+            assert!(conn.is_active("sid-old"), "active moved off the ceremony link");
+            assert_eq!(t.closes.load(Ordering::Relaxed), 0, "the ceremony transport was closed");
+        }
+
+        // Kept: the same uid while an in-flight transfer is still moving (11b).
+        let t = FakeQuic::flowing();
+        let (conn, log, _far) = conn_with(t.clone(), true).await;
+        assert!(
+            conn.code_reconnect_kept("sid-old", Some("uid-b")),
+            "a flowing same-uid ceremony link must be kept"
+        );
+        assert_eq!(log.take(), vec![(Level::Debug, KEEP.to_string())]);
+        untouched(&conn, &t);
+
+        // Kept: the same uid on an idle link with nothing in flight.
+        let t = FakeQuic::idle(120_000);
+        let (conn, log, _far) = conn_with(t.clone(), false).await;
+        assert!(
+            conn.code_reconnect_kept("sid-old", Some("uid-b")),
+            "an idle, alive same-uid ceremony link must be kept"
+        );
+        assert_eq!(log.take(), vec![(Level::Debug, KEEP.to_string())]);
+        untouched(&conn, &t);
+
+        // A different uid is not this code's receiver: refused, and silent,
+        // because it is not a reconnect of the ceremony peer at all.
+        let t = FakeQuic::flowing();
+        let (conn, log, _far) = conn_with(t.clone(), true).await;
+        assert!(
+            !conn.code_reconnect_kept("sid-old", Some("uid-other")),
+            "a different uid must never be kept as the ceremony peer"
+        );
+        assert!(log.take().is_empty(), "a different uid logged a reconnect line");
+        untouched(&conn, &t);
+
+        // No uid at all cannot be matched to the ceremony peer.
+        assert!(!conn.code_reconnect_kept("sid-old", None), "a uid-less peer was kept");
+        assert!(log.take().is_empty(), "a uid-less peer logged a reconnect line");
+        untouched(&conn, &t);
+
+        // No ceremony link to compare against: nothing to keep.
+        assert!(
+            !conn.code_reconnect_kept("sid-missing", Some("uid-b")),
+            "a missing ceremony link was reported as kept"
+        );
+        assert!(log.take().is_empty());
+        untouched(&conn, &t);
+
+        // Gate 11's case: same uid, but the in-flight transfer stopped moving,
+        // so the ceremony link does not survive. Refused, with the refusal line
+        // the gate greps for, and the ceremony link is left for its own
+        // liveness to fail rather than being superseded.
+        let t = FakeQuic::idle(60_000);
+        let (conn, log, _far) = conn_with(t.clone(), true).await;
+        assert!(
+            !conn.code_reconnect_kept("sid-old", Some("uid-b")),
+            "a frozen in-flight ceremony link must not be kept"
+        );
+        assert_eq!(log.take(), vec![(Level::Debug, REFUSE.to_string())]);
+        untouched(&conn, &t);
+
+        // Same uid over a dead transport: refused the same way.
+        let t = FakeQuic::live();
+        t.alive.store(false, Ordering::Relaxed);
+        let (conn, log, _far) = conn_with(t.clone(), false).await;
+        assert!(
+            !conn.code_reconnect_kept("sid-old", Some("uid-b")),
+            "a dead ceremony link must not be kept"
+        );
+        assert_eq!(log.take(), vec![(Level::Debug, REFUSE.to_string())]);
+        assert_eq!(conn.links.len(), 1, "the check created or removed a link");
+        assert!(conn.links.contains_key("sid-old"), "the ceremony link was dropped");
+    }
+
     /// A relay link has no QUIC keepalive, so `peer_present` uses the peer's 5 s
     /// application keepalive. A quiet but heard peer is an idle link and is
     /// kept; a peer that stopped being heard is a dead path and is superseded.
