@@ -218,9 +218,14 @@ tunlion up --detach     # background daemon, survives the terminal closing
 tunlion down -y         # stop it
 ```
 
-Do not add `--shell` or `--install` unless the user asked: `--shell` lets
-every paired device run commands here, and `--install` creates a login
-service.
+Do not add `--shell` or `--install` unless the user asked. `--shell` lets
+devices paired directly with this one run commands here, once their pairing
+proof verifies. That includes pairs without a certificate and devices paired
+later. It does not include fleet siblings or any unpaired device, a device
+whose shell is denied or whose certificate is revoked, or a peer with a
+certificate whose identity is not resolved. It also exposes the loopback
+tunnel. On Unix it needs `--i-know` or `--shell-user`. `--install` creates
+a login service.
 
 ### Pair a new device
 
