@@ -1201,8 +1201,21 @@ impl DirectTransport {
         if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(anyhow!("direct connection closed"));
         }
+        self.bounded_write(kind, self.write_framed_unbounded(kind, payload)).await
+    }
+
+    /// Run one write on the shared send stream (lock acquisition included)
+    /// under `write_stall_budget(kind)`. A write that makes no progress within
+    /// the budget marks the link dead and CLOSES the QUIC connection, which
+    /// wakes whoever is parked on the stream with an error and releases the
+    /// lock. Every write on this link goes through here (see `write_framed`).
+    async fn bounded_write<T>(
+        &self,
+        kind: u8,
+        write: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
         let budget = write_stall_budget(kind);
-        match tokio::time::timeout(budget, self.write_framed_unbounded(kind, payload)).await {
+        match tokio::time::timeout(budget, write).await {
             Ok(r) => r,
             Err(_) => {
                 self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1241,6 +1254,58 @@ impl DirectTransport {
         let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         if trace && lock_us + hdr_us + body_us > 1000 {
             dlog!("[TRACE direct write_framed] lock={}us hdr={}us body={}us payload_len={} kind={}", lock_us, hdr_us, body_us, payload.len(), kind);
+        }
+        Ok(())
+    }
+
+    /// The data frame's write, unbounded: `[hdr][sid][offset][payload]` as
+    /// four writes under one hold of the send lock (scatter-gather, no copy of
+    /// the payload). Only `send_frame` calls this, through `bounded_write`.
+    async fn send_frame_unbounded(&self, sid: u32, offset: u64, payload: &[u8]) -> Result<()> {
+        let trace = cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
+        let t_total_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_lock_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let mut s = self.send.lock().await;
+        let lock_us = t_lock_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(anyhow!("direct connection closed"));
+        }
+        let mut hdr = [0u8; 5];
+        hdr[0] = KIND_DATA;
+        let payload_len = (4 + 8 + payload.len()) as u32;
+        hdr[1..5].copy_from_slice(&payload_len.to_be_bytes());
+        let t_hdr_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if let Err(e) = s.write_all(&hdr).await {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("direct write hdr: {e}"));
+        }
+        let hdr_us = t_hdr_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_sid_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if let Err(e) = s.write_all(&sid.to_be_bytes()).await {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("direct write sid: {e}"));
+        }
+        let sid_us = t_sid_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_off_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if let Err(e) = s.write_all(&offset.to_be_bytes()).await {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("direct write offset: {e}"));
+        }
+        let off_us = t_off_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_body_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if let Err(e) = s.write_all(payload).await {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("direct write body: {e}"));
+        }
+        let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        drop(s);
+        let total_us = t_total_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        if trace {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c % 10 == 0 || total_us > 5000 {
+                dlog!("[TRACE direct send_frame] sid={} offset={} len={} lock={}us hdr={}us sid={}us off={}us body={}us total={}us", sid, offset, payload.len(), lock_us, hdr_us, sid_us, off_us, body_us, total_us);
+            }
         }
         Ok(())
     }
@@ -1356,51 +1421,16 @@ impl Transport for DirectTransport {
         // --- PROD PATH: scatter-gather without intermediate Vec copy ---
         // Previously this was behind a test-hook guard (dead code in prod), causing
         // an extra 1 MiB alloc+memcpy per chunk. Now we write directly.
-        let trace = cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
-        let t_total_start = if trace { Some(std::time::Instant::now()) } else { None };
-        let t_lock_start = if trace { Some(std::time::Instant::now()) } else { None };
-        let mut s = self.send.lock().await;
-        let lock_us = t_lock_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        //
+        // Bounded like every other write on this link (`write_framed`): the
+        // lock and the four writes share one stall budget, and a stall closes
+        // the connection instead of parking forever while holding the shared
+        // send lock (which would block every control send behind it).
         if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(anyhow!("direct connection closed"));
         }
-        let mut hdr = [0u8; 5];
-        hdr[0] = KIND_DATA;
-        let payload_len = (4 + 8 + payload.len()) as u32;
-        hdr[1..5].copy_from_slice(&payload_len.to_be_bytes());
-        let t_hdr_start = if trace { Some(std::time::Instant::now()) } else { None };
-        if let Err(e) = s.write_all(&hdr).await {
-            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
-            return Err(anyhow!("direct write hdr: {e}"));
-        }
-        let hdr_us = t_hdr_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-        let t_sid_start = if trace { Some(std::time::Instant::now()) } else { None };
-        if let Err(e) = s.write_all(&sid.to_be_bytes()).await {
-            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
-            return Err(anyhow!("direct write sid: {e}"));
-        }
-        let sid_us = t_sid_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-        let t_off_start = if trace { Some(std::time::Instant::now()) } else { None };
-        if let Err(e) = s.write_all(&offset.to_be_bytes()).await {
-            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
-            return Err(anyhow!("direct write offset: {e}"));
-        }
-        let off_us = t_off_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-        let t_body_start = if trace { Some(std::time::Instant::now()) } else { None };
-        if let Err(e) = s.write_all(payload).await {
-            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
-            return Err(anyhow!("direct write body: {e}"));
-        }
-        let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-        drop(s);
-        let total_us = t_total_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-        if trace {
-            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if c % 10 == 0 || total_us > 5000 {
-                dlog!("[TRACE direct send_frame] sid={} offset={} len={} lock={}us hdr={}us sid={}us off={}us body={}us total={}us", sid, offset, payload.len(), lock_us, hdr_us, sid_us, off_us, body_us, total_us);
-            }
-        }
+        self.bounded_write(KIND_DATA, self.send_frame_unbounded(sid, offset, payload))
+            .await?;
         self.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         // Bug 2 PROOF hook: force structural death mid-transfer after N bytes.
         // One-shot: only the first transport dies; the re-dial (rung c) streams
@@ -1441,8 +1471,15 @@ impl Transport for DirectTransport {
         if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(()); // connection already gone, nothing left to drain
         }
+        // The lock is bounded too: it sat outside the 180 s wall below, so a
+        // writer parked on the stream parked the drain with it. Any holder is
+        // itself a bounded write, so a lock still held after one data budget
+        // means the stream is wedged: treat it as that write's stall.
         let stopped = {
-            let mut s = self.send.lock().await;
+            let mut s = self
+                .bounded_write(KIND_DATA, async { Ok::<_, anyhow::Error>(self.send.lock().await) })
+                .await
+                .map_err(|e| anyhow!("direct drain: {e}"))?;
             let _ = s.finish(); // harmless if already finished/stopped
             s.stopped()
         };
@@ -2558,6 +2595,44 @@ mod tests {
         })
         .await
         .expect("a control send behind a peer that stopped reading HUNG (the daemon-wedge bug)");
+        TEST_STALL_MS.with(|c| c.set(0));
+    }
+
+    /// The data path's own bound. `send_frame`'s production path wrote under
+    /// the shared send lock with no timeout, so a peer that stops reading
+    /// parked it forever (and every write queued behind the lock with it). It
+    /// must now give up within the stall budget, mark the link dead and close
+    /// it, exactly like `write_framed`.
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_cannot_park_send_frame() {
+        TEST_STALL_MS.with(|c| c.set(1000));
+        tokio::time::timeout(std::time::Duration::from_secs(40), async {
+            let ((conn_d, send_d, recv_d), (_conn_a, _send_a, _recv_a)) = connected_pair().await;
+            // The peer side never reads `_recv_a`: alive, connected, not draining.
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let ours = make_transport("peer".to_string(), conn_d, send_d, recv_d, tx, false, None, true, None);
+            let chunk = vec![7u8; 60 * 1024];
+            let mut stalled = None;
+            for i in 0..2000u64 {
+                let t0 = std::time::Instant::now();
+                if ours.send_frame(0x8000_0001, i, &chunk).await.is_err() {
+                    stalled = Some(t0.elapsed());
+                    break;
+                }
+            }
+            let took = stalled.expect("send_frame to a peer that stopped reading must eventually fail");
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "the parked send_frame must give up within its 1 s bound, took {took:?}"
+            );
+            assert!(ours.is_dead(), "a link whose data write stalled must be marked dead");
+            assert!(
+                ours.send_frame(0x8000_0001, 0, &chunk).await.is_err(),
+                "a later send_frame on the stalled link must fail at once, not park"
+            );
+        })
+        .await
+        .expect("send_frame to a peer that stopped reading HUNG (unbounded data write)");
         TEST_STALL_MS.with(|c| c.set(0));
     }
 
