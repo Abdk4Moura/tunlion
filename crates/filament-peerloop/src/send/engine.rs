@@ -719,6 +719,9 @@ async fn drive_over(
                             p["id"].as_str().unwrap_or_default(),
                             CodePeerEvent::Adoption,
                         ) {
+                            if let Some(ceremony) = pake_peer.as_deref() {
+                                let _ = conn.code_reconnect_kept(ceremony, p["uid"].as_str());
+                            }
                             continue;
                         }
                         conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done))
@@ -729,7 +732,11 @@ async fn drive_over(
                 sess.invalidate();
             }
             Ev::Synced(v) => {
-                if let Some(roster) = sess.on_synced(&v) {
+                let synced = sess.on_synced(&v);
+                if let Some(w) = sess.take_channel_warning() {
+                    ports.log.critical(&w);
+                }
+                if let Some(roster) = synced {
                     for p in &roster.peers {
                         if !code_peer_event_allowed(
                             use_code,
@@ -738,6 +745,9 @@ async fn drive_over(
                             p["id"].as_str().unwrap_or_default(),
                             CodePeerEvent::Adoption,
                         ) {
+                            if let Some(ceremony) = pake_peer.as_deref() {
+                                let _ = conn.code_reconnect_kept(ceremony, p["uid"].as_str());
+                            }
                             continue;
                         }
                         conn.maybe_adopt_from(
@@ -865,8 +875,8 @@ async fn drive_over(
                     if conn.direct_pending.contains_key(&from) {
                         conn.on_transport_offer(&from, cands, srflx, public, proto);
                     } else {
-                        conn.buffered_offers
-                            .insert(from.clone(), (cands, srflx, public, proto));
+                        let ch = data["ch"].as_str().map(String::from);
+                        conn.buffer_offer(&from, (cands, srflx, public, proto, ch));
                     }
                     continue;
                 }

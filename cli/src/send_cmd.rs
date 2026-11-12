@@ -1265,6 +1265,9 @@ pub(crate) async fn send_cmd(
                             p["id"].as_str().unwrap_or_default(),
                             CodePeerEvent::Adoption,
                         ) {
+                            if let Some(ceremony) = pake_peer.as_deref() {
+                                let _ = conn.code_reconnect_kept(ceremony, p["uid"].as_str());
+                            }
                             continue;
                         }
                         conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done)).await?;
@@ -1291,6 +1294,9 @@ pub(crate) async fn send_cmd(
                             p["id"].as_str().unwrap_or_default(),
                             CodePeerEvent::Adoption,
                         ) {
+                            if let Some(ceremony) = pake_peer.as_deref() {
+                                let _ = conn.code_reconnect_kept(ceremony, p["uid"].as_str());
+                            }
                             continue;
                         }
                         conn.maybe_adopt_from(p, adopt_wants_active(code_used, use_code, pake_done), AdoptSource::Digest)
@@ -1444,6 +1450,13 @@ pub(crate) async fn send_cmd(
                     v["id"].as_str().unwrap_or_default(),
                     CodePeerEvent::Adoption,
                 ) {
+                    // A same-device reconnect while the authenticated link is
+                    // alive is kept deliberately (#28), not silently ignored.
+                    // A dead one is refused: a spent code cannot be handed to
+                    // a replacement receiver.
+                    if let Some(ceremony) = pake_peer.as_deref() {
+                        let _ = conn.code_reconnect_kept(ceremony, v["uid"].as_str());
+                    }
                     continue;
                 }
                 conn.maybe_adopt(&v, adopt_wants_active(code_used, use_code, pake_done)).await?;
@@ -1597,9 +1610,15 @@ pub(crate) async fn send_cmd(
                                 peer_proto,
                             );
                         } else {
-                            conn.buffered_offers.insert(
-                                from.clone(),
-                                (cands, srflx, peer_server_public, peer_proto),
+                            conn.buffer_offer(
+                                &from,
+                                (
+                                    cands,
+                                    srflx,
+                                    peer_server_public,
+                                    peer_proto,
+                                    data["ch"].as_str().map(String::from),
+                                ),
                             );
                         }
                     }
@@ -2003,6 +2022,20 @@ pub(crate) async fn send_cmd(
                 // The post-PAKE promotion's handoff (crate::conn, `handoff`).
                 Some("path-promote" | "path-promoted" | "path-declined" | "path-stay") => {
                     let _ = conn.on_promote_control(&pid, &v).await;
+                    // The remember offer is sent when the file is accepted,
+                    // which can be just BEFORE a direct-path handoff. The old
+                    // single send was then read on neither path and the
+                    // receiver never stored its half (gate 14). The new
+                    // transport is current now, so re-offer on it. Idempotent:
+                    // the receiver stores a repeated secret without a suffix,
+                    // and only the ceremony peer is allowed to answer.
+                    if !remember_acked {
+                        if let (Some((_, secret)), Some(peer)) =
+                            (remember_offer.as_ref(), pake_peer.as_deref())
+                        {
+                            let _ = offer_pair_keep(&conn, peer, secret).await;
+                        }
+                    }
                 }
                 // Fleet target: the peer's certificate. The fleet secret proved
                 // it is IN the fleet; this proves WHICH member. The device key it

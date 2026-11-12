@@ -489,6 +489,88 @@ impl HostServices for CliHost {
             reason: cut.reason_for(idev),
         })
     }
+    fn live_capability_cut(&self, idev: Option<&[u8; 32]>, action: &str) -> Option<String> {
+        use filament_peerloop::refusal;
+        let idev = idev?;
+        // Forget and certificate revocation keep the SAME order and wording as
+        // `live_session_cut`, which every serving loop asks first. Duplicating
+        // them here is deliberate: a caller that asks only this predicate must
+        // still report the decision a person made before any capability
+        // question, never "shell revoked" for a device that was forgotten.
+        if crate::identity_state::cert_forgotten_for(Some(idev)) {
+            return Some(refusal::UNRECOGNIZED_REASON.to_string());
+        }
+        if crate::identity_state::cert_revoked_for(Some(idev)) {
+            return Some(crate::identity_state::DEVICE_REVOKED_REASON.to_string());
+        }
+        // The deny list, the local grants and the enrolment ceiling are keyed
+        // by the name on the record the verified KEY resolved to. A key with no
+        // record is the forget case above; not being known here is no opinion,
+        // not a cut.
+        let record = crate::device_view::devices_find_by_device_pub(idev)?;
+        let name = record["name"].as_str()?;
+
+        // #244: a revoke is a DECISION (`deniedCaps`), not merely the absence
+        // of a grant, and it outranks every grant source and the daemon's
+        // blanket shell policy. This is the cut an established ssh/L2 stream
+        // must take when `tunlion revoke <device> shell` lands.
+        if crate::device_caps::device_capability_denied(name, action) {
+            return Some(refusal::revoked_reason(Some(name)));
+        }
+
+        // A delegated record's owner-signed enrolment ceiling is authoritative:
+        // once it stops covering the action, no grant here can widen it back.
+        // Asked separately from `device_allows`, which reads the record's grant
+        // list: the ceiling is its own source, exactly as the shell gate asks it.
+        if crate::principal_ceiling_for(name).is_some_and(|ceiling| {
+            !ceiling.iter().any(|c| c.eq_ignore_ascii_case(action))
+        }) {
+            return Some(refusal::CEILING_REASON.to_string());
+        }
+
+        // A bounded local grant that has LAPSED is a withdrawal with a
+        // timestamp: the cap list no longer holds it, while `capExpires` still
+        // records the end the owner set. Absence alone is NOT a cut here: this
+        // store-level host cannot see whether the daemon admitted the stream
+        // under the blanket `--shell` / `--shell-only` / `TUNLION_L2` policy,
+        // and cutting every ungranted stream in those documented modes would
+        // break them. A withdrawn owner/fleet grant has the same shape (the
+        // held set is REPLACED, not tombstoned), so a still-held grant is
+        // consulted as a protector but its absence is not proof of loss.
+        // The deny above is the revocation decision this predicate exists for;
+        // this branch covers a grant that ran out.
+        let now = crate::identity::now_secs();
+        let lapsed = self
+            .device_cap_expiry(name, action)
+            .is_some_and(|at| !crate::capability::grant_active(at, now));
+        if lapsed {
+            // The same owner-signed sources the open gate reads must protect a
+            // still-live grant: a held fleet set on a joined device, and an
+            // owner-signed grant in this machine's cap store (a bounded approval
+            // writes both, and a separate user-wide grant can outlive it).
+            let user_pub: Option<[u8; 32]> = record["deviceCert"]["userPub"]
+                .as_str()
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| b.try_into().ok());
+            let signed_grant = crate::capability::cap_fleet_inputs(
+                &crate::settings::config_dir(),
+                "self",
+                action,
+                Some(idev),
+                user_pub.as_ref(),
+                None,
+            )
+            .1;
+            if !crate::device_caps::device_allows(name, action)
+                && !crate::devices_store::store().fleet_grant_applies(idev, action, now)
+                && !signed_grant
+                && !crate::identity_state::ceiling_covers_action(Some(idev), action)
+            {
+                return Some(refusal::not_granted_reason(Some(name)));
+            }
+        }
+        None
+    }
     fn peer_liveness_alive(&self, idev: Option<&[u8; 32]>) -> Option<bool> {
         crate::identity_state::peer_liveness_alive(idev)
     }
