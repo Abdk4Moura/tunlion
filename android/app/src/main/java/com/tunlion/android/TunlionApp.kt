@@ -806,11 +806,11 @@ private fun DeviceDetails(
             policy.deviceKey?.let { DetailRow("Device key", it) }
             policy.expires?.let { DetailRow("Core policy expiry", instantText(it)) }
             val actions = policy.actions
-            actionGroup("EFFECTIVE", actions.filter { isEffective(it.state) }, EFFECTIVE_GROUP_NOTE)
-            actionGroup("PENDING", actions.filter { it.state == CoreAccessState.PENDING }, PENDING_GROUP_NOTE)
-            actionGroup("BLOCKED", actions.filter { it.state == CoreAccessState.BLOCKED }, null)
-            actionGroup("UNKNOWN", actions.filter { it.state == CoreAccessState.UNKNOWN }, null)
-            actionGroup("UNAVAILABLE", actions.filter { it.state == CoreAccessState.UNSUPPORTED }, null)
+            actionGroup("EFFECTIVE", actions.filter { isEffective(it.state) }, emptyNote = EFFECTIVE_GROUP_NOTE)
+            actionGroup("PENDING", actions.filter { it.state == CoreAccessState.PENDING }, groupNote = PENDING_GROUP_NOTE)
+            actionGroup("BLOCKED", actions.filter { it.state == CoreAccessState.BLOCKED })
+            actionGroup("UNKNOWN", actions.filter { it.state == CoreAccessState.UNKNOWN })
+            actionGroup("UNAVAILABLE", actions.filter { it.state == CoreAccessState.UNSUPPORTED })
             SecondaryText("Only actions reported by the shared core appear here, with the stored fact each one comes from. Pending is a local record, not confirmed access.")
             Eyebrow("REVOKE A CAPABILITY")
             SecondaryText("Revoking one capability records a single deny on this phone. If the access comes from the invitation ceiling, the core refuses and this screen says so instead of reporting success.")
@@ -903,10 +903,13 @@ private fun RemovalConfirmDialog(mode: CoreRemovalMode, name: String, busy: Bool
 }
 
 @Composable
-private fun actionGroup(title: String, actions: List<CoreActionPolicy>, note: String?) {
-    if (actions.isEmpty()) { note?.let { SecondaryText(it) }; return }
+private fun actionGroup(title: String, actions: List<CoreActionPolicy>, emptyNote: String? = null, groupNote: String? = null) {
+    if (actions.isEmpty()) { emptyNote?.let { SecondaryText(it) }; return }
     Eyebrow(title)
     actions.forEach { ActionPolicyRow(it) }
+    // A group explanation belongs under the rows it explains. The empty-state
+    // line above is a different thing and only appears when nothing is listed.
+    groupNote?.let { SecondaryText(it) }
 }
 
 @Composable
