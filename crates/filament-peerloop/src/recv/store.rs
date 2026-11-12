@@ -640,7 +640,9 @@ mod receive_history_tests {
         let mut held = vec![("a".into(), "s-a".into()), ("b".into(), "s-b".into())];
         assert_eq!(
             store.prune_held(&mut held),
-            ["s-b".to_string()].into_iter().collect()
+            ["s-b".to_string()]
+                .into_iter()
+                .collect::<std::collections::HashSet<String>>()
         );
         assert_eq!(held, vec![("a".to_string(), "s-a".to_string())]);
 
