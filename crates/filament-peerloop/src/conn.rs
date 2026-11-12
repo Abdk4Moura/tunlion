@@ -1134,6 +1134,14 @@ fn buffered_offer_signal(pid: &str, offer: BufferedOffer) -> Value {
         data["ch"] = json!(c);
     }
     json!({ "from": pid, "data": data })
+/// The SDP payloads a building WebRTC candidate consumes: a session
+/// description or an ICE candidate. `envelope` is the server-stamped signal
+/// (`{from, data}`); only these kinds are ever staged for a build.
+fn is_candidate_sdp_signal(envelope: &Value) -> bool {
+    matches!(
+        envelope["data"]["type"].as_str(),
+        Some("description") | Some("candidate")
+    )
 }
 
 /// One prepared establish that has done only loop-local work: guards, role,
@@ -3858,7 +3866,17 @@ impl Conn {
     /// signal handler. The candidate is named by the server-stamped envelope
     /// `from`; a payload's `to`/`from` is peer-controlled data and is never
     /// used to choose a build.
+    ///
+    /// Only the candidate's own SDP traffic (`description`/`candidate`) is
+    /// staged: it is the one kind that needs the peer connection being built.
+    /// Everything else (transport-hint, transport-offer, PAKE, identity,
+    /// not-recognized, ...) returns false and takes the normal handler NOW. Held
+    /// here it was invisible for the whole build and was discarded with the
+    /// build when the build was cancelled.
     pub fn stage_signal(&mut self, data: &Value) -> bool {
+        if !is_candidate_sdp_signal(data) {
+            return false;
+        }
         let Some(pid) = data["from"].as_str() else {
             return false;
         };
@@ -11663,6 +11681,65 @@ mod warm_identity_tests {
         assert!(conn.links.contains_key(pid), "the candidate was not installed");
         assert!(offers.is_empty(), "an offer from an older generation was replayed");
         assert!(!conn.buffered_offers.contains_key(pid));
+    /// P5: a build stages ONLY its own SDP traffic. A transport-hint,
+    /// transport-offer or PAKE frame from the same peer is handed straight
+    /// back to the caller's normal handler, so cancelling the build cannot
+    /// take it down with the staged SDP.
+    #[tokio::test]
+    async fn a_build_stages_only_sdp_and_cancel_keeps_other_frames() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-stage-sdp";
+        conn.builds.insert(pid.to_string(), build_state(3));
+        let non_sdp = [
+            json!({ "from": pid, "data": { "type": "transport-hint", "direct": false } }),
+            json!({ "from": pid, "data": { "type": "transport-offer", "v": 1, "addrs": [] } }),
+            json!({ "from": pid, "data": { "type": "pake-msg", "msg": "x" } }),
+            json!({ "from": pid, "data": { "type": "pake-confirm", "mac": "x" } }),
+        ];
+        for frame in &non_sdp {
+            assert!(
+                !conn.stage_signal(frame),
+                "a non-SDP frame was parked for the build: {frame}"
+            );
+        }
+        assert!(conn.stage_signal(&json!({
+            "from": pid,
+            "data": { "type": "description", "description": { "type": "offer", "sdp": "v=0" } }
+        })));
+        assert!(conn.stage_signal(&json!({
+            "from": pid,
+            "data": { "type": "candidate", "candidate": { "candidate": "candidate:1" } }
+        })));
+        assert_eq!(conn.builds[pid].signals.len(), 2, "only the SDP payloads are staged");
+        assert!(
+            conn.builds[pid]
+                .signals
+                .iter()
+                .all(|v| matches!(v["data"]["type"].as_str(), Some("description") | Some("candidate"))),
+            "a non-SDP frame reached the build's staging area"
+        );
+        // A deferred intent follows the same rule.
+        let other = "sid-stage-deferred";
+        let plan = conn
+            .prepare_build(
+                json!({ "id": other, "name": "peer" }),
+                None,
+                std::panic::Location::caller(),
+                Replace::NeverLive,
+            )
+            .expect("prepare")
+            .expect("plan");
+        conn.build_deferred.insert(other.to_string(), (plan, Instant::now()));
+        assert!(!conn.stage_signal(&json!({ "from": other, "data": { "type": "transport-offer" } })));
+        assert!(conn.stage_signal(&json!({ "from": other, "data": { "type": "candidate" } })));
+        assert_eq!(conn.build_deferred[other].0.signals.len(), 1);
+        // Cancelling the build discards only the staged SDP; every non-SDP frame
+        // was already returned to its handler and still is after the cancel.
+        conn.cancel_build(pid);
+        assert!(!conn.builds.contains_key(pid));
+        for frame in &non_sdp {
+            assert!(!conn.stage_signal(frame), "a frame was held after the cancel");
+        }
     }
 
     /// A dropped/replaced link's queued candidate events are discarded, not
