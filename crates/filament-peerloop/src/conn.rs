@@ -3520,7 +3520,11 @@ impl Conn {
         }
         // Room adoption can select this target after its asynchronous build
         // captured active_on_apply. Keep that current selection across the
-        // old-link cleanup, which also clears the active slot.
+        // old-link cleanup, which also clears the active slot. The restore
+        // below is driven ONLY by facts true at install time (this selection,
+        // or a caller's `note_active` intent). `active_on_apply` was captured
+        // at plan time and is stale: another target selected while this one
+        // built must keep the slot.
         let selected_while_building = self.is_active(&built.peer_id);
         self.drop_link(&built.peer_id);
         if webrtc_only {
@@ -3557,12 +3561,19 @@ impl Conn {
                 host: self.host.clone(),
             },
         );
-        if built.active_on_apply || pending_active || selected_while_building {
+        if pending_active || selected_while_building {
             self.active = Some(built.peer_id.clone());
         }
+        // `planned_active` is diagnostic only: the plan-time selection, shown
+        // beside the install-time outcome so a stolen or lost slot is visible.
         self.log.debug(&format!(
-            "tunlion: ESTABLISH peer={} caller={} early={} signals={}",
-            built.peer_id, built.caller, early.len(), signals.len()
+            "tunlion: ESTABLISH peer={} caller={} early={} signals={} planned_active={} active={}",
+            built.peer_id,
+            built.caller,
+            early.len(),
+            signals.len(),
+            built.active_on_apply,
+            self.is_active(&built.peer_id)
         ));
         for ev in early {
             let _ = self.tx.send(ev);
@@ -11297,6 +11308,230 @@ mod warm_identity_tests {
             "data": { "to": pid, "type": "description" }
         })));
         assert_eq!(conn.builds[pid].signals.len(), 1);
+    }
+
+    /// P1: `active_on_apply` is a plan-time snapshot. A target selected while
+    /// peer A's candidate builds keeps the slot when A installs; only an
+    /// install-time fact (A still selected, or a caller's `note_active` for A)
+    /// gives A the slot.
+    #[tokio::test]
+    async fn a_stale_planned_selection_does_not_steal_the_active_slot() {
+        async fn candidate(conn: &Conn, pid: &str, generation: u32) -> BuiltPeer {
+            let peer = net::Peer::connect(
+                pid.to_string(),
+                conn.my_uid.clone(),
+                true,
+                Vec::new(),
+                false,
+                conn.sio.clone(),
+                conn.tx.clone(),
+                generation,
+            )
+            .await
+            .expect("local candidate");
+            let source = peer.source();
+            BuiltPeer {
+                peer_id: pid.to_string(),
+                generation,
+                source,
+                peer,
+                info: json!({ "id": pid, "name": "peer-a" }),
+                name: "peer-a".to_string(),
+                uid: None,
+                carried_secret: None,
+                // A was the selection when its build was planned.
+                active_on_apply: true,
+                replace: Replace::NeverLive,
+                caller: std::panic::Location::caller(),
+                prior_generation: None,
+            }
+        }
+        let (mut conn, _far, _rx) = test_conn().await;
+        let a = "sid-a-building";
+        let b = "sid-b-selected";
+
+        // 1. B is selected while A builds: A's install must not take the slot.
+        conn.builds.insert(a.to_string(), build_state(31));
+        conn.current_intent.insert(a.to_string(), 31);
+        conn.active = Some(b.to_string());
+        let built = candidate(&conn, a, 31).await;
+        conn.apply_built_peer(built);
+        assert!(conn.links.contains_key(a), "A's candidate was not installed");
+        assert!(conn.is_active(b), "A's stale planned selection stole B's slot");
+        assert!(!conn.is_active(a));
+
+        // 2. A caller's install-time intent for A still restores A. (A fresh
+        //    candidate each time: a NeverLive install refuses beside a live
+        //    link, so drop the previous one first.)
+        conn.drop_link(a);
+        conn.builds.insert(a.to_string(), build_state(32));
+        conn.current_intent.insert(a.to_string(), 32);
+        conn.active = Some(b.to_string());
+        conn.note_active(a);
+        let built = candidate(&conn, a, 32).await;
+        conn.apply_built_peer(built);
+        assert!(conn.is_active(a), "a pending_active intent was not restored on install");
+        assert!(!conn.pending_active.contains(a), "the intent outlived its install");
+
+        // 3. A still selected while it builds keeps the slot across the
+        //    old-link cleanup inside the install.
+        conn.drop_link(a);
+        conn.builds.insert(a.to_string(), build_state(33));
+        conn.current_intent.insert(a.to_string(), 33);
+        conn.active = Some(a.to_string());
+        let built = candidate(&conn, a, 33).await;
+        conn.apply_built_peer(built);
+        assert!(conn.is_active(a), "the current selection was lost across install");
+    }
+
+    /// P5: a build stages ONLY its own SDP traffic. A transport-hint,
+    /// transport-offer or PAKE frame from the same peer is handed straight
+    /// back to the caller's normal handler, so cancelling the build cannot
+    /// take it down with the staged SDP.
+    #[tokio::test]
+    async fn a_build_stages_only_sdp_and_cancel_keeps_other_frames() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-stage-sdp";
+        conn.builds.insert(pid.to_string(), build_state(3));
+        let non_sdp = [
+            json!({ "from": pid, "data": { "type": "transport-hint", "direct": false } }),
+            json!({ "from": pid, "data": { "type": "transport-offer", "v": 1, "addrs": [] } }),
+            json!({ "from": pid, "data": { "type": "pake-msg", "msg": "x" } }),
+            json!({ "from": pid, "data": { "type": "pake-confirm", "mac": "x" } }),
+        ];
+        for frame in &non_sdp {
+            assert!(
+                !conn.stage_signal(frame),
+                "a non-SDP frame was parked for the build: {frame}"
+            );
+        }
+        assert!(conn.stage_signal(&json!({
+            "from": pid,
+            "data": { "type": "description", "description": { "type": "offer", "sdp": "v=0" } }
+        })));
+        assert!(conn.stage_signal(&json!({
+            "from": pid,
+            "data": { "type": "candidate", "candidate": { "candidate": "candidate:1" } }
+        })));
+        assert_eq!(conn.builds[pid].signals.len(), 2, "only the SDP payloads are staged");
+        assert!(
+            conn.builds[pid]
+                .signals
+                .iter()
+                .all(|v| matches!(v["data"]["type"].as_str(), Some("description") | Some("candidate"))),
+            "a non-SDP frame reached the build's staging area"
+        );
+        // A deferred intent follows the same rule.
+        let other = "sid-stage-deferred";
+        let plan = conn
+            .prepare_build(
+                json!({ "id": other, "name": "peer" }),
+                None,
+                std::panic::Location::caller(),
+                Replace::NeverLive,
+            )
+            .expect("prepare")
+            .expect("plan");
+        conn.build_deferred.insert(other.to_string(), (plan, Instant::now()));
+        assert!(!conn.stage_signal(&json!({ "from": other, "data": { "type": "transport-offer" } })));
+        assert!(conn.stage_signal(&json!({ "from": other, "data": { "type": "candidate" } })));
+        assert_eq!(conn.build_deferred[other].0.signals.len(), 1);
+        // Cancelling the build discards only the staged SDP; every non-SDP frame
+        // was already returned to its handler and still is after the cancel.
+        conn.cancel_build(pid);
+        assert!(!conn.builds.contains_key(pid));
+        for frame in &non_sdp {
+            assert!(!conn.stage_signal(frame), "a frame was held after the cancel");
+        }
+    }
+
+    /// P4: a transport-offer that arrived while the peer had neither a pending
+    /// nor a link (its candidate was still building) is buffered. Installing
+    /// the link must replay it once, under that pid, through the driver's
+    /// ordinary signal path; the old-link cleanup inside the install used to
+    /// discard it, so the offer was never answered.
+    #[tokio::test]
+    async fn a_buffered_offer_is_replayed_once_when_its_link_installs() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let pid = "sid-buffered-offer";
+        let other = "sid-other-offer";
+        conn.buffered_offers.insert(
+            pid.to_string(),
+            (
+                vec!["10.0.0.2:4433".to_string()],
+                Some("203.0.113.7:5000".to_string()),
+                None,
+                2,
+                Some("chan-fleet".to_string()),
+            ),
+        );
+        conn.buffered_offers
+            .insert(other.to_string(), (vec!["10.0.0.3:4433".to_string()], None, None, 1, None));
+        for generation in [5u32, 6u32] {
+            let peer = net::Peer::connect(
+                pid.to_string(),
+                conn.my_uid.clone(),
+                true,
+                Vec::new(),
+                false,
+                conn.sio.clone(),
+                conn.tx.clone(),
+                generation,
+            )
+            .await
+            .expect("local candidate");
+            let source = peer.source();
+            conn.install_built(
+                BuiltPeer {
+                    peer_id: pid.to_string(),
+                    generation,
+                    source,
+                    peer,
+                    info: json!({ "id": pid, "name": "peer" }),
+                    name: "peer".to_string(),
+                    uid: None,
+                    carried_secret: None,
+                    active_on_apply: false,
+                    replace: Replace::NeverLive,
+                    caller: std::panic::Location::caller(),
+                    prior_generation: None,
+                },
+                std::collections::VecDeque::new(),
+                std::collections::VecDeque::new(),
+                None,
+                false,
+            );
+            assert!(conn.links.contains_key(pid), "the candidate was not installed");
+            assert!(
+                !conn.buffered_offers.contains_key(pid),
+                "the replayed offer stayed buffered and could apply twice"
+            );
+            assert!(
+                conn.buffered_offers.contains_key(other),
+                "another peer's buffered offer was consumed by this install"
+            );
+            let mut replayed: Vec<Value> = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                if let Ev::Signal(v) = ev {
+                    if v["data"]["type"].as_str() == Some("transport-offer") {
+                        replayed.push(v);
+                    }
+                }
+            }
+            if generation == 5 {
+                assert_eq!(replayed.len(), 1, "the buffered offer was not replayed on install");
+                let v = &replayed[0];
+                assert_eq!(v["from"].as_str(), Some(pid), "the replay named another peer");
+                assert_eq!(v["data"]["addrs"][0].as_str(), Some("10.0.0.2:4433"));
+                assert_eq!(v["data"]["srflx"].as_str(), Some("203.0.113.7:5000"));
+                assert!(v["data"]["server_public"].is_null());
+                assert_eq!(v["data"]["proto"].as_u64(), Some(2));
+                assert_eq!(v["data"]["ch"].as_str(), Some("chan-fleet"));
+                assert!(v["data"]["probe"].is_null(), "a replay re-answered an upgrade probe");
+            } else {
+                assert!(replayed.is_empty(), "a second install replayed the offer again");
+            }
+        }
     }
 
     /// A dropped/replaced link's queued candidate events are discarded, not
