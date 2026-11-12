@@ -223,11 +223,9 @@ pub(crate) async fn run_ceremony_within(link: &mut PairLink, words: &str, namepl
                 )
                 .map_err(|why| anyhow!("pairing REFUSED: {why}"))?;
                 peer_cert = Some(cert);
-                if cer.peer_acks_expose() {
-                    if let Some(of) = frame["nonce"].as_str() {
-                        if let Some(ack) = crate::pair_cmd::seal_expose_ack(k, of) {
-                            pair_write(&mut link.send, &ack).await?;
-                        }
+                if cer.peer_acks_expose() && !frame.nonce.is_empty() {
+                    if let Some(ack) = crate::pair_cmd::seal_expose_ack(k, &frame.nonce) {
+                        pair_write(&mut link.send, &ack).await?;
                     }
                 }
             }
