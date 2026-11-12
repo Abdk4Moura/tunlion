@@ -650,6 +650,13 @@ impl Mux {
         self.close_err.lock().await.remove(&sid)
     }
 
+    /// Observe a recorded close reason without consuming it. The bridge
+    /// watcher needs it as soon as it lands, before the trailing close send
+    /// can stall; the one-shot client still takes it later.
+    pub async fn peek_close_err(&self, sid: u32) -> Option<String> {
+        self.close_err.lock().await.get(&sid).cloned()
+    }
+
     /// Data-channel died (or a send errored): tear down EVERY live stream so no
     /// pump hangs forever waiting on a peer that will never speak again.
     pub async fn shutdown_all(&self) {
@@ -657,7 +664,9 @@ impl Mux {
         self.open_ack_tx.lock().await.clear();
         self.exec_ctl.lock().await.clear();
         self.exec_init.lock().await.clear();
-        self.close_err.lock().await.clear();
+        // Do NOT clear `close_err`: a denial that raced the transport's death
+        // must still be readable by the pump that is about to end. The map is
+        // bounded by the streams drained here and sids are not reused.
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
             if let Some(h) = s.read_pump {
