@@ -21,3 +21,7 @@ jobs:
         run: cargo test -p tunlion-peerloop chunk_attribution_fences_pairing_and_worker_dispatch -- --nocapture
       - name: Selected link chunk fencing and CLI compilation
         run: cargo test -p tunlion --bin tunlion the_selected_pump_reads_only_the_selected_transports_source -- --nocapture
+      - name: Install isolated signaling backend dependencies
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+      - name: Real temporary pairing and byte-exact service echo
+        run: cargo test -p tunlion --test pty_flows temporary_service_pairing_uses_real_transport_and_end_closes_the_socket -- --nocapture
