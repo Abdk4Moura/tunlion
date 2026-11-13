@@ -189,6 +189,46 @@ enum DirectIntent {
     Fleet,
 }
 
+/// A fleet one-shot can complete its authenticated QUIC handshake just after
+/// the direct race budget. Keep that attempt adoptable for a short grace
+/// instead of retiring it: the responder would otherwise reject the late but
+/// valid connection as `attempt retired`, close it, and the initiator would
+/// rotate to a fleet-secret WebRTC path it cannot certificate-bind.
+const FLEET_DIRECT_GRACE: Duration = Duration::from_secs(3);
+
+/// How long a direct attempt remains adoptable. The fleet one-shot gets a
+/// grace because its initiator starts racing only after receiving the
+/// responder's offer and can finish just past the normal budget.
+fn direct_pending_budget(intent: DirectIntent, holepunch_enabled: bool) -> Duration {
+    let base = if holepunch_enabled {
+        direct::DIRECT_BUDGET + holepunch::PUNCH_BUDGET + Duration::from_secs(3)
+    } else {
+        direct::DIRECT_BUDGET
+    };
+    if intent == DirectIntent::Fleet {
+        base + FLEET_DIRECT_GRACE
+    } else {
+        base
+    }
+}
+
+#[cfg(test)]
+mod direct_budget_tests {
+    use super::*;
+
+    #[test]
+    fn a_fleet_pending_outlives_the_one_shot_handshake() {
+        assert_eq!(
+            direct_pending_budget(DirectIntent::Fleet, false),
+            direct::DIRECT_BUDGET + FLEET_DIRECT_GRACE
+        );
+        assert_eq!(
+            direct_pending_budget(DirectIntent::Normal, false),
+            direct::DIRECT_BUDGET
+        );
+    }
+}
+
 /// Which existing link an establish may replace. Two values, not a bool, so a
 /// call site says what it means.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -5068,15 +5108,10 @@ impl Conn {
         // the deadline MUST cover the WHOLE ladder, rung-1 budget + punch budget
         // + QUIC handshake slack, or the reaper would race WebRTC against an
         // in-flight punch and the route would be a coin flip. Flag-gated, so
-        // rung-1-only timing is byte-identical.
-        let deadline = if holepunch::holepunch_enabled() {
-            Instant::now()
-                + direct::DIRECT_BUDGET
-                + holepunch::PUNCH_BUDGET
-                + Duration::from_secs(3)
-        } else {
-            Instant::now() + direct::DIRECT_BUDGET
-        };
+        // rung-1-only timing is byte-identical. A fleet one-shot also gets a
+        // short adoption grace: its initiator starts after our offer and can
+        // arrive just past the normal budget (see `FLEET_DIRECT_GRACE`).
+        let deadline = Instant::now() + direct_pending_budget(intent, holepunch::holepunch_enabled());
         if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
             self.log.debug(&format!(
                 "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
