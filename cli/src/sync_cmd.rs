@@ -682,9 +682,14 @@ mod tests {
         Ev::Sourced { pid: "boxb".into(), source, inner: Box::new(inner) }
     }
 
-    /// The direct reader delivers the ack and stream frames source-tagged.
-    /// From the selected transport both are accepted; from another source (a
-    /// losing candidate) neither is, not even an ack naming our sid.
+    /// The direct reader delivers the ack source-tagged (`Ev::Sourced {
+    /// Control }`); from the selected transport it is accepted, from another
+    /// source (a losing candidate) it is not, even naming our sid.
+    ///
+    /// The chunks here are SYNTHETIC tagged chunks. The real QUIC and WebRTC
+    /// readers emit `Ev::Chunk` untagged (direct.rs, net.rs), which the gate
+    /// passes through, so this pins only the gate's handling of a tagged chunk.
+    /// It does not show that a losing candidate's real chunks are isolated.
     #[tokio::test]
     async fn open_ack_reads_the_selected_source_and_drops_others() {
         let selected = crate::net::SourceId::next();
@@ -732,6 +737,39 @@ mod tests {
             .await
             .expect("an untagged ack must end the wait");
         assert_eq!(got, Ok(Some("/d".to_string())));
+    }
+
+    /// The plan and file acks come back as length-prefixed JSON records on the
+    /// stream, carried in untagged chunks (the shape the real readers emit),
+    /// here split across two frames. A stale-source `l2-close` between them
+    /// must not end the read; the record must be reassembled whole.
+    #[tokio::test]
+    async fn next_json_reads_an_ack_record_across_untagged_chunks() {
+        let selected = crate::net::SourceId::next();
+        let stale = crate::net::SourceId::next();
+        let mux = l2::Mux::new(
+            Arc::new(SourcedTransport(Some(selected))),
+            crate::host_impl::cli_host(),
+        );
+        let sid = mux.alloc_sid();
+        let mut pipe = mux.register_stream(sid).await.expect("register stream");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let body = serde_json::to_vec(&json!({"type": "plan-ack", "need": ["a", "b"]})).unwrap();
+        let mut rec = (body.len() as u32).to_be_bytes().to_vec();
+        rec.extend_from_slice(&body);
+        let (head, tail) = rec.split_at(7);
+        tx.send(Ev::Chunk("boxb".into(), sid, None, Bytes::copy_from_slice(head))).unwrap();
+        tx.send(sourced(
+            stale,
+            Ev::Control("boxb".into(), json!({"type": "l2-close", "sid": sid, "err": "stale close"})),
+        ))
+        .unwrap();
+        tx.send(Ev::Chunk("boxb".into(), sid, None, Bytes::copy_from_slice(tail))).unwrap();
+        let mut recs = Records(Vec::new());
+        let v = next_json(&mut pipe, Some(&mut rx), &mux, sid, &mut recs, Duration::from_secs(5))
+            .await
+            .expect("the ack record must arrive whole despite the stale close");
+        assert_eq!(v, json!({"type": "plan-ack", "need": ["a", "b"]}));
     }
 
     /// Mid-stream, an `l2-close` for our sid ends the transfer only when it
