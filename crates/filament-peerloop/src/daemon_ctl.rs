@@ -585,9 +585,10 @@ fn log_warm_pick(conn: &Conn, peer: &str, chosen: &str) {
             continue;
         }
         conn.log.debug(&format!(
-            "warm-pick '{peer}': pid={p} chosen={} direct={} alive={} age_ms={:?} deferred_left={}",
+            "warm-pick '{peer}': pid={p} chosen={} direct={} lan={} alive={} age_ms={:?} deferred_left={}",
             p == chosen,
             l.direct,
+            l.lan_binding.is_some(),
             l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false),
             l.established_at.map(|t| t.elapsed().as_millis()),
             conn.deferred_left.contains_key(p),

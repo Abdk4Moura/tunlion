@@ -72,6 +72,12 @@ pub struct LinkObs<'a> {
     pub alive: bool,
     /// An authenticated direct (QUIC) link rather than WebRTC/relay.
     pub direct: bool,
+    /// The link came up through the LAN handshake (`Link::lan_binding`). That
+    /// handshake proves a local holder of a shared secret, not the pair binding,
+    /// so the link is born untrusted with a delegated principal, and the peer
+    /// refuses work (a forward, a shell) that its pair link to the same device
+    /// would carry. Placement ranks it below a non-LAN link of the same kind.
+    pub lan: bool,
     /// Milliseconds since the transport last moved bytes either way.
     pub idle_ms: u64,
     /// Milliseconds since the link was established (`Link::established_at`).
@@ -117,8 +123,11 @@ pub fn eligible(l: &LinkObs<'_>, peer: &str) -> bool {
 /// Place `work` for `peer` on the given links. Pure.
 ///
 /// Every eligible link qualifies; a direct one is preferred over a relayed one
-/// (P6). Among links of the same kind the LONGEST-LIVED one wins. That is the
-/// durability rule: a one-shot `exec` client opens a fresh link to the same
+/// (P6). Among links of the same kind a non-LAN link beats a LAN one whatever
+/// their ages (P8): both may reach the device, but only the pair link carries
+/// the authority the peer checks, so the LAN link is a refusal waiting to
+/// happen whenever the pair link is also up. Then the LONGEST-LIVED one wins.
+/// That is the durability rule: a one-shot `exec` client opens a fresh link to the same
 /// device and proves the same identity, so without a lifetime preference it can
 /// be selected (HashMap order is `last-equal`) and then close under the work it
 /// was given. Nothing in `Link` says whether it was dialled by a daemon or by a
@@ -133,6 +142,8 @@ pub fn place(_work: Work, peer: &str, links: &[LinkObs<'_>]) -> Placement {
         .max_by(|a, b| {
             a.direct
                 .cmp(&b.direct)
+                // Reversed: `false` (not LAN) must rank higher.
+                .then_with(|| b.lan.cmp(&a.lan))
                 .then_with(|| age_rank(a).cmp(&age_rank(b)))
                 // Reversed so `max_by` picks the SMALLEST pid on a full tie.
                 .then_with(|| b.pid.cmp(a.pid))
@@ -334,6 +345,7 @@ mod tests {
             has_transport: true,
             alive: true,
             direct: false,
+            lan: false,
             idle_ms: 0,
             age_ms: Some(0),
         }
@@ -352,6 +364,57 @@ mod tests {
             place(Work::Interactive, "laptop", &[lan]),
             Placement::Reuse { pid: "lan".into() }
         );
+    }
+
+    #[test]
+    fn a_pair_link_beats_an_older_lan_link_to_the_same_device() {
+        // Shape from the net-blockers and forward-refusal CI runs: two live
+        // direct links to bravo, the LAN one 42 ms older. Age picked the LAN
+        // link and bravo refused the forward ("denied"). Both orders, and the
+        // LAN link made far older, so neither iteration nor age can decide.
+        let mut lan = obs("lan-6daee5532e971aa3", Some("bravo"));
+        lan.direct = true;
+        lan.lan = true;
+        lan.age_ms = Some(900_000);
+        let mut pair = obs("YZr4lvfHwQ8A9RLlAAAJ", Some("bravo"));
+        pair.direct = true;
+        pair.age_ms = Some(6_441);
+        for links in [[lan.clone(), pair.clone()], [pair.clone(), lan.clone()]] {
+            assert_eq!(
+                place(Work::Interactive, "bravo", &links),
+                Placement::Reuse { pid: "YZr4lvfHwQ8A9RLlAAAJ".into() }
+            );
+        }
+        // Reached only by its LAN reservation (not identity-known), the same.
+        lan.identity_known = false;
+        lan.verified_name = None;
+        lan.lan_device_name = Some("bravo");
+        for links in [[lan.clone(), pair.clone()], [pair.clone(), lan.clone()]] {
+            assert_eq!(
+                place(Work::Interactive, "bravo", &links),
+                Placement::Reuse { pid: "YZr4lvfHwQ8A9RLlAAAJ".into() }
+            );
+        }
+    }
+
+    #[test]
+    fn a_lan_link_is_still_used_when_it_is_the_only_one_or_the_only_direct_one() {
+        // The LAN rank orders links, it never makes one ineligible, and it sits
+        // below P6: a direct LAN link still beats a relayed pair link.
+        let mut lan = obs("lan", Some("bravo"));
+        lan.direct = true;
+        lan.lan = true;
+        assert_eq!(
+            place(Work::Interactive, "bravo", &[lan.clone()]),
+            Placement::Reuse { pid: "lan".into() }
+        );
+        let relay = obs("relay", Some("bravo"));
+        for links in [[lan.clone(), relay.clone()], [relay.clone(), lan.clone()]] {
+            assert_eq!(
+                place(Work::Interactive, "bravo", &links),
+                Placement::Reuse { pid: "lan".into() }
+            );
+        }
     }
 
     #[test]
