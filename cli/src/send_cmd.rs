@@ -868,6 +868,12 @@ pub(crate) async fn send_cmd(
     let mut offered_to: Option<String> = None;
     // Progress while waiting on the peer (send_liveness::still_waiting_line).
     let mut last_heartbeat = Instant::now();
+    // A receiver frozen mid-transfer keeps its signaling presence, so no
+    // peer-left arrives and the rejoin window never opens. Its data link goes
+    // silent instead. Bound that silence by the same rejoin window, so the
+    // sender fails honestly instead of waiting forever (gate 11 measured 90 s
+    // and still alive).
+    let mut link_down_since: Option<Instant> = None;
     let mut remedy_said = false;
     let peer_label = known_target
         .as_ref()
@@ -881,6 +887,37 @@ pub(crate) async fn send_cmd(
 
     loop {
         conn.pump_builds();
+        let rejoin_window = conn.rejoin.rejoin_window;
+        let link_down = conn
+            .active
+            .as_ref()
+            .and_then(|p| conn.transport_of(p))
+            .map(|t| {
+                let silent = t.heard_ms();
+                !t.is_alive()
+                    || t.is_dead()
+                    || silent == Some(u64::MAX)
+                    || silent.is_some_and(|ms| ms > rejoin_window.as_millis() as u64)
+            })
+            .unwrap_or(false);
+        if link_down {
+            let unfinished = outgoing.lock().await.iter().any(|o| !o.done && !o.declined);
+            if unfinished {
+                let since = *link_down_since.get_or_insert_with(Instant::now);
+                if since.elapsed() > rejoin_window {
+                    ui::clear_sticky();
+                    let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                    bail!(crate::send_liveness::receiver_gone_message(
+                        rejoin_window.as_secs(),
+                        use_code && known_target.is_none(),
+                    ));
+                }
+            } else {
+                link_down_since = None;
+            }
+        } else {
+            link_down_since = None;
+        }
         // Never a silent minute: while the peer has not connected, or has
         // stopped answering mid-send, say so every few seconds. Not while a
         // code waits to be typed, and not while a person there is deciding.
@@ -1265,6 +1302,9 @@ pub(crate) async fn send_cmd(
                             p["id"].as_str().unwrap_or_default(),
                             CodePeerEvent::Adoption,
                         ) {
+                            if let Some(ceremony) = pake_peer.as_deref() {
+                                let _ = conn.code_reconnect_kept(ceremony, p["uid"].as_str());
+                            }
                             continue;
                         }
                         conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done)).await?;
@@ -1291,6 +1331,9 @@ pub(crate) async fn send_cmd(
                             p["id"].as_str().unwrap_or_default(),
                             CodePeerEvent::Adoption,
                         ) {
+                            if let Some(ceremony) = pake_peer.as_deref() {
+                                let _ = conn.code_reconnect_kept(ceremony, p["uid"].as_str());
+                            }
                             continue;
                         }
                         conn.maybe_adopt_from(p, adopt_wants_active(code_used, use_code, pake_done), AdoptSource::Digest)
@@ -1444,6 +1487,13 @@ pub(crate) async fn send_cmd(
                     v["id"].as_str().unwrap_or_default(),
                     CodePeerEvent::Adoption,
                 ) {
+                    // A same-device reconnect while the authenticated link is
+                    // alive is kept deliberately (#28), not silently ignored.
+                    // A dead one is refused: a spent code cannot be handed to
+                    // a replacement receiver.
+                    if let Some(ceremony) = pake_peer.as_deref() {
+                        let _ = conn.code_reconnect_kept(ceremony, v["uid"].as_str());
+                    }
                     continue;
                 }
                 conn.maybe_adopt(&v, adopt_wants_active(code_used, use_code, pake_done)).await?;
@@ -1508,8 +1558,19 @@ pub(crate) async fn send_cmd(
                 }
             }
             Ev::Signal(v) => {
-                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
+                // A spent code authorizes exactly the peer its PAKE ceremony
+                // confirmed. A late transport offer or control frame from a
+                // different sid must not build a link, and must not keep the
+                // send alive past its rejoin window: gate 11 measured the
+                // sender still retrying after 90 s because a replacement
+                // receiver's offers kept resetting activity. This is the same
+                // rule the event filter applies to Control/ChannelReady, now
+                // applied before a signal can be staged for a build.
+                if use_code && pake_done && pake_peer.as_deref() != Some(from.as_str()) {
+                    continue;
+                }
+                if conn.stage_signal(&v) { continue; }
                 let data = v["data"].clone();
                 // A browser's PeerLink sends its transport hint BEFORE any SDP.
                 // Apply it first so a WebRTC-only peer does not sit out the
@@ -1597,9 +1658,15 @@ pub(crate) async fn send_cmd(
                                 peer_proto,
                             );
                         } else {
-                            conn.buffered_offers.insert(
-                                from.clone(),
-                                (cands, srflx, peer_server_public, peer_proto),
+                            conn.buffer_offer(
+                                &from,
+                                (
+                                    cands,
+                                    srflx,
+                                    peer_server_public,
+                                    peer_proto,
+                                    data["ch"].as_str().map(String::from),
+                                ),
                             );
                         }
                     }
@@ -2003,6 +2070,20 @@ pub(crate) async fn send_cmd(
                 // The post-PAKE promotion's handoff (crate::conn, `handoff`).
                 Some("path-promote" | "path-promoted" | "path-declined" | "path-stay") => {
                     let _ = conn.on_promote_control(&pid, &v).await;
+                    // The remember offer is sent when the file is accepted,
+                    // which can be just BEFORE a direct-path handoff. The old
+                    // single send was then read on neither path and the
+                    // receiver never stored its half (gate 14). The new
+                    // transport is current now, so re-offer on it. Idempotent:
+                    // the receiver stores a repeated secret without a suffix,
+                    // and only the ceremony peer is allowed to answer.
+                    if !remember_acked {
+                        if let (Some((_, secret)), Some(peer)) =
+                            (remember_offer.as_ref(), pake_peer.as_deref())
+                        {
+                            let _ = offer_pair_keep(&conn, peer, secret).await;
+                        }
+                    }
                 }
                 // Fleet target: the peer's certificate. The fleet secret proved
                 // it is IN the fleet; this proves WHICH member. The device key it
