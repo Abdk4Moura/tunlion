@@ -1071,7 +1071,13 @@ export function useTunlion() {
 
   const acceptTransfer = useCallback((transferId) => {
     const peerId = transferOwner.current.get(transferId)
-    linksRef.current.get(peerId)?.acceptTransfer(transferId)
+    const link = linksRef.current.get(peerId)
+    if (!link) return
+    const recordId = provenRef.current.get(peerId)
+    const record = link._proven && recordId && devicesLoad().find((d) => d.id === recordId)
+    // Explicit consent can accept a fresh transfer from anyone, but may only
+    // reuse old bytes when the current link proves the same remembered record.
+    link.acceptTransfer(transferId, record ? { id: record.id, secret: record.secret } : null)
   }, [])
 
   const declineTransfer = useCallback((transferId) => {

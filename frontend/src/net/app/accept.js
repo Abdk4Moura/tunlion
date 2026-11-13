@@ -38,7 +38,11 @@ export async function acceptIfCurrent(link, id, snapshot, opts) {
     const { now: currentNow, ...afterFacts } = after.facts
     if (JSON.stringify({ ...after, facts: afterFacts }) !== token) return false
     if (currentNow !== now) continue
-    link.acceptTransfer(id)
+    // Only a live, proved remembered record can bind a partial to a peer.
+    // A one-time code authenticates this session, not a durable identity.
+    const owner = after.facts.proven && after.recordId && after.secret
+      ? { id: after.recordId, secret: after.secret } : null
+    link.acceptTransfer(id, owner)
     return true
   }
   return false
