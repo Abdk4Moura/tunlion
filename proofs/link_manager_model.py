@@ -13,14 +13,18 @@ Placement
   P4  never places work on a relay link quiet past the stale window
       (a possible NAT/relay zombie), while a quiet direct link stays usable;
   P5  reuses whenever any eligible link exists (no needless cold dial);
-  P6  prefers a direct link whenever an eligible one exists;
+  P6  prefers a direct link whenever an eligible one of the same LAN-ness
+      exists;
   P7  among eligible links of the same kind and LAN-ness, takes the
       longest-lived and breaks a full tie by the smallest pid (a one-shot exec
       link must not displace the older daemon link; iteration order must not
       decide);
-  P8  among eligible links of the same kind, a non-LAN link beats a LAN one
-      whatever their ages (a LAN link carries no pair authority, so the peer
-      refuses a forward its pair link would carry).
+  P8  for interactive work (it needs the peer's trusted grant) a non-LAN link
+      beats a LAN one whatever their route or age, so a capability-less direct
+      LAN link never outranks a relayed pair link; a LAN link is still placed
+      when it is the only usable one.
+
+The model checks `Work::Interactive`, the only placement caller today.
 
 Upgrade verify (run over every tick sequence up to a bound)
   U1  never upgrades on the first look at a standby;
@@ -68,14 +72,15 @@ def eligible(link, peer):
 
 
 def rank(link):
-    return (int(link["direct"]), int(not link["lan"]), link["age"])
+    # Interactive work: authority (not LAN) first, then route, then age.
+    return (int(not link["lan"]), int(link["direct"]), link["age"])
 
 
 def place(peer, links):
     eligible_links = [l for l in links if eligible(l, peer)]
     if not eligible_links:
         return ("establish", None)
-    # Mirror `max_by`: direct first, then not-LAN, then longest-lived (age),
+    # Mirror `max_by`: not-LAN first, then direct, then longest-lived (age),
     # then the pid tie-break (Rust reverses the pid comparison so the smallest
     # wins).
     top = max(rank(l) for l in eligible_links)
@@ -114,11 +119,11 @@ def check_placement():
             assert chosen["identity_known"], ("P2", links)
             assert chosen["has_transport"] and chosen["alive"], ("P3", links)
             assert chosen["direct"] or chosen["idle"] < STALE, ("P4", links)
-            if any(eligible(l, "laptop") and l["direct"] for l in links):
+            if any(eligible(l, "laptop") and l["direct"]
+                   and l["lan"] == chosen["lan"] for l in links):
                 assert chosen["direct"], ("P6", links)
-            # P8: a non-LAN link of the winner's kind always beats a LAN one.
-            if any(eligible(l, "laptop") and l["direct"] == chosen["direct"]
-                   and not l["lan"] for l in links):
+            # P8: any eligible non-LAN link beats every LAN one.
+            if any(eligible(l, "laptop") and not l["lan"] for l in links):
                 assert not chosen["lan"], ("P8", links)
             # P7: the winner is the longest-lived link of its kind and LAN-ness,
             # and a full tie resolves to the smallest pid (not the last one seen).
@@ -152,6 +157,15 @@ def check_placement():
     lan_link = dict(daemon, lan=True, age=6_483, pid="lan")
     for links in ([lan_link, pair], [pair, lan_link]):
         assert place("laptop", links) == ("reuse", "pair"), "P8 pair over LAN"
+    # P8 across routes: a direct LAN link does not outrank a relayed pair link.
+    relayed_pair = dict(pair, direct=False, age=24, pid="relay")
+    direct_lan = dict(lan_link, age=900_000)
+    for links in ([direct_lan, relayed_pair], [relayed_pair, direct_lan]):
+        assert place("laptop", links) == ("reuse", "relay"), "P8 relayed pair over direct LAN"
+    # P8 keeps a LAN link usable when the pair link is not (a quiet relay).
+    stale_pair = dict(relayed_pair, idle=STALE)
+    for links in ([direct_lan, stale_pair], [stale_pair, direct_lan]):
+        assert place("laptop", links) == ("reuse", "lan"), "P8 LAN when only usable"
     return checked
 
 

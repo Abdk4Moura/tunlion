@@ -1808,9 +1808,10 @@ const LOCAL_TCP_TRANSPORT: bool = false;
 
 /// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, or
 /// on an exact authenticated LAN DEVICE reservation that is still the current
-/// store's binding) to a warm, alive link, preferring a direct one, then a
-/// non-LAN one (a LAN link carries no pair authority, so the peer refuses work
-/// its pair link would carry), and then the longest-lived (so a fresh one-shot
+/// store's binding) to a warm, alive link, preferring a non-LAN one (a LAN link
+/// carries no pair authority, so the peer refuses work its pair link would
+/// carry, even when the LAN link is direct), then a direct one, and then the
+/// longest-lived (so a fresh one-shot
 /// `exec` link cannot displace the daemon's stable link). The single resolver for every warm-reuse op (open + pty), so
 /// the eligibility rule lives in exactly one place. A miss means the caller
 /// falls back to a fresh establish, which is correct. Routing only: permission
