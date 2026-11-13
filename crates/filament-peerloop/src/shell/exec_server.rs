@@ -196,6 +196,18 @@ async fn end_session_tree(
     for r in readers {
         r.abort();
     }
+    stop_session_tree(child, first, first_already_sent, why, log).await
+}
+
+/// Stop remaining group members without aborting output readers. A signalled
+/// leader can exit before its descendants, which still hold the output pipes.
+async fn stop_session_tree(
+    child: &mut dyn ExecChild,
+    first: TreeSignal,
+    first_already_sent: bool,
+    why: &str,
+    log: &dyn LogSink,
+) -> Option<i32> {
     let mut gone = false;
     for (step, &sig) in ladder(first).iter().enumerate() {
         // A signal the initiator forwarded moments ago is not sent twice: the
@@ -241,6 +253,7 @@ async fn end_session_tree(
 /// in [`handle_exec_open`]; the ticker below re-reads the STORE each tick.
 #[derive(Clone)]
 pub struct ExecSessionAuthz {
+    pub terminal_scope: Option<crate::shell_gate::TerminalSessionScope>,
     pub dev_name: Option<String>,
     pub idev: Option<[u8; 32]>,
     pub policy_allows: bool,
@@ -449,6 +462,16 @@ pub async fn serve_exec(
     loop {
         tokio::select! {
             status = child.wait() => {
+                if forwarded.is_some() && child.group_alive() {
+                    // The leader's INT trap may have exited while a background
+                    // child ignored INT. End that child BEFORE waiting for pipe
+                    // EOF, or the output drain prevents us handling l2-close.
+                    // Preserve both the leader's status and already-written tail.
+                    stop_session_tree(
+                        child.as_mut(), TreeSignal::Terminate, false,
+                        "signalled command exited with descendants", log.as_ref(),
+                    ).await;
+                }
                 let out_bytes = out_task.await.unwrap_or(0);
                 let err_bytes = err_task.await.unwrap_or(0);
                 let mut close = json!({ "type": "exec-close", "sid": sid, "out_bytes": out_bytes, "err_bytes": err_bytes });
@@ -639,13 +662,13 @@ pub async fn serve_exec(
                 // Revocation and the delegated deadline, from the one live
                 // re-check every serving loop shares.
                 let cut = host.live_session_cut(authz.idev.as_ref());
-                let grant_gone = match authz.dev_name.as_deref() {
+                let grant_gone = authz.terminal_scope.as_ref().map(|scope| scope.withdrawn(host.as_ref())).unwrap_or_else(|| match authz.dev_name.as_deref() {
                     Some(n) => {
                         host.device_capability_denied(n, "shell")
                             || !(authz.policy_allows || host.device_allows(n, "shell"))
                     }
                     None => false,
-                };
+                });
                 // A ceiling narrowed under a ceiling-admitted session ends
                 // it (re-read fresh; grant-admitted sessions ignore this).
                 let ceiling_gone = authz.admitted_via_ceiling
@@ -890,6 +913,7 @@ pub async fn handle_exec_open(
         .unwrap_or(false);
     let idev = device_pub;
     let authz = ExecSessionAuthz {
+        terminal_scope: Some(crate::shell_gate::TerminalSessionScope::capture(conn, pid, shell_policy)),
         dev_name,
         idev,
         policy_allows,
@@ -1026,6 +1050,7 @@ mod tests {
         stderr: Option<Box<dyn AsyncRead + Unpin + Send>>,
         exit: ExecExit,
         alive: bool,
+        group_stops_on_terminate: bool,
         signals: Arc<Mutex<Vec<TreeSignal>>>,
     }
 
@@ -1043,6 +1068,7 @@ mod tests {
                 })),
                 exit,
                 alive: true,
+                group_stops_on_terminate: false,
                 signals: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -1073,8 +1099,29 @@ mod tests {
             true
         }
         fn group_alive(&self) -> bool {
-            self.alive
+            self.alive && !(self.group_stops_on_terminate
+                && self.signals.lock().unwrap().iter().any(|sig| {
+                    matches!(sig, TreeSignal::Terminate | TreeSignal::Kill)
+                }))
         }
+    }
+
+    #[tokio::test]
+    async fn exited_signal_trap_does_not_leave_a_child_holding_output_open() {
+        let mut child = FakeChild::new(b"tail", b"", ExecExit { code: Some(130), signal: None });
+        child.group_stops_on_terminate = true;
+        assert_eq!(child.wait().await.unwrap().wire_code(), Some(130));
+        assert!(child.group_alive(), "leader exit is not group exit");
+        let status = stop_session_tree(
+            &mut child, TreeSignal::Terminate, false,
+            "signalled command exited with descendants", &crate::host::NoLog,
+        ).await;
+        assert_eq!(status, Some(130));
+        assert!(!child.group_alive());
+        assert_eq!(*child.signals.lock().unwrap(), vec![TreeSignal::Terminate]);
+        let mut output = Vec::new();
+        child.take_stdout().unwrap().read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, b"tail", "cleanup must not abort the output reader");
     }
 
     /// A process primitive with scripted facts and a captured spawn request.
@@ -1202,6 +1249,7 @@ mod tests {
                 ExecSessionAuthz {
                     dev_name: Some("phone".into()),
                     idev: None,
+                    terminal_scope: None,
                     policy_allows: true,
                     admitted_via_ceiling: false,
                 },

@@ -632,6 +632,7 @@ impl AgreementEngine {
             let _stderr = stderr;
             let exec_ctl = mux.register_exec_ctl(sid).await;
             let authority = crate::shell::exec_server::ExecSessionAuthz {
+                terminal_scope: None,
                 dev_name: None,
                 idev: None,
                 policy_allows: false,
@@ -723,7 +724,7 @@ impl AgreementEngine {
             let session_id = format!("agreement\u{1}{id}\u{1}{sid:#x}");
             let session = match attach_pty(
                 &mux, mux.transport(), sid, session_id.clone(), request.cols, request.rows,
-                request.term, argv, None, false, backend.as_ref(),
+                request.term, argv, None, false, None, backend.as_ref(),
                 || account.revalidate().map_err(|error| error.to_string()),
             ).await {
                 Ok(session) => session,

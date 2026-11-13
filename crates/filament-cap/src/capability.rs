@@ -1444,11 +1444,296 @@ impl GateDecision {
     }
 }
 
+/// Why a transfer was refused. Structured instead of a bare string so the
+/// adapter that owns the wording (CLI refusal messages, Core status text) can
+/// render it without re-deciding the policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferDeny {
+    Revoked,
+    Denied,
+    Ceiling,
+    Expired { at: u64 },
+    AnonymousOutOfBounds,
+    AnonymousNoConsent,
+    FleetNeedsGrant,
+    Unauthorized(String),
+    /// Shadow mode refused a legacy-denied open with no capability reason to
+    /// name. The effective decision is Deny with no operator reason.
+    ShadowLegacy,
+}
+
+impl TransferDeny {
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            TransferDeny::Revoked => Some("device revoked".into()),
+            TransferDeny::Denied => Some("explicitly denied by owner (deniedCaps)".into()),
+            TransferDeny::Ceiling => {
+                Some("this capability is outside the device's invitation ceiling".into())
+            }
+            TransferDeny::Expired { at } => Some(format!("access expired at {at}")),
+            TransferDeny::AnonymousOutOfBounds => Some(
+                "anonymous code transfer must land inside the receiver's inbox".into(),
+            ),
+            TransferDeny::AnonymousNoConsent => {
+                Some("anonymous code peer has no transfer consent".into())
+            }
+            TransferDeny::FleetNeedsGrant => Some(
+                "fleet device: action needs an explicit grant (deliberate tier or out of scope)"
+                    .into(),
+            ),
+            TransferDeny::Unauthorized(reason) => {
+                if reason.is_empty() {
+                    Some("transfer not authorized".into())
+                } else {
+                    Some(reason.clone())
+                }
+            }
+            TransferDeny::ShadowLegacy => None,
+        }
+    }
+}
+
+/// One transfer decision, plus the observability facts the CLI's counters and
+/// shadow log need. The policy is entirely here; adapters only render it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferDecision {
+    pub allowed: bool,
+    pub deny: Option<TransferDeny>,
+    /// The post-compose capability outcome (same-owner fleet recomputation and
+    /// the proven/expired composers applied). Counter bucketing uses this.
+    pub observable_outcome: CapOutcome,
+    pub fleet_ok: bool,
+    pub ceiling_ok: bool,
+}
+
+impl TransferDecision {
+    fn allow(observable_outcome: CapOutcome, fleet_ok: bool, ceiling_ok: bool) -> Self {
+        Self {
+            allowed: true,
+            deny: None,
+            observable_outcome,
+            fleet_ok,
+            ceiling_ok,
+        }
+    }
+    fn deny(
+        deny: TransferDeny,
+        observable_outcome: CapOutcome,
+        fleet_ok: bool,
+        ceiling_ok: bool,
+    ) -> Self {
+        Self {
+            allowed: false,
+            deny: Some(deny),
+            observable_outcome,
+            fleet_ok,
+            ceiling_ok,
+        }
+    }
+    pub fn allowed(&self) -> bool {
+        self.allowed
+    }
+    pub fn deny_reason(&self) -> Option<String> {
+        self.deny.as_ref().and_then(TransferDeny::reason)
+    }
+}
+
+/// Explicit inputs for the single transfer policy. `same_owner` is the
+/// certificate-derived fact (`own_user_pub == peer user_pub`), never a claimed
+/// name. `now` is seconds since the epoch.
+pub struct TransferGateInput<'a> {
+    pub authoritative: bool,
+    pub legacy_allowed: bool,
+    pub outcome: &'a CapOutcome,
+    pub cert_revoked: bool,
+    pub denied: bool,
+    pub auth_key_caps: Option<&'a [String]>,
+    pub cert_expires: Option<u64>,
+    pub now: u64,
+    pub same_owner: bool,
+    pub binding: BindingStrength,
+    pub scoped_in_bounds: bool,
+    pub has_explicit_grant: bool,
+    pub ceiling_authorizes: bool,
+    pub identity_state: IdentityState,
+}
+
+/// THE transfer allow/deny policy. CLI, Core and any future client must call
+/// this instead of composing their own transfer gate. (The pre-existing
+/// `transfer_gate_decision` below is the renderer for a finished GateDecision,
+/// not a policy.)
+pub fn transfer_decision(input: &TransferGateInput<'_>) -> TransferDecision {
+    let TransferGateInput {
+        authoritative,
+        legacy_allowed,
+        outcome,
+        cert_revoked,
+        denied,
+        auth_key_caps,
+        cert_expires,
+        now,
+        same_owner,
+        binding,
+        scoped_in_bounds,
+        has_explicit_grant,
+        ceiling_authorizes,
+        identity_state,
+    } = *input;
+
+    // An explicitly anonymous peer answered identity-unavailable after the
+    // ceremony/consent selected it. It has no key to revoke, and the consent
+    // authorizes a bounded transfer only.
+    if identity_state == IdentityState::ExplicitlyUnavailableAnonymous {
+        if cert_revoked {
+            return TransferDecision::deny(
+                TransferDeny::Revoked,
+                outcome.clone(),
+                false,
+                false,
+            );
+        }
+        if denied {
+            return TransferDecision::deny(
+                TransferDeny::Denied,
+                outcome.clone(),
+                false,
+                false,
+            );
+        }
+        if !scoped_in_bounds {
+            return TransferDecision::deny(
+                TransferDeny::AnonymousOutOfBounds,
+                outcome.clone(),
+                false,
+                false,
+            );
+        }
+        return if legacy_allowed {
+            TransferDecision::allow(outcome.clone(), false, false)
+        } else {
+            TransferDecision::deny(
+                TransferDeny::AnonymousNoConsent,
+                outcome.clone(),
+                false,
+                false,
+            )
+        };
+    }
+
+    if cert_revoked {
+        return TransferDecision::deny(TransferDeny::Revoked, outcome.clone(), false, false);
+    }
+
+    // A delegated principal's composed deadline is absolute in both modes.
+    if auth_key_caps.is_some() {
+        if let Some(at) = cert_expires {
+            if now >= at {
+                return TransferDecision::deny(
+                    TransferDeny::Expired { at },
+                    outcome.clone(),
+                    false,
+                    false,
+                );
+            }
+        }
+    }
+
+    if let Some(caps) = auth_key_caps {
+        if !caps.iter().any(|c| c.eq_ignore_ascii_case(CAP_TRANSFER)) {
+            return TransferDecision::deny(TransferDeny::Ceiling, outcome.clone(), false, false);
+        }
+    }
+
+    if denied {
+        return TransferDecision::deny(TransferDeny::Denied, outcome.clone(), false, false);
+    }
+
+    let fleet_ok = fleet_auto_trust(same_owner, binding, scoped_in_bounds, !cert_revoked);
+    let ceiling_ok =
+        ceiling_authorizes && same_owner && binding == BindingStrength::Proven && !cert_revoked;
+    let base_outcome = if same_owner {
+        if fleet_ok || ceiling_ok || has_explicit_grant {
+            CapOutcome::Authorized
+        } else {
+            CapOutcome::Denied(
+                "fleet device: action needs an explicit grant (deliberate tier or out of scope)"
+                    .into(),
+            )
+        }
+    } else {
+        outcome.clone()
+    };
+    let composed = cap_authorize_proven(&base_outcome, binding, authoritative);
+    let composed = cap_authorize_expired(&composed, cert_expires, authoritative);
+    let fleet_allow = !denied
+        && (fleet_ok || (authoritative && ceiling_ok))
+        && matches!(
+            cap_authorize_expired(&CapOutcome::Authorized, cert_expires, true),
+            CapOutcome::Authorized
+        );
+    let effective = fleet_allow
+        || if authoritative {
+            matches!(composed, CapOutcome::Authorized)
+        } else {
+            legacy_allowed
+        };
+    if effective {
+        return TransferDecision::allow(composed, fleet_ok, ceiling_ok);
+    }
+    if authoritative {
+        let reason = match &composed {
+            CapOutcome::Denied(reason) => reason.clone(),
+            CapOutcome::Unprovisioned => {
+                "resource unprovisioned (no capability header); run tunlion grant/init".to_string()
+            }
+            CapOutcome::Authorized => String::new(),
+        };
+        TransferDecision::deny(
+            TransferDeny::Unauthorized(reason),
+            composed,
+            fleet_ok,
+            ceiling_ok,
+        )
+    } else {
+        TransferDecision::deny(
+            TransferDeny::ShadowLegacy,
+            composed,
+            fleet_ok,
+            ceiling_ok,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingStrength {
     None,
     Proven,
     Inferred,
+}
+
+/// The identity fact a link carries at gate time.
+///
+/// `Pending` and `Resolved` are the ordering states the #161 probe guards: a
+/// legacy-trusted open must never be decided while identity resolution is
+/// merely unfinished. `ExplicitlyUnavailableAnonymous` is different in kind:
+/// the peer answered our possession challenge with `identity-unavailable`
+/// AFTER a one-time code ceremony or an explicit local transfer consent
+/// (`-y`/daemon room acceptance) selected it, so the absence of a certificate
+/// is a fact, not a race. Only a transfer consents to that class; every other
+/// action remains denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdentityState {
+    /// Not resolved yet, or the peer never answered. Fail closed: hold, then
+    /// deny, rather than decide with revocation unknowable.
+    #[default]
+    Pending,
+    /// The link carries a device certificate (Inferred or Proven).
+    Resolved,
+    /// The peer explicitly said it holds no certificate, after the one-time
+    /// code ceremony or the operator's explicit room consent selected it. That
+    /// consent is the authority; revocation cannot be consulted because there
+    /// is no device identity to consult.
+    ExplicitlyUnavailableAnonymous,
 }
 
 /// A delegated principal CANNOT exist without its caps ceiling — the compiler
@@ -4298,5 +4583,162 @@ mod frozen_protocol_literals {
             let got: String = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
             assert_eq!(got, digest, "frozen protocol literal {name} changed");
         }
+    }
+}
+
+#[cfg(test)]
+mod transfer_decision_tests {
+    use super::*;
+
+    fn input<'a>(
+        outcome: &'a CapOutcome,
+        authoritative: bool,
+        legacy_allowed: bool,
+    ) -> TransferGateInput<'a> {
+        TransferGateInput {
+            authoritative,
+            legacy_allowed,
+            outcome,
+            cert_revoked: false,
+            denied: false,
+            auth_key_caps: None,
+            cert_expires: None,
+            now: 1_000,
+            same_owner: false,
+            binding: BindingStrength::None,
+            scoped_in_bounds: true,
+            has_explicit_grant: false,
+            ceiling_authorizes: false,
+            identity_state: IdentityState::Resolved,
+        }
+    }
+
+    #[test]
+    fn anonymous_transfer_is_bounded_and_consent_only() {
+        let outcome = CapOutcome::Denied("no header".into());
+        let mut gate = input(&outcome, false, true);
+        gate.identity_state = IdentityState::ExplicitlyUnavailableAnonymous;
+        assert!(transfer_decision(&gate).allowed);
+
+        gate.legacy_allowed = false;
+        assert_eq!(
+            transfer_decision(&gate).deny,
+            Some(TransferDeny::AnonymousNoConsent)
+        );
+
+        gate.legacy_allowed = true;
+        gate.scoped_in_bounds = false;
+        assert_eq!(
+            transfer_decision(&gate).deny,
+            Some(TransferDeny::AnonymousOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn pending_identity_is_not_the_anonymous_class() {
+        let outcome = CapOutcome::Denied("no header".into());
+        let mut gate = input(&outcome, true, true);
+        gate.identity_state = IdentityState::Pending;
+        let d = transfer_decision(&gate);
+        assert!(!d.allowed, "authoritative pending must fail closed");
+        gate.identity_state = IdentityState::ExplicitlyUnavailableAnonymous;
+        assert!(
+            transfer_decision(&gate).allowed,
+            "only explicit unavailable is anonymous"
+        );
+    }
+
+    #[test]
+    fn revocation_and_local_deny_outrank_consent() {
+        let outcome = CapOutcome::Denied("no header".into());
+        let mut gate = input(&outcome, false, true);
+        gate.cert_revoked = true;
+        assert_eq!(transfer_decision(&gate).deny, Some(TransferDeny::Revoked));
+        gate.cert_revoked = false;
+        gate.denied = true;
+        assert_eq!(transfer_decision(&gate).deny, Some(TransferDeny::Denied));
+    }
+
+    #[test]
+    fn delegated_ceiling_and_expiry_are_absolute() {
+        let outcome = CapOutcome::Authorized;
+        let caps = vec!["transfer".to_string()];
+        let mut gate = input(&outcome, false, true);
+        gate.auth_key_caps = Some(&caps);
+        gate.cert_expires = Some(999);
+        assert_eq!(
+            transfer_decision(&gate).deny,
+            Some(TransferDeny::Expired { at: 999 })
+        );
+        gate.cert_expires = Some(2_000);
+        let mount_only = vec!["mount".to_string()];
+        gate.auth_key_caps = Some(&mount_only);
+        assert_eq!(transfer_decision(&gate).deny, Some(TransferDeny::Ceiling));
+    }
+
+    #[test]
+    fn shadow_uses_legacy_and_authoritative_uses_the_cap_outcome() {
+        let denied = CapOutcome::Denied("denied".into());
+        let mut gate = input(&denied, false, true);
+        gate.identity_state = IdentityState::Resolved;
+        assert!(transfer_decision(&gate).allowed, "shadow legacy allow");
+        gate.authoritative = true;
+        assert_eq!(
+            transfer_decision(&gate).deny,
+            Some(TransferDeny::Unauthorized("denied".into()))
+        );
+    }
+
+    #[test]
+    fn a_proven_same_owner_sibling_gets_the_scoped_default_in_both_modes() {
+        let denied = CapOutcome::Denied("denied".into());
+        let mut gate = input(&denied, true, false);
+        gate.same_owner = true;
+        gate.binding = BindingStrength::Proven;
+        gate.scoped_in_bounds = true;
+        gate.cert_expires = Some(u64::MAX);
+        assert!(transfer_decision(&gate).allowed);
+        gate.authoritative = false;
+        assert!(transfer_decision(&gate).allowed);
+        gate.binding = BindingStrength::Inferred;
+        assert!(!transfer_decision(&gate).allowed);
+    }
+
+    #[test]
+    fn the_enrolment_ceiling_is_authoritative_only_for_the_decision() {
+        let denied = CapOutcome::Denied("denied".into());
+        let mut gate = input(&denied, true, false);
+        gate.same_owner = true;
+        gate.binding = BindingStrength::Proven;
+        gate.scoped_in_bounds = false;
+        gate.ceiling_authorizes = true;
+        gate.cert_expires = Some(u64::MAX);
+        assert!(transfer_decision(&gate).allowed);
+        gate.authoritative = false;
+        assert_eq!(
+            transfer_decision(&gate).deny,
+            Some(TransferDeny::ShadowLegacy)
+        );
+    }
+
+    #[test]
+    fn an_explicit_fleet_grant_survives_inferred_only_where_the_policy_allows_it() {
+        let denied = CapOutcome::Denied("denied".into());
+        let mut gate = input(&denied, false, true);
+        gate.same_owner = true;
+        gate.binding = BindingStrength::Inferred;
+        gate.has_explicit_grant = true;
+        gate.cert_expires = Some(u64::MAX);
+        assert!(
+            transfer_decision(&gate).allowed,
+            "shadow still decides by legacy consent on an Inferred link"
+        );
+        gate.authoritative = true;
+        assert!(
+            !transfer_decision(&gate).allowed,
+            "authoritative fails closed on an Inferred binding"
+        );
+        gate.cert_revoked = true;
+        assert_eq!(transfer_decision(&gate).deny, Some(TransferDeny::Revoked));
     }
 }

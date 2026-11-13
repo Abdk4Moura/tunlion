@@ -258,7 +258,7 @@ else
 fi
 
 # ---------------------------------------------------------------- gate 2 ----
-say "2: chaos — receiver killed mid-transfer, replacement resumes (C4/C6/C7)"
+say "2: chaos: receiver killed mid-transfer, fresh code resumes (C4/C6/C7)"
 D="$WORK/g2"; mkdir -p "$D"
 # TUNLION_TEST_TRANSFER_STALL_MS: the kill below has to land MID-transfer.
 # Once two processes of one install stopped falling back to WebRTC after the
@@ -266,8 +266,9 @@ D="$WORK/g2"; mkdir -p "$D"
 # 0.5s poll, and the receiver finished before it could be killed (measured:
 # "delivered" at 160 MB/s). 3ms per chunk stretches it to ~5s, the same remedy
 # and the same arithmetic as gate 11b.
+G2ROOM="g2room$$"
 TUNLION_TEST_TRANSFER_STALL_MS=${TUNLION_TEST_TRANSFER_STALL_MS:-3} \
-  "$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g2-send.log" 2>&1 &
+  "$BIN" send "$BIG" --word "$CODE_WORD" --room "$G2ROOM" --server "$SERVER" >"$WORK/g2-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g2-send.log") || { bad "kill-resume (no code minted)"; tail -n 3 "$WORK/g2-send.log"; }
 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv1.log" 2>&1 &
@@ -297,25 +298,47 @@ if [ "$G2SZ" -eq 0 ]; then
   bad "kill-resume: no partial file to resume from (receiver wrote nothing, or cleaned up on exit)"
   tail -n 3 "$WORK/g2-recv1.log" 2>/dev/null
 fi
-sleep 2
-# The "resuming at" line is a DEBUG (resilience-internal) message, so the
-# replacement receiver runs with -v to surface it for the assertion below. The
-# resume itself is verbosity-independent (the sender re-offers from the saved
-# offset); -v only makes the proof visible.
-timeout 180 "$BIN" -v receive -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv2.log" 2>&1
+# A claimed code cannot authorize a different receiver. The interrupted send
+# must fail honestly, and the spent code must stay burned. Resume is a fresh
+# send and fresh authenticated claim into the same folder, not a room bypass.
+# Adversarial: a non-ceremony peer joins the sender's own room while the
+# authentic receiver is dead. It has no PAKE claim on this code, so it must
+# receive nothing; only a fresh send with a fresh code can move the partial.
+D2="$WORK/g2-replacement"; mkdir -p "$D2"
+timeout 60 "$BIN" receive -y --dir "$D2" --room "$G2ROOM" --server "$SERVER" >"$WORK/g2-roompeer.log" 2>&1 &
+R2=$!; pids+=($R2)
+bounded_wait $SP 60 "interrupted code sender" "$WORK/g2-send.log"; RCS1=$?
+timeout 30 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g2-replay.log" 2>&1
+RCREPLAY=$?
+G2ROOMPEER=$(ls -A "$D2" 2>/dev/null | tr '\n' ' ')
+kill -9 $R2 2>/dev/null; wait $R2 2>/dev/null
+G2AUTH=0
+if [ $RCS1 -eq 6 ] && [ $RCREPLAY -ne 0 ] && [ $RCREPLAY -ne 124 ] \
+   && grep -q "code rejected" "$WORK/g2-replay.log" \
+   && [ -z "$G2ROOMPEER" ] \
+   && [ "$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)" -eq "$G2SZ" ]; then
+  G2AUTH=1
+fi
+G2WORD="gentle-dolphin"
+"$BIN" send "$BIG" --word "$G2WORD" --server "$SERVER" >"$WORK/g2-resend.log" 2>&1 &
+SP=$!; pids+=($SP)
+W2=$(wait_code "$WORK/g2-resend.log" "$G2WORD") || { bad "kill-resume (no fresh code minted)"; tail -n 3 "$WORK/g2-resend.log"; }
+# The resume proof is DEBUG; verbosity does not change resume behavior.
+timeout 180 "$BIN" -v receive "$W2" -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv2.log" 2>&1
 RC2=$?
 # BOUNDED. This was a bare `wait $SP`, and a sender whose event loop had parked
 # on its dead receiver never exited, so the job hung until it was cancelled at
 # 90 minutes (ten cancelled Gates Core runs on 2026-10-09/10, every one in this
 # gate). The replacement receiver has already finished or timed out here; a
 # sender still running a minute later is wedged.
-bounded_wait $SP 60 "kill-resume sender" "$WORK/g2-send.log" "$WORK/g2-recv2.log"; RCS=$?
+bounded_wait $SP 60 "kill-resume sender" "$WORK/g2-resend.log" "$WORK/g2-recv2.log"; RCS=$?
 if [ $RCS -eq 124 ]; then
   bad "kill-resume: sender still running 60s after the replacement receiver finished (wedged, state above)"
-elif [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
+elif [ "$G2AUTH" -eq 1 ] && [ "$W2" != "$W" ] \
+   && [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
    && grep -q "resuming at" "$WORK/g2-recv2.log"; then
   ok "kill-resume: replacement receiver resumed, hash matches"
-else bad "kill-resume"; tail -n 4 "$WORK/g2-send.log" "$WORK/g2-recv2.log"; fi
+else bad "kill-resume"; tail -n 4 "$WORK/g2-send.log" "$WORK/g2-replay.log" "$WORK/g2-resend.log" "$WORK/g2-recv2.log"; fi
 
 # --------------------------------------------------------------- gate 2b ----
 # The half of gate 2 that was never asserted: the receiver is killed mid-transfer
@@ -622,17 +645,15 @@ elif [ $WITH_RELAY -eq 1 ]; then
 fi
 
 # --------------------------------------------------------------- gate 11 ----
-say "11: same-uid rejoin supersede (C6) — frozen receiver replaced by same device"
-D="$WORK/g11"; mkdir -p "$D"
-# #28: the same-uid supersede preserves an actively flowing link (a live
-# signaling reconnect must not tear down a transfer) and also preserves a
-# quiet-but-alive idle link. A frozen receiver is different: it has a transfer
-# in flight and no bytes are moving, so it still supersedes. We pin the idle
-# threshold low and sleep past it after the freeze to keep the stall signal
-# deterministic regardless of how fast the replacement joins.
-# -v on the sender: "superseding old link" is a DEBUG (resilience-internal) line.
-# The freeze must land mid-transfer; see gate 2 for the stall.
-TUNLION_ADOPT_ACTIVE_MS=500 TUNLION_TEST_TRANSFER_STALL_MS=${TUNLION_TEST_TRANSFER_STALL_MS:-3} \
+say "11: spent code — a same-uid replacement receiver gets nothing"
+D="$WORK/g11"; D2="$WORK/g11-replacement"; mkdir -p "$D" "$D2"
+# The spent code authorizes exactly the peer whose PAKE ceremony confirmed
+# (5709eb28e). A later signaling peer is not that receiver even when it claims
+# the same install uid: same-uid supersede was removed deliberately because a
+# different process can set the uid. The replacement must receive NOTHING and
+# the sender must fail honestly with the partial kept. The flowing-link keep
+# (#28) is gate 11b; this gate is the dead-link half.
+TUNLION_TEST_TRANSFER_STALL_MS=${TUNLION_TEST_TRANSFER_STALL_MS:-3} \
   "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g11-send.log") || { bad "uid supersede (no code minted)"; tail -n 3 "$WORK/g11-send.log"; }
@@ -643,24 +664,29 @@ for _ in $(seq 1 60); do
   [ "$sz" -gt $((10 * 1024 * 1024)) ] && break
   sleep 0.5
 done
-# Freeze (don't kill): the server lease stays alive, so when the replacement
-# with the SAME uid joins, the sender must take the supersede path, not the
-# peer-left path.
+# Freeze (don't kill): the server lease stays alive, so the replacement with
+# the SAME uid joins while the ceremony peer is still present but not moving.
 kill -STOP $R1 2>/dev/null
-sleep 3   # > TUNLION_ADOPT_ACTIVE_MS so the frozen link reads as idle (#28)
-# -v on the replacement: "resuming at" is a DEBUG (resilience-internal) line.
-TUNLION_UID="samedevice$$" timeout 180 "$BIN" -v receive -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
+sleep 3
+# The replacement is a never-authenticated room listener. It must store nothing.
+TUNLION_UID="samedevice$$" timeout 60 "$BIN" receive -y --dir "$D2" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
 RC2=$?
 # bounded wait: a hung sender must fail the gate, not the whole suite
 RCS=99
-for _ in $(seq 1 60); do kill -0 $SP 2>/dev/null || { wait $SP; RCS=$?; break; }; sleep 1; done
+for _ in $(seq 1 90); do kill -0 $SP 2>/dev/null || { wait $SP; RCS=$?; break; }; sleep 1; done
 kill -9 $SP 2>/dev/null
 kill -9 $R1 2>/dev/null
-if [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
-   && grep -q "superseding old link" "$WORK/g11-send.log" \
-   && grep -q "resuming at" "$WORK/g11-recv2.log"; then
-  ok "same-uid supersede: sender swapped links, transfer resumed, hash matches"
-else bad "uid supersede"; tail -n 4 "$WORK/g11-send.log" "$WORK/g11-recv2.log"; fi
+REPLACEMENT="$(ls -A "$D2" 2>/dev/null | tr '\n' ' ')"
+if [ $RCS -ne 0 ] && [ -z "$REPLACEMENT" ] \
+   && grep -qE "receiver is unreachable|could not come back" "$WORK/g11-send.log" \
+   && [ ! -f "$D/big.bin" ] \
+   && [ "$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)" -gt $((10 * 1024 * 1024)) ]; then
+  ok "spent code: replacement receiver got nothing, sender failed honestly"
+else
+  bad "uid supersede"
+  echo "  replacement dir: [$REPLACEMENT] sender exit $RCS, replacement exit $RC2"
+  tail -n 4 "$WORK/g11-send.log" "$WORK/g11-recv2.log"
+fi
 
 # -------------------------------------------------------------- gate 11b ----
 # The inverse of gate 11 (#28): when the same device reconnects its signaling
@@ -1063,11 +1089,27 @@ DA="$H_DIR/a"; mkdir -p "$DA"
 "$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g18ba-send.log" 2>&1 &
 SPA=$!; pids+=($SPA)
 WA=$(wait_code "$WORK/g18ba-send.log") || { bad "gate-18b Mode B (no code minted)"; tail -n 3 "$WORK/g18ba-send.log"; }
-( sleep 6; kill -9 $SPA 2>/dev/null ) &   # sender departs after delivering the file
+# Depart only AFTER the receiver verified the file. A fixed six-second kill
+# sometimes interrupted the handshake or transfer, testing a missing file
+# instead of post-completion churn. The receiver's original 30s bound remains.
+modeb_depart_after_delivery() {
+  local sender="$1" receiver="$2" log="$3" i
+  for i in $(seq 1 300); do
+    grep -q 'small.bin verified (whole-file sha256 matched), acked' "$log" && break
+    kill -0 "$receiver" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -9 "$sender" 2>/dev/null
+}
 TUNLION_TEST_DISABLE_MODEB_DROP=1 TUNLION_TEST_CHURN_AFTER_COMPLETE=1 \
   TUNLION_TEST_DROP_PEER_LEFT=1 TUNLION_QUIET_EXIT_SECS=2 \
-  timeout 30 "$BIN" -v receive "$WA" -y --dir "$DA" --server "$SERVER" </dev/null >"$WORK/g18ba-recv.log" 2>&1
+  timeout 30 "$BIN" -v receive "$WA" -y --dir "$DA" --server "$SERVER" </dev/null >"$WORK/g18ba-recv.log" 2>&1 &
+R18A=$!; pids+=($R18A)
+modeb_depart_after_delivery "$SPA" "$R18A" "$WORK/g18ba-recv.log" &
+K18A=$!; pids+=($K18A)
+wait "$R18A"
 RCA=$?
+wait "$K18A" 2>/dev/null
 kill -9 $SPA 2>/dev/null; wait $SPA 2>/dev/null
 # Baseline MUST hang (RC=124) yet still have the bytes on disk (it's the EXIT
 # that's broken, not the transfer) and show the flap, never a clean drop.
@@ -1081,10 +1123,14 @@ DB="$H_DIR/b"; mkdir -p "$DB"
 SPB=$!; pids+=($SPB)
 WB=$(wait_code "$WORK/g18bb-send.log") || { bad "gate-18b Mode B (no code minted)"; tail -n 3 "$WORK/g18bb-send.log"; }
 T0=$(date +%s)
-( sleep 6; kill -9 $SPB 2>/dev/null ) &
 TUNLION_TEST_CHURN_AFTER_COMPLETE=1 TUNLION_TEST_DROP_PEER_LEFT=1 TUNLION_QUIET_EXIT_SECS=2 \
-  timeout 30 "$BIN" -v receive "$WB" -y --dir "$DB" --server "$SERVER" </dev/null >"$WORK/g18bb-recv.log" 2>&1
+  timeout 30 "$BIN" -v receive "$WB" -y --dir "$DB" --server "$SERVER" </dev/null >"$WORK/g18bb-recv.log" 2>&1 &
+R18B=$!; pids+=($R18B)
+modeb_depart_after_delivery "$SPB" "$R18B" "$WORK/g18bb-recv.log" &
+K18B=$!; pids+=($K18B)
+wait "$R18B"
 RCB=$?
+wait "$K18B" 2>/dev/null
 T1=$(date +%s)
 kill -9 $SPB 2>/dev/null; wait $SPB 2>/dev/null
 if [ "$base_ok" = "1" ] && [ $RCB -eq 0 ] \
