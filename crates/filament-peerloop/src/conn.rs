@@ -53,7 +53,7 @@ use crate::link_manager::{LinkObs, Placement, Work, peer_present, place};
 use crate::present::{NoScreen, Presentation};
 use crate::resilience;
 use crate::test_hooks;
-use filament_cap::capability::{BindingStrength, PrincipalKind};
+use filament_cap::capability::{BindingStrength, IdentityState, PrincipalKind};
 use filament_transport::direct;
 use filament_transport::net::{self, Ev, Peer, Transport};
 
@@ -232,10 +232,20 @@ const MAX_BUILD_EVENT_BYTES: usize = 256 * 1024;
 const MAX_BUILD_SIGNALS: usize = 64;
 const MAX_BUILD_SIGNAL_BYTES: usize = 256 * 1024;
 /// Terminal-drain tombstones and inbound registrations are bounded. New direct
-/// attempts fail closed when full; a tombstone is never evicted early.
+/// attempts fail closed when full.
 const MAX_RETIRED_ATTEMPTS: usize = 16;
 /// A candidate that never completes is reaped, not left to a detached timer.
 const BUILD_REAP_GRACE: Duration = Duration::from_secs(30);
+/// A retired attempt's readiness producer must be terminal before its drain
+/// barrier is enqueued. That producer can itself hang on a socket that never
+/// answers; waiting forever left 16 tombstones in place and every later direct
+/// attempt was refused ("retirement drain capacity full"), which turns one
+/// stuck build into a permanent direct-path outage. Abort and drain after this.
+const RETIRED_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+/// Even if the drain event is lost, a tombstone older than this cannot still be
+/// protecting a live producer: the budget above already aborted it. Reaping at
+/// 2x the budget keeps the cap from ever wedging the path permanently.
+const RETIRED_TOMBSTONE_TTL: Duration = Duration::from_secs(60);
 /// Direct attempts that expired at the same time are handed to the caller one
 /// per call, not as a batch. The fallback caller awaits a full WebRTC establish
 /// for each entry, and that establish can take up to the ICE config budget plus
@@ -517,6 +527,11 @@ pub struct Link {
     pub identity_user_pub: Option<[u8; 32]>,
     /// Binding strength of the identity fields (set alongside them).
     pub identity_binding: BindingStrength,
+    /// Whether the identity fields are Pending, Resolved, or the peer
+    /// explicitly answered that it holds no certificate after the code
+    /// ceremony. The gate distinguishes an unfinished resolution (must hold,
+    /// then fail closed) from an explicit anonymous code peer (transfer only).
+    pub identity_state: IdentityState,
     /// Identity cert expiry (unix seconds). None = no cert resolved.
     pub identity_cert_expires: Option<u64>,
     /// Principal kind: OwnerDevice or Delegated { caps }. A Delegated
@@ -611,6 +626,7 @@ impl Link {
         self.identity_user_pub = Some(owner_pub);
         self.identity_device_pub = Some(device_pub);
         self.identity_binding = BindingStrength::Proven;
+        self.identity_state = IdentityState::Resolved;
         self.identity_cert_expires = Some(expires);
         self.principal_kind = PrincipalKind::FleetSibling;
     }
@@ -662,6 +678,7 @@ impl Link {
         self.identity_user_pub = Some(owner_pub);
         self.identity_device_pub = Some(device_pub);
         self.identity_binding = BindingStrength::Proven;
+        self.identity_state = IdentityState::Resolved;
         self.identity_cert_expires = Some(expires);
         self.principal_kind = PrincipalKind::Delegated { caps };
         // NOTE: deliberately do NOT set self.trusted. binding=Proven satisfies
@@ -1083,6 +1100,60 @@ pub struct DirectPending {
     /// expiry, replacement) must also stop that task; otherwise it keeps
     /// advertising a direct dial we have already abandoned for several seconds.
     pub cancel: Arc<AtomicBool>,
+}
+
+/// A transport-offer held until its peer has a pending or a link:
+/// (candidates, srflx, server_public, proto, ch). `ch` is the meeting place
+/// the offer named (absent from a one-shot dialer), kept so a replay goes
+/// through the same forgotten-channel and fleet checks as the original.
+pub type BufferedOffer = (Vec<String>, Option<String>, Option<String>, u8, Option<String>);
+
+/// A buffered transport-offer together with what this end knew about its peer
+/// at the moment it was buffered. The install-time replay (`install_built`)
+/// reads these to tell the one offer it exists for (the peer's dial that
+/// arrived before ANY link for it, while its first candidate was building)
+/// from the offers it must never replay: a re-emit of an offer an earlier link
+/// already answered, or an offer staged under an older build generation.
+#[derive(Clone, Debug)]
+pub struct StagedOffer {
+    pub offer: BufferedOffer,
+    /// `current_intent` for the pid when the offer was buffered: the build
+    /// generation that was in flight (or the installed link's), `None` when no
+    /// intent existed yet.
+    pub intent: Option<u32>,
+    /// A link (live or not) already existed for the pid when the offer was
+    /// buffered, so the offer belongs to that link's incarnation.
+    pub linked: bool,
+}
+
+/// Rebuild the server envelope of a buffered transport-offer so a replay is
+/// handled by the driver's ordinary `Ev::Signal` transport-offer arm. `from`
+/// is the pid the offer was buffered under, never a payload field, so a replay
+/// cannot be attributed to another peer. `probe` is deliberately not carried:
+/// the upgrade-probe answer already ran when the offer first arrived.
+fn buffered_offer_signal(pid: &str, offer: BufferedOffer) -> Value {
+    let (cands, srflx, server_public, proto, ch) = offer;
+    let mut data = json!({ "type": "transport-offer", "v": 1, "proto": proto, "addrs": cands });
+    if let Some(s) = srflx {
+        data["srflx"] = json!(s);
+    }
+    if let Some(s) = server_public {
+        data["server_public"] = json!(s);
+    }
+    if let Some(c) = ch {
+        data["ch"] = json!(c);
+    }
+    json!({ "from": pid, "data": data })
+}
+
+/// The SDP payloads a building WebRTC candidate consumes: a session
+/// description or an ICE candidate. `envelope` is the server-stamped signal
+/// (`{from, data}`); only these kinds are ever staged for a build.
+fn is_candidate_sdp_signal(envelope: &Value) -> bool {
+    matches!(
+        envelope["data"]["type"].as_str(),
+        Some("description") | Some("candidate")
+    )
 }
 
 /// One prepared establish that has done only loop-local work: guards, role,
@@ -1540,9 +1611,13 @@ pub struct Conn {
     pub webrtc_only: HashSet<String>,
     /// Bug 2: transport-offers that arrived before the receiver's DirectPending
     /// was created (peer's re-dial after a mid-transfer death). Same class as Bug
-    /// 1 (pre-PAKE offers): buffered here and replayed once `start_direct` creates
-    /// the pending. pid → (candidates, srflx).
-    pub buffered_offers: HashMap<String, (Vec<String>, Option<String>, Option<String>, u8)>,
+    /// 1 (pre-PAKE offers): buffered here and replayed once a pending OR a link
+    /// for that peer appears: `start_direct` replays it into the new pending,
+    /// and installing a built link re-queues it through the driver's ordinary
+    /// transport-offer handler (`install_built`). pid → (candidates, srflx,
+    /// server_public, proto, ch) plus the intent/link facts captured when it
+    /// was buffered (`StagedOffer`). Insert only through `buffer_offer`.
+    pub buffered_offers: HashMap<String, StagedOffer>,
     /// Post-PAKE promotions in progress (make-before-break; see `handoff`),
     /// keyed by peer sid. Each pairs with an ephemeral `direct_pending` entry
     /// that must survive beside the serving link until the handoff resolves.
@@ -1918,6 +1993,15 @@ impl Conn {
     pub fn is_active(&self, pid: &str) -> bool {
         self.active.as_deref() == Some(pid)
     }
+    /// The gate-relevant identity fact for `pid`. A missing link is Pending,
+    /// never anonymous: only an explicit identity-unavailable answer sets the
+    /// anonymous state, and it is stored on the link that received it.
+    pub fn identity_state_of(&self, pid: &str) -> IdentityState {
+        self.links
+            .get(pid)
+            .map(|l| l.identity_state)
+            .unwrap_or(IdentityState::Pending)
+    }
     pub fn transport(&self) -> Option<Arc<dyn Transport>> {
         self.active_link().and_then(|l| l.transport.clone())
     }
@@ -2125,6 +2209,35 @@ impl Conn {
         !self.resil.in_flight_since.contains_key(pid)
     }
 
+    /// A spent code authorizes exactly the peer its PAKE ceremony confirmed.
+    /// A same-device signaling reconnect (same install uid, new sid) is not a
+    /// replacement receiver, but it must not churn a live link either (#28):
+    /// when the code peer's link is still usable, keep it and say so. Returns
+    /// true when the reconnect was deliberately kept; false (including a dead
+    /// or stalled link) means the caller must refuse the new sid, never
+    /// supersede to it.
+    pub fn code_reconnect_kept(&self, ceremony_peer: &str, peer_uid: Option<&str>) -> bool {
+        let Some(uid) = peer_uid else {
+            return false;
+        };
+        let Some(old) = self.links.get(ceremony_peer) else {
+            return false;
+        };
+        if old.uid.as_deref() != Some(uid) {
+            return false; // a different device, not this code's receiver
+        }
+        let name = old.name.clone();
+        if self.old_link_survives_reconnect(ceremony_peer) {
+            self.log
+                .debug(&format!("{name} reconnected, keeping active link"));
+            return true;
+        }
+        self.log.debug(&format!(
+            "{name} reconnected on a spent code; refusing to replace the authenticated receiver"
+        ));
+        false
+    }
+
     /// Attach a freshly-opened channel to its link and mark the peer Ready.
     ///
     /// Every `Ev::ChannelReady` arm opened with these same few lines, copied
@@ -2325,6 +2438,21 @@ impl Conn {
             self.rejoin.waiting_rejoin = None;
         }
         Ok(self.is_active(&peer_id))
+    }
+
+    /// Buffer a transport-offer that found no pending for `pid`, recording the
+    /// peer's current intent generation and whether a link already existed.
+    /// `start_direct` replays it into the next pending unchanged; the
+    /// install-time replay (`install_built`) uses the recorded facts to replay
+    /// only an offer that predates every link of this pid and belongs to the
+    /// candidate being installed. A later offer for the same pid replaces it.
+    pub fn buffer_offer(&mut self, pid: &str, offer: BufferedOffer) {
+        let staged = StagedOffer {
+            offer,
+            intent: self.current_intent.get(pid).copied(),
+            linked: self.links.contains_key(pid),
+        };
+        self.buffered_offers.insert(pid.to_string(), staged);
     }
 
     /// A link is "live" if its primary transport or any worker is still alive,
@@ -3502,6 +3630,45 @@ impl Conn {
                 self.revoked_peers.remove(&built.peer_id);
             }
         }
+        // Room adoption can select this target after its asynchronous build
+        // captured active_on_apply. Keep that current selection across the
+        // old-link cleanup, which also clears the active slot.
+        let selected_while_building = self.is_active(&built.peer_id);
+        // A transport-offer buffered while this candidate was building (no
+        // pending and no link existed, so the driver could not arm one) must
+        // outlive the old-link cleanup below: `drop_link` clears
+        // `buffered_offers`, and nothing else would ever replay it. Take it
+        // here, before the cleanup, and requeue it once the link exists.
+        //
+        // Only for a FIRST-LINK install. Whether this pid already had a link
+        // is read here, before the cleanup removes it, never from the
+        // plan-time snapshot. An install that replaces a link (a stuck-attempt
+        // rebuild, a same-pid reconnect) keeps a single dialer: the offer was
+        // the old incarnation's, and replaying it would re-arm a direct
+        // attempt against the link this install just put up. So would an
+        // offer buffered while a link existed (a re-emit of an offer that link
+        // already answered), one staged under another build generation, or
+        // one for a peer a direct attempt already owns. Those are dropped
+        // with the old link, as before this replay existed.
+        let staged_offer = self.buffered_offers.remove(&built.peer_id);
+        let replay_offer = staged_offer.and_then(|staged| {
+            let first_link = built.replace == Replace::NeverLive
+                && !self.links.contains_key(&built.peer_id);
+            let same_intent =
+                staged.intent.is_none() || staged.intent == Some(built.generation);
+            let owned_elsewhere = self.direct_pending.contains_key(&built.peer_id);
+            if first_link && !staged.linked && same_intent && !owned_elsewhere {
+                Some(staged.offer)
+            } else {
+                self.log.debug(&format!(
+                    "dropping buffered transport-offer from {} on link install: \
+                     first_link={first_link} buffered_with_link={} intent={:?} \
+                     generation={} direct_pending={owned_elsewhere}",
+                    built.peer_id, staged.linked, staged.intent, built.generation
+                ));
+                None
+            }
+        });
         self.drop_link(&built.peer_id);
         if webrtc_only {
             self.webrtc_only.insert(built.peer_id.clone());
@@ -3531,12 +3698,13 @@ impl Conn {
                 identity_device_pub: None,
                 identity_user_pub: None,
                 identity_binding: BindingStrength::None,
+                identity_state: IdentityState::Pending,
                 identity_cert_expires: None,
                 principal_kind: PrincipalKind::OwnerDevice,
                 host: self.host.clone(),
             },
         );
-        if built.active_on_apply || pending_active {
+        if built.active_on_apply || pending_active || selected_while_building {
             self.active = Some(built.peer_id.clone());
         }
         self.log.debug(&format!(
@@ -3548,6 +3716,21 @@ impl Conn {
         }
         for signal in signals {
             let _ = self.tx.send(Ev::Signal(signal));
+        }
+        // Invariant: an offer buffered before any link or pending existed for
+        // a never-live peer is replayed once, when that peer's first link
+        // installs. Hand it back to the driver's own transport-offer arm
+        // (refusal, re-arm, answer, or buffer again), whose single-dialer and
+        // live-link guards still apply. It was removed from the map above, so
+        // it replays once, and its envelope names exactly this pid.
+        if let Some(offer) = replay_offer {
+            self.log.debug(&format!(
+                "replaying buffered transport-offer from {} on link install",
+                built.peer_id
+            ));
+            let _ = self
+                .tx
+                .send(Ev::Signal(buffered_offer_signal(&built.peer_id, offer)));
         }
     }
 
@@ -3724,7 +3907,17 @@ impl Conn {
     /// signal handler. The candidate is named by the server-stamped envelope
     /// `from`; a payload's `to`/`from` is peer-controlled data and is never
     /// used to choose a build.
+    ///
+    /// Only the candidate's own SDP traffic (`description`/`candidate`) is
+    /// staged: it is the one kind that needs the peer connection being built.
+    /// Everything else (transport-hint, transport-offer, PAKE, identity,
+    /// not-recognized, ...) returns false and takes the normal handler NOW. Held
+    /// here it was invisible for the whole build and was discarded with the
+    /// build when the build was cancelled.
     pub fn stage_signal(&mut self, data: &Value) -> bool {
+        if !is_candidate_sdp_signal(data) {
+            return false;
+        }
         let Some(pid) = data["from"].as_str() else {
             return false;
         };
@@ -4293,8 +4486,18 @@ impl Conn {
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
                     // Normal return, early return, panic/JoinError: all terminal
-                    // before the barrier is enqueued.
-                    let _ = handle.await;
+                    // before the barrier is enqueued. A producer that never
+                    // returns is aborted after the budget so one hung build
+                    // cannot fill the tombstone cap and refuse every later
+                    // direct attempt.
+                    let mut handle = handle;
+                    if tokio::time::timeout(RETIRED_DRAIN_BUDGET, &mut handle)
+                        .await
+                        .is_err()
+                    {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
                     let _ = tx.send(Ev::AttemptDrained(attempt));
                 });
             }
@@ -5078,10 +5281,18 @@ impl Conn {
             Instant::now() + direct::DIRECT_BUDGET
         };
         if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
-            self.log.debug(&format!(
-                "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
-            ));
-            return;
+            // Liveness backstop: a tombstone older than the abort budget cannot
+            // still be protecting a live producer. If its drain event was lost,
+            // reap it rather than leaving the direct path permanently refused.
+            let now = Instant::now();
+            self.retired_attempts
+                .retain(|_, retired| now.duration_since(retired.at) < RETIRED_TOMBSTONE_TTL);
+            if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
+                self.log.debug(&format!(
+                    "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
+                ));
+                return;
+            }
         }
         self.next_gen += 1;
         let auth = match intent {
@@ -5121,7 +5332,9 @@ impl Conn {
         // standby (`on_transport_offer`); upgrade probes keep their relay link.
         // Bug 2: replay any transport-offers that were buffered while we had
         // no DirectPending (the sender re-dialed after a mid-transfer death).
-        if let Some((cands, srflx, server_public, proto)) = self.buffered_offers.remove(pid) {
+        if let Some(StagedOffer { offer: (cands, srflx, server_public, proto, _ch), .. }) =
+            self.buffered_offers.remove(pid)
+        {
             self.log.debug(&format!("replaying buffered transport-offer from {pid}"));
             self.on_transport_offer(pid, cands, srflx, server_public, proto);
         }
@@ -5590,12 +5803,16 @@ impl Conn {
             for worker in old_workers {
                 worker.force_close();
             }
-            if existing
-                .transport
-                .as_ref()
-                .map(|t2| t2.is_dead())
-                .unwrap_or(true)
+            if !existing.direct
+                || existing
+                    .transport
+                    .as_ref()
+                    .map(|t2| t2.is_dead())
+                    .unwrap_or(true)
             {
+                // A live WebRTC predecessor is not the adopted direct
+                // transport. Retaining it while installing the direct source
+                // drops the incoming connection and leaves a hybrid link.
                 existing.transport = Some(t);
             }
             existing.direct = true;
@@ -5604,7 +5821,14 @@ impl Conn {
             existing.source = source;
             existing.attempt = Some(attempt);
             existing.attempts = 0;
-            if !ephemeral {
+            // A FLEET direct link is not pair-authenticated. The new-link branch
+            // below already keeps `trusted: false` and no petname until a verified
+            // fleet-hello names it; the update branch used to grant both anyway when
+            // the one-shot already had an unverified WebRTC link on this pid. That
+            // made `is_sibling_link()` false, so the target ignored the owner grant
+            // for the very device its certificate named and refused the terminal as
+            // "shell not granted".
+            if !ephemeral && !fleet {
                 existing.trusted = true;
                 if let Some((n, _)) = &expected_secret {
                     existing.verified_name = Some(n.clone());
@@ -5665,6 +5889,7 @@ impl Conn {
                     identity_device_pub: None,
                     identity_user_pub: None,
                     identity_binding: BindingStrength::None,
+                    identity_state: IdentityState::Pending,
                     identity_cert_expires: None,
                     principal_kind: if fleet || lan {
                         PrincipalKind::Delegated { caps: Vec::new() }
@@ -5945,11 +6170,24 @@ impl Conn {
         // upgrade cutover consuming it.
         // A promotion's pending is EXCLUDED too: it coexists with the serving
         // WebRTC link by design (make-before-break), and its adoption needs it.
+        // A FLEET pending is excluded while its link is still unproven for the
+        // same reason: a fleet-secret WebRTC link exposes no channel binding, so
+        // it can never carry the certificate proof a one-shot dialer must present.
+        // Reaping the direct race here retired the only attempt that could ever
+        // verify that dialer, and adopt_direct then refused the late but valid
+        // QUIC connection as `attempt retired`. The pending still dies at its
+        // deadline (the two filters above/below never leave it parked).
         let linked: Vec<String> = self
             .direct_pending
             .iter()
             .filter(|(pid, p)| {
-                !p.probe && self.links.contains_key(*pid) && !self.promotions.contains_key(*pid)
+                if p.probe || self.promotions.contains_key(*pid) {
+                    return false;
+                }
+                let Some(link) = self.links.get(*pid) else {
+                    return false;
+                };
+                !(p.fleet && !link.fleet_proven() && now < p.deadline)
             })
             .map(|(pid, _)| pid.clone())
             .collect();
@@ -6991,6 +7229,7 @@ impl Conn {
                 identity_device_pub: None,
                 identity_user_pub: None,
                 identity_binding: BindingStrength::None,
+                identity_state: IdentityState::Pending,
                 identity_cert_expires: None,
                 principal_kind: upgrade_principal(&carried).1,
                 host: self.host.clone(),
@@ -8755,6 +8994,7 @@ mod warm_identity_tests {
             identity_device_pub: None,
             identity_user_pub: None,
             identity_binding: BindingStrength::None,
+            identity_state: IdentityState::Pending,
             identity_cert_expires: None,
             principal_kind: PrincipalKind::OwnerDevice,
             host: Arc::new(crate::host::NoHost),
@@ -10553,6 +10793,62 @@ mod warm_identity_tests {
         assert!(!conn.direct_pending.contains_key(normal_pid));
     }
 
+    /// A fleet one-shot's direct race must outlive the fleet-secret WebRTC link
+    /// that lands beside it. That WebRTC link exposes no channel binding, so it
+    /// can never carry the certificate proof the one-shot must present. Reaping
+    /// the race here retired the only attempt able to prove the dialer, and
+    /// `adopt_direct` then rejected the valid QUIC connection as `attempt
+    /// retired` (the one-shot saw `direct connection closed` right after
+    /// `tunnel up`).
+    #[tokio::test]
+    async fn a_fleet_direct_attempt_outlives_its_unbound_webrtc_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-fleet-oneshot";
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        expired_direct_pending(&mut conn, pid, soon());
+        let attempt = conn.direct_pending[pid].attempt;
+
+        assert!(conn.expired_direct().is_empty(), "a live link armed a fallback");
+        assert!(
+            conn.direct_pending.contains_key(pid),
+            "the fleet race was reaped by an unproven WebRTC link"
+        );
+        assert!(
+            !conn.retired_attempts.contains_key(&attempt),
+            "the direct attempt was retired before its connection could be adopted"
+        );
+
+        // The exception is bounded by the attempt's own budget: once it has
+        // expired the pending is retired (no fallback is needed, a link exists).
+        conn.direct_pending.get_mut(pid).unwrap().deadline =
+            Instant::now() - Duration::from_millis(1);
+        assert!(conn.expired_direct().is_empty());
+        assert!(!conn.direct_pending.contains_key(pid), "an expired fleet pending leaked");
+        assert!(
+            conn.retired_attempts.contains_key(&attempt),
+            "an expired fleet attempt was not retired"
+        );
+    }
+
+    /// The fleet exception must not change the ordinary cleanup: for any other
+    /// attempt, a link that landed by another route makes the direct race
+    /// redundant and it is retired exactly as before.
+    #[tokio::test]
+    async fn a_normal_direct_attempt_is_still_reaped_by_its_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-normal-linked";
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        expired_direct_pending(&mut conn, pid, soon());
+        conn.direct_pending.get_mut(pid).unwrap().fleet = false;
+        let attempt = conn.direct_pending[pid].attempt;
+
+        assert!(conn.expired_direct().is_empty());
+        assert!(!conn.direct_pending.contains_key(pid), "a redundant direct attempt survived");
+        assert!(conn.retired_attempts.contains_key(&attempt));
+    }
+
     /// The dispatch loop's shape: one reaper call and one awaited establish per
     /// iteration, with the watchdog heartbeat stamped at the top. An establish
     /// stand-in is awaited for each fallback; with the batch capped, the
@@ -10744,6 +11040,76 @@ mod warm_identity_tests {
             "the shipping task path never installed its link"
         );
         assert!(conn.builds.is_empty());
+    }
+
+    /// Room adoption chooses its target after spawning the build. Installing
+    /// that candidate must not erase the newer choice, or ChannelReady becomes
+    /// a responder-only event and no file is ever offered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn room_target_selected_during_build_survives_installation() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-room-target";
+        test_inline::set(false);
+        let result = conn
+            .maybe_adopt(
+                &json!({ "id": pid, "name": "receiver", "uid": "cli-r-room-target" }),
+                true,
+            )
+            .await;
+        // Restore the convenience path even if the assertion below fails.
+        test_inline::set(true);
+        assert!(result.expect("room adoption"));
+        assert!(conn.is_active(pid), "adoption never selected the room target");
+        assert!(
+            !conn.links.contains_key(pid),
+            "the build was not asynchronous"
+        );
+        for _ in 0..100 {
+            conn.pump_builds();
+            if conn.links.contains_key(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            conn.links.contains_key(pid),
+            "the room candidate was not installed"
+        );
+        assert!(
+            conn.is_active(pid),
+            "installing the room candidate erased its target slot"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn installing_a_room_responder_preserves_another_target() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-room-responder";
+        conn.active = Some("selected-target".to_string());
+        test_inline::set(false);
+        let result = conn
+            .maybe_adopt(
+                &json!({ "id": pid, "name": "bystander", "uid": "cli-r-bystander" }),
+                false,
+            )
+            .await;
+        test_inline::set(true);
+        assert!(!result.expect("room responder adoption"));
+        for _ in 0..100 {
+            conn.pump_builds();
+            if conn.links.contains_key(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            conn.links.contains_key(pid),
+            "the responder candidate was not installed"
+        );
+        assert!(
+            conn.is_active("selected-target"),
+            "a responder stole another target's slot"
+        );
     }
 
     /// A failed build reports its cause, releases the slot and is retried with
@@ -11123,6 +11489,318 @@ mod warm_identity_tests {
             "data": { "to": pid, "type": "description" }
         })));
         assert_eq!(conn.builds[pid].signals.len(), 1);
+    }
+
+    /// P4: a transport-offer that arrived while the peer had neither a pending
+    /// nor a link (its candidate was still building) is buffered. Installing
+    /// the link must replay it once, under that pid, through the driver's
+    /// ordinary signal path; the old-link cleanup inside the install used to
+    /// discard it, so the offer was never answered.
+    #[tokio::test]
+    async fn a_buffered_offer_is_replayed_once_when_its_link_installs() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let pid = "sid-buffered-offer";
+        let other = "sid-other-offer";
+        conn.buffer_offer(
+            pid,
+            (
+                vec!["10.0.0.2:4433".to_string()],
+                Some("203.0.113.7:5000".to_string()),
+                None,
+                2,
+                Some("chan-fleet".to_string()),
+            ),
+        );
+        conn.buffer_offer(other, (vec!["10.0.0.3:4433".to_string()], None, None, 1, None));
+        for generation in [5u32, 6u32] {
+            let peer = net::Peer::connect(
+                pid.to_string(),
+                conn.my_uid.clone(),
+                true,
+                Vec::new(),
+                false,
+                conn.sio.clone(),
+                conn.tx.clone(),
+                generation,
+            )
+            .await
+            .expect("local candidate");
+            let source = peer.source();
+            conn.install_built(
+                BuiltPeer {
+                    peer_id: pid.to_string(),
+                    generation,
+                    source,
+                    peer,
+                    info: json!({ "id": pid, "name": "peer" }),
+                    name: "peer".to_string(),
+                    uid: None,
+                    carried_secret: None,
+                    active_on_apply: false,
+                    replace: Replace::NeverLive,
+                    caller: std::panic::Location::caller(),
+                    prior_generation: None,
+                },
+                std::collections::VecDeque::new(),
+                std::collections::VecDeque::new(),
+                None,
+                false,
+            );
+            assert!(conn.links.contains_key(pid), "the candidate was not installed");
+            assert!(
+                !conn.buffered_offers.contains_key(pid),
+                "the replayed offer stayed buffered and could apply twice"
+            );
+            assert!(
+                conn.buffered_offers.contains_key(other),
+                "another peer's buffered offer was consumed by this install"
+            );
+            let mut replayed: Vec<Value> = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                if let Ev::Signal(v) = ev {
+                    if v["data"]["type"].as_str() == Some("transport-offer") {
+                        replayed.push(v);
+                    }
+                }
+            }
+            if generation == 5 {
+                assert_eq!(replayed.len(), 1, "the buffered offer was not replayed on install");
+                let v = &replayed[0];
+                assert_eq!(v["from"].as_str(), Some(pid), "the replay named another peer");
+                assert_eq!(v["data"]["addrs"][0].as_str(), Some("10.0.0.2:4433"));
+                assert_eq!(v["data"]["srflx"].as_str(), Some("203.0.113.7:5000"));
+                assert!(v["data"]["server_public"].is_null());
+                assert_eq!(v["data"]["proto"].as_u64(), Some(2));
+                assert_eq!(v["data"]["ch"].as_str(), Some("chan-fleet"));
+                assert!(v["data"]["probe"].is_null(), "a replay re-answered an upgrade probe");
+            } else {
+                assert!(replayed.is_empty(), "a second install replayed the offer again");
+            }
+        }
+    }
+
+    /// Install a locally built candidate for `pid` the way `apply_built_peer`
+    /// does, then return every transport-offer signal the install queued.
+    async fn install_candidate_offers(
+        conn: &mut Conn,
+        rx: &mut mpsc::UnboundedReceiver<Ev>,
+        pid: &str,
+        generation: u32,
+        replace: Replace,
+        uid: Option<String>,
+    ) -> Vec<Value> {
+        let peer = net::Peer::connect(
+            pid.to_string(),
+            conn.my_uid.clone(),
+            true,
+            Vec::new(),
+            false,
+            conn.sio.clone(),
+            conn.tx.clone(),
+            generation,
+        )
+        .await
+        .expect("local candidate");
+        let source = peer.source();
+        conn.install_built(
+            BuiltPeer {
+                peer_id: pid.to_string(),
+                generation,
+                source,
+                peer,
+                info: json!({ "id": pid, "name": "peer" }),
+                name: "peer".to_string(),
+                uid,
+                carried_secret: None,
+                active_on_apply: false,
+                replace,
+                caller: std::panic::Location::caller(),
+                prior_generation: None,
+            },
+            std::collections::VecDeque::new(),
+            std::collections::VecDeque::new(),
+            None,
+            false,
+        );
+        let mut offers: Vec<Value> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Ev::Signal(v) = ev {
+                if v["data"]["type"].as_str() == Some("transport-offer") {
+                    offers.push(v);
+                }
+            }
+        }
+        offers
+    }
+
+    /// The offer the install-time replay exists for: it arrived while the
+    /// peer's FIRST candidate (generation 7) was building, with no link and
+    /// no pending. Installing that candidate replays it once, addressed to its
+    /// own pid only; another never-live peer's buffered offer is neither
+    /// consumed nor re-addressed (the `--to bob` shape).
+    #[tokio::test]
+    async fn a_first_link_install_replays_only_its_own_buffered_offer() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let bob = "sid-bob";
+        let carol = "sid-carol";
+        conn.current_intent.insert(bob.to_string(), 7);
+        conn.current_intent.insert(carol.to_string(), 9);
+        conn.buffer_offer(bob, (vec!["10.0.0.2:4433".to_string()], None, None, 2, None));
+        conn.buffer_offer(carol, (vec!["10.0.0.3:4433".to_string()], None, None, 2, None));
+        assert_eq!(conn.buffered_offers[bob].intent, Some(7));
+        assert!(!conn.buffered_offers[bob].linked);
+
+        let offers =
+            install_candidate_offers(&mut conn, &mut rx, bob, 7, Replace::NeverLive, None).await;
+        assert_eq!(offers.len(), 1, "the first-link install did not replay its offer");
+        assert_eq!(offers[0]["from"].as_str(), Some(bob), "the replay named another peer");
+        assert_eq!(offers[0]["data"]["addrs"][0].as_str(), Some("10.0.0.2:4433"));
+        assert!(!conn.buffered_offers.contains_key(bob), "the replayed offer stayed buffered");
+        assert_eq!(
+            conn.buffered_offers.get(carol).map(|s| s.offer.0.clone()),
+            Some(vec!["10.0.0.3:4433".to_string()]),
+            "another peer's buffered offer was consumed or altered by this install"
+        );
+    }
+
+    /// An install that supersedes an existing link (the retry ladder's stuck
+    /// rebuild) must not replay a buffered offer onto the new link: the offer
+    /// was staged for the old incarnation, and replaying it re-arms a direct
+    /// attempt against the link the install just put up (two dialers). The
+    /// offer is dropped with the old link, as `drop_link` always did.
+    #[tokio::test]
+    async fn an_install_that_supersedes_a_link_does_not_replay_a_buffered_offer() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let pid = "sid-superseded";
+        conn.current_intent.insert(pid.to_string(), 8);
+        // Buffered before any link, so only the supersede itself can refuse it.
+        conn.buffer_offer(pid, (vec!["10.0.0.2:4433".to_string()], None, None, 2, None));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let t: Arc<dyn Transport> = Rec::new("old", &log);
+        conn.links.insert(pid.to_string(), direct_link(pid, "peer", "peer", t));
+
+        let offers =
+            install_candidate_offers(&mut conn, &mut rx, pid, 8, Replace::StuckAttempt, None)
+                .await;
+        assert!(conn.links.contains_key(pid), "the replacement was not installed");
+        assert_eq!(conn.links[pid].generation, 8, "the old link was kept");
+        assert!(offers.is_empty(), "a supersede replayed a buffered offer onto the new link");
+        assert!(
+            !conn.buffered_offers.contains_key(pid),
+            "the refused offer survived the supersede and could replay later"
+        );
+    }
+
+    /// Same pid, same uid, reconnecting while its earlier link still exists:
+    /// an offer buffered under that link belongs to it (a re-emit of an offer
+    /// it already answered). Installing the reconnect's candidate must not
+    /// replay it, even on the NeverLive path.
+    #[tokio::test]
+    async fn a_same_uid_reconnect_does_not_replay_an_offer_buffered_under_the_old_link() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let pid = "sid-same-uid";
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let t: Arc<dyn Transport> = Rec::new("old", &log);
+        let mut old = direct_link(pid, "peer", "peer", t);
+        old.uid = Some("uid-same".to_string());
+        conn.links.insert(pid.to_string(), old);
+        conn.current_intent.insert(pid.to_string(), 7);
+        conn.buffer_offer(pid, (vec!["10.0.0.2:4433".to_string()], None, None, 2, None));
+        assert!(conn.buffered_offers[pid].linked, "the offer was not tagged with its link");
+        // The reconnect's candidate takes the next intent.
+        conn.current_intent.insert(pid.to_string(), 9);
+
+        let offers = install_candidate_offers(
+            &mut conn,
+            &mut rx,
+            pid,
+            9,
+            Replace::NeverLive,
+            Some("uid-same".to_string()),
+        )
+        .await;
+        assert!(offers.is_empty(), "a same-uid reconnect replayed the old link's offer");
+        assert!(!conn.buffered_offers.contains_key(pid));
+    }
+
+    /// An offer staged under an older build generation is stale for the
+    /// candidate that installs: a newer intent owns the peer. It is dropped,
+    /// never replayed, even though this is a first-link install.
+    #[tokio::test]
+    async fn a_stale_generation_buffered_offer_is_not_replayed() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let pid = "sid-stale-gen";
+        conn.current_intent.insert(pid.to_string(), 3);
+        conn.buffer_offer(pid, (vec!["10.0.0.2:4433".to_string()], None, None, 2, None));
+        // A re-pair superseded generation 3 before it installed.
+        conn.current_intent.insert(pid.to_string(), 4);
+
+        let offers =
+            install_candidate_offers(&mut conn, &mut rx, pid, 4, Replace::NeverLive, None).await;
+        assert!(conn.links.contains_key(pid), "the candidate was not installed");
+        assert!(offers.is_empty(), "an offer from an older generation was replayed");
+        assert!(!conn.buffered_offers.contains_key(pid));
+    }
+
+    /// P5: a build stages ONLY its own SDP traffic. A transport-hint,
+    /// transport-offer or PAKE frame from the same peer is handed straight
+    /// back to the caller's normal handler, so cancelling the build cannot
+    /// take it down with the staged SDP.
+    #[tokio::test]
+    async fn a_build_stages_only_sdp_and_cancel_keeps_other_frames() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-stage-sdp";
+        conn.builds.insert(pid.to_string(), build_state(3));
+        let non_sdp = [
+            json!({ "from": pid, "data": { "type": "transport-hint", "direct": false } }),
+            json!({ "from": pid, "data": { "type": "transport-offer", "v": 1, "addrs": [] } }),
+            json!({ "from": pid, "data": { "type": "pake-msg", "msg": "x" } }),
+            json!({ "from": pid, "data": { "type": "pake-confirm", "mac": "x" } }),
+        ];
+        for frame in &non_sdp {
+            assert!(
+                !conn.stage_signal(frame),
+                "a non-SDP frame was parked for the build: {frame}"
+            );
+        }
+        assert!(conn.stage_signal(&json!({
+            "from": pid,
+            "data": { "type": "description", "description": { "type": "offer", "sdp": "v=0" } }
+        })));
+        assert!(conn.stage_signal(&json!({
+            "from": pid,
+            "data": { "type": "candidate", "candidate": { "candidate": "candidate:1" } }
+        })));
+        assert_eq!(conn.builds[pid].signals.len(), 2, "only the SDP payloads are staged");
+        assert!(
+            conn.builds[pid]
+                .signals
+                .iter()
+                .all(|v| matches!(v["data"]["type"].as_str(), Some("description") | Some("candidate"))),
+            "a non-SDP frame reached the build's staging area"
+        );
+        // A deferred intent follows the same rule.
+        let other = "sid-stage-deferred";
+        let plan = conn
+            .prepare_build(
+                json!({ "id": other, "name": "peer" }),
+                None,
+                std::panic::Location::caller(),
+                Replace::NeverLive,
+            )
+            .expect("prepare")
+            .expect("plan");
+        conn.build_deferred.insert(other.to_string(), (plan, Instant::now()));
+        assert!(!conn.stage_signal(&json!({ "from": other, "data": { "type": "transport-offer" } })));
+        assert!(conn.stage_signal(&json!({ "from": other, "data": { "type": "candidate" } })));
+        assert_eq!(conn.build_deferred[other].0.signals.len(), 1);
+        // Cancelling the build discards only the staged SDP; every non-SDP frame
+        // was already returned to its handler and still is after the cancel.
+        conn.cancel_build(pid);
+        assert!(!conn.builds.contains_key(pid));
+        for frame in &non_sdp {
+            assert!(!conn.stage_signal(frame), "a frame was held after the cancel");
+        }
     }
 
     /// A dropped/replaced link's queued candidate events are discarded, not
@@ -11618,6 +12296,46 @@ mod warm_identity_tests {
             DirectAdoption::Adopted { tkey: Some(key), .. }
                 if key == direct::transport_key("device-secret")
         ));
+    }
+
+    /// A fleet one-shot's direct connection usually replaces the unverified
+    /// WebRTC link already held for the same signaling id. Adoption must not
+    /// turn that into a pair-trusted link: `trusted` is what makes
+    /// `is_sibling_link()` false, and then the target ignores the owner grant
+    /// for the device its certificate just named (observed as "shell not
+    /// granted to 'bravo' here" on an otherwise verified direct link).
+    #[tokio::test]
+    async fn fleet_direct_adoption_over_webrtc_does_not_gain_pair_trust() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-fleet-oneshot-adopt";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+
+        let t: Arc<dyn Transport> = Rec::new("direct", &log);
+        let attempt = t.attempt_id().unwrap();
+        let mut pending = direct_pending_with(attempt, (FLEET_LINK_NAME, "fleet-rv"));
+        pending.fleet = true;
+        pending.auth = DirectAuth::fleet(1);
+        conn.direct_pending.insert(pid.into(), pending);
+
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), "direct-quic"),
+            DirectAdoption::Adopted { attempt: seen, .. } if seen == attempt
+        ));
+        let link = &conn.links[pid];
+        assert!(
+            Arc::ptr_eq(link.transport.as_ref().unwrap(), &t),
+            "adopted fleet direct transport was discarded for its live WebRTC predecessor"
+        );
+        assert!(link.direct, "the fleet transport was not installed");
+        assert!(
+            !link.trusted,
+            "fleet direct adoption inherited pair trust from the unverified WebRTC link"
+        );
+        assert!(
+            link.verified_name.is_none(),
+            "fleet direct adoption minted a petname before fleet-hello"
+        );
     }
 
     /// An authorized upgrade adopts the verified standby exactly once.

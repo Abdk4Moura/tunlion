@@ -214,6 +214,65 @@ pub fn fleet_presence_allowed(is_fleet_channel: bool) -> bool {
     cfg!(feature = "fleet") && is_fleet_channel
 }
 
+/// What the receive dispatch does with a transport-offer from a peer whose
+/// pending (if any) is decided by `linked_fleet_offer_action`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkedFleetOffer {
+    /// A pending already exists for this peer: the offer feeds it. A repeat
+    /// offer is a no-op there once the race runs, so nothing is armed twice.
+    Feed,
+    /// Arm one fleet pending for this offer and feed it. Our sid is the
+    /// lower one, so we are the end the fleet adoption arm elects to dial.
+    ArmDial,
+    /// Arm one fleet pending for this offer and feed it, as the answer to
+    /// the peer's dial. Our sid is the higher one: we never dial this peer
+    /// on presence, only reply to the offer it already sent, so the two ends
+    /// still meet on the peer's single attempt and cannot glare.
+    ArmAnswer,
+    /// Not the linked-fleet case: keep buffering, as before.
+    Buffer,
+}
+
+/// A re-dial transport-offer arrived from a fleet sibling we already hold a
+/// link to (typically the WebRTC fallback), with no direct pending here. The
+/// sibling keeps re-offering on the fleet channel, and before this nothing
+/// ever armed a pending to consume it: it was buffered forever and the
+/// direct path, which alone carries the fleet-hello channel binding, never
+/// formed.
+///
+/// Arm only when every fact holds: a link exists, no pending exists, the
+/// offer names a meeting place (`ch`) that is exactly this fleet's channel,
+/// and the link is fleet-shaped (`recv::fleet::shaped_link`). A `ch`-less
+/// unicast offer and an offer for any other channel keep the old behavior.
+pub fn linked_fleet_offer_action(
+    has_link: bool,
+    has_pending: bool,
+    offer_ch: Option<&str>,
+    fleet_ch: Option<&str>,
+    link_is_fleet_shaped: bool,
+    my_id: &str,
+    pid: &str,
+) -> LinkedFleetOffer {
+    if has_pending {
+        return LinkedFleetOffer::Feed;
+    }
+    if !has_link || !link_is_fleet_shaped {
+        return LinkedFleetOffer::Buffer;
+    }
+    let on_fleet_channel = match (offer_ch, fleet_ch) {
+        (Some(offer), Some(fleet)) => !offer.is_empty() && offer == fleet,
+        _ => false,
+    };
+    if !on_fleet_channel {
+        return LinkedFleetOffer::Buffer;
+    }
+    if my_id < pid {
+        LinkedFleetOffer::ArmDial
+    } else {
+        LinkedFleetOffer::ArmAnswer
+    }
+}
+
 /// The settle timeout reason, shared by the expiry deny and the client.
 pub fn settle_timeout_reason(ms: u64) -> String {
     format!("identity not proven within {ms} ms; retry")
@@ -1050,6 +1109,31 @@ pub fn report_sync_join(log: &dyn LogSink, pid: &str, sid: u32, result: Result<(
     }
 }
 
+/// Is this the peer a transfer's explicit consent names, for identity
+/// settling purposes? A pair-trusted link is consent by construction (its MAC
+/// proved the paired device); a code send names its ceremony peer; a room send
+/// is consented by -y or a daemon, which accepts every offer it receives.
+fn consented_identity_peer(
+    conn: &Conn,
+    pid: &str,
+    recv_code_path: bool,
+    recv_pake_done: bool,
+    yes: bool,
+    daemon: bool,
+) -> bool {
+    if conn.link(pid).is_some_and(|l| l.trusted) {
+        return true;
+    }
+    if recv_code_path {
+        recv_pake_done && conn.is_bound_active_peer(pid)
+    } else {
+        // A room with -y / a daemon accepts every offer it consents to, so
+        // each such link settles its own identity; no single active slot is
+        // required to decide which peer the consent names.
+        yes || daemon
+    }
+}
+
 async fn recv_run(
     server: &str,
     mut code: Option<String>,
@@ -1289,18 +1373,21 @@ async fn recv_run(
     // that second link on the roster line under its raw signaling id.
     let code_only = code.is_some() && !daemon;
     if !code_only {
-        sess.channels = devices.iter().map(|(_, s)| host.channel_of(s)).collect();
         // Fleet auto-mesh: one more meeting point, where devices certified by the
         // SAME owner key find each other with no pairwise pairing. Presence there
         // authorizes NOTHING; admission runs on the certificate. See cli/src/fleet.rs
-        // and docs/design-fleet-automesh.md.
-        if cfg!(feature = "fleet") {
-            if let Some(fc) = ports.identity.fleet_channel() {
-                if !sess.channels.contains(&fc) {
-                    sess.channels.push(fc);
-                }
-            }
-        }
+        // and docs/design-fleet-automesh.md. It leads the list so the server's
+        // channel cap can never truncate it away (`subscription_order`).
+        let fleet = if cfg!(feature = "fleet") {
+            ports.identity.fleet_channel()
+        } else {
+            None
+        };
+        sess.channels = crate::session::subscription_order(
+            None,
+            fleet,
+            devices.iter().map(|(_, s)| host.channel_of(s)),
+        );
     }
     // L1-a: the ephemeral SPAKE2 ceremony for a `recv <code>` claim. The typed
     // code is split CLIENT-SIDE; only the numeric nameplate is sent (pair-claim
@@ -1337,6 +1424,12 @@ async fn recv_run(
     // pending, bounded by RECV_IDENTITY_HOLD_DEADLINE from first sight so a
     // ceremony that never resolves cannot wedge the transfer.
     let mut recv_identity_hold: HashMap<String, std::time::Instant> = HashMap::new();
+    // Last time the held identity challenge was re-sent. The first copy can
+    // race the peer's control channel becoming ready (measured on a room
+    // transfer: the challenge was issued at ChannelReady but the sender had not
+    // installed the link yet), and a lost challenge must not turn into a
+    // fail-closed refusal. Re-sending the SAME nonce is idempotent.
+    let mut recv_identity_resent: HashMap<String, std::time::Instant> = HashMap::new();
     // #161: how long the offer waits for identity to resolve before deciding.
     // Identity resolution normally settles in well under a second on a working
     // link; the window exists so a revoked device's cert (which resolves via
@@ -1456,29 +1549,31 @@ async fn recv_run(
             } else {
                 log.debug("enrollment closed (no armed keys: mint or arm an auth-key to open)");
             }
-            let chans: Vec<String> = devices.iter().map(|(_, s)| host.channel_of(s)).collect();
-            let mut c = chans;
-            if ports.identity.is_armed() {
-                if let Some(uk) = host.user_key() {
-                    let ek = ports.identity.enroll_channel(&uk.public_key_bytes());
-                    if !c.contains(&ek) {
-                        c.push(ek);
-                    }
-                }
-            }
+            let enroll = if ports.identity.is_armed() {
+                host.user_key()
+                    .map(|uk| ports.identity.enroll_channel(&uk.public_key_bytes()))
+            } else {
+                None
+            };
             // Fleet auto-mesh: the meeting point for same-owner devices goes in
             // the SAME list, because this is the subscribe the daemon actually
             // emits. (It rebuilds `c` from scratch and then overwrites
             // sess.channels, so anything pushed onto sess.channels before this
             // point is discarded.) Presence here authorizes nothing; admission
             // runs on the certificate. See cli/src/fleet.rs.
-            if cfg!(feature = "fleet") {
-                if let Some(fc) = ports.identity.fleet_channel() {
-                    if !c.contains(&fc) {
-                        c.push(fc);
-                    }
-                }
-            }
+            let fleet = if cfg!(feature = "fleet") {
+                ports.identity.fleet_channel()
+            } else {
+                None
+            };
+            // Enrollment and fleet FIRST: the server keeps only the first
+            // SIGNALING_MAX_CHANNELS entries, and with 64+ devices listed
+            // ahead of them no new device could ever enroll.
+            let c = crate::session::subscription_order(
+                enroll,
+                fleet,
+                devices.iter().map(|(_, s)| host.channel_of(s)),
+            );
             sess.emit(&sio, "subscribe", json!({ "channels": c })).await;
             sess.channels = c;
             log.say(&format!(
@@ -1978,6 +2073,10 @@ async fn recv_run(
     //   theirs[pid] what THEY chose: sign messages we send to them.
     let mut bind_ours: HashMap<String, Vec<u8>> = HashMap::new();
     let mut bind_theirs: HashMap<String, Vec<u8>> = HashMap::new();
+    // The transport source each pid's nonces were exchanged on. A replacement
+    // transport can reuse the same peer id; nonces from the previous transport
+    // must not be carried across (see the reset in `ChannelReady`).
+    let mut bind_source: HashMap<String, net::SourceId> = HashMap::new();
     let mut fleet_pending: std::collections::HashSet<String> = Default::default();
     let mut fleet_verified: std::collections::HashSet<String> = Default::default();
     // Offers that arrived while this link's `fleet-hello` was still in flight.
@@ -2810,7 +2909,7 @@ async fn recv_run(
                     if retry_due {
                         if ports
                             .identity
-                            .resend_identity_challenge(&conn, &p.pid, &mut identity_nonces)
+                            .resend_identity_challenge(&t, &p.pid, &mut identity_nonces)
                             .await
                         {
                             log.debug(&format!(
@@ -3281,7 +3380,9 @@ async fn recv_run(
             let armed = ports.identity.is_armed();
             let subscribed = sess.channels.contains(&ek);
             if armed && !subscribed {
-                sess.channels.push(ek.clone());
+                // At the FRONT: appended after 64+ device channels it would be
+                // cut by the server's channel cap on every re-sync.
+                sess.prioritize_channel(ek.clone());
                 let _ = sio.emit("subscribe", json!({ "channels": [ek] })).await;
             } else if !armed && subscribed {
                 sess.channels.retain(|c| c != &ek);
@@ -4116,6 +4217,22 @@ async fn recv_run(
 
         let Some((ev, event_source)) = ev else { continue };
 
+        // A fleet verdict, a hello marker and a nonce all belong to the
+        // TRANSPORT they were earned on. Links are dropped from several places
+        // (health scan, zombie warm link, peer-left, revocation); trusting each
+        // site to remember these sets let the periodic health scan keep a dead
+        // link's `fleet_verified`, so a replacement that reused the peer id
+        // skipped its hello and inherited the old transport's verdict. Retire
+        // them centrally for any peer that no longer has a link, so every drop
+        // path, including future ones, starts the replacement unverified.
+        fleet_pending.retain(|p| conn.links.contains_key(p));
+        fleet_verified.retain(|p| conn.links.contains_key(p));
+        fleet_greeted.retain(|p| conn.links.contains_key(p));
+        bind_ours.retain(|p, _| conn.links.contains_key(p));
+        bind_theirs.retain(|p, _| conn.links.contains_key(p));
+        bind_source.retain(|p, _| conn.links.contains_key(p));
+        fleet_deferred_offers.retain(|(p, _, _)| conn.links.contains_key(p));
+
         // C23: questions from links that died (supersede/peer-left) are
         // moot, the sender re-offers on its new link. Purge them so a 'y'
         // can never accept a ghost (the duplicate-stream ENOENT crash).
@@ -4200,6 +4317,7 @@ async fn recv_run(
                     // exists to stop.
                     bind_ours.remove(&pid);
                     bind_theirs.remove(&pid);
+                    bind_source.remove(&pid);
                 }
             }
             Ev::PairMatched(v) => {
@@ -4222,7 +4340,18 @@ async fn recv_run(
             // C30: server confirmed our session digest. Phase 2: reconcile
             // the roster it carries, missed peer-joined/left self-correct.
             Ev::Synced(v) => {
-                if let Some(roster) = sess.on_synced(&v) {
+                let synced = sess.on_synced(&v);
+                // The server's channel cap truncated what we sent: the session
+                // stays unconfirmed (slow re-sync) and this must be seen, since
+                // a cut enrollment channel means no device can enroll.
+                if let Some(w) = sess.take_channel_warning() {
+                    log.critical(&format!(
+                        "  {} {}",
+                        log.paint(Tone::Warn, log.glyph_warn()),
+                        log.paint(Tone::Warn, &w)
+                    ));
+                }
+                if let Some(roster) = synced {
                     // Take the flag before any reconcile work: exactly the first
                     // digest on a fresh signaling sid is exempt from absence
                     // counting (adoption below still runs, so a new sid is
@@ -4804,6 +4933,43 @@ async fn recv_run(
                                 conn.start_direct_fleet(&from, &rv).await;
                             }
                         }
+                        // A daemon sibling re-dialing on our FLEET channel while
+                        // we already hold a link to it (the WebRTC fallback).
+                        // Neither branch above matches it (its offer names the
+                        // fleet channel and the link carries no pair secret), so
+                        // its offers were buffered forever and the direct path
+                        // never armed. Arm exactly one fleet pending for this
+                        // offer when the link is fleet-shaped; the offer is fed
+                        // into it just below. A repeat offer then finds the
+                        // pending and feeds it instead of arming another.
+                        if !conn.direct_pending.contains_key(&from) && cfg!(feature = "fleet") {
+                            if let Some(rv) = ports.identity.fleet_rv() {
+                                let fleet_ch = host.channel_of(&rv);
+                                let action = linked_fleet_offer_action(
+                                    conn.links.contains_key(&from),
+                                    conn.direct_pending.contains_key(&from),
+                                    data["ch"].as_str(),
+                                    Some(fleet_ch.as_str()),
+                                    crate::recv::fleet::shaped_link(&conn, &from, Some(rv.as_str())),
+                                    conn.my_id.as_str(),
+                                    from.as_str(),
+                                );
+                                if matches!(
+                                    action,
+                                    LinkedFleetOffer::ArmDial | LinkedFleetOffer::ArmAnswer
+                                ) {
+                                    log.debug(&format!(
+                                        "fleet: arming direct for linked sibling {from}'s transport-offer ({})",
+                                        if action == LinkedFleetOffer::ArmDial {
+                                            "dialer"
+                                        } else {
+                                            "answer"
+                                        }
+                                    ));
+                                    conn.start_direct_fleet(&from, &rv).await;
+                                }
+                            }
+                        }
                         if conn.direct_pending.contains_key(&from) {
                             // Re-arm succeeded — process the offer now.
                             conn.on_transport_offer(
@@ -4814,9 +4980,15 @@ async fn recv_run(
                                 peer_proto,
                             );
                         } else {
-                            conn.buffered_offers.insert(
-                                from.clone(),
-                                (cands, srflx, peer_server_public, peer_proto),
+                            conn.buffer_offer(
+                                &from,
+                                (
+                                    cands,
+                                    srflx,
+                                    peer_server_public,
+                                    peer_proto,
+                                    data["ch"].as_str().map(String::from),
+                                ),
                             );
                             log.debug(&format!(
                                 "buffering re-dial transport-offer from {from} (no pending yet)"
@@ -5075,12 +5247,12 @@ async fn recv_run(
                 filament_transport::lan::LanEvent::PairingNearby { .. } => {}
             },
             Ev::DirectReady(pid, t, route) => {
+                let named_before = conn.link(&pid).and_then(|l| l.verified_name.clone());
                 let verdict = conn.adopt_direct(&pid, t.clone(), route);
                 let tkey = match verdict {
                     crate::conn::DirectAdoption::Adopted { tkey, .. } => tkey,
                     _ => continue,
                 };
-                let named_before = conn.link(&pid).and_then(|l| l.verified_name.clone());
                 // A direct link to a REMEMBERED device was authenticated by its
                 // pair secret (the QUIC keying-material MAC), the proof a
                 // WebRTC link gets from `pair-proof`. Only the pair-proof path
@@ -5132,10 +5304,18 @@ async fn recv_run(
                 // would then decide a legacy-trusted offer with
                 // cert_revoked_for(None)=false, letting a revoked device push a
                 // transfer before its revoked cert resolves.
+                let consent_identity = consented_identity_peer(
+                    &conn,
+                    &pid,
+                    recv_code_path,
+                    recv_pake_done,
+                    yes,
+                    daemon,
+                );
                 let needs_challenge = if host.cap_authoritative() {
-                    idev_known && !proven
+                    (idev_known && !proven) || (!idev_known && consent_identity)
                 } else {
-                    recv_code_path && !idev_known
+                    consent_identity && !idev_known
                 };
                 if needs_challenge {
                     // Shared issue-and-hold (hold-then-await; see the helper). This
@@ -5177,7 +5357,11 @@ async fn recv_run(
                         let _ = tx.send(Ev::sourced_channel_ready(pid, t));
                     }
                 } else {
-                    let _ = tx.send(Ev::ChannelReady(pid, t));
+                    // Keep the transport's own source on the re-emit. An
+                    // unsourced ChannelReady hides which transport it belongs
+                    // to, so a replacement cannot retire the previous
+                    // transport's fleet nonces.
+                    let _ = tx.send(Ev::sourced_channel_ready(pid, t));
                 }
             }
             Ev::DirectWorkersReady(pid, workers, primary_source) => {
@@ -5228,7 +5412,15 @@ async fn recv_run(
                 // normal WebRTC path (ChannelReady BEFORE PAKE) never gets an
                 // early challenge the sender cannot answer - only the case
                 // where the channel arrived after the ceremony.
-                if recv_code_path && recv_pake_done {
+                let consent_identity = consented_identity_peer(
+                    &conn,
+                    &pid,
+                    recv_code_path,
+                    recv_pake_done,
+                    yes,
+                    daemon,
+                );
+                if consent_identity {
                     if let Some(l) = conn.link_mut(&pid) {
                         crate::identity::resolve_peer_identity(l);
                     }
@@ -5277,6 +5469,29 @@ async fn recv_run(
                 // Fleet auto-mesh: this link came off the fleet channel, so there
                 // is no pair secret to prove. Present the owner-signed certificate
                 // bound to THIS link instead.
+                // Send link control on the transport actually installed for this
+                // link, not on the one a possibly superseded ChannelReady event
+                // carried. With two transports racing for one peer id, the loser
+                // can deliver this event while the winner is installed; signing
+                // and sending our fleet hello down the loser made the peer never
+                // receive it, while we accepted the peer's hello. That showed up
+                // as a link that stays fleet-unverified on one side only.
+                let t = conn.transport_of(&pid).unwrap_or(t);
+                // A nonce belongs to the TRANSPORT it was exchanged on. A
+                // re-established transport can reuse the same peer id (warm
+                // re-dial after a zombie drop), so carrying the previous
+                // transport's nonce forward makes each side sign a value the
+                // other no longer expects: both fleet hellos fail verification
+                // and the link stays unverified forever. Drop both directions
+                // when the transport source changes; a genuinely same-transport
+                // re-announce keeps its nonce.
+                if let Some(source) = event_source {
+                    if bind_source.get(&pid).copied() != Some(source) {
+                        bind_source.insert(pid.clone(), source);
+                        bind_ours.remove(&pid);
+                        bind_theirs.remove(&pid);
+                    }
+                }
                 // No exporter on this transport: open the challenge. Our nonce
                 // goes out now; anything we SEND waits until theirs arrives.
                 if t.channel_binding().is_none() {
@@ -6295,23 +6510,60 @@ async fn recv_run(
                         .get(&pid)
                         .map(|(n, _, _)| hex::encode(n))
                         .is_some_and(|n| Some(n.as_str()) == v["nonce"].as_str());
-                    if ours {
-                        identity_nonces.remove(&pid);
-                        st.pending_proven.lock().unwrap().remove(&pid);
-                        if let Some(expired) =
-                            Instant::now().checked_sub(RECV_IDENTITY_HOLD_DEADLINE)
-                        {
-                            recv_identity_hold.insert(pid.clone(), expired);
+                    // Only the peer the transfer consent names can be
+                    // classified: the code ceremony's bound peer, or the active
+                    // room peer the operator accepted with -y / a daemon. A room
+                    // bystander cannot answer for it, and an unanswered
+                    // challenge must stay Pending (hold then fail closed), never
+                    // quietly become anonymous.
+                    let consented_peer = consented_identity_peer(
+                        &conn,
+                        &pid,
+                        recv_code_path,
+                        recv_pake_done,
+                        yes,
+                        daemon,
+                    );
+                    if consented_peer {
+                        // A certificate is the only identity fact this answer can
+                        // settle. It is the PEER's own link saying it cannot
+                        // prove one, so the consent already given (code, -y or
+                        // daemon) names this link whether or not the nonce still
+                        // matches: a challenge re-issued across a link rebuild
+                        // can leave the peer answering an older nonce, and the
+                        // old strict match turned that ordering race into a
+                        // 20 s Pending hold that refused an allowed transfer.
+                        // Identity state only ever becomes anonymous here;
+                        // shell still needs an explicit pair grant.
+                        let anonymous = conn
+                            .link(&pid)
+                            .is_some_and(|l| l.identity_state != cap::IdentityState::Resolved);
+                        if ours {
+                            identity_nonces.remove(&pid);
+                            st.pending_proven.lock().unwrap().remove(&pid);
                         }
+                        if anonymous {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                l.identity_state = cap::IdentityState::ExplicitlyUnavailableAnonymous;
+                            }
+                            log.debug(&format!(
+                                "  {pid} cannot prove an identity; explicit transfer consent makes it an anonymous transfer peer"
+                            ));
+                        }
+                    } else if ours {
+                        // The challenge was answered, but this is not the
+                        // consented peer. Do not let it clear the real peer's
+                        // hold or change any identity state.
                         log.debug(&format!(
-                            "  {pid} cannot prove an identity; deciding its offers without waiting"
+                            "  ignoring identity-unavailable from non-consented peer {pid}"
                         ));
                     }
                 }
                 // #30: respond to identity nonce challenge by producing a
                 // possession_sig (0x02) over the peer-provided nonce. The
                 // challenger verifies and upgrades our binding to Proven.
-                #[cfg(feature = "mesh")]
+                // Receive identity is not a mesh-only feature: the reduced
+                // dispatch profile needs it to settle code-transfer identity.
                 Some("identity-nonce-challenge") => {
                     // #30: shared responder (also used by send_cmd) proves
                     // device-key possession so the challenger upgrades us to Proven.
@@ -6328,7 +6580,7 @@ async fn recv_run(
                 }
                 // #30: received possession-sig from peer after our challenge.
                 // Verify, upgrade binding to Proven so capability gates pass.
-                #[cfg(feature = "mesh")]
+                // Needed by the dispatch-only Core profile, not just mesh.
                 Some("identity-expose") => {
                     log.debug(&format!("identity-expose received on {pid}"));
                     if ports.identity.handle_identity_expose(
@@ -6479,15 +6731,20 @@ async fn recv_run(
                     // daemon's live channel set immediately; waiting for restart
                     // would make the persisted ceiling correct but unreachable.
                     devices = host.devices_load();
-                    sess.channels = devices
-                        .iter()
-                        .map(|(_, secret)| host.channel_of(secret))
-                        .collect();
-                    if let Some(fc) = ports.identity.fleet_channel() {
-                        if !sess.channels.contains(&fc) {
-                            sess.channels.push(fc);
-                        }
-                    }
+                    // Keep the enrollment channel if we hold it (the arm-gate
+                    // owns adding and dropping it) and put the meeting points
+                    // first, inside the server's channel cap. This rebuild is
+                    // what the next sync carries, so an owner at the cap must
+                    // not lose enrollment by enrolling one more device.
+                    let enroll = host
+                        .user_key()
+                        .map(|uk| ports.identity.enroll_channel(&uk.public_key_bytes()))
+                        .filter(|ek| sess.channels.contains(ek));
+                    sess.channels = crate::session::subscription_order(
+                        enroll,
+                        ports.identity.fleet_channel(),
+                        devices.iter().map(|(_, secret)| host.channel_of(secret)),
+                    );
                     sess.invalidate();
                 }
                 Some("depart") => {
@@ -6667,7 +6924,14 @@ async fn recv_run(
                 // L2: it opens nothing and only proves this end is here.
                 Some("reach-ping") => {
                     if let Some(t) = conn.transport_of(&pid) {
-                        let _ = t.send_control(&crate::daemon_ctl::liveness_pong(&v)).await;
+                        log.debug(&format!(
+                            "reach-pong start pid={pid} incoming={event_source:?} outgoing={:?}",
+                            t.source_id(),
+                        ));
+                        let result = t.send_control(&crate::daemon_ctl::liveness_pong(&v)).await;
+                        log.debug(&format!("reach-pong sent pid={pid} result={result:?}"));
+                    } else {
+                        log.debug(&format!("reach-pong not sent pid={pid}: no current transport"));
                     }
                 }
                 Some("reach-pong") => {
@@ -6853,85 +7117,14 @@ async fn recv_run(
                             continue;
                         }
                     }
-                    let (trusted, fleet_proven) = conn
-                        .link(&pid)
-                        .map(|l| (l.trusted, l.fleet_proven()))
-                        .unwrap_or((false, false));
-                    // Cap lookup keys on the PROVEN petname, not the presence name.
-                    let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
-                    // Granted if the device was explicitly `grant`ed shell OR an
-                    // active `up --shell[-only]` policy auto-allows it. Trust
-                    // (pair-proof) is still required for the grant; the policy
-                    // also accepts a proven fleet link to the same PAIRED
-                    // record, which is what the direct dial proves (see
-                    // `shell_gate::policy_trusted`).
-                    let legacy_ok = dev
-                        .as_deref()
-                        .map(|n| {
-                            !host.device_capability_denied(n, "shell")
-                                && ((crate::shell_gate::policy_trusted(
-                                    trusted,
-                                    fleet_proven,
-                                    n,
-                                    host.as_ref(),
-                                ) && shell_policy.auto_allows(n))
-                                    || (trusted && host.device_allows(n, "shell")))
-                        })
-                        .unwrap_or(false);
-                    // Capability layer evaluated unconditionally (shadow samples the
-                    // legacy-allowed population); legacy stands in shadow, cap gates
-                    // under TUNLION_CAP_AUTHORITATIVE.
-                    let granted = {
-                        let az = crate::shell_gate::peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-                        let store = host.cap_store();
-                        let now = host.now_secs();
-                        let outcome = cap::authorize_in(
-                            &store,
-                            "self",
-                            cap::CAP_SHELL,
-                            idev,
-                            iusr,
-                            ak_caps,
-                            now,
-                        );
-                        {
-                            let (own_user, has_grant) = cap::fleet_inputs_in(
-                                &store,
-                                "self",
-                                cap::CAP_SHELL,
-                                idev,
-                                iusr,
-                                ak_caps,
-                                now,
-                            );
-                            // Deliberate tier: `shell` is never a scoped default, so a
-                            // same-owner device gets it ONLY via an explicit grant
-                            // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
-                            // The explicit deny travels too: denied short-circuits
-                            // fleet auto-trust, matching the legacy fold above.
-                            let denied = dev
-                                .as_deref()
-                                .map(|n| host.device_capability_denied(n, "shell"))
-                                .unwrap_or(false);
-                            host.cap_gate_effective(CapGate {
-                                legacy_allowed: legacy_ok,
-                                outcome: &outcome,
-                                action: cap::CAP_SHELL,
-                                resource: "self",
-                                device_pub: idev,
-                                user_pub: iusr,
-                                binding,
-                                cert_expires: expires,
-                                auth_key_caps: ak_caps,
-                                own_user_pub: own_user.as_ref(),
-                                scoped_in_bounds: false,
-                                has_explicit_grant: has_grant,
-                                cert_revoked,
-                                denied,
-                                ceiling_authorizes: false,
-                            })
-                        }
+                    // Bootstrap asks the same core gate as exec, PTY and the
+                    // certificate signer, including authenticated legacy pairs.
+                    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(
+                        &mut conn, &pid, &shell_policy, cap::CAP_SHELL,
+                    );
+                    let granted = match crate::shell_gate::ssh_gate_decision(&inputs, host.as_ref()) {
+                        Ok(()) => cap::GateDecision::Allow,
+                        Err(cap_reason) => cap::GateDecision::Deny { cap_reason },
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -7334,7 +7527,7 @@ async fn recv_run(
                         let ceremony_peer =
                             recv_code_path && recv_pake_done && conn.is_bound_active_peer(&pid);
                         let kept = match (&remember, ceremony_peer) {
-                            (Some(name), true) => match ports.store.devices_store(name, &sec) {
+                            (Some(name), true) => match ports.store.devices_store_remembered(name, &sec) {
                                 Ok(stored) => {
                                     ports
                                         .env
@@ -7412,10 +7605,11 @@ async fn recv_run(
                                 == mac
                         })
                     };
-                    let ok = if let Some((n, _)) = hit {
+                    let ok = if let Some((n, secret)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
                             l.trusted = true;
                             l.verified_name = Some(n.clone());
+                            l.expected_secret = Some((n.clone(), secret.clone()));
                             crate::identity::resolve_peer_identity(l);
                         }
                         // #39: identity just RESOLVED on the WebRTC/relay path — verified_name
@@ -7713,6 +7907,7 @@ async fn recv_run(
                                                                                 l.identity_device_pub = Some(cert.device_pub);
                                                                                 l.identity_user_pub = Some(cert.user_pub);
                                                                                 l.identity_binding = cap::BindingStrength::Proven;
+                                                                                l.identity_state = cap::IdentityState::Resolved;
                                                                                 l.identity_cert_expires = Some(cert.expires);
                                                                             }
                                                                             // The peer by name, not its raw signaling id.
@@ -7847,6 +8042,44 @@ async fn recv_run(
                     let offer_full = v["full"].as_str().map(|s| s.to_string());
                     let is_resume = v["resume"].as_bool().unwrap_or(false);
 
+                    // A retried offer for a file this dispatch already stored is
+                    // not a new transfer. The sender retries the SAME `{uid}-{sid}`
+                    // id when its delivery-ack was lost across a link rebuild;
+                    // accepting it again stored a second copy and doubled the
+                    // reported byte total. Re-ack with the stored name instead.
+                    // Only an exact name/size/digest match counts: a reused id
+                    // for different content falls through to the normal gates.
+                    // Clone out and drop the guard here: the ack below awaits,
+                    // and a std MutexGuard must not be held across it.
+                    let already = ports
+                        .env
+                        .delivery
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&id).cloned());
+                    if let Some(done) = already {
+                        let same = done.name == name
+                            && done.size == size
+                            && match (&done.full, &offer_full) {
+                                (Some(a), Some(b)) => a == b,
+                                _ => true,
+                            };
+                        if same {
+                            if let Some(t) = conn.transport_of(&pid) {
+                                let mut ack = protocol::delivery_ack_msg(&id, sid);
+                                ack["stored"] = serde_json::json!(done.stored_name);
+                                let _ = t.send_control(&ack).await;
+                            }
+                            log.say(&log.paint(
+                                Tone::Dim,
+                                &format!(
+                                    "  {name}: already delivered here; re-acked the sender's retry"
+                                ),
+                            ));
+                            continue;
+                        }
+                    }
+
                     // A pinned receive refuses unverifiable legacy offers and
                     // content with a different advertised digest before writing
                     // any bytes. For a match, the ordinary completion path still
@@ -7948,20 +8181,43 @@ async fn recv_run(
                     // hold is either revoked or on a link the ceremony does not
                     // complete on; both must be refused, not admitted.
                     {
-                        let (proven, idev_known, link_ready) = conn
+                        let (proven, link_ready, identity_state) = conn
                             .link(&pid)
                             .map(|l| {
                                 (
                                     l.identity_binding == cap::BindingStrength::Proven,
-                                    l.identity_device_pub.is_some(),
                                     l.presence == Presence::Ready,
+                                    l.identity_state,
                                 )
                             })
-                            .unwrap_or((false, false, false));
+                            .unwrap_or((false, false, cap::IdentityState::Pending));
                         let challenge_in_flight =
                             st.pending_proven.lock().unwrap().contains_key(&pid);
-                        let code_hold = recv_code_path && !proven && !idev_known;
-                        let hold = if code_hold {
+                        // A consented transfer may not be decided while its
+                        // identity is merely Pending. On the code path consent
+                        // is the ceremony itself; on a room it is -y/daemon plus
+                        // the active peer selection. Explicit anonymous is a
+                        // settled fact and skips the hold.
+                        let consented_peer = consented_identity_peer(
+                            &conn,
+                            &pid,
+                            recv_code_path,
+                            recv_pake_done,
+                            yes,
+                            daemon,
+                        );
+                        let identity_hold = consented_peer
+                            && identity_state == cap::IdentityState::Pending;
+                        let expired = if identity_hold && link_ready {
+                            recv_identity_hold
+                                .entry(pid.clone())
+                                .or_insert_with(std::time::Instant::now)
+                                .elapsed()
+                                >= RECV_IDENTITY_HOLD_DEADLINE
+                        } else {
+                            false
+                        };
+                        let hold = if identity_hold {
                             if !link_ready {
                                 // Transport still establishing (the direct-blocked
                                 // fallback brings WebRTC up AFTER PAKE, and the
@@ -7969,15 +8225,46 @@ async fn recv_run(
                                 // it does). Hold without starting the clock.
                                 true
                             } else {
-                                let deadline = *recv_identity_hold
-                                    .entry(pid.clone())
-                                    .or_insert_with(std::time::Instant::now);
-                                deadline.elapsed() < RECV_IDENTITY_HOLD_DEADLINE
+                                !expired
                             }
                         } else {
                             host.cap_authoritative() && challenge_in_flight && !proven
                         };
                         if hold {
+                            if identity_hold {
+                                let due = recv_identity_resent
+                                    .get(&pid)
+                                    .map(|at| at.elapsed() >= Duration::from_millis(500))
+                                    .unwrap_or(true);
+                                if !identity_nonces.contains_key(&pid) {
+                                    // The readiness site may have run before this
+                                    // peer became the consented target (a room
+                                    // adoption can select it later), so no
+                                    // challenge exists yet. Issue one now.
+                                    ports
+                                        .identity
+                                        .issue_proven_challenge_and_hold(
+                                            &conn,
+                                            &pid,
+                                            &t,
+                                            &st.pending_proven,
+                                            &mut identity_nonces,
+                                        )
+                                        .await;
+                                    recv_identity_resent.insert(pid.clone(), Instant::now());
+                                } else if due
+                                    && ports
+                                        .identity
+                                        .resend_identity_challenge(
+                                            &t,
+                                            &pid,
+                                            &identity_nonces,
+                                        )
+                                        .await
+                                {
+                                    recv_identity_resent.insert(pid.clone(), Instant::now());
+                                }
+                            }
                             let rtx = tx.clone();
                             let rpid = pid.clone();
                             let rv = v.clone();
@@ -7991,19 +8278,25 @@ async fn recv_run(
                             });
                             continue;
                         }
-                        // #161: the hold expires into a DECISION, not a denial.
-                        // Revocation binds wherever identity resolves: a revoked
-                        // device's cert resolves via the challenge and the gate's
-                        // absolute Deny fires. A peer whose identity does NOT
-                        // resolve within the hold (a slow fallback link, or a
-                        // lost challenge on a transport that came up late) is
-                        // decided by the normal gate - consent and grants in
-                        // shadow, the capability layer under authoritative. The
-                        // residual (a revoked device whose identity ceremony does
-                        // not complete on a given path being admitted) is
-                        // precondition-bounded and documented in the changelog;
-                        // the terminal-outcome model that closes it entirely is
-                        // the next iteration, not a 0.8.0 change.
+                        if identity_hold && expired {
+                            // #161 FAIL-CLOSED EXPIRY. The consented path held the
+                            // offer while identity was merely Pending. If that
+                            // deadline passes without either a certificate
+                            // (Resolved) or an explicit identity-unavailable
+                            // (ExplicitlyUnavailableAnonymous), there is no
+                            // identity fact to decide on. Refuse rather than
+                            // reach the policy site in the ordering window.
+                            log.say(
+                                "the sender's identity did not settle after consent; refusing the transfer, retry the send",
+                            );
+                            let reason =
+                                "the sender's identity could not be established; a fresh code is required";
+                            let r = t
+                                .send_control(&policy_decline_msg(&id, Some(reason)))
+                                .await;
+                            peer_step(daemon, &pid, "identity-timeout decline", r, log.as_ref())?;
+                            continue;
+                        }
                     }
 
                     // C14/C22: consent. -y accepts everything; a resume of a
@@ -8122,6 +8415,7 @@ async fn recv_run(
                             scoped_in_bounds,
                             has_explicit_grant: has_grant,
                             cert_revoked,
+                            identity_state: conn.identity_state_of(&pid),
                             // A sibling's local deny wins over its kind default and grants;
                             // no deny list is consulted for anyone else on this path.
                             denied: sibling.denied,
@@ -11002,6 +11296,140 @@ mod expiry_redrive_tests {
         assert!(policy_decline_msg("x", Some("unverified peer"))
             .get("reason")
             .is_none());
+    }
+}
+
+/// The linked-fleet re-dial offer decision (`linked_fleet_offer_action`).
+/// Live shape: charlie held an installed WebRTC link to bravo, bravo
+/// re-offered on the fleet channel once a second, and every offer was
+/// buffered with "no pending yet", so the direct path never armed.
+#[cfg(test)]
+mod linked_fleet_offer_tests {
+    use super::{linked_fleet_offer_action as decide, LinkedFleetOffer};
+
+    const FLEET: &str = "chan-fleet";
+    const LOW: &str = "sid-aaa";
+    const HIGH: &str = "sid-zzz";
+
+    /// A fleet-channel offer from a linked, fleet-shaped sibling with no
+    /// pending arms exactly one pending, and which role it takes follows the
+    /// same sid comparison as the fleet adoption arm: the lower sid is the
+    /// dialer, the higher sid only answers the offer it was sent.
+    #[test]
+    fn a_fleet_offer_on_a_shaped_link_with_no_pending_arms_one() {
+        // We are the higher sid: the peer is the elected dialer, we answer.
+        assert_eq!(
+            decide(true, false, Some(FLEET), Some(FLEET), true, HIGH, LOW),
+            LinkedFleetOffer::ArmAnswer
+        );
+        // We are the lower sid: we are the elected dialer.
+        assert_eq!(
+            decide(true, false, Some(FLEET), Some(FLEET), true, LOW, HIGH),
+            LinkedFleetOffer::ArmDial
+        );
+    }
+
+    /// Once that pending exists, the identical offer (the sibling re-emits
+    /// every 1.2 s) is fed into it and never arms a second one, from either
+    /// role and whatever else is true of the link.
+    #[test]
+    fn a_repeat_offer_feeds_the_existing_pending() {
+        for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
+            for has_link in [false, true] {
+                for shaped in [false, true] {
+                    for ch in [None, Some(FLEET), Some("chan-pair")] {
+                        assert_eq!(
+                            decide(has_link, true, ch, Some(FLEET), shaped, me, peer),
+                            LinkedFleetOffer::Feed,
+                            "a pending peer was re-armed (link={has_link} shaped={shaped} ch={ch:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Everything that is not the linked-fleet case keeps buffering: a
+    /// `ch`-less unicast offer, an offer on another channel, an empty `ch`,
+    /// no fleet channel of our own, no link, or a link that is not
+    /// fleet-shaped (a paired or trusted link).
+    #[test]
+    fn every_other_offer_still_buffers() {
+        for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
+            // ch-less unicast offer on a shaped link.
+            assert_eq!(
+                decide(true, false, None, Some(FLEET), true, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+            // Another meeting place (a pair channel) on a shaped link.
+            assert_eq!(
+                decide(true, false, Some("chan-pair"), Some(FLEET), true, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+            // An empty `ch` never matches, even against an empty fleet channel.
+            assert_eq!(
+                decide(true, false, Some(""), Some(""), true, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+            // We are in no fleet.
+            assert_eq!(
+                decide(true, false, Some(FLEET), None, true, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+            // No link to the peer: not this case (the one-shot and
+            // known-device arms own it).
+            assert_eq!(
+                decide(false, false, Some(FLEET), Some(FLEET), true, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+            assert_eq!(
+                decide(false, false, Some(FLEET), Some(FLEET), false, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+            // A link that is not fleet-shaped.
+            assert_eq!(
+                decide(true, false, Some(FLEET), Some(FLEET), false, me, peer),
+                LinkedFleetOffer::Buffer
+            );
+        }
+    }
+
+    /// The whole input space, so no combination slips between the rules:
+    /// arm iff link && !pending && ch == fleet channel (non-empty) && shaped,
+    /// feed iff pending, buffer otherwise; the arm's role is the sid order.
+    #[test]
+    fn the_decision_is_exhaustive() {
+        let chans = [None, Some(""), Some(FLEET), Some("chan-pair")];
+        let fleets = [None, Some(FLEET)];
+        for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
+            for has_link in [false, true] {
+                for has_pending in [false, true] {
+                    for shaped in [false, true] {
+                        for ch in chans {
+                            for fleet in fleets {
+                                let got = decide(has_link, has_pending, ch, fleet, shaped, me, peer);
+                                let on_fleet = ch.is_some_and(|c| !c.is_empty()) && ch == fleet;
+                                let want = if has_pending {
+                                    LinkedFleetOffer::Feed
+                                } else if has_link && shaped && on_fleet {
+                                    if me < peer {
+                                        LinkedFleetOffer::ArmDial
+                                    } else {
+                                        LinkedFleetOffer::ArmAnswer
+                                    }
+                                } else {
+                                    LinkedFleetOffer::Buffer
+                                };
+                                assert_eq!(
+                                    got, want,
+                                    "link={has_link} pending={has_pending} shaped={shaped} ch={ch:?} fleet={fleet:?} me={me}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

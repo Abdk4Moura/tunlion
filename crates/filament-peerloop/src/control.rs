@@ -38,6 +38,12 @@ pub enum ReqKind {
     Pty { peer: String, session: String, cols: u16, rows: u16, term: String, cmd: String },
     /// Relay a window-size change to an already-open warm PTY (by `session`).
     Resize { session: String, cols: u16, rows: u16 },
+    /// Why a finished warm PTY bridge ended, if the peer sent a scoped close.
+    /// The bridge records the peer's `l2-close{err}` before tearing the socket
+    /// down, so a one-shot client can report the same nonzero reason the cold
+    /// path reports instead of always exiting 0 on EOF. Answer carries
+    /// `{"ok":true}` with no reason for a clean end.
+    WarmPtyReason { session: String },
     /// Run a ONE-SHOT command over the daemon's existing warm link to `peer`.
     /// The daemon sends the same `exec-open` a cold initiator would (so the
     /// peer's serving/capability/revocation checks run at request time), then

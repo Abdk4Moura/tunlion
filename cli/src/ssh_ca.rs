@@ -177,7 +177,7 @@ pub(crate) async fn request_cert(
     .await?;
     let cert: Result<String, String> = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let ev = match rx.recv().await {
+            let ev = match crate::l2::recv_selected_event(rx, t.source_id()).await {
                 Some(ev) => ev,
                 None => break Err("peer closed the sign stream before answering".to_string()),
             };

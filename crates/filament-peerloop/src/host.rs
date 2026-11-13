@@ -371,7 +371,7 @@ pub trait HostServices: Send + Sync + 'static {
     }
     /// Append the receiver's structured transfer-history record.
     #[cfg(feature = "dispatch")]
-    fn record_received_file(&self, _record: &crate::recv::files::ReceivedFileRecord) {}
+    fn record_received_file(&self, _record: &crate::recv::store::ReceivedFileRecord) {}
     /// Append one line to the daemon's upload log, if it keeps one.
     #[cfg(feature = "dispatch")]
     fn append_receive_log(&self, _line: &str) {}
@@ -776,6 +776,22 @@ pub trait HostServices: Send + Sync + 'static {
     fn live_session_cut(&self, _idev: Option<&[u8; 32]>) -> Option<LiveCut> {
         None
     }
+    /// Why a live session must lose `action` now, if it must. The capability
+    /// half of [`live_session_cut`](Self::live_session_cut): a session that
+    /// survived forget, certificate revocation and the delegated deadline is
+    /// re-asked whether its authorization was WITHDRAWN. `None` means either
+    /// nothing was withdrawn or the host cannot see a withdrawal, so an inert
+    /// host never cuts.
+    ///
+    /// Only a positive withdrawal belongs here. The mere absence of a local
+    /// grant is not one: a daemon may have admitted the stream under its
+    /// blanket shell policy, and a store-level answer cannot see that policy.
+    ///
+    /// The answer is a close reason (the same wire vocabulary a refusal at open
+    /// uses), so the initiator maps it to the same exit code and remedy.
+    fn live_capability_cut(&self, _idev: Option<&[u8; 32]>, _action: &str) -> Option<String> {
+        None
+    }
     /// Is this peer's composed access deadline still ahead? `None` means the
     /// host cannot resolve the identity (no opinion); `Some(false)` ends a live
     /// session. Revocation has its own check in [`live_session_cut`](Self::live_session_cut).
@@ -852,6 +868,10 @@ pub struct CapGate<'a> {
     pub scoped_in_bounds: bool,
     pub has_explicit_grant: bool,
     pub cert_revoked: bool,
+    /// Whether the link's identity is Pending, Resolved, or explicitly absent
+    /// after a code ceremony. The policy site uses this to keep the ordering
+    /// probe strict while allowing the one anonymous-transfer class.
+    pub identity_state: filament_cap::capability::IdentityState,
     pub denied: bool,
     pub ceiling_authorizes: bool,
 }
@@ -1063,6 +1083,7 @@ mod tests {
         // refuses it instead of opening a socket the peer named.
         assert!(host.connect_local_stream("127.0.0.1", 22).await.is_err());
         assert!(host.live_session_cut(Some(&[0u8; 32])).is_none());
+        assert!(host.live_capability_cut(Some(&[0u8; 32]), "shell").is_none());
         assert_eq!(host.revoke_recheck_interval(), Duration::from_secs(5));
     }
 

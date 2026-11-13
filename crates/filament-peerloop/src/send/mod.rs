@@ -8,6 +8,7 @@
 
 pub mod ceremony;
 pub mod engine;
+pub mod gate;
 pub mod liveness;
 pub mod source;
 pub mod stream;

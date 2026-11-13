@@ -19,16 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
-/// One structured receive-history row. The host maps it onto its own store.
-pub struct ReceivedFileRecord {
-    pub time: u64,
-    pub peer: Option<String>,
-    pub file: String,
-    pub stored: Option<String>,
-    pub bytes: u64,
-    pub sha256: Option<String>,
-    pub ok: bool,
-}
+/// One structured receive-history row. Shared with the device store because a
+/// host can persist receipts without compiling the dispatch receive path.
+pub use crate::recv::store::ReceivedFileRecord;
 
 /// The delivery-ack for transfer `id`, carrying the name it was stored under
 /// when this invocation knows it. `stored` is additive: an older sender ignores
@@ -36,10 +29,15 @@ pub struct ReceivedFileRecord {
 pub fn delivery_ack(
     id: &str,
     sid: u32,
-    stored: &std::sync::Arc<Mutex<HashMap<String, String>>>,
+    stored: &std::sync::Arc<Mutex<HashMap<String, crate::recv::ports::DeliveredFile>>>,
 ) -> serde_json::Value {
     let mut m = protocol::delivery_ack_msg(id, sid);
-    let name = stored.lock().ok().and_then(|mut s| s.remove(id));
+    // Peek, never take: a retry of the same offer after this ack was lost must
+    // still find what was stored and be re-acked instead of re-received.
+    let name = stored
+        .lock()
+        .ok()
+        .and_then(|s| s.get(id).map(|d| d.stored_name.clone()));
     if let Some(name) = name {
         m["stored"] = serde_json::json!(name);
     }
@@ -155,7 +153,7 @@ pub async fn finalize_incoming(
     daemon: bool,
     from_name: &str,
     report: &RecvReport,
-    delivery: &std::sync::Arc<Mutex<HashMap<String, String>>>,
+    delivery: &std::sync::Arc<Mutex<HashMap<String, crate::recv::ports::DeliveredFile>>>,
 ) -> Result<bool> {
     let f = inc.file.clone();
     let _ = tokio::task::spawn_blocking(move || {
@@ -220,7 +218,22 @@ pub async fn finalize_incoming(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     if let Ok(mut m) = delivery.lock() {
-        m.insert(inc.id.clone(), stored_name.clone());
+        // Bounded: a daemon serves for the life of the process. 256 recent
+        // transfers is far more than any delivery-ack retry window can reach.
+        if m.len() >= 256 {
+            if let Some(k) = m.keys().next().cloned() {
+                m.remove(&k);
+            }
+        }
+        m.insert(
+            inc.id.clone(),
+            crate::recv::ports::DeliveredFile {
+                name: inc.name.clone(),
+                size: inc.size,
+                full: inc.full.clone(),
+                stored_name: stored_name.clone(),
+            },
+        );
     }
     if !daemon && ok {
         report.note_stored(&inc.name, recvd, inc.full.as_deref(), &stored_name);
@@ -271,7 +284,7 @@ pub async fn sweep_completed_streams(
     daemon: bool,
     report: &RecvReport,
     completed: &mut usize,
-    delivery: &std::sync::Arc<Mutex<HashMap<String, String>>>,
+    delivery: &std::sync::Arc<Mutex<HashMap<String, crate::recv::ports::DeliveredFile>>>,
 ) -> Result<()> {
     let done_sids: Vec<(String, u32)> = by_sid
         .iter()

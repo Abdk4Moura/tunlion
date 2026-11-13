@@ -67,7 +67,7 @@ pub use imp::{
     try_bootstrap, try_cap_status, try_deny_request, try_dial, try_dial_reason, try_fleet_rendezvous,
     try_l3_state, try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping,
     try_pty_reason, try_reconfigure, try_reload, try_reload_expose, try_resize,
-    try_revocation_sync, try_unmount, try_wake, try_depart,
+    try_revocation_sync, try_unmount, try_wake, try_depart, warm_pty_end_reason,
 };
 
 #[cfg(not(unix))]
@@ -276,6 +276,40 @@ mod imp {
         let reply = read_line(&mut s, 4096).await.ok()?;
         let v: Value = serde_json::from_str(&reply).ok()?;
         (v["ok"].as_bool() == Some(true)).then_some(s)
+    }
+
+    /// The scoped reason a finished warm PTY bridge recorded, if any. The
+    /// daemon stores it around the bridge's socket close, so poll briefly;
+    /// silence is a clean end, not an error.
+    pub async fn warm_pty_end_reason(session: &str) -> Option<String> {
+        for attempt in 0..6 {
+            if let Some(reason) = warm_pty_end_reason_once(session).await {
+                return Some(reason);
+            }
+            if attempt < 5 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        None
+    }
+
+    async fn warm_pty_end_reason_once(session: &str) -> Option<String> {
+        if reuse_disabled() {
+            return None;
+        }
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut line = serde_json::to_vec(&json!({ "op": "warm-pty-reason", "session": session })).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), read_line(&mut s, 4096))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true))
+            .then(|| v["reason"].as_str().map(str::to_string))
+            .flatten()
     }
 
     /// Relay a window-size change to an already-open warm PTY (by `session`),
@@ -630,19 +664,74 @@ mod imp {
     /// Returns the one-time secret both ends will meet on. `None` when there is
     /// no daemon, or it holds no verified link to that peer, in which case the
     /// caller falls back to finding the peer itself.
+    ///
+    /// A daemon that answers "no verified link" is reporting a link it had and
+    /// lost (a transport can die after the daemon's last health scan) rather
+    /// than a peer that was never known. Wait a bounded window for the warm
+    /// re-dial to restore that verified link, then give the same answer. Every
+    /// attempt still requires the daemon's live verified link: this retries the
+    /// request, never the authentication.
     pub async fn try_fleet_rendezvous(name: &str) -> Option<String> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        const RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(12);
+        const RETRY_STEP: std::time::Duration = std::time::Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + RETRY_WINDOW;
+        loop {
+            match fleet_rendezvous_once(name).await {
+                BrokerReply::Secret(secret) => return Some(secret),
+                BrokerReply::NoDaemon => return None,
+                BrokerReply::NoVerifiedLink if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(RETRY_STEP).await;
+                }
+                BrokerReply::NoVerifiedLink => return None,
+                BrokerReply::Refused => return None,
+            }
+        }
+    }
+
+    enum BrokerReply {
+        Secret(String),
+        NoDaemon,
+        /// The daemon is serving but currently holds no verified link to the
+        /// named sibling. Transient; worth one bounded wait.
+        NoVerifiedLink,
+        /// Any other refusal: never retried.
+        Refused,
+    }
+
+    async fn fleet_rendezvous_once(name: &str) -> BrokerReply {
+        let Some(mut s) = UnixStream::connect(control_sock_path()).await.ok() else {
+            return BrokerReply::NoDaemon;
+        };
         let req = json!({ "op": "fleet-rendezvous", "name": name });
-        let mut line = serde_json::to_vec(&req).ok()?;
+        let Ok(mut line) = serde_json::to_vec(&req) else {
+            return BrokerReply::Refused;
+        };
         line.push(b'\n');
-        s.write_all(&line).await.ok()?;
-        s.flush().await.ok()?;
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), read_line(&mut s, 4096))
-            .await.ok()?.ok()?;
-        let v: Value = serde_json::from_str(&reply).ok()?;
-        (v["ok"].as_bool() == Some(true))
-            .then(|| v["secret"].as_str().map(str::to_string))
-            .flatten()
+        if s.write_all(&line).await.is_err() || s.flush().await.is_err() {
+            return BrokerReply::Refused;
+        }
+        let Ok(Ok(reply)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_line(&mut s, 4096)).await
+        else {
+            return BrokerReply::Refused;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&reply) else {
+            return BrokerReply::Refused;
+        };
+        if v["ok"].as_bool() == Some(true) {
+            return match v["secret"].as_str() {
+                Some(secret) if !secret.is_empty() => BrokerReply::Secret(secret.to_string()),
+                _ => BrokerReply::Refused,
+            };
+        }
+        let no_link = v["err"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("no verified link"));
+        if no_link {
+            BrokerReply::NoVerifiedLink
+        } else {
+            BrokerReply::Refused
+        }
     }
 
     /// Ask the daemon to approve a pending request by id.
@@ -843,6 +932,10 @@ mod imp {
                     }
                     Some("cap-status") => ReqKind::CapStatus,
                     Some("list-warm") => ReqKind::ListWarm,
+                    Some("warm-pty-reason") => {
+                        let Some(session) = v["session"].as_str().map(str::to_string) else { return };
+                        ReqKind::WarmPtyReason { session }
+                    }
                     Some("fleet-rendezvous") => {
                         let Some(name) = v["name"].as_str().map(str::to_string) else { return };
                         ReqKind::FleetRendezvous { name }
@@ -1108,6 +1201,12 @@ mod stub {
     /// No control socket here, so no daemon can be asked to reload onto an
     /// updated binary; `update` then prints how to restart it instead.
     pub async fn try_reload() -> Option<Value> {
+        None
+    }
+
+    /// No warm daemon bridge exists on this platform, so there is no recorded
+    /// close reason to ask for.
+    pub async fn warm_pty_end_reason(_session: &str) -> Option<String> {
         None
     }
 

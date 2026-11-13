@@ -294,6 +294,13 @@
       ]
     },
     {
+      "path": "cli/tests/fleet-terminal-withdrawal-gates.sh",
+      "disposition": "diagnostic",
+      "issue": "https://github.com/Abdk4Moura/tunlion/issues/661",
+      "owner": "appropriator",
+      "expires": "2026-12-31"
+    },
+    {
       "path": "cli/tests/revocation-live-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/revocation-live-gates.sh",

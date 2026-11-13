@@ -183,6 +183,9 @@ pub fn peer_authz(conn: &mut Conn, pid: &str) -> PeerAuthz {
 /// Gathered gate inputs: link-derived + store-derived + policy, pre-decision.
 /// Plain data (no Conn), so the matrix test can fabricate every cell.
 pub struct ShellGateInputs {
+    /// A verified pair-secret relationship, deliberately distinct from both
+    /// a pending certificate identity and consented anonymous transfer.
+    pub certless_pair: Option<CertlessPair>,
     pub trusted: bool,
     pub denied: bool,
     pub policy_allows: bool,
@@ -205,11 +208,175 @@ pub struct ShellGateInputs {
     /// engine's `ceiling_authorizes`, which decides only under authoritative
     /// mode (shadow must decide exactly as it did before this feature).
     pub ceiling_covers: bool,
+    /// The link's identity fact at gate time. `ExplicitlyUnavailableAnonymous`
+    /// denies every shell-class action; it is transfer-only by policy.
+    pub identity_state: filament_cap::capability::IdentityState,
     /// The SCOPE-DEFAULT class for this open (transfer into the drop dir,
     /// forward to an exposed port). Distinct from the ceiling: this class has
     /// always auto-authorized same-owner Proven devices in BOTH modes.
     /// False for the shell-class paths, which are deliberate-tier.
     pub scoped_default: bool,
+}
+
+/// Evidence captured only after link authentication. The secret is private and
+/// never formatted; every decision rechecks its exact current-store binding.
+pub struct CertlessPair {
+    name: String,
+    secret: String,
+}
+
+impl CertlessPair {
+    fn current(&self, host: &dyn HostServices) -> bool {
+        !self.secret.is_empty()
+            && !host.device_record_revoked(&self.name)
+            && host.device_cert_for(&self.name).is_none()
+            && host.principal_ceiling_for(&self.name).is_none()
+            && host.devices_load().iter().any(|(name, secret)| {
+                name == &self.name && secret == &self.secret
+            })
+    }
+
+    fn from_link(conn: &Conn, pid: &str) -> Option<Self> {
+        // Identity state is about a CERTIFICATE, not the pair. A certless pair
+        // that answered `identity-unavailable` is honestly anonymous for
+        // transfer, yet its exact stored secret still authenticates the shell
+        // relationship; only an explicit grant may use it.
+        Self::authenticated_binding(conn, pid)
+    }
+
+    fn authenticated_binding(conn: &Conn, pid: &str) -> Option<Self> {
+        let link = conn.link(pid)?;
+        if !link.trusted
+            || link.identity_device_pub.is_some()
+            || link.identity_user_pub.is_some()
+            || !matches!(link.principal_kind, PrincipalKind::OwnerDevice)
+        {
+            return None;
+        }
+        let pair = Self {
+            name: link.verified_name.clone()?,
+            secret: link.device_secret()?.to_string(),
+        };
+        pair.current(conn.host.as_ref()).then_some(pair)
+    }
+}
+
+/// The authenticated scope of one terminal, not a peer label supplied on wire.
+/// Retained by the session so withdrawal rechecks never tear down unrelated
+/// streams or replace the identity with a newly reused petname.
+#[derive(Clone)]
+pub struct TerminalSessionScope {
+    name: Option<String>,
+    device: Option<[u8; 32]>,
+    user: Option<[u8; 32]>,
+    binding: BindingStrength,
+    expires: Option<u64>,
+    key_caps: Option<Vec<String>>,
+    trusted: bool,
+    policy_allows: bool,
+    sibling: bool,
+    pair_binding: Option<String>,
+    require_name_key: bool,
+    identity_state: filament_cap::capability::IdentityState,
+}
+
+fn terminal_pair_binding(sibling: bool, secret: Option<&str>) -> Option<String> {
+    // A sibling's transport may have used the shared rendezvous secret. It
+    // is not a device pair record and cannot be rechecked as one.
+    if sibling {
+        return None;
+    }
+    secret.map(str::to_owned)
+}
+
+impl TerminalSessionScope {
+    pub fn capture(conn: &mut Conn, pid: &str, policy: &ShellPolicy) -> Self {
+        let (name, inputs) = gather_shell_gate_inputs(conn, pid, policy, "shell");
+        let require_name_key = name.as_deref().is_some_and(|name| conn.host.device_cert_for(name).is_some());
+        let sibling = conn.link(pid).is_some_and(|l| l.is_sibling_link() && l.fleet_proven());
+        let pair_binding = terminal_pair_binding(
+            sibling,
+            conn.link(pid).and_then(|l| l.device_secret()),
+        );
+        Self {
+            name,
+            device: inputs.idev,
+            user: inputs.iusr,
+            binding: inputs.binding,
+            expires: inputs.expires,
+            key_caps: inputs.ak_caps,
+            trusted: inputs.trusted,
+            policy_allows: inputs.policy_allows,
+            sibling,
+            pair_binding,
+            require_name_key,
+            identity_state: inputs.identity_state,
+        }
+    }
+
+    /// Re-run the same admission gate over fresh receiver facts. This is scoped
+    /// to the terminal's proven identity; fleet grants cannot authorize a paired
+    /// browser, and local denial overrides every grant source.
+    pub fn withdrawn(&self, host: &dyn HostServices) -> bool {
+        // Browser pairwise sessions without a persisted identity retain their
+        // existing lifetime policy. Do not invent a fleet identity for them.
+        if self.name.is_none() && self.device.is_none() {
+            return false;
+        }
+        if let Some(secret) = &self.pair_binding {
+            if !host.devices_load().iter().any(|(name, held)| {
+                Some(name) == self.name.as_ref() && held == secret
+            }) {
+                return true;
+            }
+        }
+        if let (Some(name), Some(device)) = (&self.name, self.device.as_ref()) {
+            let current = host.device_cert_for(name);
+            if current.as_ref().is_some_and(|cert| cert.device_pub != *device)
+                || (self.require_name_key && current.is_none()) {
+                return true;
+            }
+        }
+        let now = host.now_secs();
+        let delegated = self.device.as_ref().and_then(|key| host.delegated_access_for(key));
+        let expires = delegated.as_ref().map(|d| d.deadline).or(self.expires);
+        let key_caps = delegated.as_ref().map(|d| {
+            if d.expired(now) { Vec::new() } else { d.ceiling.clone() }
+        }).or_else(|| self.key_caps.clone());
+        let store = host.cap_store();
+        let outcome = authorize_in(&store, "self", "shell", self.device.as_ref(), self.user.as_ref(), key_caps.as_deref(), now);
+        let (own_user, has_grant) = fleet_inputs_in(&store, "self", "shell", self.device.as_ref(), self.user.as_ref(), key_caps.as_deref(), now);
+        let denied = self.name.as_deref().is_some_and(|n| host.device_capability_denied(n, "shell"));
+        let local_grant = self.name.as_deref().is_some_and(|n| host.device_allows(n, "shell"));
+        let owner_grant = self.sibling && self.device.as_ref().is_some_and(|key| host.fleet_grant_applies(key, "shell"));
+        let inputs = ShellGateInputs {
+            certless_pair: if self.trusted && !self.sibling
+                && self.device.is_none() && self.user.is_none() && self.key_caps.is_none()
+            {
+                self.name.as_ref().zip(self.pair_binding.as_ref()).map(|(name, secret)| CertlessPair {
+                    name: name.clone(), secret: secret.clone(),
+                })
+            } else { None },
+            trusted: self.trusted,
+            denied,
+            policy_allows: self.policy_allows,
+            store_allows: local_grant || owner_grant,
+            outcome,
+            idev: self.device,
+            iusr: self.user,
+            binding: self.binding,
+            expires,
+            ak_caps: key_caps,
+            own_user,
+            has_grant: has_grant || (self.sibling && (local_grant || owner_grant)),
+            cert_revoked: host.cert_revoked_for(self.device.as_ref()),
+            action: "shell".into(),
+            ceiling_covers: host.ceiling_covers_action(self.device.as_ref(), "shell"),
+            identity_state: self.identity_state,
+            scoped_default: false,
+        };
+        decide(&inputs, host).is_err()
+    }
 }
 
 /// Gather from live state. Both call sites use this; nothing gate-relevant
@@ -256,6 +423,7 @@ pub fn gather_shell_gate_inputs(
     let (_, has_grant) = sibling_gate_inputs(&sib, action, false, has_grant);
     let store_allows = store_allows || (sib.is_sibling && sib.owner_grant);
     let inputs = ShellGateInputs {
+        certless_pair: CertlessPair::from_link(conn, pid),
         trusted,
         denied,
         policy_allows,
@@ -270,6 +438,7 @@ pub fn gather_shell_gate_inputs(
         has_grant,
         cert_revoked,
         ceiling_covers,
+        identity_state: conn.identity_state_of(pid),
         scoped_default: false,
         action: action.to_string(),
     };
@@ -414,6 +583,20 @@ fn decide_with_legacy(
     legacy_ok: bool,
     host: &dyn HostServices,
 ) -> Result<(), Option<String>> {
+    if let Some(pair) = &inputs.certless_pair {
+        // Certificate-less pairs are authenticated by the exact stored secret,
+        // not by an absent certificate key. Never send them to the certificate
+        // evaluator as if unresolved identity were certificate authority.
+        return if inputs.trusted && legacy_ok && !inputs.denied && !inputs.cert_revoked
+            && inputs.idev.is_none() && inputs.iusr.is_none() && inputs.ak_caps.is_none()
+            && pair.current(host)
+        {
+            Ok(())
+        } else {
+            Err(Some("pair access revoked or not granted".into()))
+        };
+    }
+    require_shell_identity(inputs.identity_state, inputs.idev.as_ref())?;
     // Two auto-trust classes travel separately: `scoped_default` (mode
     // independent, pre-existing) and `ceiling_covers` (authoritative-only
     // for the decision; counted as would-allow in shadow so the ceiling
@@ -432,6 +615,7 @@ fn decide_with_legacy(
         scoped_in_bounds: inputs.scoped_default,
         has_explicit_grant: inputs.has_grant,
         cert_revoked: inputs.cert_revoked,
+        identity_state: inputs.identity_state,
         denied: inputs.denied,
         ceiling_authorizes: inputs.ceiling_covers,
     });
@@ -439,6 +623,19 @@ fn decide_with_legacy(
         GateDecision::Allow => Ok(()),
         GateDecision::Deny { cap_reason } => Err(cap_reason),
     }
+}
+
+/// Pair-secret trust does not settle the identity needed for certificate
+/// revocation. Refuse before capability evaluation until that identity exists;
+/// anonymous consent is transfer-only, never authority for a shell.
+pub fn require_shell_identity(
+    state: filament_cap::capability::IdentityState,
+    device_pub: Option<&[u8; 32]>,
+) -> Result<(), Option<String>> {
+    if state != filament_cap::capability::IdentityState::Resolved || device_pub.is_none() {
+        return Err(Some("identity-not-proven".to_string()));
+    }
+    Ok(())
 }
 
 /// Exec-open's entry point: delegates to the shared core (no local logic).
@@ -455,6 +652,234 @@ pub fn pty_gate_decision(
     host: &dyn HostServices,
 ) -> Result<(), Option<String>> {
     decide(inputs, host)
+}
+
+#[cfg(test)]
+mod terminal_lifecycle_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Facts {
+        owner_grants: HashSet<[u8; 32]>,
+        local_grants: HashSet<String>,
+        denies: HashSet<String>,
+        pairs: Vec<(String, String)>,
+        keys: std::collections::HashMap<String, [u8; 32]>,
+        revoked_records: HashSet<String>,
+        delegated_records: HashSet<String>,
+    }
+    #[derive(Default)]
+    struct Host(Mutex<Facts>);
+    impl HostServices for Host {
+        fn settings_get_str(&self, _: &str) -> Option<String> { None }
+        fn devices_load(&self) -> Vec<(String, String)> { self.0.lock().unwrap().pairs.clone() }
+        fn is_self_uid(&self, _: &str, _: Option<&str>) -> bool { false }
+        fn rejoin_unwarned(&self) -> Duration { Duration::from_secs(1) }
+        fn relay_banner(&self) -> String { String::new() }
+        fn relay_forbidden(&self) -> bool { false }
+        fn channel_of(&self, _: &str) -> String { String::new() }
+        fn roster_snapshot_json(&self) -> Option<String> { None }
+        fn fleet_rv_present(&self) -> bool { false }
+        fn device_cert_for(&self, name: &str) -> Option<filament_id::DeviceCert> {
+            self.0.lock().unwrap().keys.get(name).map(|key| filament_id::DeviceCert {
+                device_pub: *key, user_pub: [9; 32], expires: u64::MAX, issued: 1, sig: [0; 64],
+            })
+        }
+        fn fleet_grant_applies(&self, key: &[u8; 32], _: &str) -> bool {
+            self.0.lock().unwrap().owner_grants.contains(key)
+        }
+        fn device_allows(&self, name: &str, _: &str) -> bool {
+            self.0.lock().unwrap().local_grants.contains(name)
+        }
+        fn device_capability_denied(&self, name: &str, _: &str) -> bool {
+            self.0.lock().unwrap().denies.contains(name)
+        }
+        fn cap_gate_effective(&self, gate: CapGate<'_>) -> GateDecision {
+            assert!(require_shell_identity(gate.identity_state, gate.device_pub).is_ok());
+            if gate.legacy_allowed && !gate.denied && !gate.cert_revoked {
+                GateDecision::Allow
+            } else {
+                GateDecision::Deny { cap_reason: Some("access revoked".into()) }
+            }
+        }
+        fn device_record_revoked(&self, name: &str) -> bool {
+            self.0.lock().unwrap().revoked_records.contains(name)
+        }
+        fn principal_ceiling_for(&self, name: &str) -> Option<Vec<String>> {
+            self.0.lock().unwrap().delegated_records.contains(name).then(Vec::new)
+        }
+    }
+    fn sibling(name: &str, key: u8) -> TerminalSessionScope {
+        TerminalSessionScope {
+            name: Some(name.into()), device: Some([key; 32]), user: Some([9; 32]),
+            binding: BindingStrength::Proven, expires: Some(u64::MAX), key_caps: None,
+            trusted: true, policy_allows: false, sibling: true, pair_binding: None, require_name_key: false,
+            identity_state: filament_cap::capability::IdentityState::Resolved,
+        }
+    }
+
+    #[test]
+    fn owner_withdrawal_only_ends_the_matching_terminal_scope() {
+        let host = Host::default();
+        let alice = sibling("alice", 1);
+        let bob = sibling("bob", 2);
+        host.0.lock().unwrap().owner_grants.extend([[1; 32], [2; 32]]);
+        assert!(!alice.withdrawn(&host));
+        assert!(!bob.withdrawn(&host));
+        host.0.lock().unwrap().owner_grants.remove(&[1; 32]);
+        assert!(alice.withdrawn(&host));
+        assert!(!bob.withdrawn(&host));
+        // A separate receiver-local grant survives owner withdrawal.
+        host.0.lock().unwrap().local_grants.insert("alice".into());
+        assert!(!alice.withdrawn(&host));
+        host.0.lock().unwrap().denies.insert("alice".into());
+        assert!(alice.withdrawn(&host));
+        assert!(!bob.withdrawn(&host));
+    }
+
+    #[test]
+    fn unresolved_shell_identity_is_refused_before_legacy_authorization() {
+        use filament_cap::capability::IdentityState;
+        let key = [1; 32];
+        for state in [IdentityState::Pending, IdentityState::ExplicitlyUnavailableAnonymous] {
+            for device_pub in [None, Some(&key)] {
+                assert_eq!(
+                    require_shell_identity(state, device_pub),
+                    Err(Some("identity-not-proven".into()))
+                );
+            }
+        }
+        assert!(require_shell_identity(IdentityState::Resolved, None).is_err());
+        assert!(require_shell_identity(IdentityState::Resolved, Some(&key)).is_ok());
+
+        let host = Host::default();
+        host.0.lock().unwrap().owner_grants.insert(key);
+        host.0.lock().unwrap().local_grants.insert("alice".into());
+        let mut scope = sibling("alice", 1);
+        scope.trusted = true;
+        scope.device = None;
+        scope.identity_state = IdentityState::Pending;
+        assert!(scope.withdrawn(&host), "unresolved identity must not retain shell access");
+    }
+
+    fn legacy_pair_scope() -> TerminalSessionScope {
+        let mut scope = sibling("paired", 1);
+        scope.sibling = false;
+        scope.device = None;
+        scope.user = None;
+        scope.expires = None;
+        scope.binding = BindingStrength::None;
+        scope.identity_state = filament_cap::capability::IdentityState::Pending;
+        scope.pair_binding = Some("authenticated-pair-secret".into());
+        scope
+    }
+
+    #[test]
+    fn certless_authenticated_pairs_keep_explicit_shell_access_not_fleet_authority() {
+        let host = Host::default();
+        host.0.lock().unwrap().pairs.push(("paired".into(), "authenticated-pair-secret".into()));
+        let scope = legacy_pair_scope();
+        assert!(scope.withdrawn(&host), "pair authentication alone is not shell permission");
+        host.0.lock().unwrap().owner_grants.insert([1; 32]);
+        assert!(scope.withdrawn(&host), "fleet grants cannot authorize a certless pair");
+        host.0.lock().unwrap().local_grants.insert("paired".into());
+        assert!(!scope.withdrawn(&host), "current authenticated pair plus local grant must work");
+        let mut anonymous = scope.clone();
+        anonymous.identity_state =
+            filament_cap::capability::IdentityState::ExplicitlyUnavailableAnonymous;
+        assert!(
+            !anonymous.withdrawn(&host),
+            "a certless pair stays shell-authorized by its exact secret when its identity is honestly anonymous"
+        );
+        host.0.lock().unwrap().denies.insert("paired".into());
+        assert!(scope.withdrawn(&host), "local deny overrides pair permission");
+    }
+
+    #[test]
+    fn certless_pair_access_ends_on_secret_replacement_or_forget() {
+        let host = Host::default();
+        host.0.lock().unwrap().pairs.push(("paired".into(), "authenticated-pair-secret".into()));
+        host.0.lock().unwrap().local_grants.insert("paired".into());
+        let mut scope = legacy_pair_scope();
+        assert!(!scope.withdrawn(&host));
+        scope.identity_state = filament_cap::capability::IdentityState::ExplicitlyUnavailableAnonymous;
+        assert!(
+            !scope.withdrawn(&host),
+            "anonymous is an identity fact, not a revocation of an explicitly granted pair"
+        );
+        scope.identity_state = filament_cap::capability::IdentityState::Pending;
+        scope.trusted = false;
+        assert!(scope.withdrawn(&host), "a guessed secret is not an authenticated pair");
+        scope.trusted = true;
+        host.0.lock().unwrap().revoked_records.insert("paired".into());
+        assert!(scope.withdrawn(&host));
+        host.0.lock().unwrap().revoked_records.clear();
+        host.0.lock().unwrap().delegated_records.insert("paired".into());
+        assert!(scope.withdrawn(&host), "a missing delegated cert cannot become a legacy pair");
+        host.0.lock().unwrap().delegated_records.clear();
+        host.0.lock().unwrap().keys.insert("paired".into(), [3; 32]);
+        assert!(scope.withdrawn(&host), "a certificate-bearing peer cannot bypass identity settlement");
+        host.0.lock().unwrap().keys.clear();
+        host.0.lock().unwrap().pairs[0].1 = "replacement-secret".into();
+        assert!(scope.withdrawn(&host));
+        host.0.lock().unwrap().pairs.clear();
+        assert!(scope.withdrawn(&host));
+    }
+
+    #[test]
+    fn fleet_rendezvous_is_not_rechecked_as_a_device_pair_record() {
+        let host = Host::default();
+        let mut scope = sibling("alice", 1);
+        scope.pair_binding = terminal_pair_binding(true, Some("fleet-rendezvous"));
+        assert!(scope.pair_binding.is_none());
+        host.0.lock().unwrap().owner_grants.insert([1; 32]);
+        assert!(host.devices_load().is_empty());
+        assert!(!scope.withdrawn(&host), "a held owner grant must survive the recheck");
+        host.0.lock().unwrap().owner_grants.remove(&[1; 32]);
+        assert!(scope.withdrawn(&host), "withdrawal must still end the terminal");
+        assert_eq!(terminal_pair_binding(false, Some("paired-device")), Some("paired-device".into()));
+    }
+
+    #[test]
+    fn owner_grants_never_widen_pairwise_or_browser_sessions() {
+        let host = Host::default();
+        host.0.lock().unwrap().owner_grants.insert([1; 32]);
+        let mut paired = sibling("paired", 1);
+        paired.sibling = false;
+        assert!(paired.withdrawn(&host));
+        paired.name = None;
+        paired.device = None;
+        assert!(!paired.withdrawn(&host));
+    }
+
+    #[test]
+    fn reused_petname_cannot_keep_a_retired_pair_session_alive() {
+        let host = Host::default();
+        let mut scope = sibling("laptop", 1);
+        scope.sibling = false;
+        scope.pair_binding = Some("old-binding".into());
+        host.0.lock().unwrap().local_grants.insert("laptop".into());
+        host.0.lock().unwrap().pairs.push(("laptop".into(), "old-binding".into()));
+        assert!(!scope.withdrawn(&host));
+        host.0.lock().unwrap().pairs[0].1 = "fresh-binding".into();
+        assert!(scope.withdrawn(&host));
+    }
+
+    #[test]
+    fn a_certless_replacement_record_cannot_inherit_a_fleet_terminal() {
+        let host = Host::default();
+        let mut scope = sibling("laptop", 1);
+        scope.require_name_key = true;
+        host.0.lock().unwrap().keys.insert("laptop".into(), [1; 32]);
+        host.0.lock().unwrap().local_grants.insert("laptop".into());
+        assert!(!scope.withdrawn(&host));
+        host.0.lock().unwrap().keys.remove("laptop");
+        assert!(scope.withdrawn(&host));
+        host.0.lock().unwrap().keys.insert("laptop".into(), [2; 32]);
+        assert!(scope.withdrawn(&host));
+    }
 }
 
 /// Forward-open's entry point: same shared core, but the caller supplies
