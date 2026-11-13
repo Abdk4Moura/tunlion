@@ -1,0 +1,23 @@
+name: Chunk attribution regression
+on:
+  push:
+    branches: [fix/chunk-source-attribution]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Real QUIC worker reader and readiness ordering
+        run: cargo test -p tunlion-transport worker_ready_precedes_actual_sourced_chunk -- --nocapture
+      - name: Daemon chunk admission, worker and pre-adoption fencing
+        run: cargo test -p tunlion-peerloop chunk_attribution_fences_pairing_and_worker_dispatch -- --nocapture
+      - name: Selected link chunk fencing and CLI compilation
+        run: cargo test -p tunlion --bin tunlion the_selected_pump_reads_only_the_selected_transports_source -- --nocapture

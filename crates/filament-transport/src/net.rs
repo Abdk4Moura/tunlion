@@ -2615,12 +2615,14 @@ async fn wire_channel(
                                         buf[4], buf[5], buf[6], buf[7],
                                         buf[8], buf[9], buf[10], buf[11],
                                     ]);
-                                    let _ = tx.send(Ev::Chunk(
-                                        peer_id.clone(),
-                                        sid,
-                                        Some(offset),
-                                        Bytes::copy_from_slice(&buf[12..n]),
-                                    ));
+                                    let _ = tx.send(Ev::Sourced {
+                                        pid: peer_id.clone(),
+                                        source,
+                                        inner: Box::new(Ev::Chunk(
+                                            peer_id.clone(), sid, Some(offset),
+                                            Bytes::copy_from_slice(&buf[12..n]),
+                                        )),
+                                    });
                                 }
                             }
                         }

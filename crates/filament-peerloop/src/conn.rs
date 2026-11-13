@@ -3808,7 +3808,8 @@ impl Conn {
                 let valid_inner = match inner.as_ref() {
                     Ev::Control(ipid, _)
                     | Ev::PcState(ipid, _)
-                    | Ev::ChannelReady(ipid, _) => ipid == &pid,
+                    | Ev::ChannelReady(ipid, _)
+                    | Ev::Chunk(ipid, ..) => ipid == &pid,
                     _ => false,
                 };
                 if !valid_inner {
@@ -3826,7 +3827,7 @@ impl Conn {
             }
             // A transport-origin event must never arrive untagged. Fail closed
             // whether or not a link exists.
-            Ev::Control(..) | Ev::PcState(..) | Ev::ChannelReady(..) => None,
+            Ev::Control(..) | Ev::PcState(..) | Ev::ChannelReady(..) | Ev::Chunk(..) => None,
             // Loop-authored events are explicitly trusted: they are created by
             // this loop, not a transport callback.
             Ev::LocalControl(pid, value) => Some((Ev::Control(pid, value), None)),
@@ -3836,7 +3837,7 @@ impl Conn {
     }
 
     /// A source is current when it is the link's primary source, or (for
-    /// Control only) one of its current worker sources. PcState/ChannelReady
+    /// Control and Chunk only) one of its current worker sources. PcState/ChannelReady
     /// and a departure barrier (`Ev::PeerLeft`) are primary-only so a worker
     /// can never trigger primary teardown/readiness or a departure.
     fn source_current(&self, pid: &str, source: net::SourceId, inner: &Ev) -> bool {
@@ -3846,7 +3847,7 @@ impl Conn {
         if link.source == source {
             return true;
         }
-        matches!(inner, Ev::Control(..)) && link.worker_sources.contains(&source)
+        matches!(inner, Ev::Control(..) | Ev::Chunk(..)) && link.worker_sources.contains(&source)
     }
 
     /// Buffer a pre-adoption event for a registered source. Per-source and total
@@ -6056,9 +6057,7 @@ impl Conn {
             tokio::spawn(async move {
                 let workers =
                     direct::accept_workers(endpoints, tkey, pid.clone(), tx.clone(), count).await;
-                if !workers.is_empty() {
-                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers, primary_source));
-                }
+                direct::announce_workers(workers, &tx, pid, primary_source);
             });
         } else {
             // DIALER: wait for the acceptor's worker ports, then connect to each.
@@ -6077,9 +6076,7 @@ impl Conn {
                 let workers =
                     direct::dial_workers(ports, peer_ip, tkey, pid.clone(), tx.clone(), count)
                         .await;
-                if !workers.is_empty() {
-                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers, primary_source));
-                }
+                direct::announce_workers(workers, &tx, pid, primary_source);
             });
         }
     }
@@ -13275,6 +13272,48 @@ mod warm_identity_tests {
         assert!(conn
             .stage_event(Ev::LocalControl(pid.into(), json!({ "type": "x" })))
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn chunk_attribution_fences_pairing_and_worker_dispatch() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "pairing-peer";
+        let primary = Rec::new("primary", &log);
+        let source = primary.source_id().unwrap();
+        let worker = Rec::new("worker", &log);
+        let worker_source = worker.source_id().unwrap();
+        let retired = net::SourceId::next();
+        let mut link = relay_link(pid, "peer", "peer", primary);
+        link.source = source;
+        link.worker_sources.insert(worker_source);
+        conn.links.insert(pid.into(), link);
+        let chunk = |s, envelope: &str, inner: &str| Ev::Sourced {
+            pid: envelope.into(), source: s,
+            inner: Box::new(Ev::Chunk(inner.into(), 42, Some(0), bytes::Bytes::from_static(b"pair"))),
+        };
+        assert!(matches!(conn.stage_event(chunk(source, pid, pid)), Some((Ev::Chunk(..), Some(s))) if s == source));
+        assert!(matches!(conn.stage_event(chunk(worker_source, pid, pid)), Some((Ev::Chunk(..), Some(s))) if s == worker_source));
+        assert!(conn.stage_event(chunk(retired, pid, pid)).is_none());
+        assert!(conn.stage_event(chunk(source, pid, "other")).is_none());
+        assert!(conn.stage_event(Ev::Chunk(pid.into(), 42, Some(0), bytes::Bytes::new())).is_none());
+
+        // A registered standby may read before adoption. Replay stays tagged,
+        // and replacement between flush and dispatch must still fence it.
+        let standby = Rec::new("standby", &log);
+        let standby_source = standby.source_id().unwrap();
+        conn.pending_sources.insert(standby_source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::new(), bytes: 0,
+        });
+        assert!(conn.stage_event(chunk(standby_source, pid, pid)).is_none());
+        assert_eq!(conn.pending_sources[&standby_source].events.len(), 1);
+        conn.links.get_mut(pid).unwrap().source = standby_source;
+        conn.flush_pending_source(standby_source);
+        conn.links.get_mut(pid).unwrap().source = source;
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
+        conn.links.get_mut(pid).unwrap().worker_sources.clear();
+        assert!(conn.stage_event(chunk(worker_source, pid, pid)).is_none());
     }
 
     /// A registered standby source buffers until adoption, replays with its tag,

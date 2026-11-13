@@ -1871,12 +1871,13 @@ fn reader_task(
                         }
                         // Zero-copy: convert Vec directly to Bytes, then split off the 12-byte prefix.
                         let bytes = bytes::Bytes::from(body);
-                        let _ = tx.send(crate::net::Ev::Chunk(
-                            peer_id.clone(),
-                            sid,
-                            Some(offset),
-                            bytes.slice(12..),
-                        ));
+                        let _ = tx.send(crate::net::Ev::Sourced {
+                            pid: peer_id.clone(),
+                            source,
+                            inner: Box::new(crate::net::Ev::Chunk(
+                                peer_id.clone(), sid, Some(offset), bytes.slice(12..),
+                            )),
+                        });
                     }
                 }
                 _ => {}
@@ -1940,6 +1941,25 @@ impl Drop for UnreadTransport {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(reader);
             }
+        }
+    }
+}
+
+/// Authorize the whole worker set before any of its readers can emit events.
+pub fn announce_workers(
+    mut workers: Vec<UnreadTransport>,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+    pid: String,
+    primary_source: SourceId,
+) {
+    if workers.is_empty() {
+        return;
+    }
+    let transports = workers.iter().map(|w| w.transport.clone()).collect();
+    let _ = tx.send(crate::net::Ev::DirectWorkersReady(pid, transports, primary_source));
+    for worker in &mut workers {
+        if let Some(reader) = worker.take_reader() {
+            tokio::spawn(reader);
         }
     }
 }
@@ -2035,8 +2055,8 @@ pub fn spawn_mesh_accept(
                 match conn.accept_bi().await {
                     Ok((send, recv)) => {
                         let conn2 = conn.clone();
-                        let worker = make_transport(pid.clone(), conn2, send, recv, tx.clone(), true, None, false, None);
-                        let _ = tx.send(crate::net::Ev::DirectWorkersReady(pid.clone(), vec![worker], primary_source));
+                        let worker = make_transport_unread(pid.clone(), conn2, send, recv, tx.clone(), true, None, false, None);
+                        announce_workers(vec![worker], &tx, pid.clone(), primary_source);
                     }
                     Err(_) => return,
                 }
@@ -2059,7 +2079,7 @@ pub async fn dial_workers(
     peer_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     count: usize,
-) -> Vec<Arc<dyn Transport>> {
+) -> Vec<UnreadTransport> {
     const WORKER_BUDGET: Duration = Duration::from_secs(5);
     if count == 0 || ports.is_empty() {
         return vec![];
@@ -2092,7 +2112,7 @@ pub async fn dial_workers(
             result = futs.next() => {
                 match result {
                     Some(Ok((conn, send, recv, ep))) => {
-                        workers.push(make_transport(
+                        workers.push(make_transport_unread(
                             peer_id.clone(), conn, send, recv, tx.clone(), false, Some(ep), false, None,
                         ));
                         if workers.len() >= count { break; }
@@ -2120,7 +2140,7 @@ pub async fn accept_workers(
     peer_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     count: usize,
-) -> Vec<Arc<dyn Transport>> {
+) -> Vec<UnreadTransport> {
     const WORKER_BUDGET: Duration = Duration::from_secs(5);
     if count == 0 || endpoints.is_empty() {
         return vec![];
@@ -2154,7 +2174,7 @@ pub async fn accept_workers(
             result = futs.next() => {
                 match result {
                     Some(Ok((conn, send, recv, ep))) => {
-                        workers.push(make_transport(
+                        workers.push(make_transport_unread(
                             peer_id.clone(), conn, send, recv, tx.clone(), true, Some(ep), false, None,
                         ));
                         if workers.len() >= count { break; }
@@ -2872,6 +2892,32 @@ mod tests {
         })
         .await
         .expect("announce-order test did not finish within 20s (a stall must FAIL here)");
+    }
+
+    #[tokio::test]
+    async fn worker_ready_precedes_actual_sourced_chunk() {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let ((conn_d, send_d, recv_d), (conn_a, send_a, recv_a)) = connected_pair().await;
+            let (peer_tx, _peer_rx) = tokio::sync::mpsc::unbounded_channel();
+            let peer = make_transport("us".into(), conn_d, send_d, recv_d, peer_tx, false, None, false, None);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let worker = make_transport_unread("peer".into(), conn_a, send_a, recv_a, tx.clone(), true, None, false, None);
+            let source = worker.transport().source_id().unwrap();
+            let primary = SourceId::next();
+            peer.send_frame(42, 17, b"payload").await.unwrap();
+            announce_workers(vec![worker], &tx, "peer".into(), primary);
+            assert!(matches!(rx.recv().await, Some(crate::net::Ev::DirectWorkersReady(ref pid, ref workers, s))
+                if pid == "peer" && s == primary && workers[0].source_id() == Some(source)));
+            match rx.recv().await.unwrap() {
+                crate::net::Ev::Sourced { pid, source: seen, inner } => {
+                    assert_eq!(pid, "peer");
+                    assert_eq!(seen, source);
+                    assert!(matches!(*inner, crate::net::Ev::Chunk(ref p, 42, Some(17), ref data)
+                        if p == "peer" && data.as_ref() == b"payload"));
+                }
+                other => panic!("expected sourced chunk from actual worker reader, got {other:?}"),
+            }
+        }).await.expect("worker reader test timed out");
     }
 
     /// Dropping an unannounced link must still start its reader: a link that
