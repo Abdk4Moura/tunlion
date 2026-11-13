@@ -1733,6 +1733,7 @@ pub struct Conn {
     /// Source-bound standby/upgrade events awaiting adoption. Bounded per source
     /// and in total; overflow closes the standby instead of growing forever.
     pub pending_sources: HashMap<net::SourceId, PendingSource>,
+    replaying_sources: HashMap<net::SourceId, PendingSource>,
     /// Roster sids absent from consecutive channel/room digests, for the
     /// two-tick hysteresis in `prune_roster_absent`.
     pub roster_absent: HashMap<String, u8>,
@@ -1970,6 +1971,7 @@ impl Conn {
             revoked_bindings: HashSet::new(),
             link_events: HashMap::new(),
             pending_sources: HashMap::new(),
+            replaying_sources: HashMap::new(),
             roster_absent: HashMap::new(),
             log,
             host,
@@ -2579,6 +2581,7 @@ impl Conn {
     /// from the call sites the way a manual audit does.
     #[track_caller]
     pub fn drop_link(&mut self, pid: &str) {
+        self.replaying_sources.retain(|_, pending| pending.pid != pid);
         // A drop is an invalidation: a candidate still building for this peer
         // must not publish after the link it was replacing is gone.
         self.cancel_build(pid);
@@ -3767,6 +3770,16 @@ impl Conn {
     /// handlers that defer/requeue the event).
     pub fn stage_event(&mut self, ev: Ev) -> Option<(Ev, Option<net::SourceId>)> {
         match ev {
+            Ev::ReplaySource(source) => {
+                let pending = self.replaying_sources.get_mut(&source)?;
+                let pid = pending.pid.clone();
+                let inner = pending.events.pop_front()?;
+                pending.bytes = pending.bytes.saturating_sub(ev_weight(&inner));
+                if pending.events.is_empty() {
+                    self.replaying_sources.remove(&source);
+                }
+                return self.source_current(&pid, source, &inner).then_some((inner, Some(source)));
+            }
             Ev::AttemptDrained(attempt) => {
                 self.retired_attempts.remove(&attempt);
                 None
@@ -3816,6 +3829,26 @@ impl Conn {
                     return None;
                 }
                 if self.source_current(&pid, source, inner.as_ref()) {
+                    if self.replaying_sources.contains_key(&source) {
+                        // The replay tokens were queued behind already-read newer
+                        // events. Swap this arrival behind the oldest buffered
+                        // event, so the consumer sees source order, not queue order.
+                        let total: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.bytes).sum();
+                        let pending = self.replaying_sources.get_mut(&source).unwrap();
+                        if pending.pid != pid { return None; }
+                        let older = pending.events.pop_front().unwrap();
+                        let bytes = pending.bytes.saturating_sub(ev_weight(&older))
+                            .saturating_add(ev_weight(&inner));
+                        let total_after = total.saturating_sub(pending.bytes).saturating_add(bytes);
+                        if bytes > MAX_BUILD_EVENT_BYTES || total_after > MAX_BUILD_EVENT_BYTES {
+                            self.replaying_sources.remove(&source);
+                            if let Some(t) = self.transport_of(&pid) { t.force_close(); }
+                            return None;
+                        }
+                        pending.bytes = bytes;
+                        pending.events.push_back(*inner);
+                        return self.source_current(&pid, source, &older).then_some((older, Some(source)));
+                    }
                     return Some((*inner, Some(source)));
                 }
                 // A standby/upgrade attempt may deliver before adoption. Buffer
@@ -3855,8 +3888,8 @@ impl Conn {
     /// dropping the pending source and its standby transport.
     fn buffer_pending_source(&mut self, pid: String, source: net::SourceId, inner: Ev) {
         let weight = ev_weight(&inner);
-        let total_events: usize = self.pending_sources.values().map(|p| p.events.len()).sum();
-        let total_bytes: usize = self.pending_sources.values().map(|p| p.bytes).sum();
+        let total_events: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.events.len()).sum();
+        let total_bytes: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.bytes).sum();
         let over_total = total_events >= MAX_BUILD_EVENTS
             || total_bytes.saturating_add(weight) > MAX_BUILD_EVENT_BYTES;
         let is_new = !self.pending_sources.contains_key(&source);
@@ -3913,18 +3946,17 @@ impl Conn {
         }
     }
 
-    /// Replay buffered standby events after adoption. They keep their tag, so a
-    /// second replacement still rejects them at the final gate.
+    /// Queue one token per buffered event. Newer already-queued events swap with
+    /// the oldest replay item at the final gate, preserving source order.
     fn flush_pending_source(&mut self, source: net::SourceId) {
         let Some(pending) = self.pending_sources.remove(&source) else {
             return;
         };
-        for inner in pending.events {
-            let _ = self.tx.send(Ev::Sourced {
-                pid: pending.pid.clone(),
-                source,
-                inner: Box::new(inner),
-            });
+        let count = pending.events.len();
+        if count == 0 { return; }
+        self.replaying_sources.insert(source, pending);
+        for _ in 0..count {
+            let _ = self.tx.send(Ev::ReplaySource(source));
         }
     }
 
@@ -13325,6 +13357,38 @@ mod warm_identity_tests {
         assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
         conn.links.get_mut(pid).unwrap().worker_sources.clear();
         assert!(conn.stage_event(chunk(worker_source, pid, pid)).is_none());
+    }
+
+    #[tokio::test]
+    async fn buffered_standby_chunks_cannot_be_overtaken_at_adoption() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "ordered-standby";
+        let old = Rec::new("old", &log);
+        let old_source = old.source_id().unwrap();
+        let standby = Rec::new("standby", &log);
+        let source = standby.source_id().unwrap();
+        let mut link = relay_link(pid, "peer", "peer", old);
+        link.source = old_source;
+        conn.links.insert(pid.into(), link);
+        conn.pending_sources.insert(source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::new(), bytes: 0,
+        });
+        let chunk = |offset, data: &'static [u8]| Ev::Sourced {
+            pid: pid.into(), source,
+            inner: Box::new(Ev::Chunk(pid.into(), 42, Some(offset), bytes::Bytes::from_static(data))),
+        };
+        assert!(conn.stage_event(chunk(0, b"old")).is_none());
+        // This event is already in the normal queue when adoption happens.
+        conn.tx.send(chunk(3, b"new")).unwrap();
+        conn.links.get_mut(pid).unwrap().source = source;
+        conn.flush_pending_source(source);
+        let first = conn.stage_event(rx.try_recv().unwrap()).unwrap().0;
+        let second = conn.stage_event(rx.try_recv().unwrap()).unwrap().0;
+        assert!(matches!(first, Ev::Chunk(_, 42, Some(0), ref data) if data.as_ref() == b"old"));
+        assert!(matches!(second, Ev::Chunk(_, 42, Some(3), ref data) if data.as_ref() == b"new"));
+        assert!(conn.replaying_sources.is_empty());
     }
 
     /// A registered standby source buffers until adoption, replays with its tag,
