@@ -470,6 +470,7 @@ fn temporary_access_cancel_and_failed_connect_do_not_remember_device() {
         t.send("\r");
         assert!(t.wait_for_from(at, "(read-only)", 20), "{}", tail(&t.text()));
         t.settle(200, 3);
+        assert!(t.text()[at..].contains("Folders  · (read-only) ~"), "HOME was not abbreviated:\n{}", tail(&t.text()));
         // A service, added and then removed and added again, exercises the
         // services editor rather than only menu navigation.
         composer_add_service(&mut t, "3000", 0);
@@ -502,6 +503,113 @@ fn temporary_access_cancel_and_failed_connect_do_not_remember_device() {
         }
         if !activate { assert!(!dir.join("overlay.ed25519").exists(), "cancel created transport keys"); }
     }
+}
+
+// A real narrow picker must retain the security-relevant summary even when the
+// first path is much wider than the terminal. No server or identity is needed.
+// Replay the picker's terminal operations, rather than treating erased output
+// as visible. This deliberately models only the controls used by these frames.
+#[cfg(unix)]
+fn picker_screen(output: &str, cols: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let mut rows = vec![vec![' '; cols]; 60];
+    let (mut y, mut x) = (15usize, 0usize);
+    let mut chars = output.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' if chars.peek() == Some(&'[') => {
+                chars.next();
+                let mut params = String::new();
+                for ch in chars.by_ref() {
+                    if ('@'..='~').contains(&ch) {
+                        let n = params.parse::<usize>().unwrap_or(1);
+                        match ch {
+                            'A' => y = y.saturating_sub(n),
+                            'C' => x = (x + n).min(cols - 1),
+                            'K' if params == "2" => rows[y].fill(' '),
+                            'J' => {
+                                rows[y][x..].fill(' ');
+                                for row in rows.iter_mut().skip(y + 1) { row.fill(' '); }
+                            }
+                            _ => {}
+                        }
+                        break;
+                    }
+                    params.push(ch);
+                }
+            }
+            '\r' => x = 0,
+            '\n' => y = (y + 1).min(rows.len() - 1),
+            c if !c.is_control() => {
+                let width = c.width().unwrap_or(0);
+                if width == 0 { continue; }
+                if x + width > cols { y = (y + 1).min(rows.len() - 1); x = 0; }
+                rows[y][x] = c;
+                x += width;
+            }
+            _ => {}
+        }
+    }
+    rows.into_iter().map(|row| row.into_iter().collect::<String>().trim_end().to_string()).collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn temporary_access_long_folder_keeps_mode_and_count_visible() {
+    let label = "access-long-folder";
+    let (mut t, exe) = fresh_term(label);
+    t.resize(50, 30);
+    let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
+    let first = dir.join("a-very-long-folder-name-that-must-be-clipped-at-the-terminal-edge");
+    let second = dir.join("another-folder");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    open_temporary_composer(&mut t, &exe, "http://127.0.0.1:9");
+    let at = t.text().len();
+    t.send(ROW_FOLDERS);
+    assert!(t.wait_for_from(at, "folder to share [", 20), "{}", tail(&t.text()));
+    t.send(&format!("{}\r", first.display()));
+    assert!(t.wait_for_from(at, "Folders  · (read-only)", 20), "{}", tail(&t.text()));
+    t.settle(200, 3);
+    let at = t.text().len();
+    t.send(ROW_FOLDERS);
+    assert!(t.wait_for_from(at, "Add another folder", 20), "{}", tail(&t.text()));
+    assert!(t.text()[at..].contains("(read-only) ·"), "{}", tail(&t.text()));
+    t.settle(200, 3);
+    let at = t.text().len();
+    t.send("2");
+    assert!(t.wait_for_from(at, "folder to share [", 20), "{}", tail(&t.text()));
+    t.send(&format!("{}\r", second.display()));
+    assert!(t.wait_for_from(at, "Add another folder", 20), "{}", tail(&t.text()));
+    t.settle(200, 3);
+    let at = t.text().len();
+    let menu_at = at;
+    t.send("1");
+    assert!(t.wait_for_from(at, "Read & write", 20), "{}", tail(&t.text()));
+    t.settle(200, 3);
+    t.send("\x1b[B");
+    t.settle(200, 3);
+    let screen = picker_screen(&t.text()[menu_at..], 50).join("\n");
+    assert_eq!(screen.matches("Read & write").count(), 1, "{screen}");
+    assert!(screen.contains("Stop sharing this folder"), "{screen}");
+    assert!(!screen.contains("must-be-clipped-at-the-terminal-edge"), "heading wrapped: {screen}");
+    let at = t.text().len();
+    t.send("2");
+    assert!(t.wait_for_from(at, "(read & write) ·", 20), "{}", tail(&t.text()));
+    t.settle(200, 3);
+    let screen = picker_screen(&t.text()[menu_at..], 50).join("\n");
+    assert!(screen.contains("Add another folder"), "{screen}");
+    assert!(!screen.contains("Stop sharing this folder"), "stale submenu: {screen}");
+    assert!(!screen.contains("tunlion-pty-access-long-folder"), "stale heading: {screen}");
+    let at = t.text().len();
+    t.send("4"); // Done after two folders and Add another folder.
+    // The first folder was set to read & write, the second is still
+    // read-only, so the summary names the MIXED set and says that write
+    // access is in it. The point of this test is that the permission and the
+    // count stay visible before the path is clipped.
+    assert!(t.wait_for_from(at, "Folders  · mixed: write +1", 20), "{}", tail(&t.text()));
+    assert!(t.text()[at..].contains('…'), "long path was not clipped:\n{}", tail(&t.text()));
+    t.send("\x1b");
 }
 
 // ---------------------------------------------------------------------------

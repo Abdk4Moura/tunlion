@@ -474,6 +474,7 @@ mod tests {
                 identity_device_pub: Some(DEVICE),
                 identity_user_pub: Some([3; 32]),
                 identity_binding: cap::BindingStrength::Proven,
+                identity_state: cap::IdentityState::Resolved,
                 identity_cert_expires: Some(1000),
                 principal_kind: cap::PrincipalKind::OwnerDevice,
                 host,

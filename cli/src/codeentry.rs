@@ -289,13 +289,14 @@ fn level_color(level: Level) -> String {
 /// terminals. A single line cleared with CR + erase-line (`\r\x1b[2K`) redraws
 /// consistently on every terminal.
 fn render(prompt: &str, buf: &str, j: &Judgment) {
+    use unicode_width::UnicodeWidthStr;
     let mut err = std::io::stderr();
     let reset = ui::tone_reset();
     let color = level_color(j.level);
     // ONE terminal row, always: a steer longer than what is left of the row
     // wrapped, and `\r\x1b[2K` then cleared only the last row, so every
     // keystroke left a stale line behind. Fit steer and preview to the width.
-    let used = prompt.chars().count() + buf.chars().count() + 3;
+    let used = prompt.width() + buf.width() + 3;
     let room = term_width().saturating_sub(used + 1);
     let (steer, preview_text) = fit_steer(&j.steer, j.preview.as_deref(), room);
     let preview = match preview_text {
@@ -307,7 +308,7 @@ fn render(prompt: &str, buf: &str, j: &Judgment) {
     let _ = write!(err, "\r\x1b[2K{prompt}{buf}   {color}{steer}{reset}{preview}");
     // Put the caret back right after the typed buffer (browser-like), so typing
     // continues at the end of the code rather than after the steer text.
-    let col = prompt.chars().count() + buf.chars().count();
+    let col = prompt.width() + buf.width();
     let _ = write!(err, "\r");
     if col > 0 {
         let _ = write!(err, "\x1b[{col}C");
@@ -319,9 +320,10 @@ fn render(prompt: &str, buf: &str, j: &Judgment) {
 /// columns: the preview goes first, then the steer is clipped with an
 /// ellipsis. Pure.
 pub(crate) fn fit_steer(steer: &str, preview: Option<&str>, room: usize) -> (String, Option<String>) {
-    let s_len = steer.chars().count();
+    use unicode_width::UnicodeWidthStr;
+    let s_len = steer.width();
     if let Some(p) = preview {
-        if s_len + 2 + p.chars().count() <= room {
+        if s_len + 2 + p.width() <= room {
             return (steer.to_string(), Some(p.to_string()));
         }
     }
@@ -422,13 +424,25 @@ pub(crate) fn hint_line(len: usize, hints: &[(char, &str)]) -> String {
 /// Clip a label to the terminal width so a long path never wraps: a wrapped row
 /// makes the in-place redraw rewind the wrong number of lines.
 pub(crate) fn fit(s: &str, width: usize) -> String {
-    let n = s.chars().count();
-    if width < 8 || n <= width {
+    use unicode_width::UnicodeWidthStr;
+    if s.width() <= width {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(width - 1).collect();
+    if width == 0 { return String::new(); }
+    // Width is not additive over chars: variation selectors and other sequences
+    // can change the width of preceding characters. Check the complete output,
+    // including the ellipsis, at each UTF-8 boundary, longest prefix first.
+    let mut out = s.to_string();
     out.push('\u{2026}');
-    out
+    for (end, _) in s.char_indices().rev() {
+        out.truncate(end);
+        out.push('\u{2026}');
+        if out.width() <= width {
+            return out;
+        }
+    }
+    // The empty prefix plus the ellipsis fits whenever width is nonzero.
+    unreachable!()
 }
 
 pub(crate) fn term_width() -> usize {
@@ -454,7 +468,7 @@ fn render_picker(header: &str, items: &[String], sel: usize, prev: usize, hints:
     }
     let mut drawn = 0;
     if !header.is_empty() {
-        frame.push_str(&format!("\r\x1b[2K{}\r\n", ui::header(ui::Tone::Brand, ui::Tone::Bold, header)));
+        frame.push_str(&format!("\r\x1b[2K{}\r\n", ui::header(ui::Tone::Brand, ui::Tone::Bold, &fit(header, width))));
         drawn += 1;
     }
     if above > 0 {
@@ -1152,5 +1166,47 @@ mod viewport_tests {
     #[test]
     fn an_empty_list_is_not_a_panic() {
         assert_eq!(viewport_window(0, 0, 7), (0, 0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::{fit, fit_steer};
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn clips_wide_headings_and_tiny_widths_by_terminal_cells() {
+        for width in 0..40 {
+            let text = fit(&format!("/{}", "資料".repeat(30)), width);
+            assert!(text.width() <= width, "width {width}: {text}");
+        }
+        assert_eq!(fit("abcdef", 1), "…");
+        assert_eq!(fit("abc", 3), "abc");
+    }
+
+    #[test]
+    fn clips_variation_sequences_with_the_ellipsis_inside_the_budget() {
+        let inputs = ["❤️xyz", "a❤️xyz", "資料❤️xyz", "✈️❤️資料xyz"];
+        for input in inputs {
+            for width in 0..=input.width() + 1 {
+                let text = fit(input, width);
+                assert!(text.width() <= width, "input {input:?}, width {width}: {text:?} has width {}", text.width());
+                if input.width() > width && width > 0 {
+                    assert!(text.ends_with('…'), "input {input:?}, width {width}: {text:?}");
+                } else if input.width() <= width {
+                    assert_eq!(text, input);
+                }
+            }
+        }
+        assert_eq!(fit("❤️xyz", 0), "");
+        assert_eq!(fit("❤️xyz", 1), "…");
+        assert_eq!(fit("❤️xyz", 3), "❤️…");
+        assert_eq!(fit("資料xyz", 3), "資…");
+    }
+
+    #[test]
+    fn steer_preview_budget_uses_terminal_cells() {
+        assert_eq!(fit_steer("資料", Some("好"), 7), ("資料".into(), None));
+        assert_eq!(fit_steer("資料", Some("好"), 8), ("資料".into(), Some("好".into())));
     }
 }

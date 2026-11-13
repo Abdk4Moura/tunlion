@@ -128,7 +128,11 @@ class CliTunlionCore(private val context: Context) : TunlionCore {
         }
     }
 
-    override suspend fun joinInvitation(bytes: ByteArray): CoreResult = guarded {
+    override suspend fun previewInvitation(bytes: ByteArray): InvitationPreviewResult =
+        InvitationPreviewResult.Failed(CoreResult.Failure(CoreErrorKind.FEATURE_NOT_LINKED,
+            "The legacy CLI backend cannot preview invitations. Nothing was joined."))
+
+    override suspend fun joinInvitation(bytes: ByteArray, name: String): CoreResult = guarded {
         require(bytes.size in 1..65536) { "Invitation is empty or too large" }
         transferForeground {
         val result = operations.withLock {
@@ -137,7 +141,7 @@ class CliTunlionCore(private val context: Context) : TunlionCore {
                 try {
                     Files.createFile(invitation.toPath(), java.nio.file.attribute.PosixFilePermissions.asFileAttribute(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")))
                     invitation.writeBytes(bytes)
-                    cli.run(listOf("join", "--invite-file", invitation.absolutePath, "--name", Build.MODEL, "--yes"), 120_000).result()
+                    cli.run(listOf("join", "--invite-file", invitation.absolutePath, "--name", name, "--yes"), 120_000).result()
                 } finally { invitation.delete() }
             }
         }

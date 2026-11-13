@@ -13,6 +13,7 @@
 //! landed (or, only for a source with no digest, that every byte was written
 //! and acknowledged at the transport).
 
+use crate::send::gate::{adopt_wants_active, code_peer_event_allowed, CodePeerEvent};
 use crate::conn::Conn;
 use crate::driver::{Cancellation, DriverOutcome};
 use crate::host::{HostServices, LogSink};
@@ -253,10 +254,6 @@ fn build_outgoing(request: &SendRequest, log: &dyn LogSink) -> Result<Vec<Outgoi
         outgoing.push(out);
     }
     Ok(outgoing)
-}
-
-fn adopt_wants_active(code_claimed: bool, use_code: bool, pake_done: bool) -> bool {
-    code_claimed && (!use_code || pake_done)
 }
 
 fn code_partner(
@@ -679,6 +676,35 @@ async fn drive_over(
         let Some(ev) = ev else { continue };
         last_activity = Instant::now();
         let ev = match conn.stage_event(ev) { Some((ev, _)) => ev, None => continue };
+        // A spent code authenticates only its ceremony peer, never a new room
+        // member claiming the same install UID after the receiver disappears.
+        if use_code {
+            match &ev {
+                Ev::Control(pid, _)
+                    if !code_peer_event_allowed(
+                        use_code,
+                        pake_done,
+                        pake_peer.as_deref(),
+                        pid,
+                        CodePeerEvent::Control,
+                    ) =>
+                {
+                    continue
+                }
+                Ev::ChannelReady(pid, _)
+                    if !code_peer_event_allowed(
+                        use_code,
+                        pake_done,
+                        pake_peer.as_deref(),
+                        pid,
+                        CodePeerEvent::Channel,
+                    ) =>
+                {
+                    continue
+                }
+                _ => {}
+            }
+        }
         match ev {
             Ev::Welcome(v) => {
                 if let Some(id) = v["id"].as_str() {
@@ -686,6 +712,18 @@ async fn drive_over(
                 }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
+                        if !code_peer_event_allowed(
+                            use_code,
+                            pake_done,
+                            pake_peer.as_deref(),
+                            p["id"].as_str().unwrap_or_default(),
+                            CodePeerEvent::Adoption,
+                        ) {
+                            if let Some(ceremony) = pake_peer.as_deref() {
+                                let _ = conn.code_reconnect_kept(ceremony, p["uid"].as_str());
+                            }
+                            continue;
+                        }
                         conn.maybe_adopt(p, adopt_wants_active(code_used, use_code, pake_done))
                             .await
                             .map_err(internal)?;
@@ -694,8 +732,24 @@ async fn drive_over(
                 sess.invalidate();
             }
             Ev::Synced(v) => {
-                if let Some(roster) = sess.on_synced(&v) {
+                let synced = sess.on_synced(&v);
+                if let Some(w) = sess.take_channel_warning() {
+                    ports.log.critical(&w);
+                }
+                if let Some(roster) = synced {
                     for p in &roster.peers {
+                        if !code_peer_event_allowed(
+                            use_code,
+                            pake_done,
+                            pake_peer.as_deref(),
+                            p["id"].as_str().unwrap_or_default(),
+                            CodePeerEvent::Adoption,
+                        ) {
+                            if let Some(ceremony) = pake_peer.as_deref() {
+                                let _ = conn.code_reconnect_kept(ceremony, p["uid"].as_str());
+                            }
+                            continue;
+                        }
                         conn.maybe_adopt_from(
                             p,
                             adopt_wants_active(code_used, use_code, pake_done),
@@ -761,6 +815,15 @@ async fn drive_over(
                 ports.log.say("code claimed, connecting...");
             }
             Ev::PeerJoined(v) => {
+                if !code_peer_event_allowed(
+                    use_code,
+                    pake_done,
+                    pake_peer.as_deref(),
+                    v["id"].as_str().unwrap_or_default(),
+                    CodePeerEvent::Adoption,
+                ) {
+                    continue;
+                }
                 conn.maybe_adopt(&v, adopt_wants_active(code_used, use_code, pake_done))
                     .await
                     .map_err(internal)?;
@@ -780,8 +843,14 @@ async fn drive_over(
                 }
             }
             Ev::Signal(v) => {
-                if conn.stage_signal(&v) { continue; }
                 let from = v["from"].as_str().unwrap_or_default().to_string();
+                // A spent code talks only to the peer its PAKE ceremony
+                // confirmed. A replacement sid's signals must not build a link
+                // or reset the send's rejoin window (see send_cmd's twin).
+                if use_code && pake_done && pake_peer.as_deref() != Some(from.as_str()) {
+                    continue;
+                }
+                if conn.stage_signal(&v) { continue; }
                 let data = v["data"].clone();
                 if data["type"].as_str() == Some("not-recognized") {
                     return Err(SendFailure::denied(format!(
@@ -812,8 +881,8 @@ async fn drive_over(
                     if conn.direct_pending.contains_key(&from) {
                         conn.on_transport_offer(&from, cands, srflx, public, proto);
                     } else {
-                        conn.buffered_offers
-                            .insert(from.clone(), (cands, srflx, public, proto));
+                        let ch = data["ch"].as_str().map(String::from);
+                        conn.buffer_offer(&from, (cands, srflx, public, proto, ch));
                     }
                     continue;
                 }

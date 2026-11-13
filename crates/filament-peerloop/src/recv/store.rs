@@ -43,7 +43,8 @@
 
 use anyhow::{Context, Result};
 use filament_cap::capability::{
-    now_secs as cap_now_secs, superseded_by_tombstone, CapOp, PrincipalKind, CAP_TOMBSTONE_TYPE,
+    apply_header, now_secs as cap_now_secs, self_resource_id, superseded_by_tombstone,
+    update_ratchet, CapHeader, CapOp, PrincipalKind, CAP_TOMBSTONE_TYPE,
 };
 use filament_cap::ephemeral::Reuse;
 use filament_id::{now_secs, DeviceCert, KeyStore, UserKey};
@@ -57,6 +58,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const DEVICES_FILE: &str = "devices.json";
 /// The cross-process lock sidecar used for `devices.json` writes.
 pub const DEVICES_LOCK_FILE: &str = "devices.json.lock";
+/// The capability store's file name, relative to the root.
+pub const CAP_STORE_FILE: &str = "caps.json";
+/// The cross-process lock sidecar used for the `caps.json` read/modify/write.
+pub const CAP_STORE_LOCK_FILE: &str = "caps.json.lock";
+/// The key-revocation block's file name, relative to the root.
+///
+/// PROVENANCE IS PART OF THE FORMAT: an entry here means "FORGOTTEN", and
+/// nothing else. It is written only by the removal service's Forget mode and
+/// lifted by an explicit re-add or `promote`. Every peer-facing path reads a
+/// hit as "not recognized", on admission and mid-session alike.
+pub const KEY_REVOCATIONS_FILE: &str = "revoked-keys.json";
+/// The cross-process lock sidecar used for the `revoked-keys.json`
+/// read/modify/write.
+pub const KEY_REVOCATIONS_LOCK_FILE: &str = "revoked-keys.json.lock";
 /// The local device certificate record, relative to the root.
 pub const LOCAL_DEVICE_CERT_FILE: &str = "identity/device-cert.json";
 /// How long a provisional identity is worth keeping. It exists to bridge one
@@ -121,6 +136,35 @@ pub struct InvitationLedgerEntry {
     pub uses: u64,
     pub expires: u64,
     pub withdrawn: bool,
+}
+
+/// The armed-invitation record. `key_id` is the enrollment PUBLIC key (hex),
+/// never its private half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArmedInvitation {
+    pub key_id: String,
+    pub expires: u64,
+    pub name: Option<String>,
+    pub kind: Option<String>,
+    pub allow: Option<Vec<String>>,
+    /// The mint's reuse shape as JSON (`"once"`, a number, `"forever"`).
+    /// Presentation only: admission reads the signed invitation and the
+    /// durable use count, never this field.
+    pub reuse: Option<Value>,
+    pub created: Option<u64>,
+}
+
+impl ArmedInvitation {
+    /// The short id the owner can name it by: the first 12 hex digits of the
+    /// public key, unique in practice and never secret.
+    pub fn id(&self) -> &str {
+        &self.key_id[..self.key_id.len().min(12)]
+    }
+
+    /// The name shown and matched, `(unnamed)` when the mint gave none.
+    pub fn label(&self) -> String {
+        self.name.clone().unwrap_or_else(|| format!("({})", self.id()))
+    }
 }
 
 /// Terminal principal states written to `principalState` on a device record.
@@ -357,7 +401,7 @@ fn backup_path(path: &Path) -> PathBuf {
 
 /// Keep the current file as `<name>.bak`, best effort. Never blocks the write
 /// it protects.
-fn keep_backup(path: &Path) {
+pub(crate) fn keep_backup(path: &Path) {
     if let Ok(raw) = std::fs::read_to_string(path) {
         if !raw.trim().is_empty() {
             let _ = secret_write::SecretFile::write_str(&backup_path(path), &raw);
@@ -603,6 +647,52 @@ mod receive_history_tests {
         assert!(DeviceStore::open(root.path()).record_received_file(&receipt(1)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[");
     }
+
+    #[test]
+    fn revocation_snapshot_is_fail_closed_and_prunes_only_absent_secrets() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.path());
+        assert_eq!(
+            store.revocation_snapshot(),
+            Some((String::new(), String::new()))
+        );
+        // A missing store is empty content, so every held secret loses trust:
+        // fail closed, never keep a secret a deleted store cannot vouch for.
+        let mut held = vec![("a".into(), "s-a".into()), ("b".into(), "s-b".into())];
+        assert_eq!(store.prune_held(&mut held).len(), 2);
+        assert!(held.is_empty());
+
+        std::fs::write(
+            root.path().join("devices.json"),
+            r#"[{"name":"a","secret":"s-a"}]"#,
+        )
+        .unwrap();
+        let mut held = vec![("a".into(), "s-a".into()), ("b".into(), "s-b".into())];
+        assert_eq!(
+            store.prune_held(&mut held),
+            ["s-b".to_string()]
+                .into_iter()
+                .collect::<std::collections::HashSet<String>>()
+        );
+        assert_eq!(held, vec![("a".to_string(), "s-a".to_string())]);
+
+        // A rename of the same secret follows the current name; it is not a
+        // removal and must not leave the old name authorizing the new record.
+        std::fs::write(
+            root.path().join("devices.json"),
+            r#"[{"name":"renamed","secret":"s-a"}]"#,
+        )
+        .unwrap();
+        let mut held = vec![("a".into(), "s-a".into())];
+        assert!(store.prune_held(&mut held).is_empty());
+        assert_eq!(held, vec![("renamed".to_string(), "s-a".to_string())]);
+
+        std::fs::write(root.path().join("devices.json"), "not-json").unwrap();
+        let mut held = vec![("a".into(), "s-a".into())];
+        assert_eq!(store.revocation_snapshot(), None);
+        assert!(store.prune_held(&mut held).is_empty());
+        assert_eq!(held.len(), 1, "an unreadable store must remove nothing");
+    }
 }
 
 impl DeviceStore {
@@ -642,16 +732,109 @@ impl DeviceStore {
         self.root.join(DEVICES_FILE)
     }
 
+    /// The exact two store files the revocation sweep compares: `devices.json`
+    /// and the key-revocation block. `None` means unreadable or malformed, so a
+    /// sweep must do nothing rather than treat it as "everything was removed".
+    /// Missing files are empty content, not an error.
+    pub fn revocation_snapshot(&self) -> Option<(String, String)> {
+        let read_or_empty = |path: &Path| -> Option<String> {
+            match std::fs::read_to_string(path) {
+                Ok(content) => Some(content),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Some(String::new()),
+                Err(_) => None,
+            }
+        };
+        let devices = read_or_empty(&self.devices_path())?;
+        if !devices.trim().is_empty()
+            && !matches!(serde_json::from_str::<Value>(&devices), Ok(Value::Array(_)))
+        {
+            return None;
+        }
+        let revoked = read_or_empty(&self.key_revocations_path())?;
+        Some((devices, revoked))
+    }
+
+    /// Remove from `held` every pair whose secret the current store no longer
+    /// holds, returning the removed SECRETS. An unreadable store removes
+    /// nothing: absence of evidence is not a removal. Matching is on the
+    /// secret, the fact that proves, never on the display name.
+    pub fn prune_held(&self, held: &mut Vec<(String, String)>) -> std::collections::HashSet<String> {
+        // Parse the SAME snapshot that decided the sweep may run. Re-reading the
+        // store here let a file change between the two reads prune everything.
+        let Some((devices, _)) = self.revocation_snapshot() else {
+            return std::collections::HashSet::new();
+        };
+        let records: Vec<Value> = if devices.trim().is_empty() {
+            Vec::new()
+        } else {
+            match serde_json::from_str(&devices) {
+                Ok(records) => records,
+                Err(_) => return std::collections::HashSet::new(),
+            }
+        };
+        // A matching secret keeps its trust but follows the store's CURRENT
+        // name: the held name keys certificates, grants and dialing one layer
+        // down, so a rename must not let an old name resolve a new record.
+        let current: std::collections::HashMap<String, String> = records
+            .iter()
+            .filter_map(|record| {
+                let name = record["name"].as_str()?.to_string();
+                let secret = record["secret"].as_str()?.to_string();
+                Some((secret, name))
+            })
+            .collect();
+        let mut removed = std::collections::HashSet::new();
+        held.retain_mut(|(name, secret)| match current.get(secret) {
+            Some(current_name) => {
+                *name = current_name.clone();
+                true
+            }
+            None => {
+                removed.insert(secret.clone());
+                false
+            }
+        });
+        removed
+    }
+
     pub fn devices_lock_path(&self) -> PathBuf {
         self.root.join(DEVICES_LOCK_FILE)
     }
 
     pub fn cap_store_path(&self) -> PathBuf {
-        self.root.join("caps.json")
+        self.root.join(CAP_STORE_FILE)
     }
 
     pub fn local_device_cert_path(&self) -> PathBuf {
         self.root.join(LOCAL_DEVICE_CERT_FILE)
+    }
+
+    pub fn armed_path(&self) -> PathBuf {
+        self.root.join("armed.json")
+    }
+
+    fn armed_lock_path(&self) -> PathBuf {
+        self.root.join("armed.json.lock")
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.root.join("config")
+    }
+
+    fn config_lock_path(&self) -> PathBuf {
+        self.root.join("config.lock")
+    }
+
+    /// Run `f` under the same `identity.lock` the owner-key bootstrap and the
+    /// join acknowledgement use. A blank device claiming an invitation and a
+    /// concurrent first-run owner bootstrap must not both decide who owns this
+    /// directory.
+    pub fn with_identity_lock<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        create_private_dir_all(&self.root)
+            .with_context(|| format!("create config dir {}", self.root.display()))?;
+        let _lock = StoreLock::acquire(&self.root.join("identity.lock"))
+            .with_context(|| format!("lock {}", self.root.join("identity.lock").display()))?;
+        f(self)
     }
 
     fn provisional_path(&self, name: &str) -> PathBuf {
@@ -682,6 +865,109 @@ impl DeviceStore {
         keep_devices_backup(&p, &arr);
         secret_write::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
             .context("atomic write devices.json")?;
+        Ok(out)
+    }
+
+    /// The device records, fail-closed: a missing file is empty, but an
+    /// existing file that cannot be read or parsed is an error rather than an
+    /// empty fleet. Removal planning uses this so a corrupt store cannot be
+    /// mistaken for "no record to remove" (the tolerant [`devices_records`]
+    /// remains for read-only display paths).
+    pub fn devices_snapshot(&self) -> Result<Vec<Value>> {
+        let p = self.devices_path();
+        match std::fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|e| CorruptStore::new(p, e.to_string()).into()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(anyhow::anyhow!("read devices.json: {e}")),
+        }
+    }
+
+    /// The key-revocation entries, fail-closed: absent is empty, unreadable or
+    /// unparseable is an error.
+    pub fn key_revocation_entries(&self) -> Result<Vec<Value>> {
+        let p = self.key_revocations_path();
+        match std::fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|e| CorruptStore::new(p, e.to_string()).into()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(anyhow::anyhow!("read revoked-keys.json: {e}")),
+        }
+    }
+
+    /// Lock, read, mutate and atomically write `revoked-keys.json`. The
+    /// closure returns the facts it lifted and whether the file changed; an
+    /// empty lift therefore does not create or rewrite the file. A corrupt
+    /// list is an error and is never written over.
+    pub(crate) fn with_key_revocations_mut<T>(
+        &self,
+        f: impl FnOnce(&mut Vec<Value>) -> Result<(T, bool)>,
+    ) -> Result<T> {
+        let p = self.key_revocations_path();
+        if let Some(dir) = p.parent() {
+            create_private_dir_all(dir)
+                .with_context(|| format!("create config dir {}", dir.display()))?;
+        }
+        let lock_path = self.root.join(KEY_REVOCATIONS_LOCK_FILE);
+        let _lock = StoreLock::acquire(&lock_path)
+            .with_context(|| format!("lock {}", lock_path.display()))?;
+        let mut entries: Vec<Value> = match std::fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|e| CorruptStore::new(p.clone(), e.to_string()))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(anyhow::anyhow!("read revoked-keys.json: {e}")),
+        };
+        let (out, changed) = f(&mut entries)?;
+        if changed {
+            keep_backup(&p);
+            secret_write::SecretFile::write_str(&p, &serde_json::to_string_pretty(&entries)?)
+                .context("atomic write revoked-keys.json")?;
+        }
+        Ok(out)
+    }
+
+    /// The capability store, fail-closed: absent is empty, unreadable or
+    /// unparseable is an error. The tolerant [`cap_store`] stays for the
+    /// read-only evaluators, which already treat damage as "no grants".
+    pub fn cap_store_checked(&self) -> Result<Vec<Value>> {
+        let p = self.cap_store_path();
+        match std::fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|e| CorruptStore::new(p, e.to_string()).into()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(anyhow::anyhow!("read caps.json: {e}")),
+        }
+    }
+
+    /// Lock, read, mutate and atomically write `caps.json`. The closure
+    /// returns whether anything changed, so a no-op revoke does not rewrite
+    /// the store. `before_write_json_array` refuses to replace a corrupt or
+    /// truncated file.
+    pub fn with_cap_store_mut<T>(
+        &self,
+        f: impl FnOnce(&mut Vec<Value>) -> Result<(T, bool)>,
+    ) -> Result<T> {
+        let p = self.cap_store_path();
+        if let Some(dir) = p.parent() {
+            create_private_dir_all(dir)
+                .with_context(|| format!("create config dir {}", dir.display()))?;
+        }
+        let lock_path = self.root.join(CAP_STORE_LOCK_FILE);
+        let _lock = StoreLock::acquire(&lock_path)
+            .with_context(|| format!("lock {}", lock_path.display()))?;
+        let mut store: Vec<Value> = match std::fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|e| CorruptStore::new(p.clone(), e.to_string()))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(anyhow::anyhow!("read caps.json: {e}")),
+        };
+        let (out, changed) = f(&mut store)?;
+        if changed {
+            before_write_json_array(&p)?;
+            keep_backup(&p);
+            secret_write::SecretFile::write_str(&p, &serde_json::to_string_pretty(&store)?)
+                .context("atomic write caps.json")?;
+        }
         Ok(out)
     }
 
@@ -820,7 +1106,7 @@ impl DeviceStore {
     /// The key revocations at `revoked-keys.json`, fail-closed: absent is
     /// empty, unreadable or unparseable is an error.
     pub fn key_revocations_path(&self) -> PathBuf {
-        self.root.join("revoked-keys.json")
+        self.root.join(KEY_REVOCATIONS_FILE)
     }
 
     fn load_key_revocations(&self) -> std::result::Result<Vec<Value>, ()> {
@@ -1069,6 +1355,21 @@ impl DeviceStore {
     /// re-keys an existing record, whatever name the peer asked for.
     pub fn devices_store(&self, name: &str, secret: &str) -> Result<String> {
         self.devices_store_new(name, secret, None)
+    }
+
+    /// Store a `pair-keep` secret idempotently. The same secret can arrive more
+    /// than once when the sender retries across a path handoff; each repeat
+    /// must return the existing record instead of minting a suffixed duplicate.
+    pub fn devices_store_remembered(&self, name: &str, secret: &str) -> Result<String> {
+        if let Some(existing) = self
+            .devices_records()
+            .iter()
+            .find(|d| d["secret"].as_str() == Some(secret))
+            .and_then(|d| d["name"].as_str())
+        {
+            return Ok(existing.to_string());
+        }
+        self.devices_store(name, secret)
     }
 
     pub fn devices_store_new(
@@ -1359,68 +1660,244 @@ impl DeviceStore {
         pending.commit(&self.keystore())
     }
 
-    /// Any unexpired armed invitation? Prunes expired entries on read, so the
-    /// file self-cleans and a stale entry never keeps the enrollment room open.
-    pub fn is_armed(&self) -> bool {
-        let path = self.root.join("armed.json");
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            return false;
+    /// Record an outstanding invitation in `armed.json`. The whole
+    /// read/modify/write runs under `armed.json.lock`, so two mints (or a
+    /// mint and the daemon's pruning pass) cannot lose each other's entry.
+    /// Dedupes by key id and drops entries whose expiry has passed.
+    pub fn arm_invitation(&self, entry: ArmedInvitation, now: u64) -> Result<()> {
+        create_private_dir_all(&self.root)
+            .with_context(|| format!("create config dir {}", self.root.display()))?;
+        let _lock = StoreLock::acquire(&self.armed_lock_path())
+            .with_context(|| format!("lock {}", self.armed_lock_path().display()))?;
+        let mut entries = self.read_armed_strict()?;
+        entries.retain(|e| e.expires > now && e.key_id != entry.key_id);
+        entries.push(entry);
+        self.write_armed(&entries)
+    }
+
+    /// Every unexpired armed invitation, oldest first. Expired entries are
+    /// pruned under the lock, so the file self-cleans and a stale entry never
+    /// keeps the enrollment room open. A corrupt file is reported rather than
+    /// silently replaced: an owner must be able to see that arming failed.
+    pub fn armed_invitations(&self, now: u64) -> Result<Vec<ArmedInvitation>> {
+        if !self.armed_path().exists() {
+            return Ok(Vec::new());
+        }
+        create_private_dir_all(&self.root)
+            .with_context(|| format!("create config dir {}", self.root.display()))?;
+        let _lock = StoreLock::acquire(&self.armed_lock_path())
+            .with_context(|| format!("lock {}", self.armed_lock_path().display()))?;
+        let before = self.read_armed_strict()?;
+        let mut entries: Vec<ArmedInvitation> =
+            before.iter().filter(|e| e.expires > now).cloned().collect();
+        if entries.len() != before.len() {
+            self.write_armed(&entries)?;
+        }
+        entries.sort_by(|a, b| a.created.cmp(&b.created).then(a.expires.cmp(&b.expires)));
+        Ok(entries)
+    }
+
+    /// Drop one key from the armed set now. Withdrawal deliberately does NOT
+    /// call this: a withdrawn entry stays armed until expiry so a late claimer
+    /// hears "withdrawn" instead of waiting on a silent room.
+    pub fn disarm_invitation(&self, key_id: &str) -> Result<()> {
+        if !self.armed_path().exists() {
+            return Ok(());
+        }
+        let _lock = StoreLock::acquire(&self.armed_lock_path())
+            .with_context(|| format!("lock {}", self.armed_lock_path().display()))?;
+        let mut entries = self.read_armed_strict()?;
+        entries.retain(|e| e.key_id != key_id);
+        self.write_armed(&entries)
+    }
+
+    fn read_armed_strict(&self) -> Result<Vec<ArmedInvitation>> {
+        let raw = match std::fs::read_to_string(self.armed_path()) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow::anyhow!("read armed.json: {e}")),
         };
-        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-            return false;
-        };
-        let arr = value.as_array().cloned().unwrap_or_default();
-        let now = cap_now_secs();
-        let before = arr.len();
-        let entries: Vec<Value> = arr
-            .into_iter()
-            .filter(|e| {
-                e["key_id"].as_str().is_some() && e["expires"].as_u64().is_some_and(|exp| exp > now)
+        let value: Value = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("armed.json is corrupt: {e}"))?;
+        let arr = value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("armed.json is not a JSON array"))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for e in arr {
+            let key_id = e["key_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("armed.json entry has no key_id"))?
+                .to_string();
+            let expires = e["expires"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("armed.json entry has no expiry"))?;
+            out.push(ArmedInvitation {
+                key_id,
+                expires,
+                name: e["name"].as_str().map(str::to_string),
+                kind: e["kind"].as_str().map(str::to_string),
+                allow: e["allow"].as_array().map(|a| {
+                    a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect()
+                }),
+                reuse: e.get("reuse").cloned().filter(|v| !v.is_null()),
+                created: e["created"].as_u64(),
+            });
+        }
+        Ok(out)
+    }
+
+    fn write_armed(&self, entries: &[ArmedInvitation]) -> Result<()> {
+        let arr: Vec<Value> = entries
+            .iter()
+            .map(|e| {
+                let mut v = json!({ "key_id": e.key_id, "expires": e.expires });
+                if let Some(n) = &e.name {
+                    v["name"] = json!(n);
+                }
+                if let Some(k) = &e.kind {
+                    v["kind"] = json!(k);
+                }
+                if let Some(a) = &e.allow {
+                    v["allow"] = json!(a);
+                }
+                if let Some(r) = &e.reuse {
+                    v["reuse"] = r.clone();
+                }
+                if let Some(c) = e.created {
+                    v["created"] = json!(c);
+                }
+                v
             })
             .collect();
-        if entries.len() != before {
-            if let Ok(body) = serde_json::to_string_pretty(&entries) {
-                let _ = secret_write::SecretFile::write_str(&path, &body);
-            }
-        }
-        !entries.is_empty()
+        let body = serde_json::to_string_pretty(&arr)?;
+        secret_write::SecretFile::write_str(&self.armed_path(), &body)
+            .context("atomic write armed.json")
+    }
+
+    /// Any unexpired armed invitation? Prunes expired entries under the lock,
+    /// so a stale entry never keeps the enrollment room open.
+    pub fn is_armed(&self) -> bool {
+        self.armed_invitations(cap_now_secs())
+            .map(|entries| !entries.is_empty())
+            .unwrap_or(false)
     }
 
     /// The `invitee_name` field recorded for an outstanding invitation, while
-    /// it is unexpired. Explicit-root port of `cli/src/armed.rs`.
+    /// it is unexpired. Read under the same lock as the writers.
     pub fn invitee_name(&self, key_id: &str) -> Option<String> {
-        let now = cap_now_secs();
-        self.armed_entries()
+        self.armed_invitations(cap_now_secs())
+            .ok()?
             .into_iter()
-            .find(|e| {
-                e["key_id"].as_str() == Some(key_id)
-                    && e["expires"].as_u64().is_some_and(|x| x > now)
-            })
-            .and_then(|e| e["name"].as_str().map(str::to_string))
+            .find(|e| e.key_id == key_id)
+            .and_then(|e| e.name)
             .filter(|n| !n.trim().is_empty())
     }
 
     /// The `invitee_kind` (`person`/`device`) recorded for an outstanding
     /// invitation, while it is unexpired.
     pub fn invitee_kind(&self, key_id: &str) -> Option<String> {
-        let now = cap_now_secs();
-        self.armed_entries()
+        self.armed_invitations(cap_now_secs())
+            .ok()?
             .into_iter()
-            .find(|e| {
-                e["key_id"].as_str() == Some(key_id)
-                    && e["expires"].as_u64().is_some_and(|x| x > now)
-            })
-            .and_then(|e| e["kind"].as_str().map(str::to_string))
+            .find(|e| e.key_id == key_id)
+            .and_then(|e| e.kind)
     }
 
-    fn armed_entries(&self) -> Vec<Value> {
-        let Ok(raw) = std::fs::read_to_string(self.root.join("armed.json")) else {
-            return Vec::new();
-        };
-        serde_json::from_str::<Value>(&raw)
-            .ok()
-            .and_then(|v| v.as_array().cloned())
+    /// One `key value` per line, matching the CLI's long-standing config
+    /// format. The read/modify/write runs under `config.lock` so a name set by
+    /// a join cannot be lost to another setting written at the same time.
+    pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
+        create_private_dir_all(&self.root)
+            .with_context(|| format!("create config dir {}", self.root.display()))?;
+        let _lock = StoreLock::acquire(&self.config_lock_path())
+            .with_context(|| format!("lock {}", self.config_lock_path().display()))?;
+        let p = self.config_path();
+        let mut lines: Vec<String> = std::fs::read_to_string(&p)
             .unwrap_or_default()
+            .lines()
+            .filter(|l| l.split_whitespace().next() != Some(key))
+            .map(|l| l.to_string())
+            .collect();
+        lines.push(format!("{key} {value}"));
+        secret_write::SecretFile::write_str(&p, &(lines.join("\n") + "\n"))
+            .context("atomic write config")
+    }
+
+    /// A config value, trimmed. A bare key (empty value) reads as absent, the
+    /// same rule the CLI's `config_get` used.
+    pub fn config_value(&self, key: &str) -> Option<String> {
+        std::fs::read_to_string(self.config_path())
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                let (k, v) = line.split_once(char::is_whitespace)?;
+                (k == key && !v.trim().is_empty()).then(|| v.trim().to_string())
+            })
+    }
+
+    pub fn device_name(&self) -> Option<String> {
+        self.config_value("name")
+    }
+
+    pub fn set_device_name(&self, name: &str) -> Result<()> {
+        self.set_config("name", name)
+    }
+
+    /// Verify and store the owner's signed capability header for resource
+    /// `self`. This is a network-origin write, so it is parsed from JSON,
+    /// checked as a genesis header under the owner key named by the verified
+    /// owner certificate, and only then applied through the shared
+    /// `apply_header` chain (which also advances the ratchet).
+    ///
+    /// Returns `false` when a self header is already present: a duplicate from
+    /// a replayed acknowledgement must not fork or rewrite the chain.
+    pub fn store_owner_cap_header(
+        &self,
+        header_json: &Value,
+        owner_pub: &[u8; 32],
+    ) -> Result<bool> {
+        let header =
+            CapHeader::from_json(header_json).ok_or_else(|| anyhow::anyhow!("cap header is malformed"))?;
+        if header.resource != "self" {
+            anyhow::bail!(
+                "cap header resource '{}' is not this device's 'self' resource",
+                header.resource
+            );
+        }
+        if header.owner_pub != *owner_pub {
+            anyhow::bail!("cap header is signed by a different owner than the verified certificate");
+        }
+        create_private_dir_all(&self.root)
+            .with_context(|| format!("create config dir {}", self.root.display()))?;
+        let lock_path = self.root.join("caps.json.lock");
+        let _lock = StoreLock::acquire(&lock_path)
+            .with_context(|| format!("lock {}", lock_path.display()))?;
+        let mut store = self.load_cap_store();
+        let already = store.iter().any(|e| {
+            e.get("type").and_then(|x| x.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some("self")
+        });
+        if already {
+            return Ok(false);
+        }
+        if header.resource == "self" {
+            // The legacy fleet header is STORED under the caller-facing alias
+            // `self`, but its signature commits to the self-certifying derived
+            // resource id. Rebuild that signed view before verifying; do not
+            // weaken the check to the stored alias.
+            let mut signed = header.clone();
+            signed.resource = self_resource_id(owner_pub);
+            signed.verify_signed_by(owner_pub)?;
+            store.push(header.to_json());
+            update_ratchet(&mut store, owner_pub, header.issued_at)?;
+        } else {
+            // A real resource header must be a genesis with a self-certifying
+            // id; `apply_header` verifies it before writing.
+            apply_header(&mut store, &header)?;
+        }
+        self.save_cap_store(&store)
+            .map_err(|e| anyhow::anyhow!("owner capability header not stored: {e}"))?;
+        Ok(true)
     }
 
     /// The owner-signed `cap_header` for resource "self", if this store has one.
@@ -4565,5 +5042,185 @@ mod forget_admission_precedence {
         assert_eq!(r.code, Code::CertRevoked);
         assert_eq!(r.reason, "device revoked");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod remembered_store_tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_remember_secret_is_idempotent_but_a_new_secret_is_a_new_record() {
+        let root = std::env::temp_dir().join(format!(
+            "fil-remember-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DeviceStore::open(&root);
+        let one = "a".repeat(64);
+        let two = "b".repeat(64);
+        let first = store.devices_store_remembered("boxa", &one).unwrap();
+        let repeated = store.devices_store_remembered("boxa", &one).unwrap();
+        assert_eq!(first, repeated, "a retried pair-keep must not mint a suffix");
+        assert_eq!(
+            store
+                .devices_records()
+                .iter()
+                .filter(|d| d["secret"].as_str() == Some(one.as_str()))
+                .count(),
+            1
+        );
+        let other = store.devices_store_remembered("boxa", &two).unwrap();
+        assert_ne!(
+            first, other,
+            "a different secret is a different device and still gets its own record"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod invitation_store_tests {
+    use super::*;
+
+    struct TestRoot(PathBuf);
+    impl TestRoot {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "invitation-store-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn armed(key: &str, name: &str, expires: u64) -> ArmedInvitation {
+        ArmedInvitation {
+            key_id: key.repeat(32),
+            expires,
+            name: Some(name.into()),
+            kind: Some("device".into()),
+            allow: Some(vec!["transfer".into(), "mount".into()]),
+            reuse: Some(json!(20)),
+            created: Some(10),
+        }
+    }
+
+    #[test]
+    fn arm_list_disarm_and_expiry_share_one_locked_store() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.0.clone());
+        let now = cap_now_secs();
+        store
+            .arm_invitation(armed("aa", "beta", now + 1_000), now)
+            .unwrap();
+        store
+            .arm_invitation(armed("bb", "old", now.saturating_sub(50)), now)
+            .unwrap();
+        let listed = store.armed_invitations(now).unwrap();
+        assert_eq!(listed.len(), 1, "expired entries are not listed");
+        assert_eq!(listed[0].label(), "beta");
+        assert_eq!(store.invitee_name(&"aa".repeat(32)).as_deref(), Some("beta"));
+        assert!(store.is_armed());
+
+        // Re-arming one key replaces its record instead of duplicating it.
+        store
+            .arm_invitation(armed("aa", "beta-2", now + 1_000), now)
+            .unwrap();
+        let listed = store.armed_invitations(now).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].label(), "beta-2");
+
+        store.disarm_invitation(&"aa".repeat(32)).unwrap();
+        assert!(store.armed_invitations(now).unwrap().is_empty());
+        assert!(!store.is_armed());
+    }
+
+    #[test]
+    fn a_corrupt_armed_file_is_reported_and_not_replaced() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.0.clone());
+        std::fs::write(root.0.join("armed.json"), "{").unwrap();
+        assert!(store.armed_invitations(100).is_err());
+        assert!(store.arm_invitation(armed("aa", "beta", 1_000), 100).is_err());
+        assert_eq!(std::fs::read_to_string(root.0.join("armed.json")).unwrap(), "{");
+    }
+
+    #[test]
+    fn config_name_writes_keep_other_keys() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.0.clone());
+        store.set_config("server", "http://127.0.0.1:1").unwrap();
+        store.set_device_name("phone").unwrap();
+        assert_eq!(store.device_name().as_deref(), Some("phone"));
+        assert_eq!(
+            store.config_value("server").as_deref(),
+            Some("http://127.0.0.1:1")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.0.join("config")).unwrap(),
+            "server http://127.0.0.1:1\nname phone\n"
+        );
+    }
+
+    #[test]
+    fn a_legacy_self_header_is_verified_over_its_signed_resource_id() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.0.clone());
+        let seed = [4u8; 32];
+        let owner = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        use ring::signature::KeyPair;
+        let owner_pub: [u8; 32] = owner.public_key().as_ref().try_into().unwrap();
+        let nonce = [9u8; 32];
+        let mut header = filament_cap::capability::CapHeader {
+            resource: filament_cap::capability::self_resource_id(&owner_pub),
+            epoch: 0,
+            owner_pub,
+            nonce,
+            floors: Vec::new(),
+            issued_at: 10,
+            prev_owner_pub: None,
+            prev_header_hash: None,
+            sig: [0u8; 64],
+        };
+        header.sig = filament_cap::capability::sign_cap_header(&header, &owner);
+        let mut stored = header.to_json();
+        stored["resource"] = json!("self");
+        assert!(store.store_owner_cap_header(&stored, &owner_pub).unwrap());
+        assert!(!store.store_owner_cap_header(&stored, &owner_pub).unwrap());
+        assert!(store.owner_cap_header().is_some());
+        let _ = std::fs::remove_dir_all(&root.0);
+    }
+
+    #[test]
+    fn an_invalid_owner_header_never_reaches_the_store() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.0.clone());
+        let owner = [7u8; 32];
+        let header = json!({
+            "type": "cap_header",
+            "resource": "self",
+            "epoch": 0,
+            "owner_pub": hex::encode(owner),
+            "nonce": hex::encode([1u8; 32]),
+            "floors": [],
+            "issued_at": 10,
+            "prev_owner_pub": null,
+            "prev_header_hash": null,
+            "sig": hex::encode([0u8; 64]),
+        });
+        assert!(store.store_owner_cap_header(&header, &owner).is_err());
+        assert!(!store.cap_store_path().exists());
     }
 }

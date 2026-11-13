@@ -1,6 +1,6 @@
 [package]
 name = "tunlion"
-version = "0.9.3"
+version = "0.9.4"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2024"
 description = "P2P file transfer between terminals and browsers, no upload, no account. The terminal end of tunlion.autumated.com."
@@ -91,6 +91,7 @@ mount-macos = ["dep:fuser"]
 
 
 [dependencies]
+unicode-width = "0.2"
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 base64 = "0.22"

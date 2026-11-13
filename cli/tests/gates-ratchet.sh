@@ -83,7 +83,11 @@ EXPECTED_GREEN=(
   "kill-resume: replacement receiver resumed|kill-resume"
   "--to bob delivered to bob only|--to selection"
   "relayed transfer via coturn|relay"
-  "same-uid supersede: sender swapped links|uid supersede"
+  # Gate 11 was rewritten to the spent-code rule (5709eb28e): a replacement
+  # receiver, even with the same uid, must receive nothing. It is the same
+  # strength, not a removed assertion: the old pass text asserted a supersede
+  # the product now refuses on purpose.
+  "spent code: replacement receiver got nothing|uid supersede"
   "daemon: verified identity, room-less|daemon"
   "pair ceremony: both exited clean|pair-ceremony"
   "ceremony bailed in|pair fail-fast"

@@ -7,7 +7,7 @@
 //! local socket. It owns no terminal, reads no settings, and does not build or
 //! close links.
 //!
-//! The two host edges go through `host::HostServices`, never through the CLI:
+//! The host edges go through `host::HostServices`, never through the CLI:
 //!   * `connect_local_stream` is the acceptor's dial. A peer asks for a local
 //!     target; only the host can open a socket here, and its inert default
 //!     REFUSES. The loopback check and the operator allowlist stay in
@@ -16,6 +16,10 @@
 //!     served stream runs. The host names the cut and its exact reason; an inert
 //!     host has no opinion, and an unidentified peer (`idev == None`) is never
 //!     cut here.
+//!   * `live_capability_cut` is asked only when `live_session_cut` found
+//!     nothing: the grant the stream rides may have been revoked under it (a
+//!     live ssh session whose `shell` grant is withdrawn), and that withdrawal
+//!     is a capability question, not a certificate or deadline one.
 //!
 //! Everything else is pure policy over the `Transport` trait. Nothing in this
 //! file calls back into the CLI.
@@ -541,11 +545,44 @@ impl Mux {
     /// broke). The ack is an empty `Some`: `on_frame` maps real empty payloads to
     /// `None`/EOF, so `Some(empty)` never occurs organically and is an unambiguous
     /// marker; replaying it writes zero bytes to the client.
+    ///
+    /// Never parks, like [`Self::on_frame`]: the event loop calls this inline,
+    /// and an awaited send on a full 256-slot pipe (a consumer that stopped
+    /// draining) froze the whole loop. A full pipe resets the stream the same
+    /// way `on_frame` does. An ack only means something for a stream THIS end
+    /// opened, so an ack naming a sid we did not open (the peer's own sid, or
+    /// one we accepted) is ignored: nothing is written and no stream changes.
     pub async fn on_open_ack(&self, sid: u32) {
-        let tx = self.streams.lock().await.get(&sid).map(|s| s.tx.clone());
-        if let Some(tx) = tx {
-            let _ = tx.send(Some(Bytes::new())).await;
+        if !self.opened_here(sid) || self.accepted.lock().await.contains_key(&sid) {
+            hooks::debug(&format!("l2: open-ack for sid {sid:#x} this end did not open, ignored"));
+            return;
         }
+        let tx = self.streams.lock().await.get(&sid).map(|s| s.tx.clone());
+        let Some(tx) = tx else { return };
+        match tx.try_send(Some(Bytes::new())) {
+            Ok(()) => {}
+            // Receiver gone: the stream is already torn down.
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                let _ = self
+                    .transport
+                    .send_control(&json!({
+                        "type": "l2-close",
+                        "sid": sid,
+                        "err": "stream input flooded (consumer stalled)",
+                    }))
+                    .await;
+                self.drop_stream(sid).await;
+            }
+        }
+    }
+
+    /// Was `sid` allocated by THIS end's [`Self::alloc_sid`]? Every sid this end
+    /// opens carries its role bit (`0x4000_0000` iff the transport is the sid
+    /// answerer), and the peer allocates with the opposite bit, so the bit
+    /// names the opener without any per-open record.
+    fn opened_here(&self, sid: u32) -> bool {
+        is_l2_sid(sid) && ((sid & 0x4000_0000 != 0) == self.transport.sid_answerer())
     }
 
     /// Inbound l2-close. `err` set = RST/abort (drop, do NOT deliver clean EOF);
@@ -646,6 +683,13 @@ impl Mux {
         self.close_err.lock().await.remove(&sid)
     }
 
+    /// Observe a recorded close reason without consuming it. The bridge
+    /// watcher needs it as soon as it lands, before the trailing close send
+    /// can stall; the one-shot client still takes it later.
+    pub async fn peek_close_err(&self, sid: u32) -> Option<String> {
+        self.close_err.lock().await.get(&sid).cloned()
+    }
+
     /// Data-channel died (or a send errored): tear down EVERY live stream so no
     /// pump hangs forever waiting on a peer that will never speak again.
     pub async fn shutdown_all(&self) {
@@ -653,7 +697,9 @@ impl Mux {
         self.open_ack_tx.lock().await.clear();
         self.exec_ctl.lock().await.clear();
         self.exec_init.lock().await.clear();
-        self.close_err.lock().await.clear();
+        // Do NOT clear `close_err`: a denial that raced the transport's death
+        // must still be readable by the pump that is about to end. The map is
+        // bounded by the streams drained here and sids are not reused.
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
             if let Some(h) = s.read_pump {
@@ -826,6 +872,24 @@ pub async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         }
                     }
                     revoked_reason = Some(cut.reason);
+                    if let Some(r) = reader.take() { r.abort(); }
+                    writer.abort();
+                    read_result = None;
+                    break;
+                }
+                // Same tick, second question (#244 shape): the certificate and
+                // the invitation are intact, but the GRANT this stream rides may
+                // be gone. An ssh session over the tunnel is admitted as a
+                // shell-class stream; `tunlion revoke <device> shell` must end
+                // it, the same way the pty and exec loops recheck their
+                // TerminalSessionScope. The session check keeps its reason
+                // precedence: forget/revoke/expiry above.
+                if let Some(reason) = mux
+                    .host
+                    .live_capability_cut(idev.as_ref(), filament_cap::capability::CAP_SHELL)
+                {
+                    hooks::critical("l2: peer's shell capability withdrawn, closing the live stream");
+                    revoked_reason = Some(reason);
                     if let Some(r) = reader.take() { r.abort(); }
                     writer.abort();
                     read_result = None;
@@ -1237,6 +1301,227 @@ mod tests {
         }
     }
 
+    /// A host whose two live re-checks the test controls: the certificate/
+    /// deadline cut (`live_session_cut`) and the capability cut
+    /// (`live_capability_cut`). The mux asks the first, then the second only
+    /// when the first found nothing. `capability_asked` records that order, and
+    /// `asked_actions` records exactly what the mux asked for.
+    #[derive(Default)]
+    struct TwoGateHost {
+        cert_cut: StdMutex<Option<crate::host::LiveCut>>,
+        capability_cut: StdMutex<Option<String>>,
+        capability_asked: std::sync::atomic::AtomicBool,
+        asked_actions: StdMutex<Vec<String>>,
+    }
+
+    impl TwoGateHost {
+        fn with_capability(reason: &str) -> Arc<Self> {
+            let host = TwoGateHost::default();
+            *host.capability_cut.lock().unwrap() = Some(reason.to_string());
+            Arc::new(host)
+        }
+        fn with_cert_cut(cause: LiveCutCause, reason: &str) -> Arc<Self> {
+            let host = TwoGateHost::default();
+            *host.cert_cut.lock().unwrap() = Some(crate::host::LiveCut {
+                cause,
+                expires_at: None,
+                reason: reason.to_string(),
+            });
+            Arc::new(host)
+        }
+    }
+
+    #[async_trait]
+    impl HostServices for TwoGateHost {
+        fn settings_get_str(&self, key: &str) -> Option<String> {
+            NoHost.settings_get_str(key)
+        }
+        fn devices_load(&self) -> Vec<(String, String)> {
+            NoHost.devices_load()
+        }
+        fn is_self_uid(&self, my_uid: &str, peer_uid: Option<&str>) -> bool {
+            NoHost.is_self_uid(my_uid, peer_uid)
+        }
+        fn rejoin_unwarned(&self) -> Duration {
+            NoHost.rejoin_unwarned()
+        }
+        fn relay_banner(&self) -> String {
+            NoHost.relay_banner()
+        }
+        fn relay_forbidden(&self) -> bool {
+            NoHost.relay_forbidden()
+        }
+        fn channel_of(&self, secret: &str) -> String {
+            NoHost.channel_of(secret)
+        }
+        fn roster_snapshot_json(&self) -> Option<String> {
+            NoHost.roster_snapshot_json()
+        }
+        fn fleet_rv_present(&self) -> bool {
+            NoHost.fleet_rv_present()
+        }
+        fn live_session_cut(&self, idev: Option<&[u8; 32]>) -> Option<crate::host::LiveCut> {
+            idev.and_then(|_| self.cert_cut.lock().unwrap().clone())
+        }
+        fn live_capability_cut(&self, idev: Option<&[u8; 32]>, action: &str) -> Option<String> {
+            idev?;
+            self.capability_asked
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.asked_actions.lock().unwrap().push(action.to_string());
+            self.capability_cut.lock().unwrap().clone()
+        }
+        fn revoke_recheck_interval(&self) -> Duration {
+            Duration::from_millis(1)
+        }
+    }
+
+    /// Serve one stream until it ends or the bound passes, returning whether it
+    /// ended inside the bound. The client half is held open (a live ssh data
+    /// pipe with no traffic) so only the revoke tick can end it.
+    async fn serve_until_terminal(
+        host: Arc<TwoGateHost>,
+        sid: u32,
+        bound: Duration,
+    ) -> (Arc<MockTransport>, Arc<Mux>, bool) {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), host);
+        let rx = mux.register(sid).await.expect("fresh sid registers");
+        let (_client, socket) = tokio::io::duplex(64);
+        let ended = tokio::time::timeout(
+            bound,
+            serve_stream(mux.clone(), sid, socket, rx, true, None, Some([7; 32])),
+        )
+        .await
+        .is_ok();
+        (t, mux, ended)
+    }
+
+    /// The defect this pins: a `shell` revoke has to end a stream that is
+    /// already established. `live_session_cut` reports nothing (the certificate
+    /// and invitation are intact), so the ticker's second question is the only
+    /// thing that can close it.
+    #[tokio::test]
+    async fn live_stream_closes_when_the_shell_capability_is_revoked() {
+        let reason = "shell revoked for 'peer' here";
+        let host = TwoGateHost::with_capability(reason);
+        let sid = L2_SID_BASE | 101;
+        let (t, mux, ended) = serve_until_terminal(host.clone(), sid, Duration::from_secs(5)).await;
+        assert!(ended, "a revoked shell capability must end the live stream");
+        assert_eq!(mux.live_streams().await, 0, "the stream must be retired");
+        let controls = t.controls.lock().unwrap();
+        assert!(
+            controls.iter().any(|v| v["type"] == "l2-close"
+                && v["sid"].as_u64() == Some(sid as u64)
+                && v["err"] == reason),
+            "the close must carry the capability reason, got: {controls:?}"
+        );
+        assert!(host.capability_asked.load(std::sync::atomic::Ordering::Relaxed));
+        let asked = host.asked_actions.lock().unwrap();
+        assert_eq!(asked.len(), 1, "the mux must ask once per tick it survives");
+        assert_eq!(asked[0], "shell", "the mux must ask for the capability the stream rides");
+        drop(asked);
+    }
+
+    /// An unrelated capability revoke (here `transfer`) changes no source the
+    /// shell stream rides: the ticker must not close a healthy stream.
+    #[tokio::test]
+    async fn live_stream_survives_an_unrelated_capability_revoke() {
+        use tokio::io::AsyncReadExt;
+        let host = Arc::new(TwoGateHost::default());
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), host.clone());
+        let sid = L2_SID_BASE | 102;
+        let rx = mux.register(sid).await.unwrap();
+        let (mut client, socket) = tokio::io::duplex(256);
+        let task = tokio::spawn(serve_stream(
+            mux.clone(),
+            sid,
+            socket,
+            rx,
+            true,
+            None,
+            Some([7; 32]),
+        ));
+        // Several recheck ticks, with the shell capability intact.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(mux.has_stream(sid).await, "an unrelated revoke closed the stream");
+        // The data plane still moves: an inbound frame reaches the local app.
+        mux.on_frame(sid, Bytes::from_static(b"PING")).await;
+        let mut got = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut got))
+            .await
+            .expect("the surviving stream still carries bytes")
+            .unwrap();
+        assert_eq!(&got, b"PING");
+        assert!(
+            t.controls.lock().unwrap().is_empty(),
+            "no close may be sent for a healthy stream"
+        );
+        task.abort();
+    }
+
+    /// Reason precedence: forget/certificate revocation are decided by
+    /// `live_session_cut` first, and the capability question is never allowed
+    /// to replace their words (a revoked device must read "device revoked", a
+    /// forgotten one "not recognized").
+    #[tokio::test]
+    async fn certificate_and_forget_cuts_keep_their_reason_precedence() {
+        for (cause, reason) in [
+            (LiveCutCause::Revoked, "device revoked"),
+            (
+                LiveCutCause::Forgotten,
+                "this device is not recognized here: it was forgotten, or was never paired",
+            ),
+        ] {
+            let host = TwoGateHost::with_cert_cut(cause, reason);
+            // A capability cut is ALSO pending: it must not win.
+            *host.capability_cut.lock().unwrap() = Some("shell revoked for 'peer' here".into());
+            let sid = L2_SID_BASE | 103;
+            let (t, mux, ended) =
+                serve_until_terminal(host.clone(), sid, Duration::from_secs(5)).await;
+            assert!(ended, "{cause:?} did not end the live stream");
+            assert_eq!(mux.live_streams().await, 0);
+            let controls = t.controls.lock().unwrap();
+            assert!(
+                controls.iter().any(|v| v["type"] == "l2-close" && v["err"] == reason),
+                "{cause:?} must close with '{reason}', got: {controls:?}"
+            );
+            assert!(
+                !host.capability_asked.load(std::sync::atomic::Ordering::Relaxed),
+                "{cause:?}: the capability question must not be reached"
+            );
+        }
+    }
+
+    /// The no-revoke control: an intact capability survives its own recheck.
+    /// Without this, a ticker that closed every stream would pass the revoke
+    /// test above.
+    #[tokio::test]
+    async fn live_stream_with_an_intact_capability_is_not_closed() {
+        let host = Arc::new(TwoGateHost::default());
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), host);
+        let sid = L2_SID_BASE | 104;
+        let rx = mux.register(sid).await.unwrap();
+        let (_client, socket) = tokio::io::duplex(64);
+        let task = tokio::spawn(serve_stream(
+            mux.clone(),
+            sid,
+            socket,
+            rx,
+            true,
+            None,
+            Some([7; 32]),
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(mux.has_stream(sid).await, "the recheck closed an intact stream");
+        assert!(
+            t.controls.lock().unwrap().is_empty(),
+            "an intact capability must not send a close"
+        );
+        task.abort();
+    }
+
     /// INITIATOR-side warm exec routing: an ack/close reaches only the sid it
     /// names, a revocation reaches every in-flight exec on the link, and
     /// dropping the stream retires the waiter so a late frame cannot wake it.
@@ -1368,6 +1653,96 @@ mod tests {
                         .contains("flooded")
             ),
             "reset carries an l2-close naming the flood, got: {controls:?}"
+        );
+    }
+
+    /// The open-ack is delivered from the event loop like a data frame, so it
+    /// must never park on a stalled consumer's full pipe either: it resets the
+    /// stream the way `on_frame` does and returns at once.
+    #[tokio::test]
+    async fn on_open_ack_resets_full_pipe_instead_of_parking() {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        // A sid this end opened: MockTransport is not the sid answerer, and
+        // alloc_sid hands out sids without the answerer bit.
+        let sid = mux.alloc_sid();
+        let _rx = mux.register_stream(sid).await.expect("fresh sid registers");
+        for _ in 0..256 {
+            mux.on_frame(sid, bytes::Bytes::from_static(b"x")).await;
+        }
+        assert!(
+            mux.streams.lock().await.contains_key(&sid),
+            "a full-but-live pipe stays registered"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), mux.on_open_ack(sid))
+            .await
+            .expect("on_open_ack never parks, even on a full pipe");
+        assert!(
+            !mux.streams.lock().await.contains_key(&sid),
+            "a full pipe resets (drops) the stream"
+        );
+        let controls = t.controls.lock().unwrap();
+        assert!(
+            controls.iter().any(|v| v["type"] == "l2-close"
+                && v["sid"].as_u64() == Some(sid as u64)
+                && v["err"].as_str().unwrap_or("").contains("flooded")),
+            "the reset carries an l2-close naming the flood, got: {controls:?}"
+        );
+    }
+
+    /// An ack is the peer answering an open THIS end sent. An ack naming a
+    /// sid this end did not open (one the peer allocated, or one this end
+    /// accepted) must write nothing and leave the stream table unchanged.
+    #[tokio::test]
+    async fn on_open_ack_ignores_a_sid_this_end_did_not_open() {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        // The peer's allocation carries the answerer bit this end lacks.
+        let peer_sid = L2_SID_BASE | 0x4000_0000 | 5;
+        let mut rx = mux.register_stream(peer_sid).await.expect("fresh sid registers");
+        let before = {
+            let mut sids = mux.live_sids().await;
+            sids.sort_unstable();
+            sids
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), mux.on_open_ack(peer_sid))
+            .await
+            .expect("on_open_ack never parks");
+        assert!(
+            rx.try_recv().is_err(),
+            "an ack for a sid this end did not open must deliver nothing"
+        );
+        let after = {
+            let mut sids = mux.live_sids().await;
+            sids.sort_unstable();
+            sids
+        };
+        assert_eq!(before, after, "the stream table is unchanged");
+        assert!(
+            t.controls.lock().unwrap().is_empty(),
+            "an ignored ack sends no control"
+        );
+
+        // A sid with this end's parity that this end ACCEPTED (the peer chose
+        // it) is not ours either.
+        let accepted_sid = L2_SID_BASE | 9;
+        let mut rx2 = mux.register_stream(accepted_sid).await.expect("fresh sid registers");
+        mux.accepted.lock().await.insert(accepted_sid, ());
+        mux.on_open_ack(accepted_sid).await;
+        assert!(
+            rx2.try_recv().is_err(),
+            "an ack for an accepted sid must deliver nothing"
+        );
+        assert!(mux.has_stream(accepted_sid).await, "the accepted stream is untouched");
+
+        // Control: the ack for a sid this end did open is delivered.
+        let ours = mux.alloc_sid();
+        let mut rx3 = mux.register_stream(ours).await.expect("fresh sid registers");
+        mux.on_open_ack(ours).await;
+        assert_eq!(
+            rx3.try_recv().ok(),
+            Some(Some(Bytes::new())),
+            "the ack for our own open is the empty liveness marker"
         );
     }
 

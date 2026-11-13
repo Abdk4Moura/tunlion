@@ -75,6 +75,7 @@ pub mod handoff;
 pub mod holepunch;
 pub mod host;
 pub mod identity;
+pub mod invitation;
 pub mod l2;
 #[cfg(feature = "l3")]
 pub mod l3;
@@ -94,6 +95,7 @@ pub mod present;
 pub mod process;
 pub mod recv;
 pub mod refusal;
+pub mod removal;
 pub mod resilience;
 mod retry;
 pub mod secret;
