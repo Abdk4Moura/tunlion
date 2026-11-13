@@ -1738,7 +1738,7 @@ pub struct Conn {
     /// Set by a candidate sender when it has queued a `BuildWake`, cleared by
     /// `pump_builds` before it drains. One wake is outstanding at a time, so a
     /// busy data channel cannot flood the main queue with wakes.
-    candidate_wake: Arc<AtomicBool>,
+    pub candidate_wake: Arc<AtomicBool>,
     /// Source-bound standby/upgrade events awaiting adoption. Bounded per source
     /// and in total; overflow closes the standby instead of growing forever.
     pub pending_sources: HashMap<net::SourceId, PendingSource>,
