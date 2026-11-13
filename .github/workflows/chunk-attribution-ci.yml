@@ -16,12 +16,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Real QUIC worker reader and readiness ordering
-        run: cargo test -p tunlion-transport worker_ready_precedes_actual_sourced_chunk -- --nocapture
+        run: |
+          set -o pipefail
+          cargo test -p tunlion-transport --lib direct::tests::worker_ready_precedes_actual_sourced_chunk -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-reader.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-reader.log"
       - name: Daemon chunk admission, worker and pre-adoption fencing
-        run: cargo test -p tunlion-peerloop chunk_attribution_fences_pairing_and_worker_dispatch -- --nocapture
+        run: |
+          set -o pipefail
+          cargo test -p tunlion-peerloop --lib conn::warm_identity_tests::chunk_attribution_fences_pairing_and_worker_dispatch -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-admission.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-admission.log"
       - name: Selected link chunk fencing and CLI compilation
-        run: cargo test -p tunlion --bin tunlion the_selected_pump_reads_only_the_selected_transports_source -- --nocapture
+        run: |
+          set -o pipefail
+          cargo test -p tunlion --bin tunlion l2::h1_tests::the_selected_pump_reads_only_the_selected_transports_source -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-selected.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-selected.log"
       - name: Install isolated signaling backend dependencies
         run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
       - name: Real temporary pairing and byte-exact service echo
-        run: cargo test -p tunlion --test pty_flows temporary_service_pairing_uses_real_transport_and_end_closes_the_socket -- --nocapture
+        run: |
+          set -o pipefail
+          cargo test -p tunlion --test pty_flows temporary_service_pairing_uses_real_transport_and_end_closes_the_socket -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-pair.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-pair.log"

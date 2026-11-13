@@ -1966,8 +1966,8 @@ pub fn announce_workers(
 
 /// Build a `DirectTransport` from an authenticated connection + its auth stream
 /// (reused as the control/data stream), wiring the reader into `tx` and
-/// starting it at once. Used for worker streams, which are never announced
-/// one at a time; the PRIMARY link goes through `make_transport_unread`.
+/// starting it at once. Production primary and worker readers use
+/// `make_transport_unread` so their readiness is queued first.
 #[allow(clippy::too_many_arguments)]
 pub fn make_transport(
     peer_id: String,

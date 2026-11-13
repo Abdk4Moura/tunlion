@@ -396,7 +396,7 @@ pub enum Ev {
     DirectWorkersReady(String, Vec<Arc<dyn Transport>>, SourceId),
     Control(String, Value),
     /// A transport-origin event with immutable provenance. `pid` must match the
-    /// inner Control/PcState/ChannelReady pid; nested Sourced is invalid. The
+    /// inner Control/PcState/ChannelReady/Chunk pid; nested Sourced is invalid. The
     /// handler gate checks `source` against the current link immediately before
     /// dispatch.
     Sourced {

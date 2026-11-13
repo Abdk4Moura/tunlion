@@ -3759,7 +3759,7 @@ impl Conn {
         }
     }
 
-    /// Final pre-dispatch gate. Transport-origin Control/PcState/ChannelReady
+    /// Final pre-dispatch gate. Transport-origin Control/PcState/ChannelReady/Chunk
     /// must carry an immutable SourceId; the event is accepted only if that
     /// source still belongs to the pid's CURRENT link at the moment the driver
     /// is about to handle it. A replacement after forwarding therefore cannot
@@ -13308,6 +13308,17 @@ mod warm_identity_tests {
         });
         assert!(conn.stage_event(chunk(standby_source, pid, pid)).is_none());
         assert_eq!(conn.pending_sources[&standby_source].events.len(), 1);
+        assert_eq!(conn.pending_sources[&standby_source].bytes, 4);
+        conn.links.get_mut(pid).unwrap().source = standby_source;
+        conn.flush_pending_source(standby_source);
+        assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(..), Some(s))) if s == standby_source));
+
+        conn.links.get_mut(pid).unwrap().source = source;
+        conn.pending_sources.insert(standby_source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::new(), bytes: 0,
+        });
+        assert!(conn.stage_event(chunk(standby_source, pid, pid)).is_none());
         conn.links.get_mut(pid).unwrap().source = standby_source;
         conn.flush_pending_source(standby_source);
         conn.links.get_mut(pid).unwrap().source = source;
