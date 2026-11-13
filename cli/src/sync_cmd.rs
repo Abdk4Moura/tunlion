@@ -686,10 +686,10 @@ mod tests {
     /// Control }`); from the selected transport it is accepted, from another
     /// source (a losing candidate) it is not, even naming our sid.
     ///
-    /// The chunks here are SYNTHETIC tagged chunks. The real QUIC and WebRTC
-    /// readers emit `Ev::Chunk` untagged (direct.rs, net.rs), which the gate
-    /// passes through, so this pins only the gate's handling of a tagged chunk.
-    /// It does not show that a losing candidate's real chunks are isolated.
+    /// The chunks here are tagged with their source, the shape the QUIC and
+    /// WebRTC readers now emit (see the transport's chunk attribution). The
+    /// gate admits a chunk only from the selected source, so a losing
+    /// candidate's chunk does not reach this link's stream.
     #[tokio::test]
     async fn open_ack_reads_the_selected_source_and_drops_others() {
         let selected = crate::net::SourceId::next();
@@ -725,7 +725,9 @@ mod tests {
         assert!(pipe.try_recv().is_err(), "a stale chunk reached the stream");
     }
 
-    /// The untagged shape (WebRTC/LAN readers) is still accepted.
+    /// A transport with no source of its own still delivers an untagged
+    /// control, and the gate accepts it. Only a CHUNK must be attributed, so
+    /// an untagged control keeps working while an untagged chunk does not.
     #[tokio::test]
     async fn open_ack_still_reads_untagged_events() {
         let mux = l2::Mux::new(Arc::new(SourcedTransport(None)), crate::host_impl::cli_host());

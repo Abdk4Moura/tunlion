@@ -1,13 +1,18 @@
 name: Chunk attribution regression
 on:
   push:
-    branches: [main, fix/chunk-source-attribution]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   regression:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
