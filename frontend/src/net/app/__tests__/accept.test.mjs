@@ -86,5 +86,34 @@ for (const mutation of ['forget', 'deny', 'replace', 'close', 'decline']) {
   eq(`${mutation} never calls acceptTransfer`, accepted, 0)
 }
 
+// The policy clock is part of the decision, not a cosmetic snapshot field.
+// A pre-expiry allow arriving after expiry must be re-evaluated and denied;
+// a rollover that does not cross an expiry must still make progress.
+for (const expiresAt of [1001, 2000]) {
+  let finish
+  let calls = 0
+  let now = 1000
+  let accepted = 0
+  const entry = { id: 'clock', ...offer }
+  const link = { transfers: new Map([['clock', entry]]), _closed: false,
+    acceptTransfer() { accepted++ } }
+  const admitClock = (json) => {
+    const input = JSON.parse(json)
+    calls++
+    const allowed = input.certExpires == null || input.now < input.certExpires
+    const result = JSON.stringify({ allowed, deny: allowed ? null : { kind: 'expired', at: input.certExpires } })
+    if (calls === 1) return new Promise((resolve) => { finish = () => resolve(result) })
+    return Promise.resolve(result)
+  }
+  const snapshot = () => ({ facts: { ...proven, now, expiresAt }, recordId: 'peer', secret: 'old' })
+  const pending = acceptIfCurrent(link, 'clock', snapshot, { admit: admitClock })
+  now = 1001
+  finish()
+  const allowed = await pending
+  eq(`rollover at expiry ${expiresAt} returns the current decision`, allowed, expiresAt > now)
+  eq(`rollover at expiry ${expiresAt} applies only a current allow`, accepted, expiresAt > now ? 1 : 0)
+  eq(`rollover at expiry ${expiresAt} re-evaluates policy`, calls, 2)
+}
+
 if (!ok) { console.log('FAIL'); process.exit(1) }
 console.log('PASS')

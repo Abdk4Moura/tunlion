@@ -22,16 +22,26 @@ export async function shouldAutoAccept(facts, opts) {
 export async function acceptIfCurrent(link, id, snapshot, opts) {
   const offer = link.transfers.get(id)
   if (!offer || link._closed) return false
-  const before = snapshot(offer)
-  if (!before) return false
-  const token = JSON.stringify(before)
-  if (!await shouldAutoAccept(before.facts, opts)) return false
-  const current = link.transfers.get(id)
-  if (!current || current !== offer || link._closed) return false
-  const after = snapshot(current)
-  if (!after || JSON.stringify(after) !== token) return false
-  link.acceptTransfer(id)
-  return true
+  // A rollover requires a fresh decision with the new clock: an allowance
+  // before expiry is not an allowance after expiry. Bound retries so a slow
+  // core fails closed instead of spinning indefinitely.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const before = snapshot(offer)
+    if (!before) return false
+    const { now, ...beforeFacts } = before.facts
+    const token = JSON.stringify({ ...before, facts: beforeFacts })
+    if (!await shouldAutoAccept(before.facts, opts)) return false
+    const current = link.transfers.get(id)
+    if (!current || current !== offer || link._closed) return false
+    const after = snapshot(current)
+    if (!after) return false
+    const { now: currentNow, ...afterFacts } = after.facts
+    if (JSON.stringify({ ...after, facts: afterFacts }) !== token) return false
+    if (currentNow !== now) continue
+    link.acceptTransfer(id)
+    return true
+  }
+  return false
 }
 
 // Offers that arrived BEFORE the consent was established (the pair-proof or the
