@@ -98,10 +98,12 @@ trap fixture_cleanup EXIT
 start_backend
 
 SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+mkdir -p "$SYNC_DIAG_DIR"
+printf '%s\n' "$SECRET" > "$SYNC_DIAG_DIR/secret"
 printf '[{"name":"boxb","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
 printf '[{"name":"boxa","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 DROP="$WORK/Bdrop"; mkdir -p "$DROP"
-env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxb "$BIN" up --dir "$DROP" --server "$SERVER" > >(python3 "$HERE/sync-diag-timestamp.py" "$WORK/receiver.timestamped") 2>&1 &
+env TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxb "$BIN" up --dir "$DROP" --server "$SERVER" > >(python3 "$HERE/sync-diag-timestamp.py" "$SYNC_DIAG_DIR/receiver.raw" >"$WORK/up.log") 2>&1 &
 FIX_PIDS+=($!)
 sleep 3
 
@@ -141,13 +143,15 @@ same_bytes() { cmp -s "$TREE/$1" "$DROP/inbox/$1"; }
 
 # ===================================================================== GATE A ==
 say A
-"${SYNC[@]}" --json sync "$TREE" boxb:inbox >"$WORK/A.jsonl" 2> >(python3 "$HERE/sync-diag-timestamp.py" "$WORK/initiator.timestamped" >"$WORK/A.err"); rcA=$?
-wait "$!" 2>/dev/null || true
-mkdir -p "$SYNC_DIAG_DIR"
-cp "$WORK/receiver.timestamped" "$SYNC_DIAG_DIR/receiver.raw"
-cp "$WORK/initiator.timestamped" "$SYNC_DIAG_DIR/initiator.raw"
-cp "$WORK/A.jsonl" "$SYNC_DIAG_DIR/initiator-result.raw"
-printf '%s\n' "$SECRET" > "$SYNC_DIAG_DIR/secret"
+exec 3> >(python3 "$HERE/sync-diag-timestamp.py" "$SYNC_DIAG_DIR/initiator.raw" >"$WORK/A.err")
+diag_pid=$!
+exec 4> >(python3 "$HERE/sync-diag-timestamp.py" "$SYNC_DIAG_DIR/initiator-result.raw" >"$WORK/A.jsonl")
+result_pid=$!
+"${SYNC[@]}" --json sync "$TREE" boxb:inbox 1>&4 2>&3; rcA=$?
+exec 3>&-
+exec 4>&-
+wait "$diag_pid" 2>/dev/null || true
+wait "$result_pid" 2>/dev/null || true
 echo "## rc=$rcA"; cat "$WORK/A.jsonl"
 if [ "$rcA" = 0 ]; then ok "gateA: first sync exits 0"; else cat "$WORK/A.err"; tail -20 "$WORK/up.log"; bad "gateA: first sync rc=$rcA"; fi
 if [ "$(jstates "$WORK/A.jsonl")" = "$(printf 'sent\ta\t300\nsent\tbig\t%s\nskipped\tlink\t0\nsent\tsub/c\t5' $((CHUNK*3)))" ]; then
