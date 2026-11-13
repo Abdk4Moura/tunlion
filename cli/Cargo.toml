@@ -91,6 +91,7 @@ mount-macos = ["dep:fuser"]
 
 
 [dependencies]
+unicode-width = "0.2"
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 base64 = "0.22"

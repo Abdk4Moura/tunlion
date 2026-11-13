@@ -107,12 +107,17 @@ fn expand_home(input: &str) -> std::path::PathBuf {
 
 /// `$HOME/x` -> `~/x` for display only, and never a control character.
 fn short_path(path: &std::path::Path) -> String {
-    let shown = match home_dir() {
-        Some(home) if path == home => "~".to_string(),
-        Some(home) if path.starts_with(&home) => {
-            format!("~{}{}", std::path::MAIN_SEPARATOR, path.strip_prefix(&home).map(|p| p.display().to_string()).unwrap_or_default())
-        }
-        _ => path.display().to_string(),
+    short_path_with_home(path, home_dir().as_deref())
+}
+
+fn short_path_with_home(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    let canonical_home = home.and_then(|home| std::fs::canonicalize(home).ok());
+    let relative = home.and_then(|home| path.strip_prefix(home).ok())
+        .or_else(|| canonical_home.as_deref().and_then(|home| path.strip_prefix(home).ok()));
+    let shown = match relative {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => path.display().to_string(),
     };
     terminal_label(&shown)
 }
@@ -379,7 +384,11 @@ fn composer_rows(draft: &Draft, finish: &str) -> Vec<String> {
     let folders = match draft.spec.folders.as_slice() {
         [] => "none".to_string(),
         [one] => format!("({}) {}", mode_label(&one.mode), short_path(&one.path)),
-        [first, rest @ ..] => format!("({}) +{} {}", mode_label(&first.mode), rest.len(), short_path(&first.path)),
+        [first, rest @ ..] => {
+            let mixed = rest.iter().any(|folder| folder.mode != first.mode);
+            let mode = if mixed { &FolderMode::ReadWrite } else { &first.mode };
+            format!("({}) +{}{} {}", mode_label(mode), rest.len(), if mixed { " mixed" } else { "" }, short_path(&first.path))
+        }
     };
     let services = if draft.spec.services.is_empty() {
         "none".to_string()
@@ -622,6 +631,37 @@ mod tests {
             assert_eq!(short_path(&home), "~");
             assert_eq!(short_path(&home.join("folder")), format!("~{}folder", std::path::MAIN_SEPARATOR));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_paths_are_shortened_when_home_is_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("tunlion-home-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("real/folder")).unwrap();
+        let link = root.join("link");
+        if !link.exists() { symlink(root.join("real"), &link).unwrap(); }
+        let path = std::fs::canonicalize(link.join("folder")).unwrap();
+        assert_eq!(short_path_with_home(&path, Some(&link)), "~/folder");
+        assert_eq!(short_path_with_home(&std::fs::canonicalize(&link).unwrap(), Some(&link)), "~");
+        assert_ne!(short_path_with_home(&root.join("real-other"), Some(&link)), "~");
+    }
+
+    #[test]
+    fn mixed_folder_modes_warn_even_when_write_access_is_not_first() {
+        let mut draft = Draft::default();
+        for (id, mode) in [("a", FolderMode::ReadOnly), ("b", FolderMode::ReadWrite)] {
+            draft.spec.folders.push(FolderAccess { id: id.into(), path: format!("/{id}").into(), mode });
+        }
+        for _ in 0..2 {
+            let row = crate::codeentry::fit(&composer_rows(&draft, "Done")[0], 38);
+            assert!(row.contains("(read & write) +1 mixed"), "{row}");
+            draft.spec.folders.reverse();
+        }
+        draft.spec.folders[1].mode = FolderMode::ReadWrite;
+        let row = &composer_rows(&draft, "Done")[0];
+        assert!(row.contains("(read & write) +1"));
+        assert!(!row.contains("mixed"));
     }
 
     #[test]

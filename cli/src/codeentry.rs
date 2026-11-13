@@ -422,11 +422,19 @@ pub(crate) fn hint_line(len: usize, hints: &[(char, &str)]) -> String {
 /// Clip a label to the terminal width so a long path never wraps: a wrapped row
 /// makes the in-place redraw rewind the wrong number of lines.
 pub(crate) fn fit(s: &str, width: usize) -> String {
-    let n = s.chars().count();
-    if width < 8 || n <= width {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= width {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(width - 1).collect();
+    if width == 0 { return String::new(); }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let cells = c.width().unwrap_or(0);
+        if used + cells > width - 1 { break; }
+        out.push(c);
+        used += cells;
+    }
     out.push('\u{2026}');
     out
 }
@@ -454,7 +462,7 @@ fn render_picker(header: &str, items: &[String], sel: usize, prev: usize, hints:
     }
     let mut drawn = 0;
     if !header.is_empty() {
-        frame.push_str(&format!("\r\x1b[2K{}\r\n", ui::header(ui::Tone::Brand, ui::Tone::Bold, header)));
+        frame.push_str(&format!("\r\x1b[2K{}\r\n", ui::header(ui::Tone::Brand, ui::Tone::Bold, &fit(header, width))));
         drawn += 1;
     }
     if above > 0 {
@@ -1152,5 +1160,21 @@ mod viewport_tests {
     #[test]
     fn an_empty_list_is_not_a_panic() {
         assert_eq!(viewport_window(0, 0, 7), (0, 0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::fit;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn clips_wide_headings_and_tiny_widths_by_terminal_cells() {
+        for width in 0..40 {
+            let text = fit(&format!("/{}", "資料".repeat(30)), width);
+            assert!(text.width() <= width, "width {width}: {text}");
+        }
+        assert_eq!(fit("abcdef", 1), "…");
+        assert_eq!(fit("abc", 3), "abc");
     }
 }
