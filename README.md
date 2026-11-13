@@ -62,6 +62,14 @@ New to it? `tunlion demo` is a guided tour you follow in your terminal: real com
 
 ## Reach your devices
 
+For automatic connections between your own devices, see the
+[fleet guide](docs/fleet.md). Ordinary `add --name phone` pairing does not enroll
+a fleet member: use `add --for device --name phone` on the owner for that.
+Fleet siblings can send files into each other's inbox by default, but membership
+does not imply shell, mount, forwarding or route authority. The guide explains
+target-side grant policy and the difference between revoking a grant and cutting
+a device off.
+
 Once two machines are paired, they share a crypto-addressed overlay — each device's public key *is* its address. On top of that:
 
 ```sh
