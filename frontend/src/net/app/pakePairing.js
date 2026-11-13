@@ -16,6 +16,20 @@
 export const RESEND_FIRST_MS = 250
 export const RESEND_CAP_MS = 2000
 
+/// The fingerprint PAIR a confirmation is bound to, sorted so both sides name
+/// the same link the same way: this side's local DTLS fingerprint is the
+/// peer's remote one, so the sorted pair is identical on both ends of a link.
+///
+/// A confirmation MAC is computed over this pair, so it only verifies against
+/// the link it was made on. If the link is replaced mid-ceremony, a
+/// confirmation made on the old link cannot verify against the new one - and
+/// that is NOT a wrong code, it is a confirmation for a link that is gone.
+export function pairKey(fps) {
+  if (!fps) return null
+  const [lo, hi] = [fps.mine, fps.theirs].sort()
+  return `${lo}\u0000${hi}`
+}
+
 /// Delay before the re-send that follows re-send number `step` (0-based):
 /// 250, 500, 1000, then 2000 ms from there on.
 export function resendDelay(step) {
@@ -49,6 +63,12 @@ export class PakeCeremony {
     this._pendingConfirmMac = null // a confirm that arrived before fingerprints
     this._resendAt = null
     this._resendStep = 0
+    // The fingerprint pairs this ceremony has seen, oldest first. A link can be
+    // replaced mid-ceremony (the peer leaves and rejoins under a fresh sid),
+    // and a confirmation is bound to the pair of the link it was made on. Keep
+    // the recent pairs so a confirmation made on a link that was replaced is
+    // recognised as that, and not reported as a wrong code.
+    this._fpsHistory = []
   }
 
   /// Send our SPAKE2 element (idempotent). Call once the peer sid is known.
@@ -73,6 +93,15 @@ export class PakeCeremony {
     if (this._pendingConfirmMac && !this.secret) this._verify(this._pendingConfirmMac)
   }
 
+  /// Remember the fingerprint pair of the link we are on, so a confirmation
+  /// made on a link that was later replaced is still recognisable as one.
+  /// Bounded: a ceremony only ever sees a handful of links.
+  _rememberFps(fps) {
+    if (!fps) return
+    if (this._fpsHistory.some((old) => old.mine === fps.mine && old.theirs === fps.theirs)) return
+    this._fpsHistory.push({ mine: fps.mine, theirs: fps.theirs })
+    if (this._fpsHistory.length > 4) this._fpsHistory.shift()
+  }
   /// Re-send the current message if its backoff slot is due. Call on a short
   /// cadence while the ceremony is live; a no-op once confirmed or refused.
   tick() {
@@ -133,14 +162,38 @@ export class PakeCeremony {
       this._pendingConfirmMac = mac
       return
     }
+    this._rememberFps(fps)
     if (this.session.verifyPeerConfirm(fps.mine, fps.theirs, this.capsCanon, mac)) {
       // CONFIRMED. Derive the pinned secret from K (agreed, never transmitted).
       this.secret = this.session.secret()
       // Ours may not have gone out yet (the fingerprints arrived with theirs).
       this.tryConfirm()
-    } else {
-      this.aborted = 'key confirmation failed: wrong code or tampering (a server cannot forge this)'
+      return
     }
+    // The MAC did not verify against the CURRENT link. Before calling that a
+    // wrong code, ask whether the peer could have confirmed on a link this
+    // ceremony has since left: a confirmation is bound to the fingerprint pair
+    // of the link it was made on, so a link that was replaced mid-ceremony
+    // makes the peer's (perfectly valid) confirmation unverifiable here.
+    //
+    // A genuine wrong code fails against EVERY pair, because K itself
+    // differs. So: if the MAC verifies against a pair this ceremony used on an
+    // earlier link, the peer confirmed correctly and the link moved under us.
+    // Otherwise it is a wrong code, and it stays refused.
+    for (const old of this._fpsHistory) {
+      if (old.mine === fps.mine && old.theirs === fps.theirs) continue
+      if (this.session.verifyPeerConfirm(old.mine, old.theirs, this.capsCanon, mac)) {
+        // The link changed under us. The peer's confirmation is for the old
+        // link; the current one has to be confirmed on its own terms. Keep
+        // waiting for a confirmation made on the link we are on now, and
+        // re-send ours on it.
+        this.sentConfirm = false
+        this._pendingConfirmMac = mac
+        this._arm()
+        return
+      }
+    }
+    this.aborted = 'key confirmation failed: wrong code or tampering (a server cannot forge this)'
   }
 
   // Already confirmed, and the peer re-sent its confirmation: it has not heard
@@ -172,6 +225,7 @@ export class PakeCeremony {
   _confirmPayload() {
     const fps = this.getFingerprints()
     if (!fps) return null
+    this._rememberFps(fps)
     const mac = this.session.ourConfirm(fps.mine, fps.theirs, this.capsCanon)
     if (!mac) return null
     return { type: 'pake-confirm', v: 2, mac: b64(mac), msg: b64(this.msg), caps: this.caps, np: this.nameplate }
