@@ -1,11 +1,16 @@
 # Fleet auto-mesh: same-owner devices connect without pairwise pairing
 
-> Status: decided (2026-08-25). Amends `docs/design-mesh-network.md`, which
-> rejected a mesh control plane. This note records the one narrow exception the
-> owner accepted, why it does not reopen what that note closed, and the exact
-> mechanism.
+> Status: implementation history, partly superseded. For current commands,
+> defaults and security boundaries, read [Fleet usage and security](fleet.md).
+> The #609 stage below was superseded in part by #616; both landed before 0.9.2.
+> Do not read this chronological record as one consistent current specification.
 
-## 0.9.2: what ships, measured against 0.9.1 (2026-10-28)
+## Historical #609 stage: measured against 0.9.1 (2026-10-28)
+
+**Superseded in part by #616 below:** grant-only sibling transfer and deferred
+grant distribution describe this intermediate stage, not released 0.9.2 policy.
+The final kind is `FleetSibling`, with inbox transfer by default; owner-signed
+target-specific grant sets are implemented.
 
 The owner's scope for 0.9.2, and how the tree meets it. Read this before the
 historical sections below; several of them describe work that went further than
@@ -63,7 +68,7 @@ tree from the filament era are named honestly: the `FleetDevice` principal kind
 `fleet-policy` relay of owner-signed cap ops (unchanged; an owner-signed grant
 already counted as an explicit grant on every fleet device in 0.9.1).
 
-## 0.9.2 fleet trust: the two deferred decisions, decided (2026-10-28)
+## Implemented #616: final 0.9.2 fleet trust (2026-10-28)
 
 Stacked on the auto-mesh change above. The owner decided both items that
 section left out.
@@ -178,7 +183,15 @@ action, whatever the network delivers, and shell is never allowed unless it is
 `all` (filtered at use, so narrowing applies to a set already held); no trap
 states. Ten mutants, each must fail. Live: `cli/tests/fleet-trust-gates.sh`.
 
-## Problem
+## Historical design and investigations (2026-08 onward)
+
+Everything below preserves the original investigation, not current operating
+instructions. In particular, rendezvous rotation was never implemented; the
+empty-ceiling/FleetDevice stages, old grant relay and unfinished sibling-send
+tables were superseded. Current removal uses signed-roster admission and link
+closure, not rendezvous rotation. See [the maintained guide](fleet.md).
+
+### Original problem
 
 Install plus pair does not give a mesh. A pairing mints one shared secret and
 the signaling channel is `sha256("filament-pair:" || secret)`
