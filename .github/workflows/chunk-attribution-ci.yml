@@ -36,11 +36,21 @@ jobs:
           set -o pipefail
           cargo test -p tunlion-peerloop --lib conn::warm_identity_tests::replay_precedes_real_departure_paths_and_fences_replacement -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-departure.log"
           grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-departure.log"
+      - name: Replay overflow closes the adopted link and fails closed
+        run: |
+          set -o pipefail
+          cargo test -p tunlion-peerloop --lib conn::warm_identity_tests::a_replay_overflow_closes_the_adopted_link_not_the_standby -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-overflow.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-overflow.log"
       - name: Selected link chunk fencing and CLI compilation
         run: |
           set -o pipefail
           cargo test -p tunlion --bin tunlion l2::h1_tests::the_selected_pump_reads_only_the_selected_transports_source -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-selected.log"
           grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-selected.log"
+      - name: Sync reads an ack record across tagged chunks only
+        run: |
+          set -o pipefail
+          cargo test -p tunlion --bin tunlion sync_cmd::tests::next_json_reads_an_ack_record_across_tagged_chunks -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-sync-record.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-sync-record.log"
       - name: Install isolated signaling backend dependencies
         run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
       - name: Real temporary pairing and byte-exact service echo

@@ -740,11 +740,15 @@ mod tests {
     }
 
     /// The plan and file acks come back as length-prefixed JSON records on the
-    /// stream, carried in untagged chunks (the shape the real readers emit),
-    /// here split across two frames. A stale-source `l2-close` between them
-    /// must not end the read; the record must be reassembled whole.
+    /// stream, carried in chunks, here split across two frames. A stale-source
+    /// `l2-close` between them must not end the read, and a stale-source chunk
+    /// must not reach the stream; the record must be reassembled whole.
+    ///
+    /// The chunks are tagged with the selected source, the shape the readers
+    /// now emit: an untagged chunk is refused by the source gate, because a
+    /// chunk without a source cannot be attributed to this link.
     #[tokio::test]
-    async fn next_json_reads_an_ack_record_across_untagged_chunks() {
+    async fn next_json_reads_an_ack_record_across_tagged_chunks() {
         let selected = crate::net::SourceId::next();
         let stale = crate::net::SourceId::next();
         let mux = l2::Mux::new(
@@ -758,13 +762,27 @@ mod tests {
         let mut rec = (body.len() as u32).to_be_bytes().to_vec();
         rec.extend_from_slice(&body);
         let (head, tail) = rec.split_at(7);
-        tx.send(Ev::Chunk("boxb".into(), sid, None, Bytes::copy_from_slice(head))).unwrap();
+        // A stale source's chunk for our sid must not reach the stream.
+        tx.send(sourced(
+            stale,
+            Ev::Chunk("boxb".into(), sid, None, Bytes::from_static(b"stale")),
+        ))
+        .unwrap();
+        tx.send(sourced(
+            selected,
+            Ev::Chunk("boxb".into(), sid, None, Bytes::copy_from_slice(head)),
+        ))
+        .unwrap();
         tx.send(sourced(
             stale,
             Ev::Control("boxb".into(), json!({"type": "l2-close", "sid": sid, "err": "stale close"})),
         ))
         .unwrap();
-        tx.send(Ev::Chunk("boxb".into(), sid, None, Bytes::copy_from_slice(tail))).unwrap();
+        tx.send(sourced(
+            selected,
+            Ev::Chunk("boxb".into(), sid, None, Bytes::copy_from_slice(tail)),
+        ))
+        .unwrap();
         let mut recs = Records(Vec::new());
         let v = next_json(&mut pipe, Some(&mut rx), &mux, sid, &mut recs, Duration::from_secs(5))
             .await

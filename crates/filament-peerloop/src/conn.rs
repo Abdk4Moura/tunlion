@@ -3858,9 +3858,17 @@ impl Conn {
                         // events. Swap this arrival behind the oldest buffered
                         // event, so the consumer sees source order, not queue order.
                         let total: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.bytes).sum();
-                        let pending = self.replaying_sources.get_mut(&source).unwrap();
+                        let Some(pending) = self.replaying_sources.get_mut(&source) else { return None; };
                         if pending.pid != pid { return None; }
-                        let older = pending.events.pop_front().unwrap();
+                        // The token invariant says one buffered event per token.
+                        // If it does not hold, fail closed: drop the replay and
+                        // close the transport rather than panic in the daemon's
+                        // event loop.
+                        let Some(older) = pending.events.pop_front() else {
+                            self.replaying_sources.remove(&source);
+                            if let Some(t) = self.transport_of(&pid) { t.force_close(); }
+                            return None;
+                        };
                         let bytes = pending.bytes.saturating_sub(ev_weight(&older))
                             .saturating_add(ev_weight(&inner));
                         let total_after = total.saturating_sub(pending.bytes).saturating_add(bytes);
@@ -13506,6 +13514,37 @@ mod warm_identity_tests {
         conn.links.insert(pid.into(), delegated_link(pid, newer));
         assert!(!conn.on_peer_left(&deferred));
         assert!(conn.links.contains_key(pid), "staged departure dropped a newer link");
+    }
+
+    /// The replay swap path closes the CURRENT, already adopted transport when
+    /// the replay would exceed the event budget. That is a behaviour change on
+    /// a live link, so it is pinned here rather than left implicit: the
+    /// standby's replay is dropped, the adopted link's transport is closed,
+    /// and the daemon keeps running.
+    #[tokio::test]
+    async fn a_replay_overflow_closes_the_adopted_link_not_the_standby() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "replay-overflow";
+        let adopted = Rec::new("adopted", &log);
+        let source = adopted.source_id().unwrap();
+        conn.links.insert(pid.into(), delegated_link(pid, adopted));
+        // A replay already in flight for this source, with one buffered event.
+        conn.replaying_sources.insert(source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"old"))]), bytes: 3,
+        });
+        // A new event over the budget: the swap overflows and must close the
+        // adopted transport.
+        let big = vec![0u8; MAX_BUILD_EVENT_BYTES];
+        let ev = Ev::Sourced {
+            pid: pid.into(),
+            source,
+            inner: Box::new(Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from(big))),
+        };
+        assert!(conn.stage_event(ev).is_none(), "the overflowing event must not be dispatched");
+        assert!(!conn.replaying_sources.contains_key(&source), "the replay entry must be dropped");
+        assert!(conn.links.contains_key(pid), "the daemon must survive the overflow");
     }
 
     /// A registered standby source buffers until adoption, replays with its tag,
