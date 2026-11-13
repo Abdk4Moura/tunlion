@@ -2,7 +2,7 @@
 // Pins which incoming offers the browser asks the shared policy about, and that
 // the policy's answer is the only thing that accepts one. The policy itself is
 // Rust; the real wasm is driven by frontend/tests/policy-wire.spec.cjs.
-import { shouldAutoAccept, offersCoveredNow } from '../accept.js'
+import { shouldAutoAccept, offersCoveredNow, acceptIfCurrent } from '../accept.js'
 import { readFileSync } from 'node:fs'
 
 let ok = true
@@ -58,11 +58,62 @@ const hook = readFileSync(new URL('../../../lib/useTunlion.js', import.meta.url)
 const webrtc = readFileSync(new URL('../../../lib/webrtc.js', import.meta.url), 'utf8')
 const acceptSrc = readFileSync(new URL('../accept.js', import.meta.url), 'utf8')
 const eph = hook.slice(hook.indexOf('if (pendingPakeRef.current?.ephemeral)'), hook.indexOf("tel('pake-transfer-authed'"))
-eq('receive by code re-checks early offers', /acceptCoveredByPolicy\([\s\S]{0,160}byCode: true/.test(eph), true)
-eq('pair-proof re-checks early offers', /acceptCoveredByPolicy\([\s\S]{0,160}proven: true/.test(hook), true)
+eq('receive by code re-checks early offers', /acceptCoveredByPolicy\(/.test(eph), true)
+eq('pair-proof re-checks early offers', /proof-ok[\s\S]{0,400}acceptCoveredByPolicy\(/.test(hook), true)
 eq('the code ceremony marks the link code-authed, not verified', /_codeAuthed = true/.test(eph) && !/_verified/.test(hook), true)
 eq('the state ping reports only the pair proof', /trusted: !!this\._proven/.test(webrtc), true)
 eq('accept.js keeps no local trust boolean', /provenKnown|byCode \|\|/.test(acceptSrc), false)
+
+// Suspend the policy result at the actual async boundary, then forget or
+// revoke before it returns. A stale allow must never reach acceptTransfer.
+for (const mutation of ['forget', 'deny', 'replace', 'close', 'decline']) {
+  let finish
+  const paused = () => new Promise((resolve) => { finish = resolve })
+  const entry = { id: 'race', ...offer }
+  let accepted = 0
+  const link = { transfers: new Map([['race', entry]]), _closed: false,
+    acceptTransfer() { accepted++ } }
+  let current = { facts: { ...proven }, recordId: 'peer', secret: 'old' }
+  const pending = acceptIfCurrent(link, 'race', () => current, { admit: paused })
+  // admitTransfer invokes its injected core synchronously before yielding.
+  if (mutation === 'forget') current = null
+  if (mutation === 'deny') current = { ...current, facts: { ...current.facts, denied: true } }
+  if (mutation === 'replace') current = { ...current, secret: 'new' }
+  if (mutation === 'close') link._closed = true
+  if (mutation === 'decline') link.transfers.delete('race')
+  finish(JSON.stringify({ allowed: true, deny: null }))
+  eq(`${mutation} during pending policy cannot auto-accept`, await pending, false)
+  eq(`${mutation} never calls acceptTransfer`, accepted, 0)
+}
+
+// The policy clock is part of the decision, not a cosmetic snapshot field.
+// A pre-expiry allow arriving after expiry must be re-evaluated and denied;
+// a rollover that does not cross an expiry must still make progress.
+for (const expiresAt of [1001, 2000]) {
+  let finish
+  let calls = 0
+  let now = 1000
+  let accepted = 0
+  const entry = { id: 'clock', ...offer }
+  const link = { transfers: new Map([['clock', entry]]), _closed: false,
+    acceptTransfer() { accepted++ } }
+  const admitClock = (json) => {
+    const input = JSON.parse(json)
+    calls++
+    const allowed = input.certExpires == null || input.now < input.certExpires
+    const result = JSON.stringify({ allowed, deny: allowed ? null : { kind: 'expired', at: input.certExpires } })
+    if (calls === 1) return new Promise((resolve) => { finish = () => resolve(result) })
+    return Promise.resolve(result)
+  }
+  const snapshot = () => ({ facts: { ...proven, now, expiresAt }, recordId: 'peer', secret: 'old' })
+  const pending = acceptIfCurrent(link, 'clock', snapshot, { admit: admitClock })
+  now = 1001
+  finish()
+  const allowed = await pending
+  eq(`rollover at expiry ${expiresAt} returns the current decision`, allowed, expiresAt > now)
+  eq(`rollover at expiry ${expiresAt} applies only a current allow`, accepted, expiresAt > now ? 1 : 0)
+  eq(`rollover at expiry ${expiresAt} re-evaluates policy`, calls, 2)
+}
 
 if (!ok) { console.log('FAIL'); process.exit(1) }
 console.log('PASS')

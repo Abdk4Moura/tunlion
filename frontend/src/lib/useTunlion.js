@@ -21,7 +21,7 @@ import { loadDeviceName, saveDeviceName, loadOwnerToken, tabUid, currentGenerati
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
 // APPLICATION/resilience-manager — pure recovery decisions (Phase 2).
 import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink, linkIsLive, reconcileDigest } from '../net/app/recovery.js'
-import { shouldAutoAccept, offersCoveredNow } from '../net/app/accept.js'
+import { shouldAutoAccept, acceptIfCurrent } from '../net/app/accept.js'
 import { linkPolicyFacts } from '../net/app/policyFacts.js'
 import { codeStatusAfterTransfer } from '../net/app/codeStatus.js'
 import { localHelperEnabled } from '../net/app/localHelper.js'
@@ -61,14 +61,10 @@ function beaconSessionClose(gen, token) {
 // Re-check the offers a fresh proof or code ceremony now covers, through the
 // shared policy, and accept only the ids it allows. The offer may arrive before
 // the proof/ceremony finishes, so this runs in both directions.
-async function acceptCoveredByPolicy(link, facts) {
+async function acceptCoveredByPolicy(link, snapshot) {
   if (!link) return
   try {
-    const ids = await offersCoveredNow(link.transfers.values(), facts)
-    for (const tid of ids) {
-      const t = link.transfers.get(tid)
-      if (t && t.status === 'offered' && !link._closed) link.acceptTransfer(tid)
-    }
+    for (const tid of link.transfers.keys()) await acceptIfCurrent(link, tid, snapshot)
   } catch {
     // A policy failure accepts nothing; the offers wait for a click.
   }
@@ -412,6 +408,21 @@ export function useTunlion() {
     })
   }, [])
 
+  // Re-read the proof and record immediately before applying a policy result.
+  const currentPolicySnapshot = (id, link, transfer) => {
+    if (linksRef.current.get(id) !== link) return null
+    const recordId = provenRef.current.get(id) || null
+    const record = recordId ? devicesLoad().find((d) => d.id === recordId) : null
+    return {
+      facts: linkPolicyFacts({
+        transfer, byCode: !!link._codeAuthed, proven: !!link._proven && !!record,
+        caps: record ? deviceCaps(recordId) : null, now: Math.floor(Date.now() / 1000),
+      }),
+      recordId,
+      secret: record?.secret || null,
+    }
+  }
+
   // ---- create a PeerLink for one remote peer -------------------------------
   const makeLink = useCallback(
     ({ id, name, uid, relayOnly }) => {
@@ -457,6 +468,10 @@ export function useTunlion() {
         polite = true
       }
       addPeer({ id, name, uid: uid || null, color: colorFor(id), status: 'connecting', route: null, lastSeen: 'now' })
+      // Read fresh trust and record facts on both sides of the asynchronous
+      // policy call. The record secret identifies the proved relationship; a
+      // replacement with the same visible caps must not inherit the proof.
+      const policySnapshot = (transfer) => currentPolicySnapshot(id, link, transfer)
       const link = new PeerLink({
         id,
         name,
@@ -478,22 +493,7 @@ export function useTunlion() {
           // shared core's. The browser supplies only facts it holds; the core
           // can still deny (cap ceiling, missing consent, explicit deny).
           if (t.direction !== 'receive' || t.status !== 'offered') return
-          const recordId = provenRef.current.get(id) || expectedSecretRef.current.get(id)?.id || null
-          const facts = linkPolicyFacts({
-            transfer: t,
-            byCode: !!link._codeAuthed,
-            proven: !!link._proven,
-            caps: recordId ? deviceCaps(recordId) : null,
-            now: Math.floor(Date.now() / 1000),
-          })
-          shouldAutoAccept(facts)
-            .then((accept) => {
-              // Re-read the live transfer: a user may have declined while the
-              // core was deciding. Only an offer still awaiting a decision moves.
-              const live = link.transfers.get(t.id)
-              if (accept && live && live.status === 'offered' && !link._closed) link.acceptTransfer(t.id)
-            })
-            .catch(() => {}) // a policy failure leaves the offer waiting for a click
+          void acceptIfCurrent(link, t.id, policySnapshot).catch(() => {})
         },
         onRoute: (route) => updatePeer(id, { route }),
         // web-shell: the peer announced whether it offers a terminal, surfaces
@@ -574,13 +574,7 @@ export function useTunlion() {
                 link.sendPairProofAck(true)
                 // The proof is checked asynchronously and a sender's offer can
                 // land first: accept the offers this proof now covers.
-                await acceptCoveredByPolicy(link, {
-                  proven: true,
-                  relationship: 'remembered',
-                  caps: deviceCaps(d.id),
-                  consent: true,
-                  now: Math.floor(Date.now() / 1000),
-                })
+                await acceptCoveredByPolicy(link, policySnapshot)
                 return
               }
             } catch {}
@@ -1077,7 +1071,13 @@ export function useTunlion() {
 
   const acceptTransfer = useCallback((transferId) => {
     const peerId = transferOwner.current.get(transferId)
-    linksRef.current.get(peerId)?.acceptTransfer(transferId)
+    const link = linksRef.current.get(peerId)
+    if (!link) return
+    const recordId = provenRef.current.get(peerId)
+    const record = link._proven && recordId && devicesLoad().find((d) => d.id === recordId)
+    // Explicit consent can accept a fresh transfer from anyone, but may only
+    // reuse old bytes when the current link proves the same remembered record.
+    link.acceptTransfer(transferId, record ? { id: record.id, secret: record.secret } : null)
   }, [])
 
   const declineTransfer = useCallback((transferId) => {
@@ -1162,11 +1162,7 @@ export function useTunlion() {
           // The sender may have offered before this ceremony finished on our
           // side: accept what the code now covers instead of leaving it waiting.
           if (link) {
-            void acceptCoveredByPolicy(link, {
-              byCode: true,
-              consent: true,
-              now: Math.floor(Date.now() / 1000),
-            })
+            void acceptCoveredByPolicy(link, (transfer) => currentPolicySnapshot(peerId, link, transfer))
           }
         }
         tel('pake-transfer-authed', { peer: String(peerId).slice(-6) })

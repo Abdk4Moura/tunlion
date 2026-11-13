@@ -38,7 +38,6 @@ import {
   declineMsg,
   endMsg,
   deliveryAckMsg,
-  decideOnOffer,
   decideAfterVerify,
   decideAckFallback,
   sendsToResume,
@@ -916,20 +915,10 @@ export class PeerLink {
         // P4: stash the offered whole-file digest on the transfer so accept can
         // copy it onto the partial; verified at file-end.
         t._full = msg.full || null
-        // Resume: if we already hold partial bytes for this transfer (the link
-        // dropped mid-receive), accept automatically from where we left off,
-        // the user already said yes once.
-        const partial = msg.resume && this.stores.partials.get(msg.id)
-        if (decideOnOffer({ resume: msg.resume, hasPartial: !!partial }).action === 'auto-accept') {
-          // P4: a re-offer may carry the digest the first offer did (or update
-          // it); keep the partial verifiable across a resume.
-          if (msg.full) partial.full = msg.full
-          this._incomingBySid.set(msg.sid, msg.id)
-          this._update(t, { status: 'transferring', progress: t.size ? partial.received / t.size : 0 })
-          this._control(acceptMsg(msg.id, partial.received))
-        } else {
-          this.onTransfer(t)
-        }
+        // A transfer id is not an identity or permission. Re-offers go through
+        // the same live admission and explicit-consent path as fresh offers.
+        t._resume = msg.resume === true
+        this.onTransfer(t)
         break
       }
       case CTRL.ACCEPT:
@@ -1143,14 +1132,22 @@ export class PeerLink {
     })
   }
 
-  // Receiver accepts an offered incoming transfer (fresh, from byte 0).
-  acceptTransfer(id) {
+  // Receiver accepts an offer after current policy or explicit human consent.
+  // A partial can only be reused for the same proved remembered relationship
+  // and the same verified whole-file digest and size. An anonymous/code-only
+  // offer, different record or unbound legacy partial starts from byte zero.
+  acceptTransfer(id, owner = null) {
     const t = this.transfers.get(id)
-    if (!t || t.direction !== 'receive') return
-    this.stores.partials.set(id, { received: 0, buffers: [], size: t.size, mime: t.mime, name: t.name, full: t._full || null })
+    if (!t || t.direction !== 'receive' || t.status !== 'offered') return
+    const prior = t._resume && this.stores.partials.get(id)
+    const reuse = !!(prior && owner && prior.owner && owner.id === prior.owner.id
+      && owner.secret === prior.owner.secret && t._full && prior.full === t._full
+      && prior.size === t.size)
+    const partial = reuse ? prior : { received: 0, buffers: [], size: t.size, mime: t.mime, name: t.name, full: t._full || null, owner }
+    this.stores.partials.set(id, partial)
     this._incomingBySid.set(t._sid, id)
-    this._update(t, { status: 'transferring' })
-    this._control(acceptMsg(id, 0))
+    this._update(t, { status: 'transferring', progress: t.size ? partial.received / t.size : 0 })
+    this._control(acceptMsg(id, partial.received))
   }
 
   declineTransfer(id) {
