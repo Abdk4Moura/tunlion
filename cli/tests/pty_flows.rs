@@ -603,7 +603,11 @@ fn temporary_access_long_folder_keeps_mode_and_count_visible() {
     assert!(!screen.contains("tunlion-pty-access-long-folder"), "stale heading: {screen}");
     let at = t.text().len();
     t.send("4"); // Done after two folders and Add another folder.
-    assert!(t.wait_for_from(at, "Folders  · (read & write) +1", 20), "{}", tail(&t.text()));
+    // The first folder was set to read & write, the second is still
+    // read-only, so the summary names the MIXED set and says that write
+    // access is in it. The point of this test is that the permission and the
+    // count stay visible before the path is clipped.
+    assert!(t.wait_for_from(at, "Folders  · mixed: write +1", 20), "{}", tail(&t.text()));
     assert!(t.text()[at..].contains('…'), "long path was not clipped:\n{}", tail(&t.text()));
     t.send("\x1b");
 }

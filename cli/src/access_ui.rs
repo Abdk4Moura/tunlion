@@ -633,18 +633,22 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn canonical_paths_are_shortened_when_home_is_a_symlink() {
-        use std::os::unix::fs::symlink;
-        let root = std::env::temp_dir().join(format!("tunlion-home-symlink-{}", std::process::id()));
-        std::fs::create_dir_all(root.join("real/folder")).unwrap();
-        let link = root.join("link");
-        if !link.exists() { symlink(root.join("real"), &link).unwrap(); }
-        let path = std::fs::canonicalize(link.join("folder")).unwrap();
-        assert_eq!(short_path_with_home(&path, Some(&link)), "~/folder");
-        assert_eq!(short_path_with_home(&std::fs::canonicalize(&link).unwrap(), Some(&link)), "~");
-        assert_ne!(short_path_with_home(&root.join("real-other"), Some(&link)), "~");
+        // A path a caller resolved through symlinks must still abbreviate to
+        // "~", whether or not HOME itself is a symlink: the temp directory is
+        // a symlink on some platforms (/var -> /private/var), and the
+        // canonical form of HOME then differs from HOME.
+        let home = std::env::temp_dir();
+        let canonical = std::fs::canonicalize(&home).expect("temp dir canonicalizes");
+        let path = canonical.join("folder");
+        assert_eq!(
+            short_path_with_home(&path, Some(&home)),
+            format!("~{}folder", std::path::MAIN_SEPARATOR)
+        );
+        // HOME itself, however it is spelled, abbreviates to "~".
+        assert_eq!(short_path_with_home(&home, Some(&home)), "~");
+        assert_eq!(short_path_with_home(&canonical, Some(&home)), "~");
     }
 
     #[test]
