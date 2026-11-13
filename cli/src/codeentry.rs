@@ -289,13 +289,14 @@ fn level_color(level: Level) -> String {
 /// terminals. A single line cleared with CR + erase-line (`\r\x1b[2K`) redraws
 /// consistently on every terminal.
 fn render(prompt: &str, buf: &str, j: &Judgment) {
+    use unicode_width::UnicodeWidthStr;
     let mut err = std::io::stderr();
     let reset = ui::tone_reset();
     let color = level_color(j.level);
     // ONE terminal row, always: a steer longer than what is left of the row
     // wrapped, and `\r\x1b[2K` then cleared only the last row, so every
     // keystroke left a stale line behind. Fit steer and preview to the width.
-    let used = prompt.chars().count() + buf.chars().count() + 3;
+    let used = prompt.width() + buf.width() + 3;
     let room = term_width().saturating_sub(used + 1);
     let (steer, preview_text) = fit_steer(&j.steer, j.preview.as_deref(), room);
     let preview = match preview_text {
@@ -307,7 +308,7 @@ fn render(prompt: &str, buf: &str, j: &Judgment) {
     let _ = write!(err, "\r\x1b[2K{prompt}{buf}   {color}{steer}{reset}{preview}");
     // Put the caret back right after the typed buffer (browser-like), so typing
     // continues at the end of the code rather than after the steer text.
-    let col = prompt.chars().count() + buf.chars().count();
+    let col = prompt.width() + buf.width();
     let _ = write!(err, "\r");
     if col > 0 {
         let _ = write!(err, "\x1b[{col}C");
@@ -319,9 +320,10 @@ fn render(prompt: &str, buf: &str, j: &Judgment) {
 /// columns: the preview goes first, then the steer is clipped with an
 /// ellipsis. Pure.
 pub(crate) fn fit_steer(steer: &str, preview: Option<&str>, room: usize) -> (String, Option<String>) {
-    let s_len = steer.chars().count();
+    use unicode_width::UnicodeWidthStr;
+    let s_len = steer.width();
     if let Some(p) = preview {
-        if s_len + 2 + p.chars().count() <= room {
+        if s_len + 2 + p.width() <= room {
             return (steer.to_string(), Some(p.to_string()));
         }
     }
@@ -1165,7 +1167,7 @@ mod viewport_tests {
 
 #[cfg(test)]
 mod fit_tests {
-    use super::fit;
+    use super::{fit, fit_steer};
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -1176,5 +1178,11 @@ mod fit_tests {
         }
         assert_eq!(fit("abcdef", 1), "…");
         assert_eq!(fit("abc", 3), "abc");
+    }
+
+    #[test]
+    fn steer_preview_budget_uses_terminal_cells() {
+        assert_eq!(fit_steer("資料", Some("好"), 7), ("資料".into(), None));
+        assert_eq!(fit_steer("資料", Some("好"), 8), ("資料".into(), Some("好".into())));
     }
 }

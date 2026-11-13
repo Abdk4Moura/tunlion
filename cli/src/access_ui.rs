@@ -386,8 +386,8 @@ fn composer_rows(draft: &Draft, finish: &str) -> Vec<String> {
         [one] => format!("({}) {}", mode_label(&one.mode), short_path(&one.path)),
         [first, rest @ ..] => {
             let mixed = rest.iter().any(|folder| folder.mode != first.mode);
-            let mode = if mixed { &FolderMode::ReadWrite } else { &first.mode };
-            format!("({}) +{}{} {}", mode_label(mode), rest.len(), if mixed { " mixed" } else { "" }, short_path(&first.path))
+            let summary = if mixed { "mixed: write".to_string() } else { format!("({})", mode_label(&first.mode)) };
+            format!("{summary} +{} {}", rest.len(), short_path(&first.path))
         }
     };
     let services = if draft.spec.services.is_empty() {
@@ -621,7 +621,7 @@ mod tests {
         draft.spec.folders.push(FolderAccess { id: "second".into(), path, mode: FolderMode::ReadOnly });
         let row = &composer_rows(&draft, "Create code")[0];
         let clipped = crate::codeentry::fit(row, 32);
-        assert!(clipped.contains("(read & write) +1"), "{clipped}");
+        assert!(clipped.contains("mixed: write +1"), "{clipped}");
         assert!(clipped.ends_with('…'), "{clipped}");
     }
 
@@ -654,8 +654,11 @@ mod tests {
             draft.spec.folders.push(FolderAccess { id: id.into(), path: format!("/{id}").into(), mode });
         }
         for _ in 0..2 {
-            let row = crate::codeentry::fit(&composer_rows(&draft, "Done")[0], 38);
-            assert!(row.contains("(read & write) +1 mixed"), "{row}");
+            let full = composer_rows(&draft, "Done");
+            assert!(full[0].contains("mixed: write +1 /"), "{}", full[0]);
+            // The picker reserves eight columns, leaving 24 at a 32-column terminal.
+            let row = crate::codeentry::fit(&full[0], 24);
+            assert!(row.contains("mixed: write"), "{row}");
             draft.spec.folders.reverse();
         }
         draft.spec.folders[1].mode = FolderMode::ReadWrite;
