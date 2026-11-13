@@ -322,12 +322,12 @@ impl RecvIdentity for CliRecv {
     }
     async fn resend_identity_challenge(
         &self,
-        conn: &Conn,
+        t: &Arc<dyn Transport>,
         pid: &str,
         identity_nonces: &HashMap<String, ([u8; 32], Instant, [u8; 32])>,
     ) -> bool {
         self.identity()
-            .resend_identity_challenge(conn, pid, identity_nonces)
+            .resend_identity_challenge(t, pid, identity_nonces)
             .await
     }
     fn device_name_for_pub(&self, device_pub: &[u8; 32]) -> Option<String> {
@@ -820,7 +820,11 @@ impl RecvDaemon for CliRecv {
         // link. Never the display/roster name: a pong may only wake the probe
         // for the peer that link actually reaches.
         let peer = conn.link_peer_name(pid);
-        self.liveness.answered(peer.as_deref(), pid, v);
+        let answered = self.liveness.answered(peer.as_deref(), pid, v);
+        self.log.debug(&format!(
+            "reach-pong receive pid={pid} peer={peer:?} matched={answered} outstanding={}",
+            self.liveness.outstanding(),
+        ));
     }
     fn peer_present(&self, alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool {
         crate::link_manager::peer_present(alive, direct, heard_ms, idle_ms)

@@ -13,6 +13,51 @@ release build failed and nothing was published under it.
 
 ## [Unreleased]
 
+- Browser transfer admission through the shared policy core is prepared in
+  #675/#677 and is not part of 0.9.4. The browser remains pairwise-only.
+- Invitations through one shared core policy are prepared in #662 and are not
+  part of 0.9.4. The existing CLI invitation policy is unchanged.
+
+## [0.9.4] - 2026-11-13
+
+### Added
+
+- Running commands, terminals and SSH on your other devices now goes through
+  one shared access decision, so the command line and the background service
+  agree on who may do what.
+- Android app: the phone loads the shared core directly for its identity and
+  for sending and receiving with a code. Showing each device's access and
+  removing devices from the phone arrive with the device lifecycle update.
+
+### Changed
+
+- A transfer code works for one receiver only: the one that completed the
+  code exchange. Another device that connects afterwards cannot take over the
+  transfer, even from the same install. To send again, start a new send and
+  use its new code.
+- `tunlion revoke <device> shell` now also ends that device's SSH session if
+  one is already open, not just new ones. Terminals and remote commands
+  already stopped when their permission was withdrawn.
+- `tunlion up --shell` lets devices you paired with directly run commands,
+  once their pairing is verified, including devices paired without a
+  certificate. It does not let in other devices in your fleet, devices you
+  never paired, a device whose shell access you denied or whose certificate
+  you revoked, or a device whose identity has not been confirmed. On Linux
+  and macOS it still needs `--i-know` or `--shell-user`.
+
+### Fixed
+
+- A transfer to a device that had just reconnected no longer fails after a
+  20 second wait for its identity.
+- A direct connection offer that arrived before the connection was ready is
+  no longer lost.
+- When terminal access is withdrawn, the open terminal now closes with an
+  error that says access was revoked, and the device can still receive files.
+- `--remember` is no longer lost when the connection switches to a direct path
+  in the middle of pairing.
+- A file whose delivery confirmation was lost is confirmed again instead of
+  being stored a second time.
+
 ## [0.9.3] - 2026-10-30
 
 ### Added

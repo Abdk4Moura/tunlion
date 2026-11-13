@@ -10,7 +10,7 @@
 
 use crate::conn::Link;
 use crate::host::HostServices;
-use filament_cap::capability::{BindingStrength, PrincipalKind};
+use filament_cap::capability::{BindingStrength, IdentityState, PrincipalKind};
 
 /// Populate link identity from the peer's stored device cert, if the
 /// link already has a proof-verified name but identity pubkeys are absent.
@@ -35,6 +35,7 @@ pub fn resolve_peer_identity(link: &mut Link) {
     // function (symmetric-secret proof + name->cert lookup) sets Inferred.
     // An Inferred MAY later be upgraded to Proven by identity-expose.
     if link.identity_device_pub.is_some() || link.identity_user_pub.is_some() {
+        link.identity_state = IdentityState::Resolved;
         return; // already resolved (any binding, Proven or Inferred, stays)
     }
     let name = match &link.verified_name {
@@ -59,12 +60,14 @@ pub fn resolve_peer_identity(link: &mut Link) {
             link.identity_device_pub = Some(cert.device_pub);
             link.identity_user_pub = Some(cert.user_pub);
             link.identity_cert_expires = Some(cert.expires);
+            link.identity_state = IdentityState::Resolved;
         }
         return;
     }
     link.identity_device_pub = Some(cert.device_pub);
     link.identity_user_pub = Some(cert.user_pub);
     link.identity_binding = BindingStrength::Inferred;
+    link.identity_state = IdentityState::Resolved;
     let principal = host.persisted_principal_for_cert(&cert);
     let deadline = host.principal_deadline(
         cert.expires,
