@@ -396,6 +396,8 @@ pub enum Ev {
     DirectWorkersReady(String, Vec<Arc<dyn Transport>>, SourceId),
     /// Loop-owned token to drain one buffered event after source adoption.
     ReplaySource(SourceId),
+    /// Loop-owned, source-bound room departure deferred behind replay.
+    ReplayDeparture(String, SourceId, Value),
     Control(String, Value),
     /// A transport-origin event with immutable provenance. `pid` must match the
     /// inner Control/PcState/ChannelReady/Chunk pid; nested Sourced is invalid. The

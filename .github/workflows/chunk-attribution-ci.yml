@@ -31,6 +31,11 @@ jobs:
           set -o pipefail
           cargo test -p tunlion-peerloop --lib conn::warm_identity_tests::buffered_standby_chunks_cannot_be_overtaken_at_adoption -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-order.log"
           grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-order.log"
+      - name: Departure waits for replay and cannot drop replacement
+        run: |
+          set -o pipefail
+          cargo test -p tunlion-peerloop --lib conn::warm_identity_tests::replay_precedes_real_departure_paths_and_fences_replacement -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-departure.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-departure.log"
       - name: Selected link chunk fencing and CLI compilation
         run: |
           set -o pipefail

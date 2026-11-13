@@ -1733,7 +1733,8 @@ pub struct Conn {
     /// Source-bound standby/upgrade events awaiting adoption. Bounded per source
     /// and in total; overflow closes the standby instead of growing forever.
     pub pending_sources: HashMap<net::SourceId, PendingSource>,
-    replaying_sources: HashMap<net::SourceId, PendingSource>,
+    pub replaying_sources: HashMap<net::SourceId, PendingSource>,
+    pub replay_departures: HashMap<String, (net::SourceId, bool)>,
     /// Roster sids absent from consecutive channel/room digests, for the
     /// two-tick hysteresis in `prune_roster_absent`.
     pub roster_absent: HashMap<String, u8>,
@@ -1972,6 +1973,7 @@ impl Conn {
             link_events: HashMap::new(),
             pending_sources: HashMap::new(),
             replaying_sources: HashMap::new(),
+            replay_departures: HashMap::new(),
             roster_absent: HashMap::new(),
             log,
             host,
@@ -2582,6 +2584,9 @@ impl Conn {
     #[track_caller]
     pub fn drop_link(&mut self, pid: &str) {
         self.replaying_sources.retain(|_, pending| pending.pid != pid);
+        if self.replay_departures.get(pid).is_some_and(|(_, ready)| !ready) {
+            self.replay_departures.remove(pid);
+        }
         // A drop is an invalidation: a candidate still building for this peer
         // must not publish after the link it was replacing is gone.
         self.cancel_build(pid);
@@ -3770,6 +3775,21 @@ impl Conn {
     /// handlers that defer/requeue the event).
     pub fn stage_event(&mut self, ev: Ev) -> Option<(Ev, Option<net::SourceId>)> {
         match ev {
+            Ev::ReplayDeparture(pid, source, payload) => {
+                if self.replay_departures.get(&pid) != Some(&(source, false)) {
+                    return None;
+                }
+                if self.links.get(&pid).map(|link| link.source) != Some(source) {
+                    self.replay_departures.remove(&pid);
+                    return None;
+                }
+                if self.replaying_sources.contains_key(&source) {
+                    let _ = self.tx.send(Ev::ReplayDeparture(pid, source, payload));
+                    return None;
+                }
+                self.replay_departures.insert(pid, (source, true));
+                return Some((Ev::PeerLeft(payload), Some(source)));
+            }
             Ev::ReplaySource(source) => {
                 let pending = self.replaying_sources.get_mut(&source)?;
                 let pid = pending.pid.clone();
@@ -3800,6 +3820,10 @@ impl Conn {
                     // newer authority and must survive; a stale barrier only
                     // self-rejects (and never marks anything).
                     if !self.source_current(&pid, source, inner.as_ref()) {
+                        return None;
+                    }
+                    if self.replaying_sources.contains_key(&source) {
+                        let _ = self.tx.send(Ev::Sourced { pid, source, inner });
                         return None;
                     }
                     match self.link_events.get_mut(&pid) {
@@ -8001,11 +8025,27 @@ impl Conn {
         // and finalizer below. Ordinary ready/pending behaviour is unchanged.
         let forced = v["__fil_force_drop"].as_bool() == Some(true);
         if forced {
+            self.replay_departures.remove(pid_val);
             if let Some(events) = self.link_events.get_mut(pid_val) {
                 events.departure_ready = None;
                 events.departure_pending = None;
             }
         } else {
+            if let Some((source, ready)) = self.replay_departures.get(pid_val).copied() {
+                if self.links.get(pid_val).map(|link| link.source) != Some(source) {
+                    self.replay_departures.remove(pid_val);
+                    if ready { return false; }
+                } else {
+                    if !ready { return false; }
+                    self.replay_departures.remove(pid_val);
+                }
+            } else if let Some(source) = self.links.get(pid_val).map(|link| link.source) {
+                if self.replaying_sources.contains_key(&source) {
+                    self.replay_departures.insert(pid_val.to_string(), (source, false));
+                    let _ = self.tx.send(Ev::ReplayDeparture(pid_val.to_string(), source, v.clone()));
+                    return false;
+                }
+            }
             // A departure barrier `stage_event` admitted: the departed link's
             // already-read events were dispatched ahead of it, and the marker is
             // bound to that exact source. Consume it once and run the ordinary
@@ -13389,6 +13429,83 @@ mod warm_identity_tests {
         assert!(matches!(first, Ev::Chunk(_, 42, Some(0), ref data) if data.as_ref() == b"old"));
         assert!(matches!(second, Ev::Chunk(_, 42, Some(3), ref data) if data.as_ref() == b"new"));
         assert!(conn.replaying_sources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_precedes_real_departure_paths_and_fences_replacement() {
+        for sourced_barrier in [false, true] {
+            let (mut conn, _far, mut rx) = test_conn().await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "replay-departure";
+            let transport = Rec::new("current", &log);
+            let source = transport.source_id().unwrap();
+            conn.links.insert(pid.into(), delegated_link(pid, transport));
+            if sourced_barrier {
+                let (_tx, queued) = tokio::sync::mpsc::unbounded_channel();
+                conn.link_events.insert(pid.into(), LinkEvents {
+                    generation: 7, rx: std::sync::Mutex::new(queued),
+                    departure_ready: None, departure_pending: Some(source),
+                });
+            }
+            conn.pending_sources.insert(source, PendingSource {
+                pid: pid.into(), attempt: None, at: Instant::now(),
+                events: std::collections::VecDeque::from([Ev::Chunk(
+                    pid.into(), 42, Some(0), bytes::Bytes::from_static(b"before-left"),
+                )]), bytes: 11,
+            });
+            let payload = json!({"id": pid});
+            let departure = if sourced_barrier {
+                Ev::Sourced { pid: pid.into(), source, inner: Box::new(Ev::PeerLeft(payload.clone())) }
+            } else { Ev::PeerLeft(payload.clone()) };
+            conn.tx.send(departure).unwrap();
+            conn.flush_pending_source(source);
+            if let Some((Ev::PeerLeft(v), _)) = conn.stage_event(rx.try_recv().unwrap()) {
+                assert!(!conn.on_peer_left(&v));
+            } else {
+                assert!(sourced_barrier, "ordinary room departure was not dispatched");
+            }
+            assert!(conn.links.contains_key(pid), "departure overtook buffered data");
+            assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(_, 42, Some(0), ref b), Some(s))) if s == source && b.as_ref() == b"before-left"));
+            let (Ev::PeerLeft(v), seen) = conn.stage_event(rx.try_recv().unwrap()).expect("deferred departure") else { panic!("expected departure") };
+            assert_eq!(seen, Some(source));
+            conn.on_peer_left(&v);
+            assert!(!conn.links.contains_key(pid), "departure did not finalize");
+        }
+
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "replay-replacement";
+        let old = Rec::new("old", &log);
+        let source = old.source_id().unwrap();
+        conn.links.insert(pid.into(), delegated_link(pid, old));
+        conn.pending_sources.insert(source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"x"))]), bytes: 1,
+        });
+        conn.flush_pending_source(source);
+        assert!(!conn.on_peer_left(&json!({"id": pid})));
+        let successor = Rec::new("successor", &log);
+        conn.links.insert(pid.into(), delegated_link(pid, successor));
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
+        assert!(conn.links.contains_key(pid), "stale deferred departure dropped replacement");
+
+        // A replacement after the deferred event passes staging but before its
+        // caller invokes on_peer_left must also survive.
+        let current = conn.links[pid].source;
+        conn.replaying_sources.insert(current, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"y"))]), bytes: 1,
+        });
+        conn.tx.send(Ev::ReplaySource(current)).unwrap();
+        assert!(!conn.on_peer_left(&json!({"id": pid})));
+        assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(..), _))));
+        let (Ev::PeerLeft(deferred), _) = conn.stage_event(rx.try_recv().unwrap()).unwrap() else { panic!("expected staged departure") };
+        conn.drop_link(pid);
+        let newer = Rec::new("newer", &log);
+        conn.links.insert(pid.into(), delegated_link(pid, newer));
+        assert!(!conn.on_peer_left(&deferred));
+        assert!(conn.links.contains_key(pid), "staged departure dropped a newer link");
     }
 
     /// A registered standby source buffers until adoption, replays with its tag,
