@@ -78,6 +78,7 @@ async fn next_rec(
     timeout: Duration,
 ) -> Result<Vec<u8>> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let source = mux.transport().source_id();
     loop {
         if let Some(r) = recs.next()? {
             return Ok(r);
@@ -87,7 +88,10 @@ async fn next_rec(
                 Some(Some(b)) => recs.0.extend_from_slice(&b),
                 _ => bail!("the peer closed the sync stream"),
             },
-            ev = async { match rx.as_deref_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => match ev {
+            // Selected-source reads, as exec does: the direct reader tags every
+            // control frame with its source, so a bare `rx.recv()` match never
+            // saw an `l2-close` or a chunk from a QUIC link.
+            ev = async { match rx.as_deref_mut() { Some(rx) => l2::recv_selected_event(rx, source).await, None => std::future::pending().await } } => match ev {
                 Some(Ev::Control(_, v)) => {
                     if v["type"].as_str() == Some("l2-close") && v["sid"].as_u64() == Some(sid as u64) {
                         bail!("{}", v["err"].as_str().unwrap_or("closed"));
@@ -458,10 +462,11 @@ async fn sync_inner(
     }))
     .await?;
     // Ack wait, exec's four outcomes: ack, refusal with the receiver's reason,
-    // stream closed, silence.
+    // stream closed, silence. The ack arrives source-tagged on a direct link;
+    // a bare `rx.recv()` match dropped it and timed out as "no answer".
     let ack = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            match rx.recv().await {
+            match l2::recv_selected_event(&mut rx, t.source_id()).await {
                 Some(Ev::Control(_, v)) if v["sid"].as_u64() == Some(sid as u64) => {
                     match v["type"].as_str() {
                         Some("sync-open-ack") => {
