@@ -1,7 +1,5 @@
 name: Revoke sync diagnostic
 on:
-  push:
-    branches: [diag/revoke-sync-fixture]
   workflow_dispatch: {}
 jobs:
   diagnostic:
@@ -25,11 +23,14 @@ jobs:
           TUNLION_LOG: trace
           SYNC_DIAG_DIR: ${{ runner.temp }}/sync-diag
         run: |
+          umask 077
           mkdir -p "$SYNC_DIAG_DIR"
           git rev-parse HEAD > "$SYNC_DIAG_DIR/sha.txt"
+          date -u '+%Y-%m-%dT%H:%M:%SZ workflow gate start' >> "$SYNC_DIAG_DIR/steps.txt"
           set +e
-          timeout 300 bash cli/tests/sync-gates.sh > "$SYNC_DIAG_DIR/gate.raw" 2>&1
+          timeout -k 10 300 bash cli/tests/sync-gates.sh > "$SYNC_DIAG_DIR/gate.raw" 2>&1
           code=$?
+          date -u '+%Y-%m-%dT%H:%M:%SZ workflow gate finished' >> "$SYNC_DIAG_DIR/steps.txt"
           printf '%s\n' "$code" > "$SYNC_DIAG_DIR/exit.txt"
           python3 - "$SYNC_DIAG_DIR" <<'PY'
           import pathlib, re, sys
@@ -39,6 +40,7 @@ jobs:
               s = f.read_text(errors='replace')
               if secret:
                   s = s.replace(secret, '[REDACTED FIXTURE SECRET]')
+              s = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----', '[REDACTED PRIVATE KEY]', s, flags=re.S)
               # Prevent accidental exposure of signed tokens and common credential fields.
               s = re.sub(r'(?i)(secret|token|password|authorization)(["\s:=]+)([^\s",}]+)', r'\1\2[REDACTED]', s)
               s = re.sub(r'\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b', '[REDACTED TOKEN]', s)

@@ -83,6 +83,7 @@
 #      purpose: a size-only or mtime-only comparison would call it `same`.
 
 set -uo pipefail
+umask 077
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
 BIN="${TUNLION_BIN:-$CLI_DIR/target/release/tunlion}"
@@ -95,6 +96,9 @@ DA="$WORK/A"; DB="$WORK/B"; mkdir -p "$DA" "$DB"
 # shellcheck source=lib/fixture.sh
 . "$HERE/lib/fixture.sh"
 trap fixture_cleanup EXIT
+diag_step() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$SYNC_DIAG_DIR/steps.txt"; }
+mkdir -p "$SYNC_DIAG_DIR"
+diag_step 'starting backend'
 start_backend
 
 SECRET=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
@@ -143,15 +147,32 @@ same_bytes() { cmp -s "$TREE/$1" "$DROP/inbox/$1"; }
 
 # ===================================================================== GATE A ==
 say A
+diag_step 'gate A starting initiator'
 exec 3> >(python3 "$HERE/sync-diag-timestamp.py" "$SYNC_DIAG_DIR/initiator.raw" >"$WORK/A.err")
 diag_pid=$!
 exec 4> >(python3 "$HERE/sync-diag-timestamp.py" "$SYNC_DIAG_DIR/initiator-result.raw" >"$WORK/A.jsonl")
 result_pid=$!
 "${SYNC[@]}" --json sync "$TREE" boxb:inbox 1>&4 2>&3; rcA=$?
+diag_step "gate A initiator exited rc=$rcA; draining captures"
 exec 3>&-
 exec 4>&-
+# A descendant can retain a capture pipe after the command exits. Never wait
+# indefinitely: a failed drain is a fixture failure, not a product verdict.
+(
+  sleep 10
+  printf 'capture drain timed out\n' > "$SYNC_DIAG_DIR/drain-timeout.txt"
+  kill "$diag_pid" "$result_pid" 2>/dev/null || true
+) &
+drain_watchdog=$!
 wait "$diag_pid" 2>/dev/null || true
 wait "$result_pid" 2>/dev/null || true
+kill "$drain_watchdog" 2>/dev/null || true
+wait "$drain_watchdog" 2>/dev/null || true
+if [ -e "$SYNC_DIAG_DIR/drain-timeout.txt" ]; then
+  diag_step 'gate A capture drain timed out; fixture aborted'
+  exit 2
+fi
+diag_step 'gate A captures drained'
 echo "## rc=$rcA"; cat "$WORK/A.jsonl"
 if [ "$rcA" = 0 ]; then ok "gateA: first sync exits 0"; else cat "$WORK/A.err"; tail -20 "$WORK/up.log"; bad "gateA: first sync rc=$rcA"; fi
 if [ "$(jstates "$WORK/A.jsonl")" = "$(printf 'sent\ta\t300\nsent\tbig\t%s\nskipped\tlink\t0\nsent\tsub/c\t5' $((CHUNK*3)))" ]; then
