@@ -79,6 +79,7 @@ async function device(browser, name) {
   await ctx.addInitScript((n) => {
     try { if (!localStorage.getItem('tunlion.deviceName')) localStorage.setItem('tunlion.deviceName', n) } catch {}
     try { localStorage.setItem('tunlionLog', 'debug') } catch {}
+    try { sessionStorage.setItem('tunlion.pakeTrace', '1') } catch {}
   }, name);
   const page = await ctx.newPage();
   const logs = [];
