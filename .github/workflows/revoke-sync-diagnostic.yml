@@ -1,0 +1,58 @@
+name: Revoke sync diagnostic
+on:
+  push:
+    branches: [diag/revoke-sync-fixture]
+  workflow_dispatch: {}
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Build
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: 'true'
+        run: cargo build --release -p tunlion
+      - name: Run complete sync gate with endpoint traces
+        env:
+          TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
+          TUNLION_LOG: trace
+          SYNC_DIAG_DIR: ${{ runner.temp }}/sync-diag
+        run: |
+          mkdir -p "$SYNC_DIAG_DIR"
+          git rev-parse HEAD > "$SYNC_DIAG_DIR/sha.txt"
+          set +e
+          timeout 300 bash cli/tests/sync-gates.sh > "$SYNC_DIAG_DIR/gate.raw" 2>&1
+          code=$?
+          printf '%s\n' "$code" > "$SYNC_DIAG_DIR/exit.txt"
+          python3 - "$SYNC_DIAG_DIR" <<'PY'
+          import pathlib, re, sys
+          p = pathlib.Path(sys.argv[1])
+          secret = (p / 'secret').read_text().strip() if (p / 'secret').exists() else ''
+          for f in p.glob('*.raw'):
+              s = f.read_text(errors='replace')
+              if secret:
+                  s = s.replace(secret, '[REDACTED FIXTURE SECRET]')
+              # Prevent accidental exposure of signed tokens and common credential fields.
+              s = re.sub(r'(?i)(secret|token|password|authorization)(["\s:=]+)([^\s",}]+)', r'\1\2[REDACTED]', s)
+              s = re.sub(r'\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b', '[REDACTED TOKEN]', s)
+              f.with_suffix('.log').write_text(s)
+              f.unlink()
+          if (p / 'secret').exists(): (p / 'secret').unlink()
+          PY
+          cat "$SYNC_DIAG_DIR/gate.log"
+          test "$code" -eq 0 && test "$(grep -c '^PASS:' "$SYNC_DIAG_DIR/gate.log")" -eq 18 && ! grep -q '^FAIL:' "$SYNC_DIAG_DIR/gate.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sync-diagnostic-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/sync-diag/*.log
+            ${{ runner.temp }}/sync-diag/*.txt
+          if-no-files-found: warn
