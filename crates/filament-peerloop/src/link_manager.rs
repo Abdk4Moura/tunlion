@@ -35,10 +35,11 @@ pub const WARM_RELAY_STALE_MS: u64 = 8_000;
 // PLACEMENT: which existing link (if any) a request rides.
 // ============================================================================
 
-/// What the caller wants to do with a device. Every class is placed by the same
-/// rule today; the class is carried so the rule can differ per class without
-/// touching any caller (a bulk transfer next to a live shell is the first case
-/// that will want its own connection).
+/// What the caller wants to do with a device. The class is carried so the rule
+/// can differ per class without touching any caller. The first difference:
+/// work that needs the peer's trusted grant ranks authority (a non-LAN link)
+/// above route, see `place`. A bulk transfer next to a live shell is the next
+/// case that will want its own connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Work {
@@ -72,6 +73,12 @@ pub struct LinkObs<'a> {
     pub alive: bool,
     /// An authenticated direct (QUIC) link rather than WebRTC/relay.
     pub direct: bool,
+    /// The link came up through the LAN handshake (`Link::lan_binding`). That
+    /// handshake proves a local holder of a shared secret, not the pair binding,
+    /// so the link is born untrusted with a delegated principal, and the peer
+    /// refuses work (a forward, a shell) that its pair link to the same device
+    /// would carry. Placement ranks it below a non-LAN link of the same kind.
+    pub lan: bool,
     /// Milliseconds since the transport last moved bytes either way.
     pub idle_ms: u64,
     /// Milliseconds since the link was established (`Link::established_at`).
@@ -116,9 +123,17 @@ pub fn eligible(l: &LinkObs<'_>, peer: &str) -> bool {
 
 /// Place `work` for `peer` on the given links. Pure.
 ///
-/// Every eligible link qualifies; a direct one is preferred over a relayed one
-/// (P6). Among links of the same kind the LONGEST-LIVED one wins. That is the
-/// durability rule: a one-shot `exec` client opens a fresh link to the same
+/// Every eligible link qualifies. For work that needs the peer's trusted grant
+/// (`Work::Interactive`: shell, pty, exec, forward) a non-LAN link beats a LAN
+/// one before anything else, whatever their route or age (P8): both may reach
+/// the device, but only the pair link carries the authority the peer checks,
+/// so a capability-less LAN link is a refusal waiting to happen whenever the
+/// pair link is also up, even when the LAN link is direct and the pair link is
+/// relayed. A LAN link is still placed when it is the only usable one.
+///
+/// Then a direct link is preferred over a relayed one (P6; for other work
+/// classes this comes first and LAN-ness only orders links of the same route).
+/// Then the LONGEST-LIVED one wins. That is the durability rule: a one-shot `exec` client opens a fresh link to the same
 /// device and proves the same identity, so without a lifetime preference it can
 /// be selected (HashMap order is `last-equal`) and then close under the work it
 /// was given. Nothing in `Link` says whether it was dialled by a daemon or by a
@@ -126,19 +141,34 @@ pub fn eligible(l: &LinkObs<'_>, peer: &str) -> bool {
 ///
 /// Ties are broken by the lexicographically smallest pid, not by iteration
 /// order, so the same link set always yields the same placement.
-pub fn place(_work: Work, peer: &str, links: &[LinkObs<'_>]) -> Placement {
+pub fn place(work: Work, peer: &str, links: &[LinkObs<'_>]) -> Placement {
+    let authority_first = needs_trusted_grant(work);
     links
         .iter()
         .filter(|l| eligible(l, peer))
         .max_by(|a, b| {
-            a.direct
-                .cmp(&b.direct)
+            // Reversed: `false` (not LAN) must rank higher.
+            let authority = b.lan.cmp(&a.lan);
+            let route = a.direct.cmp(&b.direct);
+            let (first, second) = if authority_first {
+                (authority, route)
+            } else {
+                (route, authority)
+            };
+            first
+                .then(second)
                 .then_with(|| age_rank(a).cmp(&age_rank(b)))
                 // Reversed so `max_by` picks the SMALLEST pid on a full tie.
                 .then_with(|| b.pid.cmp(a.pid))
         })
         .map(|l| Placement::Reuse { pid: l.pid.to_string() })
         .unwrap_or(Placement::Establish)
+}
+
+/// Does this work class need the peer's trusted grant (shell, forward), which
+/// only the pair link carries? Such work ranks authority above route.
+fn needs_trusted_grant(work: Work) -> bool {
+    matches!(work, Work::Interactive)
 }
 
 /// A link's lifetime for placement. Unknown ranks as youngest (0 ms), so it
@@ -334,6 +364,7 @@ mod tests {
             has_transport: true,
             alive: true,
             direct: false,
+            lan: false,
             idle_ms: 0,
             age_ms: Some(0),
         }
@@ -352,6 +383,85 @@ mod tests {
             place(Work::Interactive, "laptop", &[lan]),
             Placement::Reuse { pid: "lan".into() }
         );
+    }
+
+    #[test]
+    fn a_pair_link_beats_an_older_lan_link_to_the_same_device() {
+        // Shape from the net-blockers and forward-refusal CI runs: two live
+        // direct links to bravo, the LAN one 42 ms older. Age picked the LAN
+        // link and bravo refused the forward ("denied"). Both orders, and the
+        // LAN link made far older, so neither iteration nor age can decide.
+        let mut lan = obs("lan-6daee5532e971aa3", Some("bravo"));
+        lan.direct = true;
+        lan.lan = true;
+        lan.age_ms = Some(900_000);
+        let mut pair = obs("YZr4lvfHwQ8A9RLlAAAJ", Some("bravo"));
+        pair.direct = true;
+        pair.age_ms = Some(6_441);
+        for links in [[lan.clone(), pair.clone()], [pair.clone(), lan.clone()]] {
+            assert_eq!(
+                place(Work::Interactive, "bravo", &links),
+                Placement::Reuse { pid: "YZr4lvfHwQ8A9RLlAAAJ".into() }
+            );
+        }
+        // Reached only by its LAN reservation (not identity-known), the same.
+        lan.identity_known = false;
+        lan.verified_name = None;
+        lan.lan_device_name = Some("bravo");
+        for links in [[lan.clone(), pair.clone()], [pair.clone(), lan.clone()]] {
+            assert_eq!(
+                place(Work::Interactive, "bravo", &links),
+                Placement::Reuse { pid: "YZr4lvfHwQ8A9RLlAAAJ".into() }
+            );
+        }
+    }
+
+    #[test]
+    fn a_relayed_pair_link_beats_a_direct_lan_link_for_interactive_work() {
+        // Owner decision: capability first. A direct LAN link must not outrank
+        // a relayed pair link that holds the grant a shell or forward needs,
+        // in either order and however much older the LAN link is.
+        let mut lan = obs("lan", Some("bravo"));
+        lan.direct = true;
+        lan.lan = true;
+        lan.age_ms = Some(900_000);
+        let mut relay = obs("relay", Some("bravo"));
+        relay.age_ms = Some(24);
+        for links in [[lan.clone(), relay.clone()], [relay.clone(), lan.clone()]] {
+            assert_eq!(
+                place(Work::Interactive, "bravo", &links),
+                Placement::Reuse { pid: "relay".into() }
+            );
+        }
+        // Work that does not ride the trusted grant keeps the route first.
+        for links in [[lan.clone(), relay.clone()], [relay.clone(), lan.clone()]] {
+            assert_eq!(
+                place(Work::Bulk { bytes: 1 << 20 }, "bravo", &links),
+                Placement::Reuse { pid: "lan".into() }
+            );
+        }
+    }
+
+    #[test]
+    fn a_lan_link_is_still_used_when_it_is_the_only_usable_one() {
+        // The LAN rank orders links, it never makes one ineligible.
+        let mut lan = obs("lan", Some("bravo"));
+        lan.direct = true;
+        lan.lan = true;
+        assert_eq!(
+            place(Work::Interactive, "bravo", &[lan.clone()]),
+            Placement::Reuse { pid: "lan".into() }
+        );
+        // The pair link is a quiet relay (a possible zombie), so it is not
+        // usable and the LAN link carries the work.
+        let mut stale = obs("relay", Some("bravo"));
+        stale.idle_ms = WARM_RELAY_STALE_MS;
+        for links in [[lan.clone(), stale.clone()], [stale.clone(), lan.clone()]] {
+            assert_eq!(
+                place(Work::Interactive, "bravo", &links),
+                Placement::Reuse { pid: "lan".into() }
+            );
+        }
     }
 
     #[test]

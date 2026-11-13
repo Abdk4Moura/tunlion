@@ -1808,9 +1808,11 @@ const LOCAL_TCP_TRANSPORT: bool = false;
 
 /// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, or
 /// on an exact authenticated LAN DEVICE reservation that is still the current
-/// store's binding) to a warm, alive link, preferring a direct one and then the
-/// longest-lived (so a fresh one-shot `exec` link cannot displace the daemon's
-/// stable link). The single resolver for every warm-reuse op (open + pty), so
+/// store's binding) to a warm, alive link, preferring a non-LAN one (a LAN link
+/// carries no pair authority, so the peer refuses work its pair link would
+/// carry, even when the LAN link is direct), then a direct one, and then the
+/// longest-lived (so a fresh one-shot
+/// `exec` link cannot displace the daemon's stable link). The single resolver for every warm-reuse op (open + pty), so
 /// the eligibility rule lives in exactly one place. A miss means the caller
 /// falls back to a fresh establish, which is correct. Routing only: permission
 /// is still the receiving capability gate's decision.
@@ -1867,6 +1869,7 @@ pub fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn Transpo
                 .as_ref()
                 .is_some_and(|t| t.is_alive() && !t.is_dead()),
             direct: l.direct,
+            lan: l.lan_binding.is_some(),
             idle_ms: l.transport.as_ref().map_or(u64::MAX, |t| t.idle_ms()),
             age_ms: l.established_at.map(|t| t.elapsed().as_millis() as u64),
         })
