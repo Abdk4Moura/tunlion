@@ -424,21 +424,25 @@ pub(crate) fn hint_line(len: usize, hints: &[(char, &str)]) -> String {
 /// Clip a label to the terminal width so a long path never wraps: a wrapped row
 /// makes the in-place redraw rewind the wrong number of lines.
 pub(crate) fn fit(s: &str, width: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    use unicode_width::UnicodeWidthStr;
     if s.width() <= width {
         return s.to_string();
     }
     if width == 0 { return String::new(); }
-    let mut out = String::new();
-    let mut used = 0;
-    for c in s.chars() {
-        let cells = c.width().unwrap_or(0);
-        if used + cells > width - 1 { break; }
-        out.push(c);
-        used += cells;
-    }
+    // Width is not additive over chars: variation selectors and other sequences
+    // can change the width of preceding characters. Check the complete output,
+    // including the ellipsis, at each UTF-8 boundary, longest prefix first.
+    let mut out = s.to_string();
     out.push('\u{2026}');
-    out
+    for (end, _) in s.char_indices().rev() {
+        out.truncate(end);
+        out.push('\u{2026}');
+        if out.width() <= width {
+            return out;
+        }
+    }
+    // The empty prefix plus the ellipsis fits whenever width is nonzero.
+    unreachable!()
 }
 
 pub(crate) fn term_width() -> usize {
@@ -1178,6 +1182,26 @@ mod fit_tests {
         }
         assert_eq!(fit("abcdef", 1), "…");
         assert_eq!(fit("abc", 3), "abc");
+    }
+
+    #[test]
+    fn clips_variation_sequences_with_the_ellipsis_inside_the_budget() {
+        let inputs = ["❤️xyz", "a❤️xyz", "資料❤️xyz", "✈️❤️資料xyz"];
+        for input in inputs {
+            for width in 0..=input.width() + 1 {
+                let text = fit(input, width);
+                assert!(text.width() <= width, "input {input:?}, width {width}: {text:?} has width {}", text.width());
+                if input.width() > width && width > 0 {
+                    assert!(text.ends_with('…'), "input {input:?}, width {width}: {text:?}");
+                } else if input.width() <= width {
+                    assert_eq!(text, input);
+                }
+            }
+        }
+        assert_eq!(fit("❤️xyz", 0), "");
+        assert_eq!(fit("❤️xyz", 1), "…");
+        assert_eq!(fit("❤️xyz", 3), "❤️…");
+        assert_eq!(fit("資料xyz", 3), "資…");
     }
 
     #[test]
