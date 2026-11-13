@@ -1339,6 +1339,42 @@ fn drain_candidate_events(state: &mut BuildState) -> bool {
     }
 }
 
+/// The sender a WebRTC peer emits into. Every event goes to `candidate`
+/// unchanged, then the loop is woken once per burst.
+///
+/// The candidate channel is drained only inside `pump_builds`, once per loop
+/// turn, and nothing else wakes the loop when a data-channel event lands in it.
+/// Without this an installed WebRTC link's chunks and controls waited for an
+/// unrelated event: in practice the 1200 ms DIRECT-OFFER re-emit, which is why
+/// a 256 KB code transfer took exactly 2.41 or 3.61 s after `authenticated`.
+///
+/// Only the wake is new. The events still travel through the candidate channel,
+/// so `pump_builds` keeps its generation check and a dropped link's queue is
+/// still discarded rather than applied. The forwarder ends when the peer drops
+/// its sender or the link's receiver is gone.
+fn waking_candidate_sender(
+    candidate: mpsc::UnboundedSender<Ev>,
+    wake: mpsc::UnboundedSender<Ev>,
+) -> mpsc::UnboundedSender<Ev> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if candidate.send(ev).is_err() {
+                return;
+            }
+            while let Ok(ev) = rx.try_recv() {
+                if candidate.send(ev).is_err() {
+                    return;
+                }
+            }
+            if wake.send(Ev::BuildWake).is_err() {
+                return;
+            }
+        }
+    });
+    tx
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_build_task(
     plan: BuildPlan,
@@ -1357,6 +1393,7 @@ async fn run_build_task(
     let connect_polite = plan.polite;
     let connect_relay = plan.relay_ice;
     let connect_gen = plan.generation;
+    let candidate = waking_candidate_sender(candidate, wake.clone());
     let wake_tx = wake;
     let retry_plan = plan.clone();
     let connect_cfg = plan.config;
@@ -8795,6 +8832,52 @@ mod relay_privacy_tests {
                 "a browser peer was sent a transport-offer: {seen:?}"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod candidate_wake_tests {
+    use super::*;
+
+    /// A data-channel event reaches the candidate channel unchanged and wakes
+    /// the loop, so `pump_builds` runs without waiting for an unrelated event.
+    /// A burst costs one wake per drain, not one per event.
+    #[tokio::test]
+    async fn a_candidate_event_is_forwarded_and_wakes_the_loop() {
+        let (candidate_tx, mut candidate_rx) = mpsc::unbounded_channel();
+        let (wake_tx, mut wake_rx) = mpsc::unbounded_channel();
+        let peer_tx = waking_candidate_sender(candidate_tx, wake_tx);
+        peer_tx.send(Ev::Control("p".into(), json!({"type": "one"}))).unwrap();
+        peer_tx.send(Ev::Control("p".into(), json!({"type": "two"}))).unwrap();
+
+        let woke = tokio::time::timeout(Duration::from_secs(2), wake_rx.recv())
+            .await
+            .expect("an event on the candidate channel must wake the loop");
+        assert!(matches!(woke, Some(Ev::BuildWake)));
+        for want in ["one", "two"] {
+            match candidate_rx.try_recv() {
+                Ok(Ev::Control(pid, v)) => {
+                    assert_eq!(pid, "p");
+                    assert_eq!(v["type"], want, "events must arrive in order");
+                }
+                _ => panic!("the event was not forwarded before the wake"),
+            }
+        }
+    }
+
+    /// Once the link's receiver is gone (drop_link, replacement), queued events
+    /// are not delivered anywhere and no wake follows.
+    #[tokio::test]
+    async fn a_dropped_link_gets_no_events_and_no_wake() {
+        let (candidate_tx, candidate_rx) = mpsc::unbounded_channel::<Ev>();
+        let (wake_tx, mut wake_rx) = mpsc::unbounded_channel();
+        let peer_tx = waking_candidate_sender(candidate_tx, wake_tx);
+        drop(candidate_rx);
+        peer_tx.send(Ev::Control("p".into(), json!({"type": "late"}))).unwrap();
+        let woke = tokio::time::timeout(Duration::from_secs(2), wake_rx.recv())
+            .await
+            .expect("the forwarder must end, closing the wake sender");
+        assert!(woke.is_none(), "a dropped link's event woke the loop");
     }
 }
 
