@@ -661,7 +661,11 @@ mod tests {
             assert!(row.contains("mixed: write"), "{row}");
             draft.spec.folders.reverse();
         }
-        draft.spec.folders[1].mode = FolderMode::ReadWrite;
+        // The same mode for every folder: the summary names that mode and
+        // drops the mixed qualifier.
+        for folder in draft.spec.folders.iter_mut() {
+            folder.mode = FolderMode::ReadWrite;
+        }
         let row = &composer_rows(&draft, "Done")[0];
         assert!(row.contains("(read & write) +1"));
         assert!(!row.contains("mixed"));
