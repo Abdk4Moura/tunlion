@@ -348,7 +348,26 @@ fn all_facts() -> Vec<Facts> {
 
 /// Cut a device off: the durable revoke. Shared with the dashboard's "Cut off".
 pub(crate) async fn cut_off(name: &str) -> Result<()> {
-    crate::set_device_revoked(name, true)?;
+    // The store write is the shared removal service's CutOff mode: it writes
+    // the single `certRevoked` marker on the kept record and leaves grants and
+    // the managed SSH key alone, so a live link can still carry the refusal.
+    let store = crate::devices_store::store();
+    let Some(record) = store
+        .devices_records()
+        .into_iter()
+        .find(|record| record["name"].as_str() == Some(name))
+    else {
+        anyhow::bail!("device '{name}' is not in the device store");
+    };
+    let cert = crate::identity::DeviceCert::from_json(&record["deviceCert"]);
+    let plan = filament_peerloop::removal::plan_removal(
+        &record,
+        cert.as_ref(),
+        crate::fleet::my_owner_pub(),
+        filament_peerloop::removal::RemovalMode::CutOff,
+        crate::identity::now_secs(),
+    );
+    store.apply_removal(&plan, None, |_| Ok(()))?;
     crate::withdraw_requests_for(name);
     let answer = crate::revocation_live::tell_daemon().await;
     match crate::revocation_live::revoke_line(name, &answer) {
@@ -361,14 +380,41 @@ pub(crate) async fn cut_off(name: &str) -> Result<()> {
 /// Undo a cut off, or lift the key block a `forget` left behind. Returns the
 /// report line; exit 3 when there was nothing by that name at all.
 pub(crate) async fn restore(name: &str) -> Result<String> {
-    let record = crate::device_view::device_record_exists(name);
-    let revoked = record && crate::device_view::device_record_revoked(name);
-    if revoked {
-        crate::set_device_revoked(name, false)?;
-    }
-    let lifted = crate::fleet_support::lift_key_revocations_named(name)?;
-    let report = crate::fleet_support::restore_report(name, record, revoked, &lifted);
-    if !record && lifted.is_empty() {
+    let store = crate::devices_store::store();
+    let record = store
+        .devices_records()
+        .into_iter()
+        .find(|record| record["name"].as_str() == Some(name));
+    let revoked = record
+        .as_ref()
+        .is_some_and(crate::device_view::record_is_revoked);
+    let cert = record
+        .as_ref()
+        .and_then(|record| crate::identity::DeviceCert::from_json(&record["deviceCert"]));
+    // The service lifts by the record's DEVICE KEY whenever one exists; only a
+    // device whose record is already gone falls back to the name it was
+    // recorded under.
+    let plan = match record.as_ref() {
+        Some(record) => filament_peerloop::removal::plan_removal(
+            record,
+            cert.as_ref(),
+            crate::fleet::my_owner_pub(),
+            filament_peerloop::removal::RemovalMode::Restore,
+            crate::identity::now_secs(),
+        ),
+        None => filament_peerloop::removal::plan_restore_by_name(
+            name,
+            crate::identity::now_secs(),
+        ),
+    };
+    let receipt = store.apply_removal(&plan, None, |_| Ok(()))?;
+    let lifted: Vec<(String, u64, String)> = receipt
+        .key_blocks_lifted
+        .iter()
+        .map(|entry| (entry.name.clone(), entry.revoked_at, entry.device_key.clone()))
+        .collect();
+    let report = crate::fleet_support::restore_report(name, record.is_some(), revoked, &lifted);
+    if record.is_none() && lifted.is_empty() {
         return Err(crate::exit_codes::err(
             crate::exit_codes::ExitKind::UnknownDevice,
             format!("no device named '{name}', and no forgotten device by that name; see `tunlion devices`"),

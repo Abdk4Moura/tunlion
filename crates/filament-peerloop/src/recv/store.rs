@@ -57,6 +57,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const DEVICES_FILE: &str = "devices.json";
 /// The cross-process lock sidecar used for `devices.json` writes.
 pub const DEVICES_LOCK_FILE: &str = "devices.json.lock";
+/// The capability store's file name, relative to the root.
+pub const CAP_STORE_FILE: &str = "caps.json";
+/// The cross-process lock sidecar used for the `caps.json` read/modify/write.
+pub const CAP_STORE_LOCK_FILE: &str = "caps.json.lock";
+/// The key-revocation block's file name, relative to the root.
+///
+/// PROVENANCE IS PART OF THE FORMAT: an entry here means "FORGOTTEN", and
+/// nothing else. It is written only by the removal service's Forget mode and
+/// lifted by an explicit re-add or `promote`. Every peer-facing path reads a
+/// hit as "not recognized", on admission and mid-session alike.
+pub const KEY_REVOCATIONS_FILE: &str = "revoked-keys.json";
+/// The cross-process lock sidecar used for the `revoked-keys.json`
+/// read/modify/write.
+pub const KEY_REVOCATIONS_LOCK_FILE: &str = "revoked-keys.json.lock";
 /// The local device certificate record, relative to the root.
 pub const LOCAL_DEVICE_CERT_FILE: &str = "identity/device-cert.json";
 /// How long a provisional identity is worth keeping. It exists to bridge one
@@ -357,7 +371,7 @@ fn backup_path(path: &Path) -> PathBuf {
 
 /// Keep the current file as `<name>.bak`, best effort. Never blocks the write
 /// it protects.
-fn keep_backup(path: &Path) {
+pub(crate) fn keep_backup(path: &Path) {
     if let Ok(raw) = std::fs::read_to_string(path) {
         if !raw.trim().is_empty() {
             let _ = secret_write::SecretFile::write_str(&backup_path(path), &raw);
@@ -603,6 +617,52 @@ mod receive_history_tests {
         assert!(DeviceStore::open(root.path()).record_received_file(&receipt(1)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[");
     }
+
+    #[test]
+    fn revocation_snapshot_is_fail_closed_and_prunes_only_absent_secrets() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.path());
+        assert_eq!(
+            store.revocation_snapshot(),
+            Some((String::new(), String::new()))
+        );
+        // A missing store is empty content, so every held secret loses trust:
+        // fail closed, never keep a secret a deleted store cannot vouch for.
+        let mut held = vec![("a".into(), "s-a".into()), ("b".into(), "s-b".into())];
+        assert_eq!(store.prune_held(&mut held).len(), 2);
+        assert!(held.is_empty());
+
+        std::fs::write(
+            root.path().join("devices.json"),
+            r#"[{"name":"a","secret":"s-a"}]"#,
+        )
+        .unwrap();
+        let mut held = vec![("a".into(), "s-a".into()), ("b".into(), "s-b".into())];
+        assert_eq!(
+            store.prune_held(&mut held),
+            ["s-b".to_string()]
+                .into_iter()
+                .collect::<std::collections::HashSet<String>>()
+        );
+        assert_eq!(held, vec![("a".to_string(), "s-a".to_string())]);
+
+        // A rename of the same secret follows the current name; it is not a
+        // removal and must not leave the old name authorizing the new record.
+        std::fs::write(
+            root.path().join("devices.json"),
+            r#"[{"name":"renamed","secret":"s-a"}]"#,
+        )
+        .unwrap();
+        let mut held = vec![("a".into(), "s-a".into())];
+        assert!(store.prune_held(&mut held).is_empty());
+        assert_eq!(held, vec![("renamed".to_string(), "s-a".to_string())]);
+
+        std::fs::write(root.path().join("devices.json"), "not-json").unwrap();
+        let mut held = vec![("a".into(), "s-a".into())];
+        assert_eq!(store.revocation_snapshot(), None);
+        assert!(store.prune_held(&mut held).is_empty());
+        assert_eq!(held.len(), 1, "an unreadable store must remove nothing");
+    }
 }
 
 impl DeviceStore {
@@ -642,12 +702,77 @@ impl DeviceStore {
         self.root.join(DEVICES_FILE)
     }
 
+    /// The exact two store files the revocation sweep compares: `devices.json`
+    /// and the key-revocation block. `None` means unreadable or malformed, so a
+    /// sweep must do nothing rather than treat it as "everything was removed".
+    /// Missing files are empty content, not an error.
+    pub fn revocation_snapshot(&self) -> Option<(String, String)> {
+        let read_or_empty = |path: &Path| -> Option<String> {
+            match std::fs::read_to_string(path) {
+                Ok(content) => Some(content),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Some(String::new()),
+                Err(_) => None,
+            }
+        };
+        let devices = read_or_empty(&self.devices_path())?;
+        if !devices.trim().is_empty()
+            && !matches!(serde_json::from_str::<Value>(&devices), Ok(Value::Array(_)))
+        {
+            return None;
+        }
+        let revoked = read_or_empty(&self.key_revocations_path())?;
+        Some((devices, revoked))
+    }
+
+    /// Remove from `held` every pair whose secret the current store no longer
+    /// holds, returning the removed SECRETS. An unreadable store removes
+    /// nothing: absence of evidence is not a removal. Matching is on the
+    /// secret, the fact that proves, never on the display name.
+    pub fn prune_held(&self, held: &mut Vec<(String, String)>) -> std::collections::HashSet<String> {
+        // Parse the SAME snapshot that decided the sweep may run. Re-reading the
+        // store here let a file change between the two reads prune everything.
+        let Some((devices, _)) = self.revocation_snapshot() else {
+            return std::collections::HashSet::new();
+        };
+        let records: Vec<Value> = if devices.trim().is_empty() {
+            Vec::new()
+        } else {
+            match serde_json::from_str(&devices) {
+                Ok(records) => records,
+                Err(_) => return std::collections::HashSet::new(),
+            }
+        };
+        // A matching secret keeps its trust but follows the store's CURRENT
+        // name: the held name keys certificates, grants and dialing one layer
+        // down, so a rename must not let an old name resolve a new record.
+        let current: std::collections::HashMap<String, String> = records
+            .iter()
+            .filter_map(|record| {
+                let name = record["name"].as_str()?.to_string();
+                let secret = record["secret"].as_str()?.to_string();
+                Some((secret, name))
+            })
+            .collect();
+        let mut removed = std::collections::HashSet::new();
+        held.retain_mut(|(name, secret)| match current.get(secret) {
+            Some(current_name) => {
+                *name = current_name.clone();
+                true
+            }
+            None => {
+                removed.insert(secret.clone());
+                false
+            }
+        });
+        removed
+    }
+
     pub fn devices_lock_path(&self) -> PathBuf {
         self.root.join(DEVICES_LOCK_FILE)
     }
 
     pub fn cap_store_path(&self) -> PathBuf {
-        self.root.join("caps.json")
+        self.root.join(CAP_STORE_FILE)
     }
 
     pub fn local_device_cert_path(&self) -> PathBuf {
@@ -682,6 +807,109 @@ impl DeviceStore {
         keep_devices_backup(&p, &arr);
         secret_write::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
             .context("atomic write devices.json")?;
+        Ok(out)
+    }
+
+    /// The device records, fail-closed: a missing file is empty, but an
+    /// existing file that cannot be read or parsed is an error rather than an
+    /// empty fleet. Removal planning uses this so a corrupt store cannot be
+    /// mistaken for "no record to remove" (the tolerant [`devices_records`]
+    /// remains for read-only display paths).
+    pub fn devices_snapshot(&self) -> Result<Vec<Value>> {
+        let p = self.devices_path();
+        match std::fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|e| CorruptStore::new(p, e.to_string()).into()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(anyhow::anyhow!("read devices.json: {e}")),
+        }
+    }
+
+    /// The key-revocation entries, fail-closed: absent is empty, unreadable or
+    /// unparseable is an error.
+    pub fn key_revocation_entries(&self) -> Result<Vec<Value>> {
+        let p = self.key_revocations_path();
+        match std::fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|e| CorruptStore::new(p, e.to_string()).into()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(anyhow::anyhow!("read revoked-keys.json: {e}")),
+        }
+    }
+
+    /// Lock, read, mutate and atomically write `revoked-keys.json`. The
+    /// closure returns the facts it lifted and whether the file changed; an
+    /// empty lift therefore does not create or rewrite the file. A corrupt
+    /// list is an error and is never written over.
+    pub(crate) fn with_key_revocations_mut<T>(
+        &self,
+        f: impl FnOnce(&mut Vec<Value>) -> Result<(T, bool)>,
+    ) -> Result<T> {
+        let p = self.key_revocations_path();
+        if let Some(dir) = p.parent() {
+            create_private_dir_all(dir)
+                .with_context(|| format!("create config dir {}", dir.display()))?;
+        }
+        let lock_path = self.root.join(KEY_REVOCATIONS_LOCK_FILE);
+        let _lock = StoreLock::acquire(&lock_path)
+            .with_context(|| format!("lock {}", lock_path.display()))?;
+        let mut entries: Vec<Value> = match std::fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|e| CorruptStore::new(p.clone(), e.to_string()))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(anyhow::anyhow!("read revoked-keys.json: {e}")),
+        };
+        let (out, changed) = f(&mut entries)?;
+        if changed {
+            keep_backup(&p);
+            secret_write::SecretFile::write_str(&p, &serde_json::to_string_pretty(&entries)?)
+                .context("atomic write revoked-keys.json")?;
+        }
+        Ok(out)
+    }
+
+    /// The capability store, fail-closed: absent is empty, unreadable or
+    /// unparseable is an error. The tolerant [`cap_store`] stays for the
+    /// read-only evaluators, which already treat damage as "no grants".
+    pub(crate) fn cap_store_checked(&self) -> Result<Vec<Value>> {
+        let p = self.cap_store_path();
+        match std::fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|e| CorruptStore::new(p, e.to_string()).into()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(anyhow::anyhow!("read caps.json: {e}")),
+        }
+    }
+
+    /// Lock, read, mutate and atomically write `caps.json`. The closure
+    /// returns whether anything changed, so a no-op revoke does not rewrite
+    /// the store. `before_write_json_array` refuses to replace a corrupt or
+    /// truncated file.
+    pub(crate) fn with_cap_store_mut<T>(
+        &self,
+        f: impl FnOnce(&mut Vec<Value>) -> Result<(T, bool)>,
+    ) -> Result<T> {
+        let p = self.cap_store_path();
+        if let Some(dir) = p.parent() {
+            create_private_dir_all(dir)
+                .with_context(|| format!("create config dir {}", dir.display()))?;
+        }
+        let lock_path = self.root.join(CAP_STORE_LOCK_FILE);
+        let _lock = StoreLock::acquire(&lock_path)
+            .with_context(|| format!("lock {}", lock_path.display()))?;
+        let mut store: Vec<Value> = match std::fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|e| CorruptStore::new(p.clone(), e.to_string()))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(anyhow::anyhow!("read caps.json: {e}")),
+        };
+        let (out, changed) = f(&mut store)?;
+        if changed {
+            before_write_json_array(&p)?;
+            keep_backup(&p);
+            secret_write::SecretFile::write_str(&p, &serde_json::to_string_pretty(&store)?)
+                .context("atomic write caps.json")?;
+        }
         Ok(out)
     }
 
@@ -820,7 +1048,7 @@ impl DeviceStore {
     /// The key revocations at `revoked-keys.json`, fail-closed: absent is
     /// empty, unreadable or unparseable is an error.
     pub fn key_revocations_path(&self) -> PathBuf {
-        self.root.join("revoked-keys.json")
+        self.root.join(KEY_REVOCATIONS_FILE)
     }
 
     fn load_key_revocations(&self) -> std::result::Result<Vec<Value>, ()> {
