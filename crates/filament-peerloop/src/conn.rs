@@ -13528,7 +13528,8 @@ mod warm_identity_tests {
         let pid = "replay-overflow";
         let adopted = Rec::new("adopted", &log);
         let source = adopted.source_id().unwrap();
-        conn.links.insert(pid.into(), delegated_link(pid, adopted));
+        conn.links
+            .insert(pid.into(), delegated_link(pid, adopted.clone()));
         // A replay already in flight for this source, with one buffered event.
         conn.replaying_sources.insert(source, PendingSource {
             pid: pid.into(), attempt: None, at: Instant::now(),
@@ -13536,7 +13537,9 @@ mod warm_identity_tests {
         });
         // A new event over the budget: the swap overflows and must close the
         // adopted transport.
-        let big = vec![0u8; MAX_BUILD_EVENT_BYTES];
+        // The comparison is strict (`>`), so exactly the limit is allowed.
+        // One byte above it must take the overflow path.
+        let big = vec![0u8; MAX_BUILD_EVENT_BYTES + 1];
         let ev = Ev::Sourced {
             pid: pid.into(),
             source,
@@ -13545,6 +13548,7 @@ mod warm_identity_tests {
         assert!(conn.stage_event(ev).is_none(), "the overflowing event must not be dispatched");
         assert!(!conn.replaying_sources.contains_key(&source), "the replay entry must be dropped");
         assert!(conn.links.contains_key(pid), "the daemon must survive the overflow");
+        assert!(adopted.is_dead(), "overflow must close the adopted transport");
     }
 
     /// A registered standby source buffers until adoption, replays with its tag,
