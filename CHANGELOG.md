@@ -13,21 +13,21 @@ release build failed and nothing was published under it.
 
 ## [Unreleased]
 
-## [0.9.4] - 2026-11-12
+- Browser transfer admission through the shared policy core is prepared in
+  #675/#677 and is not part of 0.9.4. The browser remains pairwise-only.
+- Invitations through one shared core policy are prepared in #662 and are not
+  part of 0.9.4. The existing CLI invitation policy is unchanged.
+
+## [0.9.4] - 2026-11-13
 
 ### Added
 
 - Running commands, terminals and SSH on your other devices now goes through
-  one shared access decision, so the command line, the background service and
-  the browser all agree on who may do what.
-- The browser asks the same shared core whether to accept a transfer. If that
-  check is missing or returns something unexpected, the transfer is refused.
+  one shared access decision, so the command line and the background service
+  agree on who may do what.
 - Android app: the phone loads the shared core directly for its identity and
   for sending and receiving with a code. Showing each device's access and
   removing devices from the phone arrive with the device lifecycle update.
-- Invitations are previewed, created, joined and withdrawn through one shared
-  set of rules, so an expiry date and a permission limit mean the same thing
-  on every device.
 
 ### Changed
 
