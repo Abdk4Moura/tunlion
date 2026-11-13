@@ -78,6 +78,7 @@ async fn next_rec(
     timeout: Duration,
 ) -> Result<Vec<u8>> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let source = mux.transport().source_id();
     loop {
         if let Some(r) = recs.next()? {
             return Ok(r);
@@ -87,7 +88,9 @@ async fn next_rec(
                 Some(Some(b)) => recs.0.extend_from_slice(&b),
                 _ => bail!("the peer closed the sync stream"),
             },
-            ev = async { match rx.as_deref_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => match ev {
+            // Selected-source reads, as exec does: the direct reader tags its
+            // events with their source, and a bare match never saw them.
+            ev = async { match rx.as_deref_mut() { Some(rx) => l2::recv_selected_event(rx, source).await, None => std::future::pending().await } } => match ev {
                 Some(Ev::Control(_, v)) => {
                     if v["type"].as_str() == Some("l2-close") && v["sid"].as_u64() == Some(sid as u64) {
                         bail!("{}", v["err"].as_str().unwrap_or("closed"));
@@ -98,6 +101,37 @@ async fn next_rec(
                 None => bail!("the link died during sync"),
             },
             _ = tokio::time::sleep_until(deadline) => bail!("timed out waiting for the peer"),
+        }
+    }
+}
+
+/// Wait for the receiver's answer to `sync-open`: `Ok(dest)` on the ack,
+/// `Err(reason)` on a refusal or a link that closed first. Frames for the
+/// stream that arrive meanwhile go to the mux.
+///
+/// Reads through the selected-source gate, as exec does. The direct reader
+/// delivers the ack source-tagged; a bare `Ev::Control` match dropped it and
+/// the caller timed out as "no answer" with the peer's ack already received.
+async fn wait_open_ack(
+    rx: &mut mpsc::UnboundedReceiver<Ev>,
+    source: Option<crate::net::SourceId>,
+    mux: &l2::Mux,
+    sid: u32,
+) -> std::result::Result<Option<String>, String> {
+    loop {
+        match l2::recv_selected_event(rx, source).await {
+            Some(Ev::Control(_, v)) if v["sid"].as_u64() == Some(sid as u64) => {
+                match v["type"].as_str() {
+                    Some("sync-open-ack") => return Ok(v["dest"].as_str().map(str::to_string)),
+                    Some("l2-close") => {
+                        return Err(v["err"].as_str().unwrap_or("closed").to_string())
+                    }
+                    _ => {}
+                }
+            }
+            Some(Ev::Chunk(_, got, _, data)) => mux.on_frame(got, data).await,
+            Some(_) => {}
+            None => return Err("closed the link before answering".into()),
         }
     }
 }
@@ -459,26 +493,10 @@ async fn sync_inner(
     .await?;
     // Ack wait, exec's four outcomes: ack, refusal with the receiver's reason,
     // stream closed, silence.
-    let ack = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            match rx.recv().await {
-                Some(Ev::Control(_, v)) if v["sid"].as_u64() == Some(sid as u64) => {
-                    match v["type"].as_str() {
-                        Some("sync-open-ack") => {
-                            break Ok(v["dest"].as_str().map(str::to_string));
-                        }
-                        Some("l2-close") => {
-                            break Err(v["err"].as_str().unwrap_or("closed").to_string());
-                        }
-                        _ => {}
-                    }
-                }
-                Some(Ev::Chunk(_, got, _, data)) => mux.on_frame(got, data).await,
-                Some(_) => {}
-                None => break Err("closed the link before answering".into()),
-            }
-        }
-    })
+    let ack = tokio::time::timeout(
+        Duration::from_secs(15),
+        wait_open_ack(&mut rx, t.source_id(), &mux, sid),
+    )
     .await
     .map_err(|_| {
         fail(
@@ -635,6 +653,149 @@ fn sync_destination(peer: &str, remote_dir: &str, dest: Option<&str>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transport whose events carry `source`. Records nothing, sends nothing.
+    struct SourcedTransport(Option<crate::net::SourceId>);
+    #[async_trait::async_trait]
+    impl Transport for SourcedTransport {
+        async fn send_control(&self, _msg: &Value) -> Result<()> {
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn source_id(&self) -> Option<crate::net::SourceId> {
+            self.0
+        }
+    }
+
+    fn sourced(source: crate::net::SourceId, inner: Ev) -> Ev {
+        Ev::Sourced { pid: "boxb".into(), source, inner: Box::new(inner) }
+    }
+
+    /// The direct reader delivers the ack source-tagged (`Ev::Sourced {
+    /// Control }`); from the selected transport it is accepted, from another
+    /// source (a losing candidate) it is not, even naming our sid.
+    ///
+    /// The chunks here are SYNTHETIC tagged chunks. The real QUIC and WebRTC
+    /// readers emit `Ev::Chunk` untagged (direct.rs, net.rs), which the gate
+    /// passes through, so this pins only the gate's handling of a tagged chunk.
+    /// It does not show that a losing candidate's real chunks are isolated.
+    #[tokio::test]
+    async fn open_ack_reads_the_selected_source_and_drops_others() {
+        let selected = crate::net::SourceId::next();
+        let stale = crate::net::SourceId::next();
+        let mux = l2::Mux::new(
+            Arc::new(SourcedTransport(Some(selected))),
+            crate::host_impl::cli_host(),
+        );
+        let sid = mux.alloc_sid();
+        let mut pipe = mux.register_stream(sid).await.expect("register stream");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ack = |dest: &str| {
+            Ev::Control("boxb".into(), json!({"type": "sync-open-ack", "sid": sid, "dest": dest}))
+        };
+        let chunk = |b: &'static [u8]| Ev::Chunk("boxb".into(), sid, None, Bytes::from_static(b));
+        tx.send(sourced(stale, chunk(b"stale"))).unwrap();
+        tx.send(sourced(stale, ack("/stale"))).unwrap();
+        tx.send(sourced(selected, chunk(b"live"))).unwrap();
+        tx.send(sourced(selected, ack("/live"))).unwrap();
+
+        let got = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_open_ack(&mut rx, Some(selected), &mux, sid),
+        )
+        .await
+        .expect("a selected-source ack must end the wait");
+        assert_eq!(got, Ok(Some("/live".to_string())), "the stale ack was taken");
+        assert_eq!(
+            pipe.try_recv().ok(),
+            Some(Some(Bytes::from_static(b"live"))),
+            "the selected chunk must reach the stream, and the stale one must not precede it"
+        );
+        assert!(pipe.try_recv().is_err(), "a stale chunk reached the stream");
+    }
+
+    /// The untagged shape (WebRTC/LAN readers) is still accepted.
+    #[tokio::test]
+    async fn open_ack_still_reads_untagged_events() {
+        let mux = l2::Mux::new(Arc::new(SourcedTransport(None)), crate::host_impl::cli_host());
+        let sid = mux.alloc_sid();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Ev::Control("boxb".into(), json!({"type": "sync-open-ack", "sid": sid, "dest": "/d"})))
+            .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), wait_open_ack(&mut rx, None, &mux, sid))
+            .await
+            .expect("an untagged ack must end the wait");
+        assert_eq!(got, Ok(Some("/d".to_string())));
+    }
+
+    /// The plan and file acks come back as length-prefixed JSON records on the
+    /// stream, carried in untagged chunks (the shape the real readers emit),
+    /// here split across two frames. A stale-source `l2-close` between them
+    /// must not end the read; the record must be reassembled whole.
+    #[tokio::test]
+    async fn next_json_reads_an_ack_record_across_untagged_chunks() {
+        let selected = crate::net::SourceId::next();
+        let stale = crate::net::SourceId::next();
+        let mux = l2::Mux::new(
+            Arc::new(SourcedTransport(Some(selected))),
+            crate::host_impl::cli_host(),
+        );
+        let sid = mux.alloc_sid();
+        let mut pipe = mux.register_stream(sid).await.expect("register stream");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let body = serde_json::to_vec(&json!({"type": "plan-ack", "need": ["a", "b"]})).unwrap();
+        let mut rec = (body.len() as u32).to_be_bytes().to_vec();
+        rec.extend_from_slice(&body);
+        let (head, tail) = rec.split_at(7);
+        tx.send(Ev::Chunk("boxb".into(), sid, None, Bytes::copy_from_slice(head))).unwrap();
+        tx.send(sourced(
+            stale,
+            Ev::Control("boxb".into(), json!({"type": "l2-close", "sid": sid, "err": "stale close"})),
+        ))
+        .unwrap();
+        tx.send(Ev::Chunk("boxb".into(), sid, None, Bytes::copy_from_slice(tail))).unwrap();
+        let mut recs = Records(Vec::new());
+        let v = next_json(&mut pipe, Some(&mut rx), &mux, sid, &mut recs, Duration::from_secs(5))
+            .await
+            .expect("the ack record must arrive whole despite the stale close");
+        assert_eq!(v, json!({"type": "plan-ack", "need": ["a", "b"]}));
+    }
+
+    /// Mid-stream, an `l2-close` for our sid ends the transfer only when it
+    /// comes from the selected transport. A stale close must not end it.
+    #[tokio::test]
+    async fn next_rec_honours_only_the_selected_close() {
+        let selected = crate::net::SourceId::next();
+        let stale = crate::net::SourceId::next();
+        let mux = l2::Mux::new(
+            Arc::new(SourcedTransport(Some(selected))),
+            crate::host_impl::cli_host(),
+        );
+        let sid = mux.alloc_sid();
+        let mut pipe = mux.register_stream(sid).await.expect("register stream");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let close = |err: &str| {
+            Ev::Control("boxb".into(), json!({"type": "l2-close", "sid": sid, "err": err}))
+        };
+        tx.send(sourced(stale, close("stale close"))).unwrap();
+        tx.send(sourced(selected, close("receiver refused"))).unwrap();
+        let mut recs = Records(Vec::new());
+        let err = next_rec(&mut pipe, Some(&mut rx), &mux, sid, &mut recs, Duration::from_secs(5))
+            .await
+            .expect_err("the selected close must end the stream");
+        assert_eq!(err.to_string(), "receiver refused");
+    }
 
     #[test]
     fn windows_sync_refusal_is_operator_visible_without_genericizing_reason() {
