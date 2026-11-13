@@ -1339,47 +1339,12 @@ fn drain_candidate_events(state: &mut BuildState) -> bool {
     }
 }
 
-/// The sender a WebRTC peer emits into. Every event goes to `candidate`
-/// unchanged, then the loop is woken once per burst.
-///
-/// The candidate channel is drained only inside `pump_builds`, once per loop
-/// turn, and nothing else wakes the loop when a data-channel event lands in it.
-/// Without this an installed WebRTC link's chunks and controls waited for an
-/// unrelated event: in practice the 1200 ms DIRECT-OFFER re-emit, which is why
-/// a 256 KB code transfer took exactly 2.41 or 3.61 s after `authenticated`.
-///
-/// Only the wake is new. The events still travel through the candidate channel,
-/// so `pump_builds` keeps its generation check and a dropped link's queue is
-/// still discarded rather than applied. The forwarder ends when the peer drops
-/// its sender or the link's receiver is gone.
-fn waking_candidate_sender(
-    candidate: mpsc::UnboundedSender<Ev>,
-    wake: mpsc::UnboundedSender<Ev>,
-) -> mpsc::UnboundedSender<Ev> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            if candidate.send(ev).is_err() {
-                return;
-            }
-            while let Ok(ev) = rx.try_recv() {
-                if candidate.send(ev).is_err() {
-                    return;
-                }
-            }
-            if wake.send(Ev::BuildWake).is_err() {
-                return;
-            }
-        }
-    });
-    tx
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_build_task(
     plan: BuildPlan,
     candidate: mpsc::UnboundedSender<Ev>,
     wake: mpsc::UnboundedSender<Ev>,
+    wake_pending: Arc<AtomicBool>,
     cancel: Arc<BuildCancel>,
     out: mpsc::UnboundedSender<BuildDone>,
     context: filament_transport::TransportContext,
@@ -1393,7 +1358,10 @@ async fn run_build_task(
     let connect_polite = plan.polite;
     let connect_relay = plan.relay_ice;
     let connect_gen = plan.generation;
-    let candidate = waking_candidate_sender(candidate, wake.clone());
+    // The peer's events wake the loop: the candidate channel is drained only
+    // by `pump_builds`, and nothing else turns the loop when a data-channel
+    // event lands in it (see `EvSink::waking`).
+    let candidate = net::EvSink::waking(candidate, wake.clone(), wake_pending);
     let wake_tx = wake;
     let retry_plan = plan.clone();
     let connect_cfg = plan.config;
@@ -1767,6 +1735,10 @@ pub struct Conn {
     /// so a queued ChannelReady/Control from the old generation is discarded
     /// instead of being replayed onto the new link.
     pub link_events: HashMap<String, LinkEvents>,
+    /// Set by a candidate sender when it has queued a `BuildWake`, cleared by
+    /// `pump_builds` before it drains. One wake is outstanding at a time, so a
+    /// busy data channel cannot flood the main queue with wakes.
+    candidate_wake: Arc<AtomicBool>,
     /// Source-bound standby/upgrade events awaiting adoption. Bounded per source
     /// and in total; overflow closes the standby instead of growing forever.
     pub pending_sources: HashMap<net::SourceId, PendingSource>,
@@ -2006,6 +1978,7 @@ impl Conn {
             revoked_peers: HashMap::new(),
             revoked_bindings: HashSet::new(),
             link_events: HashMap::new(),
+            candidate_wake: Arc::new(AtomicBool::new(false)),
             pending_sources: HashMap::new(),
             roster_absent: HashMap::new(),
             log,
@@ -3378,6 +3351,7 @@ impl Conn {
         // replayed onto the candidate after installation.
         let (candidate_tx, candidate_rx) = mpsc::unbounded_channel();
         let wake = self.tx.clone();
+        let wake_pending = self.candidate_wake.clone();
         let context = self.transport_context.clone();
         let server = self.server.clone();
         let sio = self.sio.clone();
@@ -3389,6 +3363,7 @@ impl Conn {
                 plan,
                 candidate_tx,
                 wake,
+                wake_pending,
                 task_cancel,
                 out,
                 context,
@@ -3422,6 +3397,10 @@ impl Conn {
     /// slots are free, and reap a task that outlived its grace. Every Conn
     /// driver calls this once per loop turn; it never awaits.
     pub fn pump_builds(&mut self) -> usize {
+        // Clear BEFORE draining. An event queued after this point sees the
+        // flag clear and sends a fresh wake, so it is never left for an
+        // unrelated event to collect; one queued before it is drained below.
+        self.candidate_wake.store(false, Ordering::SeqCst);
         // Installed-link event streams are candidate-local. Forward them only
         // while the link still carries the generation that created the stream;
         // a replaced/dropped link's queued events are discarded, never applied
@@ -8836,52 +8815,6 @@ mod relay_privacy_tests {
 }
 
 #[cfg(test)]
-mod candidate_wake_tests {
-    use super::*;
-
-    /// A data-channel event reaches the candidate channel unchanged and wakes
-    /// the loop, so `pump_builds` runs without waiting for an unrelated event.
-    /// A burst costs one wake per drain, not one per event.
-    #[tokio::test]
-    async fn a_candidate_event_is_forwarded_and_wakes_the_loop() {
-        let (candidate_tx, mut candidate_rx) = mpsc::unbounded_channel();
-        let (wake_tx, mut wake_rx) = mpsc::unbounded_channel();
-        let peer_tx = waking_candidate_sender(candidate_tx, wake_tx);
-        peer_tx.send(Ev::Control("p".into(), json!({"type": "one"}))).unwrap();
-        peer_tx.send(Ev::Control("p".into(), json!({"type": "two"}))).unwrap();
-
-        let woke = tokio::time::timeout(Duration::from_secs(2), wake_rx.recv())
-            .await
-            .expect("an event on the candidate channel must wake the loop");
-        assert!(matches!(woke, Some(Ev::BuildWake)));
-        for want in ["one", "two"] {
-            match candidate_rx.try_recv() {
-                Ok(Ev::Control(pid, v)) => {
-                    assert_eq!(pid, "p");
-                    assert_eq!(v["type"], want, "events must arrive in order");
-                }
-                _ => panic!("the event was not forwarded before the wake"),
-            }
-        }
-    }
-
-    /// Once the link's receiver is gone (drop_link, replacement), queued events
-    /// are not delivered anywhere and no wake follows.
-    #[tokio::test]
-    async fn a_dropped_link_gets_no_events_and_no_wake() {
-        let (candidate_tx, candidate_rx) = mpsc::unbounded_channel::<Ev>();
-        let (wake_tx, mut wake_rx) = mpsc::unbounded_channel();
-        let peer_tx = waking_candidate_sender(candidate_tx, wake_tx);
-        drop(candidate_rx);
-        peer_tx.send(Ev::Control("p".into(), json!({"type": "late"}))).unwrap();
-        let woke = tokio::time::timeout(Duration::from_secs(2), wake_rx.recv())
-            .await
-            .expect("the forwarder must end, closing the wake sender");
-        assert!(woke.is_none(), "a dropped link's event woke the loop");
-    }
-}
-
-#[cfg(test)]
 mod raw_label_tests {
     use super::label_is_raw_id;
 
@@ -11109,6 +11042,92 @@ mod warm_identity_tests {
             .unwrap();
         conn.pump_builds();
         assert_eq!(conn.builds[pid].early.len(), 1);
+    }
+
+    /// An installed WebRTC link's events wake the loop: the first event queues
+    /// one `BuildWake` on the main queue, further events before the next drain
+    /// queue none, and `pump_builds` forwards them in order and re-arms the
+    /// wake. Before this, nothing woke the loop and the events waited for an
+    /// unrelated one (promote-mbb M1/M3: 2.41 or 3.61 s instead of ~0.1 s).
+    #[tokio::test]
+    async fn an_installed_links_events_wake_the_loop_once_per_drain() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-wake";
+        let t = Rec::new("webrtc", &log);
+        let link = relay_link(pid, "peer", "peer", t);
+        let generation = link.generation;
+        conn.links.insert(pid.to_string(), link);
+        let (candidate_tx, candidate_rx) = mpsc::unbounded_channel();
+        conn.link_events.insert(
+            pid.to_string(),
+            LinkEvents {
+                generation,
+                rx: std::sync::Mutex::new(candidate_rx),
+                departure_ready: None,
+                departure_pending: None,
+            },
+        );
+        let sink = net::EvSink::waking(candidate_tx, conn.tx.clone(), conn.candidate_wake.clone());
+        let wakes = |rx: &mut mpsc::UnboundedReceiver<Ev>| {
+            let mut n = 0;
+            while let Ok(ev) = rx.try_recv() {
+                if matches!(ev, Ev::BuildWake) {
+                    n += 1;
+                }
+            }
+            n
+        };
+        let _ = wakes(&mut rx);
+
+        for i in 0..50 {
+            sink.send(Ev::Control(pid.to_string(), json!({ "type": "data", "i": i })))
+                .unwrap();
+        }
+        assert_eq!(wakes(&mut rx), 1, "a burst must wake the loop exactly once");
+
+        conn.pump_builds();
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Ev::Control(from, v) = ev {
+                assert_eq!(from, pid);
+                seen.push(v["i"].as_i64().unwrap());
+            }
+        }
+        assert_eq!(seen, (0..50).collect::<Vec<i64>>(), "forwarded in order, none lost");
+
+        sink.send(Ev::Control(pid.to_string(), json!({ "type": "data", "i": 50 })))
+            .unwrap();
+        assert_eq!(wakes(&mut rx), 1, "the drain must re-arm the wake");
+    }
+
+    /// The departure path drains the link's queue directly. With no forwarder
+    /// between the peer and that queue, an event the peer sent before departure
+    /// is already in it, so the drain sees it; and once the queue is gone a
+    /// late send fails and wakes nothing.
+    #[tokio::test]
+    async fn a_sent_event_is_in_the_queue_at_departure_and_a_dropped_queue_wakes_nothing() {
+        let (conn, _far, mut rx) = test_conn().await;
+        let (candidate_tx, mut candidate_rx) = mpsc::unbounded_channel();
+        let sink = net::EvSink::waking(candidate_tx, conn.tx.clone(), conn.candidate_wake.clone());
+        sink.send(Ev::Control("p".into(), json!({ "type": "l2-close", "sid": 1 })))
+            .unwrap();
+        // No await between the send and the drain: nothing else had to run.
+        match candidate_rx.try_recv() {
+            Ok(Ev::Control(_, v)) => assert_eq!(v["type"], "l2-close"),
+            _ => panic!("the final control was not in the link's queue"),
+        }
+        while rx.try_recv().is_ok() {}
+        conn.candidate_wake.store(false, Ordering::SeqCst);
+        drop(candidate_rx);
+        assert!(
+            sink.send(Ev::Control("p".into(), json!({ "type": "late" }))).is_err(),
+            "a dropped link's queue must refuse the event"
+        );
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|ev| matches!(ev, Ev::BuildWake)),
+            "a dropped link's event woke the loop"
+        );
     }
 
     /// Signaling can arrive before installation; the envelope names the peer in
