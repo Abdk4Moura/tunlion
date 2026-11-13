@@ -108,7 +108,8 @@ fn expand_home(input: &str) -> std::path::PathBuf {
 /// `$HOME/x` -> `~/x` for display only, and never a control character.
 fn short_path(path: &std::path::Path) -> String {
     let shown = match home_dir() {
-        Some(home) if path.starts_with(&home) && path != home => {
+        Some(home) if path == home => "~".to_string(),
+        Some(home) if path.starts_with(&home) => {
             format!("~{}{}", std::path::MAIN_SEPARATOR, path.strip_prefix(&home).map(|p| p.display().to_string()).unwrap_or_default())
         }
         _ => path.display().to_string(),
@@ -377,8 +378,8 @@ pub(crate) fn terminal_label(label: &str) -> String {
 fn composer_rows(draft: &Draft, finish: &str) -> Vec<String> {
     let folders = match draft.spec.folders.as_slice() {
         [] => "none".to_string(),
-        [one] => format!("{} ({})", short_path(&one.path), mode_label(&one.mode)),
-        [first, rest @ ..] => format!("{} ({}) +{}", short_path(&first.path), mode_label(&first.mode), rest.len()),
+        [one] => format!("({}) {}", mode_label(&one.mode), short_path(&one.path)),
+        [first, rest @ ..] => format!("({}) +{} {}", mode_label(&first.mode), rest.len(), short_path(&first.path)),
     };
     let services = if draft.spec.services.is_empty() {
         "none".to_string()
@@ -427,7 +428,7 @@ fn edit_folders(draft: &mut Draft, stop: &AtomicBool) -> Result<()> {
     }
     loop {
         let mut labels: Vec<String> = draft.spec.folders.iter()
-            .map(|folder| format!("{} \u{b7} {}", short_path(&folder.path), mode_label(&folder.mode))).collect();
+            .map(|folder| format!("({}) \u{b7} {}", mode_label(&folder.mode), short_path(&folder.path))).collect();
         labels.extend(["Add another folder".into(), "Done".into()]);
         let Some(selected) = live_menu("FOLDERS", &labels, stop)? else { return Ok(()) };
         let n = draft.spec.folders.len();
@@ -596,6 +597,31 @@ mod tests {
         let rows = composer_rows(&draft, "Create code");
         assert_eq!(rows[1], "Services \u{b7} port 3000, 127.0.0.2:22");
         assert_eq!(rows[2], "Shell    \u{b7} on");
+    }
+
+    #[test]
+    fn folder_summary_keeps_permissions_and_count_when_picker_clips_path() {
+        let mut draft = Draft::default();
+        let path = std::path::PathBuf::from(format!("/{}", "long-folder".repeat(12)));
+        draft.spec.folders.push(FolderAccess { id: "first".into(), path: path.clone(), mode: FolderMode::ReadOnly });
+        let row = &composer_rows(&draft, "Create code")[0];
+        let clipped = crate::codeentry::fit(row, 32);
+        assert!(clipped.contains("(read-only)"), "{clipped}");
+        assert!(clipped.ends_with('…'), "{clipped}");
+        draft.spec.folders[0].mode = FolderMode::ReadWrite;
+        draft.spec.folders.push(FolderAccess { id: "second".into(), path, mode: FolderMode::ReadOnly });
+        let row = &composer_rows(&draft, "Create code")[0];
+        let clipped = crate::codeentry::fit(row, 32);
+        assert!(clipped.contains("(read & write) +1"), "{clipped}");
+        assert!(clipped.ends_with('…'), "{clipped}");
+    }
+
+    #[test]
+    fn home_itself_and_children_are_abbreviated() {
+        if let Some(home) = home_dir() {
+            assert_eq!(short_path(&home), "~");
+            assert_eq!(short_path(&home.join("folder")), format!("~{}folder", std::path::MAIN_SEPARATOR));
+        }
     }
 
     #[test]

@@ -470,6 +470,7 @@ fn temporary_access_cancel_and_failed_connect_do_not_remember_device() {
         t.send("\r");
         assert!(t.wait_for_from(at, "(read-only)", 20), "{}", tail(&t.text()));
         t.settle(200, 3);
+        assert!(t.text()[at..].contains("Folders  · (read-only) ~"), "HOME was not abbreviated:\n{}", tail(&t.text()));
         // A service, added and then removed and added again, exercises the
         // services editor rather than only menu navigation.
         composer_add_service(&mut t, "3000", 0);
@@ -502,6 +503,52 @@ fn temporary_access_cancel_and_failed_connect_do_not_remember_device() {
         }
         if !activate { assert!(!dir.join("overlay.ed25519").exists(), "cancel created transport keys"); }
     }
+}
+
+// A real narrow picker must retain the security-relevant summary even when the
+// first path is much wider than the terminal. No server or identity is needed.
+#[cfg(unix)]
+#[test]
+fn temporary_access_long_folder_keeps_mode_and_count_visible() {
+    let label = "access-long-folder";
+    let (mut t, exe) = fresh_term(label);
+    t.resize(50, 30);
+    let dir = std::env::temp_dir().join(format!("tunlion-pty-{label}-{}", std::process::id()));
+    let first = dir.join("a-very-long-folder-name-that-must-be-clipped-at-the-terminal-edge");
+    let second = dir.join("another-folder");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    open_temporary_composer(&mut t, &exe, "http://127.0.0.1:9");
+    let at = t.text().len();
+    t.send(ROW_FOLDERS);
+    assert!(t.wait_for_from(at, "folder to share [", 20), "{}", tail(&t.text()));
+    t.send(&format!("{}\r", first.display()));
+    assert!(t.wait_for_from(at, "Folders  · (read-only)", 20), "{}", tail(&t.text()));
+    t.settle(200, 3);
+    let at = t.text().len();
+    t.send(ROW_FOLDERS);
+    assert!(t.wait_for_from(at, "Add another folder", 20), "{}", tail(&t.text()));
+    assert!(t.text()[at..].contains("(read-only) ·"), "{}", tail(&t.text()));
+    t.settle(200, 3);
+    let at = t.text().len();
+    t.send("2");
+    assert!(t.wait_for_from(at, "folder to share [", 20), "{}", tail(&t.text()));
+    t.send(&format!("{}\r", second.display()));
+    assert!(t.wait_for_from(at, "Add another folder", 20), "{}", tail(&t.text()));
+    t.settle(200, 3);
+    let at = t.text().len();
+    t.send("1");
+    assert!(t.wait_for_from(at, "Read & write", 20), "{}", tail(&t.text()));
+    t.settle(200, 3);
+    let at = t.text().len();
+    t.send("2");
+    assert!(t.wait_for_from(at, "(read & write) ·", 20), "{}", tail(&t.text()));
+    t.settle(200, 3);
+    let at = t.text().len();
+    t.send("4"); // Done after two folders and Add another folder.
+    assert!(t.wait_for_from(at, "Folders  · (read & write) +1", 20), "{}", tail(&t.text()));
+    assert!(t.text()[at..].contains('…'), "long path was not clipped:\n{}", tail(&t.text()));
+    t.send("\x1b");
 }
 
 // ---------------------------------------------------------------------------
