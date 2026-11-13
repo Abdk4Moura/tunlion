@@ -10,11 +10,12 @@ Build a debug APK with:
 gradle :app:assembleDebug
 ```
 
-The preview uses one journey: set up this phone, connect a device, select it,
-then send a file. Home contains this phone's availability and known devices;
-code entry is a dedicated task, Files is contextual, and Settings lives in the
-header. There is no bottom navigation bar. Screen changes use short slide/fade
-transitions and in-flight actions prevent repeated submission.
+The current native slice is identity setup, read-only stored-device facts, and
+file-code send/receive. Fleet enrollment is required follow-up, not a completed
+feature. Relationship choices (my device, someone else's, temporary worker) are
+explained independently of code/file/nearby methods, but enrollment controls
+remain unavailable until the shared core exposes confirmation and permissions
+APIs. No Kotlin policy engine or browser fleet behavior is implied.
 
 Navigation uses Jetpack's `NavHost`, with Android predictive back enabled. Back
 gestures seek the destination transition before release; cancelling keeps the
@@ -23,31 +24,95 @@ including Files or setup, rather than always jumping home. Recovery words and
 capture protection remain active until the recovery destination is disposed
 after a committed pop, not when a gesture merely starts.
 
-`TunlionCore` is the app boundary. The temporary `CliTunlionCore` backend drives
-the real Rust CLI for all operations. There is no FFI dependency in this preview.
-The workflow builds the ARM64 and x86_64 CLI from the same revision as the app,
-packages it as `libtunlion_cli.so`, and enables Android native-library extraction
-so the signed executable can run from `nativeLibraryDir`. Local builds require
-the same ABI binaries under `app/src/main/jniLibs/` and a standard Android debug
-keystore under `.signing/preview.keystore`.
+`TunlionCore` is the app boundary. `MainActivity` and `AvailabilityService` use
+one process-owned `NativeTunlionCore`, backed by the generated UniFFI
+`CoreSession`. Blocking calls run off the UI thread. The previous CLI adapter
+and its acceptance harness are quarantined under `android/legacy-cli/`, outside
+every Gradle source set, and are not compiled or run. The app packages no CLI
+executable and never starts a subprocess; the app workflow rejects an APK that
+contains `libtunlion_cli.so` or an executable `assets/` payload.
 
-- Commands use argument arrays, private explicit config paths, structured JSON
-  and exit codes. Stdout and stderr are drained separately without logging
-  invitation material or codes. Cancellation terminates and reaps the child.
-- CLI identity setup happens in a private draft directory. Confirmation promotes
-  the complete state directory; cancelling discards it. Capture is blocked while
-  recovery words are visible. Existing identities and pairings are never replaced.
-- Availability owns an attached `up --userspace` child in a foreground service,
-  with bounded restart backoff. Off waits for shutdown and removes its notification.
-- User-started pair/transfer operations have a foreground service while the app
-  is backgrounded. UI snapshots are polled only while the Activity is started.
-- Invitations are copied into owner-only private files and passed by path, never
-  as invitation bytes in argv. Picker content is staged privately for sending.
-- Verified receive history drives publication into `Download/Tunlion` through
-  MediaStore on Android 10+, with an export journal to avoid duplicate saves.
-  Android 8/9 uses a user-selected SAF folder. No storage permission is requested.
-- The UI reports verified completion only from CLI outcomes/history. Unknown
-  peer presence and routes are left unknown, not invented from stored names.
+The `Android app` workflow builds both `libtunlion_core.so` ABIs and generates
+Kotlin bindings from the same checkout. JNA uses the Android AAR so native
+dispatch is packaged. The APK, instrumentation APK, source head and SHA256
+manifest are separate artifacts. Source-only edits do not constitute a build
+or device verification; use the workflow or an approved leased Android worker.
+
+- Identity setup uses core-owned `PendingIdentity`. Confirmation writes through
+  `commitIdentity`; going back closes the pending object without saving. Existing
+  preview config directories are reused without replacing or parsing keys.
+- Availability starts the native reduced receiver in a foreground service. It
+  does not grant terminal or folder authority. Off waits for the native join.
+- One native engine slot exists. Turn availability off before code transfers.
+  Code sends allocate with `createCode`, show the actual code, then `waitSend`
+  checks receiver acknowledgments. Code receive uses `receiveCode`.
+- File selection uses SAF document URIs, stages only the selected files in
+  private cache, and keeps staging until the blocking sender returns.
+  Cancellation requests native stop independently of the blocked caller, holding
+  the operation lease until cleanup. No resume after process death is promised.
+- Verified core receive history drives publication into `Download/Tunlion` via
+  MediaStore on Android 10+; Android 8/9 uses a user-selected SAF folder. Private
+  originals are kept on publication failure and publication retries on refresh.
+  The integrated core persists a bounded receiver completion journal, so a
+  verified receipt and its public copy are separate, checkable facts. No
+  directory scan is substituted for verification evidence.
+- Identity state is explicit: not read yet, blank, local owner identity, or joined
+  through stored device records without a local owner fingerprint. A blank phone
+  is offered setup or join, never a fabricated identity or device list.
+- Pairing is carrier-first. The spoken code and invitation file are carrier
+  facts, not relationship facts; the relationship choices are labelled intent
+  only. Temporary worker stays disabled for a spoken code and is invitation
+  file only. An invitation file is read once into memory and handed to the
+  core's `previewInvitation`; the screen shows only the core's preview fields
+  and offers Join only when the preview succeeded and the core's `expired` flag
+  is false. Join passes the same bytes to `joinInvitation`. Spoken-code
+  enrollment is still not linked.
+- The device list is projected from core `devices()`, not from Kotlin policy or
+  CLI output. It shows the stored relationship (paired, fleet, temporary,
+  unknown) and every returned action state (effective, pending, blocked,
+  unsupported, unknown), keyed by the core `ActionKind` enum rather than a
+  display string, including expiry and local revocation. Presence stays
+  unknown unless the core reports `Live`; the snapshot does not probe peers. A
+  stored relationship or recorded grant is never shown as proof that a remote
+  action currently works.
+- Sending to a stored device is offered as an explicit attempt only when the
+  core reports outbound authorization as unknown. The result screen reports the
+  receiver's per-file delivery acknowledgment from `SendResult`; an attempt
+  that was not acknowledged is never shown as delivered.
+- Enrollment, capability revocation, device removal and active-session
+  termination are not exposed by the integrated core. Their controls are
+  disabled and labelled unavailable rather than simulated. Enrollment is
+  expected to use shared `filament-id::enrollment` facts when that surface
+  exists; this client does not mint relationship or permission authority.
+- Discovery, expiry enforcement beyond stored facts, and recovery import still
+  need core APIs. No successful stub or inferred remote permission is used.
+  Offline and route facts remain unknown.
+
+## Client parity
+
+Android is an adapter over the shared core, not a second fleet model. It
+projects the core's identity, device snapshot and transfer receipts; it does
+not evaluate access, enroll devices or perform removal. The instrumentation
+suite exercises the same core facts as the CLI (identity, relationship versus
+access, expiry/denial, verified receipt). Enrollment, capability removal,
+device removal, active-session termination, and browser/WASM parity remain
+blocked on the shared core surface and are not reimplemented in Kotlin.
+
+## Native acceptance
+
+`NativeCoreAcceptanceTest` checks real native identity confirmation, mismatch
+rejection without writes, duplicate identity refusal and malformed-code refusal.
+`NativeAdapterAcceptanceTest` drives a real desktop sender through the app
+adapter, verifies the published bytes against the sender's SHA-256, and checks
+the typed `devices()` projection without exporting pair secrets.
+`DeviceAuthorityUiTest` checks the relationship and action-state UI contract,
+including that an unknown remote send permission permits only an explicit
+attempt and that removal controls stay disabled and labelled unavailable.
+`NativePeerAcceptanceTest` requires a real sender plus `code`, `sha256`, `bytes`
+instrumentation arguments and verifies exact stored bytes against the digest.
+These tests must run on a leased worker or CI. `CliAndroidAcceptanceTest` is
+quarantined under `android/legacy-cli/` and is not evidence for the native
+adapter.
 
 ## Preview feedback
 

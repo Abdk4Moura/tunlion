@@ -205,6 +205,10 @@ The cross-engine gates add real bytes both ways: a CLI `send --code` into
 `wait_send` into a normal CLI `receive <code>` (`core-send-e2e-gates.sh`), with
 the inbox compared byte for byte, the summary's stored/bytes/sha256 asserted,
 the sender exit checked, and the receiver/sender logs checked for the code.
+The invitation gate adds a real invite-file path: a CLI owner mints an
+invitation and a blank Core joins it through `Core::join_invitation`
+(`core-invitation-join-gates.sh`), asserting the preview, the stored
+transfer-only ceiling, the local certificate/name and the owner's record.
 Android keeps the reduced `filament-peerloop` profile: no
 `mount-server`, `forward-server`, `mesh` or `fleet` sectors compile into the
 core library, and the graph gate fails if they do. The shipped Android CLI is

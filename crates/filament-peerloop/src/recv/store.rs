@@ -43,7 +43,8 @@
 
 use anyhow::{Context, Result};
 use filament_cap::capability::{
-    now_secs as cap_now_secs, superseded_by_tombstone, CapOp, PrincipalKind, CAP_TOMBSTONE_TYPE,
+    apply_header, now_secs as cap_now_secs, self_resource_id, superseded_by_tombstone,
+    update_ratchet, CapHeader, CapOp, PrincipalKind, CAP_TOMBSTONE_TYPE,
 };
 use filament_cap::ephemeral::Reuse;
 use filament_id::{now_secs, DeviceCert, KeyStore, UserKey};
@@ -135,6 +136,35 @@ pub struct InvitationLedgerEntry {
     pub uses: u64,
     pub expires: u64,
     pub withdrawn: bool,
+}
+
+/// The armed-invitation record. `key_id` is the enrollment PUBLIC key (hex),
+/// never its private half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArmedInvitation {
+    pub key_id: String,
+    pub expires: u64,
+    pub name: Option<String>,
+    pub kind: Option<String>,
+    pub allow: Option<Vec<String>>,
+    /// The mint's reuse shape as JSON (`"once"`, a number, `"forever"`).
+    /// Presentation only: admission reads the signed invitation and the
+    /// durable use count, never this field.
+    pub reuse: Option<Value>,
+    pub created: Option<u64>,
+}
+
+impl ArmedInvitation {
+    /// The short id the owner can name it by: the first 12 hex digits of the
+    /// public key, unique in practice and never secret.
+    pub fn id(&self) -> &str {
+        &self.key_id[..self.key_id.len().min(12)]
+    }
+
+    /// The name shown and matched, `(unnamed)` when the mint gave none.
+    pub fn label(&self) -> String {
+        self.name.clone().unwrap_or_else(|| format!("({})", self.id()))
+    }
 }
 
 /// Terminal principal states written to `principalState` on a device record.
@@ -777,6 +807,34 @@ impl DeviceStore {
 
     pub fn local_device_cert_path(&self) -> PathBuf {
         self.root.join(LOCAL_DEVICE_CERT_FILE)
+    }
+
+    pub fn armed_path(&self) -> PathBuf {
+        self.root.join("armed.json")
+    }
+
+    fn armed_lock_path(&self) -> PathBuf {
+        self.root.join("armed.json.lock")
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.root.join("config")
+    }
+
+    fn config_lock_path(&self) -> PathBuf {
+        self.root.join("config.lock")
+    }
+
+    /// Run `f` under the same `identity.lock` the owner-key bootstrap and the
+    /// join acknowledgement use. A blank device claiming an invitation and a
+    /// concurrent first-run owner bootstrap must not both decide who owns this
+    /// directory.
+    pub fn with_identity_lock<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        create_private_dir_all(&self.root)
+            .with_context(|| format!("create config dir {}", self.root.display()))?;
+        let _lock = StoreLock::acquire(&self.root.join("identity.lock"))
+            .with_context(|| format!("lock {}", self.root.join("identity.lock").display()))?;
+        f(self)
     }
 
     fn provisional_path(&self, name: &str) -> PathBuf {
@@ -1602,68 +1660,244 @@ impl DeviceStore {
         pending.commit(&self.keystore())
     }
 
-    /// Any unexpired armed invitation? Prunes expired entries on read, so the
-    /// file self-cleans and a stale entry never keeps the enrollment room open.
-    pub fn is_armed(&self) -> bool {
-        let path = self.root.join("armed.json");
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            return false;
+    /// Record an outstanding invitation in `armed.json`. The whole
+    /// read/modify/write runs under `armed.json.lock`, so two mints (or a
+    /// mint and the daemon's pruning pass) cannot lose each other's entry.
+    /// Dedupes by key id and drops entries whose expiry has passed.
+    pub fn arm_invitation(&self, entry: ArmedInvitation, now: u64) -> Result<()> {
+        create_private_dir_all(&self.root)
+            .with_context(|| format!("create config dir {}", self.root.display()))?;
+        let _lock = StoreLock::acquire(&self.armed_lock_path())
+            .with_context(|| format!("lock {}", self.armed_lock_path().display()))?;
+        let mut entries = self.read_armed_strict()?;
+        entries.retain(|e| e.expires > now && e.key_id != entry.key_id);
+        entries.push(entry);
+        self.write_armed(&entries)
+    }
+
+    /// Every unexpired armed invitation, oldest first. Expired entries are
+    /// pruned under the lock, so the file self-cleans and a stale entry never
+    /// keeps the enrollment room open. A corrupt file is reported rather than
+    /// silently replaced: an owner must be able to see that arming failed.
+    pub fn armed_invitations(&self, now: u64) -> Result<Vec<ArmedInvitation>> {
+        if !self.armed_path().exists() {
+            return Ok(Vec::new());
+        }
+        create_private_dir_all(&self.root)
+            .with_context(|| format!("create config dir {}", self.root.display()))?;
+        let _lock = StoreLock::acquire(&self.armed_lock_path())
+            .with_context(|| format!("lock {}", self.armed_lock_path().display()))?;
+        let before = self.read_armed_strict()?;
+        let mut entries: Vec<ArmedInvitation> =
+            before.iter().filter(|e| e.expires > now).cloned().collect();
+        if entries.len() != before.len() {
+            self.write_armed(&entries)?;
+        }
+        entries.sort_by(|a, b| a.created.cmp(&b.created).then(a.expires.cmp(&b.expires)));
+        Ok(entries)
+    }
+
+    /// Drop one key from the armed set now. Withdrawal deliberately does NOT
+    /// call this: a withdrawn entry stays armed until expiry so a late claimer
+    /// hears "withdrawn" instead of waiting on a silent room.
+    pub fn disarm_invitation(&self, key_id: &str) -> Result<()> {
+        if !self.armed_path().exists() {
+            return Ok(());
+        }
+        let _lock = StoreLock::acquire(&self.armed_lock_path())
+            .with_context(|| format!("lock {}", self.armed_lock_path().display()))?;
+        let mut entries = self.read_armed_strict()?;
+        entries.retain(|e| e.key_id != key_id);
+        self.write_armed(&entries)
+    }
+
+    fn read_armed_strict(&self) -> Result<Vec<ArmedInvitation>> {
+        let raw = match std::fs::read_to_string(self.armed_path()) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow::anyhow!("read armed.json: {e}")),
         };
-        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-            return false;
-        };
-        let arr = value.as_array().cloned().unwrap_or_default();
-        let now = cap_now_secs();
-        let before = arr.len();
-        let entries: Vec<Value> = arr
-            .into_iter()
-            .filter(|e| {
-                e["key_id"].as_str().is_some() && e["expires"].as_u64().is_some_and(|exp| exp > now)
+        let value: Value = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("armed.json is corrupt: {e}"))?;
+        let arr = value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("armed.json is not a JSON array"))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for e in arr {
+            let key_id = e["key_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("armed.json entry has no key_id"))?
+                .to_string();
+            let expires = e["expires"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("armed.json entry has no expiry"))?;
+            out.push(ArmedInvitation {
+                key_id,
+                expires,
+                name: e["name"].as_str().map(str::to_string),
+                kind: e["kind"].as_str().map(str::to_string),
+                allow: e["allow"].as_array().map(|a| {
+                    a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect()
+                }),
+                reuse: e.get("reuse").cloned().filter(|v| !v.is_null()),
+                created: e["created"].as_u64(),
+            });
+        }
+        Ok(out)
+    }
+
+    fn write_armed(&self, entries: &[ArmedInvitation]) -> Result<()> {
+        let arr: Vec<Value> = entries
+            .iter()
+            .map(|e| {
+                let mut v = json!({ "key_id": e.key_id, "expires": e.expires });
+                if let Some(n) = &e.name {
+                    v["name"] = json!(n);
+                }
+                if let Some(k) = &e.kind {
+                    v["kind"] = json!(k);
+                }
+                if let Some(a) = &e.allow {
+                    v["allow"] = json!(a);
+                }
+                if let Some(r) = &e.reuse {
+                    v["reuse"] = r.clone();
+                }
+                if let Some(c) = e.created {
+                    v["created"] = json!(c);
+                }
+                v
             })
             .collect();
-        if entries.len() != before {
-            if let Ok(body) = serde_json::to_string_pretty(&entries) {
-                let _ = secret_write::SecretFile::write_str(&path, &body);
-            }
-        }
-        !entries.is_empty()
+        let body = serde_json::to_string_pretty(&arr)?;
+        secret_write::SecretFile::write_str(&self.armed_path(), &body)
+            .context("atomic write armed.json")
+    }
+
+    /// Any unexpired armed invitation? Prunes expired entries under the lock,
+    /// so a stale entry never keeps the enrollment room open.
+    pub fn is_armed(&self) -> bool {
+        self.armed_invitations(cap_now_secs())
+            .map(|entries| !entries.is_empty())
+            .unwrap_or(false)
     }
 
     /// The `invitee_name` field recorded for an outstanding invitation, while
-    /// it is unexpired. Explicit-root port of `cli/src/armed.rs`.
+    /// it is unexpired. Read under the same lock as the writers.
     pub fn invitee_name(&self, key_id: &str) -> Option<String> {
-        let now = cap_now_secs();
-        self.armed_entries()
+        self.armed_invitations(cap_now_secs())
+            .ok()?
             .into_iter()
-            .find(|e| {
-                e["key_id"].as_str() == Some(key_id)
-                    && e["expires"].as_u64().is_some_and(|x| x > now)
-            })
-            .and_then(|e| e["name"].as_str().map(str::to_string))
+            .find(|e| e.key_id == key_id)
+            .and_then(|e| e.name)
             .filter(|n| !n.trim().is_empty())
     }
 
     /// The `invitee_kind` (`person`/`device`) recorded for an outstanding
     /// invitation, while it is unexpired.
     pub fn invitee_kind(&self, key_id: &str) -> Option<String> {
-        let now = cap_now_secs();
-        self.armed_entries()
+        self.armed_invitations(cap_now_secs())
+            .ok()?
             .into_iter()
-            .find(|e| {
-                e["key_id"].as_str() == Some(key_id)
-                    && e["expires"].as_u64().is_some_and(|x| x > now)
-            })
-            .and_then(|e| e["kind"].as_str().map(str::to_string))
+            .find(|e| e.key_id == key_id)
+            .and_then(|e| e.kind)
     }
 
-    fn armed_entries(&self) -> Vec<Value> {
-        let Ok(raw) = std::fs::read_to_string(self.root.join("armed.json")) else {
-            return Vec::new();
-        };
-        serde_json::from_str::<Value>(&raw)
-            .ok()
-            .and_then(|v| v.as_array().cloned())
+    /// One `key value` per line, matching the CLI's long-standing config
+    /// format. The read/modify/write runs under `config.lock` so a name set by
+    /// a join cannot be lost to another setting written at the same time.
+    pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
+        create_private_dir_all(&self.root)
+            .with_context(|| format!("create config dir {}", self.root.display()))?;
+        let _lock = StoreLock::acquire(&self.config_lock_path())
+            .with_context(|| format!("lock {}", self.config_lock_path().display()))?;
+        let p = self.config_path();
+        let mut lines: Vec<String> = std::fs::read_to_string(&p)
             .unwrap_or_default()
+            .lines()
+            .filter(|l| l.split_whitespace().next() != Some(key))
+            .map(|l| l.to_string())
+            .collect();
+        lines.push(format!("{key} {value}"));
+        secret_write::SecretFile::write_str(&p, &(lines.join("\n") + "\n"))
+            .context("atomic write config")
+    }
+
+    /// A config value, trimmed. A bare key (empty value) reads as absent, the
+    /// same rule the CLI's `config_get` used.
+    pub fn config_value(&self, key: &str) -> Option<String> {
+        std::fs::read_to_string(self.config_path())
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                let (k, v) = line.split_once(char::is_whitespace)?;
+                (k == key && !v.trim().is_empty()).then(|| v.trim().to_string())
+            })
+    }
+
+    pub fn device_name(&self) -> Option<String> {
+        self.config_value("name")
+    }
+
+    pub fn set_device_name(&self, name: &str) -> Result<()> {
+        self.set_config("name", name)
+    }
+
+    /// Verify and store the owner's signed capability header for resource
+    /// `self`. This is a network-origin write, so it is parsed from JSON,
+    /// checked as a genesis header under the owner key named by the verified
+    /// owner certificate, and only then applied through the shared
+    /// `apply_header` chain (which also advances the ratchet).
+    ///
+    /// Returns `false` when a self header is already present: a duplicate from
+    /// a replayed acknowledgement must not fork or rewrite the chain.
+    pub fn store_owner_cap_header(
+        &self,
+        header_json: &Value,
+        owner_pub: &[u8; 32],
+    ) -> Result<bool> {
+        let header =
+            CapHeader::from_json(header_json).ok_or_else(|| anyhow::anyhow!("cap header is malformed"))?;
+        if header.resource != "self" {
+            anyhow::bail!(
+                "cap header resource '{}' is not this device's 'self' resource",
+                header.resource
+            );
+        }
+        if header.owner_pub != *owner_pub {
+            anyhow::bail!("cap header is signed by a different owner than the verified certificate");
+        }
+        create_private_dir_all(&self.root)
+            .with_context(|| format!("create config dir {}", self.root.display()))?;
+        let lock_path = self.root.join("caps.json.lock");
+        let _lock = StoreLock::acquire(&lock_path)
+            .with_context(|| format!("lock {}", lock_path.display()))?;
+        let mut store = self.load_cap_store();
+        let already = store.iter().any(|e| {
+            e.get("type").and_then(|x| x.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some("self")
+        });
+        if already {
+            return Ok(false);
+        }
+        if header.resource == "self" {
+            // The legacy fleet header is STORED under the caller-facing alias
+            // `self`, but its signature commits to the self-certifying derived
+            // resource id. Rebuild that signed view before verifying; do not
+            // weaken the check to the stored alias.
+            let mut signed = header.clone();
+            signed.resource = self_resource_id(owner_pub);
+            signed.verify_signed_by(owner_pub)?;
+            store.push(header.to_json());
+            update_ratchet(&mut store, owner_pub, header.issued_at)?;
+        } else {
+            // A real resource header must be a genesis with a self-certifying
+            // id; `apply_header` verifies it before writing.
+            apply_header(&mut store, &header)?;
+        }
+        self.save_cap_store(&store)
+            .map_err(|e| anyhow::anyhow!("owner capability header not stored: {e}"))?;
+        Ok(true)
     }
 
     /// The owner-signed `cap_header` for resource "self", if this store has one.
@@ -4843,5 +5077,150 @@ mod remembered_store_tests {
             "a different secret is a different device and still gets its own record"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod invitation_store_tests {
+    use super::*;
+
+    struct TestRoot(PathBuf);
+    impl TestRoot {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "invitation-store-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn armed(key: &str, name: &str, expires: u64) -> ArmedInvitation {
+        ArmedInvitation {
+            key_id: key.repeat(32),
+            expires,
+            name: Some(name.into()),
+            kind: Some("device".into()),
+            allow: Some(vec!["transfer".into(), "mount".into()]),
+            reuse: Some(json!(20)),
+            created: Some(10),
+        }
+    }
+
+    #[test]
+    fn arm_list_disarm_and_expiry_share_one_locked_store() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.0.clone());
+        let now = cap_now_secs();
+        store
+            .arm_invitation(armed("aa", "beta", now + 1_000), now)
+            .unwrap();
+        store
+            .arm_invitation(armed("bb", "old", now.saturating_sub(50)), now)
+            .unwrap();
+        let listed = store.armed_invitations(now).unwrap();
+        assert_eq!(listed.len(), 1, "expired entries are not listed");
+        assert_eq!(listed[0].label(), "beta");
+        assert_eq!(store.invitee_name(&"aa".repeat(32)).as_deref(), Some("beta"));
+        assert!(store.is_armed());
+
+        // Re-arming one key replaces its record instead of duplicating it.
+        store
+            .arm_invitation(armed("aa", "beta-2", now + 1_000), now)
+            .unwrap();
+        let listed = store.armed_invitations(now).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].label(), "beta-2");
+
+        store.disarm_invitation(&"aa".repeat(32)).unwrap();
+        assert!(store.armed_invitations(now).unwrap().is_empty());
+        assert!(!store.is_armed());
+    }
+
+    #[test]
+    fn a_corrupt_armed_file_is_reported_and_not_replaced() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.0.clone());
+        std::fs::write(root.0.join("armed.json"), "{").unwrap();
+        assert!(store.armed_invitations(100).is_err());
+        assert!(store.arm_invitation(armed("aa", "beta", 1_000), 100).is_err());
+        assert_eq!(std::fs::read_to_string(root.0.join("armed.json")).unwrap(), "{");
+    }
+
+    #[test]
+    fn config_name_writes_keep_other_keys() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.0.clone());
+        store.set_config("server", "http://127.0.0.1:1").unwrap();
+        store.set_device_name("phone").unwrap();
+        assert_eq!(store.device_name().as_deref(), Some("phone"));
+        assert_eq!(
+            store.config_value("server").as_deref(),
+            Some("http://127.0.0.1:1")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.0.join("config")).unwrap(),
+            "server http://127.0.0.1:1\nname phone\n"
+        );
+    }
+
+    #[test]
+    fn a_legacy_self_header_is_verified_over_its_signed_resource_id() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.0.clone());
+        let seed = [4u8; 32];
+        let owner = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        use ring::signature::KeyPair;
+        let owner_pub: [u8; 32] = owner.public_key().as_ref().try_into().unwrap();
+        let nonce = [9u8; 32];
+        let mut header = filament_cap::capability::CapHeader {
+            resource: filament_cap::capability::self_resource_id(&owner_pub),
+            epoch: 0,
+            owner_pub,
+            nonce,
+            floors: Vec::new(),
+            issued_at: 10,
+            prev_owner_pub: None,
+            prev_header_hash: None,
+            sig: [0u8; 64],
+        };
+        header.sig = filament_cap::capability::sign_cap_header(&header, &owner);
+        let mut stored = header.to_json();
+        stored["resource"] = json!("self");
+        assert!(store.store_owner_cap_header(&stored, &owner_pub).unwrap());
+        assert!(!store.store_owner_cap_header(&stored, &owner_pub).unwrap());
+        assert!(store.owner_cap_header().is_some());
+        let _ = std::fs::remove_dir_all(&root.0);
+    }
+
+    #[test]
+    fn an_invalid_owner_header_never_reaches_the_store() {
+        let root = TestRoot::new();
+        let store = DeviceStore::open(root.0.clone());
+        let owner = [7u8; 32];
+        let header = json!({
+            "type": "cap_header",
+            "resource": "self",
+            "epoch": 0,
+            "owner_pub": hex::encode(owner),
+            "nonce": hex::encode([1u8; 32]),
+            "floors": [],
+            "issued_at": 10,
+            "prev_owner_pub": null,
+            "prev_header_hash": null,
+            "sig": hex::encode([0u8; 64]),
+        });
+        assert!(store.store_owner_cap_header(&header, &owner).is_err());
+        assert!(!store.cap_store_path().exists());
     }
 }

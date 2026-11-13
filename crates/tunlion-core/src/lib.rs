@@ -20,9 +20,21 @@
 
 mod host;
 mod devices;
+mod enrollment;
 mod lifecycle;
-pub use devices::{AccessState, ActionKind, ActionPolicy, DeliveryKind, DeliveryState, DeviceAccess, DevicePolicy, DevicePresence, DeviceRelationship, EffectiveAction, EnrollmentKind, EnrollmentState, PolicySource};
-pub use lifecycle::{CapabilityOutcome, CapabilityReceipt, EnrollmentStatus, EnrollmentSupport, LiftedKeyBlock, RemovalMode, RemovalReceipt, SessionsSummary};
+pub use devices::{
+    AccessState, ActionKind, ActionPolicy, DeliveryKind, DeliveryState, DeviceAccess, DevicePolicy,
+    DevicePresence, DeviceRelationship, EffectiveAction, EnrollmentKind, EnrollmentState,
+    PolicySource,
+};
+pub use enrollment::{
+    CoreInvitationInput, CoreInvitationKind, CoreInvitationPreview, CoreInvitationReuse,
+    CoreJoinResult, CoreOutstandingInvitation, EnrollmentRelationship,
+};
+pub use lifecycle::{
+    CapabilityOutcome, CapabilityReceipt, EnrollmentStatus, EnrollmentSupport, LiftedKeyBlock,
+    RemovalMode, RemovalReceipt, SessionsSummary,
+};
 pub mod access;
 
 uniffi::setup_scaffolding!();

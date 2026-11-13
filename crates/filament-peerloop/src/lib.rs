@@ -75,6 +75,7 @@ pub mod handoff;
 pub mod holepunch;
 pub mod host;
 pub mod identity;
+pub mod invitation;
 pub mod l2;
 #[cfg(feature = "l3")]
 pub mod l3;
