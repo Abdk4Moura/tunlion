@@ -237,9 +237,10 @@ impl CertlessPair {
     }
 
     fn from_link(conn: &Conn, pid: &str) -> Option<Self> {
-        if conn.link(pid)?.identity_state == filament_cap::capability::IdentityState::ExplicitlyUnavailableAnonymous {
-            return None;
-        }
+        // Identity state is about a CERTIFICATE, not the pair. A certless pair
+        // that answered `identity-unavailable` is honestly anonymous for
+        // transfer, yet its exact stored secret still authenticates the shell
+        // relationship; only an explicit grant may use it.
         Self::authenticated_binding(conn, pid)
     }
 
@@ -277,29 +278,6 @@ pub struct TerminalSessionScope {
     pair_binding: Option<String>,
     require_name_key: bool,
     identity_state: filament_cap::capability::IdentityState,
-}
-
-/// An unavailable certificate does not erase a separately proven pair. Recover
-/// only from exact, current-store pair evidence, never from consent or timeout.
-pub(crate) fn preserve_authenticated_pair(conn: &mut Conn, pid: &str) -> bool {
-    if CertlessPair::authenticated_binding(conn, pid).is_none() {
-        return false;
-    }
-    if let Some(link) = conn.link_mut(pid) {
-        link.identity_state = pair_identity_state(link.identity_state, true);
-    }
-    true
-}
-
-fn pair_identity_state(
-    state: filament_cap::capability::IdentityState,
-    authenticated_pair: bool,
-) -> filament_cap::capability::IdentityState {
-    use filament_cap::capability::IdentityState;
-    if authenticated_pair && state == IdentityState::ExplicitlyUnavailableAnonymous {
-        return IdentityState::Pending;
-    }
-    state
 }
 
 fn terminal_pair_binding(sibling: bool, secret: Option<&str>) -> Option<String> {
@@ -374,7 +352,6 @@ impl TerminalSessionScope {
         let inputs = ShellGateInputs {
             certless_pair: if self.trusted && !self.sibling
                 && self.device.is_none() && self.user.is_none() && self.key_caps.is_none()
-                && self.identity_state != filament_cap::capability::IdentityState::ExplicitlyUnavailableAnonymous
             {
                 self.name.as_ref().zip(self.pair_binding.as_ref()).map(|(name, secret)| CertlessPair {
                     name: name.clone(), secret: secret.clone(),
@@ -612,7 +589,6 @@ fn decide_with_legacy(
         // evaluator as if unresolved identity were certificate authority.
         return if inputs.trusted && legacy_ok && !inputs.denied && !inputs.cert_revoked
             && inputs.idev.is_none() && inputs.iusr.is_none() && inputs.ak_caps.is_none()
-            && inputs.identity_state != filament_cap::capability::IdentityState::ExplicitlyUnavailableAnonymous
             && pair.current(host)
         {
             Ok(())
@@ -788,16 +764,6 @@ mod terminal_lifecycle_tests {
         assert!(scope.withdrawn(&host), "unresolved identity must not retain shell access");
     }
 
-    #[test]
-    fn unavailable_certificate_does_not_erase_an_independently_authenticated_pair() {
-        use filament_cap::capability::IdentityState;
-        let anonymous = IdentityState::ExplicitlyUnavailableAnonymous;
-        assert_eq!(pair_identity_state(anonymous, false), anonymous);
-        assert_eq!(pair_identity_state(anonymous, true), IdentityState::Pending);
-        assert_eq!(pair_identity_state(IdentityState::Resolved, true), IdentityState::Resolved);
-        assert!(require_shell_identity(pair_identity_state(anonymous, true), None).is_err());
-    }
-
     fn legacy_pair_scope() -> TerminalSessionScope {
         let mut scope = sibling("paired", 1);
         scope.sibling = false;
@@ -820,19 +786,29 @@ mod terminal_lifecycle_tests {
         assert!(scope.withdrawn(&host), "fleet grants cannot authorize a certless pair");
         host.0.lock().unwrap().local_grants.insert("paired".into());
         assert!(!scope.withdrawn(&host), "current authenticated pair plus local grant must work");
+        let mut anonymous = scope.clone();
+        anonymous.identity_state =
+            filament_cap::capability::IdentityState::ExplicitlyUnavailableAnonymous;
+        assert!(
+            !anonymous.withdrawn(&host),
+            "a certless pair stays shell-authorized by its exact secret when its identity is honestly anonymous"
+        );
         host.0.lock().unwrap().denies.insert("paired".into());
         assert!(scope.withdrawn(&host), "local deny overrides pair permission");
     }
 
     #[test]
-    fn certless_pair_access_ends_on_secret_replacement_forget_or_anonymous_state() {
+    fn certless_pair_access_ends_on_secret_replacement_or_forget() {
         let host = Host::default();
         host.0.lock().unwrap().pairs.push(("paired".into(), "authenticated-pair-secret".into()));
         host.0.lock().unwrap().local_grants.insert("paired".into());
         let mut scope = legacy_pair_scope();
         assert!(!scope.withdrawn(&host));
         scope.identity_state = filament_cap::capability::IdentityState::ExplicitlyUnavailableAnonymous;
-        assert!(scope.withdrawn(&host), "anonymous consent must never become pair authority");
+        assert!(
+            !scope.withdrawn(&host),
+            "anonymous is an identity fact, not a revocation of an explicitly granted pair"
+        );
         scope.identity_state = filament_cap::capability::IdentityState::Pending;
         scope.trusted = false;
         assert!(scope.withdrawn(&host), "a guessed secret is not an authenticated pair");

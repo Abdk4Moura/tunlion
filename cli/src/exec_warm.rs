@@ -397,8 +397,12 @@ mod tests {
             String::from_utf8(buf).unwrap()
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "filament-warm-exec-{}-{}",
+        // Unix socket paths are capped at SUN_LEN (~108 bytes). A CI runner's
+        // TMPDIR is a deep job directory, so the old descriptive name pushed
+        // this test's path past the cap and it failed with EINVAL before it
+        // tested anything. /tmp is short everywhere this test compiles.
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
+            "fw-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

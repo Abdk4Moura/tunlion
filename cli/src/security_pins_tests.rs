@@ -420,3 +420,174 @@ fn signed_bounded_grant_reaches_the_gate_under_one_header() {
         assert!(!issue_signed_bounded_grant("bare", "shell", exp).unwrap());
     })
 }
+
+// ---------------------------------------------------------------------------
+// Live capability cut (`tunlion revoke <device> shell` on a live L2 stream)
+// ---------------------------------------------------------------------------
+
+/// The shell revoke an operator runs MUST end the ssh/L2 stream already riding
+/// that grant: `live_session_cut` reports nothing (the certificate and the
+/// invitation are intact), so the L2 ticker's capability question is the only
+/// decision that can close it. An unrelated revoke changes no source the
+/// stream rides and must leave it alone.
+#[test]
+fn live_capability_cut_ends_a_shell_stream_and_spares_an_unrelated_revoke() {
+    use crate::host_impl::CliHost;
+    use filament_peerloop::host::HostServices;
+    with_cfg(|dir| {
+        let peer = user();
+        let device = rand32();
+        write_devices(
+            dir,
+            json!([{
+                "name": "alpha", "secret": "s", "v": 2,
+                "caps": ["transfer", "shell", "mount"],
+                "deviceCert": cert(&peer, device).to_json()
+            }]),
+        );
+        let host = CliHost;
+        assert_eq!(
+            host.live_capability_cut(Some(&device), "shell"),
+            None,
+            "an intact shell grant was cut"
+        );
+
+        // An unrelated capability revoke: shell still holds its own grant.
+        crate::device_caps::device_set_cap("alpha", "mount", false, None).unwrap();
+        assert_eq!(
+            host.live_capability_cut(Some(&device), "shell"),
+            None,
+            "revoking mount cut the shell stream"
+        );
+
+        // The decision this predicate exists for.
+        crate::device_caps::device_set_cap("alpha", "shell", false, None).unwrap();
+        let cut = host
+            .live_capability_cut(Some(&device), "shell")
+            .expect("a revoked shell grant must cut the live stream");
+        assert!(
+            cut.contains("shell revoked for 'alpha'"),
+            "the close must reuse the shell-revoked wording, got: {cut}"
+        );
+        assert_eq!(
+            host.live_capability_cut(Some(&device), "transfer"),
+            None,
+            "the shell deny spread to another capability"
+        );
+    })
+}
+
+/// An owner-signed enrolment ceiling is authoritative: when it stops covering
+/// shell, no grant here can restore it. A bounded grant that ran out is a
+/// withdrawal too, while a live one is not.
+#[test]
+fn live_capability_cut_follows_a_narrowed_ceiling_and_a_lapsed_grant() {
+    use crate::host_impl::CliHost;
+    use filament_peerloop::host::HostServices;
+    with_cfg(|dir| {
+        let peer = user();
+        let delegated = rand32();
+        let bounded = rand32();
+        write_devices(
+            dir,
+            json!([
+                {"name": "guest", "secret": "s1", "v": 2, "caps": ["transfer", "shell"],
+                 "principalKind": "delegated", "principalCeiling": ["transfer"],
+                 "deviceCert": cert(&peer, delegated).to_json()},
+                {"name": "bounded", "secret": "s2",
+                 "deviceCert": cert(&peer, bounded).to_json()}
+            ]),
+        );
+        let host = CliHost;
+        assert_eq!(
+            host.live_capability_cut(Some(&delegated), "shell"),
+            Some(filament_peerloop::refusal::CEILING_REASON.to_string()),
+            "a ceiling that excludes shell must cut the stream"
+        );
+
+        let now = identity::now_secs();
+        crate::device_caps::device_set_cap("bounded", "shell", true, Some(now + 3600)).unwrap();
+        assert_eq!(
+            host.live_capability_cut(Some(&bounded), "shell"),
+            None,
+            "a live bounded grant was cut"
+        );
+        crate::device_caps::device_set_cap("bounded", "shell", true, Some(now - 1)).unwrap();
+        let cut = host
+            .live_capability_cut(Some(&bounded), "shell")
+            .expect("a lapsed bounded grant must cut the stream");
+        assert!(
+            cut.contains("shell not granted to 'bounded'"),
+            "the close must say the grant is gone, got: {cut}"
+        );
+    })
+}
+
+/// Forget and certificate revocation keep their own words even when this
+/// predicate is asked on its own (the serving loops ask `live_session_cut`
+/// first; this is the second line of defence, not a replacement).
+#[test]
+fn live_capability_cut_keeps_forget_and_revocation_wording() {
+    use crate::host_impl::CliHost;
+    use filament_peerloop::host::HostServices;
+    with_cfg(|dir| {
+        let peer = user();
+        let revoked = rand32();
+        let forgotten = rand32();
+        write_devices(
+            dir,
+            json!([
+                {"name": "revoked", "secret": "s1", "certRevoked": true,
+                 "deviceCert": cert(&peer, revoked).to_json()},
+                {"name": "forgotten", "secret": "s2",
+                 "deviceCert": cert(&peer, forgotten).to_json()}
+            ]),
+        );
+        let host = CliHost;
+        assert_eq!(
+            host.live_capability_cut(Some(&revoked), "shell"),
+            Some(crate::identity_state::DEVICE_REVOKED_REASON.to_string()),
+            "a revoked certificate must keep 'device revoked'"
+        );
+        // `devices forget` writes the key block, which folds into revocation:
+        // the CAUSE is still a forget, and the peer must hear "not recognized".
+        std::fs::write(
+            dir.join(crate::fleet_support::KEY_REVOCATIONS_FILE),
+            serde_json::to_string(&json!([{
+                "devicePub": hex::encode(forgotten),
+                "certExpires": identity::now_secs() + 3600
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            host.live_capability_cut(Some(&forgotten), "shell"),
+            Some(crate::refusal::UNRECOGNIZED_REASON.to_string()),
+            "a forgotten device must read 'not recognized', never 'device revoked'"
+        );
+    })
+}
+
+/// No resolved identity, or a key with no record, is no opinion: the predicate
+/// never fabricates a cut for a peer it cannot name.
+#[test]
+fn live_capability_cut_has_no_opinion_without_a_known_identity() {
+    use crate::host_impl::CliHost;
+    use filament_peerloop::host::HostServices;
+    with_cfg(|dir| {
+        let peer = user();
+        let known = rand32();
+        write_devices(
+            dir,
+            json!([{"name": "alpha", "secret": "s", "v": 2, "caps": ["transfer", "shell"],
+                    "deviceCert": cert(&peer, known).to_json()}]),
+        );
+        let host = CliHost;
+        assert_eq!(host.live_capability_cut(None, "shell"), None, "an unidentified peer was cut");
+        assert_eq!(
+            host.live_capability_cut(Some(&rand32()), "shell"),
+            None,
+            "an unknown key was cut"
+        );
+    })
+}
