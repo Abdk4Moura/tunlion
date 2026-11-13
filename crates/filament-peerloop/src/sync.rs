@@ -553,6 +553,41 @@ fn windows_root_rel(drop_dir: &Path, request: &str) -> Option<PathBuf> {
     path_within(drop_dir, &drop_dir.join(&rel)).then_some(rel)
 }
 
+/// How long an owner waits for a cancelled served sync task to finish before
+/// aborting it. Cancellation is only observed at a record boundary; a task
+/// parked inside a transport write is released by the link close the caller
+/// performs first, which lands well inside this bound (the drop grace is 2 s).
+/// The bound is the backstop for any other stall, so the event loop that owns
+/// the task can never wait on it forever.
+pub const SYNC_JOIN_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The outcome of [`join_bounded`].
+#[derive(Debug)]
+pub enum BoundedJoin<T> {
+    /// The task finished (or panicked or was cancelled) within the bound.
+    Joined(Result<T, tokio::task::JoinError>),
+    /// The bound expired. The task was aborted and its handle detached; an
+    /// abort takes effect at the task's next await point.
+    Aborted,
+}
+
+/// Join `handle` for at most `bound`. On expiry the task is aborted instead of
+/// awaited, so a caller on an event loop never parks on a task that stopped
+/// making progress. The handle is polled at least once, so a task that already
+/// finished is joined even with a zero bound.
+pub async fn join_bounded<T>(
+    mut handle: tokio::task::JoinHandle<T>,
+    bound: std::time::Duration,
+) -> BoundedJoin<T> {
+    match tokio::time::timeout(bound, &mut handle).await {
+        Ok(result) => BoundedJoin::Joined(result),
+        Err(_) => {
+            handle.abort();
+            BoundedJoin::Aborted
+        }
+    }
+}
+
 /// Stateful receiver for an admitted sync stream. This module owns record
 /// framing, manifest validation, delta planning, bounded file writes, content
 /// verification, deletion, cancellation and stream cleanup. The CLI owns the
@@ -749,6 +784,15 @@ pub mod serving {
             mut self,
         ) -> std::result::Result<std::result::Result<(), String>, tokio::task::JoinError> {
             self.join.take().expect("sync task joined once").await
+        }
+
+        /// [`Self::join`] for at most `bound`; on expiry the task is aborted
+        /// (see [`super::join_bounded`]). Callers on the event loop use this.
+        pub async fn join_within(
+            mut self,
+            bound: Duration,
+        ) -> super::BoundedJoin<std::result::Result<(), String>> {
+            super::join_bounded(self.join.take().expect("sync task joined once"), bound).await
         }
     }
 
@@ -2026,6 +2070,57 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
+
+    /// Sets its flag when dropped: proof that an aborted task's future was
+    /// actually torn down rather than left parked.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_join_aborts_a_task_parked_forever() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        // A served sync task stuck on a write that never completes.
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            Ok::<(), String>(())
+        });
+        let bound = Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let outcome = join_bounded(handle, bound).await;
+        let waited = started.elapsed();
+        assert!(
+            matches!(outcome, BoundedJoin::Aborted),
+            "a parked task must be reported aborted, got {outcome:?}"
+        );
+        assert!(waited >= bound, "the join waited out its bound ({waited:?})");
+        assert!(
+            waited < Duration::from_secs(2),
+            "the join returned within the bound, not when the task finished ({waited:?})"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the aborted task's future is dropped");
+    }
+
+    #[tokio::test]
+    async fn bounded_join_returns_a_finished_task_result() {
+        let handle = tokio::spawn(async { Err::<(), String>("refused".into()) });
+        match join_bounded(handle, Duration::from_secs(5)).await {
+            BoundedJoin::Joined(Ok(result)) => assert_eq!(result, Err("refused".to_string())),
+            other => panic!("a finished task is joined with its result, got {other:?}"),
+        }
+    }
 
     const PID: &str = "sync-peer";
     const SID: u32 = l2::L2_SID_BASE + 7;

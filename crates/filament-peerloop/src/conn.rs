@@ -242,9 +242,15 @@ const BUILD_REAP_GRACE: Duration = Duration::from_secs(30);
 /// attempt was refused ("retirement drain capacity full"), which turns one
 /// stuck build into a permanent direct-path outage. Abort and drain after this.
 const RETIRED_DRAIN_BUDGET: Duration = Duration::from_secs(30);
-/// Even if the drain event is lost, a tombstone older than this cannot still be
-/// protecting a live producer: the budget above already aborted it. Reaping at
-/// 2x the budget keeps the cap from ever wedging the path permanently.
+/// Backstop for a lost drain event, applied ONLY to a tombstone whose producer
+/// is known terminal (its drain task set [`RetiredAttempt::drained`]). Age
+/// alone proves nothing: the abort above takes effect only at the producer's
+/// next await, so a producer stuck elsewhere can outlive any budget, and
+/// reaping its tombstone would let its late ready be adopted. A live, undrained
+/// producer therefore keeps its slot, and new attempts fail closed against
+/// [`MAX_RETIRED_ATTEMPTS`]. A drained tombstone still waits out this TTL
+/// because its `AttemptDrained` barrier may be queued behind the old attempt's
+/// own events; past it, the event was lost and the slot is reaped.
 const RETIRED_TOMBSTONE_TTL: Duration = Duration::from_secs(60);
 /// Direct attempts that expired at the same time are handed to the caller one
 /// per call, not as a batch. The fallback caller awaits a full WebRTC establish
@@ -1523,6 +1529,25 @@ pub enum DirectAdoption {
 pub struct RetiredAttempt {
     pub pid: String,
     pub at: Instant,
+    /// Set by the drain task only once the attempt's readiness producer is
+    /// terminal (its handle returned, by completion or after abort), or at
+    /// retirement when there is no async producer. Only a drained tombstone
+    /// may be reaped by age; see [`RETIRED_TOMBSTONE_TTL`].
+    pub drained: Arc<AtomicBool>,
+}
+
+impl RetiredAttempt {
+    /// A tombstone whose producer is not yet known terminal.
+    pub fn new(pid: impl Into<String>) -> Self {
+        Self { pid: pid.into(), at: Instant::now(), drained: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// May the capacity backstop reap this tombstone at `now`? Only when its
+    /// producer is terminal AND the drain barrier had the TTL to arrive.
+    fn reapable(&self, now: Instant) -> bool {
+        self.drained.load(Ordering::Acquire)
+            && now.duration_since(self.at) >= RETIRED_TOMBSTONE_TTL
+    }
 }
 
 pub struct Conn {
@@ -4466,6 +4491,13 @@ impl Conn {
         Some(pending)
     }
 
+    /// Reap tombstones whose producer is terminal and whose drain barrier has
+    /// had [`RETIRED_TOMBSTONE_TTL`] to arrive. An undrained tombstone is kept
+    /// however old: its producer may still emit a ready.
+    fn reap_drained_tombstones(&mut self, now: Instant) {
+        self.retired_attempts.retain(|_, retired| !retired.reapable(now));
+    }
+
     /// Retire an attempt and enqueue its terminal-drain barrier only after the
     /// finite readiness producer is terminal.
     fn retire_attempt(
@@ -4477,10 +4509,9 @@ impl Conn {
         if self.retired_attempts.contains_key(&attempt) {
             return;
         }
-        self.retired_attempts.insert(
-            attempt,
-            RetiredAttempt { pid: pid.to_string(), at: Instant::now() },
-        );
+        let retired = RetiredAttempt::new(pid);
+        let drained = retired.drained.clone();
+        self.retired_attempts.insert(attempt, retired);
         match task {
             Some(handle) => {
                 let tx = self.tx.clone();
@@ -4498,12 +4529,16 @@ impl Conn {
                         handle.abort();
                         let _ = handle.await;
                     }
+                    // Only now is the producer terminal: the tombstone may be
+                    // reaped by age if this barrier is lost.
+                    drained.store(true, Ordering::Release);
                     let _ = tx.send(Ev::AttemptDrained(attempt));
                 });
             }
             None => {
                 // A promotion-held readiness producer is synchronous; no async
                 // producer can emit after this loop turn.
+                drained.store(true, Ordering::Release);
                 let _ = self.tx.send(Ev::AttemptDrained(attempt));
             }
         }
@@ -5281,12 +5316,10 @@ impl Conn {
             Instant::now() + direct::DIRECT_BUDGET
         };
         if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
-            // Liveness backstop: a tombstone older than the abort budget cannot
-            // still be protecting a live producer. If its drain event was lost,
-            // reap it rather than leaving the direct path permanently refused.
-            let now = Instant::now();
-            self.retired_attempts
-                .retain(|_, retired| now.duration_since(retired.at) < RETIRED_TOMBSTONE_TTL);
+            // Liveness backstop for a lost drain event. Only a tombstone whose
+            // producer is terminal is reaped; a live producer keeps its slot
+            // and this attempt fails closed below.
+            self.reap_drained_tombstones(Instant::now());
             if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
                 self.log.debug(&format!(
                     "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
@@ -12187,7 +12220,7 @@ mod warm_identity_tests {
             if retired {
                 conn.retired_attempts.insert(
                     attempt,
-                    RetiredAttempt { pid: pid.into(), at: Instant::now() },
+                    RetiredAttempt::new(pid),
                 );
             } else {
                 conn.revoked_bindings.insert("old-secret".into());
@@ -12589,7 +12622,7 @@ mod warm_identity_tests {
         conn.revoked_bindings.remove("secret");
         conn.retired_attempts.insert(
             attempt,
-            RetiredAttempt { pid: pid.into(), at: Instant::now() },
+            RetiredAttempt::new(pid),
         );
         let retired: Arc<dyn Transport> = Rec::with_attempt("retired", &log, attempt);
         conn.stash_upgrade_standby(pid, retired.clone(), "direct-quic");
@@ -12949,7 +12982,7 @@ mod warm_identity_tests {
         conn.seed_lan(fresh_pid, "dev", "secret", false, fresh_attempt);
         conn.retired_attempts.insert(
             fresh_attempt,
-            RetiredAttempt { pid: fresh_pid.into(), at: Instant::now() },
+            RetiredAttempt::new(fresh_pid),
         );
         assert!(matches!(
             conn.adopt_direct(fresh_pid, fresh.clone(), filament_transport::lan::ROUTE_LAN),
@@ -12957,6 +12990,82 @@ mod warm_identity_tests {
         ));
         assert!(fresh.is_dead());
         assert!(!conn.links.contains_key(fresh_pid));
+    }
+
+    /// The capacity backstop reaps a tombstone by age only once its producer
+    /// is terminal. A drained tombstone past the TTL is reaped (its drain event
+    /// was lost); an undrained one past the TTL is kept, because its producer
+    /// may still emit a ready; a drained one inside the TTL is kept, because
+    /// its barrier may still be queued.
+    #[tokio::test]
+    async fn only_a_drained_tombstone_is_reaped_past_its_ttl() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let drained_old = net::AttemptId::next();
+        let live_old = net::AttemptId::next();
+        let drained_young = net::AttemptId::next();
+        let at = Instant::now();
+        let tombstone = |drained: bool| RetiredAttempt {
+            pid: "sid-retired".into(),
+            at,
+            drained: Arc::new(AtomicBool::new(drained)),
+        };
+        conn.retired_attempts.insert(drained_old, tombstone(true));
+        conn.retired_attempts.insert(live_old, tombstone(false));
+        conn.reap_drained_tombstones(at + RETIRED_TOMBSTONE_TTL / 2);
+        assert_eq!(conn.retired_attempts.len(), 2, "nothing is reaped inside the TTL");
+
+        conn.retired_attempts.insert(drained_young, RetiredAttempt {
+            pid: "sid-retired".into(),
+            at: at + RETIRED_TOMBSTONE_TTL,
+            drained: Arc::new(AtomicBool::new(true)),
+        });
+        conn.reap_drained_tombstones(at + RETIRED_TOMBSTONE_TTL + Duration::from_secs(1));
+        assert!(
+            !conn.retired_attempts.contains_key(&drained_old),
+            "a drained tombstone past its TTL must be reaped"
+        );
+        assert!(
+            conn.retired_attempts.contains_key(&live_old),
+            "a tombstone whose producer is still live must keep its slot past the TTL"
+        );
+        assert!(
+            conn.retired_attempts.contains_key(&drained_young),
+            "a drained tombstone inside its TTL must be kept"
+        );
+    }
+
+    /// The drain task marks a tombstone drained only after the producer's
+    /// handle has returned. A producer still running leaves it undrained.
+    #[tokio::test]
+    async fn retire_marks_drained_only_after_the_producer_is_terminal() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let producer = tokio::spawn(async move {
+            let _ = released.await;
+        });
+        let attempt = net::AttemptId::next();
+        conn.retire_attempt("sid-producer", attempt, Some(producer));
+        let drained = conn.retired_attempts[&attempt].drained.clone();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !drained.load(Ordering::Acquire),
+            "a live producer must leave its tombstone undrained"
+        );
+        let _ = release.send(());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !drained.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a finished producer must mark its tombstone drained");
+
+        let sync_attempt = net::AttemptId::next();
+        conn.retire_attempt("sid-sync", sync_attempt, None);
+        assert!(
+            conn.retired_attempts[&sync_attempt].drained.load(Ordering::Acquire),
+            "a retirement with no async producer is drained at once"
+        );
     }
 
     /// A LAN reservation must match its exact attempt, and a forgotten device

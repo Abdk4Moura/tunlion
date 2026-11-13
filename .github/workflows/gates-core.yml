@@ -26,10 +26,16 @@ name: Gates Core
 on:
   push:
     branches: [main]
+  # Run the ratchet on demand for any ref, e.g. a diagnostic branch.
+  workflow_dispatch: {}
   pull_request:
     paths:
       - "cli/**"
       - "backend/**"
+      # The gates exercise the core crates as much as the CLI. Without this a
+      # change confined to crates/ (the transport and link code the ratchet
+      # guards) skipped the ratchet entirely.
+      - "crates/**"
       - ".github/workflows/gates-core.yml"
 
 # WORKFLOW-LEVEL, not per-step. The sccache env used to be set ONLY on the

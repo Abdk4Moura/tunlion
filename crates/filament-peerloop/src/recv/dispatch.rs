@@ -776,15 +776,23 @@ impl SyncTask {
     #[cfg(not(feature = "mount-server"))]
     fn cancel(&self) {}
 
+    /// Join this task, but never past `deadline`: a task still running then
+    /// is aborted and reported as an error, so the owning event loop cannot
+    /// park on a served sync stuck somewhere cancellation does not reach.
     #[cfg(feature = "mount-server")]
-    async fn join(self) -> Result<(), String> {
-        match self.0.join().await {
-            Ok(result) => result,
-            Err(error) => Err(error.to_string()),
+    async fn join(self, deadline: tokio::time::Instant) -> Result<(), String> {
+        let bound = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match self.0.join_within(bound).await {
+            crate::sync::BoundedJoin::Joined(Ok(result)) => result,
+            crate::sync::BoundedJoin::Joined(Err(error)) => Err(error.to_string()),
+            crate::sync::BoundedJoin::Aborted => Err(format!(
+                "did not stop within {}s of cancel; aborted",
+                crate::sync::SYNC_JOIN_BOUND.as_secs()
+            )),
         }
     }
     #[cfg(not(feature = "mount-server"))]
-    async fn join(self) -> Result<(), String> {
+    async fn join(self, _deadline: tokio::time::Instant) -> Result<(), String> {
         Ok(())
     }
 
@@ -975,7 +983,7 @@ impl SyncTasks {
         let previous = self.0.lock().unwrap().remove(&key);
         if let Some(previous) = previous {
             previous.cancel();
-            report_sync_join(log, &key.0, key.1, previous.join().await);
+            report_sync_join(log, &key.0, key.1, previous.join(sync_join_deadline()).await);
         }
         self.0.lock().unwrap().insert(key, task);
     }
@@ -993,11 +1001,17 @@ impl SyncTasks {
             // Take the task out first; drop the guard before the await.
             let removed = self.0.lock().unwrap().remove(&(pid.clone(), sid));
             if let Some(task) = removed {
-                report_sync_join(log, &pid, sid, task.join().await);
+                report_sync_join(log, &pid, sid, task.join(sync_join_deadline()).await);
             }
         }
     }
 
+    /// Cancel and join every served sync task for `pid`. Call this AFTER the
+    /// peer's link is dropped: cancellation is only seen at a record boundary,
+    /// and a task parked in a transport write is released by that link's
+    /// close, not by the cancel. The joins share one [`crate::sync::SYNC_JOIN_BOUND`]
+    /// deadline (the tasks run concurrently), and a task still running at the
+    /// deadline is aborted, so this never wedges the event loop.
     async fn cancel_sync_for_pid(&self, pid: &str, log: &dyn LogSink) {
         let keys: Vec<_> = self
             .0
@@ -1015,8 +1029,9 @@ impl SyncTasks {
                 joining.push((key, task));
             }
         }
+        let deadline = sync_join_deadline();
         for ((task_pid, sid), task) in joining {
-            report_sync_join(log, &task_pid, sid, task.join().await);
+            report_sync_join(log, &task_pid, sid, task.join(deadline).await);
         }
     }
 
@@ -1027,10 +1042,17 @@ impl SyncTasks {
         for (_, task) in &joining {
             task.cancel();
         }
+        let deadline = sync_join_deadline();
         for ((pid, sid), task) in joining.drain(..) {
-            report_sync_join(log, &pid, sid, task.join().await);
+            report_sync_join(log, &pid, sid, task.join(deadline).await);
         }
     }
+}
+
+/// One shared deadline for a batch of sync joins: the tasks were cancelled
+/// together and run concurrently, so a batch waits at most one bound in total.
+fn sync_join_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + crate::sync::SYNC_JOIN_BOUND
 }
 
 impl RecvCleanup {
@@ -1076,10 +1098,18 @@ impl RecvCleanup {
         // dispatch must not return (or report Stopped) while one is running.
         self.writers.join_all(log).await;
         self.note_phase("writers");
+        // Close every link before joining the served sync tasks: a sync task
+        // parked in a transport write sees its cancel only at a record
+        // boundary, and only this close releases the write. Joining first
+        // waited on that write forever. The joins are bounded as well.
+        if let Some(conn) = &mut self.conn {
+            conn.cancel_builds();
+            conn.close_links_for_exit();
+        }
         self.sync_tasks.stop_sync_tasks(log).await;
         self.note_phase("sync_tasks");
-        // Stop accepting control work before closing links. Joining aborted
-        // tasks ensures their listener futures are dropped before we return.
+        // Joining aborted tasks ensures their listener futures are dropped
+        // before we return.
         self.tasks.stop().await;
         self.note_phase("tasks");
         let had_state = self.state.is_some();
@@ -1088,10 +1118,6 @@ impl RecvCleanup {
         }
         if had_state {
             self.note_phase("flush");
-        }
-        if let Some(conn) = &mut self.conn {
-            conn.cancel_builds();
-            conn.close_links_for_exit();
         }
         tokio::task::yield_now().await;
         if let Some(sio) = self.signaling.take() {
@@ -2845,8 +2871,9 @@ async fn recv_run(
                 // it stops `warm_link_for` from selecting it again, so the
                 // caller's retry -- we send a RETRYABLE reason -- establishes
                 // a fresh link instead of parking on the same corpse.
-                sync_tasks.cancel_sync_for_pid(&p.pid, log.as_ref()).await;
+                // Drop first: its close releases a sync task parked in a write.
                 conn.drop_link(&p.pid);
+                sync_tasks.cancel_sync_for_pid(&p.pid, log.as_ref()).await;
             }
             for (p, reason) in stale {
                 log.say(&format!("l2: {:?} open dropped: {reason}", p.kind));
@@ -3411,8 +3438,9 @@ async fn recv_run(
                 log.debug(&format!(
                     "tunlion: link to '{pid}' died, dropping so it can re-connect"
                 ));
-                sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
+                // Drop first: its close releases a sync task parked in a write.
                 conn.drop_link(&pid);
+                sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                 // Removing the mux is not ending its streams: every served
                 // session holds its own Arc, so a bare remove left a remote
                 // exec's stdin pipe open and its command running for as long
@@ -3777,8 +3805,9 @@ async fn recv_run(
                         }
                     }
                     for (pid, label) in &doomed {
-                        sync_tasks.cancel_sync_for_pid(pid, log.as_ref()).await;
+                        // Drop first: its close releases a sync task parked in a write.
                         conn.drop_link(pid);
+                        sync_tasks.cancel_sync_for_pid(pid, log.as_ref()).await;
                         l2_muxes.remove(pid);
                         fleet_pending.remove(pid);
                         fleet_verified.remove(pid);
@@ -4278,8 +4307,9 @@ async fn recv_run(
                     log.debug(&format!(
                         "tunlion: dropping zombie warm link to '{pid}' (black-holed a stream)"
                     ));
-                    sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
+                    // Drop first: its close releases a sync task parked in a write.
                     conn.drop_link(&pid);
+                    sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                     #[cfg(feature = "pty-server")]
                     crate::recv::servers::shell::retire_link(
                         &ports,
@@ -4452,8 +4482,9 @@ async fn recv_run(
                     }
                     for pid in channel_gone {
                         let name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
+                        // Drop first: its close releases a sync task parked in a write.
                         conn.drop_link(&pid);
+                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                         // A stale duplicate of a peer that is still linked is
                         // housekeeping, not a departure: it printed "ok alpha
                         // ○ alpha left (channel digest reconcile), still listening", one
@@ -4541,8 +4572,9 @@ async fn recv_run(
                     }
                     for pid in gone {
                         let name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
+                        // Drop first: its close releases a sync task parked in a write.
                         conn.drop_link(&pid);
+                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                         // A stale duplicate of a peer that is still linked is
                         // housekeeping, not a departure: it printed "ok alpha
                         // ○ alpha left (digest reconcile), still listening", one
@@ -5890,8 +5922,9 @@ async fn recv_run(
                                     ));
                                     fleet_pending.remove(&pid);
                                     fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
-                                    sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
+                                    // Drop first: its close releases a sync task parked in a write.
                                     conn.drop_link(&pid);
+                                    sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                                 }
                                 Ok(ok) => {
                                     fleet_unlisted_hellos.remove(&pid);
@@ -6106,8 +6139,9 @@ async fn recv_run(
                                     log.debug(&format!("fleet-hello from {pid} rejected: {e}"));
                                     fleet_pending.remove(&pid);
                                     fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
-                                    sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
+                                    // Drop first: its close releases a sync task parked in a write.
                                     conn.drop_link(&pid);
+                                    sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                                 }
                             }
                         }
@@ -9038,8 +9072,9 @@ async fn recv_run(
                                                 "    [test] {nm} PREMATURE-CLOSE at ack (reproducing ack-loss / corpse)"
                                             ),
                                         ));
-                                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
+                                        // Drop first: its close releases a sync task parked in a write.
                                         conn.drop_link(&pid);
+                                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                                     } else if test_hooks::suppress_delivery_ack() {
                                         log.say(&log.paint(
                                             Tone::Warn,
@@ -9257,8 +9292,9 @@ async fn recv_run(
                                                 "    [test] {nm} PREMATURE-CLOSE at ack (reproducing ack-loss / corpse)"
                                             ),
                                         ));
-                                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
+                                        // Drop first: its close releases a sync task parked in a write.
                                         conn.drop_link(&pid);
+                                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                                     } else if test_hooks::suppress_delivery_ack() {
                                         log.say(&log.paint(
                                             Tone::Warn,
@@ -9866,6 +9902,8 @@ async fn recv_run(
                         .get(&pid)
                         .is_some_and(|mux| !mux.transport().is_alive());
                     if selected_transport_dead {
+                        // No drop here: the transport is already dead, so a
+                        // parked write has errored; the join is still bounded.
                         sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
                         if let Some(mux) = l2_muxes.remove(&pid) {
                             mux.shutdown_all().await;
