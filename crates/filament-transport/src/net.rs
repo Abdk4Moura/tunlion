@@ -1849,16 +1849,8 @@ impl Peer {
             .with_setting_engine(se)
             .build();
         let pc = Arc::new(
-            api.new_peer_connection(RTCConfiguration {
-                ice_servers,
-                ice_transport_policy: if relay_only {
-                    RTCIceTransportPolicy::Relay
-                } else {
-                    RTCIceTransportPolicy::All
-                },
-                ..Default::default()
-            })
-            .await?,
+            api.new_peer_connection(peer_connection_config(ice_servers, relay_only))
+                .await?,
         );
 
         // P2P ICE diagnostic: log gathering state changes to see when/if
@@ -2738,8 +2730,42 @@ where
     tokio::spawn(reader);
 }
 
+/// The configuration every RTCPeerConnection is built with.
+///
+/// It must never carry `certificates`. With none, each connection generates a
+/// fresh ephemeral DTLS certificate, and the PAKE confirmation, which MACs the
+/// two DTLS certificate fingerprints under the ceremony key (CONTRACT.md, "the
+/// confirmation is bound to this link's per-connection DTLS certificate
+/// fingerprints"), is then fresh per connection: a confirmation from one link
+/// cannot verify on a replacement link. A persistent certificate would make
+/// the fingerprints, and so the MAC, repeat across connections.
+fn peer_connection_config(ice_servers: Vec<RTCIceServer>, relay_only: bool) -> RTCConfiguration {
+    RTCConfiguration {
+        ice_servers,
+        ice_transport_policy: if relay_only {
+            RTCIceTransportPolicy::Relay
+        } else {
+            RTCIceTransportPolicy::All
+        },
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The PAKE confirmation is only fresh per link because no connection is
+    /// given a persistent DTLS certificate; see `peer_connection_config`.
+    #[test]
+    fn peer_connections_carry_no_persistent_dtls_certificate() {
+        for relay_only in [false, true] {
+            let cfg = super::peer_connection_config(Vec::new(), relay_only);
+            assert!(
+                cfg.certificates.is_empty(),
+                "a persistent DTLS certificate would let a PAKE confirmation repeat across links"
+            );
+        }
+    }
+
     use super::*;
 
     struct StubTransport;

@@ -346,8 +346,13 @@ Its key is derived from the mutually remembered pair secret. The signaling relay
 may carry direct candidates, but it never supplies that secret.
 
 - An unknown peer, including a one-time code pairing, has no shared secret before
-  the connection. WebRTC therefore carries the PAKE ceremony and its DTLS-bound
-  confirmation first. After confirmation, the newly derived secret may promote
+  the connection. WebRTC therefore carries the PAKE ceremony and its
+  confirmation first. The confirmation MAC is bound to this link's two DTLS
+  certificate fingerprints, not to a DTLS exporter (browsers expose none). It
+  is fresh per link only because every RTCPeerConnection, on both the CLI and
+  the browser, generates its own ephemeral certificate: no client may
+  configure a persistent DTLS certificate, or a confirmation could verify on a
+  replacement link. After confirmation, the newly derived secret may promote
   the link to direct QUIC where both peers are CLIs.
 - A known CLI peer already has a stored pair secret. Known-peer discovery can
   start the authenticated direct-QUIC race before WebRTC, with WebRTC retained as
@@ -392,6 +397,11 @@ single emit is load-bearing (C30):
   element was lost derives K from it instead of refusing a confirmation that
   arrived before key exchange. A confirmation with no K and no `msg` is still
   refused.
+- **Binding.** The MAC covers the direction, the two DTLS certificate
+  fingerprints in sorted order, `caps` and `scope`, keyed by K
+  (`filament-pair` `confirm_mac`). On WebRTC the fingerprints are those of the
+  link's per-connection ephemeral certificates (see above); on the local
+  carrier the same slots carry that connection's TLS exporter binding.
 - **Re-send.** Each side re-sends its current message (the element until it
   sends its confirmation, then the confirmation) at 250 ms, 500 ms, 1 s, then
   every 2 s, until the peer's confirmation verifies or the ceremony is refused.
