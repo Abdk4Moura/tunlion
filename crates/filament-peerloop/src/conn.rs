@@ -3302,6 +3302,21 @@ impl Conn {
                 }
                 WarmDecision::Establish { pid } => pid,
             };
+            // Only a device with a record here is re-dialled. With no record
+            // there is no secret to bind the link to, and the only match is a
+            // roster entry ANNOUNCING the name: a secretless link to whoever
+            // claims it, which proves nothing. A warm name can outlive its
+            // record (a completed transfer from a fleet sibling, then a
+            // revoke or forget), and re-dialling it by name kept a link open
+            // to the very device the store had just dropped. A live link is
+            // still reported above (Skip); a sibling re-meshes over the fleet
+            // channel, not here.
+            if device.is_none() {
+                self.log.trace(&format!(
+                    "warm-hold: '{peer}' has no device record here, not dialled by name"
+                ));
+                continue;
+            }
             self.log.debug(&format!(
                 "warm-hold: will establish '{peer}' via {pid} (no live link to it)"
             ));
@@ -10313,6 +10328,29 @@ mod warm_identity_tests {
                 && l.contains("principal=FleetSibling sibling=true")),
             "the tick did not report the live sibling link: {lines:?}"
         );
+    }
+
+    /// A warm name with no device record here is never re-dialled by name.
+    /// The only match would be a roster entry announcing that name, so the
+    /// tick built a secretless link to whoever claimed it. This is the shape
+    /// after a fleet sibling's completed transfer is followed by its revoke:
+    /// the name stays warm, the record is gone, and the tick kept a link open
+    /// to the revoked device.
+    #[tokio::test]
+    async fn a_warm_name_with_no_device_record_is_not_dialled_by_name() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.roster.insert(
+            "sid-c".into(),
+            json!({ "id": "sid-c", "name": "charlie", "uid": "uid-c" }),
+        );
+        conn.note_completed_transfer("sid-gone", Some("charlie"));
+        assert!(conn.warm_hold.peers_to_connect().iter().any(|p| p == "charlie"));
+        for _ in 0..3 {
+            let dialled = conn.warm_hold_tick(true).await;
+            assert!(dialled.is_empty(), "warm-hold dialled {dialled:?} by an announced name");
+        }
+        assert!(!conn.links.contains_key("sid-c"), "a secretless link was built to a claimed name");
+        assert!(conn.direct_pending.is_empty(), "a direct attempt was armed for a claimed name");
     }
 
     /// Two senders, one completes while the other is still in flight: the
