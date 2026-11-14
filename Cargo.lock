@@ -1170,7 +1170,7 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "filament-cap"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -3996,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "tunlion-fleet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "filament-id",
@@ -4026,7 +4026,7 @@ dependencies = [
 
 [[package]]
 name = "tunlion-peerloop"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4090,7 +4090,7 @@ version = "0.1.0"
 
 [[package]]
 name = "tunlion-transport"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",

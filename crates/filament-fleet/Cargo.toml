@@ -17,7 +17,7 @@
 # that needs host state. Same shape as filament-id taking a &dyn KeyStore.
 [package]
 name = "tunlion-fleet"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
 license = "MIT"
