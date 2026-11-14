@@ -711,13 +711,14 @@ async fn verify_fleet_identity(
     tx: &mpsc::UnboundedSender<Ev>,
     link: &str,
     expected: &str,
+    own_device: Option<[u8; 32]>,
 ) -> Result<()> {
     // Everything that is not this link's control traffic (presence, other
     // candidates' offers, timers) still belongs to the dial loop, which keeps
     // going if this candidate is not the one. Swallowing it here lost the
     // target's own transport-offer while the wrong sibling was being checked.
     let mut deferred = Vec::new();
-    let r = verify_fleet_identity_inner(t, rx, &mut deferred, link, expected).await;
+    let r = verify_fleet_identity_inner(t, rx, &mut deferred, link, expected, own_device).await;
     for ev in deferred {
         let _ = tx.send(ev);
     }
@@ -805,7 +806,15 @@ async fn verify_fleet_identity_inner(
     deferred: &mut Vec<Ev>,
     link: &str,
     expected: &str,
+    own_device: Option<[u8; 32]>,
 ) -> Result<()> {
+    // Fail closed: without our own key the own-key refusal below cannot run.
+    let own_device = own_device.ok_or_else(|| {
+        crate::exit_codes::err(
+            crate::exit_codes::ExitKind::NoIdentity,
+            format!("cannot verify '{expected}': this device's own key is unavailable"),
+        )
+    })?;
     let cb = t.channel_binding().ok_or_else(|| {
         anyhow!("cannot verify '{expected}': this link exposes no channel binding")
     })?;
@@ -847,6 +856,12 @@ async fn verify_fleet_identity_inner(
             continue;
         }
         let proven = crate::fleet::verify_hello(v, &cb, &owner, crate::identity::now_secs())?;
+        // Never accept a hello carrying this device's own key (own-device-key).
+        if proven.device_pub == own_device {
+            return Err(anyhow::Error::new(WrongFleetDevice(format!(
+                "refusing: the device answering as '{expected}' presented this device's own key (own-device-key). No command payload was sent."
+            ))));
+        }
         let name = crate::device_name_for_pub(&proven.device_pub);
         if name.as_deref().map(|n| n.eq_ignore_ascii_case(expected)) != Some(true) {
             return Err(anyhow::Error::new(WrongFleetDevice(format!(
@@ -968,6 +983,22 @@ pub(crate) async fn bring_up_to_known(
                 },
             }
         }
+    };
+    // This device's own key, read ONCE for a fleet dial. A hello carrying it is
+    // refused, and an unreadable key fails the dial instead of leaving that
+    // refusal inert for it.
+    let own_device: Option<[u8; 32]> = if fleet_mode {
+        Some(crate::overlay::overlay_pubkey_bytes().map_err(|e| {
+            crate::exit_codes::err(
+                crate::exit_codes::ExitKind::NoIdentity,
+                format!(
+                    "refusing the fleet dial to '{peer_name}': this device's own key at {} could not be read ({e}). Check that file's permissions, or run `tunlion init` if this device has no identity. No command payload was sent.",
+                    crate::overlay::key_path().display()
+                ),
+            )
+        })?)
+    } else {
+        None
     };
     let channel = crate::channel_of(&secret);
 
@@ -1543,7 +1574,7 @@ pub(crate) async fn bring_up_to_known(
                 // binding, because there is nothing to bind the proof to. A
                 // failed proof rejects THIS candidate, not the connect.
                 if fleet_mode {
-                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name).await {
+                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name, own_device).await {
                         crate::ui::debug(&format!("fleet: {e:#}; trying the next fleet device"));
                         t.force_close();
                         let mut uid = None;
@@ -1646,7 +1677,7 @@ pub(crate) async fn bring_up_to_known(
                 // Same certificate proof as the direct arm above; the binding
                 // exists here (checked at the top of this arm).
                 if fleet_mode {
-                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name).await {
+                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name, own_device).await {
                         crate::ui::debug(&format!("fleet: {e:#}; trying the next fleet device"));
                         t.force_close();
                         let mut uid = None;
