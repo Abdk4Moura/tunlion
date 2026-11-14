@@ -152,12 +152,22 @@ fi
 
 # ==================================================================== GATE PC ==
 say "PC: before the end, forward --stdio streams"
-timeout 6 "${G_ENV[@]}" "$BIN" --server "$SERVER" forward "alpha:$COUNTER_PORT" --stdio \
-  </dev/null >"$WORK/PC.out" 2>"$WORK/PC.err"
+# Evidence only: -v adds the cold-connect debug lines (transport attempts,
+# "candidate unresponsive, rotating") to stderr, and each stream line is
+# stamped with milliseconds since launch so a miss shows where the 6s went.
+# The budget and the assertion on PC.out are unchanged.
+pc_t0=$(date +%s%3N)
+pc_stamp() { while IFS= read -r l; do printf '+%sms %s\n' "$(( $(date +%s%3N) - pc_t0 ))" "$l"; done; }
+timeout 6 "${G_ENV[@]}" "$BIN" --server "$SERVER" -v forward "alpha:$COUNTER_PORT" --stdio \
+  </dev/null > >(tee "$WORK/PC.out" | pc_stamp >"$WORK/PC.out.t") 2> >(pc_stamp >"$WORK/PC.err")
+pc_rc=$?
+sleep 0.3
 if grep -q "TICK-" "$WORK/PC.out"; then
   ok "gatePC: forward --stdio streamed from the owner before the end"
 else
+  echo "## PC: rc=$pc_rc after $(( $(date +%s%3N) - pc_t0 ))ms (budget 6000ms); stderr and stdout, stamped from launch:"
   cat "$WORK/PC.err"
+  head -5 "$WORK/PC.out.t"
   bad "gatePC: the positive forward --stdio did not stream"
 fi
 
