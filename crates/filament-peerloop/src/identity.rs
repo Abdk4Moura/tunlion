@@ -114,11 +114,12 @@ pub struct ProofFacts<'a> {
     pub admitted_device: Option<&'a [u8; 32]>,
     /// The device key the proof names.
     pub proven_device: &'a [u8; 32],
-    /// Is the proven key a recognized sibling: a device record carries it, OR
-    /// the owner's roster lists it ([`crate::recv::store::DeviceStore::sibling_recognized`]).
-    /// The roster is the authorization fact; the index record is presentation
-    /// and may be missing (a failed or refused index write), so it is never
-    /// required on its own.
+    /// Is the proven key a recognized sibling: a device record carries it, OR,
+    /// on a joined device only, the owner's roster lists it
+    /// ([`crate::recv::store::DeviceStore::sibling_recognized`]). On a joined
+    /// device the roster is the authorization fact and the index record may
+    /// be missing (a failed or refused index write); on the owner device only
+    /// a record counts.
     pub recognized: bool,
     /// The proven certificate's own expiry.
     pub cert_expires: u64,
@@ -130,12 +131,14 @@ pub struct ProofFacts<'a> {
 ///
 /// A link the fleet hello already admitted as a SIBLING keeps that kind, with
 /// its certificate's own expiry, when the proof names the same device key and
-/// that key is recognized (recorded, or listed by the owner's roster). The persisted principal cannot stand in for it: a
+/// that key is recognized (recorded, or on a joined device listed by the
+/// owner's roster). The persisted principal cannot stand in for it: a
 /// sibling's index record carries no principal kind and reads back as an owner
 /// device, and an unrelated record's deadline is not the sibling's. A proof
 /// naming a DIFFERENT key than the admitted one is refused: one link cannot be
-/// two devices. A sibling with no admitted key, or a key neither recorded nor
-/// listed, fails closed to an empty ceiling that has already ended.
+/// two devices. A sibling with no admitted key, or a key that is not
+/// recognized (on the owner device: has no record), fails closed to an empty
+/// ceiling that has already ended.
 ///
 /// Every other link takes the persisted principal, after liveness, and the
 /// persisted (composed) deadline, exactly as before. Pure, so the decision is

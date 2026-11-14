@@ -283,8 +283,9 @@ impl IdentityService {
         let (principal_kind, not_after, max_offline, last_seen) = self
             .store
             .persisted_principal_for_cert(&cert, own_user_pub.as_ref());
-        // Is the proven key a recognized sibling (recorded, or listed by the
-        // owner's roster)? Read before the link is borrowed mutably.
+        // Is the proven key a recognized sibling (recorded, or on a joined
+        // device listed by the owner's roster)? Read before the link is
+        // borrowed mutably.
         let recognized = self.store.sibling_recognized(&cert.device_pub);
         if let Some(l) = conn.link_mut(pid) {
             let (deadline, _clock) =

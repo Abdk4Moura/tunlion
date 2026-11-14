@@ -82,12 +82,15 @@ pub const DELISTED_SIBLINGS_FILE: &str = "delisted-siblings.json";
 
 /// A read of [`DELISTED_SIBLINGS_FILE`]: its entries, or why it is unusable.
 type DelistedRead = std::result::Result<Vec<Value>, String>;
-/// The last read: path, mtime, length, when it was read, and what it held.
-/// Process-wide because callers open a fresh `DeviceStore` per call.
+/// The last read of each store's file, by path: mtime, length, when it was
+/// read, and what it held. Process-wide because callers open a fresh
+/// `DeviceStore` per call; a daemon has one path, so this stays tiny, and it
+/// is emptied if it ever grows past [`DELISTED_CACHE_PATHS`].
 #[allow(clippy::type_complexity)]
 static DELISTED_CACHE: std::sync::Mutex<
-    Option<(PathBuf, Option<SystemTime>, u64, SystemTime, DelistedRead)>,
+    Option<std::collections::HashMap<PathBuf, (Option<SystemTime>, u64, SystemTime, DelistedRead)>>,
 > = std::sync::Mutex::new(None);
+const DELISTED_CACHE_PATHS: usize = 256;
 /// A cached read is trusted only for a file whose mtime was at least this far
 /// before the read. File times are coarse (a clock tick, or worse on some
 /// filesystems), so a same-length rewrite inside one tick of the previous
@@ -1226,8 +1229,8 @@ impl DeviceStore {
         };
         let (mtime, len) = (meta.modified().ok(), meta.len());
         if let Ok(cache) = DELISTED_CACHE.lock() {
-            if let Some((cp, cm, cl, read_at, read)) = cache.as_ref() {
-                if *cp == p && *cm == mtime && *cl == len && delisted_cache_trusted(*cm, *read_at) {
+            if let Some((cm, cl, read_at, read)) = cache.as_ref().and_then(|c| c.get(&p)) {
+                if *cm == mtime && *cl == len && delisted_cache_trusted(*cm, *read_at) {
                     return Some(read.clone());
                 }
             }
@@ -1241,7 +1244,11 @@ impl DeviceStore {
             Err(e) => Err(format!("cannot be read ({e})")),
         };
         if let Ok(mut cache) = DELISTED_CACHE.lock() {
-            *cache = Some((p, mtime, len, read_at, read.clone()));
+            let c = cache.get_or_insert_with(Default::default);
+            if c.len() >= DELISTED_CACHE_PATHS {
+                c.clear();
+            }
+            c.insert(p, (mtime, len, read_at, read.clone()));
         }
         Some(read)
     }
@@ -1340,7 +1347,9 @@ impl DeviceStore {
         let p = self.root.join(DELISTED_SIBLINGS_FILE);
         let r = self.write_delisted(&p, owner, removed, now);
         if let Ok(mut cache) = DELISTED_CACHE.lock() {
-            *cache = None;
+            if let Some(c) = cache.as_mut() {
+                c.remove(&p);
+            }
         }
         if let Ok(mut last) = DELISTED_WRITE_ERROR.lock() {
             match &r {
@@ -1457,13 +1466,23 @@ impl DeviceStore {
     }
 
     /// Is `device_pub` a sibling this device recognizes for a possession proof:
-    /// a device record carries it, OR the owner's roster admits it
-    /// ([`DeviceStore::sibling_admissible`]). The roster is the authorization
-    /// fact; the record is only an index entry and its write can fail or be
-    /// refused, so a listed sibling without one keeps its kind. Revocation is
+    /// a device record carries it, OR, on a JOINED device only, the owner's
+    /// signed roster lists it. On a joined device the roster is the
+    /// authorization fact and the record is only an index entry whose write can
+    /// fail or be refused, so a listed sibling without one keeps its kind. On
+    /// the OWNER device the roster is not the authority (its own records are),
+    /// so there only a record counts: a key with no record is not recognized,
+    /// even though `sibling_admissible` admits every key there. Revocation is
     /// unaffected: a recognized but revoked key is still cut by the sweep.
     pub fn sibling_recognized(&self, device_pub: &[u8; 32]) -> bool {
-        self.devices_find_by_device_pub(device_pub).is_some() || self.sibling_admissible(device_pub)
+        if self.devices_find_by_device_pub(device_pub).is_some() {
+            return true;
+        }
+        if self.owner_pub_from_keystore().is_some() {
+            return false;
+        }
+        self.joined_owner_pub()
+            .is_some_and(|owner| self.owner_roster_lists(device_pub, &owner))
     }
 
     /// Does the stored roster (signed by `owner`, verified at receipt) list
@@ -4762,6 +4781,15 @@ mod sibling_roster_revocation {
         ));
     }
 
+    fn set_mtime(path: &Path, t: SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
     #[test]
     fn a_rewritten_delisted_store_is_read_again_even_at_the_same_length() {
         let j = joined("tomb-rewrite");
@@ -4774,24 +4802,55 @@ mod sibling_roster_revocation {
         };
         let path = j.root.join(DELISTED_SIBLINGS_FILE);
         write_delisted(&j, &entry(a));
+        let m0 = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert!(j.store.device_cert_revoked(&a) && !j.store.device_cert_revoked(&b));
-        // Rewritten at once, same length (likely inside one timestamp tick).
+        // Rewritten at the same length, and the mtime PINNED back to the first
+        // write's: (mtime, length) cannot tell the two apart, so this passes
+        // only because a recently written file is never served from the cache.
         write_delisted(&j, &entry(b));
+        set_mtime(&path, m0);
         assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, entry(a).to_string().len());
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), m0);
         assert!(!j.store.device_cert_revoked(&a) && j.store.device_cert_revoked(&b));
-        // Settled (mtime well in the past): this read may be cached ...
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(SystemTime::now() - std::time::Duration::from_secs(60))
-            .unwrap();
+        // A settled file is cached; an external in-place rewrite lands on a
+        // later mtime, so it is read again rather than served stale.
+        set_mtime(&path, SystemTime::now() - std::time::Duration::from_secs(60));
         assert!(j.store.device_cert_revoked(&b));
-        // ... and an external in-place rewrite of the same length moves the
-        // mtime, so it is read again rather than served stale.
         write_delisted(&j, &entry(a));
         assert!(j.store.device_cert_revoked(&a), "a stale cache kept the old entry");
         assert!(!j.store.device_cert_revoked(&b));
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    /// The cache-hit path, observed: a SETTLED file whose (mtime, length) are
+    /// unchanged is served from the cache without a read. This also pins the
+    /// documented limit: content rewritten under a preserved old mtime and the
+    /// same length is not seen until the file changes again.
+    #[test]
+    fn a_settled_unchanged_delisted_store_is_served_from_the_cache() {
+        let j = joined("tomb-cache-hit");
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32]]);
+        let (a, b) = ([8u8; 32], [9u8; 32]);
+        let expires = now_secs() + 3600;
+        let owner_hex = hex::encode(j.owner.public_key_bytes());
+        let entry = |k: [u8; 32]| {
+            json!([{"devicePub": hex::encode(k), "ownerPub": owner_hex, "certExpires": expires}])
+        };
+        let path = j.root.join(DELISTED_SIBLINGS_FILE);
+        let old = SystemTime::now() - std::time::Duration::from_secs(60);
+        write_delisted(&j, &entry(a));
+        set_mtime(&path, old);
+        // First read fills a trusted entry (settled for 60s).
+        assert!(j.store.device_cert_revoked(&a));
+        // Same length, same (preserved) mtime: served from the cache.
+        write_delisted(&j, &entry(b));
+        set_mtime(&path, old);
+        assert!(j.store.device_cert_revoked(&a), "the hit path re-read the file");
+        assert!(!j.store.device_cert_revoked(&b));
+        // Any mtime change ends the hit.
+        set_mtime(&path, old + std::time::Duration::from_secs(1));
+        assert!(j.store.device_cert_revoked(&b));
+        assert!(!j.store.device_cert_revoked(&a));
         let _ = std::fs::remove_dir_all(&j.root);
     }
 
@@ -4809,6 +4868,23 @@ mod sibling_roster_revocation {
         // Recorded (the fixture's sibling), whatever the roster says.
         write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32]]);
         assert!(j.store.sibling_recognized(&j.sib));
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn on_the_owner_device_only_a_record_makes_a_sibling_recognized() {
+        let j = joined("recognized-owner");
+        let k = [9u8; 32];
+        // Even a roster listing the key does not stand in for a record here.
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32], k]);
+        // Control: as a joined device the listing recognizes it.
+        assert!(j.store.sibling_recognized(&k));
+        UserKey::generate(&j.store.keystore()).unwrap();
+        // The owner admits every key (`sibling_admissible`), and that must not
+        // make an unrecorded key a recognized sibling.
+        assert!(j.store.sibling_admissible(&k));
+        assert!(!j.store.sibling_recognized(&k), "no record on the owner means not recognized");
+        assert!(j.store.sibling_recognized(&j.sib), "a recorded key still is");
         let _ = std::fs::remove_dir_all(&j.root);
     }
 

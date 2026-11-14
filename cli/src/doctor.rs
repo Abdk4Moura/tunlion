@@ -488,8 +488,10 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
         v["daemon"] = daemon.to_json();
         v["lan"] = lan;
         v["state_files"] = json!({ "ok": state.is_empty(), "problems": state });
+        // `ok` agrees with the exit code (see `preflight_result`).
+        v["ok"] = json!(sig.is_ok() && state.is_empty());
         ui::json_out(&v);
-        return preflight_result(&sig);
+        return preflight_result(&sig, !state.is_empty());
     }
 
     crate::outln!();
@@ -642,16 +644,21 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     if !crate::identity_flow::has_identity() {
         ui::say(&format!("  {}", crate::identity_flow::NO_IDENTITY_MSG));
     }
-    preflight_result(&sig)
+    preflight_result(&sig, !state.is_empty())
 }
 
 /// The preflight is healthy when the tunlion server answered; without it
 /// nothing else works, so that is exit 7 rather than 0 (13 when it answered
 /// with a certificate this machine does not trust).
-fn preflight_result(sig: &std::result::Result<u64, String>) -> Result<()> {
+/// The preflight's exit: the signaling failure's code when the server was not
+/// reached (7, or 13), else 2 (a local file problem, as every other command
+/// says for it) when a state file is damaged, else 0. The damage itself was
+/// already printed, with its recovery.
+fn preflight_result(sig: &std::result::Result<u64, String>, state_damaged: bool) -> Result<()> {
     match sig {
-        Ok(_) => Ok(()),
         Err(e) => Err(exit_codes::reported(signaling_failure_kind(e))),
+        Ok(_) if state_damaged => Err(exit_codes::reported(ExitKind::Usage)),
+        Ok(_) => Ok(()),
     }
 }
 
@@ -1000,6 +1007,16 @@ fn median(sorted: &[u64]) -> u64 {
 mod tests {
     use super::*;
 
+    /// A damaged state file is a nonzero preflight (2, the local-file-problem
+    /// code every other command uses for it); a clean one with the server
+    /// reached is 0.
+    #[test]
+    fn a_damaged_state_file_makes_the_preflight_exit_2() {
+        assert!(preflight_result(&Ok(5), false).is_ok());
+        let err = preflight_result(&Ok(5), true).unwrap_err();
+        assert_eq!(exit_codes::classify(&err).code(), 2);
+    }
+
     #[test]
     fn the_preflight_reports_a_damaged_delisted_store_and_its_backup() {
         let name = filament_peerloop::recv::store::DELISTED_SIBLINGS_FILE;
@@ -1101,7 +1118,10 @@ mod tests {
         let raw = "GET https://x/api/config: error sending request for url (https://x/api/config): client error (Connect): invalid peer certificate: UnknownIssuer";
         assert_eq!(signaling_failure_kind(raw), ExitKind::TlsCertificate);
         assert_eq!(signaling_failure_kind("GET https://x/api/config: dns error: failed to lookup address information"), ExitKind::Network);
-        let err = preflight_result(&Err(raw.to_string())).unwrap_err();
+        let err = preflight_result(&Err(raw.to_string()), false).unwrap_err();
+        assert_eq!(exit_codes::classify(&err).code(), 13);
+        // A signaling failure keeps its own code over a damaged state file.
+        let err = preflight_result(&Err(raw.to_string()), true).unwrap_err();
         assert_eq!(exit_codes::classify(&err).code(), 13);
         let e = verb_error(ExitKind::TlsCertificate, Some(raw));
         assert_eq!(e["code"], json!("tls_certificate"));
