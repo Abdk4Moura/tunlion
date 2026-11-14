@@ -164,18 +164,24 @@ function signalTrace() {
         const d = args[0];
         const cand = d && d.candidate ? String(d.candidate).split(' ').slice(4, 8).join(' ') : undefined;
         window.__diagSig.push({ t: Date.now() % 1000000, m, type: d && d.type ? d.type : (m === 'addIceCandidate' ? 'cand' : 'implicit'), cand });
-        if (window.__diagSig.length > 80) window.__diagSig.shift();
+        if (window.__diagSig.length > 40) window.__diagSig.shift();
       } catch {}
       return orig.apply(this, args);
     };
   }
 }
 
+// A diagnostic read may never hang the failure path: each is bounded, and a
+// read that does not answer in time reports that instead.
+function bounded(promise, ms, fallback) {
+  return Promise.race([promise.catch(() => fallback), sleep(ms).then(() => fallback)]);
+}
+
 async function dumpReadiness(name) {
   for (const [label, page] of diagPages) {
     try {
-      const rows = await page.locator('[data-testid="peer-tile"]').allInnerTexts().catch(() => []);
-      const state = await page.evaluate(() => {
+      const rows = await bounded(page.locator('[data-testid="peer-tile"]').allInnerTexts(), 3000, ['<rows unavailable>']);
+      const state = await bounded(page.evaluate(() => {
         const out = [];
         const links = window.__tunlionTestLinks;
         if (links) {
@@ -192,7 +198,7 @@ async function dumpReadiness(name) {
           }
         }
         return { links: out, trace: (window.__diagSig || []).slice(-40) };
-      }).catch((e) => ({ error: String(e).slice(0, 200) }));
+      }), 3000, { error: 'page did not answer within 3s' });
       console.log(`[peer-reload] DIAG waiting for ${name} on ${label}: rows=${JSON.stringify(rows.map((r) => r.replace(/\s+/g, ' ').slice(0, 120)))}`);
       console.log(`[peer-reload] DIAG ${label} links=${JSON.stringify(state.links || state)}`);
       console.log(`[peer-reload] DIAG ${label} signal-trace=${JSON.stringify(state.trace || [])}`);
@@ -208,7 +214,8 @@ async function waitPeerReady(page, name, timeout = 30000) {
   try {
     await waitPeerReadyOnce(page, name, timeout);
   } catch (e) {
-    await dumpReadiness(name);
+    // The original timeout is what fails the gate, whatever the dump does.
+    await bounded(dumpReadiness(name), 15000, undefined).catch(() => {});
     throw e;
   }
 }
