@@ -561,6 +561,11 @@ them). What a client must honour on the link and on the network:
   The dialer writes its tag first; the listener finds the secret by trying
   each it holds and then answers. No identifier precedes the tag. The
   observed-address exchange of the signaled path is not run on it.
+- **Authority**: that MAC is the pair proof, so a lan link to a paired device
+  IS the pair: it carries the same trust, petname and grants as that pair's
+  link by any other route, for as long as the record is live (not revoked,
+  not forgotten, not re-paired). Pairwise trust never depends on the route.
+  A link authenticated by the fleet secret keeps fleet rules.
 - **Route word**: a link made this way reports `route: "lan"` in `ping`/`reach`
   and `devices --json`; the human forms are `lan, direct` and `online lan`.
 - **Off switch**: `network.transports` without `lan` means no datagram, no

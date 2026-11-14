@@ -499,10 +499,11 @@ pub struct Link {
     pub trusted: bool,
     /// (name, secret) hypothesis to prove/verify on this link
     pub expected_secret: Option<(String, String)>,
-    /// LAN-origin reservation identity. Deliberately separate from
-    /// `expected_secret` so a LAN link stays untrusted/delegated without a pair
-    /// binding, while revocation and dedup can still see its exact device
-    /// binding (device LAN only; never the fleet shared RV).
+    /// LAN-origin reservation identity. Separate from `expected_secret` so a
+    /// LAN link mints no worker key or pair-proof hypothesis, while revocation,
+    /// dedup and adoption can still see its exact device binding (device LAN
+    /// only; never the fleet shared RV). A live binding makes the link the pair
+    /// at adoption (`adopt_direct`).
     pub lan_binding: Option<LanBinding>,
     /// The devices.json PETNAME this link proved as (the cap-store key). Set on a
     /// verified `pair-proof` (WebRTC) or at birth for a direct link (already
@@ -577,12 +578,11 @@ impl Link {
     /// an exact authenticated LAN DEVICE reservation that is STILL the current
     /// store's binding.
     ///
-    /// This is not an identity proof and must never become one: it does not set
-    /// `trusted`, `verified_name` or `BindingStrength::Proven`, does not touch
-    /// `expected_secret`, mints no worker key, and grants no capability. It names
-    /// the device so request routing (`reach`/`send` warm reuse) can match the
-    /// link the local handshake already authenticated with that device's pair
-    /// secret. A forgotten, revoked, re-paired or fleet-reserved link resolves
+    /// This lookup itself sets nothing. Adoption uses it once to make a live
+    /// LAN device link the pair (`adopt_direct`); routing (`reach`/`send` warm
+    /// reuse) uses it to match a link the local handshake authenticated with
+    /// that device's pair secret. A forgotten, revoked, re-paired or
+    /// fleet-reserved link resolves
     /// nothing: the store lookup is exact on `(name, secret)` and the secret
     /// must not be in `revoked`.
     pub fn authenticated_device_name<'a>(
@@ -4249,9 +4249,8 @@ impl Conn {
     ///
     /// The local LAN handshake already verified this device's pair-secret MAC,
     /// so for the transfer capability every paired device holds, a daemon may
-    /// accept the offer without asking. This does not set `trusted`, does not
-    /// make the identity Proven, and grants no owner/worker capability: under
-    /// authoritative mode the trust floor still refuses an untrusted link.
+    /// accept the offer without asking. This lookup sets nothing; a live LAN
+    /// device link is already trusted as the pair from adoption.
     /// A revoked record, or a record that denies transfer, fails closed here
     /// even while its pair secret is still present in the store.
     pub fn authenticated_lan_peer(&self, pid: &str) -> Option<String> {
@@ -4284,14 +4283,6 @@ impl Conn {
             .or_else(|| self.authenticated_lan_peer(pid))
     }
 
-    /// The delegated ceiling a LAN link may carry: the live store record's caps,
-    /// only while the link's exact authenticated binding still resolves. A
-    /// revoked, removed, unbound or fleet reservation gets the empty ceiling.
-    fn lan_delegated_caps(&self, pid: &str) -> Vec<String> {
-        self.authenticated_lan_peer(pid)
-            .map(|name| self.host.device_ceiling(&name))
-            .unwrap_or_default()
-    }
 
     /// Refusal predicate for a build intent.
     ///
@@ -5883,10 +5874,9 @@ impl Conn {
             .cloned()
             .unwrap_or_else(|| json!({ "id": pid, "name": name }));
         let uid = info["uid"].as_str().map(|s| s.to_string());
-        // LAN's proof is a shared local secret, not a pair binding. A LAN link
-        // must not inherit or mint `expected_secret`, or later identity/digest
-        // decisions would treat a local-network holder as that paired device.
-        // Its device reservation is kept separately in `lan_binding`.
+        // A LAN link never mints `expected_secret`: that field also keys worker
+        // transports and the pair-proof hypothesis, which a LAN route does not
+        // use. Its device reservation is kept separately in `lan_binding`.
         let expected_secret = if lan || secret.is_empty() {
             None
         } else {
@@ -5896,6 +5886,29 @@ impl Conn {
             name: name.clone(),
             device: lan_device_binding,
         });
+        // A LAN DEVICE link is the pair. Its handshake is the same pair-secret
+        // MAC as any direct link (`direct::authenticate` keyed by
+        // `transport_key(secret)`), and the listener only holds the secrets of
+        // live, unrevoked device records (`lan_glue::keys`). So when its exact
+        // binding still resolves in the current store, it gets what the pair
+        // link to that device gets: trusted, named by the canonical petname,
+        // born `OwnerDevice` and resolved from the record like any pair link.
+        // Pairwise trust must not depend on the route two paired devices found.
+        // A fleet reservation, or a binding the store no longer holds, stays
+        // untrusted with no ceiling.
+        let lan_pair_name: Option<String> = if lan && !fleet && !ephemeral {
+            let devices = self.host.devices_load();
+            authenticated_lan_device_name(
+                lan_binding.as_ref(),
+                &devices,
+                &self.revoked_bindings,
+                &|n: &str| self.host.device_record_revoked(n),
+            )
+            .map(str::to_string)
+        } else {
+            None
+        };
+        let lan_untrusted = lan && lan_pair_name.is_none();
         self.next_gen += 1;
         let generation = self.next_gen;
         // If a Link already exists for this pid (e.g. from a stall-watchdog
@@ -5949,12 +5962,31 @@ impl Conn {
                 }
             }
             if lan {
-                // The LAN handshake proves a local holder of a shared secret,
-                // not a device binding. It must never inherit owner trust or a
-                // worker key from another direct path.
+                // Never inherit a worker key from another direct path.
+                existing.expected_secret = None;
+            }
+            if lan {
+                // Whatever this link proved before, a LAN adoption starts its
+                // identity over: `resolve_peer_identity` keeps any cached key
+                // as already resolved, so a stale one would outlive the route
+                // that proved it.
+                existing.identity_device_pub = None;
+                existing.identity_user_pub = None;
+                existing.identity_binding = BindingStrength::None;
+                existing.identity_state = IdentityState::Pending;
+                existing.identity_cert_expires = None;
+            }
+            if let Some(n) = &lan_pair_name {
+                // Re-resolve from the record as a fresh pair link would, so a
+                // delegated record gets its ceiling.
+                existing.trusted = true;
+                existing.verified_name = Some(n.clone());
+                existing.principal_kind = PrincipalKind::OwnerDevice;
+            } else if lan_untrusted {
+                // A fleet reservation, or a binding the store no longer holds:
+                // no device trust, no identity, no ceiling.
                 existing.trusted = false;
                 existing.verified_name = None;
-                existing.expected_secret = None;
                 existing.principal_kind = PrincipalKind::Delegated { caps: Vec::new() };
             }
             resolve_peer_identity(existing);
@@ -5988,9 +6020,11 @@ impl Conn {
                     // that the peer is in the fleet. So it is born untrusted, with no
                     // petname and no owner-equivalence, until a verified fleet-hello
                     // names it.
-                    trusted: !fleet && !ephemeral && !lan,
-                    verified_name: if fleet || ephemeral || lan {
+                    trusted: !fleet && !ephemeral && !lan_untrusted,
+                    verified_name: if fleet || ephemeral || lan_untrusted {
                         None
+                    } else if lan_pair_name.is_some() {
+                        lan_pair_name.clone()
                     } else {
                         expected_secret.as_ref().map(|(n, _)| n.clone())
                     },
@@ -6005,7 +6039,7 @@ impl Conn {
                     identity_binding: BindingStrength::None,
                     identity_state: IdentityState::Pending,
                     identity_cert_expires: None,
-                    principal_kind: if fleet || lan {
+                    principal_kind: if fleet || lan_untrusted {
                         PrincipalKind::Delegated { caps: Vec::new() }
                     } else {
                         PrincipalKind::OwnerDevice
@@ -6014,18 +6048,11 @@ impl Conn {
                 },
             );
         }
-        if lan {
-            // The LAN link was admitted with the exact pair secret of a CURRENT
-            // live device record. Its delegated principal carries that record's
-            // ceiling, so the receiver's transfer gate does not read the empty
-            // caps an unverified direct link is born with. A revoked, removed,
-            // unbound or fleet reservation resolves nothing here and keeps the
-            // empty ceiling. This is authority for the LAN delegated principal
-            // only: `trusted` stays false, no `verified_name` is minted, and
-            // `expected_secret`/worker keys are untouched.
-            let caps = self.lan_delegated_caps(pid);
+        if lan_pair_name.is_some() {
+            // Resolve now, not at the later ready event: a delegated (invited)
+            // record must get its ceiling before anything can be gated on it.
             if let Some(link) = self.links.get_mut(pid) {
-                link.principal_kind = PrincipalKind::Delegated { caps };
+                resolve_peer_identity(link);
             }
         }
         // Replay anything the standby buffered before adoption. The tags remain,
@@ -9162,6 +9189,8 @@ mod warm_identity_tests {
         transfer_allowed: bool,
         /// The live store record's capability ceiling for `device_ceiling`.
         ceilings: Vec<(String, Vec<String>)>,
+        /// Delegated (invited) records' ceilings for `principal_ceiling_for`.
+        principal_ceilings: Vec<(String, Vec<String>)>,
     }
 
     #[async_trait::async_trait]
@@ -9190,6 +9219,12 @@ mod warm_identity_tests {
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
                 .map(|(_, caps)| caps.clone())
                 .unwrap_or_default()
+        }
+        fn principal_ceiling_for(&self, name: &str) -> Option<Vec<String>> {
+            self.principal_ceilings
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, caps)| caps.clone())
         }
         fn is_self_uid(&self, _my_uid: &str, _peer_uid: Option<&str>) -> bool {
             false
@@ -9302,11 +9337,6 @@ mod warm_identity_tests {
             Some("boxb"),
             "reach-pong could not key a LAN link by its exact device binding"
         );
-        assert_eq!(
-            conn.lan_delegated_caps(pid),
-            vec!["transfer".to_string()],
-            "a live LAN device must carry its stored ceiling, not the empty one"
-        );
         assert!(!conn.link(pid).unwrap().trusted, "routing must not mint trust");
         assert!(
             conn.link(pid).unwrap().verified_name.is_none(),
@@ -9341,10 +9371,6 @@ mod warm_identity_tests {
         assert_eq!(revoked_conn.authenticated_lan_peer(pid), None);
         assert!(revoked_conn.link_peer_name(pid).is_none());
         assert!(
-            revoked_conn.lan_delegated_caps(pid).is_empty(),
-            "a revoked record's retained secret still minted a non-empty ceiling"
-        );
-        assert!(
             crate::lan_glue::keys(&*revoked_host).is_empty(),
             "a revoked record's retained secret was offered as a LAN MAC key"
         );
@@ -9360,7 +9386,6 @@ mod warm_identity_tests {
         let (mut removed_conn, _far, _rx) = test_conn_with_host(removed_host).await;
         removed_conn.links.insert(pid.to_string(), lan_link(pid));
         assert!(removed_conn.link_peer_name(pid).is_none());
-        assert!(removed_conn.lan_delegated_caps(pid).is_empty());
 
         // A live record that DENIES transfer still routes (routing is not
         // permission) but must not earn the daemon's baseline auto-consent or a
@@ -9376,7 +9401,166 @@ mod warm_identity_tests {
         denied_conn.links.insert(pid.to_string(), lan_link(pid));
         assert!(warm_link_for(&denied_conn, "boxb").is_some());
         assert_eq!(denied_conn.authenticated_lan_peer(pid), None);
-        assert!(denied_conn.lan_delegated_caps(pid).is_empty());
+    }
+
+    /// Re-adopting an EXISTING link over LAN starts its identity over. A link
+    /// that had proven a device key, or held sibling or owner standing, keeps
+    /// none of it when the LAN binding no longer resolves, and a LAN pair is
+    /// re-resolved from the record rather than inheriting the old key.
+    #[tokio::test]
+    async fn an_existing_link_adopted_over_lan_keeps_no_stale_identity() {
+        fn stale(pid: &str, log: &Arc<std::sync::Mutex<Vec<String>>>) -> Link {
+            let dead: Arc<dyn Transport> = Rec::new("dead-serving", log);
+            dead.force_close();
+            let mut link = relay_link(pid, "boxb", "boxb", dead);
+            link.trusted = true;
+            link.verified_name = Some("boxb".into());
+            link.identity_device_pub = Some([7; 32]);
+            link.identity_user_pub = Some([8; 32]);
+            link.identity_binding = BindingStrength::Proven;
+            link.identity_state = IdentityState::Resolved;
+            link.identity_cert_expires = Some(u64::MAX);
+            link.principal_kind = PrincipalKind::FleetSibling;
+            link
+        }
+        for (what, host) in [
+            (
+                "revoked record",
+                TestHost {
+                    devices: vec![("boxb".to_string(), "s1".to_string())],
+                    revoked_records: vec!["boxb".to_string()],
+                    ..Default::default()
+                },
+            ),
+            ("forgotten record", TestHost::default()),
+        ] {
+            let (mut conn, _far, _rx) = test_conn_with_host(Arc::new(host)).await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "sid-lan-stale";
+            conn.links.insert(pid.into(), stale(pid, &log));
+            let t: Arc<dyn Transport> = Rec::with_attempt("lan", &log, net::AttemptId::next());
+            conn.seed_lan(pid, "boxb", "s1", false, t.attempt_id().unwrap());
+            assert!(matches!(
+                conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN),
+                DirectAdoption::Adopted { tkey: None, .. }
+            ));
+            let link = &conn.links[pid];
+            assert!(!link.trusted, "{what}: stale trust survived");
+            assert!(link.verified_name.is_none(), "{what}: stale name survived");
+            assert!(link.identity_device_pub.is_none(), "{what}: stale device key survived");
+            assert!(link.identity_user_pub.is_none(), "{what}: stale user key survived");
+            assert_eq!(link.identity_binding, BindingStrength::None, "{what}");
+            assert!(link.identity_cert_expires.is_none(), "{what}");
+            assert!(!matches!(link.identity_state, IdentityState::Resolved), "{what}");
+            assert!(!link.fleet_proven(), "{what}: sibling standing survived");
+            assert!(
+                matches!(&link.principal_kind, PrincipalKind::Delegated { caps } if caps.is_empty()),
+                "{what}: stale principal survived"
+            );
+            assert!(link.expected_secret.is_none(), "{what}: a worker key survived");
+        }
+
+        // A live binding: the pair, re-resolved, with no inherited key.
+        let host = TestHost {
+            devices: vec![("boxb".to_string(), "s1".to_string())],
+            ..Default::default()
+        };
+        let (mut conn, _far, _rx) = test_conn_with_host(Arc::new(host)).await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-lan-stale";
+        conn.links.insert(pid.into(), stale(pid, &log));
+        let t: Arc<dyn Transport> = Rec::with_attempt("lan", &log, net::AttemptId::next());
+        conn.seed_lan(pid, "boxb", "s1", false, t.attempt_id().unwrap());
+        assert!(matches!(
+            conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN),
+            DirectAdoption::Adopted { tkey: None, .. }
+        ));
+        let link = &conn.links[pid];
+        assert!(link.trusted);
+        assert_eq!(link.verified_name.as_deref(), Some("boxb"));
+        assert!(link.identity_device_pub.is_none(), "the old device key was inherited");
+        assert!(matches!(link.principal_kind, PrincipalKind::OwnerDevice));
+    }
+
+    /// A LAN DEVICE link is the pair only while its exact binding is live. A
+    /// record revoked on disk (secret retained, no sweep yet) or a forgotten
+    /// record adopts untrusted, unnamed and with the empty ceiling, exactly
+    /// what the old blanket LAN rule gave every link. A session-revoked
+    /// binding is refused before adoption and installs no link at all.
+    #[tokio::test]
+    async fn a_lan_link_is_the_pair_only_while_its_binding_is_live() {
+        async fn try_adopt(host: TestHost, session_revoked: bool) -> Option<Link> {
+            let (mut conn, _far, _rx) = test_conn_with_host(Arc::new(host)).await;
+            if session_revoked {
+                conn.revoked_bindings.insert("s1".to_string());
+            }
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "sid-lan-binding";
+            let t: Arc<dyn Transport> = Rec::with_attempt("lan", &log, net::AttemptId::next());
+            let attempt = t.attempt_id().unwrap();
+            conn.seed_lan(pid, "boxb", "s1", false, attempt);
+            match conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN) {
+                DirectAdoption::Adopted { tkey, .. } => {
+                    assert!(tkey.is_none(), "a LAN adoption minted a worker key");
+                    Some(conn.links.remove(pid).unwrap())
+                }
+                DirectAdoption::Rejected => {
+                    assert!(!conn.links.contains_key(pid));
+                    None
+                }
+                _ => panic!("unexpected LAN adoption outcome"),
+            }
+        }
+        async fn adopt(host: TestHost) -> Link {
+            try_adopt(host, false).await.expect("LAN adoption was refused")
+        }
+        fn live() -> TestHost {
+            TestHost {
+                devices: vec![("BoxB".to_string(), "s1".to_string())],
+                transfer_allowed: true,
+                ..Default::default()
+            }
+        }
+        let pair = adopt(live()).await;
+        assert!(pair.trusted);
+        assert_eq!(
+            pair.verified_name.as_deref(),
+            Some("BoxB"),
+            "the LAN pair must be named by the canonical stored petname"
+        );
+        assert!(matches!(pair.principal_kind, PrincipalKind::OwnerDevice));
+        assert!(pair.expected_secret.is_none(), "a LAN link minted a worker key");
+
+        // An invited (delegated) record is resolved at adoption like any pair
+        // link: with no live certificate it is pinned to the empty ceiling,
+        // never left owner-equivalent by the LAN route.
+        let invited = TestHost {
+            principal_ceilings: vec![("boxb".to_string(), vec!["transfer".to_string()])],
+            ..live()
+        };
+        let invited = adopt(invited).await;
+        assert!(
+            matches!(&invited.principal_kind, PrincipalKind::Delegated { caps } if caps.is_empty()),
+            "a delegated record over LAN was not resolved from its record"
+        );
+
+        let revoked = TestHost { revoked_records: vec!["boxb".to_string()], ..live() };
+        let forgotten = TestHost { devices: vec![], ..live() };
+        assert!(
+            try_adopt(live(), true).await.is_none(),
+            "a session-revoked LAN binding installed a link"
+        );
+        for (what, link) in [
+            ("revoked record", adopt(revoked).await),
+            ("forgotten record", adopt(forgotten).await),
+        ] {
+            assert!(!link.trusted, "{what}: LAN link was trusted");
+            assert!(link.verified_name.is_none(), "{what}: LAN link was named");
+            assert!(
+                matches!(&link.principal_kind, PrincipalKind::Delegated { caps } if caps.is_empty()),
+                "{what}: LAN link carried authority"
+            );
+        }
     }
 
     // --- the pure decision ------------------------------------------------
@@ -12939,7 +13123,8 @@ mod warm_identity_tests {
 
     /// A LAN reservation carries the exact checked attempt and authenticated
     /// device binding. It adopts once, consumes only that reservation, mints no
-    /// worker key, is not device-trusted, and a duplicate Arc is harmless.
+    /// worker key, is the pair (trusted, named, `OwnerDevice`) while its binding
+    /// is live, and a duplicate Arc is harmless.
     #[tokio::test]
     async fn lan_reservation_adopts_once_and_duplicate_is_harmless() {
         let host = Arc::new(TestHost {
@@ -12981,7 +13166,8 @@ mod warm_identity_tests {
         ));
         let link = &conn.links[pid];
         assert_eq!(link.direct_route, filament_transport::lan::ROUTE_LAN);
-        assert!(!link.trusted, "LAN was born device-trusted");
+        assert!(link.trusted, "a LAN link to a live paired device was not the pair");
+        assert_eq!(link.verified_name.as_deref(), Some("dev"));
         assert!(link.expected_secret.is_none());
         assert_eq!(
             link.lan_binding.as_ref().and_then(|b| b.device.clone()),
@@ -13030,16 +13216,16 @@ mod warm_identity_tests {
             conn.links[existing_pid].transport.as_ref().unwrap(),
             &lan_existing
         ));
-        // The link's DELEGATED ceiling comes from the authenticated device's
-        // current store record, not from the empty default that denied every
-        // transfer at the capability gate.
+        // Both paths give the pair link's principal and trust, resolved from
+        // the record exactly as a pair link is, not the empty delegated
+        // ceiling that refused the forward a granted pair carries.
         for owned in [pid, existing_pid] {
+            let link = &conn.links[owned];
+            assert!(link.trusted, "LAN adoption of {owned} was not the pair");
+            assert_eq!(link.verified_name.as_deref(), Some("dev"));
             assert!(
-                matches!(
-                    &conn.links[owned].principal_kind,
-                    PrincipalKind::Delegated { caps } if caps == &vec!["transfer".to_string()]
-                ),
-                "LAN adoption did not apply the stored transfer ceiling to {owned}"
+                matches!(&link.principal_kind, PrincipalKind::OwnerDevice),
+                "LAN adoption of {owned} did not carry the pair principal"
             );
         }
 
@@ -13054,6 +13240,8 @@ mod warm_identity_tests {
             conn.adopt_direct(fleet_pid, fleet_lan, filament_transport::lan::ROUTE_LAN),
             DirectAdoption::Adopted { tkey: None, .. }
         ));
+        assert!(!conn.links[fleet_pid].trusted, "a fleet LAN reservation was trusted");
+        assert!(conn.links[fleet_pid].verified_name.is_none());
         let fleet_binding = conn.links[fleet_pid].lan_binding.as_ref().unwrap();
         assert_eq!(fleet_binding.name, "fleet");
         assert!(fleet_binding.device.is_none());
@@ -13071,8 +13259,8 @@ mod warm_identity_tests {
         assert!(auth.transport_key().is_none());
     }
 
-    /// A live LAN link is deduped by its authenticated reservation even though
-    /// it is deliberately untrusted and unnamed. Its exact device binding drives
+    /// A live LAN link is deduped by its authenticated reservation. Its exact
+    /// device binding drives
     /// revocation, while a dead LAN link no longer dedups and unrelated device
     /// or fleet links survive the LAN link's removal.
     #[tokio::test]
@@ -13097,8 +13285,8 @@ mod warm_identity_tests {
             conn.adopt_direct(pid, t.clone(), filament_transport::lan::ROUTE_LAN),
             DirectAdoption::Adopted { .. }
         ));
-        assert!(!conn.links[pid].trusted);
-        assert!(conn.links[pid].verified_name.is_none());
+        assert!(conn.links[pid].trusted);
+        assert_eq!(conn.links[pid].verified_name.as_deref(), Some("dev"));
         assert!(conn.links[pid].expected_secret.is_none());
         assert_eq!(
             conn.links[pid].lan_binding.as_ref().and_then(|b| b.device.clone()),
