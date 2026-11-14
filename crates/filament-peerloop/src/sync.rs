@@ -450,6 +450,11 @@ pub async fn admit_sync_open(
         // FleetSibling: the same rule as a `file-offer`.
         let (scoped_in_bounds, has_grant) =
             crate::shell_gate::sibling_gate_inputs(&sibling, cap::CAP_TRANSFER, true, has_grant);
+        // Pair: the same rule as a `file-offer`; this device's own record
+        // transfer grant counts as an explicit grant in authoritative mode too.
+        let (outcome, has_grant) =
+            crate::shell_gate::pair_facts(conn, pid, cap::CAP_TRANSFER, ak_caps)
+                .apply(outcome, has_grant);
         // These are the `file-offer` transfer-gate inputs exactly. `denied` is
         // false because no deny list is consulted on the transfer path today;
         // `ceiling_authorizes` is false because transfer is a SCOPED DEFAULT

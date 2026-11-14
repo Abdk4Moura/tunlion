@@ -8433,6 +8433,16 @@ async fn recv_run(
                             scoped_in_bounds,
                             has_grant,
                         );
+                        // Pair: this device's own record transfer grant counts as
+                        // an explicit grant in authoritative mode too. A deny
+                        // recorded for transfer keeps it from counting.
+                        let (outcome, has_grant) = crate::shell_gate::pair_facts(
+                            &conn,
+                            &pid,
+                            cap::CAP_TRANSFER,
+                            ak_caps,
+                        )
+                        .apply(outcome, has_grant);
                         // No deny list is consulted on the transfer path today;
                         // false preserves that exactly.
                         let d = host.cap_gate_effective(CapGate {

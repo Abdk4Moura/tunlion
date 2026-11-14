@@ -107,6 +107,23 @@ fn gate_inputs(
     let (own_user, has_grant) = capability::cap_fleet_inputs(
         &config_dir, resource, action, idev.as_ref(), iusr.as_ref(), ak_caps.as_deref(),
     );
+    // Pairwise-first, mapped as the live gate maps it (`pair_facts`): this
+    // device's own record grant to a pair counts as an explicit grant. A pair
+    // here is a record holding a pair secret (the link is assumed
+    // authenticated, see ASSUMPTION) with no delegated ceiling; the record
+    // grants only "self".
+    let paired = ak_caps.is_none()
+        && resource == "self"
+        && crate::devices_store::devices_load()
+            .iter()
+            .any(|(n, secret)| n == name && !secret.is_empty());
+    let (outcome, has_grant) = capability::pair_grant_inputs(
+        paired,
+        crate::device_caps::device_caps(name).is_some_and(|c| c.iter().any(|g| g == action)),
+        device_capability_denied(name, action),
+        outcome,
+        has_grant,
+    );
     ShellGateInputs {
         certless_pair: None,
         trusted: true,

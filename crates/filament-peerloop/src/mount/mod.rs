@@ -105,6 +105,10 @@ pub async fn handle_mount_open(
         let sib = crate::shell_gate::sibling_facts(conn, pid, cap::CAP_MOUNT);
         let record_grants = record_grants || (sib.is_sibling && sib.owner_grant);
         let has_grant = has_grant || (sib.is_sibling && sib.owner_grant);
+        // Pair: this device's own record mount grant counts as an explicit grant
+        // in authoritative mode too; the deny read above still outranks it.
+        let (outcome, has_grant) = crate::shell_gate::pair_facts(conn, pid, cap::CAP_MOUNT, ak_caps)
+            .apply(outcome, has_grant);
         // A proven sibling's identity answers "is this the device the grant
         // names" as strongly as a pair MAC does (same rule as the shell fold).
         let trusted_for_grant = trusted || conn.link(pid).is_some_and(|l| l.fleet_proven());

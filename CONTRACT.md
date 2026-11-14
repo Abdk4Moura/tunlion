@@ -1497,6 +1497,33 @@ the peer's verified device identity, and checks the requested action
 against it (`ceiling_covers_action`). Anything outside the ceiling needs
 an explicit grant exactly as before.
 
+## Pair grants count in both modes (pairwise-first)
+
+Any device may pair with any other, and the only restrictions on a pair come
+from fleet-wide rules. A grant one device gives its pair (`tunlion grant <peer>
+<cap>` on THIS device, written into its own `devices.json` record, no owner key
+involved) is an explicit grant for that action in shadow AND in authoritative
+mode (`TUNLION_CAP_AUTHORITATIVE=1`). Authoritative mode does not additionally
+require an owner-signed grant for a pair peer.
+
+- A pair is a link that proved the pair secret and carries no delegated
+  ceiling. A delegated or invited device is not a pair for this rule: its
+  record caps are its ceiling, and the ceiling stays its bound.
+- The record must list the action literally; the implied `transfer` baseline
+  of `device_allows` does not count as a grant here.
+- A local deny for the action, a revoked device, a delegated ceiling that
+  lacks the action, an expired certificate and a non-Proven binding each
+  refuse it exactly as they refuse an owner-signed grant, and the shell
+  identity requirement (a resolved device identity) is unchanged.
+- Fleet siblings keep their own rule (`fleet_sibling_inputs` below); this rule
+  neither widens nor narrows it. Shadow decisions are unchanged: shadow
+  already decides on the legacy fold, which read the record grant.
+
+The rule is `filament_cap::capability::pair_grant_inputs`, applied by every
+gate that reads a record grant: shell, pty, exec, ssh-sign and forward
+(`gather_shell_gate_inputs`, and the terminal recheck), mount, file-offer
+transfer and sync.
+
 ## Owner-signed fleet grant sets (`fleet-grants`) and `fleet.owner_grants`
 
 `{"type": "fleet-grants", owner_pub, target_pub, epoch, valid_until, grants:

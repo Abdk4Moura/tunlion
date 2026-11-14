@@ -296,6 +296,124 @@ mod tests {
     // the matrix pins the decision, the gate pins that the decision is reached
     // with the real input.
 
+    /// Pairwise-first (owner decision): in authoritative mode a grant this
+    /// device gave its pair (`tunlion grant <peer> shell`, no owner key) counts,
+    /// on every shell-class entry point and for a pair under either owner key.
+    /// Deny, revocation, a delegated ceiling and the identity requirements
+    /// still refuse it, and no grant is still no shell.
+    #[test]
+    fn a_pair_record_grant_counts_under_authoritative() {
+        let _guard = crate::tests::lock_test_config();
+        let prior = std::env::var("TUNLION_CAP_AUTHORITATIVE").ok();
+        unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", "1") };
+
+        let peer_user = [0x33u8; 32];
+        // Composed exactly as gather does: the store holds no owner-signed
+        // grant, then the pair mapping runs over its outcome.
+        fn cell(
+            is_pair: bool,
+            local_grant: bool,
+            denied: bool,
+            cert_revoked: bool,
+            ak_caps: Option<Vec<String>>,
+            own_user: [u8; 32],
+        ) -> ShellGateInputs {
+            let (outcome, has_grant) = crate::capability::pair_grant_inputs(
+                is_pair,
+                local_grant,
+                denied,
+                CapOutcome::Denied("not authorized".into()),
+                false,
+            );
+            ShellGateInputs {
+                certless_pair: None,
+                trusted: true,
+                denied,
+                policy_allows: false,
+                store_allows: local_grant,
+                outcome,
+                idev: Some([0x42u8; 32]),
+                iusr: Some([0x33u8; 32]),
+                binding: BindingStrength::Proven,
+                expires: Some(9_999_999_999u64),
+                ak_caps,
+                own_user: Some(own_user),
+                has_grant,
+                cert_revoked,
+                ceiling_covers: false,
+                identity_state: IdentityState::Resolved,
+                scoped_default: false,
+                action: CAP_SHELL.to_string(),
+            }
+        }
+        let all = |inputs: &ShellGateInputs| {
+            let legacy = inputs.trusted && !inputs.denied && (inputs.policy_allows || inputs.store_allows);
+            [
+                exec_gate_decision(inputs),
+                pty_gate_decision(inputs),
+                ssh_gate_decision(inputs),
+                forward_gate_decision(inputs, legacy),
+            ]
+        };
+        // A pair under another owner's key, and one under this owner's key.
+        for own_user in [[0x11u8; 32], peer_user] {
+            for d in all(&cell(true, true, false, false, None, own_user)) {
+                assert!(d.is_ok(), "a pair record grant must admit under authoritative");
+            }
+            // The grant read only by the legacy fold (the pre-decision state)
+            // is what authoritative refused.
+            for d in all(&cell(false, true, false, false, None, own_user)) {
+                assert!(d.is_err(), "without the pair mapping the store alone refuses");
+            }
+            // No local grant: unchanged.
+            for d in all(&cell(true, false, false, false, None, own_user)) {
+                assert!(d.is_err(), "no grant is still no shell");
+            }
+            // A local deny outranks the grant.
+            for d in all(&cell(true, true, true, false, None, own_user)) {
+                assert!(d.is_err(), "a local deny must refuse a pair grant");
+            }
+            // Revocation outranks the grant.
+            for d in all(&cell(true, true, false, true, None, own_user)) {
+                assert!(d.is_err(), "a revoked device must stay refused");
+            }
+            // A delegated peer is not a pair, and its ceiling still caps a
+            // mapping forced through.
+            let ceiling = Some(vec!["transfer".to_string()]);
+            for d in all(&cell(false, true, false, false, ceiling.clone(), own_user)) {
+                assert!(d.is_err(), "a delegated peer's record is its ceiling, not a pair grant");
+            }
+            for d in all(&cell(true, true, false, false, ceiling, own_user)) {
+                assert!(d.is_err(), "a ceiling without shell must refuse");
+            }
+            // Identity requirements are unchanged.
+            let mut inferred = cell(true, true, false, false, None, own_user);
+            inferred.binding = BindingStrength::Inferred;
+            for d in all(&inferred) {
+                assert!(d.is_err(), "authoritative still requires a Proven binding");
+            }
+            let mut pending = cell(true, true, false, false, None, own_user);
+            pending.identity_state = IdentityState::Pending;
+            for d in all(&pending) {
+                assert!(d.is_err(), "an unresolved identity is refused before any grant");
+            }
+        }
+
+        // Shadow is unchanged: it decides on the legacy fold either way.
+        unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", "0") };
+        for is_pair in [false, true] {
+            assert!(exec_gate_decision(&cell(is_pair, true, false, false, None, [0x11u8; 32])).is_ok());
+            assert!(exec_gate_decision(&cell(is_pair, false, false, false, None, [0x11u8; 32])).is_err());
+        }
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TUNLION_CAP_AUTHORITATIVE", v),
+                None => std::env::remove_var("TUNLION_CAP_AUTHORITATIVE"),
+            }
+        }
+    }
+
     /// Eval item 4: on a member, `grant u1-b shell` for a fleet sibling was
     /// recorded, the caps view said EFFECTIVE yes, and every exec was refused
     /// "shell not granted to 'u1-b' here", because the fold read the link's

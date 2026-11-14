@@ -349,6 +349,16 @@ impl TerminalSessionScope {
         let denied = self.name.as_deref().is_some_and(|n| host.device_capability_denied(n, "shell"));
         let local_grant = self.name.as_deref().is_some_and(|n| host.device_allows(n, "shell"));
         let owner_grant = self.sibling && self.device.as_ref().is_some_and(|key| host.fleet_grant_applies(key, "shell"));
+        // The same pair rule admission applied, so a recheck never withdraws a
+        // terminal the gate admitted on a pair grant. `trusted && !sibling` is
+        // the pair-proven link; a delegated ceiling disqualifies it.
+        let pair = PairFacts::read(
+            host,
+            self.name.as_deref(),
+            self.trusted && !self.sibling && key_caps.is_none(),
+            "shell",
+        );
+        let (outcome, has_grant) = pair.apply(outcome, has_grant);
         let inputs = ShellGateInputs {
             certless_pair: if self.trusted && !self.sibling
                 && self.device.is_none() && self.user.is_none() && self.key_caps.is_none()
@@ -422,6 +432,10 @@ pub fn gather_shell_gate_inputs(
     let sib = sibling_facts(conn, pid, action);
     let (_, has_grant) = sibling_gate_inputs(&sib, action, false, has_grant);
     let store_allows = store_allows || (sib.is_sibling && sib.owner_grant);
+    // Pair: this device's own record grant counts as an explicit grant in
+    // authoritative mode too (the legacy fold already reads it via
+    // store_allows). The deny read above still outranks it at the gate.
+    let (outcome, has_grant) = pair_facts(conn, pid, action, ak_caps).apply(outcome, has_grant);
     let inputs = ShellGateInputs {
         certless_pair: CertlessPair::from_link(conn, pid),
         trusted,
@@ -537,6 +551,58 @@ pub fn sibling_gate_inputs(
         f.local_grant,
         f.owner_grant,
     )
+}
+
+/// What a gate needs to know about a PAIR peer's own record grant, for one
+/// action. Pairwise-first: a grant this device gave its pair counts as an
+/// explicit grant in authoritative mode too, not only in the legacy fold. The
+/// rule is `filament_cap::capability::pair_grant_inputs`; this only reads it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PairFacts {
+    /// The link proved the pair secret and carries no delegated ceiling.
+    pub is_pair: bool,
+    /// THIS machine's own record literally lists the action for the peer.
+    pub local_grant: bool,
+    /// THIS machine's record DENIES the action to the peer. Outranks the grant.
+    pub denied: bool,
+}
+
+impl PairFacts {
+    /// Read the facts for the record `name` resolves to. `is_pair` is the
+    /// caller's link fact; nothing is read for anything that is not a pair.
+    pub fn read(host: &dyn HostServices, name: Option<&str>, is_pair: bool, action: &str) -> Self {
+        match name {
+            Some(n) if is_pair => Self {
+                is_pair,
+                local_grant: host.device_record_grants(n, action),
+                denied: host.device_capability_denied(n, action),
+            },
+            _ => Self::default(),
+        }
+    }
+
+    /// Apply the pair rule to a gate's `(outcome, has_explicit_grant)`.
+    pub fn apply(&self, outcome: CapOutcome, has_grant: bool) -> (CapOutcome, bool) {
+        filament_cap::capability::pair_grant_inputs(
+            self.is_pair,
+            self.local_grant,
+            self.denied,
+            outcome,
+            has_grant,
+        )
+    }
+}
+
+/// Read the pair facts for `pid` and `action`. A pair is a link that proved the
+/// pair secret (`trusted`, which a fleet sibling never is) and that carries no
+/// delegated ceiling, from its principal or from `ak_caps` as `peer_authz`
+/// resolved it fresh: a delegated or invited peer's record caps ARE its ceiling.
+pub fn pair_facts(conn: &Conn, pid: &str, action: &str, ak_caps: Option<&[String]>) -> PairFacts {
+    let Some(l) = conn.link(pid) else {
+        return PairFacts::default();
+    };
+    let is_pair = l.trusted && l.principal_kind.auth_key_caps().is_none() && ak_caps.is_none();
+    PairFacts::read(conn.host.as_ref(), l.verified_name.as_deref(), is_pair, action)
 }
 
 /// Pure predicate behind `Link::fleet_proven`: a same-owner fleet device whose
@@ -669,6 +735,7 @@ mod terminal_lifecycle_tests {
         keys: std::collections::HashMap<String, [u8; 32]>,
         revoked_records: HashSet<String>,
         delegated_records: HashSet<String>,
+        record_grants: HashSet<String>,
     }
     #[derive(Default)]
     struct Host(Mutex<Facts>);
@@ -706,6 +773,9 @@ mod terminal_lifecycle_tests {
         }
         fn device_record_revoked(&self, name: &str) -> bool {
             self.0.lock().unwrap().revoked_records.contains(name)
+        }
+        fn device_record_grants(&self, name: &str, _: &str) -> bool {
+            self.0.lock().unwrap().record_grants.contains(name)
         }
         fn principal_ceiling_for(&self, name: &str) -> Option<Vec<String>> {
             self.0.lock().unwrap().delegated_records.contains(name).then(Vec::new)
@@ -852,6 +922,31 @@ mod terminal_lifecycle_tests {
         paired.name = None;
         paired.device = None;
         assert!(!paired.withdrawn(&host));
+    }
+
+    /// Pairwise-first: the pair facts read this device's own record grant for
+    /// a pair only, and the mapping counts it unless a local deny outranks it.
+    #[test]
+    fn pair_facts_count_a_local_grant_for_a_pair_only() {
+        let host = Host::default();
+        host.0.lock().unwrap().record_grants.insert("paired".into());
+        let denied = CapOutcome::Denied("not authorized".into());
+        let pair = PairFacts::read(&host, Some("paired"), true, "shell");
+        assert!(pair.is_pair && pair.local_grant && !pair.denied);
+        assert_eq!(pair.apply(denied.clone(), false), (CapOutcome::Authorized, true));
+        // Not a pair (a sibling, a delegated peer, an untrusted link), or no
+        // record to read: nothing is read and nothing changes.
+        for facts in [
+            PairFacts::read(&host, Some("paired"), false, "shell"),
+            PairFacts::read(&host, None, true, "shell"),
+            PairFacts::read(&host, Some("stranger"), true, "shell"),
+        ] {
+            assert_eq!(facts.apply(denied.clone(), false), (denied.clone(), false));
+        }
+        host.0.lock().unwrap().denies.insert("paired".into());
+        let pair = PairFacts::read(&host, Some("paired"), true, "shell");
+        assert!(pair.denied);
+        assert_eq!(pair.apply(denied.clone(), false), (denied.clone(), false));
     }
 
     #[test]
