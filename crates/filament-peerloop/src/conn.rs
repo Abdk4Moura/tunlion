@@ -3195,18 +3195,12 @@ impl Conn {
         // An offer held during the direct attempt makes this build its
         // responder: the peer already offered, so answering it is the only role
         // that cannot glare (the same reason `ensure_responder` forces polite).
-        let held = self.take_held(&peer_id);
-        let held_offer = held.as_ref().is_some_and(|h| h.has_offer);
-        let (signals, signal_bytes) = match held {
-            Some(h) => {
-                self.log.debug(&format!(
-                    "tunlion: HOLD-REPLAY peer={peer_id} caller={caller}: {} held signal(s) staged into its build",
-                    h.signals.len()
-                ));
-                (h.signals, h.bytes)
-            }
-            None => (std::collections::VecDeque::new(), 0),
-        };
+        // Peek here and take the hold only after the role is decided, so a role
+        // error leaves it in place for the next build.
+        let held_offer = self
+            .held_signals
+            .get(&peer_id)
+            .is_some_and(|h| h.has_offer && h.since.elapsed() < held_signal_ttl());
         let polite = match force_polite {
             Some(value) => value,
             None if held_offer => true,
@@ -3224,6 +3218,16 @@ impl Conn {
                     )?
                 }
             },
+        };
+        let (signals, signal_bytes) = match self.take_held(&peer_id) {
+            Some(h) => {
+                self.log.debug(&format!(
+                    "tunlion: HOLD-REPLAY peer={peer_id} caller={caller}: {} held signal(s) staged into its build",
+                    h.signals.len()
+                ));
+                (h.signals, h.bytes)
+            }
+            None => (std::collections::VecDeque::new(), 0),
         };
         self.next_gen += 1;
         let generation = self.next_gen;
@@ -4110,6 +4114,24 @@ impl Conn {
                 "tunlion: HOLD-DISCARD peer={pid}: {} held signal(s) dropped, {why}",
                 held.signals.len()
             ));
+        }
+    }
+
+    /// Drop holds whose direct pending is gone with no build or link to take
+    /// them, and holds past their age.
+    fn reap_orphan_holds(&mut self) {
+        let orphans: Vec<String> = self
+            .held_signals
+            .iter()
+            .filter(|(pid, h)| {
+                h.since.elapsed() >= held_signal_ttl()
+                    || (!self.direct_pending.contains_key(pid.as_str())
+                        && !self.build_pending(pid.as_str()))
+            })
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        for pid in orphans {
+            self.discard_held(&pid, "its direct attempt ended with no build to answer it");
         }
     }
 
@@ -6250,6 +6272,10 @@ impl Conn {
     /// they have no signaling peer, so expiry retires them without a fallback.
     pub fn expired_direct(&mut self) -> Vec<(String, Value, (String, String))> {
         let now = Instant::now();
+        // A hold outlives its direct pending only until the build that takes
+        // it. One whose pending ended (fallback, retirement, revocation) with no
+        // build to take it is an orphan by the next reaper call: purge it.
+        self.reap_orphan_holds();
         let mut fell_back = Vec::new();
         // Post-PAKE promotions first: one whose race lost leaves WebRTC serving
         // (nothing was torn down, so nothing falls back), one whose race won is
@@ -8719,6 +8745,22 @@ impl Conn {
             }
             Err(e) => self.log.trace(&format!("signal failed to apply: {e} (recovering)")),
         }
+    }
+
+    /// The SDP tail every driver loop runs after `ensure_responder`: stage the
+    /// signal into a build still in flight for its sid, else HOLD it when our
+    /// direct attempt for that sid is pending (no responder may be built yet,
+    /// and the peer sends its offer once per connection), else apply it.
+    pub async fn deliver_sdp_signal(&mut self, envelope: &Value) {
+        let from = envelope["from"].as_str().unwrap_or_default().to_string();
+        if self.build_pending(&from) {
+            self.stage_signal(envelope);
+            return;
+        }
+        if self.hold_for_direct(envelope) {
+            return;
+        }
+        self.apply_signal(&from, envelope["data"].clone()).await;
     }
 
     pub async fn ensure_responder(&mut self, from: &str, data: &Value) -> Result<()> {
@@ -12607,6 +12649,138 @@ mod warm_identity_tests {
         assert_eq!(new.remote_pc().await, Some(2));
         let local = new.pc.local_description().await.expect("answer");
         assert_eq!(local.sdp_type.to_string(), "answer");
+    }
+
+    /// The DoS guard: a link that is SERVING bytes is never torn down for an
+    /// offer that merely claims a new peer connection; it keeps the old
+    /// renegotiation path and its transport.
+    #[tokio::test]
+    async fn a_serving_link_never_gets_a_fresh_responder() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-serving";
+        let first = offer_from(&conn, pid, 1).await;
+        conn.ensure_responder(pid, &first["data"]).await.expect("responder");
+        conn.apply_signal(pid, first["data"].clone()).await;
+        let old = conn.links[pid].peer.clone().expect("responder");
+        let serving: Arc<dyn Transport> = Rec::new("serving", &log);
+        conn.links.get_mut(pid).unwrap().transport = Some(serving.clone());
+
+        let second = offer_from(&conn, pid, 2).await;
+        conn.apply_signal(pid, second["data"].clone()).await;
+        let link = &conn.links[pid];
+        assert!(
+            Arc::ptr_eq(link.peer.as_ref().expect("peer kept"), &old),
+            "a serving link was rebuilt for a new-pc offer"
+        );
+        assert!(
+            link.transport.as_ref().is_some_and(|t| Arc::ptr_eq(t, &serving)),
+            "the serving transport was replaced"
+        );
+        assert!(!serving.is_dead(), "the serving transport was closed");
+    }
+
+    /// An untagged sender (a browser, an older build) keeps the renegotiation
+    /// path: its second offer is applied to the same responder.
+    #[tokio::test]
+    async fn an_untagged_peer_keeps_the_renegotiation_path() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-untagged";
+        let untag = |mut v: Value| {
+            if let Some(d) = v["data"].as_object_mut() {
+                d.remove("pc");
+            }
+            v
+        };
+        let first = untag(offer_from(&conn, pid, 1).await);
+        conn.ensure_responder(pid, &first["data"]).await.expect("responder");
+        conn.apply_signal(pid, first["data"].clone()).await;
+        let old = conn.links[pid].peer.clone().expect("responder");
+        assert_eq!(old.remote_pc().await, None);
+        let second = untag(offer_from(&conn, pid, 2).await);
+        conn.apply_signal(pid, second["data"].clone()).await;
+        let now = conn.links[pid].peer.clone().expect("responder");
+        assert!(Arc::ptr_eq(&old, &now), "an untagged offer rebuilt the responder");
+    }
+
+    /// The driver loops' shared SDP tail (`deliver_sdp_signal`, called by
+    /// recv dispatch, send engine and join after `ensure_responder`): during a
+    /// pending direct attempt the offer is held, not applied or dropped; with
+    /// no pending it is applied to the responder.
+    #[tokio::test]
+    async fn the_driver_sdp_tail_holds_during_a_pending_direct_attempt() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-driver-tail";
+        expired_direct_pending(&mut conn, pid, Instant::now() + Duration::from_secs(30));
+        let offer = offer_from(&conn, pid, 1).await;
+        conn.ensure_responder(pid, &offer["data"]).await.expect("no error during a pending");
+        assert!(!conn.links.contains_key(pid), "a responder was built during the pending");
+        conn.deliver_sdp_signal(&offer).await;
+        assert!(conn.held_signals.get(pid).is_some_and(|h| h.has_offer), "the offer was not held");
+
+        let other = "sid-driver-tail-nopending";
+        let offer2 = offer_from(&conn, other, 1).await;
+        conn.ensure_responder(other, &offer2["data"]).await.expect("responder");
+        conn.deliver_sdp_signal(&offer2).await;
+        assert!(!conn.held_signals.contains_key(other), "held with no pending");
+        let p = conn.links[other].peer.clone().expect("responder");
+        assert!(p.pc.local_description().await.is_some(), "the offer was not applied");
+    }
+
+    /// The upgrade adoption site discards a hold too.
+    #[tokio::test]
+    async fn upgrade_adoption_discards_a_held_offer() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-upgrade-held";
+        conn.held_signals.insert(
+            pid.to_string(),
+            HeldSignals {
+                since: Instant::now(),
+                pc: Some(1),
+                has_offer: true,
+                signals: std::collections::VecDeque::new(),
+                bytes: 0,
+            },
+        );
+        let t: Arc<dyn Transport> = Rec::new("upgrade", &log);
+        let attempt = t.attempt_id().unwrap();
+        let adopted = conn.adopt_direct_transport(
+            pid,
+            t,
+            "direct-quic",
+            attempt,
+            Some(("peer".into(), "secret".into())),
+            None,
+            Some(DirectAuth::device(1, "peer", "secret")),
+        );
+        assert!(matches!(adopted, DirectAdoption::Adopted { .. }));
+        assert!(!conn.held_signals.contains_key(pid), "upgrade adopted but the offer stayed held");
+    }
+
+    /// A hold whose direct attempt ended with nothing built to take it is
+    /// purged by the next reaper call; one still pending is kept.
+    #[tokio::test]
+    async fn an_orphan_hold_is_purged_by_the_reaper() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-orphan";
+        let live = "sid-still-pending";
+        expired_direct_pending(&mut conn, live, Instant::now() + Duration::from_secs(30));
+        for p in [pid, live] {
+            conn.held_signals.insert(
+                p.to_string(),
+                HeldSignals {
+                    since: Instant::now(),
+                    pc: None,
+                    has_offer: true,
+                    signals: std::collections::VecDeque::new(),
+                    bytes: 0,
+                },
+            );
+        }
+        let _ = conn.expired_direct();
+        assert!(!conn.held_signals.contains_key(pid), "an orphan hold survived the reaper");
+        assert!(conn.held_signals.contains_key(live), "a pending's hold was purged");
     }
 
     /// Cold adoption keys workers from the immutable AUTHORIZATION, exactly

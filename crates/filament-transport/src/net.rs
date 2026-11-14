@@ -2223,26 +2223,13 @@ impl Peer {
         // Resolve the LOCAL address to a real interface name. A reflexive
         // local candidate names the NAT mapping, so use its base, or failing
         // that the source address the OS routes to the remote from.
-        let mut iface_addr = local_iface_addr(
+        let iface_addr = selected_local_iface_addr(
             pair.local.typ,
             &pair.local.address,
             &pair.local.related_address,
+            &pair.remote.address,
+            pair.remote.port,
         );
-        let reflexive = matches!(
-            pair.local.typ,
-            RTCIceCandidateType::Srflx | RTCIceCandidateType::Prflx
-        );
-        if reflexive && iface_addr == pair.local.address {
-            if let Some(ip) = pair
-                .remote
-                .address
-                .parse::<std::net::IpAddr>()
-                .ok()
-                .and_then(|ip| source_ip_for(std::net::SocketAddr::new(ip, pair.remote.port)))
-            {
-                iface_addr = ip.to_string();
-            }
-        }
         let iface = resolve_iface_name(&iface_addr);
         if is_tailscale_addr(&pair.local.address) || is_tailscale_addr(&pair.remote.address) {
             return Some(format!("direct over {iface}"));
@@ -2370,6 +2357,28 @@ pub fn local_iface_addr(typ: RTCIceCandidateType, address: &str, related: &str) 
     } else {
         address.to_string()
     }
+}
+
+/// `local_iface_addr`, plus the last resort for a reflexive candidate with no
+/// usable base: the source address the OS routes to the remote from.
+pub fn selected_local_iface_addr(
+    typ: RTCIceCandidateType,
+    address: &str,
+    related: &str,
+    remote_address: &str,
+    remote_port: u16,
+) -> String {
+    let addr = local_iface_addr(typ, address, related);
+    let reflexive = matches!(typ, RTCIceCandidateType::Srflx | RTCIceCandidateType::Prflx);
+    if !reflexive || addr != address {
+        return addr;
+    }
+    remote_address
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .and_then(|ip| source_ip_for(std::net::SocketAddr::new(ip, remote_port)))
+        .map(|ip| ip.to_string())
+        .unwrap_or(addr)
 }
 
 /// The concrete endpoints of a selected ICE candidate pair, for path display.
@@ -3388,6 +3397,26 @@ mod tests {
             local_iface_addr(RTCIceCandidateType::Host, "10.0.0.4", "1.2.3.4"),
             "10.0.0.4",
             "a host candidate is its own interface address"
+        );
+    }
+
+    /// With no usable base, a reflexive candidate falls back to the source the
+    /// OS routes to the remote from (loopback here, so no network is needed).
+    /// A host candidate never takes the fallback.
+    #[test]
+    fn reflexive_candidate_without_base_uses_the_routed_source() {
+        assert_eq!(
+            selected_local_iface_addr(RTCIceCandidateType::Srflx, "74.152.64.39", "", "127.0.0.1", 9),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            selected_local_iface_addr(RTCIceCandidateType::Srflx, "74.152.64.39", "10.0.0.4", "127.0.0.1", 9),
+            "10.0.0.4",
+            "a usable base wins over the routed source"
+        );
+        assert_eq!(
+            selected_local_iface_addr(RTCIceCandidateType::Host, "10.0.0.4", "", "127.0.0.1", 9),
+            "10.0.0.4"
         );
     }
 
