@@ -38,7 +38,7 @@ export const PAIR_V2_CAPS = ['transfer']
 /// `sendSignal(data)` relays an opaque payload to the peer via the server.
 /// `getFingerprints()` returns {mine, theirs} once SDP is exchanged (or null).
 export class PakePairing extends PakeCeremony {
-  constructor({ nameplate, password, caps = PAIR_V2_CAPS, sendSignal, getFingerprints }) {
+  constructor({ nameplate, password, caps = PAIR_V2_CAPS, sendSignal, getFingerprints, trace }) {
     super({
       nameplate,
       caps,
@@ -46,6 +46,7 @@ export class PakePairing extends PakeCeremony {
       session: new PakeSession(utf8(password), utf8(nameplate)),
       sendSignal,
       getFingerprints,
+      trace,
     })
     this.password = password
   }

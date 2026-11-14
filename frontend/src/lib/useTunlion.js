@@ -26,6 +26,7 @@ import { linkPolicyFacts } from '../net/app/policyFacts.js'
 import { codeStatusAfterTransfer } from '../net/app/codeStatus.js'
 import { localHelperEnabled } from '../net/app/localHelper.js'
 import { pakePartnerFor } from '../net/app/pakePartner.js'
+import { tracePake } from '../net/app/pakeTrace.js'
 import { isSamePeerBack, PEER_LEFT_GRACE_MS } from '../net/app/pairRejoin.js'
 // APPLICATION/state-reducer — pure peer/transfer list transforms (Phase 2).
 import { addPeerToList, patchPeerInList, removePeerFromList, upsertTransferInList } from '../net/app/state.js'
@@ -502,11 +503,13 @@ export function useTunlion() {
         // Resume: once the channel is open, re-offer any paused sends that were
         // headed to this same device (matched by its stable uid).
         onChannelOpen: () => {
+          tracePake('channel-open', { ceremony: pakeRef.current, link, fingerprints: link.fingerprints() })
           attemptsRef.current.delete(id) // established, reset watchdog retries
           // L1-a: a v2 pairing is in flight for this peer; now that SDP (and
           // thus the DTLS fingerprints) is exchanged, run the SPAKE2 ceremony.
           if (pendingPakeRef.current) {
             ensurePakePairing(id)
+            if (pakePeerRef.current === id) pakeRef.current?.observeFingerprints(link.fingerprints())
             drivePake()
           }
           // C20: if this peer was introduced via a known-device channel, prove
@@ -822,6 +825,7 @@ export function useTunlion() {
       })
       sig.on('peer-joined', ({ id, name, uid }) => {
         if (uid && uid === uidRef.current) return
+        tracePake('peer-joined', { ceremony: pakeRef.current, link: linksRef.current.get(id) })
         // The ceremony's partner left a moment ago and is back (a rejoin of
         // the room, possibly under a fresh sid): keep the ceremony, rebound
         // to this sid; the fresh link carries the confirmation.
@@ -843,6 +847,7 @@ export function useTunlion() {
         makeLink({ id, name, uid })
       })
       sig.on('peer-left', ({ id }) => {
+        tracePake('peer-left', { ceremony: pakeRef.current, link: linksRef.current.get(id), fingerprints: linksRef.current.get(id)?.fingerprints() })
         // The CLI ends a ceremony it refuses (wrong code, failed confirmation)
         // by leaving. Without this the browser would sit on "paired" forever.
         // But a peer that leaves and promptly rejoins (a room re-join on the
@@ -954,6 +959,7 @@ export function useTunlion() {
             ourNp: pendingPakeRef.current?.nameplate,
             haveK: !!pakeRef.current?.haveK,
           })
+          tracePake('signal-route', { ceremony: pakeRef.current, link: linksRef.current.get(from), fingerprints: linksRef.current.get(from)?.fingerprints(), state: { partner, kind: data.type === 'pake-msg' ? 'element' : 'confirm' } })
           if (partner === 'ignore') return
           if (partner === 'switch') {
             // The first link was a bystander in the room: run the ceremony
@@ -984,6 +990,10 @@ export function useTunlion() {
       // One-time pairing (#11): the server matched us with the code's other
       // party; the code is burned; move both into the private room.
       sig.on('pair-matched', ({ room }) => {
+        tracePake('pair-matched', { ceremony: pakeRef.current, link: linksRef.current.get(pakePeerRef.current), fingerprints: linksRef.current.get(pakePeerRef.current)?.fingerprints() })
+        // Preserve the bound link's fingerprints before rejoin tears it down.
+        // Its delayed MAC may arrive while the successor has no SDP yet.
+        pakeRef.current?.observeFingerprints(linksRef.current.get(pakePeerRef.current)?.fingerprints())
         log.debug('pair matched, joining room')
         setRoomCode(null)
         // Re-join even when `room` is the one we are in (same network): a CLI
@@ -1200,7 +1210,7 @@ export function useTunlion() {
     if (!cfg || !pakeReadyRef.current) return null
     pakePeerRef.current = peerId
     pakeDoneRef.current = null
-    pakeRef.current = new PakePairing({
+    const pairing = new PakePairing({
       nameplate: cfg.nameplate,
       password: cfg.password,
       caps: PAIR_V2_CAPS,
@@ -1208,7 +1218,10 @@ export function useTunlion() {
       // fresh sid is rebound in peer-joined, and the ceremony follows it.
       sendSignal: (payload) => sigRef.current?.signal(pakePeerRef.current || peerId, payload),
       getFingerprints: () => linksRef.current.get(pakePeerRef.current || peerId)?.fingerprints() || null,
+      trace: (event, fingerprints, state) => tracePake(event, { ceremony: pairing, link: linksRef.current.get(pakePeerRef.current || peerId), fingerprints, state }),
     })
+    pakeRef.current = pairing
+    tracePake('ceremony-create', { ceremony: pairing, link: linksRef.current.get(peerId), fingerprints: linksRef.current.get(peerId)?.fingerprints() })
     // C30: a lost element or confirmation is re-sent on backoff by the
     // ceremony; this tick gives it the chance. It stops with the ceremony.
     if (!pakeTickRef.current) {

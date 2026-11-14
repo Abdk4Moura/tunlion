@@ -46,13 +46,14 @@ export function resendDelay(step) {
 /// the peer via the server. `getFingerprints()` returns {mine, theirs} once SDP
 /// is exchanged (or null).
 export class PakeCeremony {
-  constructor({ nameplate, caps, capsCanon, session, sendSignal, getFingerprints, now = () => Date.now() }) {
+  constructor({ nameplate, caps, capsCanon, session, sendSignal, getFingerprints, trace = () => {}, now = () => Date.now() }) {
     this.nameplate = nameplate
     this.caps = caps
     this.capsCanon = capsCanon
     this.session = session
     this.sendSignal = sendSignal
     this.getFingerprints = getFingerprints
+    this.trace = trace
     this.now = now
     this.msg = session.message()
     this.sentMsg = false
@@ -86,6 +87,7 @@ export class PakeCeremony {
     if (this.sentConfirm || !this.haveK || this.aborted) return
     const payload = this._confirmPayload()
     if (!payload) return
+    this.trace('confirm-send', this.getFingerprints(), { haveK: this.haveK, sentConfirm: this.sentConfirm })
     this.sendSignal(payload)
     this.sentConfirm = true
     this._arm()
@@ -101,6 +103,14 @@ export class PakeCeremony {
     if (this._fpsHistory.some((old) => old.mine === fps.mine && old.theirs === fps.theirs)) return
     this._fpsHistory.push({ mine: fps.mine, theirs: fps.theirs })
     if (this._fpsHistory.length > 4) this._fpsHistory.shift()
+  }
+
+  // Record the bound link while it is still present, even before an element
+  // arrives or we send a confirmation. A peer may confirm on that link while
+  // our copy arrives only after the link is torn down. The pair is used only
+  // to identify a stale MAC; success still requires the current pair.
+  observeFingerprints(fps) {
+    this._rememberFps(fps)
   }
   /// Re-send the current message if its backoff slot is due. Call on a short
   /// cadence while the ceremony is live; a no-op once confirmed or refused.
@@ -120,10 +130,12 @@ export class PakeCeremony {
   /// (and thus consumed); false if it should fall through to WebRTC.
   onSignal(data) {
     if (data?.type === 'pake-msg') {
+      this.trace('element-receive', this.getFingerprints(), { haveK: this.haveK })
       if (!this.haveK) this._absorb(data.msg)
       return true
     }
     if (data?.type === 'pake-confirm') {
+      this.trace('confirm-receive', this.getFingerprints(), { haveK: this.haveK, sentConfirm: this.sentConfirm, completed: !!this.secret })
       // Our copy of the peer's element was lost: its confirmation carries
       // the same element, so derive K from that first.
       if (!this.haveK && data.msg) {
@@ -148,15 +160,18 @@ export class PakeCeremony {
 
   _absorb(msgB64) {
     if (!this.session.finish(b64d(msgB64))) {
+      this.trace('element-invalid', this.getFingerprints(), { haveK: this.haveK })
       this.aborted = 'malformed key-exchange message'
       return
     }
     this.haveK = true
+    this.trace('element-absorbed', this.getFingerprints(), { haveK: this.haveK })
     this.tryConfirm()
   }
 
   _verify(mac) {
     const fps = this.getFingerprints()
+    this.trace('confirm-verify', fps, { history: this._fpsHistory.length, sentConfirm: this.sentConfirm })
     if (!fps) {
       // Can't verify without fingerprints; stash and retry on tryConfirm.
       this._pendingConfirmMac = mac
@@ -164,6 +179,7 @@ export class PakeCeremony {
     }
     this._rememberFps(fps)
     if (this.session.verifyPeerConfirm(fps.mine, fps.theirs, this.capsCanon, mac)) {
+      this.trace('confirm-verified-current', fps, { history: this._fpsHistory.length })
       // CONFIRMED. Derive the pinned secret from K (agreed, never transmitted).
       this.secret = this.session.secret()
       // Ours may not have gone out yet (the fingerprints arrived with theirs).
@@ -183,6 +199,7 @@ export class PakeCeremony {
     for (const old of this._fpsHistory) {
       if (old.mine === fps.mine && old.theirs === fps.theirs) continue
       if (this.session.verifyPeerConfirm(old.mine, old.theirs, this.capsCanon, mac)) {
+        this.trace('confirm-verified-prior', old, { history: this._fpsHistory.length })
         // The link changed under us. The peer's confirmation is for the old
         // link; the current one has to be confirmed on its own terms. Keep
         // waiting for a confirmation made on the link we are on now, and
@@ -193,6 +210,7 @@ export class PakeCeremony {
         return
       }
     }
+    this.trace('confirm-abort', fps, { history: this._fpsHistory.length, sentConfirm: this.sentConfirm })
     this.aborted = 'key confirmation failed: wrong code or tampering (a server cannot forge this)'
   }
 
