@@ -1771,14 +1771,17 @@ pub struct Peer {
 /// Extract `a=fingerprint:...` from an SDP (normalized uppercase hex).
 /// The remote DTLS fingerprint a live connection may record next. A
 /// connection's DTLS certificate is fixed for its life (an ICE restart keeps
-/// it, a rebuild is a new connection), so a description that names a
-/// different one than the connection already recorded is refused.
+/// it, a rebuild is a new connection), so once one is recorded, a description
+/// that names a different one, or none, is refused.
 fn next_remote_fingerprint(recorded: Option<&str>, offered: Option<String>) -> Result<Option<String>> {
     match (recorded, offered.as_deref()) {
         (Some(old), Some(new)) if old != new => Err(anyhow!(
             "remote DTLS fingerprint changed on a live connection; description refused"
         )),
-        _ => Ok(offered.or_else(|| recorded.map(str::to_string))),
+        (Some(_), None) => Err(anyhow!(
+            "remote description names no DTLS fingerprint on a live connection; description refused"
+        )),
+        _ => Ok(offered),
     }
 }
 
@@ -2764,8 +2767,10 @@ mod tests {
         assert_eq!(next_remote_fingerprint(None, Some("AA".into())).unwrap().as_deref(), Some("AA"));
         // A renegotiation naming the same certificate is accepted.
         assert_eq!(next_remote_fingerprint(Some("AA"), Some("AA".into())).unwrap().as_deref(), Some("AA"));
-        // A description without a fingerprint line keeps the recorded one.
-        assert_eq!(next_remote_fingerprint(Some("AA"), None).unwrap().as_deref(), Some("AA"));
+        // Once recorded, a description without one is refused.
+        assert!(next_remote_fingerprint(Some("AA"), None).is_err());
+        // Before anything is recorded, a missing one records nothing.
+        assert_eq!(next_remote_fingerprint(None, None).unwrap(), None);
         // A different certificate on the same connection is refused.
         assert!(next_remote_fingerprint(Some("AA"), Some("BB".into())).is_err());
     }
