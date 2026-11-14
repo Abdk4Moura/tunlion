@@ -197,6 +197,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
+    # The daemon's control pipe: an owner-only security descriptor from SDDL,
+    # and the client's check of the pipe owner's SID (platform/ctl_endpoint.rs).
+    "Win32_Security_Authorization",
     # Console modes for the interactive PTY: VT input so mouse and special keys
     # reach a remote app (see l2.rs win_console). A feature, not a new crate.
     "Win32_System_Console",

@@ -4,14 +4,15 @@
 // link to the peer (signaling + presence + the direct-QUIC race, ~1s). But if a
 // local `tunlion up` daemon already holds an established link to that peer, the
 // new session can ride THAT link instead, skipping establishment. The daemon
-// exposes a unix-domain socket; a sibling process connects, names a peer and a
-// remote port, and on success the socket becomes a raw byte pipe for one L2
-// stream the daemon opens over its warm link.
+// exposes a local control channel; a sibling process connects, names a peer and
+// a remote port, and on success the connection becomes a raw byte pipe for one
+// L2 stream the daemon opens over its warm link.
 //
-// PLATFORM: this rides a unix-domain socket, so it is a UNIX-ONLY feature. On
-// other platforms (Windows) the control socket is absent and every command falls
-// back to a fresh establish; `Req` is an uninhabited type so the daemon loop and
-// the netcat/forward fast paths compile unchanged.
+// PLATFORM: the channel is a unix-domain socket on unix and a named pipe on
+// Windows (#205). The transport, its naming and its access control live in
+// `platform::ctl_endpoint`; everything in this file is the shared protocol,
+// written once against the streams it hands out. The client helpers that stay
+// unix-only (the daemon-managed sshfs mounts) are marked where they are defined.
 //
 // The wire protocol is one request line and one reply line, then raw bytes:
 //   client -> daemon:  {"op":"open","peer":"<name>","rport":<u16>}\n
@@ -30,21 +31,22 @@
 // the daemon itself (it already acts on behalf of the local user); a peer is only
 // reachable if it was paired AND its acceptor grants L2, exactly as for a cold
 // `tunlion ssh`. The remote side is UNCHANGED and re-verifies trust per link.
+// The Windows pipe carries the same boundary: an owner-only DACL, local clients
+// only, and clients that refuse a pipe this user does not own (see
+// `platform::ctl_endpoint`).
 
 use std::path::PathBuf;
 
-/// `{config_dir}/control.sock`, honoring TUNLION_CONFIG_DIR (hermetic tests),
-/// else `~/.config/tunlion`. Mirrors `devices_path()` / `pidfile()`. Portable
-/// (just path math); only used on unix where the socket is actually bound.
-///
-/// When that path is too long for a unix socket (a deep HOME or
-/// TUNLION_CONFIG_DIR), a short per-user directory is used instead; see
-/// `platform::control_socket_path`. Daemon and clients both resolve it here.
+pub(crate) use crate::platform::ctl_endpoint::ClientStream;
+
+/// Where this config dir's daemon listens, honoring TUNLION_CONFIG_DIR
+/// (hermetic tests), else `~/.config/tunlion`. On unix that is
+/// `{config_dir}/control.sock`, or a short per-user directory when that path is
+/// too long for a unix socket (see `platform::control_socket_path`); on Windows
+/// it is the per-user, per-config-dir pipe name. Daemon and clients both
+/// resolve it here.
 pub fn control_sock_path() -> PathBuf {
-    crate::platform::control_socket_path(
-        &crate::platform::Paths::config_path("control.sock"),
-        &crate::platform::Paths::config_dir(),
-    )
+    crate::platform::ctl_endpoint::default_endpoint()
 }
 
 /// True if the warm-reuse fast path is disabled by the operator. An escape hatch
@@ -61,37 +63,31 @@ pub use filament_peerloop::control::{Req, ReqKind};
 #[cfg(unix)]
 pub use filament_peerloop::control::send_reply;
 
-#[cfg(unix)]
 pub use imp::{
     daemon_present, daemon_responds, forward_probe, serve_at, try_approve_request,
     try_bootstrap, try_cap_status, try_deny_request, try_dial, try_dial_reason, try_fleet_rendezvous,
-    try_l3_state, try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping,
+    try_l3_state, try_list_pending, try_list_warm, try_open, try_open_reason, try_ping,
     try_pty_reason, try_reconfigure, try_reload, try_reload_expose, try_resize,
-    try_revocation_sync, try_unmount, try_wake, try_depart, warm_pty_end_reason,
+    try_revocation_sync, try_wake, try_depart, warm_pty_end_reason,
 };
-
-#[cfg(not(unix))]
-pub use stub::{
-    daemon_present, daemon_responds, forward_probe, try_approve_request, try_cap_status,
-    try_deny_request, try_fleet_rendezvous, try_list_pending, try_list_warm, try_ping,
-    try_reconfigure, try_reload, try_revocation_sync, try_wake, try_depart,
-};
-
-// --------------------------------------------------------------- unix impl ----
+// Daemon-managed sshfs mounts are a unix feature; their clients stay with it.
 #[cfg(unix)]
+pub use imp::{try_mount, try_unmount};
+
+// ------------------------------------------------------------ protocol ----
 mod imp {
-    use super::{control_sock_path, reuse_disabled};
+    use super::{control_sock_path, reuse_disabled, ClientStream};
+    use crate::platform::ctl_endpoint::{connect, Listener};
     use anyhow::{anyhow, Result};
     use filament_peerloop::control::{Req, ReqKind};
     use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{UnixListener, UnixStream};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
     /// Read a single newline-terminated line, byte at a time, so we never consume
     /// the raw stream bytes that follow the JSON line. Lines are tiny, so cheap.
-    async fn read_line(s: &mut UnixStream, max: usize) -> Result<String> {
+    async fn read_line<S: AsyncRead + Unpin>(s: &mut S, max: usize) -> Result<String> {
         let mut buf = Vec::with_capacity(64);
         let mut byte = [0u8; 1];
         loop {
@@ -122,7 +118,7 @@ mod imp {
         if reuse_disabled() {
             return false;
         }
-        UnixStream::connect(control_sock_path()).await.is_ok()
+        connect(&control_sock_path()).await.is_ok()
     }
 
     /// Try to DIAL `peer`'s OVERLAY address:`port` through the daemon's L3 plane
@@ -131,7 +127,7 @@ mod imp {
     /// daemon resolves `peer` to its verified overlay address itself (never client-
     /// asserted). Returns the bridged socket, or `None` if there is no daemon / the
     /// peer is unknown / L3 is down, so the caller can report a clean failure.
-    pub async fn try_dial(peer: &str, port: u16) -> Option<UnixStream> {
+    pub async fn try_dial(peer: &str, port: u16) -> Option<ClientStream> {
         try_dial_reason(peer, port).await.ok()
     }
 
@@ -142,11 +138,11 @@ mod imp {
     pub async fn try_dial_reason(
         peer: &str,
         port: u16,
-    ) -> std::result::Result<UnixStream, Option<String>> {
+    ) -> std::result::Result<ClientStream, Option<String>> {
         if reuse_disabled() {
             return Err(None);
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.map_err(|_| None)?;
+        let mut s = connect(&control_sock_path()).await.map_err(|_| None)?;
         let req = json!({ "op": "dial", "peer": peer, "port": port });
         let mut line = serde_json::to_vec(&req).map_err(|_| None)?;
         line.push(b'\n');
@@ -164,7 +160,7 @@ mod imp {
     /// link. Returns the connected socket (positioned for raw bytes) on success,
     /// or `None` if there is no daemon, no warm link, or any protocol error, so
     /// the caller falls back to a fresh establish. Never errors: a miss is `None`.
-    pub async fn try_open(peer: &str, rport: u16) -> Option<UnixStream> {
+    pub async fn try_open(peer: &str, rport: u16) -> Option<ClientStream> {
         if reuse_disabled() {
             return None;
         }
@@ -173,8 +169,8 @@ mod imp {
 
     /// `try_open` against an explicit socket path (the live path comes from
     /// `control_sock_path()`; tests pass a hermetic path with no global env).
-    pub async fn try_open_at(path: &Path, peer: &str, rport: u16) -> Option<UnixStream> {
-        let mut s = UnixStream::connect(path).await.ok()?;
+    pub async fn try_open_at(path: &Path, peer: &str, rport: u16) -> Option<ClientStream> {
+        let mut s = connect(path).await.ok()?;
         let req = json!({ "op": "open", "peer": peer, "rport": rport });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -194,11 +190,11 @@ mod imp {
     pub async fn try_open_reason(
         peer: &str,
         rport: u16,
-    ) -> std::result::Result<UnixStream, Option<String>> {
+    ) -> std::result::Result<ClientStream, Option<String>> {
         if reuse_disabled() {
             return Err(None);
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.map_err(|_| None)?;
+        let mut s = connect(&control_sock_path()).await.map_err(|_| None)?;
         let req = json!({ "op": "open", "peer": peer, "rport": rport });
         let mut line = serde_json::to_vec(&req).map_err(|_| None)?;
         line.push(b'\n');
@@ -239,11 +235,11 @@ mod imp {
     /// into a connect timeout.
     pub async fn try_pty_reason(
         peer: &str, session: &str, cols: u16, rows: u16, term: &str, cmd: &str,
-    ) -> std::result::Result<UnixStream, Option<String>> {
+    ) -> std::result::Result<ClientStream, Option<String>> {
         if reuse_disabled() {
             return Err(None);
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.map_err(|_| None)?;
+        let mut s = connect(&control_sock_path()).await.map_err(|_| None)?;
         let mut req = json!({ "op": "pty", "peer": peer, "session": session, "cols": cols, "rows": rows, "term": term });
         if !cmd.is_empty() {
             req["cmd"] = json!(cmd);
@@ -258,24 +254,6 @@ mod imp {
             return Ok(s);
         }
         Err(Some(v["err"].as_str().unwrap_or("rejected").to_string()))
-    }
-
-    pub async fn try_pty(peer: &str, session: &str, cols: u16, rows: u16, term: &str, cmd: &str) -> Option<UnixStream> {
-        if reuse_disabled() {
-            return None;
-        }
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
-        let mut req = json!({ "op": "pty", "peer": peer, "session": session, "cols": cols, "rows": rows, "term": term });
-        if !cmd.is_empty() {
-            req["cmd"] = json!(cmd);
-        }
-        let mut line = serde_json::to_vec(&req).ok()?;
-        line.push(b'\n');
-        s.write_all(&line).await.ok()?;
-        s.flush().await.ok()?;
-        let reply = read_line(&mut s, 4096).await.ok()?;
-        let v: Value = serde_json::from_str(&reply).ok()?;
-        (v["ok"].as_bool() == Some(true)).then_some(s)
     }
 
     /// The scoped reason a finished warm PTY bridge recorded, if any. The
@@ -297,7 +275,7 @@ mod imp {
         if reuse_disabled() {
             return None;
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let mut line = serde_json::to_vec(&json!({ "op": "warm-pty-reason", "session": session })).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -318,7 +296,7 @@ mod imp {
         if reuse_disabled() {
             return;
         }
-        let Ok(mut s) = UnixStream::connect(control_sock_path()).await else { return };
+        let Ok(mut s) = connect(&control_sock_path()).await else { return };
         let req = json!({ "op": "resize", "session": session, "cols": cols, "rows": rows });
         if let Ok(mut line) = serde_json::to_vec(&req) {
             line.push(b'\n');
@@ -338,7 +316,7 @@ mod imp {
         if reuse_disabled() {
             return None;
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "bootstrap", "peer": peer, "pubkey": pubkey, "ssh_port": ssh_port });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -363,7 +341,7 @@ mod imp {
         if reuse_disabled() {
             return None;
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "ping", "peer": peer });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -384,7 +362,7 @@ mod imp {
     /// the "takes effect on next up" message. Bounded so a wedged daemon can't
     /// hang `tunlion set`.
     pub async fn try_reconfigure(key: &str) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "reconfigure", "key": key });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -411,7 +389,7 @@ mod imp {
     /// listeners (used by `tunlion expose`/`unexpose`). Returns the daemon reply
     /// (`{"ok":true,"live":<bool>,"count":<n>}`) or `None` if no daemon answered.
     pub async fn try_reload_expose() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "reload-expose" });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -430,7 +408,7 @@ mod imp {
     /// "reason":...}`) or `None` when no daemon answered, so the caller falls
     /// back to the daemon's state file rather than inventing "ready".
     pub async fn try_l3_state() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let mut line = serde_json::to_vec(&json!({ "op": "l3-state" })).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -447,7 +425,7 @@ mod imp {
     /// ReqKind::Wake). Fire-and-forget in spirit: a short timeout, and `None`
     /// when no daemon answered, which only means the next tick does the work.
     pub async fn try_wake() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let mut line = serde_json::to_vec(&json!({ "op": "wake" })).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -469,7 +447,7 @@ mod imp {
     /// leaving (ReqKind::Depart). Replies `{"ok":true,"told":<n>}`; `None`
     /// when no daemon answered.
     pub async fn try_depart() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let mut line = serde_json::to_vec(&json!({ "op": "depart" })).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -482,7 +460,7 @@ mod imp {
     }
 
     pub async fn try_revocation_sync() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let mut line = serde_json::to_vec(&json!({ "op": "revocation-sync" })).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -503,78 +481,8 @@ mod imp {
     /// so, `{"ok":true,"reloading":false,...}` when it is NOT under a supervisor
     /// (exiting would leave it down, so it declines), or `None` if no daemon answered.
     pub async fn try_reload() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "reload" });
-        let mut line = serde_json::to_vec(&req).ok()?;
-        line.push(b'\n');
-        s.write_all(&line).await.ok()?;
-        s.flush().await.ok()?;
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
-            .await
-            .ok()?
-            .ok()?;
-        let v: Value = serde_json::from_str(&reply).ok()?;
-        (v["ok"].as_bool() == Some(true)).then_some(v)
-    }
-
-    /// Ask the daemon to mount a remote directory via sshfs. The daemon spawns
-    /// sshfs, tracks the mount, and monitors its health centrally. Returns the
-    /// daemon's reply (`{"ok":true}`) or `None` if no daemon answered, so the
-    /// caller can fall back to a direct sshfs spawn.
-    pub async fn try_mount(peer: &str, remote: &str, local: &str, read_only: bool, auto_restore: bool, port: u16) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
-        let req = json!({ "op": "mount", "peer": peer, "remote": remote, "local": local, "read_only": read_only, "auto_restore": auto_restore, "port": port });
-        let mut line = serde_json::to_vec(&req).ok()?;
-        line.push(b'\n');
-        s.write_all(&line).await.ok()?;
-        s.flush().await.ok()?;
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(15), read_line(&mut s, 8192))
-            .await
-            .ok()?
-            .ok()?;
-        let v: Value = serde_json::from_str(&reply).ok()?;
-        (v["ok"].as_bool() == Some(true)).then_some(v)
-    }
-
-    /// Ask the daemon to unmount a tunlion mount point. Returns the daemon's
-    /// reply (`{"ok":true}`) or `None` if no daemon answered.
-    pub async fn try_unmount(target: &str) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
-        let req = json!({ "op": "unmount", "target": target });
-        let mut line = serde_json::to_vec(&req).ok()?;
-        line.push(b'\n');
-        s.write_all(&line).await.ok()?;
-        s.flush().await.ok()?;
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(15), read_line(&mut s, 8192))
-            .await
-            .ok()?
-            .ok()?;
-        let v: Value = serde_json::from_str(&reply).ok()?;
-        (v["ok"].as_bool() == Some(true)).then_some(v)
-    }
-
-    /// Ask the daemon to list all tracked mounts and their health. Returns the
-    /// daemon's reply (`{"ok":true,"mounts":[...]}`) or `None` if no daemon.
-    pub async fn try_list_mounts() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
-        let req = json!({ "op": "list-mounts" });
-        let mut line = serde_json::to_vec(&req).ok()?;
-        line.push(b'\n');
-        s.write_all(&line).await.ok()?;
-        s.flush().await.ok()?;
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 16384))
-            .await
-            .ok()?
-            .ok()?;
-        let v: Value = serde_json::from_str(&reply).ok()?;
-        (v["ok"].as_bool() == Some(true)).then_some(v)
-    }
-
-    /// Ask the daemon to check health of a specific mount. Returns the daemon's
-    /// reply (`{"ok":true,"status":"healthy"}`) or `None` if no daemon.
-    pub async fn try_mount_health(target: &str) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
-        let req = json!({ "op": "mount-health", "target": target });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -593,7 +501,7 @@ mod imp {
     /// "up". `Some(false)` covers both a missing socket and a silent one.
     pub async fn daemon_responds(wait: std::time::Duration) -> Option<bool> {
         let probe = async {
-            let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+            let mut s = connect(&control_sock_path()).await.ok()?;
             let mut line = serde_json::to_vec(&json!({ "op": "cap-status" })).ok()?;
             line.push(b'\n');
             s.write_all(&line).await.ok()?;
@@ -610,7 +518,7 @@ mod imp {
     /// no daemon answered. A fresh process has zero counters; only the running
     /// daemon (`tunlion up`) accumulates them across live opens.
     pub async fn try_cap_status() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "cap-status" });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -626,7 +534,7 @@ mod imp {
 
     /// Ask the daemon for the list of pending consent requests.
     pub async fn try_list_pending() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "list-pending" });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -648,7 +556,7 @@ mod imp {
 
     /// `try_list_warm` against an explicit socket path for hermetic tests.
     pub async fn try_list_warm_at(path: &Path) -> Option<Value> {
-        let mut s = UnixStream::connect(path).await.ok()?;
+        let mut s = connect(path).await.ok()?;
         let mut line = serde_json::to_vec(&json!({ "op": "list-warm" })).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -699,7 +607,7 @@ mod imp {
     }
 
     async fn fleet_rendezvous_once(name: &str) -> BrokerReply {
-        let Some(mut s) = UnixStream::connect(control_sock_path()).await.ok() else {
+        let Some(mut s) = connect(&control_sock_path()).await.ok() else {
             return BrokerReply::NoDaemon;
         };
         let req = json!({ "op": "fleet-rendezvous", "name": name });
@@ -736,7 +644,7 @@ mod imp {
 
     /// Ask the daemon to approve a pending request by id.
     pub async fn try_approve_request(id: u64, allow: &str, expires: u64) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "approve-request", "id": id, "allow": allow, "expires": expires });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -752,7 +660,7 @@ mod imp {
 
     /// Ask the daemon to deny a pending request by id.
     pub async fn try_deny_request(id: u64) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "deny-request", "id": id });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -766,14 +674,111 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
-    // ----------------------------------------------------------------- daemon -
+    // The unix-only client helpers: daemon-managed sshfs mounts (a unix
+    // feature) and a few entry points nothing calls today, kept as they were.
+    #[cfg(unix)]
+    pub use unix_only::{try_mount, try_unmount};
+    #[cfg(unix)]
+    mod unix_only {
+        use super::*;
 
-    /// Bind the control socket and forward each parsed request to `tx` (the
-    /// daemon event loop). Removes a stale socket file first; `daemon_alive()`
-    /// already guards against two live daemons. Sets mode 0600.
-    pub async fn serve(tx: mpsc::UnboundedSender<Req>) -> Result<()> {
-        serve_at(control_sock_path(), tx, None).await
+        pub async fn try_pty(peer: &str, session: &str, cols: u16, rows: u16, term: &str, cmd: &str) -> Option<ClientStream> {
+            if reuse_disabled() {
+                return None;
+            }
+            let mut s = connect(&control_sock_path()).await.ok()?;
+            let mut req = json!({ "op": "pty", "peer": peer, "session": session, "cols": cols, "rows": rows, "term": term });
+            if !cmd.is_empty() {
+                req["cmd"] = json!(cmd);
+            }
+            let mut line = serde_json::to_vec(&req).ok()?;
+            line.push(b'\n');
+            s.write_all(&line).await.ok()?;
+            s.flush().await.ok()?;
+            let reply = read_line(&mut s, 4096).await.ok()?;
+            let v: Value = serde_json::from_str(&reply).ok()?;
+            (v["ok"].as_bool() == Some(true)).then_some(s)
+        }
+
+        /// Ask the daemon to mount a remote directory via sshfs. The daemon spawns
+        /// sshfs, tracks the mount, and monitors its health centrally. Returns the
+        /// daemon's reply (`{"ok":true}`) or `None` if no daemon answered, so the
+        /// caller can fall back to a direct sshfs spawn.
+        pub async fn try_mount(peer: &str, remote: &str, local: &str, read_only: bool, auto_restore: bool, port: u16) -> Option<Value> {
+            let mut s = connect(&control_sock_path()).await.ok()?;
+            let req = json!({ "op": "mount", "peer": peer, "remote": remote, "local": local, "read_only": read_only, "auto_restore": auto_restore, "port": port });
+            let mut line = serde_json::to_vec(&req).ok()?;
+            line.push(b'\n');
+            s.write_all(&line).await.ok()?;
+            s.flush().await.ok()?;
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(15), read_line(&mut s, 8192))
+                .await
+                .ok()?
+                .ok()?;
+            let v: Value = serde_json::from_str(&reply).ok()?;
+            (v["ok"].as_bool() == Some(true)).then_some(v)
+        }
+
+        /// Ask the daemon to unmount a tunlion mount point. Returns the daemon's
+        /// reply (`{"ok":true}`) or `None` if no daemon answered.
+        pub async fn try_unmount(target: &str) -> Option<Value> {
+            let mut s = connect(&control_sock_path()).await.ok()?;
+            let req = json!({ "op": "unmount", "target": target });
+            let mut line = serde_json::to_vec(&req).ok()?;
+            line.push(b'\n');
+            s.write_all(&line).await.ok()?;
+            s.flush().await.ok()?;
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(15), read_line(&mut s, 8192))
+                .await
+                .ok()?
+                .ok()?;
+            let v: Value = serde_json::from_str(&reply).ok()?;
+            (v["ok"].as_bool() == Some(true)).then_some(v)
+        }
+
+        /// Ask the daemon to list all tracked mounts and their health. Returns the
+        /// daemon's reply (`{"ok":true,"mounts":[...]}`) or `None` if no daemon.
+        pub async fn try_list_mounts() -> Option<Value> {
+            let mut s = connect(&control_sock_path()).await.ok()?;
+            let req = json!({ "op": "list-mounts" });
+            let mut line = serde_json::to_vec(&req).ok()?;
+            line.push(b'\n');
+            s.write_all(&line).await.ok()?;
+            s.flush().await.ok()?;
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 16384))
+                .await
+                .ok()?
+                .ok()?;
+            let v: Value = serde_json::from_str(&reply).ok()?;
+            (v["ok"].as_bool() == Some(true)).then_some(v)
+        }
+
+        /// Ask the daemon to check health of a specific mount. Returns the daemon's
+        /// reply (`{"ok":true,"status":"healthy"}`) or `None` if no daemon.
+        pub async fn try_mount_health(target: &str) -> Option<Value> {
+            let mut s = connect(&control_sock_path()).await.ok()?;
+            let req = json!({ "op": "mount-health", "target": target });
+            let mut line = serde_json::to_vec(&req).ok()?;
+            line.push(b'\n');
+            s.write_all(&line).await.ok()?;
+            s.flush().await.ok()?;
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
+                .await
+                .ok()?
+                .ok()?;
+            let v: Value = serde_json::from_str(&reply).ok()?;
+            (v["ok"].as_bool() == Some(true)).then_some(v)
+        }
+
+        /// Bind the control socket and forward each parsed request to `tx` (the
+        /// daemon event loop). Removes a stale socket file first; `daemon_alive()`
+        /// already guards against two live daemons. Sets mode 0600.
+        pub async fn serve(tx: mpsc::UnboundedSender<Req>) -> Result<()> {
+            serve_at(control_sock_path(), tx, None).await
+        }
     }
+
+    // ----------------------------------------------------------------- daemon -
 
     /// `serve` against an explicit socket path (tests pass a hermetic path).
     /// `ready`, when given, fires the moment the listener has BOUND: the socket
@@ -781,23 +786,16 @@ mod imp {
     /// up" must not print it until this fires, or a sibling process races the
     /// bind.
     pub async fn serve_at(path: PathBuf, tx: mpsc::UnboundedSender<Req>, ready: Option<tokio::sync::oneshot::Sender<()>>) -> Result<()> {
-        // A private directory (0700, ours, not writable by anyone else) before
-        // anything is bound in it: the short fallback lives under /tmp.
-        crate::platform::prepare_socket_dir(&path)
-            .map_err(|e| anyhow!("cannot prepare the control socket directory for {}: {e}", path.display()))?;
-        let _ = std::fs::remove_file(&path); // clear a stale leftover
-        let listener = UnixListener::bind(&path)
-            .map_err(|e| anyhow!("cannot bind the control socket {} ({} bytes): {e}", path.display(), path.as_os_str().len()))?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+        // Unix: a private directory, a stale socket removed, mode 0600.
+        // Windows: the first pipe instance, owner-only, local clients only.
+        // Both live in `platform::ctl_endpoint`.
+        let mut listener = Listener::bind(&path)?;
         if let Some(ready) = ready {
             let _ = ready.send(());
         }
         crate::ui::trace(&format!("tunlion: control socket at {}", path.display()));
         loop {
-            let (mut sock, _) = match listener.accept().await {
+            let mut sock = match listener.accept().await {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -958,9 +956,12 @@ mod imp {
         }
     }
 
-    #[cfg(test)]
+    // The original unix-socket tests, unchanged. The portable ones that run on
+    // every target (Windows included) are `portable_tests` below.
+    #[cfg(all(test, unix))]
     mod tests {
         use super::*;
+        use tokio::net::UnixStream;
 
         #[test]
         fn control_sock_path_ends_with_socket_name() {
@@ -1177,119 +1178,129 @@ mod imp {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
-}
 
-// -------------------------------------------------------- non-unix fallback ----
-#[cfg(not(unix))]
-mod stub {
-    use serde_json::Value;
-    // `Req` (uninhabited on this platform) now comes from the peer-loop crate;
-    // see the re-export at the top of this file.
+    /// The protocol over whichever transport this target serves (the unix
+    /// socket, or the Windows named pipe): the same request line, reply line and
+    /// raw bridge, driven through the real `serve_at` and client helpers.
+    #[cfg(test)]
+    mod portable_tests {
+        use super::*;
+        use crate::platform::ctl_endpoint::{cleanup_test_endpoint, test_endpoint};
 
-    /// No control socket here, so no daemon can be asked to apply a
-    /// revocation now; `None` makes the command say it applies within a few
-    /// seconds (the daemon's own store scan) or at the next start.
-    pub async fn try_revocation_sync() -> Option<Value> {
-        None
-    }
+        async fn serve(tag: &str) -> (PathBuf, mpsc::UnboundedReceiver<Req>, tokio::task::JoinHandle<Result<()>>) {
+            let path = test_endpoint(tag);
+            let (tx, rx) = mpsc::unbounded_channel::<Req>();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(serve_at(path.clone(), tx, Some(ready_tx)));
+            tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
+                .await
+                .expect("the listener came up")
+                .expect("serve_at reported ready");
+            (path, rx, server)
+        }
 
-    /// No control socket here: the owner's offline budget removes the box.
-    pub async fn try_depart() -> Option<Value> {
-        None
-    }
+        #[tokio::test]
+        async fn an_open_round_trips_and_then_pipes_raw_bytes() {
+            let (path, mut rx, server) = serve("open").await;
+            let p = path.clone();
+            let client = tokio::spawn(async move { try_open_at(&p, "box", 22).await });
+            let req = rx.recv().await.expect("request reached the loop");
+            match &req.kind {
+                ReqKind::Open { peer, rport } => {
+                    assert_eq!(peer, "box");
+                    assert_eq!(*rport, 22);
+                }
+                _ => panic!("expected an Open request"),
+            }
+            let mut daemon_side = req.accept().await;
+            let mut client_side = client.await.unwrap().expect("client got ok");
+            client_side.write_all(b"ping").await.unwrap();
+            client_side.flush().await.unwrap();
+            let mut got = [0u8; 4];
+            daemon_side.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"ping");
+            daemon_side.write_all(b"pong").await.unwrap();
+            daemon_side.flush().await.unwrap();
+            let mut back = [0u8; 4];
+            client_side.read_exact(&mut back).await.unwrap();
+            assert_eq!(&back, b"pong");
+            server.abort();
+            cleanup_test_endpoint(&path);
+        }
 
-    /// No control socket here, so no daemon can be asked to reload onto an
-    /// updated binary; `update` then prints how to restart it instead.
-    pub async fn try_reload() -> Option<Value> {
-        None
-    }
+        #[tokio::test]
+        async fn a_reject_is_a_miss_the_caller_falls_back_on() {
+            let (path, mut rx, server) = serve("rej").await;
+            let p = path.clone();
+            let client = tokio::spawn(async move { try_open_at(&p, "nope", 22).await });
+            let req = rx.recv().await.unwrap();
+            req.reject("no warm link").await;
+            assert!(client.await.unwrap().is_none());
+            server.abort();
+            cleanup_test_endpoint(&path);
+        }
 
-    /// No warm daemon bridge exists on this platform, so there is no recorded
-    /// close reason to ask for.
-    pub async fn warm_pty_end_reason(_session: &str) -> Option<String> {
-        None
-    }
+        #[tokio::test]
+        async fn a_reply_reaches_the_client_and_ends_the_request() {
+            let (path, mut rx, server) = serve("warm").await;
+            let p = path.clone();
+            let client = tokio::spawn(async move { try_list_warm_at(&p).await });
+            let req = rx.recv().await.expect("snapshot request reached daemon");
+            assert!(matches!(&req.kind, ReqKind::ListWarm));
+            req.reply(&json!({ "ok": true, "links": [{ "name": "box", "warm": true }] })).await;
+            let reply = client.await.unwrap().expect("snapshot reply");
+            assert_eq!(reply["links"][0]["name"], "box");
+            server.abort();
+            cleanup_test_endpoint(&path);
+        }
 
-    /// No control socket on this platform, so there is never a warm daemon link
-    /// to ping. Callers (`ping`, `forward`) treat `None` as "no daemon" and fall
-    /// back to a fresh establish. Present so the `via_daemon`-gated call sites —
-    /// dead here, since `via_daemon` is always false on non-unix — still compile.
-    pub async fn try_ping(_peer: &str) -> Option<Value> {
-        None
-    }
+        /// Answered by the server itself, so it never reaches the daemon loop.
+        #[tokio::test]
+        async fn the_exec_capability_probe_is_answered_inline() {
+            let (path, mut rx, server) = serve("cap").await;
+            let mut s = connect(&path).await.expect("connect");
+            s.write_all(b"{\"op\":\"exec-cap\"}\n").await.unwrap();
+            s.flush().await.unwrap();
+            let reply = read_line(&mut s, 256).await.unwrap();
+            let v: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(v["ok"].as_bool(), Some(true));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                    .await
+                    .is_err(),
+                "the probe must not reach the daemon loop"
+            );
+            server.abort();
+            cleanup_test_endpoint(&path);
+        }
 
-    /// No control socket here (#205), so there is no loop to wake; the
-    /// daemon's own tick picks up armed.json, exactly as before Wake existed.
-    pub async fn try_wake() -> Option<Value> {
-        None
-    }
+        /// Several sibling commands at once (a status, a ping, a forward) each
+        /// get their own connection and their own answer.
+        #[tokio::test]
+        async fn concurrent_requests_are_each_answered() {
+            let (path, mut rx, server) = serve("many").await;
+            let mut clients = Vec::new();
+            for _ in 0..4 {
+                let p = path.clone();
+                clients.push(tokio::spawn(async move { try_list_warm_at(&p).await }));
+            }
+            for _ in 0..4 {
+                let req = rx.recv().await.expect("request");
+                req.reply(&json!({ "ok": true, "links": [] })).await;
+            }
+            for c in clients {
+                assert!(c.await.unwrap().is_some(), "every client got its reply");
+            }
+            server.abort();
+            cleanup_test_endpoint(&path);
+        }
 
-    /// No control socket on this platform, so there is no daemon to query for
-    /// capability status. Callers treat `None` as "no daemon reply" and degrade
-    /// gracefully. Present so the unconditional call sites compile on non-unix.
-    pub async fn try_cap_status() -> Option<Value> {
-        None
-    }
-
-    /// No control socket here, so there is no daemon consent queue to list.
-    /// Callers treat `None` as "no daemon reply" and degrade gracefully.
-    pub async fn try_list_pending() -> Option<Value> {
-        None
-    }
-
-    /// There is no control socket on this platform, so there is never a daemon
-    /// to reach. Callers use this to decide whether a daemon-mediated path is
-    /// available at all, and here it never is.
-    pub async fn daemon_present() -> bool {
-        false
-    }
-
-    /// No control socket here, so whether the daemon answers is unknown, which
-    /// is not the same as "it does not": `status` says nothing rather than guess.
-    pub async fn daemon_responds(_wait: std::time::Duration) -> Option<bool> {
-        None
-    }
-
-    /// No control socket here, so a setting cannot be pushed into a running
-    /// daemon; the honest answer is "on the next start", which is what a
-    /// `live: false` reply says.
-    pub async fn try_reconfigure(_key: &str) -> Option<Value> {
-        Some(serde_json::json!({ "ok": true, "live": false }))
-    }
-
-    /// No control socket here, so no daemon can broker a rendezvous. `None`
-    /// means the caller finds the peer itself, which is the pre-existing path.
-    pub async fn try_fleet_rendezvous(_name: &str) -> Option<String> {
-        None
-    }
-
-    pub async fn try_list_warm() -> Option<Value> {
-        None
-    }
-
-    /// No control socket here, so no daemon to probe a forward through.
-    pub async fn forward_probe(
-        _peer: &str,
-        _rport: u16,
-    ) -> Option<std::result::Result<(), String>> {
-        None
-    }
-
-    /// No control socket here, so there is no daemon consent queue to approve
-    /// against. Callers treat `None` as "no daemon reply" and degrade gracefully.
-    ///
-    /// The signature must track the `#[cfg(unix)]` one above, including the
-    /// bounded-grant arguments, or this target stops compiling the moment a
-    /// caller passes them. That is exactly how this drifted: the unix side
-    /// gained `allow` and `expires` and this stub did not, so linux was green
-    /// and windows failed to build.
-    pub async fn try_approve_request(_id: u64, _allow: &str, _expires: u64) -> Option<Value> {
-        None
-    }
-
-    /// No control socket here, so there is no daemon consent queue to deny
-    /// against. Callers treat `None` as "no daemon reply" and degrade gracefully.
-    pub async fn try_deny_request(_id: u64) -> Option<Value> {
-        None
+        #[tokio::test]
+        async fn no_daemon_means_no_warm_path() {
+            let path = test_endpoint("absent");
+            assert!(try_list_warm_at(&path).await.is_none());
+            assert!(try_open_at(&path, "box", 22).await.is_none());
+            cleanup_test_endpoint(&path);
+        }
     }
 }

@@ -16,7 +16,6 @@ pub mod forward;
 pub mod mux;
 pub mod policy;
 pub mod warm;
-#[cfg(unix)]
 pub mod warm_exec;
 
 use std::collections::HashMap;
@@ -32,7 +31,6 @@ pub use mux::{
     TreeSignal, is_l2_sid, serve_stream, wire_sid,
 };
 pub use warm::{open_stream, open_stream_verified_reason, WarmOpen};
-#[cfg(unix)]
 pub use warm::{
     open_pty_stream_verified, serve_opened_stream, serve_verified_stream, warm_verify_window,
     WarmPtyVerdict,

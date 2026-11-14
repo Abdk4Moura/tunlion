@@ -141,10 +141,7 @@ pub async fn ping_cmd(
 
     // Warm path: ask a local `up` daemon about its held link. Synchronous and
     // exact (quinn already measured RTT/addr). A miss → None → cold probe below.
-    #[cfg(unix)]
     let warm = if relay { None } else { crate::ctl::try_ping(peer).await };
-    #[cfg(not(unix))]
-    let warm: Option<Value> = None;
 
     if json_out {
         return ping_json(server, peer, relay, warm, timeout).await;
@@ -163,7 +160,6 @@ pub async fn ping_cmd(
                     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                     // Re-sample so repeated pings show live RTT drift (quinn keeps
                     // it fresh via the keepalive); keep the prior facts on a miss.
-                    #[cfg(unix)]
                     if let Some(nv) = crate::ctl::try_ping(peer).await {
                         v = nv;
                     }
@@ -199,7 +195,7 @@ pub async fn reach_sibling(peer: &str, json_out: bool, timeout: Option<u64>) -> 
         ));
     }
     let warm = loop {
-        // Portable: off Unix there is no control socket and this is `None`.
+        // Portable: `None` when no daemon answers on the control channel.
         if let Some(v) = crate::ctl::try_ping(peer).await {
             break Some(v);
         }
