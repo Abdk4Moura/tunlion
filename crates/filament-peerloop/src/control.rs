@@ -16,7 +16,11 @@
 //! local named pipe (#205). Both carry the same bytes, so everything above the
 //! stream (the request line, the reply line, the raw bridge or the exec frames)
 //! is shared. The one difference a handler can see is that a named pipe has no
-//! write half-close: shutting down the write side only flushes it.
+//! write half-close: shutting down the write side only flushes it. A client
+//! that needs its EOF delivered on a raw `open`/`dial` stream (the Windows
+//! client always does) asks for `"eof":"frames"`, and the daemon reads that
+//! direction through [`decode_upstream`]: the exec framing's stdin and
+//! stdin-EOF frames, so EOF crosses the pipe in-band.
 //!
 //! WIRE SHAPE: these types are NOT serialized. There is no serde derive here and
 //! there never was; the control protocol is one hand-written JSON request line
@@ -27,6 +31,8 @@
 
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
+
+use crate::exec_frame::{read_frame, FRAME_STDIN, FRAME_STDIN_EOF};
 
 /// The daemon's end of one control connection.
 #[cfg(unix)]
@@ -61,6 +67,35 @@ pub fn split_stream(sock: CtlStream) -> (CtlReadHalf, CtlWriteHalf) {
 #[cfg(windows)]
 pub fn split_stream(sock: CtlStream) -> (CtlReadHalf, CtlWriteHalf) {
     tokio::io::split(sock)
+}
+
+/// A raw bridge whose client-to-daemon direction arrives framed.
+pub type FramedUpstream = tokio::io::Join<tokio::io::DuplexStream, CtlWriteHalf>;
+
+/// Decode a client's framed upstream (`"eof":"frames"`): `FRAME_STDIN` frames
+/// become bytes and `FRAME_STDIN_EOF` (or the connection closing) becomes EOF,
+/// while the daemon-to-client direction stays raw. The result is a plain
+/// AsyncRead + AsyncWrite, so the bridges use it exactly like the socket.
+/// Same frames as exec; the frame size bound applies.
+pub fn decode_upstream(sock: CtlStream) -> FramedUpstream {
+    let (mut rd, wr) = split_stream(sock);
+    let (mut feed, out) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        loop {
+            match read_frame(&mut rd).await {
+                Ok(Some((FRAME_STDIN, data))) => {
+                    if feed.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                // EOF frame, the client gone, or a frame that does not belong
+                // on this stream: all end the upstream direction.
+                _ => break,
+            }
+        }
+        let _ = feed.shutdown().await;
+    });
+    tokio::io::join(out, wr)
 }
 
 /// What a warm-reuse client is asking the daemon to do over its warm link.
@@ -187,6 +222,9 @@ pub enum ReqKind {
 pub struct Req {
     pub kind: ReqKind,
     pub sock: CtlStream,
+    /// The client asked for `"eof":"frames"`: on an `Open`/`Dial` bridge, read
+    /// its upstream through [`decode_upstream`]. Ignored by every other op.
+    pub eof_frames: bool,
 }
 
 impl Req {

@@ -4355,7 +4355,8 @@ pub(crate) async fn serve_control(
     tx: tokio::sync::mpsc::UnboundedSender<filament_peerloop::control::Req>,
     ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
-    crate::ctl::serve_at(crate::ctl::control_sock_path(), tx, ready).await
+    let (path, listener) = ctl_endpoint::bind_daemon_endpoint()?;
+    crate::ctl::serve_listener(listener, &path, tx, ready).await
 }
 
 /// The control endpoint this build serves: the socket path on unix, the pipe

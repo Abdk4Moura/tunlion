@@ -2511,6 +2511,7 @@ async fn recv_run(
                                 match l3.as_ref() {
                                     Some(m) => {
                                         let m = m.clone();
+                                        let framed = req.eof_frames;
                                         tokio::spawn(async move {
                                             let Some(addr) = m.addr_of(&peer).await else {
                                                 req.reject("unknown overlay peer").await;
@@ -2542,7 +2543,12 @@ async fn recv_run(
                                                     if got > 0 && tokio::io::AsyncWriteExt::write_all(&mut sock, &first[..got]).await.is_err() {
                                                         return;
                                                     }
-                                                    let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+                                                    if framed {
+                                                        let mut up = crate::control::decode_upstream(sock);
+                                                        let _ = tokio::io::copy_bidirectional(&mut up, &mut stream).await;
+                                                    } else {
+                                                        let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+                                                    }
                                                 }
                                                 Ok(Err(e)) => req.reject(&format!("overlay dial failed: {e}")).await,
                                                 Err(_) => req.reject(OVERLAY_DIAL_TIMED_OUT).await,

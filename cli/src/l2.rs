@@ -2136,10 +2136,9 @@ async fn open_mount_stream(
 /// is fine here because netcat is a single-shot ProxyCommand (one process, one
 /// attach, no reconnect): the singleton is created once and never handed off.
 ///
-/// On Windows the control pipe has no half-close, so the `shutdown` below only
-/// flushes: the peer learns of our stdin EOF when this process closes. That is
-/// what an ssh ProxyCommand does anyway (ssh closes both pipes together).
-async fn pump_stdio_over(sock: crate::ctl::ClientStream) -> Result<()> {
+/// The `shutdown` below reaches the peer as EOF on every transport: a unix
+/// half-close, or on the Windows pipe an in-band EOF frame (`WarmStream`).
+async fn pump_stdio_over(sock: crate::ctl::WarmStream) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(sock);
     let writer = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
@@ -3460,7 +3459,7 @@ fn port_in_use_msg(lport: u16, peer: &str, rport: u16) -> String {
 /// link). One copy per direction; either side's EOF ends the pair.
 async fn bridge_streams(
     mut tcp: TcpStream,
-    mut ctl: crate::ctl::ClientStream,
+    mut ctl: crate::ctl::WarmStream,
 ) -> std::io::Result<()> {
     tokio::io::copy_bidirectional(&mut tcp, &mut ctl)
         .await

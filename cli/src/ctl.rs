@@ -26,6 +26,14 @@
 // that makes the client cold-establish; a `refused:`/`failed:` answer after the
 // open was sent is final.
 //
+// `open` and `dial` accept one optional field, `"eof":"frames"`, which the
+// Windows client always sends: its pipe has no write half-close, so its
+// upstream bytes travel as exec-style stdin frames and its EOF as a stdin-EOF
+// frame, which the daemon turns back into plain bytes and EOF
+// (`filament_peerloop::control::decode_upstream`). The daemon-to-client
+// direction stays raw. A unix client never sends it; its requests are
+// byte-identical to before.
+//
 // SECURITY: the socket is created 0600 under the user's config dir, so only the
 // user who runs the daemon can talk to it. That is the same authority boundary as
 // the daemon itself (it already acts on behalf of the local user); a peer is only
@@ -37,7 +45,7 @@
 
 use std::path::PathBuf;
 
-pub(crate) use crate::platform::ctl_endpoint::ClientStream;
+pub(crate) use crate::platform::ctl_endpoint::{ClientStream, WarmStream};
 
 /// Where this config dir's daemon listens, honoring TUNLION_CONFIG_DIR
 /// (hermetic tests), else `~/.config/tunlion`. On unix that is
@@ -64,7 +72,7 @@ pub use filament_peerloop::control::{Req, ReqKind};
 pub use filament_peerloop::control::send_reply;
 
 pub use imp::{
-    daemon_present, daemon_responds, forward_probe, serve_at, try_approve_request,
+    daemon_present, daemon_responds, forward_probe, serve_listener, try_approve_request,
     try_bootstrap, try_cap_status, try_deny_request, try_dial, try_dial_reason, try_fleet_rendezvous,
     try_l3_state, try_list_pending, try_list_warm, try_open, try_open_reason, try_ping,
     try_pty_reason, try_reconfigure, try_reload, try_reload_expose, try_resize,
@@ -76,12 +84,12 @@ pub use imp::{try_mount, try_unmount};
 
 // ------------------------------------------------------------ protocol ----
 mod imp {
-    use super::{control_sock_path, reuse_disabled, ClientStream};
-    use crate::platform::ctl_endpoint::{connect, Listener};
+    use super::{control_sock_path, reuse_disabled, ClientStream, WarmStream};
+    use crate::platform::ctl_endpoint::{connect, upstream, Listener, HALF_CLOSE};
     use anyhow::{anyhow, Result};
     use filament_peerloop::control::{Req, ReqKind};
     use serde_json::{json, Value};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
@@ -127,7 +135,7 @@ mod imp {
     /// daemon resolves `peer` to its verified overlay address itself (never client-
     /// asserted). Returns the bridged socket, or `None` if there is no daemon / the
     /// peer is unknown / L3 is down, so the caller can report a clean failure.
-    pub async fn try_dial(peer: &str, port: u16) -> Option<ClientStream> {
+    pub async fn try_dial(peer: &str, port: u16) -> Option<WarmStream> {
         try_dial_reason(peer, port).await.ok()
     }
 
@@ -138,12 +146,13 @@ mod imp {
     pub async fn try_dial_reason(
         peer: &str,
         port: u16,
-    ) -> std::result::Result<ClientStream, Option<String>> {
+    ) -> std::result::Result<WarmStream, Option<String>> {
         if reuse_disabled() {
             return Err(None);
         }
         let mut s = connect(&control_sock_path()).await.map_err(|_| None)?;
-        let req = json!({ "op": "dial", "peer": peer, "port": port });
+        let mut req = json!({ "op": "dial", "peer": peer, "port": port });
+        ask_for_eof_frames(&mut req);
         let mut line = serde_json::to_vec(&req).map_err(|_| None)?;
         line.push(b'\n');
         s.write_all(&line).await.map_err(|_| None)?;
@@ -151,16 +160,25 @@ mod imp {
         let reply = read_line(&mut s, 4096).await.map_err(|_| None)?;
         let v: Value = serde_json::from_str(&reply).map_err(|_| None)?;
         if v["ok"].as_bool() == Some(true) {
-            return Ok(s);
+            return Ok(upstream(s));
         }
         Err(Some(v["err"].as_str().unwrap_or("rejected").to_string()))
+    }
+
+    /// On a transport with no write half-close (the Windows pipe), ask the
+    /// daemon to read this raw stream's upstream as exec-style frames, so the
+    /// client's EOF still reaches the peer. A unix request is unchanged.
+    fn ask_for_eof_frames(req: &mut Value) {
+        if !HALF_CLOSE {
+            req["eof"] = json!("frames");
+        }
     }
 
     /// Try to open an L2 stream to `peer:rport` THROUGH a local daemon's warm
     /// link. Returns the connected socket (positioned for raw bytes) on success,
     /// or `None` if there is no daemon, no warm link, or any protocol error, so
     /// the caller falls back to a fresh establish. Never errors: a miss is `None`.
-    pub async fn try_open(peer: &str, rport: u16) -> Option<ClientStream> {
+    pub async fn try_open(peer: &str, rport: u16) -> Option<WarmStream> {
         if reuse_disabled() {
             return None;
         }
@@ -169,9 +187,10 @@ mod imp {
 
     /// `try_open` against an explicit socket path (the live path comes from
     /// `control_sock_path()`; tests pass a hermetic path with no global env).
-    pub async fn try_open_at(path: &Path, peer: &str, rport: u16) -> Option<ClientStream> {
+    pub async fn try_open_at(path: &Path, peer: &str, rport: u16) -> Option<WarmStream> {
         let mut s = connect(path).await.ok()?;
-        let req = json!({ "op": "open", "peer": peer, "rport": rport });
+        let mut req = json!({ "op": "open", "peer": peer, "rport": rport });
+        ask_for_eof_frames(&mut req);
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -179,7 +198,7 @@ mod imp {
         let reply = read_line(&mut s, 4096).await.ok()?;
         let v: Value = serde_json::from_str(&reply).ok()?;
         if v["ok"].as_bool() == Some(true) {
-            Some(s)
+            Some(upstream(s))
         } else {
             None
         }
@@ -190,12 +209,13 @@ mod imp {
     pub async fn try_open_reason(
         peer: &str,
         rport: u16,
-    ) -> std::result::Result<ClientStream, Option<String>> {
+    ) -> std::result::Result<WarmStream, Option<String>> {
         if reuse_disabled() {
             return Err(None);
         }
         let mut s = connect(&control_sock_path()).await.map_err(|_| None)?;
-        let req = json!({ "op": "open", "peer": peer, "rport": rport });
+        let mut req = json!({ "op": "open", "peer": peer, "rport": rport });
+        ask_for_eof_frames(&mut req);
         let mut line = serde_json::to_vec(&req).map_err(|_| None)?;
         line.push(b'\n');
         s.write_all(&line).await.map_err(|_| None)?;
@@ -203,7 +223,7 @@ mod imp {
         let reply = read_line(&mut s, 4096).await.map_err(|_| None)?;
         let v: Value = serde_json::from_str(&reply).map_err(|_| None)?;
         if v["ok"].as_bool() == Some(true) {
-            return Ok(s);
+            return Ok(upstream(s));
         }
         Err(Some(v["err"].as_str().unwrap_or("rejected").to_string()))
     }
@@ -774,7 +794,8 @@ mod imp {
         /// daemon event loop). Removes a stale socket file first; `daemon_alive()`
         /// already guards against two live daemons. Sets mode 0600.
         pub async fn serve(tx: mpsc::UnboundedSender<Req>) -> Result<()> {
-            serve_at(control_sock_path(), tx, None).await
+            let (path, listener) = crate::platform::ctl_endpoint::bind_daemon_endpoint()?;
+            serve_listener(listener, &path, tx, None).await
         }
     }
 
@@ -784,12 +805,22 @@ mod imp {
     /// `ready`, when given, fires the moment the listener has BOUND: the socket
     /// is accepting from that instant. #211: callers who print "the daemon is
     /// up" must not print it until this fires, or a sibling process races the
-    /// bind.
-    pub async fn serve_at(path: PathBuf, tx: mpsc::UnboundedSender<Req>, ready: Option<tokio::sync::oneshot::Sender<()>>) -> Result<()> {
+    /// bind. The daemon itself goes through `serve_listener`; this binds a
+    /// given path for the tests.
+    #[cfg(test)]
+    pub async fn serve_at(path: std::path::PathBuf, tx: mpsc::UnboundedSender<Req>, ready: Option<tokio::sync::oneshot::Sender<()>>) -> Result<()> {
         // Unix: a private directory, a stale socket removed, mode 0600.
         // Windows: the first pipe instance, owner-only, local clients only.
         // Both live in `platform::ctl_endpoint`.
-        let mut listener = Listener::bind(&path)?;
+        let listener = Listener::bind(&path)?;
+        serve_listener(listener, &path, tx, ready).await
+    }
+
+    /// Serve requests from an already-bound `listener` (the daemon binds
+    /// through `platform::ctl_endpoint::bind_daemon_endpoint`, which may pick
+    /// a fresh pipe name on Windows). `ready` fires at once: the listener is
+    /// accepting before this is called.
+    pub async fn serve_listener(mut listener: Listener, path: &Path, tx: mpsc::UnboundedSender<Req>, ready: Option<tokio::sync::oneshot::Sender<()>>) -> Result<()> {
         if let Some(ready) = ready {
             let _ = ready.send(());
         }
@@ -807,14 +838,25 @@ mod imp {
                 // long `rsync` command can exceed the old 4 KiB probe bound.
                 // The socket is 0600 and local; 1 MiB caps one abusive client
                 // while leaving ordinary long command lines intact.
-                let line = match read_line(&mut sock, 1024 * 1024).await {
-                    Ok(l) => l,
-                    Err(_) => return,
+                //
+                // Bounded in time too: every real client writes its request
+                // the moment it connects, so a client that connects and stalls
+                // (or never writes) must not pin this task and a pipe instance.
+                let line = match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    read_line(&mut sock, 1024 * 1024),
+                )
+                .await
+                {
+                    Ok(Ok(l)) => l,
+                    _ => return,
                 };
                 let v: Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
                     Err(_) => return,
                 };
+                // Only `open` and `dial` bridges honour it; see `Req::eof_frames`.
+                let eof_frames = v["eof"].as_str() == Some("frames");
                 let kind = match v["op"].as_str() {
                     // Capability probe for the warm `exec` op. Answered HERE,
                     // without touching the daemon loop, so a newer CLI can tell
@@ -951,7 +993,7 @@ mod imp {
                     }
                     _ => return,
                 };
-                let _ = tx.send(Req { kind, sock });
+                let _ = tx.send(Req { kind, sock, eof_frames });
             });
         }
     }
@@ -961,6 +1003,7 @@ mod imp {
     #[cfg(all(test, unix))]
     mod tests {
         use super::*;
+        use std::path::PathBuf;
         use tokio::net::UnixStream;
 
         #[test]
@@ -1185,7 +1228,8 @@ mod imp {
     #[cfg(test)]
     mod portable_tests {
         use super::*;
-        use crate::platform::ctl_endpoint::{cleanup_test_endpoint, test_endpoint};
+        use crate::platform::ctl_endpoint::{cleanup_test_endpoint, test_endpoint, HALF_CLOSE};
+        use std::path::PathBuf;
 
         async fn serve(tag: &str) -> (PathBuf, mpsc::UnboundedReceiver<Req>, tokio::task::JoinHandle<Result<()>>) {
             let path = test_endpoint(tag);
@@ -1197,6 +1241,39 @@ mod imp {
                 .expect("the listener came up")
                 .expect("serve_at reported ready");
             (path, rx, server)
+        }
+
+        /// The daemon side of an accepted `open`, read the way the daemon's
+        /// bridge reads it: through the EOF framing when the client asked.
+        async fn exchange<D, C>(mut daemon_side: D, mut client_side: C)
+        where
+            D: AsyncRead + tokio::io::AsyncWrite + Unpin,
+            C: AsyncRead + tokio::io::AsyncWrite + Unpin,
+        {
+            client_side.write_all(b"ping").await.unwrap();
+            client_side.flush().await.unwrap();
+            let mut got = [0u8; 4];
+            daemon_side.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"ping");
+            daemon_side.write_all(b"pong").await.unwrap();
+            daemon_side.flush().await.unwrap();
+            let mut back = [0u8; 4];
+            client_side.read_exact(&mut back).await.unwrap();
+            assert_eq!(&back, b"pong");
+            // The client's EOF reaches the daemon while the reverse direction
+            // stays open: a half-close on unix, an EOF frame on the pipe.
+            client_side.shutdown().await.unwrap();
+            let mut rest = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(5), daemon_side.read_to_end(&mut rest))
+                .await
+                .expect("the client's EOF reached the daemon")
+                .unwrap();
+            assert!(rest.is_empty());
+            daemon_side.write_all(b"late").await.unwrap();
+            daemon_side.flush().await.unwrap();
+            let mut late = [0u8; 4];
+            client_side.read_exact(&mut late).await.unwrap();
+            assert_eq!(&late, b"late", "the reply still flows after the client's EOF");
         }
 
         #[tokio::test]
@@ -1212,18 +1289,16 @@ mod imp {
                 }
                 _ => panic!("expected an Open request"),
             }
-            let mut daemon_side = req.accept().await;
-            let mut client_side = client.await.unwrap().expect("client got ok");
-            client_side.write_all(b"ping").await.unwrap();
-            client_side.flush().await.unwrap();
-            let mut got = [0u8; 4];
-            daemon_side.read_exact(&mut got).await.unwrap();
-            assert_eq!(&got, b"ping");
-            daemon_side.write_all(b"pong").await.unwrap();
-            daemon_side.flush().await.unwrap();
-            let mut back = [0u8; 4];
-            client_side.read_exact(&mut back).await.unwrap();
-            assert_eq!(&back, b"pong");
+            // A transport without half-close asks for in-band EOF; unix does not.
+            let framed = req.eof_frames;
+            assert_eq!(framed, !HALF_CLOSE);
+            let daemon_side = req.accept().await;
+            let client_side = client.await.unwrap().expect("client got ok");
+            if framed {
+                exchange(filament_peerloop::control::decode_upstream(daemon_side), client_side).await;
+            } else {
+                exchange(daemon_side, client_side).await;
+            }
             server.abort();
             cleanup_test_endpoint(&path);
         }

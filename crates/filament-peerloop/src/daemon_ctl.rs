@@ -216,9 +216,6 @@ impl Drop for LivenessWait {
 /// `reach-pong` carrying the same `n`. An older peer ignores the unknown type,
 /// so its warm link simply does not confirm and reach falls back to the full
 /// probe, which works with any version.
-// Called only by the unix control socket's warm ping (no control socket
-// elsewhere), so other targets see it unused.
-#[allow(dead_code)]
 pub fn liveness_ping(n: u64) -> Value {
     json!({ "type": "reach-ping", "n": n })
 }
@@ -230,9 +227,6 @@ pub fn liveness_pong(ping: &Value) -> Value {
 
 /// How long a warm link has to answer `reach-ping` (TUNLION_REACH_PING_MS,
 /// default 1500 ms) before reach treats it as unconfirmed.
-// Called only by the unix control socket's warm ping (no control socket
-// elsewhere), so other targets see it unused.
-#[allow(dead_code)]
 pub fn liveness_window() -> Duration {
     let ms = std::env::var("TUNLION_REACH_PING_MS")
         .ok()
@@ -615,8 +609,14 @@ pub async fn handle_warm_open(
             .await
         {
             crate::l2::WarmOpen::Opened(sid, first, rx) => {
+                let framed = req.eof_frames;
                 let sock = req.accept().await;
-                crate::l2::serve_verified_stream(mux, sid, sock, first, rx).await;
+                if framed {
+                    let sock = control::decode_upstream(sock);
+                    crate::l2::serve_verified_stream(mux, sid, sock, first, rx).await;
+                } else {
+                    crate::l2::serve_verified_stream(mux, sid, sock, first, rx).await;
+                }
             }
             // The peer ANSWERED: the link is healthy, keep it, and relay the
             // reason so the client can show it (it used to be read as a zombie).

@@ -9,7 +9,6 @@
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
@@ -251,8 +250,3 @@ pub async fn serve_opened_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'sta
 ) {
     serve_stream(mux, sid, stream, rx, true, None, None).await;
 }
-
-// Keep the Duration import meaningful on non-unix builds, where the verify
-// window (and therefore the only public use) is cfg'd out.
-#[allow(dead_code)]
-fn _duration(_: Duration) {}
