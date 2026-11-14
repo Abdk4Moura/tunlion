@@ -1402,8 +1402,9 @@ async fn recv_run(
         // Fleet auto-mesh: one more meeting point, where devices certified by the
         // SAME owner key find each other with no pairwise pairing. Presence there
         // authorizes NOTHING; admission runs on the certificate. See cli/src/fleet.rs
-        // and docs/design-fleet-automesh.md. It leads the list so the server's
-        // channel cap can never truncate it away (`subscription_order`).
+        // and docs/design-fleet-automesh.md. `subscription_order` keeps it inside
+        // the server's channel cap at any device count, after the device channels
+        // that fit, so a paired device is announced on its own channel first.
         let fleet = if cfg!(feature = "fleet") {
             ports.identity.fleet_channel()
         } else {

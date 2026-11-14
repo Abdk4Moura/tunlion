@@ -35,26 +35,39 @@ const TRUNCATED_RESYNC_INTERVAL: Duration = CONFIRM_TTL;
 pub const SIGNALING_MAX_CHANNELS: usize = 64;
 
 /// The ONE place a subscription list is ordered: the enrollment channel, then
-/// the fleet channel, then every device channel, de-duplicated (first
-/// occurrence wins, device order otherwise preserved).
+/// the device channels that fit, then the fleet channel in the last slot inside
+/// the cap, then any devices past it. De-duplicated, first occurrence wins,
+/// device order otherwise preserved.
 ///
-/// The order is load-bearing. The server keeps only the first
-/// [`SIGNALING_MAX_CHANNELS`] entries, so an owner with 64+ paired devices
-/// that listed devices first lost the enrollment and fleet channels on every
-/// new socket: no new device could enroll and the request simply timed out.
-/// The two shared meeting points go first; a truncated tail can then only
-/// cost device channels.
+/// The order is load-bearing twice over:
+/// - The server keeps only the first [`SIGNALING_MAX_CHANNELS`] entries. An
+///   owner with 64+ paired devices that listed devices first lost the
+///   enrollment and fleet channels on every new socket, so no new device could
+///   enroll. Both meeting points therefore sit inside the cap whatever the
+///   device count; a truncated tail can only cost device channels.
+/// - The server emits its roster in channel order. A paired device met on the
+///   fleet channel first is dialled with the fleet secret as an unverified
+///   fleet link, and the device-channel arrival that follows is a no-op while
+///   that attempt is pending, so reach/forward found no verified warm link.
+///   Devices therefore precede the fleet channel whenever they fit.
 pub fn subscription_order(
     enroll: Option<String>,
     fleet: Option<String>,
     devices: impl IntoIterator<Item = String>,
 ) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
+    let fleet = fleet.filter(|f| enroll.as_ref() != Some(f));
+    let mut seen: std::collections::HashSet<String> =
+        enroll.iter().chain(fleet.iter()).cloned().collect();
+    let devices: Vec<String> = devices.into_iter().filter(|c| seen.insert(c.clone())).collect();
+    let ahead = SIGNALING_MAX_CHANNELS
+        .saturating_sub(usize::from(enroll.is_some()) + usize::from(fleet.is_some()))
+        .min(devices.len());
+    let (inside, past) = devices.split_at(ahead);
     enroll
         .into_iter()
+        .chain(inside.iter().cloned())
         .chain(fleet)
-        .chain(devices)
-        .filter(|c| seen.insert(c.clone()))
+        .chain(past.iter().cloned())
         .collect()
 }
 
@@ -311,11 +324,24 @@ impl Session {
     /// further back. Appending would put it past the server's
     /// [`SIGNALING_MAX_CHANNELS`] cap on a large fleet; see
     /// [`subscription_order`].
+    ///
+    /// A channel that was new or past the cap shifts every in-cap entry one
+    /// place back, pushing the last in-cap slot out. That slot holds the fleet
+    /// channel (see [`subscription_order`]), so it is kept and the device just
+    /// before it is the one displaced. A channel already inside the cap only
+    /// moves within it and shifts nothing out.
     pub fn prioritize_channel(&mut self, ch: String) {
-        if let Some(i) = self.channels.iter().position(|c| *c == ch) {
-            self.channels.remove(i);
-        }
+        let was_inside = match self.channels.iter().position(|c| *c == ch) {
+            Some(i) => {
+                self.channels.remove(i);
+                i < SIGNALING_MAX_CHANNELS
+            }
+            None => false,
+        };
         self.channels.insert(0, ch);
+        if !was_inside && self.channels.len() > SIGNALING_MAX_CHANNELS {
+            self.channels.swap(SIGNALING_MAX_CHANNELS - 1, SIGNALING_MAX_CHANNELS);
+        }
     }
 
     /// Any local change to desire invalidates confirmation timing so the next
@@ -494,7 +520,7 @@ mod tests {
     /// fleet channels past the server's 64-channel cap on every new socket.
     /// The meeting points must lead the list, and nothing may be lost.
     #[test]
-    fn enroll_and_fleet_lead_a_list_longer_than_the_server_cap() {
+    fn enroll_and_fleet_stay_inside_the_cap_on_a_list_longer_than_it() {
         let devices: Vec<String> = (0..70).map(chan).collect();
         let enroll = chan(1_000);
         let fleet = chan(2_000);
@@ -507,21 +533,47 @@ mod tests {
 
         assert!(c.len() > SIGNALING_MAX_CHANNELS);
         assert_eq!(c[0], enroll, "enrollment channel first");
-        assert_eq!(c[1], fleet, "fleet channel second");
+        assert_eq!(
+            c[SIGNALING_MAX_CHANNELS - 1], fleet,
+            "fleet takes the last slot inside the cap"
+        );
         let kept = &c[..SIGNALING_MAX_CHANNELS];
         assert!(kept.contains(&enroll) && kept.contains(&fleet));
         // Nothing lost, nothing duplicated, device order preserved.
         assert_eq!(c.len(), devices.len() + 2);
-        assert_eq!(&c[2..], &devices[..]);
+        let in_order: Vec<&String> = c.iter().filter(|x| **x != enroll && **x != fleet).collect();
+        assert_eq!(in_order, devices.iter().collect::<Vec<_>>());
         let unique: std::collections::HashSet<&String> = c.iter().collect();
         assert_eq!(unique.len(), c.len());
 
-        // Absent meeting points simply drop out of the prefix.
+        // Absent meeting points simply drop out.
         let only_devices = subscription_order(None, None, devices.clone());
         assert_eq!(only_devices, devices);
         let fleet_only = subscription_order(None, Some(fleet.clone()), devices.clone());
-        assert_eq!(fleet_only[0], fleet);
-        assert_eq!(&fleet_only[1..], &devices[..]);
+        assert_eq!(fleet_only[SIGNALING_MAX_CHANNELS - 1], fleet);
+        assert_eq!(fleet_only.len(), devices.len() + 1);
+    }
+
+    /// Within the cap (the usual case) every device channel precedes the fleet
+    /// channel, so a paired device's own channel is what the server's roster
+    /// announces it on first: the device path dials it with its pair secret,
+    /// instead of the fleet path claiming the peer as an unverified fleet link.
+    #[test]
+    fn devices_precede_fleet_when_they_fit() {
+        let devices: Vec<String> = (0..5).map(chan).collect();
+        let enroll = chan(1_000);
+        let fleet = chan(2_000);
+        let c = subscription_order(Some(enroll.clone()), Some(fleet.clone()), devices.clone());
+        assert_eq!(c[0], enroll);
+        assert_eq!(&c[1..6], &devices[..]);
+        assert_eq!(c[6], fleet);
+        assert_eq!(c.len(), 7);
+        // A full list: exactly cap - 2 devices fit ahead of fleet.
+        let full: Vec<String> = (0..62).map(chan).collect();
+        let c = subscription_order(Some(enroll.clone()), Some(fleet.clone()), full.clone());
+        assert_eq!(c.len(), SIGNALING_MAX_CHANNELS);
+        assert_eq!(&c[1..63], &full[..]);
+        assert_eq!(c[63], fleet);
     }
 
     /// The daemon's arm-gate adds the enrollment channel to a LIVE list long
@@ -532,18 +584,23 @@ mod tests {
         let fleet = chan(2_000);
         let enroll = chan(1_000);
         s.channels = subscription_order(None, Some(fleet.clone()), (0..70).map(chan));
+        assert_eq!(s.channels[SIGNALING_MAX_CHANNELS - 1], fleet);
         s.prioritize_channel(enroll.clone());
         assert_eq!(s.channels[0], enroll);
-        assert_eq!(s.channels[1], fleet);
+        // The insertion shifted the list; fleet must not be the entry pushed out.
+        assert_eq!(s.channels[SIGNALING_MAX_CHANNELS - 1], fleet, "fleet pushed past the cap");
         assert_eq!(s.channels.len(), 72);
-        // Re-adding never duplicates; a channel found further back moves up.
+        // Re-adding never duplicates and, from inside the cap, shifts nothing out.
         s.prioritize_channel(enroll.clone());
         assert_eq!(s.channels.len(), 72);
+        assert_eq!(s.channels[SIGNALING_MAX_CHANNELS - 1], fleet);
+        // A channel found past the cap moves up, and fleet still stays inside.
         s.channels.push(chan(3_000));
         s.prioritize_channel(chan(3_000));
         assert_eq!(s.channels[0], chan(3_000));
         assert_eq!(s.channels.len(), 73);
-        assert!(s.channels[..SIGNALING_MAX_CHANNELS].contains(&enroll));
+        let kept = &s.channels[..SIGNALING_MAX_CHANNELS];
+        assert!(kept.contains(&enroll) && kept.contains(&fleet));
     }
 
     fn ack(accepted: usize) -> Value {
