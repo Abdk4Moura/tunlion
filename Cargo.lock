@@ -1174,12 +1174,25 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
+ "filament-policy",
  "hex",
  "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "filament-enrol"
+version = "0.1.0"
+dependencies = [
+ "filament-id",
+ "filament-pair",
+ "hex",
+ "serde",
+ "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -1211,6 +1224,10 @@ dependencies = [
  "spake2",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "filament-policy"
+version = "0.2.0"
 
 [[package]]
 name = "filedescriptor"
@@ -3926,6 +3943,7 @@ dependencies = [
  "crossterm",
  "directories",
  "filament-cap",
+ "filament-enrol",
  "filament-id",
  "filament-pair",
  "flate2",
@@ -4058,6 +4076,16 @@ dependencies = [
  "webrtc",
  "windows-sys 0.59.0",
  "wintun",
+]
+
+[[package]]
+name = "tunlion-policy-wasm"
+version = "0.2.0"
+dependencies = [
+ "filament-policy",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]

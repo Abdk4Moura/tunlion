@@ -24,6 +24,10 @@ extracted so it can be audited and reused on its own.
   key's stated caps, enforced independently of the grant scan.
 - **Fleet trust** — `fleet_auto_trust(same_owner, binding, scoped_in_bounds)`, a
   Proven-gated scoped-default decision for a device that chains to your own user key.
+- **Shared transfer policy** — `TransferGateInput`, `TransferDecision`,
+  `TransferDeny`, `BindingStrength`, `IdentityState`, `CapOutcome` and
+  `transfer_decision` live in the dependency-free `filament-policy` crate and are
+  re-exported here unchanged. `now` is an explicit input; the policy reads no clock.
 - **Ephemeral auth keys** — the `ephemeral` module: owner-signed, single-use
   pre-authorization for device self-enrollment.
 

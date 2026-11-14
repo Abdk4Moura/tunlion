@@ -18,6 +18,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
+use filament_enrol::{build_identity_expose, open_identity_expose, IdentityExpose};
 use filament_transport::lan::{
     pair_read, pair_write, LanService, Options, PairLink, PAIR_MAX_FRAME,
 };
@@ -148,16 +149,20 @@ pub(crate) async fn run_ceremony_within(link: &mut PairLink, words: &str, namepl
             if !sent_expose {
                 if let Some(cert) = my_cert.as_ref() {
                     let sign = |m: &[u8]| crate::overlay::overlay_sign_possession(m).ok();
-                    if let Some(payload) = crate::pair_cmd::build_identity_expose(
-                        cer.k().map(|k| k.as_slice()).unwrap_or(&[]),
-                        &my_fp,
-                        &their_fp,
-                        cer.caps_canon(),
-                        scope,
-                        cert,
-                        &sign,
-                    ) {
-                        our_expose_nonce = payload["nonce"].as_str().map(str::to_string);
+                    if let (Some(k), Some(nonce)) = (cer.k(), crate::pair_cmd::fresh_seal_nonce()) {
+                        let frame = build_identity_expose(
+                            k,
+                            &my_fp,
+                            &their_fp,
+                            cer.caps_canon(),
+                            scope,
+                            cert,
+                            nonce,
+                            &sign,
+                        )
+                        .map_err(|why| anyhow!("pairing REFUSED: {why}"))?;
+                        our_expose_nonce = Some(hex::encode(nonce));
+                        let payload = frame.to_value().map_err(|why| anyhow!("pairing REFUSED: {why}"))?;
                         pair_write(&mut link.send, &payload).await?;
                     }
                 }
@@ -205,7 +210,9 @@ pub(crate) async fn run_ceremony_within(link: &mut PairLink, words: &str, namepl
                     bail!("pairing REFUSED: a certificate arrived before key confirmation");
                 };
                 let own = crate::overlay::overlay_pubkey_bytes().ok();
-                let cert = crate::pair_cmd::open_identity_expose(
+                let frame = IdentityExpose::from_value(&frame)
+                    .map_err(|why| anyhow!("pairing REFUSED: {why}"))?;
+                let cert = open_identity_expose(
                     &frame,
                     k,
                     Some(fps),
@@ -216,11 +223,9 @@ pub(crate) async fn run_ceremony_within(link: &mut PairLink, words: &str, namepl
                 )
                 .map_err(|why| anyhow!("pairing REFUSED: {why}"))?;
                 peer_cert = Some(cert);
-                if cer.peer_acks_expose() {
-                    if let Some(of) = frame["nonce"].as_str() {
-                        if let Some(ack) = crate::pair_cmd::seal_expose_ack(k, of) {
-                            pair_write(&mut link.send, &ack).await?;
-                        }
+                if cer.peer_acks_expose() && !frame.nonce.is_empty() {
+                    if let Some(ack) = crate::pair_cmd::seal_expose_ack(k, &frame.nonce) {
+                        pair_write(&mut link.send, &ack).await?;
                     }
                 }
             }

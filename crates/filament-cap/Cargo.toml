@@ -9,6 +9,11 @@
 # make_resource_id / make_tag_target), and the ephemeral auth-key layer
 # (AuthKey / EnrollmentPayload / Reuse + the burn / nonce / armed statics).
 #
+# The transfer-admission decision itself is the one exception: it lives in the
+# dependency-free `filament-policy` crate and is re-exported here under the
+# original `capability::*` paths, so the browser can compile the same rule
+# without ring, filesystem, tokio or a clock.
+#
 # The ORCHESTRATION stays in the CLI, because it is bound to the host: store
 # file I/O (load_cap_store / save_cap_store over platform::SecretFile), the env
 # mode flag (cap_authoritative), the process-static observability counters that
@@ -35,6 +40,9 @@ categories = ["authentication", "cryptography"]
 [dependencies]
 # Versions copied verbatim from cli/Cargo.toml.
 anyhow = "1.0.102"
+# The host-free transfer policy. filament-cap re-exports its public items under
+# `capability::*`; this crate keeps the wall-clock wrapper + the crypto objects.
+filament-policy = { path = "../filament-policy", version = "0.2.0" }
 ring = "0.17"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

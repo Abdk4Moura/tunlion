@@ -1,0 +1,33 @@
+# filament-enrol — the host-free enrolment ceremony, carved out of the CLI.
+#
+# A certless device offers its Ed25519 device key, sealed under the PAKE key and
+# bound to the ceremony's confirmation MAC. The owner decides once, signs a
+# device certificate, and seals the grant back. Both frames, the decision, the
+# post-ceremony outcome and the certificate checks live here so the CLI and a
+# browser compile the SAME code.
+#
+# No filesystem, no clock, no runtime, no network stack, no secret-write and no
+# native TLS. Time, randomness, keys and storage are inputs. `ring` (through
+# filament-id) is the only crypto implementation; this crate adds no second one.
+[package]
+name = "filament-enrol"
+version = "0.1.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/tunlion"
+description = "Host-free enrolment ceremony and device identity for native and WASM clients"
+readme = "README.md"
+keywords = ["enrolment", "identity", "ed25519", "wasm"]
+categories = ["authentication", "cryptography"]
+
+[lib]
+name = "filament_enrol"
+
+[dependencies]
+filament-id = { path = "../filament-id", version = "0.1.3" }
+filament-pair = { path = "../filament-pair", version = "0.1.3" }
+hex = "0.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+zeroize = "1.8"
