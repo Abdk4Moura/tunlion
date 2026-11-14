@@ -12,6 +12,8 @@
 #   alpha    owner (`tunlion init`)
 #   bravo    joined device  (add --for bravo   / join --invite-file)
 #   charlie  joined device  (add --for charlie / join --invite-file)
+#   echo     joined device  (add --for echo), the sibling NOT revoked in V:
+#            the positive control on a live sibling link
 #   dave     uncertified: paired with bravo by an ordinary code, no identity
 #
 # bravo and charlie never exchange a code, an invitation or a secret.
@@ -25,8 +27,9 @@
 #   T   transfer: the FleetSibling default, at the named device only, both
 #       ways, with no grant and no pairing; a grant stays one-directional
 #   V   revocation: `demote charlie --to cut` on the OWNER cuts bravo<->charlie
-#       (link closed, exec refused, no file lands either way, no re-admission)
-#       while bravo<->alpha keeps working (the network did not just break)
+#       (link closed, exec refused, no file lands either way, no re-admission,
+#       also after bravo's sweep removed charlie's record) while bravo<->alpha
+#       and the unrevoked sibling echo->bravo keep working on live links
 #   U   uncertified: dave gets nothing new (no fleet secret, no siblings, the
 #       siblings unknown to it) and its ordinary pairing with bravo still works
 #
@@ -51,7 +54,7 @@ source "$HERE/lib/fixture.sh"
 trap fixture_cleanup EXIT
 KNOWN_RED_ALLOW=()
 
-for n in alpha bravo charlie dave; do mkdir -p "$WORK/home-$n" "$WORK/$n-drop"; done
+for n in alpha bravo charlie dave echo; do mkdir -p "$WORK/home-$n" "$WORK/$n-drop"; done
 # The fixture's own calls (init/add/join for the owner side) run as alpha.
 export HOME="$WORK/home-alpha"
 
@@ -75,7 +78,7 @@ wait_log() { # wait_log FILE REGEX SECS
 landed() { [ -f "$WORK/$1-drop/$2" ]; }
 nowhere() { # the file landed in no node's receive dir at all
   local n
-  for n in alpha bravo charlie dave; do landed "$n" "$1" && return 1; done
+  for n in alpha bravo charlie dave echo; do landed "$n" "$1" && return 1; done
   [ ! -f "$WORK/Adrop/$1" ]
 }
 
@@ -87,6 +90,9 @@ init_owner "$DA"
 # The owner daemon serves alpha's own drop as $WORK/Adrop (fixture).
 start_acceptor "$DA"
 enroll_delegate bravo
+# echo: a second sibling, never revoked. Setup only (no gate of its own, so the
+# gate count is unchanged); it is V's positive control on a live sibling link.
+enroll_delegate echo
 # charlie joins with ITS binary (0.9.1 in mixed mode).
 out=$(fs_bounded 45 env HOME="$WORK/home-alpha" TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for charlie --out "$WORK/charlie-inv.txt" --yes)
 [ "$(fs_state)" = ok ] || fixture_die "setup: add --for charlie: $out"
@@ -109,7 +115,7 @@ mkdir -p "$WORK/dave"
 timeout 90 env HOME="$WORK/home-dave" TUNLION_CONFIG_DIR="$WORK/dave" "$BIN" --server "$SERVER" join "$code" --name bravo </dev/null >"$WORK/dave-join.log" 2>&1 || { cat "$WORK/dave-join.log" "$WORK/dave-add.log"; fixture_die "setup: dave join failed"; }
 wait $PADD || fixture_die "setup: bravo add --name dave failed: $(tail -3 "$WORK/dave-add.log")"
 
-for n in bravo charlie dave; do up_node "$n"; done
+for n in bravo charlie dave echo; do up_node "$n"; done
 
 say "M: siblings meet on their certificates, unpaired"
 if wait_log "$WORK/up-bravo.log" "fleet device 'charlie' joined the mesh" 60; then
@@ -181,12 +187,21 @@ fs_cli 60 as_node bravo exec charlie -- echo EXEC-MARK-OK; rc=$(fs_rc)
 if [ "$rc" = 0 ] && fs_out | grep -q EXEC-MARK-OK; then ok "gateS2: exec works once charlie granted shell"
 else bad "gateS2: granted exec rc=$rc: $(fs_out | tail -3)"; fi
 echo "t2-$$" > "$WORK/t2.txt"
+LT3b=$(( $(wc -l < "$WORK/up-bravo.log") + 1 )); LT3c=$(( $(wc -l < "$WORK/up-charlie.log") + 1 ))
 fs_cli 90 as_node bravo send "$WORK/t2.txt" --to charlie; rc=$(fs_rc)
 sleep 2
-if [ "$rc" = 0 ] && landed charlie t2.txt && ! landed alpha t2.txt && ! landed bravo t2.txt && ! landed dave t2.txt && [ ! -f "$WORK/Adrop/t2.txt" ] \
+if [ "$rc" = 0 ] && landed charlie t2.txt && ! landed alpha t2.txt && ! landed bravo t2.txt && ! landed dave t2.txt && ! landed echo t2.txt && [ ! -f "$WORK/Adrop/t2.txt" ] \
    && [ "$(cat "$WORK/charlie-drop/t2.txt")" = "t2-$$" ]; then
   ok "gateT3: granted bravo->charlie landed at charlie ONLY, content intact"
-else bad "gateT3: granted send rc=$rc: $(fs_out | tail -3); drops: $(ls "$WORK"/*-drop "$WORK/Adrop" | tr '\n' ' ')"; fi
+else bad "gateT3: granted send rc=$rc: $(fs_out | tail -3); drops: $(ls "$WORK"/*-drop "$WORK/Adrop" | tr '\n' ' ')"
+  # Evidence only (the verdict above stands): what each daemon did for this
+  # send, and the sender's own debug trail, which the one-line summary hides.
+  echo "## evidence: daemons during the gateT3 send"
+  tail -n +"$LT3b" "$WORK/up-bravo.log" | grep -E "rendezvous|signaling|refus|drop_link|died|closed|transfer-gate|charlie" | tail -12 | sed 's/^/  bravo: /'
+  tail -n +"$LT3c" "$WORK/up-charlie.log" | grep -E "rendezvous|signaling|refus|drop_link|died|closed|transfer-gate|bravo" | tail -12 | sed 's/^/  charlie: /'
+  echo "t2d-$$" > "$WORK/t2d.txt"
+  env HOME="$WORK/home-bravo" TUNLION_CONFIG_DIR="$WORK/bravo" TUNLION_LOG=debug timeout 60 "$BIN" --server "$SERVER" send "$WORK/t2d.txt" --to charlie </dev/null 2>&1 | tail -15 | sed 's/^/  debug-send: /'
+fi
 # charlie's shell grant to bravo says nothing about bravo's shell.
 fs_cli 60 as_node charlie exec bravo -- echo EXEC-MARK-REV; rc=$(fs_rc)
 if [ "$rc" != 0 ] && ! fs_out | grep -q EXEC-MARK-REV; then ok "gateT4: charlie->bravo exec still refused: a grant is one-directional"
@@ -209,11 +224,32 @@ if [ "$rc" = 0 ] && landed bravo u1.txt; then ok "gateU5: dave->bravo, the ordin
 else bad "gateU5: dave->bravo rc=$rc: $(fs_out | tail -3)"; fi
 
 say "V: revoking charlie on the OWNER cuts bravo<->charlie"
+# The positive control needs echo on a live sibling link BEFORE the revoke.
+wait_log "$WORK/up-bravo.log" "fleet device 'echo' joined the mesh" 60 || echo "  (echo never joined bravo's mesh; gateV5 will say so)"
+# charlie's device key, read while bravo still holds its record.
+CHARLIE_KEY=$(python3 - "$WORK/bravo/devices.json" <<'PY'
+import json,sys
+print(next((d["deviceCert"]["devicePub"] for d in json.load(open(sys.argv[1])) if d.get("name") == "charlie" and d.get("deviceCert")), ""))
+PY
+)
+# Everything V asserts about bravo's log is read from here on: a line before the
+# revoke proves nothing about it.
+LV0=$(( $(wc -l < "$WORK/up-bravo.log") + 1 ))
+since_revoke() { tail -n +"$LV0" "$WORK/up-bravo.log"; }
+# grep WITHOUT -q reads all of its input: under pipefail an early -q exit can
+# SIGPIPE the tail and turn a match into a miss, which a negated check would
+# then report as a pass.
+post_has() { since_revoke | grep -E "$1" >/dev/null; }
+wait_since() { # wait_since REGEX SECS: like wait_log, on bravo's post-revoke lines only
+  local i
+  for i in $(seq 1 $(( $2 * 2 ))); do post_has "$1" && return 0; sleep 0.5; done
+  return 1
+}
 as_node alpha demote charlie --to cut --yes </dev/null >"$WORK/revoke.log" 2>&1 || bad "gateV-setup: owner revoke failed: $(cat "$WORK/revoke.log")"
 T0=$(date +%s)
-if wait_log "$WORK/up-bravo.log" "closed the link to 'charlie'" 30; then
-  ok "gateV1: bravo closed its link to charlie within $(( $(date +%s) - T0 ))s of the owner's revoke"
-else bad "gateV1: bravo kept its link to charlie"; grep -iE "roster|charlie" "$WORK/up-bravo.log" | tail -15; fi
+if wait_since "closed the link to 'charlie'" 30 && ! post_has "closed the link to 'echo'"; then
+  ok "gateV1: bravo closed its link to charlie within $(( $(date +%s) - T0 ))s of the owner's revoke, and kept echo's"
+else bad "gateV1: bravo kept its link to charlie, or cut echo's too"; since_revoke | grep -iE "roster|charlie|echo" | tail -15; fi
 sleep 3
 fs_cli 60 as_node bravo exec charlie -- echo EXEC-MARK-REVOKED; rc=$(fs_rc)
 if [ "$rc" != 0 ] && ! fs_out | grep -q EXEC-MARK-REVOKED; then ok "gateV2: exec to revoked charlie refused (rc=$rc)"
@@ -224,19 +260,49 @@ echo "t4-$$" > "$WORK/t4.txt"
 as_node bravo grant charlie transfer >/dev/null 2>&1   # even WITH a grant at bravo
 fs_cli 90 as_node charlie send "$WORK/t4.txt" --to bravo; rc4=$(fs_rc)
 sleep 2
-if nowhere t3.txt && nowhere t4.txt; then ok "gateV3: no file crosses bravo<->charlie after the revoke (rc=$rc/$rc4), even with grants on both ends"
-else bad "gateV3: a file crossed after revoke: $(ls "$WORK"/*-drop | tr '\n' ' ')"; fi
+# The denied arm is also read off bravo's own transfer gate, not only off the
+# drop dirs: an admission of charlie after the revoke is the failure itself.
+if nowhere t3.txt && nowhere t4.txt && ! post_has "transfer-gate: from=charlie allowed=true"; then ok "gateV3: no file crosses bravo<->charlie after the revoke (rc=$rc/$rc4), even with grants on both ends"
+else bad "gateV3: a file crossed after revoke: $(ls "$WORK"/*-drop | tr '\n' ' ')"; since_revoke | grep -E "transfer-gate: from=charlie" | tail -3; fi
 sleep 15
-n_after=$(awk -v t="$T0" '/fleet device .charlie. joined the mesh/ {print}' "$WORK/up-bravo.log" | wc -l)
-if grep -q "fleet-hello from .* refused: device revoked\|closed the link to 'charlie'" "$WORK/up-bravo.log" \
-   && ! tail -n +"$(grep -n "closed the link to 'charlie'" "$WORK/up-bravo.log" | tail -1 | cut -d: -f1)" "$WORK/up-bravo.log" | grep -q "fleet device 'charlie' joined the mesh"; then
-  ok "gateV4: charlie was not re-admitted after the cut ($n_after admissions in total, all before it)"
-else bad "gateV4: charlie re-admitted after the revoke"; fi
+n_after=$(since_revoke | grep -c "fleet device 'charlie' joined the mesh" || true)
+# Re-admission is judged on every post-revoke line, NOT from the close line on
+# (a missing close line made `tail -n +` fail and this pass vacuously). Then the
+# record sweep: once bravo removed charlie's record (the instrument must fire),
+# the revocation must survive it: a delisted-sibling entry names charlie's key
+# and a fresh charlie->bravo offer is still refused.
+v4_why=""
+post_has "fleet device 'charlie' joined the mesh" && v4_why="re-admitted after the revoke ($n_after)"
+if [ -z "$v4_why" ]; then
+  for _ in $(seq 1 90); do grep -q '"name": *"charlie"' "$WORK/bravo/devices.json" || break; sleep 0.5; done
+  if grep -q '"name": *"charlie"' "$WORK/bravo/devices.json"; then v4_why="bravo still holds charlie's record 45s on (its record sweep never removed it)"
+  elif ! post_has "device\(s\) lapsed or ended"; then v4_why="charlie's record went without bravo's sweep saying so (instrument did not fire)"; fi
+fi
+if [ -z "$v4_why" ] && { [ -z "$CHARLIE_KEY" ] || ! grep -q "$CHARLIE_KEY" "$WORK/bravo/delisted-siblings.json" 2>/dev/null; }; then v4_why="removing charlie's record left no delisted-sibling entry (key=${CHARLIE_KEY:-unread})"; fi
+if [ -z "$v4_why" ]; then
+  echo "t6-$$" > "$WORK/t6.txt"
+  fs_cli 90 as_node charlie send "$WORK/t6.txt" --to bravo; rc6=$(fs_rc)
+  sleep 2
+  if ! nowhere t6.txt || post_has "transfer-gate: from=charlie allowed=true|fleet device 'charlie' joined the mesh"; then
+    v4_why="after the record sweep charlie->bravo was admitted (rc=$rc6)"
+  fi
+fi
+if [ -z "$v4_why" ]; then
+  ok "gateV4: charlie was not re-admitted after the cut, nor after bravo's sweep removed its record (rc=$rc6)"
+else bad "gateV4: $v4_why"; since_revoke | grep -E "charlie|lapsed or ended|transfer-gate" | tail -10; fi
 echo "t5-$$" > "$WORK/t5.txt"
 fs_cli 90 as_node bravo send "$WORK/t5.txt" --to alpha; rc=$(fs_rc)
 sleep 2
-if [ "$rc" = 0 ] && [ -f "$WORK/Adrop/t5.txt" ]; then ok "gateV5: CONTROL bravo->alpha still delivers after the revoke"
-else bad "gateV5: CONTROL bravo->alpha rc=$rc: $(fs_out | tail -3)"; fi
+# Positive control on a LIVE SIBLING link: echo, never revoked, still lands a
+# file at bravo, admitted by bravo's transfer gate after charlie's revoke.
+echo "e1-$$" > "$WORK/e1.txt"
+fs_cli 90 as_node echo send "$WORK/e1.txt" --to bravo; rce=$(fs_rc)
+sleep 2
+if [ "$rc" = 0 ] && [ -f "$WORK/Adrop/t5.txt" ] \
+   && [ "$rce" = 0 ] && landed bravo e1.txt && ! landed charlie e1.txt && ! landed echo e1.txt \
+   && post_has "transfer-gate: from=echo allowed=true"; then
+  ok "gateV5: CONTROL bravo->alpha and the unrevoked sibling echo->bravo still deliver after the revoke"
+else bad "gateV5: CONTROL bravo->alpha rc=$rc, sibling echo->bravo rc=$rce: $(fs_out | tail -3)"; since_revoke | grep -E "transfer-gate: from=echo|echo" | tail -5; fi
 
 say "health"
 for n in bravo charlie dave; do

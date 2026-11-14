@@ -21,13 +21,13 @@
 
 use crate::conn::Conn;
 use crate::host::{LogSink, Tone};
-use crate::identity::principal_after_liveness;
+use crate::identity::principal_after_proof;
 use crate::recv::renewal;
 use crate::recv::store::{
     effective_principal_deadline, DeviceStore, OverlayKey, PRINCIPAL_STATE_LAPSED,
     PRINCIPAL_STATE_REVOKED,
 };
-use filament_cap::capability::{BindingStrength, IdentityState};
+use filament_cap::capability::{BindingStrength, IdentityState, PrincipalKind};
 use filament_id::{now_secs, DeviceCert, IntroScope, UserKey, CERT_TTL_SECS};
 use filament_transport::net::Transport;
 use serde_json::{json, Value};
@@ -262,6 +262,20 @@ impl IdentityService {
         if cert.device_pub == own_dpub {
             return fail("reflection: the certificate is this device's own");
         }
+        // A fleet-admitted sibling link may only be proven by the key it was
+        // admitted on. Checked before anything is stored or changed.
+        if conn.link(pid).is_some_and(|l| {
+            principal_after_proof(
+                &l.principal_kind,
+                l.identity_device_pub.as_ref(),
+                &cert.device_pub,
+                PrincipalKind::OwnerDevice,
+                true,
+            )
+            .is_none()
+        }) {
+            return fail("the certificate names a different device than the sibling admitted on this link");
+        }
         let _ = self
             .store
             .store_provisional_identity(&format!("peer-{pid}"), &cert);
@@ -270,15 +284,25 @@ impl IdentityService {
             .store
             .persisted_principal_for_cert(&cert, own_user_pub.as_ref());
         if let Some(l) = conn.link_mut(pid) {
+            let (deadline, _clock) =
+                effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
+            let alive = deadline > now_secs();
+            // Decided against the link's state BEFORE it is overwritten: a
+            // sibling stays a sibling (see `principal_after_proof`).
+            let next = principal_after_proof(
+                &l.principal_kind,
+                l.identity_device_pub.as_ref(),
+                &cert.device_pub,
+                principal_kind,
+                alive,
+            )
+            .unwrap_or(PrincipalKind::Delegated { caps: Vec::new() });
             l.identity_device_pub = Some(cert.device_pub);
             l.identity_user_pub = Some(cert.user_pub);
             l.identity_binding = BindingStrength::Proven;
             l.identity_state = IdentityState::Resolved;
-            let (deadline, _clock) =
-                effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
             l.identity_cert_expires = Some(deadline);
-            let alive = deadline > now_secs();
-            l.principal_kind = principal_after_liveness(principal_kind, alive);
+            l.principal_kind = next;
         }
         self.log.debug(&format!(
             "{} identity proven for peer {}",

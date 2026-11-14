@@ -6179,6 +6179,15 @@ async fn recv_run(
                                 None => log.debug(&format!(
                                     "fleet-rendezvous from {pid} ignored: no proven identity on the link"
                                 )),
+                                // A meeting place is only as good as the sibling
+                                // that brokered it: none from a revoked one.
+                                Some(broker)
+                                    if ports.identity.device_cert_revoked(&broker.device_pub) =>
+                                {
+                                    log.say(&format!(
+                                        "fleet-rendezvous from {pid} refused: device revoked"
+                                    ));
+                                }
                                 Some(broker) if !sess.channels.contains(&ch) => {
                                     sess.channels.push(ch.clone());
                                     let _ = sio

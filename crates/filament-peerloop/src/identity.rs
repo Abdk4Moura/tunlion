@@ -105,6 +105,94 @@ pub fn principal_after_liveness(stored: PrincipalKind, alive: bool) -> Principal
     }
 }
 
+/// The principal a link carries once a possession proof (`identity-expose`)
+/// lands on it, or `None` when the proof must be refused.
+///
+/// A link the fleet hello already admitted as a SIBLING keeps that kind when
+/// the proof names the same device key. The persisted principal cannot stand
+/// in for it: a sibling's index record carries no principal kind, which reads
+/// back as an owner device, and a sibling relabelled that way is no longer
+/// governed by the sibling rules (the cut-on-revocation sweep, the transfer
+/// scope). A proof naming a DIFFERENT key than the admitted one is refused:
+/// one link cannot be two devices.
+///
+/// Every other link takes the persisted principal, after liveness, exactly as
+/// before. Pure, so the decision is testable without a `Link`.
+pub fn principal_after_proof(
+    current: &PrincipalKind,
+    admitted_device: Option<&[u8; 32]>,
+    proven_device: &[u8; 32],
+    persisted: PrincipalKind,
+    alive: bool,
+) -> Option<PrincipalKind> {
+    if matches!(current, PrincipalKind::FleetSibling) {
+        return match admitted_device {
+            Some(k) if k == proven_device => Some(PrincipalKind::FleetSibling),
+            Some(_) => None,
+            // Admission always records the key; a sibling without one is not a
+            // state admission produces. Fail closed to a ceiling that denies.
+            None => Some(PrincipalKind::Delegated { caps: Vec::new() }),
+        };
+    }
+    Some(principal_after_liveness(persisted, alive))
+}
+
+#[cfg(test)]
+mod proof_principal_tests {
+    use super::*;
+
+    #[test]
+    fn a_proof_keeps_an_admitted_sibling_a_sibling_and_others_unchanged() {
+        let k = [7u8; 32];
+        let other = [8u8; 32];
+        // The decision point: a sibling's record reads back as OwnerDevice, and
+        // that must NOT replace the sibling admission for the same key.
+        assert_eq!(
+            principal_after_proof(
+                &PrincipalKind::FleetSibling,
+                Some(&k),
+                &k,
+                PrincipalKind::OwnerDevice,
+                true
+            ),
+            Some(PrincipalKind::FleetSibling)
+        );
+        // A different key on an admitted sibling link is refused outright.
+        assert_eq!(
+            principal_after_proof(
+                &PrincipalKind::FleetSibling,
+                Some(&k),
+                &other,
+                PrincipalKind::OwnerDevice,
+                true
+            ),
+            None
+        );
+        // Positive controls: a non-sibling link takes the persisted principal,
+        // and an expired delegated one still collapses to an empty ceiling.
+        assert_eq!(
+            principal_after_proof(
+                &PrincipalKind::OwnerDevice,
+                None,
+                &k,
+                PrincipalKind::OwnerDevice,
+                true
+            ),
+            Some(PrincipalKind::OwnerDevice)
+        );
+        assert_eq!(
+            principal_after_proof(
+                &PrincipalKind::OwnerDevice,
+                None,
+                &k,
+                PrincipalKind::Delegated { caps: vec!["transfer".into()] },
+                false
+            ),
+            Some(PrincipalKind::Delegated { caps: Vec::new() })
+        );
+    }
+}
+
 /// Pin a DELEGATED peer to a ceiling-less principal, which denies every action.
 /// A no-op for an owner device, whose semantics are unchanged.
 ///
