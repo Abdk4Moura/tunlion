@@ -886,6 +886,45 @@ pub fn fleet_inputs_in(
     (Some(header.owner_pub), explicit)
 }
 
+/// Pairwise-first: map a gate's raw `(outcome, has_explicit_grant)` for a PAIR
+/// peer to what the shared gate takes, given THIS device's own record grant.
+///
+/// Any device may pair with any other, and a grant one device gives its pair
+/// (`tunlion grant <peer> <cap>` here, written into this device's own record,
+/// without the owner key) is an explicit grant for that action in BOTH modes.
+/// Before this, only the shadow legacy fold read it, so under authoritative
+/// mode a pair peer needed an owner-signed grant the pairing never asked for.
+///
+/// * `is_pair`: the link proved the pair secret and carries no delegated
+///   ceiling. A delegated or invited peer is NOT a pair here: its record caps
+///   are its ceiling, and the gate's ceiling check stays the bound for it.
+/// * `local_record_grant`: the record's STORED caps hold the action. That
+///   includes the pairing default `["transfer"]` (and a v1 record with no
+///   `caps`, which reads as `["transfer"]`): a pairing itself grants transfer.
+///   `device_allows`' implied transfer answer is not used, so a record with
+///   `caps: []`, or whose `capExpires` entry lapsed, grants nothing.
+/// * `locally_denied`: a deny recorded here for the action. It outranks the
+///   grant, so the inputs pass through unchanged and the gate refuses on it.
+///
+/// A counted grant reads as `Authorized` with `has_explicit_grant` set, which
+/// is what an owner-signed grant produces for a non-same-owner peer and what
+/// the same-owner branch reads. Everything the gate applies absolutely
+/// (revocation, a delegated ceiling, a local deny, expiry, the Proven binding
+/// composer) still applies after this mapping. Anything else passes through.
+pub fn pair_grant_inputs(
+    is_pair: bool,
+    local_record_grant: bool,
+    locally_denied: bool,
+    outcome: CapOutcome,
+    has_grant: bool,
+) -> (CapOutcome, bool) {
+    if is_pair && local_record_grant && !locally_denied {
+        (CapOutcome::Authorized, true)
+    } else {
+        (outcome, has_grant)
+    }
+}
+
 /// The scoped-default action set a same-owner Proven fleet device may exercise
 /// with NO explicit grant — each bounded to a scope the GATE enforces:
 ///   - `transfer` → into the designated inbox directory (not arbitrary paths)
@@ -4749,5 +4788,88 @@ mod transfer_decision_tests {
         );
         gate.cert_revoked = true;
         assert_eq!(transfer_decision(&gate).deny, Some(TransferDeny::Revoked));
+    }
+
+    /// Pairwise-first: a grant this device gave its pair counts as an explicit
+    /// grant, and nothing else about the mapping moves.
+    #[test]
+    fn pair_grant_inputs_counts_only_an_undenied_pair_record_grant() {
+        let denied = CapOutcome::Denied("not authorized".into());
+        assert_eq!(
+            pair_grant_inputs(true, true, false, denied.clone(), false),
+            (CapOutcome::Authorized, true)
+        );
+        // Not a pair (delegated, sibling, untrusted), no grant, or denied here:
+        // the raw inputs pass through untouched.
+        for (is_pair, grant, deny) in [
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                pair_grant_inputs(is_pair, grant, deny, denied.clone(), false),
+                (denied.clone(), false)
+            );
+        }
+        // An owner-signed grant already held is never withdrawn by the mapping.
+        assert_eq!(
+            pair_grant_inputs(false, false, false, CapOutcome::Authorized, true),
+            (CapOutcome::Authorized, true)
+        );
+    }
+
+    /// The user decision for transfer: under authoritative mode, a pair peer
+    /// with this device's own record grant is admitted without an owner-signed
+    /// grant, and every absolute still refuses it.
+    #[test]
+    fn a_pair_record_grant_admits_a_transfer_under_authoritative() {
+        let no_signed = CapOutcome::Denied("not authorized".into());
+        let pair_gate = |is_pair: bool, grant: bool, deny: bool| {
+            let (outcome, has_grant) =
+                pair_grant_inputs(is_pair, grant, deny, no_signed.clone(), false);
+            (outcome, has_grant, deny)
+        };
+        let run = |(outcome, has_grant, deny): (CapOutcome, bool, bool),
+                   revoked: bool,
+                   caps: Option<&[String]>| {
+            let mut gate = input(&outcome, true, false);
+            gate.binding = BindingStrength::Proven;
+            gate.cert_expires = Some(u64::MAX);
+            gate.scoped_in_bounds = true;
+            gate.has_explicit_grant = has_grant;
+            gate.denied = deny;
+            gate.cert_revoked = revoked;
+            gate.auth_key_caps = caps;
+            transfer_decision(&gate)
+        };
+        assert!(run(pair_gate(true, true, false), false, None).allowed);
+        // No local grant: unchanged, still refused.
+        assert!(!run(pair_gate(true, false, false), false, None).allowed);
+        // A local deny outranks the grant.
+        assert_eq!(
+            run(pair_gate(true, true, true), false, None).deny,
+            Some(TransferDeny::Denied)
+        );
+        // Revocation outranks the grant.
+        assert_eq!(
+            run(pair_gate(true, true, false), true, None).deny,
+            Some(TransferDeny::Revoked)
+        );
+        // A delegated peer is not a pair, and even a mapping forced through
+        // stays capped by its ceiling.
+        let mount_only = vec!["mount".to_string()];
+        assert!(!run(pair_gate(false, true, false), false, Some(mount_only.as_slice())).allowed);
+        assert_eq!(
+            run(pair_gate(true, true, false), false, Some(mount_only.as_slice())).deny,
+            Some(TransferDeny::Ceiling)
+        );
+        // The Proven binding requirement is unchanged.
+        let (outcome, has_grant, _) = pair_gate(true, true, false);
+        let mut inferred = input(&outcome, true, false);
+        inferred.binding = BindingStrength::Inferred;
+        inferred.cert_expires = Some(u64::MAX);
+        inferred.has_explicit_grant = has_grant;
+        assert!(!transfer_decision(&inferred).allowed);
     }
 }
