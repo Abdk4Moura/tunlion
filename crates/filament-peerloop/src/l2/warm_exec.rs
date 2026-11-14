@@ -156,6 +156,8 @@ async fn run_warm_exec(
     log: Arc<dyn crate::host::LogSink>,
     req: control::Req,
 ) {
+    // Keeps the receive loop on its fast tick for as long as this exec runs.
+    let _live = crate::l2::mux::WarmExecLive::enter();
     // H-1: the same per-link cap the acceptor applies. An exec needs TWO local
     // pipes (stdout and stderr), so require room for both; a warm path that
     // cannot fit is not a path, and falling back beats evicting somebody else's

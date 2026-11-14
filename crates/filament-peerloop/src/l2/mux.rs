@@ -675,14 +675,24 @@ impl Mux {
 
     /// INITIATOR: the link said `link-revoked` (which carries no sid). Every
     /// in-flight warm exec on THIS link is told, so it fails loudly instead of
-    /// waiting for an exit status that will never come.
-    pub async fn on_link_revoked(&self, v: Value) {
+    /// waiting for an exit status that will never come. Returns whether this
+    /// frame is the link's FIRST refusal and is now recorded; a repeat keeps
+    /// the first record and returns false (one cut, one answer).
+    pub async fn on_link_revoked(&self, v: Value) -> bool {
         // Recorded first, so no exec can observe the link failing without it.
-        *self.revoked.lock().unwrap_or_else(|p| p.into_inner()) = Some(v.clone());
+        let first = {
+            let mut slot = self.revoked.lock().unwrap_or_else(|p| p.into_inner());
+            let first = slot.is_none();
+            if first {
+                *slot = Some(v.clone());
+            }
+            first
+        };
         let senders: Vec<_> = self.exec_init.lock().await.values().cloned().collect();
         for tx in senders {
             let _ = tx.try_send(v.clone());
         }
+        first
     }
 
     /// The refusal this link received, if any (see `revoked`).
@@ -712,13 +722,76 @@ impl Mux {
         self.exec_init.lock().await.clear();
         // Do NOT clear `close_err`: a denial that raced the transport's death
         // must still be readable by the pump that is about to end. The map is
-        // bounded by the streams drained here and sids are not reused.
+        // bounded by the streams drained here and sids are not reused. Nor
+        // `revoked`, for the same reason: it is why the link is dying.
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
             if let Some(h) = s.read_pump {
                 h.abort();
             }
         }
+    }
+}
+
+/// A `link-revoked` frame arrived on a link. Record it on the link's mux and,
+/// only when this frame is the link's first refusal and is now recorded,
+/// answer the peer's nonce with `link-revoked-ack` so it may close. No mux
+/// means nothing was recorded, so nothing is acknowledged; a frame without a
+/// nonce (an older peer) asks for no answer; no transport means nothing to
+/// answer on. At most one answer per link, sent from a task under a bound so a
+/// peer that stopped reading cannot park the caller, and a peer that repeats
+/// the frame cannot multiply the tasks. Returns whether an answer was sent off.
+///
+/// The ack is a diagnostic for the cutting side, never a delivery verdict:
+/// its absence proves nothing about what this side processed.
+pub async fn answer_link_revoked(
+    mux: Option<&Arc<Mux>>,
+    t: Option<Arc<dyn Transport>>,
+    v: &Value,
+) -> bool {
+    let recorded = match mux {
+        Some(mux) => mux.on_link_revoked(v.clone()).await,
+        None => false,
+    };
+    let (Some(nonce), Some(t)) = (v["nonce"].as_str(), t) else {
+        return false;
+    };
+    if !recorded {
+        return false;
+    }
+    let ack = json!({ "type": "link-revoked-ack", "nonce": nonce });
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(LINK_REVOKED_ACK_SEND, t.send_control(&ack)).await;
+    });
+    true
+}
+
+/// Bound on writing one `link-revoked-ack`.
+const LINK_REVOKED_ACK_SEND: Duration = Duration::from_secs(5);
+
+/// Warm execs this process is running as the initiator. While any is live the
+/// receive loop ticks fast, so a refusal read on a link whose events wait for
+/// a loop turn reaches the exec (and is acknowledged) promptly.
+static WARM_EXECS_LIVE: AtomicU32 = AtomicU32::new(0);
+
+/// Whether this process has a warm exec in flight (see [`WarmExecLive`]).
+pub fn warm_exec_live() -> bool {
+    WARM_EXECS_LIVE.load(Ordering::Relaxed) > 0
+}
+
+/// Counts one in-flight warm exec for its lifetime.
+pub struct WarmExecLive(());
+
+impl WarmExecLive {
+    pub fn enter() -> Self {
+        WARM_EXECS_LIVE.fetch_add(1, Ordering::Relaxed);
+        WarmExecLive(())
+    }
+}
+
+impl Drop for WarmExecLive {
+    fn drop(&mut self) {
+        WARM_EXECS_LIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1595,6 +1668,83 @@ mod tests {
         }
         assert!(!seen, "the full queue dropped it (the case this record exists for)");
         assert_eq!(mux.link_revoked(), Some(revoked), "the link must keep the refusal");
+    }
+
+    /// The record is why the link is dying, so the teardown keeps it for the
+    /// exec that is about to read it.
+    #[tokio::test]
+    async fn a_recorded_revocation_survives_shutdown_all() {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        let revoked = json!({ "type": "link-revoked", "reason": "forgotten" });
+        assert!(mux.on_link_revoked(revoked.clone()).await, "the first refusal is recorded");
+        mux.shutdown_all().await;
+        assert_eq!(mux.link_revoked(), Some(revoked));
+    }
+
+    fn acks_sent(t: &MockTransport) -> Vec<Value> {
+        t.controls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| v["type"].as_str() == Some("link-revoked-ack"))
+            .cloned()
+            .collect()
+    }
+
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// The receiving side: the ack answers the nonce, and only once the refusal
+    /// is recorded on the link; a repeat of the frame neither re-records nor
+    /// answers again (one cut, one answer, however often a peer sends it).
+    #[tokio::test]
+    async fn a_revocation_is_acknowledged_once_and_only_after_it_is_recorded() {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        let first = json!({ "type": "link-revoked", "reason": "forgotten", "nonce": "n-1" });
+        let transport: Arc<dyn Transport> = t.clone();
+        assert!(answer_link_revoked(Some(&mux), Some(transport.clone()), &first).await);
+        assert_eq!(mux.link_revoked(), Some(first.clone()), "acked before it was recorded");
+        settle().await;
+        let acks = acks_sent(&t);
+        assert_eq!(acks.len(), 1, "one refusal, one ack: {acks:?}");
+        assert_eq!(acks[0]["nonce"], "n-1");
+        for i in 0..50 {
+            let again = json!({ "type": "link-revoked", "reason": "x", "nonce": format!("spam-{i}") });
+            assert!(!answer_link_revoked(Some(&mux), Some(transport.clone()), &again).await);
+        }
+        settle().await;
+        assert_eq!(acks_sent(&t).len(), 1, "a repeated frame was answered again");
+        assert_eq!(mux.link_revoked(), Some(first), "a repeat replaced the first record");
+    }
+
+    /// No nonce (an older peer): recorded, not answered. No mux: nothing was
+    /// recorded, so nothing is answered. No transport: recorded, nothing to
+    /// answer on, and no panic.
+    #[tokio::test]
+    async fn a_revocation_is_not_acknowledged_without_a_nonce_a_mux_or_a_transport() {
+        let t = MockTransport::new();
+        let transport: Arc<dyn Transport> = t.clone();
+
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        let bare = json!({ "type": "link-revoked", "reason": "forgotten" });
+        assert!(!answer_link_revoked(Some(&mux), Some(transport.clone()), &bare).await);
+        assert_eq!(mux.link_revoked(), Some(bare), "a frame without a nonce is still recorded");
+
+        let with_nonce = json!({ "type": "link-revoked", "reason": "forgotten", "nonce": "n-2" });
+        assert!(!answer_link_revoked(None, Some(transport.clone()), &with_nonce).await);
+
+        let other = Mux::new(t.clone(), Arc::new(NoHost));
+        assert!(!answer_link_revoked(Some(&other), None, &with_nonce).await);
+        assert_eq!(other.link_revoked(), Some(with_nonce), "no transport must not lose the record");
+
+        settle().await;
+        assert!(acks_sent(&t).is_empty(), "an ack went out: {:?}", acks_sent(&t));
     }
 
     #[cfg(feature = "forward-server")]

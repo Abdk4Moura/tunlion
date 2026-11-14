@@ -23,16 +23,18 @@
 #   E1  exec b -> a works (positive control for E2-F1).
 #   E2  exec running when a's daemon is kill -9'd: exits 6 within 16 s.
 #   E3  exec to a's dead daemon: exits 6 within 20 s (was 45 s).
-#   F1  exec running when a forgets b: exits 4 with the refusal, not
-#       "link died" (6).
-#       A's daemon must also log that b ACKNOWLEDGED the refusal: a write
-#       that returned Ok is only queued here, and the close that follows the
-#       forget discarded it about half the time (b then saw a dead link).
-#       And its other half, the no-hang side of that wait: a third device c
-#       is forgotten while its daemon is SIGSTOPped mid-exec. The forget
-#       returns within 5 s, a's daemon still answers `status` after the
-#       budget, and a logs that refusal as unconfirmed, never acknowledged.
-#       Waiting for an ack must never park a's daemon on a dead peer.
+#   F1a exec running when a forgets b: exits 4 with the refusal, not
+#       "link died" (6), and a's daemon logs that b ACKNOWLEDGED the refusal:
+#       a write that returned Ok is only queued here, and the close that
+#       follows the forget discarded it about half the time (b then saw a
+#       dead link).
+#   F1b the no-hang side of that wait: a third device c is forgotten while
+#       its daemon is SIGSTOPped mid-exec. The forget returns, and a `status`
+#       probed 200 ms into it is answered, both before the closer's 2 s ack
+#       budget has elapsed; a then logs the refusal as unconfirmed, never as
+#       acknowledged. Waiting for an ack must never park a's daemon on a peer.
+#       (c has no served sync in flight, so the revocation's bounded sync join
+#       adds nothing here.)
 #   F2  after a forgets b, b's `send --to a` is refused within 15 s, exit 4,
 #       naming the reason (was 62 s, exit 6 "is 'a' online?").
 #
@@ -74,6 +76,7 @@ sudo -n true 2>/dev/null || { echo "REFUSED: needs passwordless sudo (iptables, 
 command -v iptables >/dev/null || { echo "REFUSED: iptables is required"; exit 2; }
 
 ts() { date +%s.%N; }
+now_ms() { date +%s%3N; }
 # $1 pattern, $2 file, $3 seconds: did a line matching it appear in time?
 wait_log() {
   local i
@@ -242,9 +245,8 @@ fi
 start_a
 sleep 6
 
-# ===================================================================== F1 ======
-say "F1: exec running when a forgets b: exit 4 with the refusal, acknowledged; a frozen peer never parks a"
-F1_WHY=""
+# ===================================================================== F1a =====
+say "F1a: exec running when a forgets b: exit 4 with the refusal, acknowledged by b"
 env TUNLION_CONFIG_DIR="$DB" timeout 90 "$BIN" --server "$SERVER" exec boxa -- /bin/sleep 80 >/dev/null 2>"$WORK/f1.err" </dev/null &
 EP=$!
 sleep 6
@@ -253,29 +255,34 @@ if kill -0 "$EP" 2>/dev/null; then
   wait "$EP"; rc=$?; took=$(since "$t0")
   echo "## forget rc=$frc; exec rc=$rc ${took}s after it"; tail -3 "$WORK/f1.err"
   # The instrument: a's closer logs the refusal's fate. Only an ack from b's
-  # daemon, sent after it recorded the refusal, may read as delivered.
+  # daemon, sent after it recorded the refusal, may read as acknowledged.
   acked=no; wait_log 'link-revoked to [^ ]+: acknowledged by the peer' "$WORK/A-up.log" 5 && acked=yes
   echo "## a's record of the refusal: acked=$acked"
   grep -E 'link-revoked to ' "$WORK/A-up.log" | tail -3
   if [ "$frc" = 0 ] && [ "$rc" = 4 ] && [ "$took" -le 10 ] && grep -q "not recognized" "$WORK/f1.err" \
      && ! grep -q "died during exec" "$WORK/f1.err" && [ "$acked" = yes ]; then
-    echo "## b: the running exec ended as a refusal in ${took}s (exit 4, not recognized), acknowledged"
+    ok "F1a: the running exec ended as a refusal in ${took}s (exit 4, not recognized), acknowledged by b"
   else
-    F1_WHY="$F1_WHY b: forget rc=$frc, exec rc=$rc in ${took}s, acked=$acked;"
+    bad "F1a: exec when forgotten (forget rc=$frc, exec rc=$rc in ${took}s, acked=$acked)"
   fi
 else
-  wait "$EP"; F1_WHY="$F1_WHY b: the exec ended before the forget (rc=$?);"; tail -5 "$WORK/f1.err"
+  wait "$EP"; bad "F1a: the exec ended before the forget (rc=$?)"; tail -5 "$WORK/f1.err"
   env TUNLION_CONFIG_DIR="$DA" "$BIN" devices forget boxb -y >"$WORK/forget.log" 2>&1
 fi
+sleep 3
 
-# The no-hang half. A third device, paired exactly as b was, so nothing b's
-# gates rely on changes.
+# ===================================================================== F1b =====
+say "F1b: a forgets c while c's daemon is frozen mid-exec: a answers before the ack budget"
+# The closer's whole wait (REFUSAL_ACK_BUDGET in filament-peerloop conn.rs).
+# An inline wait in a's loop would hold the forget and the probe past it.
+BUDGET_MS=2000
+# A third device, paired exactly as b was, so nothing b's gates rely on changes.
 DC="$WORK/cfg-C"; mkdir -p "$DC" "$WORK/C-drop"
 env TUNLION_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for boxc --allow shell --out "$WORK/invc.txt" --yes >"$WORK/addc.log" 2>&1
 env TUNLION_CONFIG_DIR="$DC" timeout 45 "$BIN" --server "$SERVER" join --invite-file "$WORK/invc.txt" --name boxc --no-interactive >"$WORK/joinc.log" 2>&1
 env TUNLION_CONFIG_DIR="$DA" "$BIN" grant boxc shell -y >"$WORK/grantc.log" 2>&1
 if ! TUNLION_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q boxc; then
-  F1_WHY="$F1_WHY c: setup, boxc did not join;"; tail -5 "$WORK/addc.log" "$WORK/joinc.log" "$WORK/grantc.log"
+  bad "F1b: setup: boxc did not join"; tail -5 "$WORK/addc.log" "$WORK/joinc.log" "$WORK/grantc.log"
 else
   env TUNLION_LOG=debug TUNLION_CONFIG_DIR="$DC" "$BIN" --server "$SERVER" up --dir "$WORK/C-drop" >>"$WORK/C-up.log" 2>&1 &
   CDAEMON=$!; pids+=($CDAEMON)
@@ -286,35 +293,39 @@ else
   if kill -0 "$CEP" 2>/dev/null; then
     base=$(wc -l <"$WORK/A-up.log")
     kill -STOP "$CDAEMON"
-    t0=$(ts)
-    env TUNLION_CONFIG_DIR="$DA" timeout 20 "$BIN" devices forget boxc -y >"$WORK/forgetc.log" 2>&1; frc=$?
-    ftook=$(since "$t0")
-    # Past the closer's 2 s budget: its wait must have ended on its own.
-    sleep 4
-    ST=$(env TUNLION_CONFIG_DIR="$DA" timeout 10 "$BIN" status 2>&1); src=$?
-    tail -n +"$((base + 1))" "$WORK/A-up.log" >"$WORK/f1c-a.log"
+    t0=$(now_ms)
+    ( env TUNLION_CONFIG_DIR="$DA" timeout 20 "$BIN" devices forget boxc -y >"$WORK/forgetc.log" 2>&1
+      echo "$? $(now_ms)" >"$WORK/forgetc.rc" ) &
+    FP=$!
+    sleep 0.2
+    ST=$(env TUNLION_CONFIG_DIR="$DA" timeout 10 "$BIN" status 2>&1); src=$?; s_ms=$(( $(now_ms) - t0 ))
+    wait "$FP"
+    read -r frc fend <"$WORK/forgetc.rc"; f_ms=$(( fend - t0 ))
+    # Then the closer's verdict, after the budget, while c is still frozen.
+    outcome=no
+    for _ in $(seq 1 25); do
+      tail -n +"$((base + 1))" "$WORK/A-up.log" >"$WORK/f1c-a.log"
+      if grep -qE 'link-revoked to [^ ]+: (sent, not acknowledged within the budget \(unconfirmed\)|send did not complete within the budget)' "$WORK/f1c-a.log"; then
+        outcome=yes; break
+      fi
+      sleep 0.2
+    done
     kill -CONT "$CDAEMON"
     kill "$CEP" 2>/dev/null; wait "$CEP" 2>/dev/null
-    echo "## c frozen: forget rc=$frc in ${ftook}s; a's status rc=$src"
+    echo "## c frozen: forget rc=$frc in ${f_ms}ms; status (probed at 200ms) rc=$src done at ${s_ms}ms; budget ${BUDGET_MS}ms; unconfirmed logged=$outcome"
     echo "$ST" | head -2 | sed 's/^/    /'
     grep -E 'link-revoked to |closed the link to' "$WORK/f1c-a.log" | tail -4
-    if [ "$frc" = 0 ] && [ "$ftook" -le 5 ] && [ "$src" = 0 ] \
+    if [ "$frc" = 0 ] && [ "$f_ms" -lt "$BUDGET_MS" ] && [ "$src" = 0 ] && [ "$s_ms" -lt "$BUDGET_MS" ] \
        && echo "$ST" | grep -qE "up( but degraded)? \(pid $ADAEMON\)" \
-       && grep -qE "closed the link to 'boxc'" "$WORK/f1c-a.log" \
-       && grep -qE 'link-revoked to [^ ]+: (sent, not acknowledged within the budget \(unconfirmed\)|send did not complete within the budget)' "$WORK/f1c-a.log" \
+       && grep -qE "closed the link to 'boxc'" "$WORK/f1c-a.log" && [ "$outcome" = yes ] \
        && ! grep -qE 'link-revoked to [^ ]+: acknowledged by the peer' "$WORK/f1c-a.log"; then
-      echo "## c: the forget answered in ${ftook}s with c frozen, a still answers, the refusal is unconfirmed"
+      ok "F1b: with c frozen, the forget answered in ${f_ms}ms and status by ${s_ms}ms (< ${BUDGET_MS}ms); the refusal is logged unconfirmed"
     else
-      F1_WHY="$F1_WHY c frozen: forget rc=$frc in ${ftook}s, status rc=$src;"
+      bad "F1b: forget with a frozen peer (forget rc=$frc in ${f_ms}ms, status rc=$src by ${s_ms}ms, unconfirmed=$outcome)"
     fi
   else
-    wait "$CEP"; F1_WHY="$F1_WHY c: the exec ended before the forget (rc=$?);"; tail -5 "$WORK/f1c.err"
+    wait "$CEP"; bad "F1b: c's exec ended before the forget (rc=$?)"; tail -5 "$WORK/f1c.err"
   fi
-fi
-if [ -z "$F1_WHY" ]; then
-  ok "F1: a forgotten exec ended as an acknowledged refusal (exit 4), and a frozen peer did not park a's daemon"
-else
-  bad "F1: exec when forgotten:$F1_WHY"
 fi
 sleep 3
 

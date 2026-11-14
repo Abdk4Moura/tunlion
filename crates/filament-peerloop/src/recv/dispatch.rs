@@ -1035,6 +1035,33 @@ impl SyncTasks {
         }
     }
 
+    /// [`Self::cancel_sync_for_pid`] for a whole set of peers under ONE shared
+    /// deadline: every task is cancelled first, then all are joined against
+    /// the same [`crate::sync::SYNC_JOIN_BOUND`]. N revoked peers therefore
+    /// hold the loop for at most one bound, not one bound each.
+    async fn cancel_sync_for_pids(&self, pids: &[&str], log: &dyn LogSink) {
+        let keys: Vec<_> = self
+            .0
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(task_pid, _)| pids.contains(&task_pid.as_str()))
+            .cloned()
+            .collect();
+        let mut joining = Vec::with_capacity(keys.len());
+        for key in keys {
+            let removed = self.0.lock().unwrap().remove(&key);
+            if let Some(task) = removed {
+                task.cancel();
+                joining.push((key, task));
+            }
+        }
+        let deadline = sync_join_deadline();
+        for ((task_pid, sid), task) in joining {
+            report_sync_join(log, &task_pid, sid, task.join(deadline).await);
+        }
+    }
+
     async fn stop_sync_tasks(&self, log: &dyn LogSink) {
         let mut joining = std::mem::take(&mut *self.0.lock().unwrap())
             .into_iter()
@@ -2756,7 +2783,11 @@ async fn recv_run(
                 // between "authenticating..." and "authenticated" (two such
                 // waits, measured 4.0 to 4.1s in 4 of 5 runs). The ceremony
                 // is budgeted, so the fast tick is too.
-                if parked_opens.is_empty() && !ceremony_live {
+                // And while a warm exec runs as initiator: a refusal for it
+                // rides a link stream that is drained once per loop turn, and
+                // the cutting side holds that link open only for a short
+                // budget waiting for the acknowledgement.
+                if parked_opens.is_empty() && !ceremony_live && !l2::mux::warm_exec_live() {
                     Duration::from_secs(2)
                 } else {
                     Duration::from_millis(100)
@@ -3803,10 +3834,6 @@ async fn recv_run(
                         let mut f = json!({ "type": "link-revoked", "reason": refusal.reason });
                         refusal.annotate(&mut f);
                         conn.drop_link_after_refusal(pid, f);
-                        // A sync task parked in a write on that transport is
-                        // released by its cancel, or by the close at the
-                        // budget, and the join is bounded either way.
-                        sync_tasks.cancel_sync_for_pid(pid, log.as_ref()).await;
                         l2_muxes.remove(pid);
                         fleet_pending.remove(pid);
                         fleet_verified.remove(pid);
@@ -3817,6 +3844,13 @@ async fn recv_run(
                             "closed the link to '{label}': it was forgotten or revoked here"
                         ));
                     }
+                    // Their served sync tasks, all at once under ONE join bound
+                    // (SYNC_JOIN_BOUND, 5 s) for the whole doomed set: that is
+                    // the longest this revocation can hold the loop. A task
+                    // parked in a write on a cut transport is released by the
+                    // closer's close at REFUSAL_ACK_BUDGET (2 s), inside it.
+                    let doomed_pids: Vec<&str> = doomed.iter().map(|(p, _)| p.as_str()).collect();
+                    sync_tasks.cancel_sync_for_pids(&doomed_pids, log.as_ref()).await;
                     // An overlay route is the one thing a revoked device keeps
                     // without opening anything, so it goes with the revocation
                     // (this is the explicit forget path `remove_by_pid` is for).
@@ -7324,24 +7358,14 @@ async fn recv_run(
                 // status that will never arrive. Other consumers (send, a served
                 // session) keep their existing handling.
                 Some("link-revoked") => {
-                    if let Some(mux) = l2_muxes.get(&pid) {
-                        mux.on_link_revoked(v.clone()).await;
-                    }
-                    // Only now, with the refusal recorded where every warm exec
-                    // on this link reads it, tell the peer it may close. The
-                    // nonce binds the ack to that one cut; a frame without one
-                    // (an older peer) asks for none. Off the loop: a peer that
-                    // stopped reading must not park this daemon.
-                    if let (Some(nonce), Some(t)) = (v["nonce"].as_str(), conn.transport_of(&pid)) {
-                        let ack = json!({ "type": "link-revoked-ack", "nonce": nonce });
-                        tokio::spawn(async move {
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                t.send_control(&ack),
-                            )
-                            .await;
-                        });
-                    }
+                    // Recorded where every warm exec on this link reads it, and
+                    // only then acknowledged (see `answer_link_revoked`).
+                    let _ = l2::mux::answer_link_revoked(
+                        l2_muxes.get(&pid),
+                        conn.transport_of(&pid),
+                        &v,
+                    )
+                    .await;
                     continue;
                 }
                 // Remote command execution: parse, shell-gate, direct-spawn

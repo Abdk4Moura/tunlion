@@ -366,6 +366,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         revoked_peers: HashMap::new(),
         revoked_bindings: HashSet::new(),
         link_events: HashMap::new(),
+        closing: HashMap::new(),
         pending_sources: HashMap::new(),
         roster_absent: HashMap::new(),
         log: crate::host_impl::cli_log(),
