@@ -480,6 +480,8 @@ pkill -f "up --dir $WORK/$FORGOTTEN-again-drop" 2>/dev/null || true
 # The impostor's device key, read before its record is dropped: the owner's
 # verdict lines name it, which is how a dump tells the impostor's own hello
 # from the victim's (both claim the same name).
+NOT_EXERCISED=0
+NOT_EXERCISED_LIST=()
 MALLORY_PUB=$(python3 -c "import json;print(next((d.get('deviceCert',{}).get('devicePub','') for d in json.load(open('$DA/devices.json')) if d.get('name')=='$MALLORY'),''))" 2>/dev/null)
 python3 - "$DA" "$MALLORY" <<'PY'
 import fcntl, json, os, sys, tempfile
@@ -517,6 +519,12 @@ run_impostor_variant() {
   local refused_before=$(grep -c "reason=name-taken" "$WORK/up.log" || true)
   pkill -f "up --dir $WORK/$MALLORY-drop" 2>/dev/null || true
   sleep 2
+  # This variant's mark, taken once the previous impostor daemon has exited,
+  # so owner lines after it belong to this variant's impostor.
+  for _ in $(seq 1 10); do
+    pgrep -f "up --dir $WORK/$MALLORY-drop" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
   local owner_from=$(wc -l <"$OWNER_TRACE" 2>/dev/null || echo 0)
   local owner_log_from=$(wc -l <"$WORK/up.log" 2>/dev/null || echo 0)
   env TUNLION_CONFIG_DIR="$DM" TUNLION_NAME="$variant" TUNLION_FLEET_HELLO_TRACE="$WORK/fhello-$MALLORY-$tag.trace" "$BIN" --server "$SERVER" up --dir "$WORK/$MALLORY-drop" >"$WORK/up-$MALLORY-$tag.log" 2>&1 &
@@ -569,15 +577,16 @@ PY
   echo "## (impostor $tag) refused=$refused attempted=$attempted victim=$victim_ok intact=$intact execref=$execref"
   # Whether the OWNER evaluated the impostor's OWN hello: an info-level
   # `fleet ... step=<verdict>` line in the OWNER's log (never the impostor's),
-  # since this variant started, whose `dev=` is the impostor's device-key
+  # since this variant's mark, whose `dev=` is the impostor's device-key
   # prefix. The owner prints `dev=` only from the certificate carried by the
   # hello it is judging, so the impostor admitting the real spoke (logged in
   # the impostor's own log, with the spoke's key) cannot satisfy this. This is
   # the NOT EXERCISED verdict below, kept separate from containment and refusal.
-  local owner_eval=0 owner_steps=""
+  local owner_eval=0 owner_steps="" key_ok=0
   if printf '%s' "$MALLORY_PUB" | grep -qE '^[0-9a-f]{64}$'; then
+    key_ok=1
     owner_steps=$(tail -n +"$((owner_log_from + 1))" "$WORK/up.log" 2>/dev/null \
-      | grep -E "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=(verified|refused|held|ignored|dropped) reason=[^ ]+ cb=[^ ]+ dev=${MALLORY_PUB:0:16}\$" || true)
+      | grep -E "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=(verified|admitted|refused|held|ignored|dropped) reason=[^ ]+ cb=[^ ]+ dev=${MALLORY_PUB:0:16}\$" || true)
     [ -n "$owner_steps" ] && owner_eval=$(printf '%s\n' "$owner_steps" | wc -l)
   fi
   echo "## (impostor $tag) owner evaluated the impostor's own hello: $owner_eval ($(printf '%s\n' "$owner_steps" | grep -oE "step=[a-z]+ reason=[^ ]+" | sort | uniq -c | tr -s ' ' | tr '\n' ';'))"
@@ -616,10 +625,14 @@ PY
   # it says the scenario never reached the code under test, so the two
   # verdicts above are vacuous for this variant. The workflow fails the step
   # on any NOT-EXERCISED line and names it as such.
-  if [ "$owner_eval" -ge 1 ]; then
+  if [ "$key_ok" != "1" ]; then
+    echo "NOT-EXERCISED: gateI-$tag: impostor key unreadable, instrument fault (devicePub='${MALLORY_PUB:-}')"
+    NOT_EXERCISED=$((NOT_EXERCISED + 1)); NOT_EXERCISED_LIST+=("gateI-$tag")
+  elif [ "$owner_eval" -ge 1 ]; then
     ok "gateI-$tag: exercised (the owner evaluated the impostor's own hello: $(printf '%s\n' "$owner_steps" | grep -oE "step=[a-z]+ reason=[^ ]+" | sort -u | tr '\n' ' '))"
   else
-    echo "NOT-EXERCISED: gateI-$tag: the owner evaluated no fleet-hello carrying the impostor's key (${MALLORY_PUB:0:16}) in this variant, so containment and refusal above are vacuous"
+    echo "NOT-EXERCISED: gateI-$tag: the owner evaluated no fleet-hello carrying the impostor's key (${MALLORY_PUB:0:16}) since this variant's mark, so containment and refusal above are vacuous"
+    NOT_EXERCISED=$((NOT_EXERCISED + 1)); NOT_EXERCISED_LIST+=("gateI-$tag")
   fi
 }
 say "I1: exact-name squat refused"
@@ -797,6 +810,8 @@ KNOWN_RED_N=${#KNOWN_RED_HIT[@]}
 
 echo
 echo "==========================================="
-echo "fleet-cert gates: $PASS passed, $FAIL failed, $KNOWN_RED_N known-red${KNOWN_RED_HIT:+ -- known-red:$KNOWN_RED_HIT}${FAILED:+ -- failed:$FAILED}"
+echo "fleet-cert gates: $PASS passed, $FAIL failed, $NOT_EXERCISED not exercised, $KNOWN_RED_N known-red${KNOWN_RED_HIT:+ -- known-red:$KNOWN_RED_HIT}${FAILED:+ -- failed:$FAILED}${NOT_EXERCISED_LIST[*]:+ -- not exercised: ${NOT_EXERCISED_LIST[*]}}"
 echo "work: $WORK"
-[ "$FAIL" = "0" ]
+# A NOT EXERCISED verdict fails the run locally too: its scenario never reached
+# the code under test.
+[ "$FAIL" = "0" ] && [ "$NOT_EXERCISED" = "0" ]

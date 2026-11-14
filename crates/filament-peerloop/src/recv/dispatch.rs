@@ -6326,8 +6326,11 @@ async fn recv_run(
                                                 shown
                                             );
                                             if name_taken {
+                                                // The link stays verified; only the
+                                                // name is not adopted. Never logged as
+                                                // `refused`, which means not admitted.
                                                 fhello_outcome = format!(
-                                                    "outcome=refused why=name-taken-by-existing-record name={:?}",
+                                                    "outcome=admitted why=name-refused-existing-record name={:?}",
                                                     shown
                                                 );
                                                 // A REFUSAL, not chatter: a peer tried to
@@ -6380,7 +6383,7 @@ async fn recv_run(
                                                     }
                                                     Err(e) => {
                                                         fhello_outcome = format!(
-                                                            "outcome=admitted why=index-write-refused name={:?} err={:?}",
+                                                            "outcome=admitted why=index-write-failed name={:?} err={:?}",
                                                             shown,
                                                             e.to_string()
                                                         );
@@ -6426,9 +6429,13 @@ async fn recv_run(
                                         .split_whitespace()
                                         .find_map(|w| w.strip_prefix("why="))
                                         .unwrap_or("unknown");
+                                    // `refused` is reserved for a hello that was
+                                    // NOT admitted. A name collision admits the
+                                    // link under its proven key and only refuses
+                                    // the name, so it is `admitted`.
                                     let (fhello_step, fhello_reason) =
-                                        if fhello_outcome.starts_with("outcome=refused") {
-                                            ("refused", "claimed-name-in-use")
+                                        if fhello_why == "name-refused-existing-record" {
+                                            ("admitted", "name-refused")
                                         } else {
                                             ("verified", fhello_why)
                                         };
@@ -10469,15 +10476,28 @@ fn cb_kind(t: &Arc<dyn Transport>) -> &'static str {
     }
 }
 
+/// The trace file stops growing at this size, after one final marker line.
+const FLEET_TRACE_CAP: u64 = 4 * 1024 * 1024;
+
 fn fleet_trace_append(sink: Option<&Path>, line: &str) {
+    use std::io::Write as _;
     let Some(path) = sink else { return };
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if len >= FLEET_TRACE_CAP {
+        return;
+    }
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    let mut record = format!("t_ms={ms} {line}\n");
+    if len + record.len() as u64 >= FLEET_TRACE_CAP {
+        record = format!("t_ms={ms} trace truncated at {FLEET_TRACE_CAP} bytes\n");
+    }
+    // One append-mode write per record, so concurrent writers cannot interleave
+    // within a line.
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        use std::io::Write as _;
-        let _ = writeln!(f, "t_ms={ms} {line}");
+        let _ = f.write_all(record.as_bytes());
     }
 }
 
