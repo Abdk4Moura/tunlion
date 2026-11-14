@@ -444,13 +444,26 @@ unset TUNLION_FLEET_HELLO_TRACE
 # Wait for the hello itself, not a fixed time: a fixed `sleep 10` expired while
 # the restarted daemon was still connecting (~1 run in 7). Bounded at 60 s, then
 # a settle so the owner has had time to (wrongly) re-admit it before we look.
-FG_HELLO=0
+#
+# The restarted device must also re-verify PROMPTLY and on its first signaling
+# session: within FG_HELLO_BOUND seconds of its start, with no signaling
+# reconnect logged before it. Before the bounded challenge retry a single lost
+# challenge stalled a link until a reconnect gave it a new peer id, which landed
+# outside this window in most runs; the bound is what proves the retry, not the
+# 60 s wait.
+FG_HELLO_BOUND=20
+FG_HELLO=0 FG_HELLO_S=-1 FG_RECONNECTS=-1
+FG_T0=$SECONDS
 for _ in $(seq 1 60); do
   if grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null; then
-    FG_HELLO=1; break
+    FG_HELLO=1
+    FG_HELLO_S=$((SECONDS - FG_T0))
+    FG_RECONNECTS=$(grep -c "reconnecting" "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null || true)
+    break
   fi
   sleep 1
 done
+echo "## FORGET restarted device re-verified after ${FG_HELLO_S}s (bound ${FG_HELLO_BOUND}s), signaling reconnects before it: $FG_RECONNECTS"
 [ "$FG_HELLO" = "1" ] || window_expired "FORGET-REVOKES restarted-device hello" 60 "no fleet-hello, identity or mesh line in up-$FORGOTTEN-again.log"
 sleep 5
 FG_REINDEXED=$(python3 -c "import json;print(1 if any(d.get('deviceCert',{}).get('devicePub')=='$FG_PUB' or d.get('name')=='$FORGOTTEN' for d in json.load(open('$DA/devices.json'))) else 0)" 2>/dev/null)
@@ -459,8 +472,9 @@ echo "## forget rc=$rcFG key=${FG_PUB:0:16}... on key list=$FG_LISTED re-indexed
 if [ "$rcFG" = "0" ] && [ -n "$FG_PUB" ] \
    && grep -q "Forgot $FORGOTTEN" "$WORK/forget.log" \
    && grep -qE "key refused for [0-9]+ days?" "$WORK/forget.log" \
-   && [ "$FG_LISTED" = "1" ] && [ "$FG_REINDEXED" = "0" ] && [ "$FG_HELLO" = "1" ]; then
-  ok "gateFORGET-REVOKES: forget revoked the live key, freed the name, and fleet-hello did not re-admit it"
+   && [ "$FG_LISTED" = "1" ] && [ "$FG_REINDEXED" = "0" ] && [ "$FG_HELLO" = "1" ] \
+   && [ "$FG_HELLO_S" -ge 0 ] && [ "$FG_HELLO_S" -le "$FG_HELLO_BOUND" ] && [ "$FG_RECONNECTS" = "0" ]; then
+  ok "gateFORGET-REVOKES: forget revoked the live key, freed the name, and fleet-hello did not re-admit it (re-verified in ${FG_HELLO_S}s, no reconnect)"
 else
   echo "-- forget.log (rc=$rcFG) --"; cat "$WORK/forget.log"
   echo "-- forgotten device log --"; tail -5 "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null
@@ -469,7 +483,7 @@ else
   dump_fleet_steps "owner, since the restart" "$WORK/up.log" "$FG_OWNER_LOG_FROM"
   dump_fleet_steps "forgotten device" "$WORK/up-$FORGOTTEN-again.log"
   dump_signaling "$WORK/up.log" "$WORK/up-$FORGOTTEN-again.log" "$WORK/up-$SPOKE.log" "$WORK/up-$MALLORY.log"
-  bad "gateFORGET-REVOKES: forget of a live certificate holder did not cut it off truthfully (rc=$rcFG listed=$FG_LISTED reindexed=$FG_REINDEXED hello=$FG_HELLO)"
+  bad "gateFORGET-REVOKES: forget of a live certificate holder did not cut it off truthfully (rc=$rcFG listed=$FG_LISTED reindexed=$FG_REINDEXED hello=$FG_HELLO after=${FG_HELLO_S}s bound=${FG_HELLO_BOUND}s reconnects=$FG_RECONNECTS)"
 fi
 pkill -f "up --dir $WORK/$FORGOTTEN-again-drop" 2>/dev/null || true
 # The impostor shape these gates need, "valid cert, no record, NOT revoked",

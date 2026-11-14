@@ -335,6 +335,32 @@ is the link's channel binding:
   verified (never a fallback to the bare nonce).
 - **same-host `local-tcp`** (no DTLS): the bare nonce, as before.
 
+Challenge lifecycle (no exporter):
+
+- **Epoch.** A challenge belongs to the installed link's (generation, source).
+  When a different transport is installed for the same peer id, the verifier
+  retires its nonce and mints a fresh one, and the signer drops the peer's nonce
+  it held for the previous transport. A `ChannelReady` from a transport that is
+  not the installed one changes neither.
+- **Retry.** While the peer is unverified on the installed link, the verifier
+  re-sends the SAME nonce on a bounded backoff (2, 4, 8, 16 s; four retries).
+  A peer answers every `l3-nonce` with a `fleet-hello` signed over that nonce.
+- **Retired nonces.** A retired nonce stays acceptable for VERIFYING only, for
+  10 s, at most two per peer, and only combined with the CURRENT link's
+  fingerprint pair. It is never used to sign.
+- **Signing.** Every outgoing `fleet-hello` and `l3-announce` is signed over the
+  peer's nonce for the installed transport; with none held, nothing is signed.
+
+Why this admits no replay: a binding is recomputed per verification from the
+link the message ARRIVED on (its exporter, or its DTLS fingerprint pair) and a
+nonce the verifier itself chose. A message captured on another link carries a
+binding over that link's fingerprints and fails here, whichever nonce it used.
+A message captured earlier on the SAME link was signed over a nonce that is
+either current (the same session, which the binding already ties it to) or
+retired, and a retired nonce expires after 10 s and was chosen by the verifier,
+so a third party cannot pick it. Retrying re-sends a value already sent in the
+clear on the same link, so it reveals nothing new.
+
 This changed what a `fleet-hello` / `l3-announce` signs on WebRTC links (it was
 the bare nonce). Pre-launch, so a mixed-version pair over WebRTC simply fails
 fleet verification until both ends upgrade; direct-QUIC links are unaffected.

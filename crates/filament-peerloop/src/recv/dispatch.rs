@@ -28,6 +28,7 @@ use crate::mesh::{
 };
 use crate::present::{Ask, Presentation};
 use crate::recv::ceremony::{Ceremony, Inbound as PakeInbound};
+use crate::recv::fleet_bind;
 use crate::recv::ports::{RecvDaemon, RecvPorts, RecvServers};
 use crate::recv::report::{RecvReport, RefusalClass};
 use crate::recv::signaling_health;
@@ -2106,6 +2107,12 @@ async fn recv_run(
     // How many times a transport-source change cleared each pid's nonce maps.
     // Diagnostic only: reported with every fleet-hello verdict (`fhello`).
     let mut bind_resets: HashMap<String, u32> = HashMap::new();
+    // The challenge epoch (installed link generation + source), our outstanding
+    // challenge with its bounded retry, and superseded nonces kept verify-only
+    // for a short TTL (recv/fleet_bind.rs). `bind_ours` stays the current nonce.
+    let mut bind_epoch: HashMap<String, fleet_bind::Epoch> = HashMap::new();
+    let mut bind_challenge: HashMap<String, fleet_bind::Challenge> = HashMap::new();
+    let mut bind_retired: HashMap<String, fleet_bind::Retired> = HashMap::new();
     let fleet_trace = ports.env.fleet_hello_trace.clone();
     // Links already reported by the unverified watchdog, by (pid, generation).
     let mut fleet_unverified_said: HashSet<(String, u32)> = HashSet::new();
@@ -4250,6 +4257,61 @@ async fn recv_run(
             last_quiet = None;
         }
 
+        // Bounded challenge retry (recv/fleet_bind.rs): while a fleet link's
+        // peer is not verified, re-send OUR nonce, the same value, on the
+        // backoff. The peer answers every nonce with a hello, so one lost nonce
+        // or one lost answer costs a backoff step, not the link's life. Runs on
+        // ticks as well as events.
+        if let Some(rv) = ports.identity.fleet_rv() {
+            if !bind_challenge.is_empty() {
+                let now = Instant::now();
+                let due: Vec<String> = bind_challenge
+                    .iter()
+                    .filter(|(p, c)| {
+                        let installed = conn.link(p.as_str()).map(|l| fleet_bind::Epoch {
+                            generation: l.generation,
+                            source: l.source,
+                        });
+                        fleet_bind::retry_allowed(c, installed, fleet_verified.contains(p.as_str()), now)
+                            && (fleet_pending.contains(p.as_str())
+                                || crate::recv::fleet::shaped_link(&conn, p.as_str(), Some(rv.as_str())))
+                    })
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                for p in due {
+                    let Some(t) = conn.transport_of(&p) else { continue };
+                    if t.channel_binding().is_some() {
+                        continue;
+                    }
+                    let Some(c) = bind_challenge.get_mut(&p) else { continue };
+                    let n = c.note_retry(now);
+                    let nonce = c.nonce.clone();
+                    let sent = t
+                        .send_control(&json!({
+                            "type": "l3-nonce",
+                            "nonce": base64::engine::general_purpose::STANDARD.encode(&nonce),
+                        }))
+                        .await
+                        .is_ok();
+                    fleet_step(
+                        log.as_ref(),
+                        daemon,
+                        fleet_trace.as_deref(),
+                        &conn,
+                        &p,
+                        "sent-nonce",
+                        &format!(
+                            "{}-{n} nonce={}",
+                            if sent { "retry" } else { "retry-send-failed" },
+                            nonce_prefix(&nonce)
+                        ),
+                        "dtls",
+                        "none",
+                    );
+                }
+            }
+        }
+
         let Some((ev, event_source)) = ev else { continue };
 
         // A fleet verdict, a hello marker and a nonce all belong to the
@@ -4267,6 +4329,9 @@ async fn recv_run(
         bind_theirs.retain(|p, _| conn.links.contains_key(p));
         bind_source.retain(|p, _| conn.links.contains_key(p));
         bind_resets.retain(|p, _| conn.links.contains_key(p));
+        bind_epoch.retain(|p, _| conn.links.contains_key(p));
+        bind_challenge.retain(|p, _| conn.links.contains_key(p));
+        bind_retired.retain(|p, _| conn.links.contains_key(p));
         fleet_unverified_said.retain(|(p, _)| conn.links.contains_key(p));
         // Unverified watchdog, once per link: a fleet-shaped link that has been
         // up this long without a verified hello says what it is still waiting
@@ -4412,6 +4477,9 @@ async fn recv_run(
                     bind_ours.remove(&pid);
                     bind_theirs.remove(&pid);
                     bind_source.remove(&pid);
+                    bind_epoch.remove(&pid);
+                    bind_challenge.remove(&pid);
+                    bind_retired.remove(&pid);
                 }
             }
             Ev::PairMatched(v) => {
@@ -5573,45 +5641,59 @@ async fn recv_run(
                 // receive it, while we accepted the peer's hello. That showed up
                 // as a link that stays fleet-unverified on one side only.
                 let t = conn.transport_of(&pid).unwrap_or(t);
-                // A nonce belongs to the TRANSPORT it was exchanged on. A
-                // re-established transport can reuse the same peer id (warm
-                // re-dial after a zombie drop), so carrying the previous
-                // transport's nonce forward makes each side sign a value the
-                // other no longer expects: both fleet hellos fail verification
-                // and the link stays unverified forever. Drop both directions
-                // when the transport source changes; a genuinely same-transport
-                // re-announce keeps its nonce.
-                if let Some(source) = event_source {
-                    let prev = bind_source.get(&pid).copied();
-                    if prev != Some(source) {
-                        bind_source.insert(pid.clone(), source);
-                        let cleared_ours = bind_ours.remove(&pid).is_some();
-                        let cleared_theirs = bind_theirs.remove(&pid).is_some();
-                        if prev.is_some() && ports.identity.fleet_rv().is_some() {
-                            fleet_step(
-                                log.as_ref(),
-                                daemon,
-                                fleet_trace.as_deref(),
-                                &conn,
-                                &pid,
-                                "rechallenged",
-                                &format!(
-                                    "source-change cleared_ours={cleared_ours} cleared_theirs={cleared_theirs}"
-                                ),
-                                "none",
-                                "none",
-                            );
-                            let n = bind_resets.entry(pid.clone()).or_insert(0);
-                            *n = n.saturating_add(1);
-                            fleet_hello_note(
-                                log.as_ref(),
-                                fleet_trace.as_deref(),
-                                &format!(
-                                    "fhello-bind pid={pid} event=source-change from={prev:?} to={source:?} cleared_ours={cleared_ours} cleared_theirs={cleared_theirs} resets={n}"
-                                ),
-                            );
+                // A challenge belongs to the INSTALLED transport: its epoch is
+                // the link's (generation, source), not the source of this event
+                // (recv/fleet_bind.rs). A re-established transport can reuse the
+                // same peer id (warm re-dial after a zombie drop); on that
+                // rotation our nonce is retired (verify-only, short TTL, never
+                // signed with), a fresh one is minted, and the peer's nonce is
+                // dropped because it was chosen for the previous transport. An
+                // event delivered by a transport that is NOT installed (a racing
+                // loser) changes nothing.
+                let installed = conn.link(&pid).map(|l| fleet_bind::Epoch {
+                    generation: l.generation,
+                    source: l.source,
+                });
+                let held_epoch = bind_epoch.get(&pid).copied();
+                if fleet_bind::epoch_change(held_epoch, installed) == fleet_bind::EpochChange::Rotated {
+                    let now = Instant::now();
+                    let cleared_ours = match bind_ours.remove(&pid) {
+                        Some(old) => {
+                            bind_retired.entry(pid.clone()).or_default().retire(old, now);
+                            true
                         }
+                        None => false,
+                    };
+                    let cleared_theirs = bind_theirs.remove(&pid).is_some();
+                    bind_challenge.remove(&pid);
+                    if ports.identity.fleet_rv().is_some() {
+                        fleet_step(
+                            log.as_ref(),
+                            daemon,
+                            fleet_trace.as_deref(),
+                            &conn,
+                            &pid,
+                            "rechallenged",
+                            &format!(
+                                "epoch-rotated retired_ours={cleared_ours} cleared_theirs={cleared_theirs}"
+                            ),
+                            "none",
+                            "none",
+                        );
+                        let n = bind_resets.entry(pid.clone()).or_insert(0);
+                        *n = n.saturating_add(1);
+                        fleet_hello_note(
+                            log.as_ref(),
+                            fleet_trace.as_deref(),
+                            &format!(
+                                "fhello-bind pid={pid} event=epoch-rotated from={held_epoch:?} to={installed:?} event_source={event_source:?} retired_ours={cleared_ours} cleared_theirs={cleared_theirs} resets={n}"
+                            ),
+                        );
                     }
+                }
+                if let Some(e) = installed {
+                    bind_epoch.insert(pid.clone(), e);
+                    bind_source.insert(pid.clone(), e.source);
                 }
                 // No exporter on this transport: open the challenge. Our nonce
                 // goes out now; anything we SEND waits until theirs arrives.
@@ -5629,6 +5711,13 @@ async fn recv_run(
                         .entry(pid.clone())
                         .or_insert_with(link_nonce)
                         .clone();
+                    if let Some(e) = installed {
+                        let now = Instant::now();
+                        bind_challenge
+                            .entry(pid.clone())
+                            .and_modify(|c| c.note_sent(now))
+                            .or_insert_with(|| fleet_bind::Challenge::new(e, nonce.clone(), now));
+                    }
                     let sent = t
                         .send_control(&json!({
                             "type": "l3-nonce",
@@ -5998,7 +6087,11 @@ async fn recv_run(
                                     // signed) and is asking again. Honouring
                                     // `fleet_greeted` here would leave it waiting
                                     // forever for a proof we refuse to re-send.
-                                    if cfg!(feature = "fleet") && !fleet_verified.contains(&pid) {
+                                    // Not gated on our own verdict of the peer: the
+                                    // peer re-sends its nonce (bounded) exactly when
+                                    // it has not verified US, and only a hello
+                                    // answers that.
+                                    if cfg!(feature = "fleet") {
                                         if let Ok(hello) = ports
                                             .identity
                                             .make_fleet_hello(&cb, &ports.env.display_name)
@@ -6053,9 +6146,22 @@ async fn recv_run(
                 Some(fleet::HELLO) => {
                     let link_fps = link_fingerprints(&conn, &pid).await;
                     let hello_t = conn.transport_of(&pid);
-                    let cb = hello_t
-                        .as_ref()
-                        .and_then(|t| in_binding(t, &pid, &bind_ours, link_fps.as_ref()));
+                    // Every binding this hello may verify against: the exporter,
+                    // or our current nonce then any retired nonce still inside
+                    // its TTL, each over THIS link's DTLS fingerprint pair.
+                    let hello_cbs: Vec<Vec<u8>> = match hello_t.as_ref() {
+                        None => Vec::new(),
+                        Some(t) => match t.channel_binding() {
+                            Some(x) => vec![x],
+                            None => fleet_bind::verify_candidates(
+                                bind_ours.get(&pid).map(|n| n.as_slice()),
+                                bind_retired.get(&pid),
+                                Instant::now(),
+                                |n| nonce_binding(t, link_fps.as_ref(), n),
+                            ),
+                        },
+                    };
+                    let cb = hello_cbs.first().cloned();
                     let owner = ports.identity.fleet_owner_pub();
                     // What this hello's binding decision rested on, for the
                     // `fhello-verdict` line every arm below emits exactly once.
@@ -6091,7 +6197,20 @@ async fn recv_run(
                     );
                     match (cb, owner) {
                         (Some(cb), Some(owner)) => {
-                            match fleet::verify_hello(&v, &cb, &owner, identity::now_secs()) {
+                            let now_s = identity::now_secs();
+                            let mut verdict = fleet::verify_hello(&v, &cb, &owner, now_s);
+                            for (i, alt) in hello_cbs.iter().enumerate().skip(1) {
+                                if verdict.is_ok() {
+                                    break;
+                                }
+                                verdict = fleet::verify_hello(&v, alt, &owner, now_s);
+                                if verdict.is_ok() {
+                                    log.debug(&format!(
+                                        "fleet-hello from {pid} verified with retired nonce #{i}"
+                                    ));
+                                }
+                            }
+                            match verdict {
                                 Ok(ok)
                                     if sibling_link
                                         && !ports.identity.device_cert_revoked(&ok.device_pub)
@@ -6210,33 +6329,35 @@ async fn recv_run(
                                         l.admit_fleet(ok.owner_pub, ok.device_pub, ok.cert_expires);
                                     }
                                     // Answer once, so a mutual hello terminates.
-                                    if fleet_greeted.insert(pid.clone()) {
+                                    // Signed like every outgoing hello: over the
+                                    // binding the PEER verifies with (its nonce,
+                                    // `out_binding`), never over ours. With no
+                                    // peer nonce yet there is nothing to sign; the
+                                    // peer's own challenge retry delivers one and
+                                    // the `l3-nonce` arm answers it.
+                                    if !fleet_greeted.contains(&pid) {
                                         if let Some(t) = conn.transport_of(&pid) {
-                                            if let Ok(hello) = ports
-                                                .identity
-                                                .make_fleet_hello(&cb, &ports.env.display_name)
+                                            if let Some(out_cb) =
+                                                out_binding(&t, &pid, &bind_theirs, link_fps.as_ref())
                                             {
-                                                let sent = t.send_control(&hello).await.is_ok();
-                                                // Signed over the binding WE verify
-                                                // with (our own nonce on a
-                                                // DataChannel), which is not the one
-                                                // the peer verifies with: named
-                                                // `dtls-ours` so a trace shows it.
-                                                fleet_step(
-                                                    log.as_ref(),
-                                                    daemon,
-                                                    fleet_trace.as_deref(),
-                                                    &conn,
-                                                    &pid,
-                                                    "sent-hello",
-                                                    if sent { "answer-once" } else { "send-failed" },
-                                                    if t.channel_binding().is_some() {
-                                                        "exporter"
-                                                    } else {
-                                                        "dtls-ours"
-                                                    },
-                                                    "none",
-                                                );
+                                                if let Ok(hello) = ports
+                                                    .identity
+                                                    .make_fleet_hello(&out_cb, &ports.env.display_name)
+                                                {
+                                                    fleet_greeted.insert(pid.clone());
+                                                    let sent = t.send_control(&hello).await.is_ok();
+                                                    fleet_step(
+                                                        log.as_ref(),
+                                                        daemon,
+                                                        fleet_trace.as_deref(),
+                                                        &conn,
+                                                        &pid,
+                                                        "sent-hello",
+                                                        if sent { "answer-once" } else { "send-failed" },
+                                                        cb_kind(&t),
+                                                        "none",
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -6247,7 +6368,14 @@ async fn recv_run(
                                     #[cfg(feature = "mesh")]
                                     if let Some(l3) = l3.as_ref() {
                                         if let Some(t) = conn.transport_of(&pid) {
-                                            if let Some(ann) = l3.make_announce(&cb) {
+                                            if let Some(ann) = out_binding(
+                                                &t,
+                                                &pid,
+                                                &bind_theirs,
+                                                link_fps.as_ref(),
+                                            )
+                                            .and_then(|out_cb| l3.make_announce(&out_cb))
+                                            {
                                                 let _ = t.send_control(&ann.to_json()).await;
                                             }
                                         }
