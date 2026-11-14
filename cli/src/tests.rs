@@ -33,6 +33,22 @@ pub(crate) fn lock_test_config() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Both locks that guard writers of `TUNLION_CAP_AUTHORITATIVE`: the config
+/// lock and the capability-gate counter lock. A test whose verdict depends on
+/// that mode holds both, always in this order, so no writer under either lock
+/// can flip the mode under it. Nothing else takes both, so the order cannot
+/// deadlock.
+pub(crate) fn lock_cap_mode() -> (
+    std::sync::MutexGuard<'static, ()>,
+    std::sync::MutexGuard<'static, ()>,
+) {
+    let config = lock_test_config();
+    let gate = crate::capability::tests::CAP_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    (config, gate)
+}
+
 #[test]
 fn send_outcome_refuses_success_for_any_declined_file() {
     assert_eq!(send_outcome(1, 0), SendOutcome::Complete { completed: 1 });

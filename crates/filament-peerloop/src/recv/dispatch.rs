@@ -546,6 +546,85 @@ pub fn offer_has_consent(
     }
 }
 
+/// The `file-offer` transfer gate, exactly as the receive loop composes it:
+/// the signed-store outcome under the trust floor, the fleet inputs, the
+/// FleetSibling mapping, the pair mapping, then the injected policy site.
+/// `landing_in_bounds` is the caller's verified drop-dir bound. Returns
+/// `(allowed, cap_reason, decision)`. A function (not an inline block) so the
+/// composition the loop runs is the one its tests drive.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn file_offer_transfer_gate(
+    conn: &mut Conn,
+    pid: &str,
+    sibling: &crate::shell_gate::SiblingFacts,
+    legacy_ok: bool,
+    link_trusted: bool,
+    authoritative: bool,
+    landing_in_bounds: bool,
+    sender_name: &str,
+    log: &dyn LogSink,
+) -> (bool, Option<String>, cap::GateDecision) {
+    let host = conn.host.clone();
+    let az = crate::shell_gate::peer_authz(conn, pid);
+    let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
+    let store = host.cap_store();
+    let now = host.now_secs();
+    let outcome = cap::authorize_in(&store, "self", cap::CAP_TRANSFER, idev, iusr, ak_caps, now);
+    // Trust floor: under authoritative, an untrusted link
+    // must never authorize transfer (pair-proof vs device-key).
+    let outcome = cap::cap_trust_floor(&outcome, link_trusted, binding, authoritative);
+    let (own_user, has_grant) =
+        cap::fleet_inputs_in(&store, "self", cap::CAP_TRANSFER, idev, iusr, ak_caps, now);
+    // FleetSibling: the kind implies transfer into the drop
+    // dir and nothing else; grants from either source count.
+    let (scoped_in_bounds, has_grant) = crate::shell_gate::sibling_gate_inputs(
+        sibling,
+        cap::CAP_TRANSFER,
+        landing_in_bounds,
+        has_grant,
+    );
+    // Pair: this device's own record transfer grant counts as
+    // an explicit grant in authoritative mode too. A deny
+    // recorded for transfer keeps it from counting.
+    let (outcome, has_grant) = crate::shell_gate::pair_facts(conn, pid, cap::CAP_TRANSFER, ak_caps)
+        .apply(outcome, has_grant);
+    // No deny list is consulted on the transfer path today;
+    // false preserves that exactly.
+    let d = host.cap_gate_effective(CapGate {
+        legacy_allowed: legacy_ok,
+        outcome: &outcome,
+        action: cap::CAP_TRANSFER,
+        resource: "self",
+        device_pub: idev,
+        user_pub: iusr,
+        binding,
+        cert_expires: expires,
+        auth_key_caps: ak_caps,
+        own_user_pub: own_user.as_ref(),
+        scoped_in_bounds,
+        has_explicit_grant: has_grant,
+        cert_revoked,
+        identity_state: conn.identity_state_of(pid),
+        // A sibling's local deny wins over its kind default and grants;
+        // no deny list is consulted for anyone else on this path.
+        denied: sibling.denied,
+        ceiling_authorizes: false,
+    });
+    let reason = if let cap::GateDecision::Deny { cap_reason } = &d {
+        cap_reason.clone()
+    } else {
+        None
+    };
+    log.debug(&format!(
+        "transfer-gate: from={sender_name} allowed={} legacy_ok={legacy_ok} trusted={link_trusted} binding={binding:?} own_user={} has_grant={has_grant} in_bounds={scoped_in_bounds} revoked={cert_revoked} authoritative={} reason={:?}",
+        d.allowed(),
+        own_user.is_some(),
+        authoritative,
+        reason
+    ));
+    (d.allowed(), reason, d)
+}
+
 /// Why a code receive ended with no sender authenticated. "Older version" was
 /// said for every expiry, including when other codes' senders sharing the room
 /// ran their (current) ceremonies at us. Say it only when no peer ran one. Pure.
@@ -8382,93 +8461,33 @@ async fn recv_run(
                     // before peer_authz resolves anything (see below).
                     let sibling =
                         crate::shell_gate::sibling_facts(&conn, &pid, cap::CAP_TRANSFER);
-                    let (ok, xfer_deny_reason, xfer_gate) = {
-                        let az = crate::shell_gate::peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-                        let store = host.cap_store();
-                        let now = host.now_secs();
-                        let outcome = cap::authorize_in(
-                            &store,
-                            "self",
-                            cap::CAP_TRANSFER,
-                            idev,
-                            iusr,
-                            ak_caps,
-                            now,
-                        );
-                        // Trust floor: under authoritative, an untrusted link
-                        // must never authorize transfer (pair-proof vs device-key).
-                        let outcome =
-                            cap::cap_trust_floor(&outcome, link_trusted, binding, authoritative);
-                        // Fleet transfer scope, enforced by construction and VERIFIED
-                        // here (not hardcoded `true`, which asserted a bound nothing
-                        // checked). The offered name is basename-only (see ~14095:
-                        // `Path::new(raw).file_name()`, "never trust a remote name with
-                        // path separators") and lands in the receiver's OWN drop dir
-                        // `dir`, which the sender cannot redirect. Assert the landing
-                        // path is within `dir` so a future regression in the sanitizer
-                        // or in how `dir` is derived TRIPS the gate (fails closed to
-                        // grant-only) instead of silently widening scope. NOTE: this is
-                        // a LEXICAL check; a symlink planted at the final `.part` create
-                        // could still redirect the write — closed separately by the
-                        // plain-file-only (O_NOFOLLOW/O_EXCL) write hardening tracked as
-                        // a fleet-trust follow-up.
-                        let landing = dir.join(&name);
-                        let scoped_in_bounds =
-                            filament_transfer::path_bounds::path_within(&dir, &landing);
-                        let (own_user, has_grant) = cap::fleet_inputs_in(
-                            &store,
-                            "self",
-                            cap::CAP_TRANSFER,
-                            idev,
-                            iusr,
-                            ak_caps,
-                            now,
-                        );
-                        // FleetSibling: the kind implies transfer into the drop
-                        // dir and nothing else; grants from either source count.
-                        let (scoped_in_bounds, has_grant) = crate::shell_gate::sibling_gate_inputs(
-                            &sibling,
-                            cap::CAP_TRANSFER,
-                            scoped_in_bounds,
-                            has_grant,
-                        );
-                        // No deny list is consulted on the transfer path today;
-                        // false preserves that exactly.
-                        let d = host.cap_gate_effective(CapGate {
-                            legacy_allowed: legacy_ok,
-                            outcome: &outcome,
-                            action: cap::CAP_TRANSFER,
-                            resource: "self",
-                            device_pub: idev,
-                            user_pub: iusr,
-                            binding,
-                            cert_expires: expires,
-                            auth_key_caps: ak_caps,
-                            own_user_pub: own_user.as_ref(),
-                            scoped_in_bounds,
-                            has_explicit_grant: has_grant,
-                            cert_revoked,
-                            identity_state: conn.identity_state_of(&pid),
-                            // A sibling's local deny wins over its kind default and grants;
-                            // no deny list is consulted for anyone else on this path.
-                            denied: sibling.denied,
-                            ceiling_authorizes: false,
-                        });
-                        let reason = if let cap::GateDecision::Deny { cap_reason } = &d {
-                            cap_reason.clone()
-                        } else {
-                            None
-                        };
-                        log.debug(&format!(
-                            "transfer-gate: from={sender_name} allowed={} legacy_ok={legacy_ok} trusted={link_trusted} binding={binding:?} own_user={} has_grant={has_grant} in_bounds={scoped_in_bounds} revoked={cert_revoked} authoritative={} reason={:?}",
-                            d.allowed(),
-                            own_user.is_some(),
-                            authoritative,
-                            reason
-                        ));
-                        (d.allowed(), reason, d)
-                    };
+                    // Fleet transfer scope, enforced by construction and VERIFIED
+                    // here (not hardcoded `true`, which asserted a bound nothing
+                    // checked). The offered name is basename-only (see ~14095:
+                    // `Path::new(raw).file_name()`, "never trust a remote name with
+                    // path separators") and lands in the receiver's OWN drop dir
+                    // `dir`, which the sender cannot redirect. Assert the landing
+                    // path is within `dir` so a future regression in the sanitizer
+                    // or in how `dir` is derived TRIPS the gate (fails closed to
+                    // grant-only) instead of silently widening scope. NOTE: this is
+                    // a LEXICAL check; a symlink planted at the final `.part` create
+                    // could still redirect the write; that is closed separately by the
+                    // plain-file-only (O_NOFOLLOW/O_EXCL) write hardening tracked as
+                    // a fleet-trust follow-up.
+                    let landing = dir.join(&name);
+                    let landing_in_bounds =
+                        filament_transfer::path_bounds::path_within(&dir, &landing);
+                    let (ok, xfer_deny_reason, xfer_gate) = file_offer_transfer_gate(
+                        &mut conn,
+                        &pid,
+                        &sibling,
+                        legacy_ok,
+                        link_trusted,
+                        authoritative,
+                        landing_in_bounds,
+                        &sender_name,
+                        log.as_ref(),
+                    );
                     // Under authoritative, a capability Deny hard-declines
                     // immediately: no prompt, skip the accept path entirely.
                     if let Some(reason) = cap::transfer_gate_decision(&xfer_gate, authoritative) {
@@ -11635,4 +11654,42 @@ async fn lan_ownership(
         None => Vec::new(),
     };
     crate::lan_glue::Ownership::build(stored, live)
+}
+
+#[cfg(test)]
+mod pair_grant_tests {
+    use crate::host::NoLog;
+    use crate::shell_gate::SiblingFacts;
+    use crate::shell_gate::pair_fixture::{PID, PairHost, pair_conn};
+    use std::sync::Arc;
+
+    /// Pairwise-first, through the real `file-offer` transfer gate the receive
+    /// loop calls: under authoritative, a transfer grant this device gave its
+    /// pair (the pairing default) admits the offer with no owner-signed grant,
+    /// and with no record grant, or a local transfer deny, it is refused. Pins
+    /// the `pair_facts(...).apply` line in `file_offer_transfer_gate`.
+    #[tokio::test]
+    async fn a_pair_record_transfer_grant_admits_a_file_offer_under_authoritative() {
+        let host = Arc::new(PairHost::default());
+        let (mut conn, _far) = pair_conn(host.clone()).await;
+        let offer = |conn: &mut crate::conn::Conn| {
+            super::file_offer_transfer_gate(
+                conn,
+                PID,
+                &SiblingFacts::default(),
+                false,
+                true,
+                true,
+                true,
+                "phone",
+                &NoLog,
+            )
+            .0
+        };
+        assert!(!offer(&mut conn), "no record grant: the empty signed store refuses");
+        host.grant("transfer");
+        assert!(offer(&mut conn), "a pair transfer grant must admit under authoritative");
+        host.denies.lock().unwrap().insert("transfer".into());
+        assert!(!offer(&mut conn), "a local transfer deny outranks the grant");
+    }
 }

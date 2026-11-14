@@ -421,6 +421,22 @@ impl HostServices for CoreHost {
         false
     }
 
+    /// The record's own stored caps, as the device projection reads them
+    /// (`devices::record_caps`: the pairing default, v1 baseline and lapsed
+    /// `capExpires` applied). The pair rule (`pair_grant_inputs`) reads this,
+    /// so a grant this phone gave its pair counts under cap-authoritative too.
+    fn device_record_grants(&self, name: &str, capability: &str) -> bool {
+        self.store
+            .devices_records()
+            .into_iter()
+            .find(|d| d["name"].as_str() == Some(name))
+            .is_some_and(|record| {
+                crate::devices::record_caps(&record, now_secs())
+                    .iter()
+                    .any(|c| c == capability)
+            })
+    }
+
     fn ceiling_covers_action(&self, device_pub: Option<&[u8; 32]>, action: &str) -> bool {
         device_pub.is_some_and(|p| ceiling_covers(&self.store, p, action))
     }
@@ -1155,6 +1171,39 @@ mod tests {
         assert!(denial
             .deny_reason("")
             .contains("shell opens are not served by this core profile"));
+    }
+
+    /// Pairwise-first: Core answers the literal record grant from the same
+    /// caps its device projection reads. The pairing default (and a v1 record
+    /// with no `caps`) is a transfer grant and nothing else; `caps: []` and a
+    /// lapsed `capExpires` entry grant nothing; an unknown name grants nothing.
+    #[test]
+    fn core_record_grants_read_the_records_stored_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(
+            root.join("devices.json"),
+            r#"[{"name":"v1","secret":"s"},
+                {"name":"paired","secret":"s","v":2,"caps":["transfer","mount"]},
+                {"name":"none","secret":"s","v":2,"caps":[]},
+                {"name":"lapsed","secret":"s","v":2,"caps":["mount"],"capExpires":{"mount":1}}]"#,
+        )
+        .unwrap();
+        let host = CoreHost::new(
+            root.clone(),
+            DeviceStore::open(&root),
+            CoreSettings::default(),
+            OverlayKey::new(root.join("overlay.ed25519")),
+        );
+        assert!(host.device_record_grants("v1", CAP_TRANSFER));
+        for action in ["shell", "forward", "mount"] {
+            assert!(!host.device_record_grants("v1", action), "{action}");
+        }
+        assert!(host.device_record_grants("paired", "mount"));
+        assert!(!host.device_record_grants("paired", "shell"));
+        assert!(!host.device_record_grants("none", CAP_TRANSFER));
+        assert!(!host.device_record_grants("lapsed", "mount"));
+        assert!(!host.device_record_grants("stranger", CAP_TRANSFER));
     }
 
     #[test]

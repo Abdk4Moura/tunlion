@@ -585,7 +585,11 @@ pub(crate) fn delegated_ceiling(record: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn record_caps(record: &Value, now: u64) -> Vec<String> {
+/// The record's stored caps at `now`: the `caps` list (a v1 record with no
+/// `caps` reads as the transfer baseline), less any lapsed `capExpires` entry.
+/// Shared with `CoreHost::device_record_grants` so the projection and the
+/// gate read one source.
+pub(crate) fn record_caps(record: &Value, now: u64) -> Vec<String> {
     let mut caps: Vec<String> = match record.get("caps").and_then(|caps| caps.as_array()) {
         Some(entries) => entries
             .iter()

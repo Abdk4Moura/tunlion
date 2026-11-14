@@ -1187,7 +1187,7 @@ pub fn reconcile_shell_keys(revoked: &[String], ak_content: &str, authoritative:
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn narrowed_is_only_the_uncovered_class() {
         // The flip closing a legacy hole: uncovered, no grant.
@@ -1226,7 +1226,7 @@ mod tests {
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
-    static CAP_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static CAP_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn make_owner() -> Ed25519KeyPair {
         let rng = SystemRandom::new();
@@ -2520,6 +2520,154 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", v) },
             None => unsafe { std::env::remove_var("TUNLION_CAP_AUTHORITATIVE") },
         }
+    }
+
+    /// Pairwise-first (owner decision), mount: in authoritative mode a mount
+    /// grant this device gave its pair counts without an owner-signed grant,
+    /// composed exactly as the mount gate composes it (trust floor, then
+    /// `pair_grant_inputs`, then the shared gate). Deny, revocation and a
+    /// delegated ceiling still refuse; no grant is still refused.
+    #[test]
+    fn a_pair_record_mount_grant_counts_under_authoritative() {
+        // Both locks: this test writes TUNLION_CAP_AUTHORITATIVE, which tests
+        // under either lock also write.
+        let _guards = crate::tests::lock_cap_mode();
+        let me = [0x63u8; 32];
+        let peer_user = [0x61u8; 32];
+        let dev = [0x62u8; 32];
+        let prior = std::env::var("TUNLION_CAP_AUTHORITATIVE").ok();
+        unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", "1") };
+        let run = |is_pair: bool,
+                   grant: bool,
+                   denied: bool,
+                   revoked: bool,
+                   caps: Option<&[String]>| {
+            let floor = cap_trust_floor(
+                &CapOutcome::Denied("not authorized".into()),
+                true,
+                BindingStrength::Proven,
+                true,
+            );
+            let (outcome, has_grant) = pair_grant_inputs(is_pair, grant, denied, floor, false);
+            cap_gate_effective(
+                true,
+                &outcome,
+                CAP_MOUNT,
+                "self",
+                Some(&dev),
+                Some(&peer_user),
+                BindingStrength::Proven,
+                Some(u64::MAX),
+                caps,
+                Some(&me),
+                false,
+                has_grant,
+                revoked,
+                denied,
+                false,
+            )
+            .allowed()
+        };
+        assert!(run(true, true, false, false, None), "a pair mount grant must admit");
+        assert!(!run(false, true, false, false, None), "the store alone refuses");
+        assert!(!run(true, false, false, false, None), "no grant is still refused");
+        assert!(!run(true, true, true, false, None), "a local deny outranks the grant");
+        assert!(!run(true, true, false, true, None), "revocation outranks the grant");
+        let transfer_only = vec!["transfer".to_string()];
+        assert!(
+            !run(true, true, false, false, Some(transfer_only.as_slice())),
+            "a delegated ceiling still caps the grant"
+        );
+        match prior {
+            Some(v) => unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", v) },
+            None => unsafe { std::env::remove_var("TUNLION_CAP_AUTHORITATIVE") },
+        }
+    }
+
+    /// The pairing default is a transfer grant and nothing else, read through
+    /// the CLI host's real `device_record_grants` over a real `devices.json`:
+    /// a v1 record (no `caps`) and a default `["transfer"]` record each admit a
+    /// pair's transfer under authoritative and admit no shell, forward or
+    /// mount. `caps: []` and a lapsed `capExpires` entry grant nothing.
+    #[test]
+    fn the_pairing_default_grants_a_pair_transfer_and_nothing_else() {
+        use filament_peerloop::host::HostServices;
+        let _guards = crate::tests::lock_cap_mode();
+        let prior_mode = std::env::var("TUNLION_CAP_AUTHORITATIVE").ok();
+        let prior_dir = std::env::var("TUNLION_CONFIG_DIR").ok();
+        let dir = std::env::temp_dir().join(format!(
+            "fil-pair-default-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("devices.json"),
+            serde_json::json!([
+                {"name": "v1", "secret": "s1"},
+                {"name": "fresh", "secret": "s2", "v": 2, "caps": ["transfer"]},
+                {"name": "bare", "secret": "s3", "v": 2, "caps": []},
+                {"name": "lapsed", "secret": "s4", "v": 2, "caps": ["transfer", "shell"],
+                 "capExpires": {"shell": 1}},
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("TUNLION_CONFIG_DIR", &dir);
+            std::env::set_var("TUNLION_CAP_AUTHORITATIVE", "1");
+        }
+        let host = crate::host_impl::CliHost;
+        let dev = [0x71u8; 32];
+        let peer_user = [0x72u8; 32];
+        let me = [0x73u8; 32];
+        let admitted = |name: &str, action: &str| {
+            let (outcome, has_grant) = pair_grant_inputs(
+                true,
+                host.device_record_grants(name, action),
+                host.device_capability_denied(name, action),
+                CapOutcome::Unprovisioned,
+                false,
+            );
+            cap_gate_effective(
+                true,
+                &outcome,
+                action,
+                "self",
+                Some(&dev),
+                Some(&peer_user),
+                BindingStrength::Proven,
+                Some(u64::MAX),
+                None,
+                Some(&me),
+                action == CAP_TRANSFER,
+                has_grant,
+                false,
+                false,
+                false,
+            )
+            .allowed()
+        };
+        for name in ["v1", "fresh"] {
+            assert!(admitted(name, CAP_TRANSFER), "{name}: the pairing default grants transfer");
+            for action in [CAP_SHELL, "forward", CAP_MOUNT] {
+                assert!(!admitted(name, action), "{name}: the pairing default grants no {action}");
+            }
+        }
+        assert!(!admitted("bare", CAP_TRANSFER), "caps: [] grants nothing");
+        assert!(admitted("lapsed", CAP_TRANSFER));
+        assert!(!admitted("lapsed", CAP_SHELL), "a lapsed capExpires entry grants nothing");
+        unsafe {
+            match prior_dir {
+                Some(v) => std::env::set_var("TUNLION_CONFIG_DIR", v),
+                None => std::env::remove_var("TUNLION_CONFIG_DIR"),
+            }
+            match prior_mode {
+                Some(v) => std::env::set_var("TUNLION_CAP_AUTHORITATIVE", v),
+                None => std::env::remove_var("TUNLION_CAP_AUTHORITATIVE"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
