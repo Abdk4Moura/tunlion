@@ -1766,6 +1766,10 @@ pub struct Peer {
     /// TURN over TCP/TLS bridges for this connection (`turn_bridge`); `None`
     /// when the config had no TCP or TLS TURN URL.
     turn_bridges: Option<Arc<crate::turn_bridge::TurnBridges>>,
+    /// This connection's generation, sent as `pc` on every description and
+    /// candidate so the far end can tell a rebuilt connection on the same sid
+    /// from a renegotiation of this one.
+    generation: u32,
 }
 
 /// Extract `a=fingerprint:...` from an SDP (normalized uppercase hex).
@@ -1778,6 +1782,9 @@ fn sdp_fingerprint(sdp: &str) -> Option<String> {
 struct PeerSignalState {
     pending_candidates: Vec<RTCIceCandidateInit>,
     has_remote: bool,
+    /// The `pc` tag of the remote description applied last (the sender's
+    /// peer-connection generation), `None` from a sender that does not tag.
+    remote_pc: Option<u64>,
 }
 
 /// What `handle_signal` did with a relayed signal.
@@ -1897,7 +1904,7 @@ impl Peer {
                             let _ = sio
                                 .emit(
                                     "signal",
-                                    json!({ "to": to, "data": { "type": "candidate", "uid": uid.clone(), "candidate": init } }),
+                                    json!({ "to": to, "data": { "type": "candidate", "uid": uid.clone(), "pc": generation, "candidate": init } }),
                                 )
                                 .await;
                         }
@@ -1936,7 +1943,7 @@ impl Peer {
                 .ok_or_else(|| anyhow!("no local description"))?;
             sio.emit(
                 "signal",
-                json!({ "to": peer_id, "data": { "type": "description", "uid": my_uid.clone(), "description": advertise_max_message_size(&ld) } }),
+                json!({ "to": peer_id, "data": { "type": "description", "uid": my_uid.clone(), "pc": generation, "description": advertise_max_message_size(&ld) } }),
             )
             .await
             .ok();
@@ -1989,11 +1996,13 @@ impl Peer {
             state: Mutex::new(PeerSignalState {
                 pending_candidates: Vec::new(),
                 has_remote: false,
+                remote_pc: None,
             }),
             sio,
             closed,
             fps: Mutex::new((None, None)),
             turn_bridges,
+            generation,
         });
         // local fingerprint from whatever description we already sent (offer
         // path emits before Peer exists; capture lazily on first access too)
@@ -2029,6 +2038,20 @@ impl Peer {
         is_live_state(self.pc.connection_state())
     }
 
+    /// The far end's peer-connection tag from the remote description applied
+    /// last; `None` before one is applied or from a sender that does not tag.
+    pub async fn remote_pc(&self) -> Option<u64> {
+        self.state.lock().await.remote_pc
+    }
+
+    /// Has this establish heard back from the far end: a remote description
+    /// applied, or ICE checking or connected? An establish timer should leave
+    /// such a connection to the C3 watchdog rather than abandon it.
+    pub async fn establishing_progress(&self) -> bool {
+        let has_remote = self.state.lock().await.has_remote;
+        has_remote || ice_progressing(self.pc.ice_connection_state())
+    }
+
     /// C4: nudge ICE recovery after a transient 'disconnected' (impolite side
     /// only, mirroring the browser).
     pub async fn restart_ice(&self) {
@@ -2042,7 +2065,7 @@ impl Peer {
                         .sio
                         .emit(
                             "signal",
-                            json!({ "to": self.id, "data": { "type": "description", "description": advertise_max_message_size(&ld) } }),
+                            json!({ "to": self.id, "data": { "type": "description", "pc": self.generation, "description": advertise_max_message_size(&ld) } }),
                         )
                         .await;
                 }
@@ -2103,6 +2126,7 @@ impl Peer {
                 let pending = {
                     let mut st = self.state.lock().await;
                     st.has_remote = true;
+                    st.remote_pc = data["pc"].as_u64();
                     std::mem::take(&mut st.pending_candidates)
                 };
                 for c in pending {
@@ -2122,7 +2146,7 @@ impl Peer {
                     self.sio
                         .emit(
                             "signal",
-                            json!({ "to": self.id, "data": { "type": "description", "description": advertise_max_message_size(&ld) } }),
+                            json!({ "to": self.id, "data": { "type": "description", "pc": self.generation, "description": advertise_max_message_size(&ld) } }),
                         )
                         .await
                         .ok();
@@ -2196,8 +2220,30 @@ impl Peer {
         if same_host {
             return Some("direct over lo".into());
         }
-        // Resolve the LOCAL address to a real interface name
-        let iface = resolve_iface_name(&pair.local.address);
+        // Resolve the LOCAL address to a real interface name. A reflexive
+        // local candidate names the NAT mapping, so use its base, or failing
+        // that the source address the OS routes to the remote from.
+        let mut iface_addr = local_iface_addr(
+            pair.local.typ,
+            &pair.local.address,
+            &pair.local.related_address,
+        );
+        let reflexive = matches!(
+            pair.local.typ,
+            RTCIceCandidateType::Srflx | RTCIceCandidateType::Prflx
+        );
+        if reflexive && iface_addr == pair.local.address {
+            if let Some(ip) = pair
+                .remote
+                .address
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .and_then(|ip| source_ip_for(std::net::SocketAddr::new(ip, pair.remote.port)))
+            {
+                iface_addr = ip.to_string();
+            }
+        }
+        let iface = resolve_iface_name(&iface_addr);
         if is_tailscale_addr(&pair.local.address) || is_tailscale_addr(&pair.remote.address) {
             return Some(format!("direct over {iface}"));
         }
@@ -2296,6 +2342,34 @@ pub fn is_live_state(state: RTCPeerConnectionState) -> bool {
             | RTCPeerConnectionState::Connecting
             | RTCPeerConnectionState::Connected
     )
+}
+
+/// ICE states that mean the far end has answered and pairs are being checked
+/// or have succeeded: the state-only part of `Peer::establishing_progress`.
+pub fn ice_progressing(state: RTCIceConnectionState) -> bool {
+    matches!(
+        state,
+        RTCIceConnectionState::Checking
+            | RTCIceConnectionState::Connected
+            | RTCIceConnectionState::Completed
+    )
+}
+
+/// The address whose interface carries a selected local candidate. A server-
+/// or peer-reflexive candidate's own address is the NAT's public mapping,
+/// which no local interface owns (that read "direct over ?"); its base, the
+/// related address, is the local socket it was learned from. Falls back to
+/// the candidate's own address when the base is absent or unspecified.
+pub fn local_iface_addr(typ: RTCIceCandidateType, address: &str, related: &str) -> String {
+    let reflexive = matches!(typ, RTCIceCandidateType::Srflx | RTCIceCandidateType::Prflx);
+    let base_usable = related
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| !ip.is_unspecified());
+    if reflexive && base_usable {
+        related.to_string()
+    } else {
+        address.to_string()
+    }
 }
 
 /// The concrete endpoints of a selected ICE candidate pair, for path display.
@@ -3266,6 +3340,55 @@ mod tests {
             RTCPeerConnectionState::Connecting,
             RTCIceConnectionState::Checking,
         ));
+    }
+
+    /// The establish timer keeps a connection whose ICE has heard the far end
+    /// and abandons one that has not.
+    #[test]
+    fn ice_progressing_is_checking_or_connected_only() {
+        for s in [
+            RTCIceConnectionState::Checking,
+            RTCIceConnectionState::Connected,
+            RTCIceConnectionState::Completed,
+        ] {
+            assert!(ice_progressing(s), "{s} is progress");
+        }
+        for s in [
+            RTCIceConnectionState::New,
+            RTCIceConnectionState::Disconnected,
+            RTCIceConnectionState::Failed,
+            RTCIceConnectionState::Closed,
+        ] {
+            assert!(!ice_progressing(s), "{s} is not progress");
+        }
+    }
+
+    /// A reflexive local candidate resolves its interface from its base, not
+    /// from the public mapping no interface owns ("direct over ?").
+    #[test]
+    fn reflexive_local_candidate_resolves_by_its_base() {
+        assert_eq!(
+            local_iface_addr(RTCIceCandidateType::Srflx, "74.152.64.39", "10.0.0.4"),
+            "10.0.0.4"
+        );
+        assert_eq!(
+            local_iface_addr(RTCIceCandidateType::Prflx, "74.152.64.39", "10.0.0.4"),
+            "10.0.0.4"
+        );
+        assert_eq!(
+            local_iface_addr(RTCIceCandidateType::Srflx, "74.152.64.39", "0.0.0.0"),
+            "74.152.64.39",
+            "an unspecified base is not an interface"
+        );
+        assert_eq!(
+            local_iface_addr(RTCIceCandidateType::Srflx, "74.152.64.39", ""),
+            "74.152.64.39"
+        );
+        assert_eq!(
+            local_iface_addr(RTCIceCandidateType::Host, "10.0.0.4", "1.2.3.4"),
+            "10.0.0.4",
+            "a host candidate is its own interface address"
+        );
     }
 
     #[test]

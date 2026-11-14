@@ -231,6 +231,49 @@ const MAX_BUILD_EVENTS: usize = 64;
 const MAX_BUILD_EVENT_BYTES: usize = 256 * 1024;
 const MAX_BUILD_SIGNALS: usize = 64;
 const MAX_BUILD_SIGNAL_BYTES: usize = 256 * 1024;
+/// Peers whose WebRTC offer may be held while our direct attempt for them is
+/// pending (`hold_for_direct`). Beyond this a new peer's offer is not held.
+const MAX_HELD_PEERS: usize = 32;
+/// How long a held offer stays answerable: the direct budget plus the time the
+/// initiator keeps that peer connection alive while it is making progress.
+fn held_signal_ttl() -> Duration {
+    direct::DIRECT_BUDGET + Duration::from_secs(10)
+}
+
+/// A peer's WebRTC offer and trickled candidates that arrived while our direct
+/// attempt for that sid was still pending, when no responder may be built yet
+/// (`prepare_build` refuses during a pending). Without this hold the offer was
+/// discarded, and an initiator that sends one offer per peer connection could
+/// never be answered on its first attempt. `pc` is the sender's peer-connection
+/// tag (`None` from builds that do not send one); a different tag, or a second
+/// offer, starts a new hold because it belongs to a newer attempt.
+pub(crate) struct HeldSignals {
+    since: Instant,
+    pc: Option<u64>,
+    has_offer: bool,
+    signals: std::collections::VecDeque<Value>,
+    bytes: usize,
+}
+
+/// Is this signal payload (the envelope's `data`) a WebRTC offer?
+fn is_offer_data(data: &Value) -> bool {
+    data["type"].as_str() == Some("description")
+        && data["description"]["type"].as_str() == Some("offer")
+}
+
+/// Does this signal payload belong to a newer attempt than the one `held`
+/// captured (aged out, another peer-connection tag, or a second offer)?
+fn supersedes_held(held: &HeldSignals, data: &Value) -> bool {
+    held.since.elapsed() >= held_signal_ttl()
+        || held.pc != data["pc"].as_u64()
+        || (held.has_offer && is_offer_data(data))
+}
+/// An offer from a different peer connection than the one this responder
+/// answered: both sides tagged, and the tags differ. Untagged senders (older
+/// builds, browsers) never match, so they keep the renegotiation path.
+fn new_peer_connection(answered: Option<u64>, offered: Option<u64>) -> bool {
+    matches!((answered, offered), (Some(a), Some(o)) if a != o)
+}
 /// Terminal-drain tombstones and inbound registrations are bounded. New direct
 /// attempts fail closed when full.
 const MAX_RETIRED_ATTEMPTS: usize = 16;
@@ -1643,6 +1686,10 @@ pub struct Conn {
     /// server_public, proto, ch) plus the intent/link facts captured when it
     /// was buffered (`StagedOffer`). Insert only through `buffer_offer`.
     pub buffered_offers: HashMap<String, StagedOffer>,
+    /// WebRTC offers (and their candidates) held while a direct attempt for the
+    /// same sid is pending; replayed into the fallback responder's build. Insert
+    /// only through `hold_for_direct`.
+    pub(crate) held_signals: HashMap<String, HeldSignals>,
     /// Post-PAKE promotions in progress (make-before-break; see `handoff`),
     /// keyed by peer sid. Each pairs with an ephemeral `direct_pending` entry
     /// that must survive beside the serving link until the handoff resolves.
@@ -1938,6 +1985,7 @@ impl Conn {
             lan: None,
             webrtc_only: HashSet::new(),
             buffered_offers: HashMap::new(),
+            held_signals: HashMap::new(),
             promotions: HashMap::new(),
             resil: ResilienceState {
                 stall_repairs: HashMap::new(),
@@ -2609,6 +2657,7 @@ impl Conn {
         self.channel_digest_absent.remove(pid);
         self.room_digest_absent.remove(pid);
         self.buffered_offers.remove(pid);
+        self.held_signals.remove(pid);
         self.stuck_retry.remove(pid);
         // A promotion dies with its link: nothing will adopt the standby, and a
         // barrier still waiting on the peer must release onto the old path. One
@@ -3143,8 +3192,24 @@ impl Conn {
         let uid = info["uid"].as_str().map(|s| s.to_string());
         let peer_present = self.roster.contains_key(&peer_id);
         let name = info["name"].as_str().unwrap_or("peer").to_string();
+        // An offer held during the direct attempt makes this build its
+        // responder: the peer already offered, so answering it is the only role
+        // that cannot glare (the same reason `ensure_responder` forces polite).
+        let held = self.take_held(&peer_id);
+        let held_offer = held.as_ref().is_some_and(|h| h.has_offer);
+        let (signals, signal_bytes) = match held {
+            Some(h) => {
+                self.log.debug(&format!(
+                    "tunlion: HOLD-REPLAY peer={peer_id} caller={caller}: {} held signal(s) staged into its build",
+                    h.signals.len()
+                ));
+                (h.signals, h.bytes)
+            }
+            None => (std::collections::VecDeque::new(), 0),
+        };
         let polite = match force_polite {
             Some(value) => value,
+            None if held_offer => true,
             None => match uid.as_deref() {
                 Some(uid) => net::polite_role(&self.my_uid, uid, &self.my_id, &peer_id)?,
                 None => {
@@ -3212,8 +3277,8 @@ impl Conn {
             caller,
             attempt: 0,
             prior_generation,
-            signals: std::collections::VecDeque::new(),
-            signal_bytes: 0,
+            signals,
+            signal_bytes,
         }))
     }
 
@@ -3240,8 +3305,11 @@ impl Conn {
     /// Test-only synchronous path. It uses the same plan, peer construction and
     /// installer as the build task; only the task boundary is absent.
     #[cfg(test)]
-    async fn establish_inline(&mut self, plan: BuildPlan) -> Result<()> {
+    async fn establish_inline(&mut self, mut plan: BuildPlan) -> Result<()> {
         let pid = plan.peer_id.clone();
+        // Signals staged into the plan (an offer held during a direct attempt)
+        // replay on install exactly as the off-loop build's do.
+        let staged = std::mem::take(&mut plan.signals);
         let mut cfg = match plan.config {
             BuildIce::Cached(cfg) => cfg,
             BuildIce::Fetch => match tokio::time::timeout(
@@ -3295,7 +3363,7 @@ impl Conn {
                 prior_generation: plan.prior_generation,
             },
             std::collections::VecDeque::new(),
-            std::collections::VecDeque::new(),
+            staged,
             binding,
             pending_active,
         );
@@ -3968,6 +4036,94 @@ impl Conn {
             return true;
         }
         false
+    }
+
+    /// Hold a WebRTC offer or candidate that cannot be answered yet because our
+    /// direct attempt for that sid is still pending (`prepare_build` refuses
+    /// any build during a pending, and there is neither a link nor a build to
+    /// stage into). The fallback responder's build takes the hold
+    /// (`take_held`), so the offer is answered the moment the direct path
+    /// loses; a direct win discards it. Returns true when the signal was
+    /// consumed (held, or dropped by the bound), false when the caller should
+    /// apply it as before.
+    pub fn hold_for_direct(&mut self, envelope: &Value) -> bool {
+        if !is_candidate_sdp_signal(envelope) {
+            return false;
+        }
+        let Some(pid) = envelope["from"].as_str() else {
+            return false;
+        };
+        if !self.direct_pending.contains_key(pid)
+            || self.links.contains_key(pid)
+            || self.build_pending(pid)
+        {
+            return false;
+        }
+        if self
+            .held_signals
+            .get(pid)
+            .is_some_and(|h| supersedes_held(h, &envelope["data"]))
+        {
+            self.discard_held(pid, "a newer connection attempt arrived");
+        }
+        if !self.held_signals.contains_key(pid) {
+            if self.held_signals.len() >= MAX_HELD_PEERS {
+                self.held_signals.retain(|_, h| h.since.elapsed() < held_signal_ttl());
+            }
+            if self.held_signals.len() >= MAX_HELD_PEERS {
+                return false;
+            }
+            self.held_signals.insert(
+                pid.to_string(),
+                HeldSignals {
+                    since: Instant::now(),
+                    pc: envelope["data"]["pc"].as_u64(),
+                    has_offer: false,
+                    signals: std::collections::VecDeque::new(),
+                    bytes: 0,
+                },
+            );
+        }
+        let len = envelope.to_string().len();
+        let offer = is_offer_data(&envelope["data"]);
+        let Some(held) = self.held_signals.get_mut(pid) else {
+            return false;
+        };
+        if held.signals.len() >= MAX_BUILD_SIGNALS || held.bytes + len > MAX_BUILD_SIGNAL_BYTES {
+            return true;
+        }
+        held.has_offer |= offer;
+        held.bytes += len;
+        held.signals.push_back(envelope.clone());
+        if offer {
+            self.log.debug(&format!(
+                "tunlion: HOLD-OFFER peer={pid}: direct attempt pending, holding its WebRTC offer for the fallback responder"
+            ));
+        }
+        true
+    }
+
+    /// Drop `pid`'s held offer, if any, saying why.
+    fn discard_held(&mut self, pid: &str, why: &str) {
+        if let Some(held) = self.held_signals.remove(pid) {
+            self.log.debug(&format!(
+                "tunlion: HOLD-DISCARD peer={pid}: {} held signal(s) dropped, {why}",
+                held.signals.len()
+            ));
+        }
+    }
+
+    /// Take `pid`'s held signals for the build being prepared, unless they aged out.
+    fn take_held(&mut self, pid: &str) -> Option<HeldSignals> {
+        let held = self.held_signals.remove(pid)?;
+        if held.since.elapsed() >= held_signal_ttl() {
+            self.log.debug(&format!(
+                "tunlion: HOLD-DISCARD peer={pid}: {} held signal(s) dropped, expired",
+                held.signals.len()
+            ));
+            return None;
+        }
+        Some(held)
     }
 
     /// True when a build for this peer is pending and no transport is installed
@@ -5950,6 +6106,7 @@ impl Conn {
         // Replay anything the standby buffered before adoption. The tags remain,
         // so a second replacement still rejects them at the handler gate.
         self.flush_pending_source(source);
+        self.discard_held(pid, "the direct path was adopted");
         DirectAdoption::Adopted { attempt, tkey }
     }
 
@@ -7269,6 +7426,7 @@ impl Conn {
             },
         );
         self.flush_pending_source(source);
+        self.discard_held(pid, "the direct path was adopted");
         DirectAdoption::Adopted { attempt, tkey }
     }
 
@@ -8510,6 +8668,41 @@ impl Conn {
             Some(p) => p,
             None => return,
         };
+        // The initiator rebuilt its peer connection on the same sid (a
+        // rotation): its offer carries a new `pc` tag. Applying it to the
+        // responder that answered the OLD connection is a renegotiation across
+        // two different DTLS endpoints, which never connects. Rebuild a fresh
+        // responder for it instead, unless the link is already serving bytes.
+        let serving = self
+            .links
+            .get(from)
+            .and_then(|l| l.transport.as_ref())
+            .is_some_and(|t| !t.is_dead());
+        if !serving
+            && peer.polite
+            && is_offer_data(&data)
+            && new_peer_connection(peer.remote_pc().await, data["pc"].as_u64())
+        {
+            self.log.debug(&format!(
+                "tunlion: FRESH-RESPONDER peer={from}: offer from a new peer connection, rebuilding the responder"
+            ));
+            self.drop_link(from);
+            if let Err(e) = self.ensure_responder(from, &data).await {
+                self.log.trace(&format!("signal: fresh responder failed: {e} (recovering)"));
+                return;
+            }
+            let envelope = json!({ "from": from, "data": data.clone() });
+            if self.build_pending(from) {
+                self.stage_signal(&envelope);
+            } else if !self.hold_for_direct(&envelope) {
+                if let Some(p) = self.link(from).and_then(|l| l.peer.clone()) {
+                    if let Err(e) = p.handle_signal(data).await {
+                        self.log.trace(&format!("signal failed to apply: {e} (recovering)"));
+                    }
+                }
+            }
+            return;
+        }
         match peer.handle_signal(data).await {
             Ok(net::SignalOutcome::Handled) => {}
             Ok(net::SignalOutcome::Glare(offer)) => {
@@ -8529,6 +8722,15 @@ impl Conn {
     }
 
     pub async fn ensure_responder(&mut self, from: &str, data: &Value) -> Result<()> {
+        // A held offer from an older attempt must not be replayed in front of
+        // this newer one (the build below would answer the stale offer first).
+        if self
+            .held_signals
+            .get(from)
+            .is_some_and(|h| supersedes_held(h, data))
+        {
+            self.discard_held(from, "a newer connection attempt arrived");
+        }
         if let Some(uid) = data["uid"].as_str() {
             net::ensure_ascii_uid(uid)?;
             if let Some(info) = self.roster.get_mut(from) {
@@ -12282,6 +12484,129 @@ mod warm_identity_tests {
         ));
         assert!(conn.links.contains_key(pid));
         assert!(Arc::ptr_eq(conn.links[pid].transport.as_ref().unwrap(), &t));
+    }
+
+    /// A real WebRTC offer envelope from `pid`, tagged with peer connection `pc`.
+    async fn offer_from(conn: &Conn, pid: &str, pc: u32) -> Value {
+        let (otx, _orx) = mpsc::unbounded_channel();
+        let offerer = net::Peer::connect(
+            "sid-acceptor".to_string(),
+            "cli-l2-far".to_string(),
+            false,
+            Vec::new(),
+            false,
+            conn.sio.clone(),
+            otx,
+            pc,
+        )
+        .await
+        .expect("local offerer");
+        let ld = offerer.pc.local_description().await.expect("offer");
+        json!({
+            "from": pid,
+            "data": { "type": "description", "uid": "cli-l2-far", "pc": pc, "description": ld }
+        })
+    }
+
+    /// Cause 1 of the cold-connect failure: the initiator's offer arrived
+    /// while our direct attempt for its sid was pending. It used to be dropped
+    /// (no build may start during a pending) and, sent once per connection,
+    /// was never answered. It is held, and the fallback responder answers it.
+    #[tokio::test]
+    async fn an_offer_during_a_pending_direct_attempt_is_held_then_answered() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let pid = "sid-cold-cli";
+        expired_direct_pending(&mut conn, pid, Instant::now() + Duration::from_secs(30));
+        let offer = offer_from(&conn, pid, 1).await;
+        let cand = json!({
+            "from": pid,
+            "data": { "type": "candidate", "pc": 1, "candidate": { "candidate": "candidate:1 1 udp 1 10.0.0.9 9 typ host" } }
+        });
+        assert!(conn.hold_for_direct(&offer), "the offer was not held");
+        assert!(conn.hold_for_direct(&cand), "its candidate was not held");
+        assert_eq!(conn.held_signals[pid].signals.len(), 2);
+        // A signal for a sid with no pending is not ours to hold.
+        assert!(!conn.hold_for_direct(&json!({ "from": "sid-other", "data": offer["data"].clone() })));
+
+        // The direct path loses: the reaper falls back and establishes.
+        conn.direct_pending.get_mut(pid).unwrap().deadline = Instant::now();
+        let fell = conn.expired_direct();
+        assert_eq!(fell.len(), 1);
+        conn.establish_as(json!({ "id": pid, "uid": "cli-l2-far", "name": "far" }), None)
+            .await
+            .expect("fallback establish");
+        assert!(conn.held_signals.is_empty(), "the hold outlived its replay");
+        let peer = conn.links[pid].peer.clone().expect("responder link");
+        assert!(peer.polite, "a held offer must make the fallback its responder");
+
+        // The replayed signals reach the loop in order; applying them answers.
+        let mut replayed = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Ev::Signal(v) = ev {
+                replayed.push(v);
+            }
+        }
+        assert_eq!(replayed.len(), 2, "held offer and candidate are replayed once");
+        assert_eq!(replayed[0]["data"]["description"]["type"], "offer");
+        for v in replayed {
+            conn.apply_signal(pid, v["data"].clone()).await;
+        }
+        let local = peer.pc.local_description().await.expect("answer");
+        assert_eq!(local.sdp_type.to_string(), "answer");
+        assert_eq!(peer.remote_pc().await, Some(1));
+    }
+
+    /// A held offer is discarded when the direct path wins and adopts, so a
+    /// later rebuild can never answer a connection the peer has abandoned. A
+    /// newer offer from the same sid replaces an older held one.
+    #[tokio::test]
+    async fn a_held_offer_is_discarded_when_direct_adopts() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-held-direct-wins";
+        let t: Arc<dyn Transport> = Rec::new("direct", &log);
+        let attempt = t.attempt_id().unwrap();
+        conn.direct_pending
+            .insert(pid.into(), direct_pending_with(attempt, ("peer", "secret")));
+        let first = json!({
+            "from": pid,
+            "data": { "type": "description", "pc": 1, "description": { "type": "offer", "sdp": "v=0" } }
+        });
+        let second = json!({
+            "from": pid,
+            "data": { "type": "description", "pc": 2, "description": { "type": "offer", "sdp": "v=0" } }
+        });
+        assert!(conn.hold_for_direct(&first));
+        assert!(conn.hold_for_direct(&second));
+        assert_eq!(conn.held_signals[pid].pc, Some(2), "a newer connection replaces the hold");
+        assert_eq!(conn.held_signals[pid].signals.len(), 1);
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), "direct-quic"),
+            DirectAdoption::Adopted { attempt: seen, .. } if seen == attempt
+        ));
+        assert!(!conn.held_signals.contains_key(pid), "direct adopted but the offer stayed held");
+    }
+
+    /// Cause 3: an offer from a NEW peer connection on the same sid (the
+    /// initiator rotated) rebuilds the responder instead of renegotiating the
+    /// one that answered the old connection.
+    #[tokio::test]
+    async fn an_offer_from_a_new_peer_connection_gets_a_fresh_responder() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-rotated-cli";
+        let first = offer_from(&conn, pid, 1).await;
+        conn.ensure_responder(pid, &first["data"]).await.expect("responder");
+        conn.apply_signal(pid, first["data"].clone()).await;
+        let old = conn.links[pid].peer.clone().expect("first responder");
+        assert_eq!(old.remote_pc().await, Some(1));
+
+        let second = offer_from(&conn, pid, 2).await;
+        conn.apply_signal(pid, second["data"].clone()).await;
+        let new = conn.links[pid].peer.clone().expect("fresh responder");
+        assert!(!Arc::ptr_eq(&old, &new), "the old responder was renegotiated");
+        assert_eq!(new.remote_pc().await, Some(2));
+        let local = new.pc.local_description().await.expect("answer");
+        assert_eq!(local.sdp_type.to_string(), "answer");
     }
 
     /// Cold adoption keys workers from the immutable AUTHORIZATION, exactly

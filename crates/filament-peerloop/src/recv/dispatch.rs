@@ -5258,6 +5258,12 @@ async fn recv_run(
                     conn.stage_signal(&v);
                     continue;
                 }
+                // Our direct attempt for this sid is still pending, so no
+                // responder could be built: hold the offer for the fallback
+                // instead of dropping it (it is sent once per connection).
+                if conn.hold_for_direct(&v) {
+                    continue;
+                }
                 conn.apply_signal(&from, data).await;
             }
             // rung-1: authenticated direct-QUIC won the race, adopt as a
