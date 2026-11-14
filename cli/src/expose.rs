@@ -177,8 +177,8 @@ pub async fn expose_cmd(
         ));
     };
 
-    // The unix control socket is a fast wake; the bound record is the truth on
-    // every platform (Windows has no control socket).
+    // The control channel is a fast wake; the bound record is the truth on
+    // every platform.
     notify_daemon().await;
     let state = wait_for_bind(daemon, &binding, std::time::Duration::from_secs(6)).await;
     match state {
@@ -327,7 +327,6 @@ async fn print_list() -> Result<()> {
 
 /// Push the change to the running daemon; fall back to a clear "next up" note.
 async fn notify_daemon() {
-    #[cfg(unix)]
     {
         match crate::ctl::try_reload_expose().await {
             Some(v) if v["live"].as_bool() == Some(true) => {

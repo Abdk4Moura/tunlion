@@ -26,8 +26,9 @@
 //! status is a frame, not a process signal, so stdout, stderr and the status stay
 //! exactly what the cold path produces.
 //!
-//! PLATFORM: Unix control socket only. Windows has no control socket yet; the
-//! CLI's warm client returns `NoPath` there and every exec uses the cold path.
+//! PLATFORM: every control channel the daemon serves: a unix socket, or the
+//! named pipe on Windows. The framing carries stdin EOF as its own frame, so
+//! the pipe's lack of a write half-close changes nothing here.
 
 use crate::conn::{warm_link_for, Conn};
 use crate::control;
@@ -241,7 +242,7 @@ async fn run_warm_exec(
     }
 
     let sock = req.accept().await;
-    let (read_half, write_half) = sock.into_split();
+    let (read_half, write_half) = control::split_stream(sock);
     // A dedicated reader task owns the read half so a partial frame can never be
     // lost to select cancellation; its channel closing means the CLIENT went
     // away, which is the signal to hang up the remote tree.

@@ -9,8 +9,18 @@
 //!
 //! WHAT IS NOT HERE: nothing. Every `ReqKind` payload is plain data (`String`,
 //! `u16`, `u64`, `bool`), so no CLI type (`Conn`, `Link`, `DaemonMounts`, a path
-//! type) crosses the crate boundary. `Req` holds only the kind and a
-//! `tokio::net::UnixStream`.
+//! type) crosses the crate boundary. `Req` holds only the kind and the daemon's
+//! end of the client connection, a [`CtlStream`].
+//!
+//! TRANSPORT: on unix the channel is a unix-domain socket; on Windows it is a
+//! local named pipe (#205). Both carry the same bytes, so everything above the
+//! stream (the request line, the reply line, the raw bridge or the exec frames)
+//! is shared. The one difference a handler can see is that a named pipe has no
+//! write half-close: shutting down the write side only flushes it. A client
+//! that needs its EOF delivered on a raw `open`/`dial` stream (the Windows
+//! client always does) asks for `"eof":"frames"`, and the daemon reads that
+//! direction through [`decode_upstream`]: the exec framing's stdin and
+//! stdin-EOF frames, so EOF crosses the pipe in-band.
 //!
 //! WIRE SHAPE: these types are NOT serialized. There is no serde derive here and
 //! there never was; the control protocol is one hand-written JSON request line
@@ -20,8 +30,73 @@
 //! before the move. Moving a type that never touches the wire cannot change it.
 
 use serde_json::Value;
-#[cfg(unix)]
 use tokio::io::AsyncWriteExt;
+
+use crate::exec_frame::{read_frame, FRAME_STDIN, FRAME_STDIN_EOF};
+
+/// The daemon's end of one control connection.
+#[cfg(unix)]
+pub type CtlStream = tokio::net::UnixStream;
+/// The daemon's end of one control connection: a connected named pipe
+/// instance (the server side; clients hold a `NamedPipeClient`).
+#[cfg(windows)]
+pub type CtlStream = tokio::net::windows::named_pipe::NamedPipeServer;
+
+/// The read half of a split [`CtlStream`].
+#[cfg(unix)]
+pub type CtlReadHalf = tokio::net::unix::OwnedReadHalf;
+/// The write half of a split [`CtlStream`].
+#[cfg(unix)]
+pub type CtlWriteHalf = tokio::net::unix::OwnedWriteHalf;
+/// The read half of a split [`CtlStream`].
+#[cfg(windows)]
+pub type CtlReadHalf = tokio::io::ReadHalf<CtlStream>;
+/// The write half of a split [`CtlStream`].
+#[cfg(windows)]
+pub type CtlWriteHalf = tokio::io::WriteHalf<CtlStream>;
+
+/// Split a control connection into owned halves that can move to separate
+/// tasks. Unix keeps `into_split`, whose write half shuts the socket's write
+/// direction when dropped; a named pipe has no half-close, so its halves share
+/// the one handle and the pipe closes when both are gone.
+#[cfg(unix)]
+pub fn split_stream(sock: CtlStream) -> (CtlReadHalf, CtlWriteHalf) {
+    sock.into_split()
+}
+/// See the unix arm; a named pipe splits through tokio's shared halves.
+#[cfg(windows)]
+pub fn split_stream(sock: CtlStream) -> (CtlReadHalf, CtlWriteHalf) {
+    tokio::io::split(sock)
+}
+
+/// A raw bridge whose client-to-daemon direction arrives framed.
+pub type FramedUpstream = tokio::io::Join<tokio::io::DuplexStream, CtlWriteHalf>;
+
+/// Decode a client's framed upstream (`"eof":"frames"`): `FRAME_STDIN` frames
+/// become bytes and `FRAME_STDIN_EOF` (or the connection closing) becomes EOF,
+/// while the daemon-to-client direction stays raw. The result is a plain
+/// AsyncRead + AsyncWrite, so the bridges use it exactly like the socket.
+/// Same frames as exec; the frame size bound applies.
+pub fn decode_upstream(sock: CtlStream) -> FramedUpstream {
+    let (mut rd, wr) = split_stream(sock);
+    let (mut feed, out) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        loop {
+            match read_frame(&mut rd).await {
+                Ok(Some((FRAME_STDIN, data))) => {
+                    if feed.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                // EOF frame, the client gone, or a frame that does not belong
+                // on this stream: all end the upstream direction.
+                _ => break,
+            }
+        }
+        let _ = feed.shutdown().await;
+    });
+    tokio::io::join(out, wr)
+}
 
 /// What a warm-reuse client is asking the daemon to do over its warm link.
 #[derive(Clone)]
@@ -144,16 +219,17 @@ pub enum ReqKind {
 /// A parsed request handed to the daemon's event loop, which owns the link
 /// table and the per-peer muxes. The loop dispatches on `kind` and then
 /// `accept()`s (bridging `sock`) or `reject()`s.
-#[cfg(unix)]
 pub struct Req {
     pub kind: ReqKind,
-    pub sock: tokio::net::UnixStream,
+    pub sock: CtlStream,
+    /// The client asked for `"eof":"frames"`: on an `Open`/`Dial` bridge, read
+    /// its upstream through [`decode_upstream`]. Ignored by every other op.
+    pub eof_frames: bool,
 }
 
-#[cfg(unix)]
 impl Req {
     /// Confirm the stream is opening; returns the socket for the bridge.
-    pub async fn accept(mut self) -> tokio::net::UnixStream {
+    pub async fn accept(mut self) -> CtlStream {
         let _ = self.sock.write_all(b"{\"ok\":true}\n").await;
         let _ = self.sock.flush().await;
         self.sock
@@ -177,33 +253,10 @@ impl Req {
 
 /// Write one JSON reply line to a DEFERRED-reply socket (a `Bootstrap` request
 /// whose `sock` the daemon stashed until the peer's ack arrived). Best-effort.
-#[cfg(unix)]
-pub async fn send_reply(sock: &mut tokio::net::UnixStream, v: &Value) {
+pub async fn send_reply(sock: &mut CtlStream, v: &Value) {
     if let Ok(mut line) = serde_json::to_vec(v) {
         line.push(b'\n');
         let _ = sock.write_all(&line).await;
         let _ = sock.flush().await;
-    }
-}
-
-/// Warm-link reuse needs a unix-domain socket, which this platform lacks, so
-/// `Req` is uninhabited: the daemon never spawns `serve`, the channel never
-/// receives, and the fast paths (gated on `cfg(unix)`) never call `try_open`.
-/// Keeping the type lets the daemon loop and handler compile unchanged.
-#[cfg(not(unix))]
-pub enum Req {}
-
-#[cfg(not(unix))]
-impl Req {
-    /// Uninhabited here, so this is never called; it exists so the daemon
-    /// loop's reply to a parked revocation-sync compiles on every target.
-    pub async fn reply(self, _v: &Value) {
-        match self {}
-    }
-
-    /// Uninhabited here, so this is never called; the control loop still names
-    /// the refusal path on every target.
-    pub async fn reject(self, _err: &str) {
-        match self {}
     }
 }

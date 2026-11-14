@@ -255,8 +255,8 @@ pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
     // supervisor restarts it with fresh ambient caps: no sudo. Otherwise the
     // daemon goes on running the OLD binary, and the user is told so with the
     // exact command for how it runs: its service manager's restart, or `down`
-    // and `up --detach` with the flags it was started with. Windows has no
-    // control socket, so it always takes the second path.
+    // and `up --detach` with the flags it was started with. A Windows daemon
+    // answers but has no reload path, so it always takes the second path.
     let answer = ctl::try_reload().await;
     let reloading = matches!(answer, Some(ref v) if v["reloading"].as_bool() == Some(true));
     if reloading {

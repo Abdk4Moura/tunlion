@@ -20,6 +20,12 @@ pub(crate) use filament_peerloop::daemon_ctl::{
     PendingBootstraps, complete_warm_bootstrap, handle_list_warm, handle_warm_bootstrap,
     handle_warm_ping, log_warm_miss, reap_warm_bootstraps,
 };
+// Windows serves the control channel over a named pipe (#205), so the platform
+// wrappers reach the same bootstrap handlers there. Only the names they use.
+#[cfg(windows)]
+pub(crate) use filament_peerloop::daemon_ctl::{
+    complete_warm_bootstrap, handle_warm_bootstrap, reap_warm_bootstraps,
+};
 
 #[cfg(all(feature = "mount-daemon", unix))]
 pub(crate) use filament_peerloop::mount::daemon::{

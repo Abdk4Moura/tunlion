@@ -2135,8 +2135,10 @@ async fn open_mount_stream(
 /// "session over" semantics the cold netcat path has. Its OWN `tokio::io::stdin()`
 /// is fine here because netcat is a single-shot ProxyCommand (one process, one
 /// attach, no reconnect): the singleton is created once and never handed off.
-#[cfg(unix)]
-async fn pump_stdio_over(sock: tokio::net::UnixStream) -> Result<()> {
+///
+/// The `shutdown` below reaches the peer as EOF on every transport: a unix
+/// half-close, or on the Windows pipe an in-band EOF frame (`WarmStream`).
+async fn pump_stdio_over(sock: crate::ctl::WarmStream) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(sock);
     let writer = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
@@ -2157,9 +2159,8 @@ async fn pump_stdio_over(sock: tokio::net::UnixStream) -> Result<()> {
 /// `spawn_stdin_reader`). `pending` preserves an input chunk pulled just as the
 /// warm socket died so the cold reattach re-sends it. Returns when the socket's
 /// remote half closes (warm session over: a drop OR a clean shell exit).
-#[cfg(unix)]
 async fn pump_warm_pty_stdio(
-    sock: tokio::net::UnixStream,
+    sock: crate::ctl::ClientStream,
     stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pending: &mut Option<Vec<u8>>,
     received: &mut u64,
@@ -2201,9 +2202,8 @@ async fn pump_warm_pty_stdio(
 /// Pump a one-shot warm pty: stream output to stdout until the command exits.
 /// No raw mode, no SIGWINCH, no interactive features. Forwards stdin to match
 /// cold path parity (supports `echo hi | tunlion shell peer -- cat`).
-#[cfg(unix)]
 async fn pump_warm_pty_one_shot(
-    sock: tokio::net::UnixStream,
+    sock: crate::ctl::ClientStream,
     stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pending: &mut Option<Vec<u8>>,
 ) -> Result<()> {
@@ -2268,7 +2268,6 @@ async fn pump_warm_pty_one_shot(
 /// `netcat`; also an ssh ProxyCommand for an overlay-exposed sshd). Goes through the
 /// local daemon, which resolves the peer to its verified overlay address and dials
 /// it, so it works from a userspace node with no kernel route.
-#[cfg(unix)]
 pub async fn dial_cmd(peer: &str, port: u16) -> Result<()> {
     match crate::ctl::try_dial(peer, port).await {
         Some(sock) => pump_stdio_over(sock).await,
@@ -2276,11 +2275,6 @@ pub async fn dial_cmd(peer: &str, port: u16) -> Result<()> {
             "could not dial {peer}.mesh:{port} over the overlay (is the daemon up, the peer paired, and the port expose'd on it?)"
         ),
     }
-}
-
-#[cfg(not(unix))]
-pub async fn dial_cmd(_peer: &str, _port: u16) -> Result<()> {
-    bail!("tunlion: `forward` needs the local daemon's control socket (unix only)")
 }
 
 /// `tunlion netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
@@ -2291,8 +2285,6 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
     // ride it (no signaling, no establishment, ~1s saved). Skipped under --relay
     // (the user forced a relay path; a warm link may be direct) and self-heals: any
     // miss / no daemon / dead stream falls through to a fresh establish below.
-    // Unix-only: the control socket is a unix-domain socket (no-op elsewhere).
-    #[cfg(unix)]
     if !relay {
         match crate::ctl::try_open_reason(peer, rport).await {
             Ok(sock) => {
@@ -3038,8 +3030,8 @@ async fn pty_attach_once(
 /// stdio to it - raw mode + SIGWINCH forwarded as a `resize` op. Returns
 /// `Some(result)` once it has handled the session (stdio EOF = shell exit or a
 /// warm-link drop -> we exit), or `None` when there is no warm link, so the caller
-/// falls through to the cold resumable path. Unix-only (the control socket is unix).
-#[cfg(unix)]
+/// falls through to the cold resumable path. On Windows there is no SIGWINCH,
+/// so a resize is not forwarded (the cold Windows path does not either).
 async fn try_warm_pty(
     peer: &str,
     session: &str,
@@ -3083,20 +3075,14 @@ async fn try_warm_pty(
         }
         // Forward SIGWINCH as a `resize` control op (a fresh short connection each time).
         let session_owned = session.to_string();
-        let winch = tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sig = match signal(SignalKind::window_change()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            while sig.recv().await.is_some() {
-                if let Ok((c, r)) = crossterm::terminal::size() {
-                    crate::ctl::try_resize(&session_owned, c, r).await;
-                }
-            }
+        let winch = crate::platform::spawn_resize_watch(move |c, r| {
+            let session = session_owned.clone();
+            async move { crate::ctl::try_resize(&session, c, r).await }
         });
         let r = pump_warm_pty_stdio(sock, stdin_rx, pending, received).await;
-        winch.abort();
+        if let Some(w) = winch {
+            w.abort();
+        }
         let r = match r {
             Ok(()) => match crate::ctl::warm_pty_end_reason(session).await {
                 Some(reason) => Err(anyhow::anyhow!("{reason}")),
@@ -3227,8 +3213,12 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     // only what this terminal has not shown yet.
     let mut received: u64 = 0;
 
-    #[cfg(unix)]
-    if !relay && (interactive || !one_shot.is_empty()) {
+    // A piped one-shot needs its stdin EOF to reach the command (`echo hi |
+    // tunlion shell peer -- cat`), which the Windows control pipe cannot say
+    // (no half-close); there that case keeps the cold path, which can.
+    let warm_one_shot = !one_shot.is_empty()
+        && (stdin_is_tty || crate::platform::ctl_endpoint::HALF_CLOSE);
+    if !relay && (interactive || warm_one_shot) {
         match try_warm_pty(
             peer,
             &session_id,
@@ -3464,15 +3454,14 @@ fn port_in_use_msg(lport: u16, peer: &str, rport: u16) -> String {
     )
 }
 
-/// Bidirectionally copy an accepted local TCP connection and a warm-reuse unix
-/// socket (the daemon bridges the unix socket to an L2 stream over its existing
-/// link). One copy per direction; either side's EOF ends the pair. Unix-only.
-#[cfg(unix)]
+/// Bidirectionally copy an accepted local TCP connection and a warm-reuse
+/// control connection (the daemon bridges it to an L2 stream over its existing
+/// link). One copy per direction; either side's EOF ends the pair.
 async fn bridge_streams(
     mut tcp: TcpStream,
-    mut unix: tokio::net::UnixStream,
+    mut ctl: crate::ctl::WarmStream,
 ) -> std::io::Result<()> {
-    tokio::io::copy_bidirectional(&mut tcp, &mut unix)
+    tokio::io::copy_bidirectional(&mut tcp, &mut ctl)
         .await
         .map(|_| ())
 }
@@ -3780,11 +3769,8 @@ pub async fn forward_cmd(
     // connections are then instant and open NO new presence on the peer (the
     // daemon is the one connected), and the daemon reports its own link state.
     // Probed once, up front.
-    #[cfg(unix)]
     let via_daemon = !relay && crate::ctl::daemon_present().await;
-    #[cfg(not(unix))]
-    let via_daemon = false;
-    let warm = via_daemon; // per-connection warm attempts (unix only)
+    let warm = via_daemon; // per-connection warm attempts
 
     // Cold link (no daemon): managed by a background task that establishes it,
     // WATCHES its liveness, and reconnects on loss, reporting lost/recovered so a
@@ -3895,7 +3881,6 @@ pub async fn forward_cmd(
         let deadline = tokio::time::Instant::now() + cold_link_bound();
         // Warm path: bridge this connection straight to the daemon's link. Retried
         // per connection so it is used whenever the daemon holds a warm link.
-        #[cfg(unix)]
         if warm {
             match tokio::time::timeout_at(deadline, crate::ctl::try_open_reason(peer, rport))
                 .await
@@ -4134,7 +4119,6 @@ pub async fn proxy_serve(
     for line in proxy_usage_lines(bind, port) {
         crate::ui::say(&line);
     }
-    #[cfg(unix)]
     if !crate::ctl::daemon_present().await {
         crate::ui::say(&crate::ui::paint(
             crate::ui::Tone::Dim,
@@ -4677,7 +4661,7 @@ async fn serve_mesh_connect(
     cold: Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Arc<Mux>>>>>>,
 ) -> Result<()> {
     let started = tokio::time::Instant::now();
-    // Read only by the warm (daemon) path, which exists on unix alone.
+    // Read only by the warm (daemon) path.
     let _warm_deadline = started + proxy_warm_budget();
     let peer = peer.to_string();
     if !mesh_peer_known(&peer) {
@@ -4691,7 +4675,6 @@ async fn serve_mesh_connect(
     // (which the loopback open cannot reach). Both answers are kept: when the
     // peer refused, that refusal IS the reply, and a cold retry would only turn
     // it into a hang.
-    #[cfg(unix)]
     if crate::ctl::daemon_present().await {
         let deadline = _warm_deadline;
         let mut l2_refusal: Option<String> = None;
@@ -5089,7 +5072,7 @@ async fn shell_bootstrap(
 /// Install our managed key on `peer`, WARM-first: ask the local `up` daemon to
 /// run the `shell-bootstrap` over its already-established link (instant, no cold
 /// establish), and fall back to a fresh `shell_bootstrap` on a miss/deny/timeout,
-/// under `--relay`, or off-unix. This is what closes the last gap that left
+/// or under `--relay`. This is what closes the last gap that left
 /// `tunlion shell --ssh` slow while `pty` was already warm: the bootstrap was the only
 /// remaining cold establish in the ssh path.
 async fn bootstrap_key(
@@ -5099,7 +5082,6 @@ async fn bootstrap_key(
     ssh_port: u16,
     cert_only: bool,
 ) -> Result<BootstrapInfo> {
-    #[cfg(unix)]
     if !relay && !cert_only {
         let pubkey = crate::sshkeys::ensure_managed_key()?;
         if let Some(v) = crate::ctl::try_bootstrap(peer, &pubkey, ssh_port).await {
@@ -5658,10 +5640,7 @@ fn ssh_failed_hint(peer: &str, code: i32) {
 async fn ensure_sshd(peer: &str, rport: u16, reported: Option<bool>) {
     let sshd = match reported {
         Some(b) => Some(b),
-        #[cfg(unix)]
         None => probe_sshd_warm(peer, rport).await,
-        #[cfg(not(unix))]
-        None => None,
     };
     if sshd != Some(false) {
         return;
@@ -5694,7 +5673,6 @@ async fn ensure_sshd(peer: &str, rport: u16, reported: Option<bool>) {
 /// (no listener); any bytes (the SSH banner) mean a listener is there. No warm
 /// link or no banner in time -> `None` (unknown, caller proceeds). Works against
 /// any peer version, since it relies only on the old l2-open/l2-close path.
-#[cfg(unix)]
 async fn probe_sshd_warm(peer: &str, rport: u16) -> Option<bool> {
     use tokio::io::AsyncReadExt;
     let mut s = crate::ctl::try_open(peer, rport).await?;

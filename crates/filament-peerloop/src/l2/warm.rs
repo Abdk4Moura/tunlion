@@ -9,7 +9,6 @@
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
@@ -21,7 +20,6 @@ use crate::l2::mux::{serve_stream, Mux, PipeItem};
 /// which the peer sends UNPROMPTED, so the wait overlaps work we needed anyway.
 /// Only a black-holed link burns the whole window. Override with
 /// TUNLION_WARM_VERIFY_MS.
-#[cfg(unix)]
 pub fn warm_verify_window() -> std::time::Duration {
     let ms = std::env::var("TUNLION_WARM_VERIFY_MS")
         .ok()
@@ -138,7 +136,6 @@ pub async fn open_stream_verified_reason(
 
 /// Bridge a verified warm stream to the client `sock`, replaying the already-read
 /// `first` frame so no peer bytes are lost.
-#[cfg(unix)]
 pub async fn serve_verified_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mux: Arc<Mux>,
     sid: u32,
@@ -188,7 +185,6 @@ async fn open_pty_stream(
 ///   carries err, so this is a CLEAN session end with no output (fast
 ///   `true`), never a denial: the caller accepts and closes at once so
 ///   the client reads EOF as a clean exit, mirroring the cold path.
-#[cfg(unix)]
 pub enum WarmPtyVerdict {
     Opened(u32, PipeItem, mpsc::Receiver<PipeItem>),
     Refused(String),
@@ -196,7 +192,6 @@ pub enum WarmPtyVerdict {
     Silent,
 }
 
-#[cfg(unix)]
 pub async fn open_pty_stream_verified(
     mux: &Arc<Mux>,
     session: &str,
@@ -245,9 +240,8 @@ pub async fn open_pty_stream_verified(
 }
 
 /// Bridge an already-opened L2 stream (`sid` + its inbound `rx`) to a local
-/// `stream` (the warm pty client's unix socket), running to completion (stream
+/// `stream` (the warm pty client's control connection), running to completion (stream
 /// EOF or peer FIN). The daemon's warm-pty path uses this after a verified open.
-#[cfg(unix)]
 pub async fn serve_opened_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mux: Arc<Mux>,
     sid: u32,
@@ -256,8 +250,3 @@ pub async fn serve_opened_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'sta
 ) {
     serve_stream(mux, sid, stream, rx, true, None, None).await;
 }
-
-// Keep the Duration import meaningful on non-unix builds, where the verify
-// window (and therefore the only public use) is cfg'd out.
-#[allow(dead_code)]
-fn _duration(_: Duration) {}

@@ -2,6 +2,7 @@ pub mod fs_at;
 pub mod pty;
 pub mod win_pty;
 pub(crate) mod recv_signals;
+pub(crate) mod ctl_endpoint;
 
 use std::path::{Path, PathBuf};
 
@@ -743,6 +744,42 @@ pub async fn termination_signal() -> i32 {
     {
         std::future::pending::<i32>().await
     }
+}
+
+// ------------------------------------------------------ terminal resize --
+
+/// Call `on_resize(cols, rows)` each time this terminal changes size, from a
+/// spawned task the caller aborts when its session ends. Unix watches SIGWINCH.
+/// Windows has no resize signal, and the cold Windows shell does not forward
+/// resizes either, so there it watches nothing and returns `None`.
+#[cfg(unix)]
+pub(crate) fn spawn_resize_watch<F, Fut>(on_resize: F) -> Option<tokio::task::JoinHandle<()>>
+where
+    F: Fn(u16, u16) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    Some(tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sig = match signal(SignalKind::window_change()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        while sig.recv().await.is_some() {
+            if let Ok((c, r)) = crossterm::terminal::size() {
+                on_resize(c, r).await;
+            }
+        }
+    }))
+}
+/// See the unix arm: no resize signal here, so nothing is watched.
+#[cfg(not(unix))]
+pub(crate) fn spawn_resize_watch<F, Fut>(on_resize: F) -> Option<tokio::task::JoinHandle<()>>
+where
+    F: Fn(u16, u16) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    drop(on_resize);
+    None
 }
 
 // ------------------------------------------------- remote process trees --
@@ -4237,6 +4274,8 @@ pub use filament_peerloop::recv::storage_failure;
 
 /// The longest control-socket path we bind. `sun_path` holds 108 bytes on
 /// Linux and 104 on macOS, NUL included; the margin keeps us clear of both.
+/// Unix only: Windows serves a named pipe (`ctl_endpoint`), not a path.
+#[cfg(unix)]
 pub const SOCKET_PATH_MAX: usize = 100;
 
 /// Where the control socket lives: `preferred` (in the config directory) when it
@@ -4252,6 +4291,7 @@ pub const SOCKET_PATH_MAX: usize = 100;
 /// owner, writable by others, a symlink) is never used: `preferred` comes back
 /// instead, which cannot bind, so the daemon fails loudly rather than serve or
 /// be reached through a directory someone else controls.
+#[cfg(unix)]
 pub fn control_socket_path(preferred: &Path, config_dir: &Path) -> PathBuf {
     if preferred.as_os_str().len() < SOCKET_PATH_MAX {
         return preferred.to_path_buf();
@@ -4306,48 +4346,23 @@ pub fn control_socket_path(preferred: &Path, config_dir: &Path) -> PathBuf {
             .or_else(|| candidates.first().cloned())
             .unwrap_or_else(|| preferred.to_path_buf())
     }
-    #[cfg(not(unix))]
-    {
-        let _ = config_dir;
-        preferred.to_path_buf()
-    }
 }
 
-/// Bind and serve this build's control socket, forwarding each parsed request
-/// to `tx` and firing `ready` once accepting.
-///
-/// PLATFORM BOUND: the control socket is a Unix-domain socket, so the server is
-/// unix-only (see `ctl`). This portable wrapper is the one place host glue can
-/// call; the non-unix arm refuses with the same sentence the host trait's inert
-/// default uses.
-#[cfg(unix)]
+/// Bind and serve this build's control channel (a unix socket, or the named
+/// pipe on Windows; see `ctl_endpoint`), forwarding each parsed request to
+/// `tx` and firing `ready` once accepting.
 pub(crate) async fn serve_control(
     tx: tokio::sync::mpsc::UnboundedSender<filament_peerloop::control::Req>,
     ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
-    crate::ctl::serve_at(crate::ctl::control_sock_path(), tx, ready).await
-}
-#[cfg(not(unix))]
-pub(crate) async fn serve_control(
-    _tx: tokio::sync::mpsc::UnboundedSender<filament_peerloop::control::Req>,
-    _ready: Option<tokio::sync::oneshot::Sender<()>>,
-) -> Result<()> {
-    anyhow::bail!("this platform has no control socket")
+    let (path, listener) = ctl_endpoint::bind_daemon_endpoint()?;
+    crate::ctl::serve_listener(listener, &path, tx, ready).await
 }
 
-/// The control socket this build serves, or `None` where the platform has no
-/// Unix-domain socket server.
-///
-/// PLATFORM BOUND: the cfg lives HERE by design. Host glue calls this portable
-/// function and carries no platform branch. `None` is honest, not a disabled
-/// path: no server exists to bind.
-#[cfg(unix)]
+/// The control endpoint this build serves: the socket path on unix, the pipe
+/// name on Windows. Every supported platform serves one.
 pub(crate) fn control_sock_path_if_served() -> Option<PathBuf> {
     Some(crate::ctl::control_sock_path())
-}
-#[cfg(not(unix))]
-pub(crate) fn control_sock_path_if_served() -> Option<PathBuf> {
-    None
 }
 
 /// Prepare the directory a socket is about to be bound in: create it 0700 when
@@ -4646,18 +4661,11 @@ pub(crate) use recv_daemon::*;
 mod stdin;
 pub(crate) use stdin::{read_stdin_timeout, spawn_stdin, RawStdin};
 
-/// Ask the running daemon for its live L3 state, where this platform has a
-/// control socket. Windows has no unix-domain control socket; there the
-/// PID-checked `l3-state.json` record is the truth instead.
+/// Ask the running daemon for its live L3 state over its control channel.
+/// `None` (no daemon answered) leaves the caller on the PID-checked
+/// `l3-state.json` record.
 pub async fn l3_state_over_control() -> Option<serde_json::Value> {
-    #[cfg(unix)]
-    {
-        crate::ctl::try_l3_state().await
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
+    crate::ctl::try_l3_state().await
 }
 
 /// `up --detach` from a caller that captures its output must return: the

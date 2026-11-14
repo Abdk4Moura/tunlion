@@ -1,27 +1,21 @@
-//! Portable wrappers for the daemon control operations that only exist on
-//! unix. The branch lives here; the receive adapter calls one function name on
-//! every target (docs/architecture/PLATFORM.md).
+//! Portable wrappers for the daemon control operations whose support differs
+//! by platform. The branch lives here; the receive adapter calls one function
+//! name on every target (docs/architecture/PLATFORM.md). The warm-bootstrap and
+//! warm-list handlers run wherever a control channel does (unix socket, or the
+//! Windows named pipe); the mount handlers and the self-SIGTERM reload stay
+//! unix-only.
 
 use filament_peerloop::conn::Conn;
 use filament_peerloop::control::Req;
 use filament_peerloop::host::{HostServices, LogSink};
 use std::path::PathBuf;
 
-#[cfg(unix)]
 pub(crate) type PendingBootstraps = filament_peerloop::daemon_ctl::PendingBootstraps;
-#[cfg(not(unix))]
-pub(crate) type PendingBootstraps = ();
 
-#[cfg(unix)]
 pub(crate) async fn warm_bootstrap(conn: &Conn, pending: &mut PendingBootstraps, req: Req) {
     crate::daemon_ctl::handle_warm_bootstrap(conn, pending, req).await
 }
-#[cfg(not(unix))]
-pub(crate) async fn warm_bootstrap(_conn: &Conn, _pending: &mut PendingBootstraps, req: Req) {
-    drop(req);
-}
 
-#[cfg(unix)]
 pub(crate) async fn complete_warm_bootstrap(
     pending: &mut PendingBootstraps,
     pid: &str,
@@ -29,28 +23,13 @@ pub(crate) async fn complete_warm_bootstrap(
 ) {
     crate::daemon_ctl::complete_warm_bootstrap(pending, pid, reply).await
 }
-#[cfg(not(unix))]
-pub(crate) async fn complete_warm_bootstrap(
-    _pending: &mut PendingBootstraps,
-    _pid: &str,
-    _reply: &serde_json::Value,
-) {
-}
 
-#[cfg(unix)]
 pub(crate) fn reap_warm_bootstraps(pending: &mut PendingBootstraps) {
     crate::daemon_ctl::reap_warm_bootstraps(pending)
 }
-#[cfg(not(unix))]
-pub(crate) fn reap_warm_bootstraps(_pending: &mut PendingBootstraps) {}
 
-#[cfg(unix)]
 pub(crate) async fn list_warm(conn: &Conn, req: Req) {
     filament_peerloop::daemon_ctl::handle_list_warm(conn, req).await
-}
-#[cfg(not(unix))]
-pub(crate) async fn list_warm(_conn: &Conn, req: Req) {
-    drop(req);
 }
 
 #[cfg(unix)]

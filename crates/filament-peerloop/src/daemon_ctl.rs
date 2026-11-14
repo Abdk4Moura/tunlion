@@ -216,9 +216,6 @@ impl Drop for LivenessWait {
 /// `reach-pong` carrying the same `n`. An older peer ignores the unknown type,
 /// so its warm link simply does not confirm and reach falls back to the full
 /// probe, which works with any version.
-// Called only by the unix control socket's warm ping (no control socket
-// elsewhere), so other targets see it unused.
-#[allow(dead_code)]
 pub fn liveness_ping(n: u64) -> Value {
     json!({ "type": "reach-ping", "n": n })
 }
@@ -230,9 +227,6 @@ pub fn liveness_pong(ping: &Value) -> Value {
 
 /// How long a warm link has to answer `reach-ping` (TUNLION_REACH_PING_MS,
 /// default 1500 ms) before reach treats it as unconfirmed.
-// Called only by the unix control socket's warm ping (no control socket
-// elsewhere), so other targets see it unused.
-#[allow(dead_code)]
 pub fn liveness_window() -> Duration {
     let ms = std::env::var("TUNLION_REACH_PING_MS")
         .ok()
@@ -250,7 +244,6 @@ pub fn liveness_window() -> Duration {
 ///
 /// `probes` is the calling invocation's registry; the pong is routed back to it
 /// by the same receive loop, never through process-wide state.
-#[cfg(unix)]
 pub async fn handle_warm_ping(conn: &Conn, probes: &LivenessProbes, req: control::Req) {
     let control::ReqKind::Ping { peer } = &req.kind else {
         return;
@@ -323,7 +316,6 @@ pub async fn handle_warm_ping(conn: &Conn, probes: &LivenessProbes, req: control
 
 /// Return only links the daemon already holds. This is deliberately passive:
 /// devices listing must never establish, ping, or otherwise wake a peer.
-#[cfg(unix)]
 pub async fn handle_list_warm(conn: &Conn, req: control::Req) {
     let links: Vec<Value> = conn
         .links
@@ -368,12 +360,10 @@ pub async fn handle_list_warm(conn: &Conn, req: control::Req) {
 /// deadline) and complete it from the `shell-bootstrap-ack`/`-deny` control arms,
 /// or reap it on timeout. A `Vec` per pid handles concurrent ssh to one peer (the
 /// ack is identical, so every waiter gets the same answer).
-#[cfg(unix)]
-pub type PendingBootstraps = HashMap<String, Vec<(tokio::net::UnixStream, std::time::Instant)>>;
+pub type PendingBootstraps = HashMap<String, Vec<(control::CtlStream, std::time::Instant)>>;
 
 /// DEBUG: dump every link's warm-reuse eligibility so a miss-despite-a-live-link
 /// is diagnosable (visible at `-v` / TUNLION_LOG=debug only).
-#[cfg(unix)]
 pub fn log_warm_miss(conn: &Conn, peer: &str) {
     for (p, l) in conn.links.iter() {
         conn.log.debug(&format!(
@@ -394,7 +384,6 @@ pub fn log_warm_miss(conn: &Conn, peer: &str) {
 /// the last cold-establish left). Sends `shell-bootstrap` and STASHES the reply
 /// socket; the ack/deny handler completes it. A miss falls the client back to the
 /// cold `shell_bootstrap`.
-#[cfg(unix)]
 pub async fn handle_warm_bootstrap(
     conn: &Conn,
     pending: &mut PendingBootstraps,
@@ -429,7 +418,6 @@ pub async fn handle_warm_bootstrap(
 /// Complete every stashed `Bootstrap` waiter for `pid` with `reply`. Called from
 /// the `shell-bootstrap-ack`/`-deny` arms; a no-op if none are pending (e.g. the
 /// peer re-acked, or the waiter was already reaped).
-#[cfg(unix)]
 pub async fn complete_warm_bootstrap(pending: &mut PendingBootstraps, pid: &str, reply: &Value) {
     if let Some(waiters) = pending.remove(pid) {
         for (mut sock, _) in waiters {
@@ -440,7 +428,6 @@ pub async fn complete_warm_bootstrap(pending: &mut PendingBootstraps, pid: &str,
 
 /// Drop expired bootstrap waiters (peer never answered): closing the socket gives
 /// the client an EOF, which it reads as a miss and falls back to the cold path.
-#[cfg(unix)]
 pub fn reap_warm_bootstraps(pending: &mut PendingBootstraps) {
     if pending.is_empty() {
         return;
@@ -481,22 +468,9 @@ pub fn take_warm_pty_end(session: &str) -> Option<String> {
         .remove(session)
 }
 
-/// Dispatch one warm-reuse control request to the right handler. Warm reuse is
-/// unix-only (the control socket is a unix-domain socket); on non-unix `control::Req`
-/// is uninhabited so this is never reached - it only keeps the event loop portable.
-#[cfg(not(unix))]
-pub async fn handle_warm_req(
-    _conn: &Conn,
-    _l2_muxes: &mut crate::l2::MuxMap,
-    _warm_ptys: &WarmPtys,
-    _probes: &LivenessProbes,
-    _tx: &tokio::sync::mpsc::UnboundedSender<filament_transport::net::Ev>,
-    req: control::Req,
-) {
-    match req {}
-}
-
-#[cfg(unix)]
+/// Dispatch one warm-reuse control request to the right handler. Served on
+/// every platform with a control channel (a unix socket, or a named pipe on
+/// Windows); the daemon loop answers the inline ops before this.
 pub async fn handle_warm_req(
     conn: &Conn,
     l2_muxes: &mut crate::l2::MuxMap,
@@ -574,7 +548,6 @@ pub async fn handle_warm_req(
 
 /// DEBUG: every link that names `peer`, and which one the warm path chose, so
 /// a slow warm open on a peer with more than one link is diagnosable.
-#[cfg(unix)]
 fn log_warm_pick(conn: &Conn, peer: &str, chosen: &str) {
     for (p, l) in conn.links.iter() {
         if !l
@@ -596,8 +569,7 @@ fn log_warm_pick(conn: &Conn, peer: &str, chosen: &str) {
 }
 
 /// Warm-reuse: open a raw L2 stream to `peer:rport` over its existing link and
-/// bridge it to the client's unix socket (netcat/ssh/forward fast path).
-#[cfg(unix)]
+/// bridge it to the client's control connection (netcat/ssh/forward fast path).
 pub async fn handle_warm_open(
     conn: &Conn,
     l2_muxes: &mut crate::l2::MuxMap,
@@ -637,8 +609,14 @@ pub async fn handle_warm_open(
             .await
         {
             crate::l2::WarmOpen::Opened(sid, first, rx) => {
+                let framed = req.eof_frames;
                 let sock = req.accept().await;
-                crate::l2::serve_verified_stream(mux, sid, sock, first, rx).await;
+                if framed {
+                    let sock = control::decode_upstream(sock);
+                    crate::l2::serve_verified_stream(mux, sid, sock, first, rx).await;
+                } else {
+                    crate::l2::serve_verified_stream(mux, sid, sock, first, rx).await;
+                }
             }
             // The peer ANSWERED: the link is healthy, keep it, and relay the
             // reason so the client can show it (it used to be read as a zombie).
@@ -663,7 +641,6 @@ pub async fn handle_warm_open(
 /// Warm-reuse: open a PTY on `peer` over its existing link and bridge it to the
 /// client's stdio socket (the `tunlion shell` fast path). Records the session->sid
 /// so a later `pty-resize` can find it; the entry is dropped when the bridge ends.
-#[cfg(unix)]
 pub async fn handle_warm_pty(
     conn: &Conn,
     l2_muxes: &mut crate::l2::MuxMap,
@@ -786,7 +763,6 @@ pub async fn handle_warm_pty(
 }
 
 /// Warm-reuse: relay a window-size change to an already-open warm PTY (by session).
-#[cfg(unix)]
 pub async fn handle_warm_resize(
     l2_muxes: &crate::l2::MuxMap,
     warm_ptys: &WarmPtys,
@@ -817,9 +793,6 @@ pub async fn handle_warm_resize(
 
 /// Answer the scoped end reason a finished warm PTY bridge recorded, if any.
 /// Consuming the entry keeps the map bounded; a clean end answers `ok` alone.
-/// Warm reuse and its `control::Req` are unix-only, so this handler must be
-/// too: the non-unix `Req` has no `kind` field.
-#[cfg(unix)]
 pub async fn handle_warm_pty_reason(req: control::Req) {
     let control::ReqKind::WarmPtyReason { session } = &req.kind else {
         return;

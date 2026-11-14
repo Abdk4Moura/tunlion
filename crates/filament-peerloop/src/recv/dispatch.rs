@@ -1487,7 +1487,6 @@ async fn recv_run(
     // the daemon and `serve` was not spawned.
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<Req>();
     let mut ctl_ready: Option<tokio::sync::oneshot::Receiver<()>> = None;
-    #[cfg(unix)]
     {
         if daemon && ports.daemon.daemon_alive() == Some(ports.env.pid) {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1519,8 +1518,6 @@ async fn recv_run(
             }));
         }
     }
-    #[cfg(not(unix))]
-    let _ = &ctl_tx;
     match &code {
         Some(c) => {
             // Split the typed code into (nameplate, words); send ONLY the
@@ -2427,7 +2424,6 @@ async fn recv_run(
                     // Bootstrap defers its reply (awaits the peer's ack via this
                     // loop), so it can't go through the inline handle_warm_req; it
                     // stashes the socket in pending_bootstrap instead.
-                    #[cfg(unix)]
                     {
                         // `tunlion set` live-reconfigure: re-read the changed key
                         // into this loop's live state, then report whether it took
@@ -2496,7 +2492,9 @@ async fn recv_run(
                             // then starts the new binary with fresh ambient caps: no
                             // manual restart, no sudo. Unsupervised, we decline (exiting
                             // would just leave the node down).
-                            let supervised = ports.env.supervised;
+                            // The self-SIGTERM is unix-only; a Windows daemon
+                            // has no reload path, so it never claims one.
+                            let supervised = ports.env.supervised && cfg!(unix);
                             req.reply(&json!({ "ok": true, "reloading": supervised })).await;
                             if supervised {
                                 log.say("tunlion: reloading onto the updated binary (graceful restart)");
@@ -2513,6 +2511,7 @@ async fn recv_run(
                                 match l3.as_ref() {
                                     Some(m) => {
                                         let m = m.clone();
+                                        let framed = req.eof_frames;
                                         tokio::spawn(async move {
                                             let Some(addr) = m.addr_of(&peer).await else {
                                                 req.reject("unknown overlay peer").await;
@@ -2544,7 +2543,12 @@ async fn recv_run(
                                                     if got > 0 && tokio::io::AsyncWriteExt::write_all(&mut sock, &first[..got]).await.is_err() {
                                                         return;
                                                     }
-                                                    let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+                                                    if framed {
+                                                        let mut up = crate::control::decode_upstream(sock);
+                                                        let _ = tokio::io::copy_bidirectional(&mut up, &mut stream).await;
+                                                    } else {
+                                                        let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+                                                    }
                                                 }
                                                 Ok(Err(e)) => req.reject(&format!("overlay dial failed: {e}")).await,
                                                 Err(_) => req.reject(OVERLAY_DIAL_TIMED_OUT).await,
@@ -2736,8 +2740,6 @@ async fn recv_run(
                             ports.daemon.warm_req(&conn, &mut l2_muxes, &tx, req).await;
                         }
                     }
-                    #[cfg(not(unix))]
-                    ports.daemon.warm_req(&conn, &mut l2_muxes, &tx, req).await;
                 }
                 None
             }
@@ -3925,7 +3927,6 @@ async fn recv_run(
         }
         // Drop warm-bootstrap waiters whose peer never acked; the client's read
         // hits EOF and falls back to the cold establish.
-        #[cfg(unix)]
         ports.daemon.reap_warm_bootstraps();
         // rung-1: direct attempt timed out → fall back to WebRTC (unchanged).
         // Unlike the sender call above, this receiver-side fallback routes
@@ -7039,7 +7040,6 @@ async fn recv_run(
                 // `shell-bootstrap` we relayed over its warm link for a `tunlion
                 // ssh`. Complete the stashed reply socket(s) for this pid; the
                 // client then pins these host keys and skips the cold establish.
-                #[cfg(unix)]
                 Some("shell-bootstrap-ack") => {
                     let reply = json!({
                         "ok": true,
@@ -7052,7 +7052,6 @@ async fn recv_run(
                         .complete_warm_bootstrap(&conn, &pid, &reply)
                         .await;
                 }
-                #[cfg(unix)]
                 Some("shell-bootstrap-deny") => {
                     let reply = json!({
                         "ok": false,

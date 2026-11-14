@@ -25,7 +25,6 @@ pub(crate) enum WarmExec {
     Done(anyhow::Result<i32>),
 }
 
-#[cfg(unix)]
 mod imp {
     use super::WarmExec;
     use crate::exec_send::{
@@ -37,15 +36,16 @@ mod imp {
         FRAME_CLOSE, FRAME_EXIT, FRAME_SIGNAL, FRAME_STDERR, FRAME_STDIN, FRAME_STDIN_EOF,
         FRAME_STDOUT, read_frame, write_frame,
     };
+    use crate::ctl::ClientStream;
+    use crate::platform::ctl_endpoint::{connect, split_client};
     use serde_json::{Value, json};
     use std::path::Path;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
     use tokio::sync::mpsc;
 
     /// Read the one JSON reply line, byte at a time, so the binary frames that
     /// follow are never consumed by the line reader.
-    async fn read_line(s: &mut UnixStream, max: usize) -> Result<String> {
+    async fn read_line(s: &mut ClientStream, max: usize) -> Result<String> {
         let mut buf = Vec::with_capacity(64);
         let mut byte = [0u8; 1];
         loop {
@@ -77,7 +77,7 @@ mod imp {
     /// be a cold fallback, not the "reply lost after the open" failure. One
     /// short local round trip is cheap next to a cold establish.
     async fn supports_warm_exec_at(path: &Path) -> bool {
-        let Ok(mut sock) = UnixStream::connect(path).await else {
+        let Ok(mut sock) = connect(path).await else {
             return false;
         };
         if sock.write_all(b"{\"op\":\"exec-cap\"}\n").await.is_err() || sock.flush().await.is_err()
@@ -118,7 +118,7 @@ mod imp {
         if crate::ctl::reuse_disabled() || !supports_warm_exec_at(path).await {
             return WarmExec::NoPath;
         }
-        let mut sock = match UnixStream::connect(path).await {
+        let mut sock = match connect(path).await {
             Ok(s) => s,
             Err(_) => return WarmExec::NoPath,
         };
@@ -216,12 +216,12 @@ mod imp {
     }
 
     async fn serve(
-        sock: UnixStream,
+        sock: ClientStream,
         peer: &str,
         opts: &ExecOpts,
         interrupted: &mut Interrupted,
     ) -> Result<i32> {
-        let (read_half, mut write_half) = sock.into_split();
+        let (read_half, mut write_half) = split_client(sock);
         let (tx, mut frames) = mpsc::channel::<(u8, Vec<u8>)>(32);
         let reader = tokio::spawn(async move {
             let mut r = read_half;
@@ -342,23 +342,6 @@ mod imp {
             bail!("{}", crate::refusal::explain_frame("exec", peer, v, "err"));
         }
         bail!("'{peer}' closed the exec stream: {err}")
-    }
-}
-
-#[cfg(not(unix))]
-mod imp {
-    use super::WarmExec;
-    use crate::exec_send::{ExecOpts, Interrupted};
-
-    /// Windows has no control socket yet, so there is never a warm path: the
-    /// caller uses the cold establish. This is a NAMED absence, not a silent
-    /// success and not a pretend named-pipe implementation.
-    pub(crate) async fn try_exec(
-        _peer: &str,
-        _opts: &ExecOpts,
-        _interrupted: &mut Interrupted,
-    ) -> WarmExec {
-        WarmExec::NoPath
     }
 }
 
