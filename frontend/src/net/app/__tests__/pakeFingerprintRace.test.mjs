@@ -124,6 +124,44 @@ function rig({ pwA = 'brave-otter', pwB = 'brave-otter' } = {}) {
   check('an undisturbed ceremony does not abort', !r.a.c.aborted && !r.b.c.aborted)
 }
 
+// Observed in #689 WebKit fragment #1/#2/#8: B's old data channel was
+// already open, but its element arrived only after pair-matched removed that
+// link. A sent an old-link confirmation while B had no fingerprints; B stashed
+// it and had never itself sent a confirmation on that old link. On the new
+// link the old MAC must be classified as stale, not as a wrong code. A secret
+// is released only after the NEW link's confirmation verifies.
+{
+  const r = rig()
+  r.b.c.observeFingerprints?.(r.linkB.fp())
+  r.linkB.fp = () => null
+  r.a.c.sendOurMessage(); r.b.c.sendOurMessage(); r.pump()
+  check('observed race stashes the old confirmation without current fingerprints',
+    !!r.b.c._pendingConfirmMac && !r.b.c.sentConfirm && !r.b.c.secret)
+  r.linkA.fp = () => ({ mine: 'fp-a2', theirs: 'fp-b2' })
+  r.linkB.fp = () => ({ mine: 'fp-b2', theirs: 'fp-a2' })
+  r.b.c.tryConfirm()
+  check('observed race does not abort the correct code', !r.b.c.aborted, `aborted=${r.b.c.aborted}`)
+  check('an old-link confirmation never authorizes the replacement link', !r.b.c.secret)
+  r.pump()
+  // The receiver's next confirmation prompts the already-confirmed peer to
+  // answer with its confirmation over the current fingerprint pair.
+  r.b.c.tryConfirm(); r.pump()
+  check('observed race eventually confirms both sides on the new link', !!r.a.c.secret && !!r.b.c.secret)
+}
+
+// Keeping an old fingerprint pair cannot turn a genuine password mismatch
+// into a successful pairing, including the no-current-fingerprint window.
+{
+  const r = rig({ pwA: 'brave-otter', pwB: 'wrong-otter' })
+  r.b.c.observeFingerprints?.(r.linkB.fp())
+  r.linkB.fp = () => null
+  r.a.c.sendOurMessage(); r.b.c.sendOurMessage(); r.pump()
+  r.linkB.fp = () => ({ mine: 'fp-b2', theirs: 'fp-a2' })
+  r.b.c.tryConfirm()
+  check('observed ordering with wrong code is refused', !!r.b.c.aborted)
+  check('observed ordering with wrong code releases no secret', !r.b.c.secret)
+}
+
 // --- a genuinely wrong code is still refused ----------------------------------
 {
   const r = rig({ pwA: 'brave-otter', pwB: 'wrong-otter' })
