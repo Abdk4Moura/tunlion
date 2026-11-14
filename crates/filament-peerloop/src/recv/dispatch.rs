@@ -418,14 +418,18 @@ pub fn fleet_arm_skips_pair_link(
 ///
 /// The completion sweep removes the stream from `by_sid`, so the later warm
 /// scan cannot name the sender that just finished; with another stream open it
-/// names the wrong peer instead. The certificate-proven name is the identity
-/// here; the link petname is the fallback for a pair link. Only ever called
-/// after a successful completion, never for a failed, truncated or refused
-/// transfer.
+/// names the wrong peer instead. Only ever called after a successful
+/// completion, never for a failed, truncated or refused transfer.
+///
+/// The name must be the PETNAME the link proved or dialed, never `Link::name`:
+/// that is the peer's broadcast display string, and warming it can dial an
+/// unrelated device (see `petname.rs`). A link with neither is left out, which
+/// is the fail-closed direction: nothing is warmed rather than the wrong peer.
 fn note_completed_sender(conn: &mut Conn, pid: &str) {
     let name = conn
         .link(pid)
-        .map(|l| l.verified_name.clone().unwrap_or_else(|| l.name.clone()))
+        .and_then(crate::petname::link_petname)
+        .map(str::to_string)
         .filter(|n| !n.is_empty());
     if let Some(name) = name {
         conn.note_warm_use(&name);
@@ -438,6 +442,13 @@ fn note_completed_sender(conn: &mut Conn, pid: &str) {
 /// sibling verified on that binding must verify again on the new one: its
 /// standing is dropped and the hello is re-run, otherwise it stays a
 /// non-sibling forever (the reset to Delegated would never be undone).
+///
+/// The verdict is stamped with the epoch it was EARNED on, so a rotation drops
+/// only what an older binding proved. A verdict already earned on the binding
+/// now installed survives: the peer rotated first and greeted us, and it has no
+/// reason to send another hello, so clearing it would wait forever. An
+/// unstamped verdict, or an unknown installed epoch, counts as stale
+/// (fail-closed: re-hello rather than keep standing on an unknown binding).
 pub fn fleet_standing_after_rotation(
     verified: &mut std::collections::HashSet<String>,
     verified_at: &mut std::collections::HashMap<String, fleet_bind::Epoch>,
@@ -4447,18 +4458,11 @@ async fn recv_run(
         // recv_done=false and reconnects unchanged.
         conn.recv_done =
             protocol::recv_transfer_done(st.completed, keep_open, st.by_sid.is_empty());
-        // WARM-HOLD: when a transfer completes, mark the peer as warm so we
-        // proactively reconnect if the link drops.
-        if st.completed > 0 {
-            let warm_peers: Vec<String> = st
-                .by_sid
-                .keys()
-                .filter_map(|(pid, _)| conn.links.get(pid)?.verified_name.clone())
-                .collect();
-            for name in &warm_peers {
-                conn.note_warm_use(name);
-            }
-        }
+        // WARM-HOLD: the sender is marked warm at the completion site
+        // (`note_completed_sender`), before the sweep drops its stream. No
+        // scan here: `st.completed` is cumulative, so it re-warmed every tick,
+        // and it named whatever still sat in `by_sid`, i.e. an IN-FLIGHT peer
+        // rather than the one that just finished.
         if st.completed > 0 || !st.by_sid.is_empty() {
             st.ever_received = true; // a channel was up; Bug-5 wedge hint no longer applies
         }
@@ -6941,6 +6945,12 @@ async fn recv_run(
                                 Ok(ok) => {
                                     fleet_unlisted_hellos.remove(&pid);
                                     let fresh = fleet_verified.insert(pid.clone());
+                                    // Stamp the epoch this verdict was earned on.
+                                    // The hello arm runs with the link installed,
+                                    // so this is normally present; if it is not,
+                                    // the verdict is admitted UNSTAMPED and the
+                                    // next rotation clears it (fail-closed: a
+                                    // re-hello, never a stale standing kept).
                                     if let Some(link) = conn.link(&pid) {
                                         fleet_verified_at.insert(
                                             pid.clone(),
@@ -13059,6 +13069,10 @@ mod linked_fleet_offer_tests {
             "the rotation did not drop the standing"
         );
         assert!(!verified.contains("sib"), "the stale standing survived");
+        assert!(
+            !verified_at.contains_key("sib"),
+            "the stale epoch stamp survived the clear"
+        );
         assert!(!greeted.contains("sib"), "the stale greeting survived");
         assert!(pending.contains("sib"), "the hello was not queued again");
         // A peer that was not verified keeps its pending state, and the
@@ -13107,6 +13121,105 @@ mod linked_fleet_offer_tests {
         assert!(verified.contains("sib"), "the current verdict was removed");
         assert!(greeted.contains("sib"), "the greeting was cleared");
         assert!(!pending.contains("sib"), "a hello was queued unnecessarily");
+    }
+
+    /// An UNSTAMPED verdict counts as stale: it was earned before the epoch was
+    /// recorded, so nothing says which binding it belongs to. Dropping it costs
+    /// one hello; keeping it would keep standing on an unknown binding.
+    #[test]
+    fn an_unstamped_verdict_is_treated_as_stale() {
+        let mut verified = std::collections::HashSet::new();
+        let mut verified_at = std::collections::HashMap::new();
+        let mut greeted = std::collections::HashSet::new();
+        let mut pending = std::collections::HashSet::new();
+        let installed = fleet_bind::Epoch {
+            generation: 11,
+            source: SourceId::next(),
+        };
+        verified.insert("sib".to_string());
+        greeted.insert("sib".to_string());
+        assert!(
+            fleet_standing_after_rotation(
+                &mut verified,
+                &mut verified_at,
+                &mut greeted,
+                &mut pending,
+                "sib",
+                Some(installed),
+            ),
+            "an unstamped verdict was treated as current"
+        );
+        assert!(!verified.contains("sib"), "the unstamped verdict survived");
+        assert!(pending.contains("sib"), "no hello was queued");
+    }
+
+    /// With no installed epoch there is nothing to compare against, so the
+    /// verdict cannot be proven current: same fail-closed direction.
+    #[test]
+    fn a_verdict_with_no_installed_epoch_is_stale() {
+        let mut verified = std::collections::HashSet::new();
+        let mut verified_at = std::collections::HashMap::new();
+        let mut greeted = std::collections::HashSet::new();
+        let mut pending = std::collections::HashSet::new();
+        verified.insert("sib".to_string());
+        greeted.insert("sib".to_string());
+        verified_at.insert(
+            "sib".to_string(),
+            fleet_bind::Epoch {
+                generation: 12,
+                source: SourceId::next(),
+            },
+        );
+        assert!(
+            fleet_standing_after_rotation(
+                &mut verified,
+                &mut verified_at,
+                &mut greeted,
+                &mut pending,
+                "sib",
+                None,
+            ),
+            "a verdict survived with no installed epoch"
+        );
+        assert!(!verified.contains("sib"), "the verdict survived");
+    }
+
+    /// The pair-link skip must be checked BEFORE the cooldown at every fleet
+    /// arm site: a skip must not consume the peer's arm window, or a sibling
+    /// could never arm once the pair link dies. The predicate tests above
+    /// cannot see a reordered call site, so this pins the wiring.
+    #[test]
+    fn every_fleet_arm_site_skips_a_pair_link_before_the_cooldown() {
+        const FULL: &str = include_str!("dispatch.rs");
+        // Cut before this module, built so the marker cannot match itself.
+        let cut = FULL
+            .find(concat!("mod linked_fleet_offer", "_tests {"))
+            .expect("the production code ends where this module begins");
+        let src = &FULL[..cut];
+        const SKIP: &str = "fleet_arm_skips_pair_link(";
+        const ALLOWED: &str = "fleet_arm_allowed(";
+        let mut sites = 0usize;
+        let mut at = 0usize;
+        while let Some(i) = src[at..].find(SKIP) {
+            let pos = at + i;
+            at = pos + SKIP.len();
+            // The definition itself is not a call site.
+            if src[..pos].ends_with("fn ") {
+                continue;
+            }
+            sites += 1;
+            // The `if skip { } else if allowed(..)` shape: the cooldown check
+            // must follow the skip within the same branch chain.
+            let tail = &src[at..(at + 400).min(src.len())];
+            assert!(
+                tail.contains(&format!("else if {ALLOWED}")),
+                "fleet arm site at byte {pos} checks the cooldown without the pair-link skip first"
+            );
+        }
+        assert_eq!(
+            sites, 3,
+            "expected three fleet arm sites (presence, offer escape, sibling re-offer)"
+        );
     }
 }
 
