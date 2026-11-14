@@ -1849,16 +1849,8 @@ impl Peer {
             .with_setting_engine(se)
             .build();
         let pc = Arc::new(
-            api.new_peer_connection(RTCConfiguration {
-                ice_servers,
-                ice_transport_policy: if relay_only {
-                    RTCIceTransportPolicy::Relay
-                } else {
-                    RTCIceTransportPolicy::All
-                },
-                ..Default::default()
-            })
-            .await?,
+            api.new_peer_connection(peer_connection_config(ice_servers, relay_only))
+                .await?,
         );
 
         // P2P ICE diagnostic: log gathering state changes to see when/if
@@ -2738,8 +2730,102 @@ where
     tokio::spawn(reader);
 }
 
+/// The configuration every RTCPeerConnection is built with.
+///
+/// It must never carry `certificates`. With none, each connection generates a
+/// fresh ephemeral DTLS certificate, and the PAKE confirmation, which MACs the
+/// two DTLS certificate fingerprints under the ceremony key (CONTRACT.md, "the
+/// confirmation is bound to this link's per-connection DTLS certificate
+/// fingerprints"), is then fresh per connection: a confirmation from one link
+/// cannot verify on a replacement link. A persistent certificate would make
+/// the fingerprints, and so the MAC, repeat across connections.
+fn peer_connection_config(ice_servers: Vec<RTCIceServer>, relay_only: bool) -> RTCConfiguration {
+    RTCConfiguration {
+        ice_servers,
+        ice_transport_policy: if relay_only {
+            RTCIceTransportPolicy::Relay
+        } else {
+            RTCIceTransportPolicy::All
+        },
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The PAKE confirmation is only fresh per link because no connection is
+    /// given a persistent DTLS certificate; see `peer_connection_config`.
+    /// Every RTCPeerConnection in the workspace is built in exactly one place,
+    /// through `peer_connection_config`, so the test above covers them all. A
+    /// new construction site (or a hand-built `RTCConfiguration`) fails here
+    /// until it goes through the helper.
+    #[test]
+    fn every_peer_connection_is_built_from_the_tested_config() {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = e.file_name();
+                if p.is_dir() {
+                    if name != "target" && name != ".git" && name != "node_modules" {
+                        rust_sources(&p, out);
+                    }
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        // Spelled in pieces so this test's own source is not a match.
+        let construct = ["new_peer", "_connection("].concat();
+        let via_helper = [construct.as_str(), "peer_connection_config("].concat();
+        let literal = ["RTC", "Configuration {"].concat();
+        // A persistent DTLS certificate cannot be built without naming its
+        // type or module; nothing in the workspace names either.
+        let cert = ["RTC", "Certificate"].concat();
+        let cert_mod = ["peer_connection", "::certificate"].concat();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        for top in ["crates", "cli"] {
+            rust_sources(&root.join(top), &mut files);
+        }
+        assert!(
+            files.iter().any(|f| f.ends_with("filament-transport/src/net.rs")),
+            "the scan did not reach net.rs, so it proves nothing"
+        );
+        let (mut built, mut literals, mut certs) = (Vec::new(), Vec::new(), Vec::new());
+        for f in &files {
+            let text = std::fs::read_to_string(f).unwrap_or_default();
+            for (n, line) in text.lines().enumerate() {
+                if line.contains(&construct) {
+                    built.push((f.display().to_string(), n + 1, line.contains(&via_helper)));
+                }
+                // Any struct literal, wherever it sits on its line; the
+                // helper's signature (`-> RTCConfiguration {`) is not one.
+                if line.contains(&literal) && !line.contains("-> ") {
+                    literals.push(format!("{}:{}", f.display(), n + 1));
+                }
+                if line.contains(&cert) || line.contains(&cert_mod) {
+                    certs.push(format!("{}:{}", f.display(), n + 1));
+                }
+            }
+        }
+        assert_eq!(built.len(), 1, "RTCPeerConnection construction sites: {built:?}");
+        assert!(built[0].2, "the one construction site bypasses peer_connection_config: {built:?}");
+        assert_eq!(literals.len(), 1, "hand-built RTCConfiguration outside the helper: {literals:?}");
+        assert!(certs.is_empty(), "a DTLS certificate is constructed or imported: {certs:?}");
+    }
+
+    #[test]
+    fn peer_connections_carry_no_persistent_dtls_certificate() {
+        for relay_only in [false, true] {
+            let cfg = super::peer_connection_config(Vec::new(), relay_only);
+            assert!(
+                cfg.certificates.is_empty(),
+                "a persistent DTLS certificate would let a PAKE confirmation repeat across links"
+            );
+        }
+    }
+
     use super::*;
 
     struct StubTransport;

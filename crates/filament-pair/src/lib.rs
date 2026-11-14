@@ -9,9 +9,9 @@
 //!   - `finish()` consumes the peer's element and returns **K itself** (not
 //!     straight to the secret) — K is needed for BOTH the confirmation MAC and
 //!     the HKDF-to-pinned-secret.
-//!   - `confirm_mac(K, dir, fp_lo, fp_hi, caps)` is the §4 key-confirmation MAC,
-//!     folding the SORTED DTLS fingerprints AND the agreed capability set, so a
-//!     server that substitutes a DTLS cert OR rewrites caps breaks the MAC.
+//!   - `confirm_mac(K, dir, fp_lo, fp_hi, caps)` is the §4 key-confirmation MAC over the
+//!     SORTED link bindings (WebRTC: per-connection DTLS cert fingerprints; local QUIC:
+//!     TLS exporter values) AND the caps, so a substituted cert OR rewritten caps breaks it.
 //!   - `secret_from_k(K)` is the §5.1 HKDF to the 32-byte pinned secret (agreed,
 //!     never transmitted).
 //!
@@ -96,7 +96,7 @@ pub fn finish(state: Spake2<Ed25519Group>, peer_msg: &[u8]) -> Option<Vec<u8>> {
 /// the same byte. A CLI test pins the two together.
 pub const BROWSER_SCOPE: u8 = 0x01;
 
-/// §4 key-confirmation MAC. Folds the SORTED DTLS fingerprints (so a DTLS-layer
+/// §4 key-confirmation MAC. Folds the SORTED link bindings: DTLS fingerprints, or exporter values on local QUIC (so a DTLS-layer
 /// MITM is detected, §5.2) AND the agreed capability set (so a server that
 /// rewrites caps breaks the MAC, §6.1). `dir` is the direction tag
 /// ("A->B"/"B->A") that prevents reflection in the symmetric variant.

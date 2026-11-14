@@ -143,9 +143,84 @@ async function waitPeerVisible(page, name, timeout = 25000) {
   await waitFor(async () => (await peerRows(page, name).count()) === 1, timeout, `peer ${name} visible`);
 }
 
+// Failure-only diagnostics. Every page of the engine run is registered here
+// so a readiness timeout can say which half stalled: signaling (no remote
+// description), ICE (checking/failed), or the data channel (connected PC, a
+// channel that never opened). Nothing here changes what the page does.
+const diagPages = new Map();
+
+// Test-only signaling trace: wraps the three RTCPeerConnection calls that
+// carry offer/answer/ICE so their order is visible after a timeout. Each
+// wrapper records a compact entry and calls straight through.
+function signalTrace() {
+  window.__diagSig = [];
+  const P = window.RTCPeerConnection && window.RTCPeerConnection.prototype;
+  if (!P) return;
+  for (const m of ['setLocalDescription', 'setRemoteDescription', 'addIceCandidate']) {
+    const orig = P[m];
+    if (typeof orig !== 'function') continue;
+    P[m] = function (...args) {
+      try {
+        const d = args[0];
+        const cand = d && d.candidate ? String(d.candidate).split(' ').slice(4, 8).join(' ') : undefined;
+        window.__diagSig.push({ t: Date.now() % 1000000, m, type: d && d.type ? d.type : (m === 'addIceCandidate' ? 'cand' : 'implicit'), cand });
+        if (window.__diagSig.length > 40) window.__diagSig.shift();
+      } catch {}
+      return orig.apply(this, args);
+    };
+  }
+}
+
+// A diagnostic read may never hang the failure path: each is bounded, and a
+// read that does not answer in time reports that instead.
+function bounded(promise, ms, fallback) {
+  return Promise.race([promise.catch(() => fallback), sleep(ms).then(() => fallback)]);
+}
+
+async function dumpReadiness(name) {
+  for (const [label, page] of diagPages) {
+    try {
+      const rows = await bounded(page.locator('[data-testid="peer-tile"]').allInnerTexts(), 3000, ['<rows unavailable>']);
+      const state = await bounded(page.evaluate(() => {
+        const out = [];
+        const links = window.__tunlionTestLinks;
+        if (links) {
+          for (const [id, l] of links) {
+            const pc = l && l.pc;
+            out.push({
+              id: String(id).slice(-6),
+              name: l && l.name,
+              conn: pc && pc.connectionState,
+              ice: pc && pc.iceConnectionState,
+              sig: pc && pc.signalingState,
+              chan: l && l.channel ? l.channel.readyState : null,
+            });
+          }
+        }
+        return { links: out, trace: (window.__diagSig || []).slice(-40) };
+      }), 3000, { error: 'page did not answer within 3s' });
+      console.log(`[peer-reload] DIAG waiting for ${name} on ${label}: rows=${JSON.stringify(rows.map((r) => r.replace(/\s+/g, ' ').slice(0, 120)))}`);
+      console.log(`[peer-reload] DIAG ${label} links=${JSON.stringify(state.links || state)}`);
+      console.log(`[peer-reload] DIAG ${label} signal-trace=${JSON.stringify(state.trace || [])}`);
+    } catch (e) {
+      console.log(`[peer-reload] DIAG ${label} unavailable: ${String(e).slice(0, 200)}`);
+    }
+  }
+}
+
 // A row saying "ready" means the real PeerLink reached connectionState
 // connected; this is the live WebRTC assertion, not just "a name rendered".
 async function waitPeerReady(page, name, timeout = 30000) {
+  try {
+    await waitPeerReadyOnce(page, name, timeout);
+  } catch (e) {
+    // The original timeout is what fails the gate, whatever the dump does.
+    await bounded(dumpReadiness(name), 15000, undefined).catch(() => {});
+    throw e;
+  }
+}
+
+async function waitPeerReadyOnce(page, name, timeout) {
   await waitFor(async () => {
     const row = peerRows(page, name).first();
     if ((await row.count()) !== 1) return false;
@@ -203,7 +278,9 @@ async function runEngine(engine, browser, contextOptions) {
     // A stand-in second device, in its own context so it has its own uid/name.
     peerCtx = await browser.newContext({ ...contextOptions, serviceWorkers: 'block' });
     await peerCtx.addInitScript(trackPageshow);
+    await peerCtx.addInitScript(signalTrace);
     peer = await peerCtx.newPage();
+    diagPages.set('peer', peer);
     peer.on('pageerror', (e) => console.log(tag, '[peer page-error]', String(e).slice(0, 300)));
     peer.on('console', (m) => { if (m.type() === 'error') console.log(tag, '[peer console]', m.text().slice(0, 300)); });
     await nav(peer, BASE);
@@ -217,7 +294,9 @@ async function runEngine(engine, browser, contextOptions) {
   // stale SW would make this gate flaky for the wrong reason.
   const devCtx = await browser.newContext({ ...contextOptions, serviceWorkers: 'block' });
   await devCtx.addInitScript(trackPageshow);
+  await devCtx.addInitScript(signalTrace);
   const dev = await devCtx.newPage();
+  diagPages.set('dev', dev);
   dev.on('pageerror', (e) => console.log(tag, '[dev page-error]', String(e).slice(0, 300)));
   dev.on('console', (m) => { if (m.type() === 'error') console.log(tag, '[dev console]', m.text().slice(0, 300)); });
   await nav(dev, BASE);
@@ -259,6 +338,7 @@ async function runEngine(engine, browser, contextOptions) {
     try { sessionStorage.setItem('tunlion.uid', uid); } catch {}
   }, { uid: g2.uid });
   const second = await devCtx.newPage();
+  diagPages.set('second', second);
   second.on('pageerror', (e) => console.log(tag, '[second page-error]', String(e).slice(0, 300)));
   second.on('console', (m) => { if (m.type() === 'error') console.log(tag, '[second console]', m.text().slice(0, 300)); });
   await nav(second, BASE);
