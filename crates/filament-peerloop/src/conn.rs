@@ -9390,12 +9390,13 @@ mod warm_identity_tests {
     }
 
     /// A LAN DEVICE link is the pair only while its exact binding is live. A
-    /// record revoked on disk (secret retained, no sweep yet), a forgotten
-    /// record, or a session-revoked binding adopts untrusted, unnamed and with
-    /// the empty ceiling, exactly what the old blanket LAN rule gave every link.
+    /// record revoked on disk (secret retained, no sweep yet) or a forgotten
+    /// record adopts untrusted, unnamed and with the empty ceiling, exactly
+    /// what the old blanket LAN rule gave every link. A session-revoked
+    /// binding is refused before adoption and installs no link at all.
     #[tokio::test]
     async fn a_lan_link_is_the_pair_only_while_its_binding_is_live() {
-        async fn adopt(host: TestHost, session_revoked: bool) -> Link {
+        async fn try_adopt(host: TestHost, session_revoked: bool) -> Option<Link> {
             let (mut conn, _far, _rx) = test_conn_with_host(Arc::new(host)).await;
             if session_revoked {
                 conn.revoked_bindings.insert("s1".to_string());
@@ -9405,11 +9406,20 @@ mod warm_identity_tests {
             let t: Arc<dyn Transport> = Rec::with_attempt("lan", &log, net::AttemptId::next());
             let attempt = t.attempt_id().unwrap();
             conn.seed_lan(pid, "boxb", "s1", false, attempt);
-            assert!(matches!(
-                conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN),
-                DirectAdoption::Adopted { tkey: None, .. }
-            ));
-            conn.links.remove(pid).unwrap()
+            match conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN) {
+                DirectAdoption::Adopted { tkey, .. } => {
+                    assert!(tkey.is_none(), "a LAN adoption minted a worker key");
+                    Some(conn.links.remove(pid).unwrap())
+                }
+                DirectAdoption::Rejected => {
+                    assert!(!conn.links.contains_key(pid));
+                    None
+                }
+                _ => panic!("unexpected LAN adoption outcome"),
+            }
+        }
+        async fn adopt(host: TestHost) -> Link {
+            try_adopt(host, false).await.expect("LAN adoption was refused")
         }
         fn live() -> TestHost {
             TestHost {
@@ -9418,7 +9428,7 @@ mod warm_identity_tests {
                 ..Default::default()
             }
         }
-        let pair = adopt(live(), false).await;
+        let pair = adopt(live()).await;
         assert!(pair.trusted);
         assert_eq!(
             pair.verified_name.as_deref(),
@@ -9435,7 +9445,7 @@ mod warm_identity_tests {
             principal_ceilings: vec![("boxb".to_string(), vec!["transfer".to_string()])],
             ..live()
         };
-        let invited = adopt(invited, false).await;
+        let invited = adopt(invited).await;
         assert!(
             matches!(&invited.principal_kind, PrincipalKind::Delegated { caps } if caps.is_empty()),
             "a delegated record over LAN was not resolved from its record"
@@ -9443,10 +9453,13 @@ mod warm_identity_tests {
 
         let revoked = TestHost { revoked_records: vec!["boxb".to_string()], ..live() };
         let forgotten = TestHost { devices: vec![], ..live() };
+        assert!(
+            try_adopt(live(), true).await.is_none(),
+            "a session-revoked LAN binding installed a link"
+        );
         for (what, link) in [
-            ("revoked record", adopt(revoked, false).await),
-            ("forgotten record", adopt(forgotten, false).await),
-            ("session-revoked binding", adopt(live(), true).await),
+            ("revoked record", adopt(revoked).await),
+            ("forgotten record", adopt(forgotten).await),
         ] {
             assert!(!link.trusted, "{what}: LAN link was trusted");
             assert!(link.verified_name.is_none(), "{what}: LAN link was named");
