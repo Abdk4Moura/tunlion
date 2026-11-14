@@ -12,10 +12,11 @@ gradle :app:assembleDebug
 
 The current native slice covers identity setup, file-code transfer,
 invitation-file preview and join, and shared-core device policy. The device
-screen displays stored access states, can revoke a capability, and can cut off,
-forget, or restore a device. These are local policy changes, not claims that a
-peer was contacted or an active session ended. Spoken-code enrollment remains
-unlinked. No Kotlin policy engine or browser fleet behavior is implied.
+screen displays stored access states, can revoke a capability, cut off or
+forget a device, and lift a key block written by a prior forget. These are local
+policy changes, not claims that a peer was contacted or an active session ended.
+Spoken-code enrollment remains unlinked. No Kotlin policy engine or browser
+fleet behavior is implied.
 
 Navigation uses Jetpack's `NavHost`, with Android predictive back enabled. Back
 gestures seek the destination transition before release; cancelling keeps the
@@ -69,10 +70,11 @@ or device verification; use the workflow or an approved leased Android worker.
   enrollment is still not linked.
 - The device list is projected from core `devices()`, not from Kotlin policy or
   CLI output. It shows the stored relationship (paired, fleet, temporary,
-  unknown) and every returned action state (effective, pending, blocked,
-  unsupported, unknown), keyed by the core `ActionKind` enum rather than a
-  display string, including expiry and local revocation. Presence stays
-  unknown unless the core reports `Live`; the snapshot does not probe peers. A
+  unknown) and every returned action state (available, pending, blocked,
+  unsupported, or unknown), keyed by the core `ActionKind` enum rather than a
+  display string, including expiry and local revocation. Available is the only
+  state presented as effective. Presence stays unknown unless the core reports
+  `Live`; the snapshot does not probe peers. A
   stored relationship or recorded grant is never shown as proof that a remote
   action currently works.
 - Sending to a stored device is offered as an explicit attempt only when the
@@ -80,11 +82,13 @@ or device verification; use the workflow or an approved leased Android worker.
   receiver's per-file delivery acknowledgment from `SendResult`; an attempt
   that was not acknowledged is never shown as delivered.
 - Capability revocation and device cut-off, forget, and restore use shared-core
-  operations and typed receipts. They update this phone's policy only; the app
-  does not claim that the peer was contacted or an existing session ended.
-  Capability grants and active-session termination are not exposed in the device
-  UI. Spoken-code enrollment remains unlinked, and the client does not mint
-  relationship or permission authority.
+  operations and typed receipts. In the device UI, restore is offered only to
+  lift a key block written by a prior forget; it does not recreate the record.
+  These operations update this phone's policy only; the app does not claim that
+  the peer was contacted or an existing session ended. Capability grants and
+  active-session termination are not exposed in the device UI. Spoken-code
+  enrollment remains unlinked, and the client does not mint relationship or
+  permission authority.
 - Discovery, expiry enforcement beyond stored facts, and recovery import still
   need core APIs. No successful stub or inferred remote permission is used.
   Offline and route facts remain unknown.
@@ -109,13 +113,14 @@ the typed `devices()` projection without exporting pair secrets.
 `DeviceAuthorityUiTest` checks the relationship and action-state UI contract,
 including that an unknown remote send permission permits only an explicit
 attempt and that forget and cut-off require confirmation and show core receipts.
-`DevicePolicyFfiTest` checks native policy mapping, ceiling refusal, and the
-local-only receipts for forget, cut-off, and restore.
-`NativePeerAcceptanceTest` requires a real sender plus `code`, `sha256`, `bytes`
-instrumentation arguments and verifies exact stored bytes against the digest.
-These tests must run on a leased worker or CI. `CliAndroidAcceptanceTest` is
-quarantined under `android/legacy-cli/` and is not evidence for the native
-adapter.
+`DevicePolicyFfiTest` checks native policy mapping, ceiling refusal, forget's
+local-only receipt, and the store effects and receipt modes for cut-off and
+restore. The default workflow runs the core, policy, and UI classes, then runs
+`NativeAdapterAcceptanceTest` separately with a real desktop sender.
+`NativePeerAcceptanceTest` is not selected by the default workflow; it requires
+a real sender and `code`, `sha256`, and `bytes` instrumentation arguments.
+`CliAndroidAcceptanceTest` is quarantined under `android/legacy-cli/` and is not
+evidence for the native adapter.
 
 ## Preview feedback
 
