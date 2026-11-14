@@ -315,7 +315,7 @@ OUTC=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/ech
 rcC=$?
 echo "## (exec after revoke) rc=$rcC out='$OUTC'"
 if [ "$rcC" != "0" ] \
-   && ! echo "$OUTC" | grep -q "SHOULD-NOT-RUN" \
+   && ! grep -q "SHOULD-NOT-RUN" <<<"$OUTC" \
    && grep -qi "revoked" "$WORK/C.err" \
    && grep -q "exec refused: device revoked" "$WORK/up.log"; then
   ok "gateC: revoked certificate REFUSED the exec (nonzero, reason on both ends)"
@@ -331,7 +331,7 @@ OUTD=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" shell alpha -- 'echo S
 rcD=$?
 echo "## (shell after revoke) rc=$rcD"
 if [ "$rcD" != "0" ] \
-   && ! echo "$OUTD" | grep -q "SHOULD-NOT-RUN" \
+   && ! grep -q "SHOULD-NOT-RUN" <<<"$OUTD" \
    && grep -q "pty refused: $SPOKE: device revoked" "$WORK/up.log"; then
   ok "gateD: revoked certificate REFUSED the shell (nonzero, owner names the reason)"
 else
@@ -464,18 +464,20 @@ unset TUNLION_FLEET_HELLO_TRACE
 FG_HELLO_BOUND=20
 FG_HELLO=0 FG_HELLO_S=-1 FG_RECONNECTS=-1 FG_ADMITTED=0
 FG_KEY_OK=0
-printf '%s' "$FG_PUB" | grep -qE '^[0-9a-f]{64}$' && FG_KEY_OK=1
+[[ "$FG_PUB" =~ ^[0-9a-f]{64}$ ]] && FG_KEY_OK=1
 fg_owner_since() { tail -n +"$((FG_OWNER_LOG_FROM + 1))" "$WORK/up.log" 2>/dev/null; }
 fg_trace_since() { tail -n +"$((FG_OWNER_FROM + 1))" "$OWNER_TRACE" 2>/dev/null; }
+# Each window is read whole into a here-string and counted with `grep -c`, so
+# no producer is cut off by an early-exiting `grep -q` (SIGPIPE under pipefail).
 fg_refused() {
   [ "$FG_KEY_OK" = "1" ] || return 1
-  fg_owner_since | grep -qE "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=refused reason=device-revoked cb=[^ ]+ dev=${FG_PUB:0:16}\$" \
-    || fg_trace_since | grep -qE "^t_ms=[0-9]+ fhello-verdict .* claimed_dev=${FG_PUB} .*outcome=refused why=device-revoked dev=${FG_PUB}\$"
+  [ "$(grep -cE "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=refused reason=device-revoked cb=[^ ]+ dev=${FG_PUB:0:16}\$" <<<"$(fg_owner_since)")" -gt 0 ] \
+    || [ "$(grep -cE "^t_ms=[0-9]+ fhello-verdict .* claimed_dev=${FG_PUB} .*outcome=refused why=device-revoked dev=${FG_PUB}\$" <<<"$(fg_trace_since)")" -gt 0 ]
 }
 fg_admitted() {
   [ "$FG_KEY_OK" = "1" ] || return 1
-  fg_owner_since | grep -qE "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=(verified|admitted) reason=[^ ]+ cb=[^ ]+ dev=${FG_PUB:0:16}\$" \
-    || fg_trace_since | grep -qE "^t_ms=[0-9]+ fhello-verdict .*outcome=admitted .*dev=${FG_PUB}\$"
+  [ "$(grep -cE "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=(verified|admitted) reason=[^ ]+ cb=[^ ]+ dev=${FG_PUB:0:16}\$" <<<"$(fg_owner_since)")" -gt 0 ] \
+    || [ "$(grep -cE "^t_ms=[0-9]+ fhello-verdict .*outcome=admitted .*dev=${FG_PUB}\$" <<<"$(fg_trace_since)")" -gt 0 ]
 }
 FG_T0=$SECONDS
 for _ in $(seq 1 60); do
@@ -582,12 +584,21 @@ run_impostor_variant() {
   # impostor's key since this variant's mark (a step line with its key prefix,
   # or a trace verdict ending in its full key). The impostor's own log is never
   # read for it, so the impostor admitting the real spoke cannot satisfy it.
+  # ONE predicate serves `attempted` and the exercised verdict, so the two
+  # cannot disagree. Windows are read whole into here-strings (no pipeline
+  # into an early-exiting grep).
+  imp_owner_steps() {
+    [[ "$MALLORY_PUB" =~ ^[0-9a-f]{64}$ ]] || return 0
+    grep -E "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=(verified|admitted|refused|held|ignored|dropped) reason=[^ ]+ cb=[^ ]+ dev=${MALLORY_PUB:0:16}\$" \
+      <<<"$(tail -n +"$((owner_log_from + 1))" "$WORK/up.log" 2>/dev/null)" || true
+  }
+  imp_owner_traces() {
+    [[ "$MALLORY_PUB" =~ ^[0-9a-f]{64}$ ]] || return 0
+    grep -E "^t_ms=[0-9]+ fhello-verdict .*(claimed_dev|dev)=${MALLORY_PUB}( |\$)" \
+      <<<"$(tail -n +"$((owner_from + 1))" "$OWNER_TRACE" 2>/dev/null)" || true
+  }
   imp_owner_evaluated() {
-    printf '%s' "$MALLORY_PUB" | grep -qE '^[0-9a-f]{64}$' || return 1
-    tail -n +"$((owner_log_from + 1))" "$WORK/up.log" 2>/dev/null \
-      | grep -qE "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=(verified|admitted|refused|held|ignored|dropped) reason=[^ ]+ cb=[^ ]+ dev=${MALLORY_PUB:0:16}\$" \
-      || tail -n +"$((owner_from + 1))" "$OWNER_TRACE" 2>/dev/null \
-        | grep -qE "^t_ms=[0-9]+ fhello-verdict .*(claimed_dev|dev)=${MALLORY_PUB}( |\$)"
+    [ -n "$(imp_owner_steps)$(imp_owner_traces)" ]
   }
   local settled=0
   for _ in $(seq 1 45); do
@@ -627,7 +638,7 @@ PY
   [ "$?" = "0" ] && intact=1
   OUTI=$(timeout 60 "${M_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/I-$tag.err" </dev/null)
   local rcI=$?
-  [ "$rcI" != "0" ] && ! echo "$OUTI" | grep -q "SHOULD-NOT-RUN" && execref=1
+  [ "$rcI" != "0" ] && ! grep -q "SHOULD-NOT-RUN" <<<"$OUTI" && execref=1
   [ "$rcI" = "124" ] && window_expired "I-$tag impostor exec" 60 "the refused exec did not return"
   echo "## (impostor $tag) refused=$refused attempted=$attempted victim=$victim_ok intact=$intact execref=$execref"
   # Whether the OWNER evaluated the impostor's OWN hello: an info-level
@@ -637,14 +648,22 @@ PY
   # hello it is judging, so the impostor admitting the real spoke (logged in
   # the impostor's own log, with the spoke's key) cannot satisfy this. This is
   # the NOT EXERCISED verdict below, kept separate from containment and refusal.
-  local owner_eval=0 owner_steps="" key_ok=0
-  if printf '%s' "$MALLORY_PUB" | grep -qE '^[0-9a-f]{64}$'; then
+  local owner_eval=0 owner_steps="" owner_traces="" owner_summary="" key_ok=0
+  if [[ "$MALLORY_PUB" =~ ^[0-9a-f]{64}$ ]]; then
     key_ok=1
-    owner_steps=$(tail -n +"$((owner_log_from + 1))" "$WORK/up.log" 2>/dev/null \
-      | grep -E "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=(verified|admitted|refused|held|ignored|dropped) reason=[^ ]+ cb=[^ ]+ dev=${MALLORY_PUB:0:16}\$" || true)
-    [ -n "$owner_steps" ] && owner_eval=$(printf '%s\n' "$owner_steps" | wc -l)
+    owner_steps=$(imp_owner_steps)
+    owner_traces=$(imp_owner_traces)
+    # The same predicate as `attempted`: step lines OR trace lines.
+    imp_owner_evaluated && owner_eval=$(grep -c . <<<"$owner_steps$owner_traces")
+    # The summary names the step/reason when step lines exist, else the trace
+    # outcome/why.
+    if [ -n "$owner_steps" ]; then
+      owner_summary=$(grep -oE "step=[a-z]+ reason=[^ ]+" <<<"$owner_steps" | sort | uniq -c | tr -s ' ' | tr '\n' ';')
+    else
+      owner_summary=$(grep -oE "outcome=[a-z]+ why=[^ ]+" <<<"$owner_traces" | sort | uniq -c | tr -s ' ' | tr '\n' ';')
+    fi
   fi
-  echo "## (impostor $tag) owner evaluated the impostor's own hello: $owner_eval ($(printf '%s\n' "$owner_steps" | grep -oE "step=[a-z]+ reason=[^ ]+" | sort | uniq -c | tr -s ' ' | tr '\n' ';'))"
+  echo "## (impostor $tag) owner evaluated the impostor's own hello: $owner_eval ($owner_summary)"
   if [ "$attempted" = "1" ] && [ "$victim_ok" = "1" ] && [ "$intact" = "1" ] && [ "$execref" = "1" ]; then
     ok "gateI-$tag: squat as '$variant' CONTAINED (victim keyed + byte-identical, impostor reached the owner, exec refused)"
   else
@@ -684,7 +703,7 @@ PY
     echo "NOT-EXERCISED: gateI-$tag: impostor key unreadable, instrument fault (devicePub='${MALLORY_PUB:-}')"
     NOT_EXERCISED=$((NOT_EXERCISED + 1)); NOT_EXERCISED_LIST+=("gateI-$tag")
   elif [ "$owner_eval" -ge 1 ]; then
-    ok "gateI-$tag: exercised (the owner evaluated the impostor's own hello: $(printf '%s\n' "$owner_steps" | grep -oE "step=[a-z]+ reason=[^ ]+" | sort -u | tr '\n' ' '))"
+    ok "gateI-$tag: exercised (the owner evaluated the impostor's own hello: $owner_summary)"
   else
     echo "NOT-EXERCISED: gateI-$tag: the owner evaluated no fleet-hello carrying the impostor's key (${MALLORY_PUB:0:16}) since this variant's mark, so containment and refusal above are vacuous"
     NOT_EXERCISED=$((NOT_EXERCISED + 1)); NOT_EXERCISED_LIST+=("gateI-$tag")
@@ -819,7 +838,7 @@ echo "## (authoritative uncovered exec) rc=$rcAB out='$OUTAB'"
 # ceiling/grant refusal with nothing run, not which intermediate sentence the
 # gate logged first.
 if [ "$rcAB" != "0" ] \
-   && ! echo "$OUTAB" | grep -q "SHOULD-NOT-RUN" \
+   && ! grep -q "SHOULD-NOT-RUN" <<<"$OUTAB" \
    && grep -qiE "explicit grant|invitation ceiling" "$WORK/up-auth.log"; then
   ok "gateAUTH-B: uncovered exec refused under authoritative (grant reason, no output)"
 else
@@ -844,7 +863,7 @@ echo "## (authoritative exec after revoke) revoke rc=$rcRevAC exec rc=$rcAC out=
 # revoked, and the owner logged a new "exec refused: device revoked".
 if [ "$rcRevAC" = "0" ] \
    && [ "$rcAC" != "0" ] \
-   && ! echo "$OUTAC" | grep -q "SHOULD-NOT-RUN" \
+   && ! grep -q "SHOULD-NOT-RUN" <<<"$OUTAC" \
    && grep -qi "revoked" "$WORK/AC.err" \
    && [ "$ac_reason_after" -gt "$ac_reason_before" ]; then
   ok "gateAUTH-C: revoked spoke refused under authoritative (nonzero, reason on both ends)"
