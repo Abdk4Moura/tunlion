@@ -451,11 +451,35 @@ unset TUNLION_FLEET_HELLO_TRACE
 # challenge stalled a link until a reconnect gave it a new peer id, which landed
 # outside this window in most runs; the bound is what proves the retry, not the
 # 60 s wait.
+#
+# The evidence is the OWNER's, never the forgotten device's: a correctly
+# refused device logs neither "joined the mesh" nor anything else that says
+# it was judged. FG_HELLO is set only by an owner line, after the restart
+# mark, that refuses a hello carrying the forgotten key:
+#   step line   fleet pid=.. gen=.. src=.. step=refused reason=device-revoked cb=.. dev=<key prefix 16>
+#   trace line  t_ms=.. fhello-verdict .. claimed_dev=<full key> .. outcome=refused why=device-revoked dev=<full key>
+# and FG_ADMITTED by any owner line that ADMITS that key (step=verified or
+# step=admitted with its prefix, or a trace outcome=admitted ending in the full
+# key). An admission fails the gate even when a refusal line also exists.
 FG_HELLO_BOUND=20
-FG_HELLO=0 FG_HELLO_S=-1 FG_RECONNECTS=-1
+FG_HELLO=0 FG_HELLO_S=-1 FG_RECONNECTS=-1 FG_ADMITTED=0
+FG_KEY_OK=0
+printf '%s' "$FG_PUB" | grep -qE '^[0-9a-f]{64}$' && FG_KEY_OK=1
+fg_owner_since() { tail -n +"$((FG_OWNER_LOG_FROM + 1))" "$WORK/up.log" 2>/dev/null; }
+fg_trace_since() { tail -n +"$((FG_OWNER_FROM + 1))" "$OWNER_TRACE" 2>/dev/null; }
+fg_refused() {
+  [ "$FG_KEY_OK" = "1" ] || return 1
+  fg_owner_since | grep -qE "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=refused reason=device-revoked cb=[^ ]+ dev=${FG_PUB:0:16}\$" \
+    || fg_trace_since | grep -qE "^t_ms=[0-9]+ fhello-verdict .* claimed_dev=${FG_PUB} .*outcome=refused why=device-revoked dev=${FG_PUB}\$"
+}
+fg_admitted() {
+  [ "$FG_KEY_OK" = "1" ] || return 1
+  fg_owner_since | grep -qE "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=(verified|admitted) reason=[^ ]+ cb=[^ ]+ dev=${FG_PUB:0:16}\$" \
+    || fg_trace_since | grep -qE "^t_ms=[0-9]+ fhello-verdict .*outcome=admitted .*dev=${FG_PUB}\$"
+}
 FG_T0=$SECONDS
 for _ in $(seq 1 60); do
-  if grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null; then
+  if fg_refused; then
     FG_HELLO=1
     FG_HELLO_S=$((SECONDS - FG_T0))
     FG_RECONNECTS=$(grep -c "reconnecting" "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null || true)
@@ -463,18 +487,22 @@ for _ in $(seq 1 60); do
   fi
   sleep 1
 done
-echo "## FORGET restarted device evaluated (hello judged, refusal expected) after ${FG_HELLO_S}s (bound ${FG_HELLO_BOUND}s), signaling reconnects before it: $FG_RECONNECTS"
-[ "$FG_HELLO" = "1" ] || window_expired "FORGET-REVOKES restarted-device hello" 60 "no fleet-hello, identity or mesh line in up-$FORGOTTEN-again.log"
+echo "## FORGET owner evaluated and refused the forgotten key after ${FG_HELLO_S}s (bound ${FG_HELLO_BOUND}s), signaling reconnects before it: $FG_RECONNECTS"
+[ "$FG_HELLO" = "1" ] || window_expired "FORGET-REVOKES owner refusal of the forgotten key" 60 "no owner step=refused reason=device-revoked or trace outcome=refused for key ${FG_PUB:0:16} (key well-formed=$FG_KEY_OK)"
 sleep 5
+# Positive control, read after the settle: the owner must not have admitted
+# the forgotten key on any link since the restart.
+fg_admitted && FG_ADMITTED=1
 FG_REINDEXED=$(python3 -c "import json;print(1 if any(d.get('deviceCert',{}).get('devicePub')=='$FG_PUB' or d.get('name')=='$FORGOTTEN' for d in json.load(open('$DA/devices.json'))) else 0)" 2>/dev/null)
 FG_LISTED=$(python3 -c "import json;print(1 if any(e.get('devicePub')=='$FG_PUB' for e in json.load(open('$DA/revoked-keys.json'))) else 0)" 2>/dev/null)
-echo "## forget rc=$rcFG key=${FG_PUB:0:16}... on key list=$FG_LISTED re-indexed after a fresh hello=$FG_REINDEXED (hello attempted=$FG_HELLO)"
+echo "## forget rc=$rcFG key=${FG_PUB:0:16}... on key list=$FG_LISTED re-indexed after a fresh hello=$FG_REINDEXED (owner refused it=$FG_HELLO, owner admitted it=$FG_ADMITTED)"
 if [ "$rcFG" = "0" ] && [ -n "$FG_PUB" ] \
    && grep -q "Forgot $FORGOTTEN" "$WORK/forget.log" \
    && grep -qE "key refused for [0-9]+ days?" "$WORK/forget.log" \
    && [ "$FG_LISTED" = "1" ] && [ "$FG_REINDEXED" = "0" ] && [ "$FG_HELLO" = "1" ] \
-   && [ "$FG_HELLO_S" -ge 0 ] && [ "$FG_HELLO_S" -le "$FG_HELLO_BOUND" ] && [ "$FG_RECONNECTS" = "0" ]; then
-  ok "gateFORGET-REVOKES: forget revoked the live key, freed the name, and fleet-hello did not re-admit it (hello evaluated in ${FG_HELLO_S}s, no reconnect)"
+   && [ "$FG_HELLO_S" -ge 0 ] && [ "$FG_HELLO_S" -le "$FG_HELLO_BOUND" ] && [ "$FG_RECONNECTS" = "0" ] \
+   && [ "$FG_ADMITTED" = "0" ]; then
+  ok "gateFORGET-REVOKES: forget revoked the live key, freed the name, and the owner evaluated and refused the forgotten key after ${FG_HELLO_S}s (no reconnect, never admitted)"
 else
   echo "-- forget.log (rc=$rcFG) --"; cat "$WORK/forget.log"
   echo "-- forgotten device log --"; tail -5 "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null
@@ -483,7 +511,8 @@ else
   dump_fleet_steps "owner, since the restart" "$WORK/up.log" "$FG_OWNER_LOG_FROM"
   dump_fleet_steps "forgotten device" "$WORK/up-$FORGOTTEN-again.log"
   dump_signaling "$WORK/up.log" "$WORK/up-$FORGOTTEN-again.log" "$WORK/up-$SPOKE.log" "$WORK/up-$MALLORY.log"
-  bad "gateFORGET-REVOKES: forget of a live certificate holder did not cut it off truthfully (rc=$rcFG listed=$FG_LISTED reindexed=$FG_REINDEXED hello=$FG_HELLO after=${FG_HELLO_S}s bound=${FG_HELLO_BOUND}s reconnects=$FG_RECONNECTS)"
+  [ "$FG_ADMITTED" = "1" ] && echo "-- the OWNER ADMITTED the forgotten key ${FG_PUB:0:16} after the restart --"
+  bad "gateFORGET-REVOKES: forget of a live certificate holder did not cut it off truthfully (rc=$rcFG listed=$FG_LISTED reindexed=$FG_REINDEXED owner_refused=$FG_HELLO owner_admitted=$FG_ADMITTED after=${FG_HELLO_S}s bound=${FG_HELLO_BOUND}s reconnects=$FG_RECONNECTS)"
 fi
 pkill -f "up --dir $WORK/$FORGOTTEN-again-drop" 2>/dev/null || true
 # The impostor shape these gates need, "valid cert, no record, NOT revoked",
@@ -549,23 +578,35 @@ run_impostor_variant() {
   # no longer gets it a link: it reaches the owner only through fleet-hello,
   # after its pair-path attempt fails, which can take longer than 8s. Bounded:
   # a refusal that never comes still fails the verdicts below exactly as before.
+  # "Attempted" is OWNER-side: the owner evaluated a hello carrying the
+  # impostor's key since this variant's mark (a step line with its key prefix,
+  # or a trace verdict ending in its full key). The impostor's own log is never
+  # read for it, so the impostor admitting the real spoke cannot satisfy it.
+  imp_owner_evaluated() {
+    printf '%s' "$MALLORY_PUB" | grep -qE '^[0-9a-f]{64}$' || return 1
+    tail -n +"$((owner_log_from + 1))" "$WORK/up.log" 2>/dev/null \
+      | grep -qE "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=(verified|admitted|refused|held|ignored|dropped) reason=[^ ]+ cb=[^ ]+ dev=${MALLORY_PUB:0:16}\$" \
+      || tail -n +"$((owner_from + 1))" "$OWNER_TRACE" 2>/dev/null \
+        | grep -qE "^t_ms=[0-9]+ fhello-verdict .*(claimed_dev|dev)=${MALLORY_PUB}( |\$)"
+  }
   local settled=0
   for _ in $(seq 1 45); do
     if [ "$(grep -c "reason=name-taken" "$WORK/up.log" || true)" -gt "$refused_before" ] \
-       && grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$MALLORY-$tag.log"; then
+       && imp_owner_evaluated; then
       settled=1; break
     fi
     sleep 1
   done
-  [ "$settled" = "1" ] || window_expired "I-$tag impostor attempt" 45 "refusals then=$(grep -c "reason=name-taken" "$WORK/up.log" || true) before=$refused_before; impostor-side mesh line=$(grep -cE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$MALLORY-$tag.log" 2>/dev/null || true)"
+  [ "$settled" = "1" ] || window_expired "I-$tag impostor attempt" 45 "refusals then=$(grep -c "reason=name-taken" "$WORK/up.log" || true) before=$refused_before; owner evaluated the impostor key=$(imp_owner_evaluated && echo yes || echo no)"
   local refused=0 intact=0 execref=0 attempted=0 victim_ok=0
   local refused_after=$(grep -c "reason=name-taken" "$WORK/up.log" || true)
   [ "$refused_after" -gt "$refused_before" ] && refused=1
-  # NON-VACUITY, two ways. Containment means nothing unless (i) this impostor
-  # actually reached the owner (a daemon that never started satisfies "exec
-  # refused" via a plain connection failure) and (ii) the victim snapshot
-  # really held a keyed record (comparing two empty records passes).
-  grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$MALLORY-$tag.log" && attempted=1
+  # NON-VACUITY, two ways. Containment means nothing unless (i) the owner
+  # actually evaluated this impostor's hello (a daemon that never started
+  # satisfies "exec refused" via a plain connection failure) and (ii) the
+  # victim snapshot really held a keyed record (comparing two empty records
+  # passes).
+  imp_owner_evaluated && attempted=1
   [ -n "$(python3 -c "import json;print(json.load(open('$WORK/victim.before')).get('victim_pub') or '')")" ] && victim_ok=1
   python3 - "$DA/devices.json" "$SPOKE" "$MALLORY" "$WORK/victim.before" >"$WORK/victim.$tag.after" <<'PY'
 import json,sys
