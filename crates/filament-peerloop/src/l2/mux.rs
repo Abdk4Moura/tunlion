@@ -824,6 +824,12 @@ pub async fn answer_link_revoked(
 
 /// Distinct nonces one link answers at most. A real cut sends one frame per
 /// link; a few allow for duplicates of the same peer cut together.
+///
+/// Known residual: the cap is per mux and counts claimed nonces, so a peer
+/// that sends 8 nonce-bearing frames first can suppress the ack for a later,
+/// genuine one. That only costs the cutting side its diagnostic (it then logs
+/// the refusal as unconfirmed and closes at its budget): the ack authorizes
+/// nothing, and the refusal itself is still recorded and delivered here.
 const MAX_REVOKED_ACKS: usize = 8;
 
 /// Bound on writing one `link-revoked-ack`.

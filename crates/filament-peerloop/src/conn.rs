@@ -4164,7 +4164,8 @@ impl Conn {
             }
         } else {
             self.log.debug(&format!(
-                "link-revoked-ack from {pid}: matches no cut in flight (late, or not ours)"
+                "link-revoked-ack from {pid} for nonce {nonce}: already settled or unknown \
+                 (duplicate acks on a second path are expected)"
             ));
         }
         true
@@ -15016,9 +15017,11 @@ mod warm_identity_tests {
 
     /// F1 (daemon-path gate): a write returning Ok is not delivery, and the
     /// close discards what is still queued. The revoked link leaves routing at
-    /// once, but its transport closes only on the peer's ack for THIS cut (its
-    /// source and nonce); a stale nonce or another source's ack does nothing.
-    /// This is the main-queue path (a link with no candidate stream).
+    /// once, but its transport closes only on the peer's ack for THIS cut,
+    /// bound by NONCE only (pid plus nonce): a stale nonce, or the right nonce
+    /// for another pid, does nothing, while the right nonce for this pid counts
+    /// from any source. This is the main-queue path (a link with no candidate
+    /// stream).
     #[tokio::test]
     async fn a_revoked_link_closes_on_the_peers_ack_and_not_before() {
         let (mut conn, _far, _rx) = test_conn().await;
@@ -15099,6 +15102,38 @@ mod warm_identity_tests {
         drop(etx);
         assert!(closed_within(&t, Duration::from_millis(500)).await, "left open after the reader ended");
         assert!(start.elapsed() < REFUSAL_ACK_BUDGET, "waited out the budget for a dead reader");
+    }
+
+    /// The branch the two-link fix relies on: a cut link with its OWN stream
+    /// whose reader ends while the transport is still alive (the peer answers
+    /// on another path of the same session). The closer must keep waiting,
+    /// and the ack for the SAME nonce from a DIFFERENT source, delivered
+    /// through the main queue, completes the cut. Fails if the stream's end
+    /// stopped the wait unconditionally, or if the main-queue signal were not
+    /// registered alongside the stream.
+    #[tokio::test]
+    async fn an_ack_on_another_path_completes_a_cut_whose_own_stream_ended() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-s".into(), direct_link("sid-s", "b", "user@b", t.clone()));
+        let etx = own_stream(&mut conn, "sid-s", 7);
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-s", refusal()));
+        let nonce = written_refusal_nonce(&t).await;
+        drop(etx);
+        assert!(
+            !closed_within(&t, Duration::from_millis(300)).await,
+            "the stream's end on a live transport stopped the wait"
+        );
+        assert!(
+            conn.stage_event(revoked_ack("sid-s", net::SourceId::next(), &nonce)).is_none(),
+            "the ack was dispatched"
+        );
+        assert!(
+            closed_within(&t, REFUSAL_ACK_BUDGET.saturating_sub(start.elapsed())).await,
+            "the ack on another path did not complete the cut"
+        );
+        assert!(start.elapsed() < REFUSAL_ACK_BUDGET, "closed by the budget, not by the ack");
     }
 
     /// A candidate stream left from an EARLIER generation of the pid (a
@@ -15237,10 +15272,9 @@ mod warm_identity_tests {
             .closing
             .iter()
             .find(|(n, e)| e.pid == "sid-old" && **n != n_live)
-            .map(|(n, _)| n.clone());
-        if let Some(n_other) = n_other {
-            assert!(conn.stage_event(revoked_ack("sid-new", live.source, &n_other)).is_none());
-        }
+            .map(|(n, _)| n.clone())
+            .expect("the dead cut keeps its own entry until the next prune");
+        assert!(conn.stage_event(revoked_ack("sid-new", live.source, &n_other)).is_none());
         assert!(conn.stage_event(revoked_ack("sid-old", live.source, &n_live)).is_none());
         assert!(!closed_within(&live, Duration::from_millis(150)).await, "closed on another cut's ack");
         assert!(conn.stage_event(revoked_ack("sid-new", live.source, &n_live)).is_none());
