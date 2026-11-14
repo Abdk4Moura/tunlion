@@ -368,6 +368,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         link_events: HashMap::new(),
         pending_sources: HashMap::new(),
         roster_absent: HashMap::new(),
+        held_signals: HashMap::new(),
         log: crate::host_impl::cli_log(),
         host: crate::host_impl::cli_host(),
         present: crate::host_impl::cli_screen(),

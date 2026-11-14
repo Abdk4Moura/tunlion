@@ -247,7 +247,7 @@ fn held_signal_ttl() -> Duration {
 /// never be answered on its first attempt. `pc` is the sender's peer-connection
 /// tag (`None` from builds that do not send one); a different tag, or a second
 /// offer, starts a new hold because it belongs to a newer attempt.
-pub(crate) struct HeldSignals {
+pub struct HeldSignals {
     since: Instant,
     pc: Option<u64>,
     has_offer: bool,
@@ -1688,8 +1688,10 @@ pub struct Conn {
     pub buffered_offers: HashMap<String, StagedOffer>,
     /// WebRTC offers (and their candidates) held while a direct attempt for the
     /// same sid is pending; replayed into the fallback responder's build. Insert
-    /// only through `hold_for_direct`.
-    pub(crate) held_signals: HashMap<String, HeldSignals>,
+    /// only through `hold_for_direct`. `pub` only because the CLI builds a
+    /// `Conn` with a struct literal (cli/src/membership.rs); its contents stay
+    /// private, so start it as `HashMap::new()` and never insert directly.
+    pub held_signals: HashMap<String, HeldSignals>,
     /// Post-PAKE promotions in progress (make-before-break; see `handoff`),
     /// keyed by peer sid. Each pairs with an ephemeral `direct_pending` entry
     /// that must survive beside the serving link until the handoff resolves.
