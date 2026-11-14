@@ -5,6 +5,8 @@
 //! replacement, even when it claims the same install UID or kept a partial
 //! file. A fresh send with a fresh code is the only way to resume.
 
+use filament_transfer::Outgoing;
+
 /// Which event class a code sender is deciding for. All three are tied to the
 /// one signaling peer the PAKE ceremony authenticated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,9 +66,146 @@ pub fn code_answer_admitted(kind: &str, authority_holds: bool) -> bool {
     authority_holds || !CODE_BOUND_ANSWERS.contains(&kind)
 }
 
+/// What an answer did to the sender's outgoing table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnswerEffect {
+    /// Not admitted on the code path: nothing changed.
+    Ignored,
+    /// Admitted, but names no outgoing file.
+    NoSuchFile,
+    /// Applied to `outgoing[index]`; `was_settled` is the file's state before
+    /// (`done` for a decline, `acked` for a delivery-ack).
+    Applied { index: usize, was_settled: bool },
+}
+
+/// `file-decline`: admitted on the code path only with authority. Pure.
+pub fn admit_file_decline(
+    use_code: bool,
+    authority_holds: bool,
+    outgoing: &mut [Outgoing],
+    id: &str,
+) -> AnswerEffect {
+    if use_code && !authority_holds {
+        return AnswerEffect::Ignored;
+    }
+    let Some(index) = outgoing.iter().position(|o| o.id == id) else {
+        return AnswerEffect::NoSuchFile;
+    };
+    let o = &mut outgoing[index];
+    let was_settled = o.done;
+    o.declined = true;
+    o.done = true;
+    AnswerEffect::Applied { index, was_settled }
+}
+
+/// `delivery-ack`: admitted on the code path only with authority. Pure.
+pub fn admit_delivery_ack(
+    use_code: bool,
+    authority_holds: bool,
+    outgoing: &mut [Outgoing],
+    id: &str,
+) -> AnswerEffect {
+    if use_code && !authority_holds {
+        return AnswerEffect::Ignored;
+    }
+    let Some(index) = outgoing.iter().position(|o| o.id == id) else {
+        return AnswerEffect::NoSuchFile;
+    };
+    let o = &mut outgoing[index];
+    let was_settled = o.acked;
+    o.acked = true;
+    o.done = true;
+    AnswerEffect::Applied { index, was_settled }
+}
+
+/// What a `pair-keep-ack` does to the sender's remembered record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RememberAck {
+    Ignore,
+    Remove,
+    Keep,
+}
+
+/// `pair-keep-ack`: admitted on the code path only with authority. Pure.
+pub fn remember_ack_effect(use_code: bool, authority_holds: bool, ok: Option<bool>) -> RememberAck {
+    if use_code && !authority_holds {
+        return RememberAck::Ignore;
+    }
+    if ok == Some(false) {
+        RememberAck::Remove
+    } else {
+        RememberAck::Keep
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn one_file() -> Vec<Outgoing> {
+        vec![Outgoing {
+            id: "f1".into(),
+            sid: 1,
+            name: "f1".into(),
+            size: 4,
+            head: None,
+            full: None,
+            path: std::path::PathBuf::from("f1"),
+            temp: false,
+            accepted_once: true,
+            sent: true,
+            acked: false,
+            declined: false,
+            done: false,
+            stream_started: None,
+            stream_bytes: 4,
+        }]
+    }
+
+    #[test]
+    fn a_code_sender_applies_a_decline_only_with_authority() {
+        let mut out = one_file();
+        assert_eq!(admit_file_decline(true, false, &mut out, "f1"), AnswerEffect::Ignored);
+        assert!(!out[0].done && !out[0].declined);
+        for (use_code, holds) in [(true, true), (false, false)] {
+            let mut out = one_file();
+            assert_eq!(
+                admit_file_decline(use_code, holds, &mut out, "f1"),
+                AnswerEffect::Applied { index: 0, was_settled: false }
+            );
+            assert!(out[0].done && out[0].declined);
+            assert_eq!(admit_file_decline(use_code, holds, &mut out, "f2"), AnswerEffect::NoSuchFile);
+        }
+    }
+
+    #[test]
+    fn a_code_sender_applies_a_delivery_ack_only_with_authority() {
+        let mut out = one_file();
+        assert_eq!(admit_delivery_ack(true, false, &mut out, "f1"), AnswerEffect::Ignored);
+        assert!(!out[0].done && !out[0].acked);
+        for (use_code, holds) in [(true, true), (false, false)] {
+            let mut out = one_file();
+            assert_eq!(
+                admit_delivery_ack(use_code, holds, &mut out, "f1"),
+                AnswerEffect::Applied { index: 0, was_settled: false }
+            );
+            assert!(out[0].done && out[0].acked);
+            assert_eq!(
+                admit_delivery_ack(use_code, holds, &mut out, "f1"),
+                AnswerEffect::Applied { index: 0, was_settled: true }
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_sender_removes_a_remembered_record_only_with_authority() {
+        assert_eq!(remember_ack_effect(true, false, Some(false)), RememberAck::Ignore);
+        assert_eq!(remember_ack_effect(true, false, Some(true)), RememberAck::Ignore);
+        assert_eq!(remember_ack_effect(true, true, Some(false)), RememberAck::Remove);
+        assert_eq!(remember_ack_effect(true, true, Some(true)), RememberAck::Keep);
+        assert_eq!(remember_ack_effect(false, false, Some(false)), RememberAck::Remove);
+        assert_eq!(remember_ack_effect(false, false, None), RememberAck::Keep);
+    }
 
     /// Adversarial: the authentic receiver ran the PAKE ceremony and then
     /// died mid-transfer. A different room peer (even one sharing the install

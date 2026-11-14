@@ -50,7 +50,8 @@ use crate::shutdown;
 use crate::test_hooks;
 use crate::ui;
 use filament_peerloop::send::gate::{
-    adopt_wants_active, code_answer_admitted, code_peer_event_allowed, CodePeerEvent,
+    admit_delivery_ack, admit_file_decline, adopt_wants_active, code_answer_admitted,
+    code_peer_event_allowed, remember_ack_effect, AnswerEffect, CodePeerEvent, RememberAck,
 };
 use crate::exit_codes::{self, ExitKind};
 use anyhow::{Context, Result, anyhow, bail};
@@ -2359,13 +2360,9 @@ pub(crate) async fn send_cmd(
                 }
                 // C27: the human on the other side answered our remember offer.
                 Some("pair-keep-ack") => {
-                    // Acted on only from the code's confirmed link.
-                    if use_code
-                        && !code_answer_admitted(
-                            v["type"].as_str().unwrap_or_default(),
-                            conn.holds_code_authority(&pid).await,
-                        )
-                    {
+                    let holds = !use_code || conn.holds_code_authority(&pid).await;
+                    let effect = remember_ack_effect(use_code, holds, v["ok"].as_bool());
+                    if effect == RememberAck::Ignore {
                         ui::debug(&format!(
                             "send: ignoring {} from {pid}: not the code's confirmed link",
                             v["type"].as_str().unwrap_or_default()
@@ -2377,7 +2374,7 @@ pub(crate) async fn send_cmd(
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         crate::shared_defs::REMEMBER_ANSWERED
                             .store(true, std::sync::atomic::Ordering::Relaxed);
-                        if v["ok"].as_bool() == Some(false) {
+                        if effect == RememberAck::Remove {
                             devices_remove(&name)?;
                             crate::shared_defs::REMEMBER_STORED
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2572,13 +2569,11 @@ pub(crate) async fn send_cmd(
                     });
                 }
                 Some("file-decline") => {
-                    // Acted on only from the code's confirmed link.
-                    if use_code
-                        && !code_answer_admitted(
-                            v["type"].as_str().unwrap_or_default(),
-                            conn.holds_code_authority(&pid).await,
-                        )
-                    {
+                    let holds = !use_code || conn.holds_code_authority(&pid).await;
+                    let id = v["id"].as_str().unwrap_or_default();
+                    let mut out = outgoing.lock().await;
+                    let effect = admit_file_decline(use_code, holds, &mut out[..], id);
+                    if effect == AnswerEffect::Ignored {
                         ui::debug(&format!(
                             "send: ignoring {} from {pid}: not the code's confirmed link",
                             v["type"].as_str().unwrap_or_default()
@@ -2587,9 +2582,8 @@ pub(crate) async fn send_cmd(
                     }
                     answer_clock = Some(Instant::now());
                     receiver_asking = false;
-                    let id = v["id"].as_str().unwrap_or_default();
-                    let mut out = outgoing.lock().await;
-                    if let Some(o) = out.iter_mut().find(|o| o.id == id) {
+                    if let AnswerEffect::Applied { index, was_settled } = effect {
+                        let o = &out[index];
                         // A refusal carries the receiver's reason: say it, in its
                         // words, instead of a bare "declined" that reads as a person
                         // saying no.
@@ -2602,7 +2596,7 @@ pub(crate) async fn send_cmd(
                                 // The typed reason and the sentence, for
                                 // `send --json` (files[].refusal, error.reason).
                                 crate::send_report::note_refused(id, v["reason"].as_str(), &why);
-                                if !o.done {
+                                if !was_settled {
                                     refused.push(format!("{}: {why}", o.name));
                                 }
                                 // The same remedy exec, forward and mount give
@@ -2621,8 +2615,6 @@ pub(crate) async fn send_cmd(
                                 ui::say(&format!("declined: {}", o.name))
                             }
                         }
-                        o.declined = true;
-                        o.done = true;
                     }
                 }
                 // The receiver parked the offer for a person's yes/no; silence
@@ -2651,13 +2643,11 @@ pub(crate) async fn send_cmd(
                 // it). This closes the loop the runner had to fake above the
                 // transport: the sender deterministically KNOWS it landed whole.
                 Some("delivery-ack") => {
-                    // Acted on only from the code's confirmed link.
-                    if use_code
-                        && !code_answer_admitted(
-                            v["type"].as_str().unwrap_or_default(),
-                            conn.holds_code_authority(&pid).await,
-                        )
-                    {
+                    let holds = !use_code || conn.holds_code_authority(&pid).await;
+                    let id = v["id"].as_str().unwrap_or_default();
+                    let mut out = outgoing.lock().await;
+                    let effect = admit_delivery_ack(use_code, holds, &mut out[..], id);
+                    if effect == AnswerEffect::Ignored {
                         ui::debug(&format!(
                             "send: ignoring {} from {pid}: not the code's confirmed link",
                             v["type"].as_str().unwrap_or_default()
@@ -2665,17 +2655,14 @@ pub(crate) async fn send_cmd(
                         continue;
                     }
                     answer_clock = Some(Instant::now());
-                    let id = v["id"].as_str().unwrap_or_default();
                     // Additive: a receiver that reports the name it stored the
                     // file under says so here; an older one omits it.
                     if let Some(stored) = v["stored"].as_str() {
                         crate::send_report::note_stored(id, stored);
                     }
-                    let mut out = outgoing.lock().await;
-                    if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-                        if !o.acked {
-                            o.acked = true;
-                            o.done = true;
+                    if let AnswerEffect::Applied { index, was_settled } = effect {
+                        let o = &out[index];
+                        if !was_settled {
                             // #262: THIS is the instant the bytes are known to be
                             // on the far side, so this is the interval the
                             // throughput line is entitled to divide by. Printing

@@ -11118,7 +11118,9 @@ mod warm_identity_tests {
         conn.direct_ok = true;
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pid = "sid-code-new";
-        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        let webrtc: Arc<dyn Transport> = Rec::new("webrtc", &log);
+        let webrtc_attempt = webrtc.attempt_id().expect("a fixture attempt");
+        code_link(&mut conn, pid, webrtc);
         let promo = conn
             .start_direct_promote(pid, pid, "ceremony", PromoteRole::Lead, true)
             .await;
@@ -11133,6 +11135,13 @@ mod warm_identity_tests {
             promotion.standby = Some((quic.clone(), "direct-quic"));
             promotion.handed = true;
         }
+        // While handed, another attempt is not adopted and changes nothing.
+        let foreign: Arc<dyn Transport> = Rec::with_attempt("foreign", &log, net::AttemptId::next());
+        assert_eq!(conn.adopt_direct(pid, foreign.clone(), "direct-quic"), DirectAdoption::Rejected);
+        assert!(foreign.is_dead());
+        assert!(!conn.link(pid).expect("the serving link").direct);
+        assert!(conn.promotions.get(pid).is_some_and(|p| p.handed));
+        assert!(conn.direct_pending.contains_key(pid));
         assert!(matches!(
             conn.adopt_direct(pid, quic.clone(), "direct-quic"),
             DirectAdoption::Adopted { .. }
@@ -11140,12 +11149,30 @@ mod warm_identity_tests {
         let l = conn.link(pid).expect("the link");
         assert!(l.direct, "the serving link was not retired");
         assert!(l.transport.as_ref().is_some_and(|t| Arc::ptr_eq(t, &quic)));
+        assert_eq!(l.attempt, Some(attempt));
+        // Retired and replaced, not updated in place: the serving link's own
+        // attempt is retired and the promotion is gone.
+        assert!(conn.retired_attempts.contains_key(&webrtc_attempt));
+        assert!(!conn.promotions.contains_key(pid));
         let mut cache = CodeAuthorityCache::default();
         assert_eq!(conn.code_authority(pid).await, Ok(()));
         assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
 
+        // After adoption, another attempt is still not adopted.
+        let late: Arc<dyn Transport> = Rec::with_attempt("late", &log, net::AttemptId::next());
+        assert_eq!(conn.adopt_direct(pid, late, "direct-quic"), DirectAdoption::Rejected);
+        assert!(conn.transport_of(pid).is_some_and(|t| Arc::ptr_eq(&t, &quic)));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
+
         // A cached verdict does not survive a changed secret on the same link.
         conn.links.get_mut(pid).unwrap().expected_secret = Some((pid.to_string(), "other".into()));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Lost);
+
+        // Restored, it holds; under another attempt it does not.
+        conn.links.get_mut(pid).unwrap().expected_secret = Some((pid.to_string(), "ceremony".into()));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
+        conn.links.get_mut(pid).unwrap().attempt = Some(net::AttemptId::next());
+        assert_eq!(conn.code_authority(pid).await, Err(CodeAuthorityRefusal::ForeignDirect));
         assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Lost);
     }
 

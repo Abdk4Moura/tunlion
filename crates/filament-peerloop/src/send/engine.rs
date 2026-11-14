@@ -14,7 +14,8 @@
 //! and acknowledged at the transport).
 
 use crate::send::gate::{
-    adopt_wants_active, code_answer_admitted, code_peer_event_allowed, CodePeerEvent,
+    admit_delivery_ack, admit_file_decline, adopt_wants_active, code_answer_admitted,
+    code_peer_event_allowed, AnswerEffect, CodePeerEvent,
 };
 use crate::conn::Conn;
 use crate::driver::{Cancellation, DriverOutcome};
@@ -1116,17 +1117,13 @@ async fn drive_over(
                     }));
                 }
                 Some("file-decline") => {
-                    if use_code
-                        && !code_answer_admitted("file-decline", conn.holds_code_authority(&pid).await)
-                    {
-                        continue;
-                    }
+                    let holds = !use_code || conn.holds_code_authority(&pid).await;
                     let id = v["id"].as_str().unwrap_or_default();
                     let why = v["error"].as_str().filter(|e| !e.trim().is_empty());
                     let mut out = outgoing.lock().await;
-                    if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-                        o.declined = true;
-                        o.done = true;
+                    let effect = admit_file_decline(use_code, holds, &mut out[..], id);
+                    if let AnswerEffect::Applied { index, .. } = effect {
+                        let o = &out[index];
                         if let Some(why) = why {
                             return Err(SendFailure::refused(format!(
                                 "{} not delivered: {why}",
@@ -1137,19 +1134,14 @@ async fn drive_over(
                     }
                 }
                 Some("delivery-ack") => {
-                    if use_code
-                        && !code_answer_admitted("delivery-ack", conn.holds_code_authority(&pid).await)
-                    {
+                    let holds = !use_code || conn.holds_code_authority(&pid).await;
+                    let id = v["id"].as_str().unwrap_or_default();
+                    let mut out = outgoing.lock().await;
+                    if admit_delivery_ack(use_code, holds, &mut out[..], id) == AnswerEffect::Ignored {
                         continue;
                     }
-                    let id = v["id"].as_str().unwrap_or_default();
                     if let Some(name) = v["stored"].as_str() {
                         stored.insert(id.to_string(), name.to_string());
-                    }
-                    let mut out = outgoing.lock().await;
-                    if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-                        o.acked = true;
-                        o.done = true;
                     }
                 }
                 Some("pair-proof-ack") => {
