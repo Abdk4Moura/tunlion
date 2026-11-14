@@ -7360,12 +7360,17 @@ async fn recv_run(
                 Some("link-revoked") => {
                     // Recorded where every warm exec on this link reads it, and
                     // only then acknowledged (see `answer_link_revoked`).
-                    let _ = l2::mux::answer_link_revoked(
+                    let answer = l2::mux::answer_link_revoked(
                         l2_muxes.get(&pid),
-                        conn.transport_of(&pid),
+                        conn.reply_transports(&pid, event_source),
                         &v,
                     )
                     .await;
+                    log.debug(&format!(
+                        "link-revoked from {pid}: {} (nonce {})",
+                        answer.describe(),
+                        v["nonce"].as_str().unwrap_or("none")
+                    ));
                     continue;
                 }
                 // Remote command execution: parse, shell-gate, direct-spawn

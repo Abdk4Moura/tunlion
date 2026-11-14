@@ -247,13 +247,28 @@ sleep 6
 
 # ===================================================================== F1a =====
 say "F1a: exec running when a forgets b: exit 4 with the refusal, acknowledged by b"
+# Evidence printed only when F1a fails: both daemons' lines about the cut, the
+# ack and the links for this peer, so a failure says which side lost what.
+f1a_evidence() {
+  echo "## F1a evidence: a's links to boxb and the cut (A-up.log)"
+  grep -E "link-revoked|closed the link to 'boxb'|drop_link\(|ADOPT peer=" "$WORK/A-up.log" 2>/dev/null | tail -n 30
+  echo "## F1a evidence: b's exec link, the refusal and its ack (B-up.log)"
+  grep -E "link-revoked|warm-exec: riding|closed the link|drop_link\(|ADOPT peer=" "$WORK/B-up.log" 2>/dev/null | tail -n 30
+  echo "## F1a evidence: each daemon's view of its links just before the forget"
+  echo "# a:"; cat "$WORK/f1a-links-a.json" 2>/dev/null
+  echo "# b:"; cat "$WORK/f1a-links-b.json" 2>/dev/null
+}
+f1a_lines_a=$(wc -l <"$WORK/A-up.log")
+es=$(ts)
 env TUNLION_CONFIG_DIR="$DB" timeout 90 "$BIN" --server "$SERVER" exec boxa -- /bin/sleep 80 >/dev/null 2>"$WORK/f1.err" </dev/null &
 EP=$!
 sleep 6
 if kill -0 "$EP" 2>/dev/null; then
+  env TUNLION_CONFIG_DIR="$DA" timeout 10 "$BIN" devices --json >"$WORK/f1a-links-a.json" 2>&1
+  env TUNLION_CONFIG_DIR="$DB" timeout 10 "$BIN" devices --json >"$WORK/f1a-links-b.json" 2>&1
   env TUNLION_CONFIG_DIR="$DA" "$BIN" devices forget boxb -y >"$WORK/forget.log" 2>&1; frc=$?; t0=$(ts)
-  wait "$EP"; rc=$?; took=$(since "$t0")
-  echo "## forget rc=$frc; exec rc=$rc ${took}s after it"; tail -3 "$WORK/f1.err"
+  wait "$EP"; rc=$?; took=$(since "$t0"); ran=$(since "$es")
+  echo "## forget rc=$frc; exec rc=$rc ${took}s after it (the exec ran ${ran}s in all)"; tail -3 "$WORK/f1.err"
   # The instrument: a's closer logs the refusal's fate. Only an ack from b's
   # daemon, sent after it recorded the refusal, may read as acknowledged.
   acked=no; wait_log 'link-revoked to [^ ]+: acknowledged by the peer' "$WORK/A-up.log" 5 && acked=yes
@@ -264,6 +279,8 @@ if kill -0 "$EP" 2>/dev/null; then
     ok "F1a: the running exec ended as a refusal in ${took}s (exit 4, not recognized), acknowledged by b"
   else
     bad "F1a: exec when forgotten (forget rc=$frc, exec rc=$rc in ${took}s, acked=$acked)"
+    echo "## a's log lines since F1a started: $(( $(wc -l <"$WORK/A-up.log") - f1a_lines_a ))"
+    f1a_evidence
   fi
 else
   wait "$EP"; bad "F1a: the exec ended before the forget (rc=$?)"; tail -5 "$WORK/f1.err"
