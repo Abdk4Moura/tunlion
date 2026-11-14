@@ -6445,6 +6445,25 @@ impl Conn {
                 existing.identity_state = IdentityState::Pending;
                 existing.identity_cert_expires = None;
             }
+            if fleet {
+                // A FLEET direct is keyed by the secret the whole fleet shares:
+                // it proves fleet membership, not who the peer is. So NOTHING
+                // pair-derived may survive on this link: the standing has to be
+                // re-established by the verified fleet hello. Before this, a
+                // link that had been pair-proven kept `trusted`, its verified
+                // name and its principal kind across the adoption, so a
+                // transport that authenticates only against the fleet secret
+                // still carried pair standing, and a cut in place (revoke
+                // without a close) left that standing behind.
+                existing.trusted = false;
+                existing.verified_name = None;
+                existing.principal_kind = PrincipalKind::Delegated { caps: Vec::new() };
+                existing.identity_device_pub = None;
+                existing.identity_user_pub = None;
+                existing.identity_binding = BindingStrength::None;
+                existing.identity_state = IdentityState::Pending;
+                existing.identity_cert_expires = None;
+            }
             if let Some(n) = &lan_pair_name {
                 // Re-resolve from the record as a fresh pair link would, so a
                 // delegated record gets its ceiling.
@@ -11690,6 +11709,61 @@ mod warm_identity_tests {
         // The race's expiry still falls back to WebRTC, as before.
         conn.direct_pending.get_mut(pid).unwrap().deadline = Instant::now() - Duration::from_millis(1);
         assert_eq!(conn.expired_direct().len(), 1, "the old fallback was not armed");
+    }
+
+    /// A FLEET direct is keyed by the secret the whole fleet shares: it proves
+    /// fleet membership, not who the peer is. So a link that had been
+    /// PAIR-PROVEN must not keep that standing when it adopts a fleet-keyed
+    /// direct: the standing has to be re-established by the verified fleet
+    /// hello. Before this, the adopted link still read as pair-trusted with the
+    /// pair's name and principal, so a transport that authenticates only
+    /// against the fleet secret carried pair standing (and a cut in place left
+    /// it behind).
+    #[tokio::test]
+    async fn a_pair_proven_link_that_adopts_a_fleet_direct_loses_the_pair_standing() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-fleet";
+        // The link before the adoption: pair-proven and trusted.
+        let mut link = direct_link(pid, "peer", "peer", Rec::new("webrtc", &log));
+        link.trusted = true;
+        link.verified_name = Some("peer".to_string());
+        link.principal_kind = PrincipalKind::OwnerDevice;
+        link.expected_secret = Some(("peer".to_string(), "pair-secret".to_string()));
+        conn.links.insert(pid.to_string(), link);
+
+        // A fleet-keyed attempt for that peer: the pending says the attempt is
+        // a fleet one, so the adoption is the fleet case.
+        let attempt = net::AttemptId::next();
+        let mut pending = direct_pending_with(attempt, ("peer", "fleet-rv"));
+        pending.fleet = true;
+        pending.auth = DirectAuth::fleet(1);
+        conn.direct_pending.insert(pid.to_string(), pending);
+
+        let quic: Arc<dyn Transport> = Rec::with_attempt("quic", &log, attempt);
+        assert!(matches!(
+            conn.adopt_direct(pid, quic.clone(), "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+        let l = conn.link(pid).expect("the adopted link");
+        assert!(l.direct, "the adoption did not replace the transport");
+        // The pair standing is gone: the fleet hello has to re-establish it.
+        assert!(!l.trusted, "a fleet-keyed link kept pair trust");
+        assert!(l.verified_name.is_none(), "a fleet-keyed link kept the pair name");
+        assert!(
+            matches!(l.principal_kind, PrincipalKind::Delegated { .. }),
+            "a fleet-keyed link kept the pair principal"
+        );
+        assert!(!l.is_sibling_link(), "a fleet-keyed link read as a sibling");
+        assert!(!l.fleet_proven(), "a fleet-keyed link claimed a proven fleet link");
+        // The binding is the fleet one now, and the link is not yet a sibling
+        // until the hello names it.
+        assert_eq!(
+            l.expected_secret.as_ref().map(|(_, s)| s.as_str()),
+            Some("fleet-rv"),
+            "the fleet binding did not replace the pair one"
+        );
     }
 
     /// Code authority follows the old-peer promotion: the direct link the

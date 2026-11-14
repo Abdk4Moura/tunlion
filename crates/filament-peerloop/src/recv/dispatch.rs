@@ -371,6 +371,22 @@ pub fn refuse_forgotten_dial(
     offer_channel_forgotten && !has_direct_pending
 }
 
+/// One fleet arm per peer per window.
+///
+/// The fleet arm sites are driven by repeated events: the server re-pushes the
+/// roster on every sync tick, and a sibling re-offers its transport every
+/// ~1.2 s. Each arm starts a direct attempt, and a retired attempt leaves a
+/// tombstone in the retirement drain, which is bounded (16). Armed without a
+/// bound, a handful of peers fill that drain in seconds and then EVERY direct
+/// attempt fails closed ("retirement drain capacity full"), which reads as
+/// "can't reach the tunlion server" on the whole fleet.
+pub fn fleet_arm_allowed(last_armed_at: Option<Instant>, now: Instant, cooldown: Duration) -> bool {
+    match last_armed_at {
+        Some(at) => now.duration_since(at) >= cooldown,
+        None => true,
+    }
+}
+
 /// The outcome of ONE peer's step (adopt, answer, a control reply) inside the
 /// serving loop.
 ///
@@ -2398,6 +2414,10 @@ async fn recv_run(
     // Links already reported by the unverified watchdog, by (pid, generation).
     let mut fleet_unverified_said: HashSet<(String, u32)> = HashSet::new();
     let mut fleet_pending: std::collections::HashSet<String> = Default::default();
+    // When we last armed a fleet direct for a peer, so the arm sites (the
+    // roster push and the sibling's repeated transport-offer) cannot start an
+    // unbounded number of direct attempts and fill the retirement drain.
+    let mut fleet_arm_at: std::collections::HashMap<String, Instant> = Default::default();
     let mut fleet_verified: std::collections::HashSet<String> = Default::default();
     // Offers that arrived while this link's `fleet-hello` was still in flight.
     // Verification is MUTUAL and the two directions are not synchronized: the
@@ -5268,7 +5288,23 @@ async fn recv_run(
                     // so exactly one dials and the other accepts.
                     if conn.my_id < pid {
                         if let Some(rv) = ports.identity.fleet_rv() {
-                            conn.start_direct_fleet(&pid, &rv).await;
+                            // Bounded: one arm per peer per window. The roster
+                            // is re-pushed on every sync tick, and each arm
+                            // starts a direct attempt that can be retired into
+                            // the bounded retirement drain.
+                            let now = Instant::now();
+                            if fleet_arm_allowed(
+                                fleet_arm_at.get(&pid).copied(),
+                                now,
+                                FLEET_ARM_COOLDOWN,
+                            ) {
+                                fleet_arm_at.insert(pid.clone(), now);
+                                conn.start_direct_fleet(&pid, &rv).await;
+                            } else {
+                                log.debug(&format!(
+                                    "fleet: arm for {pid} skipped, armed recently"
+                                ));
+                            }
                         }
                     }
                     let r = conn.maybe_adopt(&v, true).await;
@@ -5442,15 +5478,33 @@ async fn recv_run(
                                     action,
                                     LinkedFleetOffer::ArmDial | LinkedFleetOffer::ArmAnswer
                                 ) {
-                                    log.debug(&format!(
-                                        "fleet: arming direct for linked sibling {from}'s transport-offer ({})",
-                                        if action == LinkedFleetOffer::ArmDial {
-                                            "dialer"
-                                        } else {
-                                            "answer"
-                                        }
-                                    ));
-                                    conn.start_direct_fleet(&from, &rv).await;
+                                    // Bounded: one arm per peer per window. The
+                                    // sibling re-offers every ~1.2 s, and each
+                                    // arm starts a direct attempt that can be
+                                    // retired into the bounded retirement
+                                    // drain, which then refuses EVERY direct
+                                    // attempt for the whole session.
+                                    let now = Instant::now();
+                                    if fleet_arm_allowed(
+                                        fleet_arm_at.get(&from).copied(),
+                                        now,
+                                        FLEET_ARM_COOLDOWN,
+                                    ) {
+                                        fleet_arm_at.insert(from.clone(), now);
+                                        log.debug(&format!(
+                                            "fleet: arming direct for linked sibling {from}'s transport-offer ({})",
+                                            if action == LinkedFleetOffer::ArmDial {
+                                                "dialer"
+                                            } else {
+                                                "answer"
+                                            }
+                                        ));
+                                        conn.start_direct_fleet(&from, &rv).await;
+                                    } else {
+                                        log.debug(&format!(
+                                            "fleet: arm for {from} skipped, armed recently"
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -11100,6 +11154,9 @@ fn signing_binding(
 
 /// How often the unverified watchdog may speak: once per link, after this long.
 const FLEET_UNVERIFIED_SAY_SECS: u64 = 20;
+/// How long one fleet direct arm per peer is allowed to stand before the next
+/// arm site may start another attempt for that peer.
+const FLEET_ARM_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// The first 8 hex characters of a binding nonce. Nonces travel in the clear,
 /// so a prefix is safe to log; it lets two daemons' lines be matched up.
@@ -12512,8 +12569,10 @@ mod expiry_redrive_tests {
 #[cfg(test)]
 mod linked_fleet_offer_tests {
     use super::{
-        linked_fleet_offer_action as decide, refuse_forgotten_dial, LinkedFleetOffer,
+        fleet_arm_allowed, linked_fleet_offer_action as decide, refuse_forgotten_dial,
+        LinkedFleetOffer,
     };
+    use std::time::{Duration, Instant};
 
     const FLEET: &str = "chan-fleet";
     const LOW: &str = "sid-aaa";
@@ -12724,7 +12783,6 @@ mod linked_fleet_offer_tests {
             "a stale link suppressed the honest refusal"
         );
     }
-
     /// The refusal still does not fire for a peer that is not forgotten, and
     /// a live direct pending (we are dialing that peer right now, on the same
     /// credential) keeps the offer in our own race.
@@ -12738,6 +12796,33 @@ mod linked_fleet_offer_tests {
         assert!(!refuse_forgotten_dial(true, true, true));
         // Forgotten, no pending, no link: the plain case still refuses.
         assert!(refuse_forgotten_dial(false, false, true));
+    }
+
+    /// The fleet arm is bounded: one per peer per window. The arm sites are
+    /// event-driven (a roster push on every sync tick, a sibling re-offer
+    /// every ~1.2 s) and each arm starts a direct attempt, so an unbounded arm
+    /// fills the bounded retirement drain and then EVERY direct attempt fails
+    /// closed for the whole session.
+    #[test]
+    fn the_fleet_arm_is_bounded_per_peer() {
+        let start = Instant::now();
+        let cooldown = Duration::from_secs(5);
+        // A peer we never armed: allowed.
+        assert!(fleet_arm_allowed(None, start, cooldown));
+        // Armed just now: refused.
+        assert!(!fleet_arm_allowed(Some(start), start, cooldown));
+        // Still inside the window: refused.
+        assert!(!fleet_arm_allowed(
+            Some(start),
+            start + Duration::from_secs(4),
+            cooldown
+        ));
+        // The window has passed: allowed again.
+        assert!(fleet_arm_allowed(
+            Some(start),
+            start + Duration::from_secs(5),
+            cooldown
+        ));
     }
 }
 
