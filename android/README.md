@@ -10,12 +10,12 @@ Build a debug APK with:
 gradle :app:assembleDebug
 ```
 
-The current native slice is identity setup, read-only stored-device facts, and
-file-code send/receive. Fleet enrollment is required follow-up, not a completed
-feature. Relationship choices (my device, someone else's, temporary worker) are
-explained independently of code/file/nearby methods, but enrollment controls
-remain unavailable until the shared core exposes confirmation and permissions
-APIs. No Kotlin policy engine or browser fleet behavior is implied.
+The current native slice covers identity setup, file-code transfer,
+invitation-file preview and join, and shared-core device policy. The device
+screen displays stored access states, can revoke a capability, and can cut off,
+forget, or restore a device. These are local policy changes, not claims that a
+peer was contacted or an active session ended. Spoken-code enrollment remains
+unlinked. No Kotlin policy engine or browser fleet behavior is implied.
 
 Navigation uses Jetpack's `NavHost`, with Android predictive back enabled. Back
 gestures seek the destination transition before release; cancelling keeps the
@@ -79,11 +79,12 @@ or device verification; use the workflow or an approved leased Android worker.
   core reports outbound authorization as unknown. The result screen reports the
   receiver's per-file delivery acknowledgment from `SendResult`; an attempt
   that was not acknowledged is never shown as delivered.
-- Enrollment, capability revocation, device removal and active-session
-  termination are not exposed by the integrated core. Their controls are
-  disabled and labelled unavailable rather than simulated. Enrollment is
-  expected to use shared `filament-id::enrollment` facts when that surface
-  exists; this client does not mint relationship or permission authority.
+- Capability revocation and device cut-off, forget, and restore use shared-core
+  operations and typed receipts. They update this phone's policy only; the app
+  does not claim that the peer was contacted or an existing session ended.
+  Capability grants and active-session termination are not exposed in the device
+  UI. Spoken-code enrollment remains unlinked, and the client does not mint
+  relationship or permission authority.
 - Discovery, expiry enforcement beyond stored facts, and recovery import still
   need core APIs. No successful stub or inferred remote permission is used.
   Offline and route facts remain unknown.
@@ -91,12 +92,12 @@ or device verification; use the workflow or an approved leased Android worker.
 ## Client parity
 
 Android is an adapter over the shared core, not a second fleet model. It
-projects the core's identity, device snapshot and transfer receipts; it does
-not evaluate access, enroll devices or perform removal. The instrumentation
-suite exercises the same core facts as the CLI (identity, relationship versus
-access, expiry/denial, verified receipt). Enrollment, capability removal,
-device removal, active-session termination, and browser/WASM parity remain
-blocked on the shared core surface and are not reimplemented in Kotlin.
+projects core identity, device policy, and transfer receipts; invitation-file
+preview/join, capability revocation, and device removal call shared-core APIs.
+It does not evaluate access or claim remote effects. Spoken-code enrollment,
+capability granting in the device UI, active-session termination, and
+browser/WASM parity remain outside this client slice and are not reimplemented
+in Kotlin.
 
 ## Native acceptance
 
@@ -107,7 +108,9 @@ adapter, verifies the published bytes against the sender's SHA-256, and checks
 the typed `devices()` projection without exporting pair secrets.
 `DeviceAuthorityUiTest` checks the relationship and action-state UI contract,
 including that an unknown remote send permission permits only an explicit
-attempt and that removal controls stay disabled and labelled unavailable.
+attempt and that forget and cut-off require confirmation and show core receipts.
+`DevicePolicyFfiTest` checks native policy mapping, ceiling refusal, and the
+local-only receipts for forget, cut-off, and restore.
 `NativePeerAcceptanceTest` requires a real sender plus `code`, `sha256`, `bytes`
 instrumentation arguments and verifies exact stored bytes against the digest.
 These tests must run on a leased worker or CI. `CliAndroidAcceptanceTest` is
