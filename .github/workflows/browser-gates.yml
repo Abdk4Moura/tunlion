@@ -180,6 +180,16 @@ jobs:
           TUNLION_TEST_VENV: python3
         run: node frontend/tests/pake-ux.spec.cjs
 
+      # The browser's auto-accept decision is the shared Rust policy compiled
+      # to wasm (frontend/src/policy, built by policy-wasm.yml). This gate
+      # replays the shared vectors through the committed module and pins the
+      # anonymous-code and stored-cap-without-identity cases. It fails, never
+      # skips, when the artifact is missing.
+      - name: policy-wire
+        env:
+          TUNLION_TEST_VENV: python3
+        run: node frontend/tests/policy-wire.spec.cjs
+
       # The new screens: one code box (Receive first), buttons only for access
       # held, keyboard reach and focus rings, the phone full-bleed shell, and a
       # code in the link's #fragment. Harness for the screens, the real built

@@ -1,0 +1,96 @@
+# The browser's transfer-admission decision is the shared Rust policy compiled
+# to WebAssembly. The module is COMMITTED under frontend/src/policy/ so
+# `npm run build` needs no Rust toolchain, and the browser decision is exactly
+# the one the CLI and Core use.
+#
+# This job rebuilds the module from source and fails if the result differs from
+# what is committed. The toolchain is pinned so the build is reproducible: when
+# this job fails after a real source change, download the `policy-wasm`
+# artifact and commit its files over frontend/src/policy/.
+#
+# It also runs when only the committed artifact changed, so a hand-edited or
+# stale module cannot pass unnoticed.
+name: Browser policy wasm
+
+on:
+  push:
+    branches: [main, "integration/**", "browser-policy-*", "feat/browser-policy-*"]
+    paths:
+      - "crates/filament-policy/**"
+      - "crates/tunlion-policy-wasm/**"
+      - "frontend/src/policy/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/policy-wasm.yml"
+  pull_request:
+    paths:
+      - "crates/filament-policy/**"
+      - "crates/tunlion-policy-wasm/**"
+      - "frontend/src/policy/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/policy-wasm.yml"
+  workflow_dispatch: {}
+
+jobs:
+  wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Keep in step with wasm-bindgen in the workspace Cargo.lock: the binding
+      # and the generated module must be the same version or the glue will not
+      # load.
+      WASM_BINDGEN_VERSION: "0.2.122"
+      RUST_VERSION: "1.88.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }} with the wasm target
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_VERSION"
+
+      - name: Check wasm-bindgen matches the lockfile
+        run: |
+          locked=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/version = |"/,""); print}' Cargo.lock)
+          test "$locked" = "$WASM_BINDGEN_VERSION" || { echo "Cargo.lock has wasm-bindgen $locked, this job pins $WASM_BINDGEN_VERSION"; exit 1; }
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/wasm-bindgen
+            ~/.cargo/registry
+            target/wasm32-unknown-unknown
+          key: policy-wasm-${{ env.RUST_VERSION }}-${{ env.WASM_BINDGEN_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install wasm-bindgen-cli
+        run: |
+          if ! wasm-bindgen --version 2>/dev/null | grep -q "$WASM_BINDGEN_VERSION"; then
+            cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked --force
+          fi
+          wasm-bindgen --version
+
+      - name: Build the module
+        run: bash crates/tunlion-policy-wasm/build-wasm.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-wasm
+          path: frontend/src/policy/
+          if-no-files-found: error
+
+      - name: Committed module matches the source
+        run: |
+          # git diff alone misses a generated file that is not tracked yet, so
+          # check status too (the first run after adding this workflow has no
+          # artifact committed and must fail loudly, not pass on an empty diff).
+          if ! git diff --exit-code --stat -- frontend/src/policy/; then
+            echo "frontend/src/policy/ is out of date with crates/tunlion-policy-wasm. Download the policy-wasm artifact from this run and commit it."
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain -- frontend/src/policy/)" ]; then
+            echo "frontend/src/policy/ has untracked or changed files. Download the policy-wasm artifact from this run and commit it."
+            git status --porcelain -- frontend/src/policy/
+            exit 1
+          fi
