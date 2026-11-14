@@ -272,6 +272,11 @@ pub async fn flush_inflight(by_sid: &mut HashMap<(String, u32), IncomingFile>) {
 
 /// Finalize streams whose bytes are complete but whose sender left before
 /// file-end. `received == size` is exactly the bar the file-end handler uses.
+///
+/// Returns the AUTHENTICATED names (`IncomingFile::sender`, captured when each
+/// stream was accepted) of the senders whose transfer completed here, so the
+/// caller can record them as warm. The link is gone by now, so the captured
+/// name is the only proven one left.
 #[allow(clippy::too_many_arguments)]
 pub async fn sweep_completed_streams(
     host: &dyn HostServices,
@@ -285,7 +290,8 @@ pub async fn sweep_completed_streams(
     report: &RecvReport,
     completed: &mut usize,
     delivery: &std::sync::Arc<Mutex<HashMap<String, crate::recv::ports::DeliveredFile>>>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut senders: Vec<String> = Vec::new();
     let done_sids: Vec<(String, u32)> = by_sid
         .iter()
         .filter(|((pid, _), inc)| {
@@ -302,6 +308,7 @@ pub async fn sweep_completed_streams(
                 })
                 .await;
                 *completed += 1;
+                senders.extend(inc.sender.clone());
                 continue;
             }
             let rename_to = if *completed == 0 {
@@ -316,6 +323,7 @@ pub async fn sweep_completed_streams(
                     inc.name
                 ),
             ));
+            let sender = inc.sender.clone();
             if finalize_incoming(
                 host,
                 log,
@@ -330,10 +338,11 @@ pub async fn sweep_completed_streams(
             .await?
             {
                 *completed += 1;
+                senders.extend(sender);
             }
         }
     }
-    Ok(())
+    Ok(senders)
 }
 
 /// The inbox marker the daemon writes beside its pidfile.

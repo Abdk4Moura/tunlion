@@ -3143,6 +3143,28 @@ impl Conn {
         self.warm_hold.note_use(peer);
     }
 
+    /// Record the sender of a COMPLETED inbound transfer as warm. Called only
+    /// after a successful completion, never for a failed, truncated or refused
+    /// transfer. The name is the link's proven `verified_name` now, else the
+    /// one `captured` when the stream was accepted (`IncomingFile::sender`);
+    /// never a name the peer claimed.
+    ///
+    /// The warm tier used to be fed from the streams STILL in flight once
+    /// anything had completed. The finished stream had already been removed
+    /// by then, so a single transfer warmed nobody, and with another sender
+    /// mid-transfer it warmed that one instead.
+    pub fn note_completed_transfer(&mut self, pid: &str, captured: Option<&str>) {
+        let name = self
+            .links
+            .get(pid)
+            .and_then(|l| l.verified_name.clone())
+            .or_else(|| captured.map(str::to_string))
+            .filter(|n| !n.is_empty());
+        if let Some(name) = name {
+            self.note_warm_use(&name);
+        }
+    }
+
     /// Load configured warm-peers from settings. Called at daemon startup and
     /// at the top of each warm_hold_tick to stay in sync with runtime changes.
     pub fn load_warm_peers_config(&mut self) {
@@ -5687,6 +5709,30 @@ impl Conn {
             return; // already linked via a live transport
         }
 
+        // The retirement drain is BOUNDED (MAX_RETIRED_ATTEMPTS), and a full
+        // drain refuses every new direct attempt for the whole session. So the
+        // check comes before a QUIC endpoint is bound, before candidates are
+        // gathered (that includes an HTTP whoami), before a transport-offer is
+        // emitted, and before the 6x/1.2s re-emitter is spawned. Checked last,
+        // every refused attempt had already paid all of that and left a
+        // re-emitter running with a cancel flag on a pending that was never
+        // created: one stuck build became a session-wide outage and an
+        // unstoppable burst. It comes AFTER the relay recovery and the no-op
+        // returns above, which consume no drain capacity: refusing those on a
+        // full drain left a relay-committed peer disconnected.
+        if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
+            // Liveness backstop for a lost drain event. Only a tombstone whose
+            // producer is terminal is reaped; a live producer keeps its slot
+            // and this attempt fails closed below.
+            self.reap_drained_tombstones(Instant::now());
+            if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
+                self.log.debug(&format!(
+                    "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
+                ));
+                return;
+            }
+        }
+
         // Check if target is same-machine peer (local transport).
         let peer_uid = self.roster.get(pid).and_then(|info| info["uid"].as_str());
         let is_local = LOCAL_TCP_TRANSPORT && self.host.is_self_uid(&self.my_uid, peer_uid);
@@ -5856,18 +5902,6 @@ impl Conn {
         } else {
             Instant::now() + direct::DIRECT_BUDGET
         };
-        if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
-            // Liveness backstop for a lost drain event. Only a tombstone whose
-            // producer is terminal is reaped; a live producer keeps its slot
-            // and this attempt fails closed below.
-            self.reap_drained_tombstones(Instant::now());
-            if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
-                self.log.debug(&format!(
-                    "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
-                ));
-                return;
-            }
-        }
         self.next_gen += 1;
         let auth = match intent {
             DirectIntent::Fleet => DirectAuth::fleet(self.next_gen),
@@ -10213,6 +10247,108 @@ mod warm_identity_tests {
         assert!(conn.warm_hold.auto.contains("x"), "the device is warm-held by petname");
     }
 
+    /// A live, certificate-admitted fleet sibling with no device record (no
+    /// pair secret, so the auto tier never holds it): the shape gate T2b reads.
+    fn cert_only_sibling(pid: &str, name: &str, t: Arc<dyn Transport>) -> Link {
+        let mut l = direct_link(pid, name, &format!("user@{name}"), t);
+        l.trusted = false;
+        l.expected_secret = None;
+        l.verified_name = Some(name.to_string());
+        l.admit_fleet([1u8; 32], [2u8; 32], u64::MAX);
+        l
+    }
+
+    /// The pair-link rule as every fleet arm site reads it, on real links: a
+    /// pair link whose secret the store still holds blocks the arm; the same
+    /// link after the device was forgotten (secret no longer held) does not;
+    /// a fleet-shaped link (untrusted, no pair secret) does not.
+    #[cfg(feature = "dispatch")]
+    #[tokio::test]
+    async fn a_fleet_arm_is_blocked_only_by_a_held_pair_link() {
+        use crate::recv::dispatch::fleet_arm_blocked_by_pair_link as blocked;
+        let (mut conn, _far, _rx) = test_conn().await;
+        let held = vec![("dev".to_string(), "s3cret".to_string())];
+        conn.links.insert("sid-p".into(), direct_link("sid-p", "dev", "user@dev", FakeQuic::live()));
+        assert!(blocked(&conn, "sid-p", &held), "a fleet arm may take over a held pair link");
+        assert!(!blocked(&conn, "sid-p", &[]), "a forgotten device's stale link blocked the arm");
+        conn.links.insert("sid-f".into(), cert_only_sibling("sid-f", "sib", FakeQuic::live()));
+        assert!(!blocked(&conn, "sid-f", &held), "a fleet link blocked the fleet arm");
+        assert!(!blocked(&conn, "sid-none", &held), "a peer with no link blocked the arm");
+    }
+
+    /// One completed receive from a certificate-only sibling, with no other
+    /// stream in flight, leaves that sender warm, and the next warm tick
+    /// reports its live link as a FleetSibling without dialling. Before, the
+    /// warm tier was fed from the streams still in flight once something had
+    /// completed; the finished stream was already gone, so this sender was
+    /// never recorded and the tick never named it.
+    #[tokio::test]
+    async fn a_completed_receive_warms_its_certificate_only_sender() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(crate::host::VecLog::new());
+        conn.log = log.clone() as Arc<dyn LogSink>;
+        conn.links.insert(
+            "sid-c".into(),
+            cert_only_sibling("sid-c", "charlie", FakeQuic::live()),
+        );
+
+        // Nothing completed yet: not warm, and the tick says nothing of it.
+        assert!(!conn.warm_hold.peers_to_connect().iter().any(|p| p == "charlie"));
+        assert!(conn.warm_hold_tick(true).await.is_empty());
+        assert!(
+            !log.take().iter().any(|(_, l)| l.contains("warm-hold: skip 'charlie'")),
+            "the tick named a sender before any transfer completed"
+        );
+
+        conn.note_completed_transfer("sid-c", Some("charlie"));
+        assert!(
+            conn.warm_hold.peers_to_connect().iter().any(|p| p == "charlie"),
+            "the completed sender is not warm"
+        );
+        let dialled = conn.warm_hold_tick(true).await;
+        assert!(dialled.is_empty(), "warm-hold dialled {dialled:?} over a live link");
+        let lines = log.take();
+        assert!(
+            lines.iter().any(|(_, l)| l.contains("warm-hold: skip 'charlie'")
+                && l.contains("principal=FleetSibling sibling=true")),
+            "the tick did not report the live sibling link: {lines:?}"
+        );
+    }
+
+    /// Two senders, one completes while the other is still in flight: the
+    /// one that COMPLETED is recorded, and only that one.
+    #[tokio::test]
+    async fn the_completed_sender_is_the_one_recorded() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.links.insert("sid-a".into(), cert_only_sibling("sid-a", "alpha", FakeQuic::live()));
+        conn.links.insert("sid-b".into(), cert_only_sibling("sid-b", "bravo", FakeQuic::live()));
+        conn.note_completed_transfer("sid-a", Some("alpha"));
+        let warm = conn.warm_hold.peers_to_connect();
+        assert!(warm.iter().any(|p| p == "alpha"), "the completed sender was not recorded");
+        assert!(!warm.iter().any(|p| p == "bravo"), "the in-flight sender was recorded instead");
+    }
+
+    /// Only a PROVEN name is recorded. The live link's verified name wins;
+    /// with the link gone (the sender left before file-end) the name captured
+    /// when the stream was accepted is used; a link with no proven name and
+    /// nothing captured records nothing, whatever name the peer claimed.
+    #[tokio::test]
+    async fn a_completed_transfer_records_only_a_proven_name() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        // The link is gone: the captured name stands in.
+        conn.note_completed_transfer("sid-gone", Some("delta"));
+        assert!(conn.warm_hold.peers_to_connect().iter().any(|p| p == "delta"));
+        // An unproven link: its claimed petname is never recorded.
+        let mut l = direct_link("sid-u", "mallory", "user@mallory", FakeQuic::live());
+        l.verified_name = None;
+        conn.links.insert("sid-u".into(), l);
+        conn.note_completed_transfer("sid-u", None);
+        assert!(
+            !conn.warm_hold.peers_to_connect().iter().any(|p| p == "mallory"),
+            "a claimed name was recorded as warm"
+        );
+    }
+
     #[tokio::test]
     async fn establish_refuses_to_replace_a_live_link() {
         let (mut conn, _far, _rx) = test_conn().await;
@@ -11725,8 +11861,11 @@ mod warm_identity_tests {
         conn.direct_ok = true;
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pid = "sid-fleet";
-        // The link before the adoption: pair-proven and trusted.
-        let mut link = direct_link(pid, "peer", "peer", Rec::new("webrtc", &log));
+        // The link before the adoption: a PAIR-proven WebRTC link, still
+        // live. A live DIRECT primary with another attempt is not replaceable
+        // through this path, so the fixture has to be the non-direct link that
+        // adopts a fleet direct IN PLACE, which is the case this is about.
+        let mut link = relay_link(pid, "peer", "peer", Rec::new("webrtc", &log));
         link.trusted = true;
         link.verified_name = Some("peer".to_string());
         link.principal_kind = PrincipalKind::OwnerDevice;
@@ -11764,6 +11903,83 @@ mod warm_identity_tests {
             Some("fleet-rv"),
             "the fleet binding did not replace the pair one"
         );
+    }
+
+    /// The whole fleet standing cycle on a real Link, through the same
+    /// functions the hello arm and the ChannelReady rotation call: an
+    /// admitted sibling adopts a fleet-keyed direct in place (Delegated, the
+    /// binding rotated), the rotation drops the verdict earned on the old
+    /// binding and leaves our hello owed, and the next verified hello makes
+    /// the link a FleetSibling again. Before the epoch stamps, nothing in
+    /// this path tied the verdict to the binding that earned it.
+    #[cfg(feature = "dispatch")]
+    #[tokio::test]
+    async fn a_sibling_that_adopts_a_fleet_direct_is_a_sibling_again_after_its_hello() {
+        use crate::recv::dispatch::{
+            admit_verified_fleet_hello, fleet_standing_after_rotation, link_epoch,
+        };
+        use crate::recv::fleet_bind::Standing;
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-sib";
+        let mut link = relay_link(pid, "sib", "sib", Rec::new("webrtc", &log));
+        link.trusted = false;
+        link.verified_name = None;
+        link.expected_secret = None;
+        link.principal_kind = PrincipalKind::Delegated { caps: Vec::new() };
+        conn.links.insert(pid.to_string(), link);
+        let mut standing = Standing::default();
+        let mut verified = std::collections::HashSet::new();
+        let mut pending = std::collections::HashSet::new();
+        let (owner, device) = ([1u8; 32], [2u8; 32]);
+
+        // 1. FleetSibling: the hello verified on the WebRTC binding.
+        let old = link_epoch(&conn, pid).expect("installed");
+        assert!(admit_verified_fleet_hello(
+            &mut conn, &mut standing, &mut verified, pid, Some("sib".into()), owner, device, u64::MAX
+        ));
+        standing.greeted(pid, old);
+        assert!(conn.link(pid).unwrap().is_sibling_link(), "the hello did not admit a sibling");
+
+        // 2. Rotate: a fleet-keyed direct is adopted in place.
+        let attempt = net::AttemptId::next();
+        let mut p = direct_pending_with(attempt, ("sib", "fleet-rv"));
+        p.fleet = true;
+        p.auth = DirectAuth::fleet(1);
+        conn.direct_pending.insert(pid.to_string(), p);
+        let quic: Arc<dyn Transport> = Rec::with_attempt("quic", &log, attempt);
+        assert!(matches!(
+            conn.adopt_direct(pid, quic, "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+        let new = link_epoch(&conn, pid).expect("installed");
+        assert_ne!(old, new, "the adoption did not rotate the binding epoch");
+
+        // 3. Delegated: nothing the old binding proved stands on the new one.
+        let l = conn.link(pid).unwrap();
+        assert!(matches!(l.principal_kind, PrincipalKind::Delegated { .. }));
+        assert!(!l.is_sibling_link());
+        assert!(
+            fleet_standing_after_rotation(&mut standing, &mut verified, &mut pending, pid, new),
+            "the rotation kept a verdict from the old binding"
+        );
+        assert!(!verified.contains(pid));
+        assert!(pending.contains(pid), "the hello was not queued again");
+        assert!(standing.hello_owed(pid, Some(new)), "our hello is not owed on the new binding");
+
+        // 4. Hello on the new binding: a sibling again, and the verdict is
+        // stamped with the new epoch, so the same rotation event replayed
+        // does not drop it.
+        assert!(admit_verified_fleet_hello(
+            &mut conn, &mut standing, &mut verified, pid, Some("sib".into()), owner, device, u64::MAX
+        ));
+        let l = conn.link(pid).unwrap();
+        assert!(matches!(l.principal_kind, PrincipalKind::FleetSibling));
+        assert!(l.is_sibling_link(), "the link did not become a sibling again");
+        assert_eq!(l.verified_name.as_deref(), Some("sib"));
+        assert!(!fleet_standing_after_rotation(&mut standing, &mut verified, &mut pending, pid, new));
+        assert!(verified.contains(pid), "a verdict on the installed binding was dropped");
     }
 
     /// Code authority follows the old-peer promotion: the direct link the
@@ -14201,6 +14417,48 @@ mod warm_identity_tests {
         ));
         assert!(fresh.is_dead());
         assert!(!conn.links.contains_key(fresh_pid));
+    }
+
+    /// A FULL retirement drain refuses new direct attempts, but not the relay
+    /// recovery or the no-op returns, which consume no drain capacity. With
+    /// the check first, a relay-committed peer with no link was refused its
+    /// relay re-establish whenever the drain was full, and stayed disconnected.
+    #[tokio::test]
+    async fn a_full_drain_still_re_establishes_a_relay_committed_peer() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let log = Arc::new(crate::host::VecLog::new());
+        conn.log = log.clone() as Arc<dyn LogSink>;
+        // Live producers: the backstop cannot reap any of them.
+        for _ in 0..MAX_RETIRED_ATTEMPTS {
+            conn.retired_attempts
+                .insert(net::AttemptId::next(), RetiredAttempt::new("sid-other"));
+        }
+        let pid = "sid-relay";
+        conn.resil.relay_committed.insert(pid.into());
+        conn.start_direct(pid, "peer", "pair-secret").await;
+        assert!(
+            conn.links.contains_key(pid),
+            "the relay re-establish was refused by a full drain"
+        );
+        assert!(!conn.direct_pending.contains_key(pid), "a direct attempt was armed");
+        let lines = log.take();
+        assert!(
+            !lines.iter().any(|(_, l)| l.contains("retirement drain capacity full")),
+            "the relay recovery was counted as a refused direct attempt: {lines:?}"
+        );
+
+        // A peer that is NOT relay-committed is still refused, before any
+        // pending exists: the drain bound itself is unchanged.
+        let other = "sid-direct";
+        conn.start_direct(other, "peer2", "pair-secret-2").await;
+        assert!(!conn.direct_pending.contains_key(other), "a full drain armed a direct attempt");
+        assert!(
+            log.take().iter().any(|(_, l)| l.contains(&format!(
+                "direct attempt for {other} refused: retirement drain capacity full"
+            ))),
+            "the full drain did not refuse the direct attempt"
+        );
     }
 
     /// The capacity backstop reaps a tombstone by age only once its producer
