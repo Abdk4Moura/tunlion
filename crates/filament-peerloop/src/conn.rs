@@ -1733,6 +1733,8 @@ pub struct Conn {
     /// Source-bound standby/upgrade events awaiting adoption. Bounded per source
     /// and in total; overflow closes the standby instead of growing forever.
     pub pending_sources: HashMap<net::SourceId, PendingSource>,
+    pub replaying_sources: HashMap<net::SourceId, PendingSource>,
+    pub replay_departures: HashMap<String, (net::SourceId, bool)>,
     /// Roster sids absent from consecutive channel/room digests, for the
     /// two-tick hysteresis in `prune_roster_absent`.
     pub roster_absent: HashMap<String, u8>,
@@ -1970,6 +1972,8 @@ impl Conn {
             revoked_bindings: HashSet::new(),
             link_events: HashMap::new(),
             pending_sources: HashMap::new(),
+            replaying_sources: HashMap::new(),
+            replay_departures: HashMap::new(),
             roster_absent: HashMap::new(),
             log,
             host,
@@ -2579,6 +2583,10 @@ impl Conn {
     /// from the call sites the way a manual audit does.
     #[track_caller]
     pub fn drop_link(&mut self, pid: &str) {
+        self.replaying_sources.retain(|_, pending| pending.pid != pid);
+        if self.replay_departures.get(pid).is_some_and(|(_, ready)| !ready) {
+            self.replay_departures.remove(pid);
+        }
         // A drop is an invalidation: a candidate still building for this peer
         // must not publish after the link it was replacing is gone.
         self.cancel_build(pid);
@@ -3759,7 +3767,7 @@ impl Conn {
         }
     }
 
-    /// Final pre-dispatch gate. Transport-origin Control/PcState/ChannelReady
+    /// Final pre-dispatch gate. Transport-origin Control/PcState/ChannelReady/Chunk
     /// must carry an immutable SourceId; the event is accepted only if that
     /// source still belongs to the pid's CURRENT link at the moment the driver
     /// is about to handle it. A replacement after forwarding therefore cannot
@@ -3767,6 +3775,31 @@ impl Conn {
     /// handlers that defer/requeue the event).
     pub fn stage_event(&mut self, ev: Ev) -> Option<(Ev, Option<net::SourceId>)> {
         match ev {
+            Ev::ReplayDeparture(pid, source, payload) => {
+                if self.replay_departures.get(&pid) != Some(&(source, false)) {
+                    return None;
+                }
+                if self.links.get(&pid).map(|link| link.source) != Some(source) {
+                    self.replay_departures.remove(&pid);
+                    return None;
+                }
+                if self.replaying_sources.contains_key(&source) {
+                    let _ = self.tx.send(Ev::ReplayDeparture(pid, source, payload));
+                    return None;
+                }
+                self.replay_departures.insert(pid, (source, true));
+                return Some((Ev::PeerLeft(payload), Some(source)));
+            }
+            Ev::ReplaySource(source) => {
+                let pending = self.replaying_sources.get_mut(&source)?;
+                let pid = pending.pid.clone();
+                let inner = pending.events.pop_front()?;
+                pending.bytes = pending.bytes.saturating_sub(ev_weight(&inner));
+                if pending.events.is_empty() {
+                    self.replaying_sources.remove(&source);
+                }
+                return self.source_current(&pid, source, &inner).then_some((inner, Some(source)));
+            }
             Ev::AttemptDrained(attempt) => {
                 self.retired_attempts.remove(&attempt);
                 None
@@ -3789,6 +3822,10 @@ impl Conn {
                     if !self.source_current(&pid, source, inner.as_ref()) {
                         return None;
                     }
+                    if self.replaying_sources.contains_key(&source) {
+                        let _ = self.tx.send(Ev::Sourced { pid, source, inner });
+                        return None;
+                    }
                     match self.link_events.get_mut(&pid) {
                         Some(events)
                             if self.links.get(&pid).map(|link| link.generation)
@@ -3808,13 +3845,42 @@ impl Conn {
                 let valid_inner = match inner.as_ref() {
                     Ev::Control(ipid, _)
                     | Ev::PcState(ipid, _)
-                    | Ev::ChannelReady(ipid, _) => ipid == &pid,
+                    | Ev::ChannelReady(ipid, _)
+                    | Ev::Chunk(ipid, ..) => ipid == &pid,
                     _ => false,
                 };
                 if !valid_inner {
                     return None;
                 }
                 if self.source_current(&pid, source, inner.as_ref()) {
+                    if self.replaying_sources.contains_key(&source) {
+                        // The replay tokens were queued behind already-read newer
+                        // events. Swap this arrival behind the oldest buffered
+                        // event, so the consumer sees source order, not queue order.
+                        let total: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.bytes).sum();
+                        let Some(pending) = self.replaying_sources.get_mut(&source) else { return None; };
+                        if pending.pid != pid { return None; }
+                        // The token invariant says one buffered event per token.
+                        // If it does not hold, fail closed: drop the replay and
+                        // close the transport rather than panic in the daemon's
+                        // event loop.
+                        let Some(older) = pending.events.pop_front() else {
+                            self.replaying_sources.remove(&source);
+                            if let Some(t) = self.transport_of(&pid) { t.force_close(); }
+                            return None;
+                        };
+                        let bytes = pending.bytes.saturating_sub(ev_weight(&older))
+                            .saturating_add(ev_weight(&inner));
+                        let total_after = total.saturating_sub(pending.bytes).saturating_add(bytes);
+                        if bytes > MAX_BUILD_EVENT_BYTES || total_after > MAX_BUILD_EVENT_BYTES {
+                            self.replaying_sources.remove(&source);
+                            if let Some(t) = self.transport_of(&pid) { t.force_close(); }
+                            return None;
+                        }
+                        pending.bytes = bytes;
+                        pending.events.push_back(*inner);
+                        return self.source_current(&pid, source, &older).then_some((older, Some(source)));
+                    }
                     return Some((*inner, Some(source)));
                 }
                 // A standby/upgrade attempt may deliver before adoption. Buffer
@@ -3826,7 +3892,7 @@ impl Conn {
             }
             // A transport-origin event must never arrive untagged. Fail closed
             // whether or not a link exists.
-            Ev::Control(..) | Ev::PcState(..) | Ev::ChannelReady(..) => None,
+            Ev::Control(..) | Ev::PcState(..) | Ev::ChannelReady(..) | Ev::Chunk(..) => None,
             // Loop-authored events are explicitly trusted: they are created by
             // this loop, not a transport callback.
             Ev::LocalControl(pid, value) => Some((Ev::Control(pid, value), None)),
@@ -3836,7 +3902,7 @@ impl Conn {
     }
 
     /// A source is current when it is the link's primary source, or (for
-    /// Control only) one of its current worker sources. PcState/ChannelReady
+    /// Control and Chunk only) one of its current worker sources. PcState/ChannelReady
     /// and a departure barrier (`Ev::PeerLeft`) are primary-only so a worker
     /// can never trigger primary teardown/readiness or a departure.
     fn source_current(&self, pid: &str, source: net::SourceId, inner: &Ev) -> bool {
@@ -3846,7 +3912,7 @@ impl Conn {
         if link.source == source {
             return true;
         }
-        matches!(inner, Ev::Control(..)) && link.worker_sources.contains(&source)
+        matches!(inner, Ev::Control(..) | Ev::Chunk(..)) && link.worker_sources.contains(&source)
     }
 
     /// Buffer a pre-adoption event for a registered source. Per-source and total
@@ -3854,8 +3920,8 @@ impl Conn {
     /// dropping the pending source and its standby transport.
     fn buffer_pending_source(&mut self, pid: String, source: net::SourceId, inner: Ev) {
         let weight = ev_weight(&inner);
-        let total_events: usize = self.pending_sources.values().map(|p| p.events.len()).sum();
-        let total_bytes: usize = self.pending_sources.values().map(|p| p.bytes).sum();
+        let total_events: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.events.len()).sum();
+        let total_bytes: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.bytes).sum();
         let over_total = total_events >= MAX_BUILD_EVENTS
             || total_bytes.saturating_add(weight) > MAX_BUILD_EVENT_BYTES;
         let is_new = !self.pending_sources.contains_key(&source);
@@ -3912,18 +3978,17 @@ impl Conn {
         }
     }
 
-    /// Replay buffered standby events after adoption. They keep their tag, so a
-    /// second replacement still rejects them at the final gate.
+    /// Queue one token per buffered event. Newer already-queued events swap with
+    /// the oldest replay item at the final gate, preserving source order.
     fn flush_pending_source(&mut self, source: net::SourceId) {
         let Some(pending) = self.pending_sources.remove(&source) else {
             return;
         };
-        for inner in pending.events {
-            let _ = self.tx.send(Ev::Sourced {
-                pid: pending.pid.clone(),
-                source,
-                inner: Box::new(inner),
-            });
+        let count = pending.events.len();
+        if count == 0 { return; }
+        self.replaying_sources.insert(source, pending);
+        for _ in 0..count {
+            let _ = self.tx.send(Ev::ReplaySource(source));
         }
     }
 
@@ -6056,9 +6121,7 @@ impl Conn {
             tokio::spawn(async move {
                 let workers =
                     direct::accept_workers(endpoints, tkey, pid.clone(), tx.clone(), count).await;
-                if !workers.is_empty() {
-                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers, primary_source));
-                }
+                direct::announce_workers(workers, &tx, pid, primary_source);
             });
         } else {
             // DIALER: wait for the acceptor's worker ports, then connect to each.
@@ -6077,9 +6140,7 @@ impl Conn {
                 let workers =
                     direct::dial_workers(ports, peer_ip, tkey, pid.clone(), tx.clone(), count)
                         .await;
-                if !workers.is_empty() {
-                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers, primary_source));
-                }
+                direct::announce_workers(workers, &tx, pid, primary_source);
             });
         }
     }
@@ -7972,11 +8033,27 @@ impl Conn {
         // and finalizer below. Ordinary ready/pending behaviour is unchanged.
         let forced = v["__fil_force_drop"].as_bool() == Some(true);
         if forced {
+            self.replay_departures.remove(pid_val);
             if let Some(events) = self.link_events.get_mut(pid_val) {
                 events.departure_ready = None;
                 events.departure_pending = None;
             }
         } else {
+            if let Some((source, ready)) = self.replay_departures.get(pid_val).copied() {
+                if self.links.get(pid_val).map(|link| link.source) != Some(source) {
+                    self.replay_departures.remove(pid_val);
+                    if ready { return false; }
+                } else {
+                    if !ready { return false; }
+                    self.replay_departures.remove(pid_val);
+                }
+            } else if let Some(source) = self.links.get(pid_val).map(|link| link.source) {
+                if self.replaying_sources.contains_key(&source) {
+                    self.replay_departures.insert(pid_val.to_string(), (source, false));
+                    let _ = self.tx.send(Ev::ReplayDeparture(pid_val.to_string(), source, v.clone()));
+                    return false;
+                }
+            }
             // A departure barrier `stage_event` admitted: the departed link's
             // already-read events were dispatched ahead of it, and the marker is
             // bound to that exact source. Consume it once and run the ordinary
@@ -13275,6 +13352,203 @@ mod warm_identity_tests {
         assert!(conn
             .stage_event(Ev::LocalControl(pid.into(), json!({ "type": "x" })))
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn chunk_attribution_fences_pairing_and_worker_dispatch() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "pairing-peer";
+        let primary = Rec::new("primary", &log);
+        let source = primary.source_id().unwrap();
+        let worker = Rec::new("worker", &log);
+        let worker_source = worker.source_id().unwrap();
+        let retired = net::SourceId::next();
+        let mut link = relay_link(pid, "peer", "peer", primary);
+        link.source = source;
+        link.worker_sources.insert(worker_source);
+        conn.links.insert(pid.into(), link);
+        let chunk = |s, envelope: &str, inner: &str| Ev::Sourced {
+            pid: envelope.into(), source: s,
+            inner: Box::new(Ev::Chunk(inner.into(), 42, Some(0), bytes::Bytes::from_static(b"pair"))),
+        };
+        assert!(matches!(conn.stage_event(chunk(source, pid, pid)), Some((Ev::Chunk(..), Some(s))) if s == source));
+        assert!(matches!(conn.stage_event(chunk(worker_source, pid, pid)), Some((Ev::Chunk(..), Some(s))) if s == worker_source));
+        assert!(conn.stage_event(chunk(retired, pid, pid)).is_none());
+        assert!(conn.stage_event(chunk(source, pid, "other")).is_none());
+        assert!(conn.stage_event(Ev::Chunk(pid.into(), 42, Some(0), bytes::Bytes::new())).is_none());
+
+        // A registered standby may read before adoption. Replay stays tagged,
+        // and replacement between flush and dispatch must still fence it.
+        let standby = Rec::new("standby", &log);
+        let standby_source = standby.source_id().unwrap();
+        conn.pending_sources.insert(standby_source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::new(), bytes: 0,
+        });
+        assert!(conn.stage_event(chunk(standby_source, pid, pid)).is_none());
+        assert_eq!(conn.pending_sources[&standby_source].events.len(), 1);
+        assert_eq!(conn.pending_sources[&standby_source].bytes, 4);
+        conn.links.get_mut(pid).unwrap().source = standby_source;
+        conn.flush_pending_source(standby_source);
+        assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(..), Some(s))) if s == standby_source));
+
+        conn.links.get_mut(pid).unwrap().source = source;
+        conn.pending_sources.insert(standby_source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::new(), bytes: 0,
+        });
+        assert!(conn.stage_event(chunk(standby_source, pid, pid)).is_none());
+        conn.links.get_mut(pid).unwrap().source = standby_source;
+        conn.flush_pending_source(standby_source);
+        conn.links.get_mut(pid).unwrap().source = source;
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
+        conn.links.get_mut(pid).unwrap().worker_sources.clear();
+        assert!(conn.stage_event(chunk(worker_source, pid, pid)).is_none());
+    }
+
+    #[tokio::test]
+    async fn buffered_standby_chunks_cannot_be_overtaken_at_adoption() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "ordered-standby";
+        let old = Rec::new("old", &log);
+        let old_source = old.source_id().unwrap();
+        let standby = Rec::new("standby", &log);
+        let source = standby.source_id().unwrap();
+        let mut link = relay_link(pid, "peer", "peer", old);
+        link.source = old_source;
+        conn.links.insert(pid.into(), link);
+        conn.pending_sources.insert(source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::new(), bytes: 0,
+        });
+        let chunk = |offset, data: &'static [u8]| Ev::Sourced {
+            pid: pid.into(), source,
+            inner: Box::new(Ev::Chunk(pid.into(), 42, Some(offset), bytes::Bytes::from_static(data))),
+        };
+        assert!(conn.stage_event(chunk(0, b"old")).is_none());
+        // This event is already in the normal queue when adoption happens.
+        conn.tx.send(chunk(3, b"new")).unwrap();
+        conn.links.get_mut(pid).unwrap().source = source;
+        conn.flush_pending_source(source);
+        let first = conn.stage_event(rx.try_recv().unwrap()).unwrap().0;
+        let second = conn.stage_event(rx.try_recv().unwrap()).unwrap().0;
+        assert!(matches!(first, Ev::Chunk(_, 42, Some(0), ref data) if data.as_ref() == b"old"));
+        assert!(matches!(second, Ev::Chunk(_, 42, Some(3), ref data) if data.as_ref() == b"new"));
+        assert!(conn.replaying_sources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_precedes_real_departure_paths_and_fences_replacement() {
+        for sourced_barrier in [false, true] {
+            let (mut conn, _far, mut rx) = test_conn().await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "replay-departure";
+            let transport = Rec::new("current", &log);
+            let source = transport.source_id().unwrap();
+            conn.links.insert(pid.into(), delegated_link(pid, transport));
+            if sourced_barrier {
+                let (_tx, queued) = tokio::sync::mpsc::unbounded_channel();
+                conn.link_events.insert(pid.into(), LinkEvents {
+                    generation: 7, rx: std::sync::Mutex::new(queued),
+                    departure_ready: None, departure_pending: Some(source),
+                });
+            }
+            conn.pending_sources.insert(source, PendingSource {
+                pid: pid.into(), attempt: None, at: Instant::now(),
+                events: std::collections::VecDeque::from([Ev::Chunk(
+                    pid.into(), 42, Some(0), bytes::Bytes::from_static(b"before-left"),
+                )]), bytes: 11,
+            });
+            let payload = json!({"id": pid});
+            let departure = if sourced_barrier {
+                Ev::Sourced { pid: pid.into(), source, inner: Box::new(Ev::PeerLeft(payload.clone())) }
+            } else { Ev::PeerLeft(payload.clone()) };
+            conn.tx.send(departure).unwrap();
+            conn.flush_pending_source(source);
+            if let Some((Ev::PeerLeft(v), _)) = conn.stage_event(rx.try_recv().unwrap()) {
+                assert!(!conn.on_peer_left(&v));
+            } else {
+                assert!(sourced_barrier, "ordinary room departure was not dispatched");
+            }
+            assert!(conn.links.contains_key(pid), "departure overtook buffered data");
+            assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(_, 42, Some(0), ref b), Some(s))) if s == source && b.as_ref() == b"before-left"));
+            let (Ev::PeerLeft(v), seen) = conn.stage_event(rx.try_recv().unwrap()).expect("deferred departure") else { panic!("expected departure") };
+            assert_eq!(seen, Some(source));
+            conn.on_peer_left(&v);
+            assert!(!conn.links.contains_key(pid), "departure did not finalize");
+        }
+
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "replay-replacement";
+        let old = Rec::new("old", &log);
+        let source = old.source_id().unwrap();
+        conn.links.insert(pid.into(), delegated_link(pid, old));
+        conn.pending_sources.insert(source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"x"))]), bytes: 1,
+        });
+        conn.flush_pending_source(source);
+        assert!(!conn.on_peer_left(&json!({"id": pid})));
+        let successor = Rec::new("successor", &log);
+        conn.links.insert(pid.into(), delegated_link(pid, successor));
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
+        assert!(conn.links.contains_key(pid), "stale deferred departure dropped replacement");
+
+        // A replacement after the deferred event passes staging but before its
+        // caller invokes on_peer_left must also survive.
+        let current = conn.links[pid].source;
+        conn.replaying_sources.insert(current, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"y"))]), bytes: 1,
+        });
+        conn.tx.send(Ev::ReplaySource(current)).unwrap();
+        assert!(!conn.on_peer_left(&json!({"id": pid})));
+        assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(..), _))));
+        let (Ev::PeerLeft(deferred), _) = conn.stage_event(rx.try_recv().unwrap()).unwrap() else { panic!("expected staged departure") };
+        conn.drop_link(pid);
+        let newer = Rec::new("newer", &log);
+        conn.links.insert(pid.into(), delegated_link(pid, newer));
+        assert!(!conn.on_peer_left(&deferred));
+        assert!(conn.links.contains_key(pid), "staged departure dropped a newer link");
+    }
+
+    /// The replay swap path closes the CURRENT, already adopted transport when
+    /// the replay would exceed the event budget. That is a behaviour change on
+    /// a live link, so it is pinned here rather than left implicit: the
+    /// standby's replay is dropped, the adopted link's transport is closed,
+    /// and the daemon keeps running.
+    #[tokio::test]
+    async fn a_replay_overflow_closes_the_adopted_link_not_the_standby() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "replay-overflow";
+        let adopted = Rec::new("adopted", &log);
+        let source = adopted.source_id().unwrap();
+        conn.links
+            .insert(pid.into(), delegated_link(pid, adopted.clone()));
+        // A replay already in flight for this source, with one buffered event.
+        conn.replaying_sources.insert(source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"old"))]), bytes: 3,
+        });
+        // A new event over the budget: the swap overflows and must close the
+        // adopted transport.
+        // The comparison is strict (`>`), so exactly the limit is allowed.
+        // One byte above it must take the overflow path.
+        let big = vec![0u8; MAX_BUILD_EVENT_BYTES + 1];
+        let ev = Ev::Sourced {
+            pid: pid.into(),
+            source,
+            inner: Box::new(Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from(big))),
+        };
+        assert!(conn.stage_event(ev).is_none(), "the overflowing event must not be dispatched");
+        assert!(!conn.replaying_sources.contains_key(&source), "the replay entry must be dropped");
+        assert!(conn.links.contains_key(pid), "the daemon must survive the overflow");
+        assert!(adopted.is_dead(), "overflow must close the adopted transport");
     }
 
     /// A registered standby source buffers until adoption, replays with its tag,
