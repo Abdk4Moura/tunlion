@@ -876,25 +876,70 @@ impl std::error::Error for WrongFleetDevice {}
 /// before saying it is offline. A live daemon answers the moment it sees us.
 const EXEC_SILENT_PEER: Duration = Duration::from_secs(15);
 
-/// Should the per-candidate establish timer leave this candidate alone?
+/// The establish bound of the candidate being dialed.
 ///
-/// The timer exists to rotate past GHOSTS: dead or wrong sids that never say a
-/// word. A candidate that has answered (any signal from its sid, or ICE that has
-/// a remote description or is checking) is a real peer still negotiating, and
-/// abandoning it rebuilds the connection the far end is answering, so the next
-/// attempt starts over against stale state. Such a candidate is left to the C3
-/// watchdog (`net::WATCHDOG_SECS`), whose own `Stuck` arrives once `age` has
-/// reached it and does rotate. A timer configured at or past the watchdog
-/// (`TUNLION_L2_CANDIDATE_SECS`) rotates exactly as before. A CONNECTED peer
-/// connection still waiting here (a fleet link waiting for its direct proof)
-/// gets no watchdog `Stuck`, so this timer stays its only bound and rotates it.
-fn keep_answering_candidate(
-    age: Duration,
-    heard: bool,
-    progressing: bool,
-    connected: bool,
-) -> bool {
-    !connected && age < Duration::from_secs(net::WATCHDOG_SECS) && (heard || progressing)
+/// The per-candidate timer (`TUNLION_L2_CANDIDATE_SECS`, 7s) exists to rotate
+/// past GHOSTS: dead or wrong sids that never say a word. A candidate that has
+/// answered (any signal from its sid, or ICE with a remote description, checking
+/// or connected) is a real peer still negotiating; abandoning it rebuilds the
+/// connection the far end is answering. Such a candidate is KEPT, and keeping
+/// arms a one-shot `Stuck` at its hard bound (`started + bound`, the C3 watchdog
+/// time), so it is rotated there whatever its peer connection state. The C3
+/// watchdog alone is not that bound: it stays silent for a CONNECTED peer
+/// connection (a fleet link waiting for its direct proof, or a data channel that
+/// never opens). A timer configured at or past the bound rotates as before.
+struct CandidateBound {
+    started: tokio::time::Instant,
+    bound: Duration,
+    rearmed: bool,
+}
+
+impl CandidateBound {
+    fn new(bound: Duration) -> Self {
+        CandidateBound {
+            started: tokio::time::Instant::now(),
+            bound,
+            rearmed: false,
+        }
+    }
+
+    /// A new peer connection is being dialed (a new candidate, or a glare
+    /// rebuild): its bound starts now.
+    fn restart(&mut self) {
+        self.started = tokio::time::Instant::now();
+        self.rearmed = false;
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// A `Stuck` fired for the current candidate `pid` at generation `g`.
+    /// Returns true to rotate it. When it is kept, the hard bound is armed
+    /// (once) on `tx`, so a kept candidate is always rotated by then.
+    fn on_stuck(
+        &mut self,
+        heard: bool,
+        progressing: bool,
+        tx: &mpsc::UnboundedSender<Ev>,
+        pid: &str,
+        g: u32,
+    ) -> bool {
+        let hard = self.started + self.bound;
+        if tokio::time::Instant::now() >= hard || !(heard || progressing) {
+            return true;
+        }
+        if !self.rearmed {
+            self.rearmed = true;
+            let tx = tx.clone();
+            let pid = pid.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(hard).await;
+                let _ = tx.send(Ev::Stuck(pid, g));
+            });
+        }
+        false
+    }
 }
 
 /// The one transient "waiting" line an `exec` may show. Created only after
@@ -1056,9 +1101,10 @@ pub(crate) async fn bring_up_to_known(
     // pop-os -> do-vm failure that 7s/12s established cleanly). Back to 7s, which
     // clears the real ICE time with margin; field-overridable via
     // TUNLION_L2_CANDIDATE_SECS. It rotates only a SILENT candidate: one that has
-    // answered keeps its connection until the C3 watchdog (a relayed or
-    // direct-fallback path can need longer than 7s, and rotating it threw away
-    // the connection the far end was answering).
+    // answered keeps its connection until its hard bound, the C3 watchdog time
+    // (`CandidateBound`): a relayed or direct-fallback path can need longer
+    // than 7s, and rotating it threw away the connection the far end was
+    // answering.
     let candidate_secs: u64 = std::env::var("TUNLION_L2_CANDIDATE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1093,9 +1139,9 @@ pub(crate) async fn bring_up_to_known(
     let mut fleet = FleetDial::default();
     // Sids that have sent us any signal (transport-offer, description,
     // candidate): those are answering peers, not ghosts, and the per-candidate
-    // timer leaves them to the watchdog (`keep_answering_candidate`).
+    // timer keeps them until their hard bound (`CandidateBound`).
     let mut heard_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut candidate_started = tokio::time::Instant::now();
+    let mut candidate_bound = CandidateBound::new(Duration::from_secs(net::WATCHDOG_SECS));
 
     let spawn_timer = |pid: String, g: u32| {
         let tx = tx.clone();
@@ -1197,7 +1243,7 @@ pub(crate) async fn bring_up_to_known(
                     }
                 };
                 generation += 1;
-                candidate_started = tokio::time::Instant::now();
+                candidate_bound.restart();
                 spawn_timer(pid.clone(), generation);
                 let p = Peer::connect(
                     pid.clone(),
@@ -1525,6 +1571,7 @@ pub(crate) async fn bring_up_to_known(
                         old.mark_closed();
                         tokio::spawn(async move { old.close().await });
                         generation += 1;
+                        candidate_bound.restart();
                         spawn_timer(pid.clone(), generation);
                         let p = Peer::connect(
                             pid,
@@ -1617,21 +1664,22 @@ pub(crate) async fn bring_up_to_known(
                 // CURRENT attempt. A silent candidate (a ghost) is dropped and
                 // rotated: the sid goes to the back of the queue and just cycles
                 // until the server evicts it. One that is answering is kept
-                // until the watchdog's own Stuck (`keep_answering_candidate`).
+                // until its hard bound (`CandidateBound::on_stuck`).
                 if g == generation && peer.as_ref().is_some_and(|p| p.id == pid) {
-                    let (progressing, connected) = match peer.as_ref() {
-                        Some(p) => (p.establishing_progress().await, p.is_connected()),
-                        None => (false, false),
+                    let progressing = match peer.as_ref() {
+                        Some(p) => p.is_connected() || p.establishing_progress().await,
+                        None => false,
                     };
-                    if keep_answering_candidate(
-                        candidate_started.elapsed(),
+                    if !candidate_bound.on_stuck(
                         heard_sids.contains(&pid),
                         progressing,
-                        connected,
+                        &tx,
+                        &pid,
+                        g,
                     ) {
                         // DEBUG: the timer fired on a peer that is answering.
                         crate::ui::debug(&format!(
-                            "tunlion: candidate answering (ice progress: {progressing}), keeping it; the {}s watchdog bounds it",
+                            "tunlion: candidate answering (ice progress: {progressing}), keeping it until its {}s bound",
                             net::WATCHDOG_SECS
                         ));
                         continue;
@@ -1642,7 +1690,7 @@ pub(crate) async fn bring_up_to_known(
                     // The per-candidate establish budget fired: this candidate
                     // wedged and we rotate. Record a stall (the "burns the budget
                     // then succeeds on retry" signal we are hunting).
-                    diag.stall(crate::diag::Phase::Establishing, candidate_secs * 1000);
+                    diag.stall(crate::diag::Phase::Establishing, candidate_bound.elapsed_ms());
                     crate::ui::debug("tunlion: candidate unresponsive, rotating");
                     queue.push_back((pid, peer_uid.take(), peer_present));
                     // On the fleet channel the next candidate may be the target,
@@ -5834,28 +5882,50 @@ mod term_tests {
 mod candidate_timer_tests {
     use super::*;
 
-    /// The 7s timer rotates a candidate that never said a word (a ghost).
-    #[test]
-    fn a_silent_candidate_is_rotated() {
-        assert!(!keep_answering_candidate(Duration::from_secs(7), false, false, false));
+    /// The timer rotates a candidate that never said a word (a ghost).
+    #[tokio::test]
+    async fn a_silent_candidate_is_rotated() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Ev>();
+        let mut b = CandidateBound::new(Duration::from_secs(net::WATCHDOG_SECS));
+        assert!(b.on_stuck(false, false, &tx, "sid-ghost", 1));
     }
 
-    /// It keeps one whose ICE is checking or whose answer was applied, and one
-    /// that has sent anything at all (its transport-offer), until the watchdog.
-    #[test]
-    fn an_answering_candidate_is_kept_until_the_watchdog() {
-        let at_timer = Duration::from_secs(7);
-        assert!(keep_answering_candidate(at_timer, false, true, false), "checking PC kept");
-        assert!(keep_answering_candidate(at_timer, true, false, false), "heard sid kept");
-        let at_watchdog = Duration::from_secs(net::WATCHDOG_SECS);
+    /// B1: a kept candidate is re-bounded. Keeping it arms exactly one Stuck
+    /// for the same pid and generation at the hard bound, and that Stuck
+    /// rotates it even though its peer connection is CONNECTED (progressing),
+    /// which the C3 watchdog would never report.
+    #[tokio::test]
+    async fn a_kept_candidate_is_rotated_at_its_bound_even_when_connected() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+        let mut b = CandidateBound::new(Duration::from_millis(150));
+        assert!(!b.on_stuck(true, true, &tx, "sid-real", 7), "answering candidate kept");
+        assert!(!b.on_stuck(true, true, &tx, "sid-real", 7), "kept again before the bound");
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the hard bound never fired")
+            .expect("channel open");
+        match ev {
+            Ev::Stuck(pid, g) => assert_eq!((pid.as_str(), g), ("sid-real", 7)),
+            _ => panic!("the bound sent something other than Stuck"),
+        }
         assert!(
-            !keep_answering_candidate(at_watchdog, true, true, false),
-            "the watchdog's own Stuck rotates even a progressing candidate"
+            tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
+            "the bound was armed more than once"
         );
-        assert!(
-            !keep_answering_candidate(at_timer, true, true, true),
-            "a connected PC gets no watchdog Stuck, so its timer still rotates it"
-        );
+        assert!(b.on_stuck(true, true, &tx, "sid-real", 7), "a connected candidate outlived its bound");
+    }
+
+    /// A rebuilt peer connection (glare, or the next candidate) gets a fresh
+    /// bound and may arm it again.
+    #[tokio::test]
+    async fn restart_gives_a_fresh_bound() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Ev>();
+        let mut b = CandidateBound::new(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(b.on_stuck(true, true, &tx, "sid-real", 1), "past the bound");
+        b.restart();
+        assert!(!b.on_stuck(true, false, &tx, "sid-real", 2), "fresh bound keeps it");
+        assert!(b.rearmed);
     }
 }
 
