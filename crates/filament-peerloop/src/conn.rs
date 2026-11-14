@@ -10262,6 +10262,7 @@ mod warm_identity_tests {
     /// pair link whose secret the store still holds blocks the arm; the same
     /// link after the device was forgotten (secret no longer held) does not;
     /// a fleet-shaped link (untrusted, no pair secret) does not.
+    #[cfg(feature = "dispatch")]
     #[tokio::test]
     async fn a_fleet_arm_is_blocked_only_by_a_held_pair_link() {
         use crate::recv::dispatch::fleet_arm_blocked_by_pair_link as blocked;
@@ -11911,6 +11912,7 @@ mod warm_identity_tests {
     /// binding and leaves our hello owed, and the next verified hello makes
     /// the link a FleetSibling again. Before the epoch stamps, nothing in
     /// this path tied the verdict to the binding that earned it.
+    #[cfg(feature = "dispatch")]
     #[tokio::test]
     async fn a_sibling_that_adopts_a_fleet_direct_is_a_sibling_again_after_its_hello() {
         use crate::recv::dispatch::{

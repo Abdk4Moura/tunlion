@@ -6361,10 +6361,13 @@ async fn recv_run(
                             .make_fleet_hello(&sign_cb, &ports.env.display_name)
                         {
                             Ok(hello) => {
-                                if let Some(e) = installed {
+                                let sent = t.send_control(&hello).await.is_ok();
+                                // Stamped only once it went out, so a failed
+                                // send stays owed and the next ChannelReady
+                                // retries it.
+                                if let (true, Some(e)) = (sent, installed) {
                                     fleet_standing.greeted(&pid, e);
                                 }
-                                let sent = t.send_control(&hello).await.is_ok();
                                 fleet_step(
                                     log.as_ref(),
                                     daemon,
@@ -6715,10 +6718,10 @@ async fn recv_run(
                                             .identity
                                             .make_fleet_hello(&sign_cb, &ports.env.display_name)
                                         {
-                                            if let Some(e) = link_epoch(&conn, &pid) {
+                                            let sent = t.send_control(&hello).await.is_ok();
+                                            if let (true, Some(e)) = (sent, link_epoch(&conn, &pid)) {
                                                 fleet_standing.greeted(&pid, e);
                                             }
-                                            let sent = t.send_control(&hello).await.is_ok();
                                             fleet_step(
                                                 log.as_ref(),
                                                 daemon,
@@ -7015,10 +7018,10 @@ async fn recv_run(
                                                     .identity
                                                     .make_fleet_hello(&sign_cb, &ports.env.display_name)
                                                 {
-                                                    if let Some(e) = link_epoch(&conn, &pid) {
+                                                    let sent = t.send_control(&hello).await.is_ok();
+                                                    if let (true, Some(e)) = (sent, link_epoch(&conn, &pid)) {
                                                         fleet_standing.greeted(&pid, e);
                                                     }
-                                                    let sent = t.send_control(&hello).await.is_ok();
                                                     fleet_step(
                                                         log.as_ref(),
                                                         daemon,
@@ -7353,6 +7356,7 @@ async fn recv_run(
                                     if ports.identity.device_cert_revoked(&broker.device_pub) =>
                                 {
                                     fleet_verified.remove(&pid);
+                                    fleet_standing.forget(&pid);
                                     revocation_sweep_now = true;
                                     log.debug(&format!(
                                         "fleet-rendezvous from {pid} refused: device revoked"
@@ -13500,7 +13504,11 @@ mod signing_call_sites {
     const STORE_THEIRS: &str = concat!("bind_theirs", ".insert(");
     const HELLO_ARM: &str = concat!("Some(fleet::", "HELLO) =>");
     const OWN_GUARD: &str = concat!("is_own", "_device(");
-    const ADMIT: &str = concat!("admit", "_fleet(");
+    // Admission in the hello arm goes through `admit_verified_fleet_hello`,
+    // which is the only caller of `admit_fleet` in this file.
+    const ADMIT: &str = concat!("admit_verified", "_fleet_hello(");
+    const ADMIT_FLEET: &str = concat!("admit", "_fleet(");
+    const ADMIT_FN: &str = concat!("fn admit_verified", "_fleet_hello(");
     const ANN_VERIFIES: [&str; 2] = [concat!("pending.verify", "(&cb)"), concat!("ann.verify", "(&cb)")];
     const ACCEPT_SEQ: &str = concat!("accept", "_seq(");
 
@@ -13590,6 +13598,15 @@ mod signing_call_sites {
         let guard = arm + src()[arm..].find(OWN_GUARD).expect("own-key guard in the fleet-hello arm");
         let admit = arm + src()[arm..].find(ADMIT).expect("admission in the fleet-hello arm");
         assert!(guard < admit, "the own-key guard must precede admission");
+        // And nothing in this file admits a link any other way: the one
+        // `admit_fleet` call is inside the admission function.
+        let f = src().find(ADMIT_FN).expect("the admission function");
+        let body = &src()[f..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        let calls: Vec<usize> = src().match_indices(ADMIT_FLEET).map(|(i, _)| i).collect();
+        assert_eq!(calls.len(), 1, "admission happens outside the admission function");
+        assert!(body.contains(ADMIT_FLEET), "the admission function does not admit");
+        assert!(calls[0] > f && calls[0] < f + body.len());
     }
 
     /// Every verified announce is checked against our own overlay key before

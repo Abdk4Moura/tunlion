@@ -263,18 +263,21 @@ impl Standing {
     /// and the hello marker (so the peer's next hello is answered, and the
     /// peer, which needs our hello on the new binding, gets it). A verdict
     /// already earned on `installed` (the peer rotated first and greeted us
-    /// before this rotation was processed) is KEPT. Returns whether a stale
-    /// verdict was dropped, so the caller can queue the hello again.
+    /// before this rotation was processed) is KEPT. Returns whether the
+    /// verdict is stale, so the caller can drop it and queue the hello again.
+    /// Fail closed: a verdict with NO stamp is stale, so a verdict recorded
+    /// anywhere but through `verified` can never outlive a rotation (costs at
+    /// most one redundant hello).
     pub fn rotated(&mut self, pid: &str, installed: Epoch) -> bool {
         if self.greeted.get(pid).is_some_and(|e| *e != installed) {
             self.greeted.remove(pid);
         }
         match self.verified.get(pid) {
-            Some(e) if *e != installed => {
+            Some(e) if *e == installed => false,
+            _ => {
                 self.verified.remove(pid);
                 true
             }
-            _ => false,
         }
     }
 }
