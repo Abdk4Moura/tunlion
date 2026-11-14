@@ -5788,10 +5788,10 @@ async fn recv_run(
                     if cfg!(feature = "fleet") {
                         fleet_pending.insert(pid.clone());
                     }
-                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
+                    if let Some(sign_cb) = signing_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
                         match ports
                             .identity
-                            .make_fleet_hello(&cb, &ports.env.display_name)
+                            .make_fleet_hello(&sign_cb, &ports.env.display_name)
                         {
                             Ok(hello) => {
                                 fleet_greeted.insert(pid.clone());
@@ -5814,8 +5814,8 @@ async fn recv_run(
                 }
                 #[cfg(feature = "mesh")]
                 if let Some(l3) = l3.as_ref() {
-                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
-                        if let Some(ann) = l3.make_announce(&cb) {
+                    if let Some(sign_cb) = signing_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
+                        if let Some(ann) = l3.make_announce(&sign_cb) {
                             let _ = t.send_control(&ann.to_json()).await;
                         }
                     }
@@ -6071,12 +6071,12 @@ async fn recv_run(
                             bind_theirs.insert(pid.clone(), nonce);
                             if let Some(t) = conn.transport_of(&pid) {
                                 let link_fps = link_fingerprints(&conn, &pid).await;
-                                if let Some(cb) =
-                                    out_binding(&t, &pid, &bind_theirs, link_fps.as_ref())
+                                if let Some(sign_cb) =
+                                    signing_binding(&t, &pid, &bind_theirs, link_fps.as_ref())
                                 {
                                     #[cfg(feature = "mesh")]
                                     if let Some(l3) = l3.as_ref() {
-                                        if let Some(ann) = l3.make_announce(&cb) {
+                                        if let Some(ann) = l3.make_announce(&sign_cb) {
                                             let _ = t.send_control(&ann.to_json()).await;
                                         }
                                     }
@@ -6094,7 +6094,7 @@ async fn recv_run(
                                     if cfg!(feature = "fleet") {
                                         if let Ok(hello) = ports
                                             .identity
-                                            .make_fleet_hello(&cb, &ports.env.display_name)
+                                            .make_fleet_hello(&sign_cb, &ports.env.display_name)
                                         {
                                             fleet_greeted.insert(pid.clone());
                                             let sent = t.send_control(&hello).await.is_ok();
@@ -6331,18 +6331,18 @@ async fn recv_run(
                                     // Answer once, so a mutual hello terminates.
                                     // Signed like every outgoing hello: over the
                                     // binding the PEER verifies with (its nonce,
-                                    // `out_binding`), never over ours. With no
+                                    // `signing_binding`), never over ours. With no
                                     // peer nonce yet there is nothing to sign; the
                                     // peer's own challenge retry delivers one and
                                     // the `l3-nonce` arm answers it.
                                     if !fleet_greeted.contains(&pid) {
                                         if let Some(t) = conn.transport_of(&pid) {
-                                            if let Some(out_cb) =
-                                                out_binding(&t, &pid, &bind_theirs, link_fps.as_ref())
+                                            if let Some(sign_cb) =
+                                                signing_binding(&t, &pid, &bind_theirs, link_fps.as_ref())
                                             {
                                                 if let Ok(hello) = ports
                                                     .identity
-                                                    .make_fleet_hello(&out_cb, &ports.env.display_name)
+                                                    .make_fleet_hello(&sign_cb, &ports.env.display_name)
                                                 {
                                                     fleet_greeted.insert(pid.clone());
                                                     let sent = t.send_control(&hello).await.is_ok();
@@ -6368,15 +6368,15 @@ async fn recv_run(
                                     #[cfg(feature = "mesh")]
                                     if let Some(l3) = l3.as_ref() {
                                         if let Some(t) = conn.transport_of(&pid) {
-                                            if let Some(ann) = out_binding(
+                                            if let Some(sign_cb) = signing_binding(
                                                 &t,
                                                 &pid,
                                                 &bind_theirs,
                                                 link_fps.as_ref(),
-                                            )
-                                            .and_then(|out_cb| l3.make_announce(&out_cb))
-                                            {
-                                                let _ = t.send_control(&ann.to_json()).await;
+                                            ) {
+                                                if let Some(ann) = l3.make_announce(&sign_cb) {
+                                                    let _ = t.send_control(&ann.to_json()).await;
+                                                }
                                             }
                                         }
                                     }
@@ -10575,7 +10575,12 @@ fn nonce_binding(
     }
 }
 
-fn out_binding(
+/// The binding an OUTGOING `fleet-hello` or `l3-announce` is signed over: the
+/// exporter, or the PEER's nonce for this link (CONTRACT.md: the signer uses
+/// the peer's nonce, the verifier its own). Every signing call site takes its
+/// binding from here, bound to a variable named `sign_cb`; the
+/// `signing_uses_the_peers_nonce` test holds the call sites to that.
+fn signing_binding(
     t: &Arc<dyn Transport>,
     pid: &str,
     theirs: &HashMap<String, Vec<u8>>,
@@ -12252,4 +12257,100 @@ async fn lan_ownership(
         None => Vec::new(),
     };
     crate::lan_glue::Ownership::build(stored, live)
+}
+
+/// The signer rule, held at the call sites themselves (CONTRACT.md, "Link
+/// channel binding": the signer uses the PEER's nonce, the verifier its own).
+/// A hello or announce signed over OUR nonce verifies here and fails at the
+/// peer, whose Err arm then drops the link. This reads this file's source, so
+/// it fails if any signing site, including the answering hello in the verified
+/// arm and the re-announce after it, takes its binding from anywhere but
+/// `signing_binding` over the peer's nonce map. The needles are built with
+/// `concat!` so this module never matches itself.
+#[cfg(test)]
+mod signing_uses_the_peers_nonce {
+    const SRC: &str = include_str!("dispatch.rs");
+    const HELLO: &str = concat!("make_fleet", "_hello(");
+    const ANNOUNCE: &str = concat!("make", "_announce(");
+    const SIGN_VAR: &str = concat!("&sign", "_cb");
+    const BOUND: &str = concat!("Some(sign", "_cb)");
+    const SIGNING_CALL: &str = concat!("signing", "_binding(");
+    const SIGNING_FN: &str = concat!("fn signing", "_binding(");
+    const THEIRS: &str = concat!("&bind", "_theirs");
+    const OURS: &str = concat!("bind", "_ours");
+
+    fn squash(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The argument list of the call whose `(` ends at `open`.
+    fn call_args(src: &str, open: usize) -> &str {
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open + 1..open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        &src[open..]
+    }
+
+    #[test]
+    fn every_signing_site_signs_over_signing_binding() {
+        let mut sites = 0;
+        for needle in [HELLO, ANNOUNCE] {
+            for (at, _) in SRC.match_indices(needle) {
+                let args = squash(call_args(SRC, at + needle.len() - 1));
+                assert!(
+                    args.starts_with(SIGN_VAR),
+                    "a signing call signs over `{args}`, not the peer-nonce binding (`sign_cb`)"
+                );
+                sites += 1;
+            }
+        }
+        // Non-vacuous: the known sites are the ChannelReady hello and announce,
+        // the l3-nonce answer's hello and announce, the verified arm's
+        // answering hello and its re-announce.
+        assert!(sites >= 6, "found only {sites} signing sites");
+    }
+
+    #[test]
+    fn every_sign_cb_comes_from_signing_binding_over_the_peers_nonce() {
+        let flat = squash(SRC);
+        let mut bound = 0;
+        for (at, _) in flat.match_indices(BOUND) {
+            let rest = &flat[at + BOUND.len()..];
+            let rest = rest.strip_prefix('=').unwrap_or("");
+            assert!(
+                rest.starts_with(SIGNING_CALL),
+                "a `sign_cb` is bound from something other than signing_binding: {}",
+                rest.chars().take(80).collect::<String>()
+            );
+            bound += 1;
+        }
+        assert!(bound >= 5, "found only {bound} sign_cb bindings");
+        for (at, _) in SRC.match_indices(SIGNING_CALL) {
+            if SRC[..at].ends_with("fn ") {
+                continue;
+            }
+            let args = call_args(SRC, at + SIGNING_CALL.len() - 1);
+            assert!(args.contains(THEIRS), "signing_binding called without the peer-nonce map: {args}");
+            assert!(!args.contains(OURS), "signing_binding called with OUR nonce map: {args}");
+        }
+    }
+
+    #[test]
+    fn signing_binding_reads_the_peers_nonce() {
+        let at = SRC.find(SIGNING_FN).expect("signing_binding exists");
+        let body = &SRC[at..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        assert!(body.contains("theirs.get(pid)"));
+        assert!(!body.contains("ours"));
+    }
 }
