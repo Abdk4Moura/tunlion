@@ -20,8 +20,13 @@
 
 use crate::conn::{Conn, dropped_no_transport};
 use crate::l2::{self, Mux, MuxMap, OpenVerdict, PipeItem};
-use crate::refusal::{Code, Reinvite, Refusal, TUNNEL_OFF_REASON};
-use crate::shell_gate::{ShellPolicy, forward_gate_decision, gather_shell_gate_inputs};
+use crate::refusal::{
+    Code, IDENTITY_SETTLING_REASON, Reinvite, Refusal, TUNNEL_OFF_REASON, expired_reason,
+    reinvite_suffix,
+};
+use crate::shell_gate::{
+    IDENTITY_NOT_PROVEN, ShellPolicy, forward_gate_decision, gather_shell_gate_inputs,
+};
 use filament_cap::capability as cap;
 use filament_transport::net::Transport;
 use serde_json::{Value, json};
@@ -87,6 +92,18 @@ pub struct ForwardDenial {
     /// The transport captured before the gate, so the caller sends on the same
     /// link the admission examined.
     pub transport: Arc<dyn Transport>,
+    /// The gate refused only because this link has not resolved WHO the peer
+    /// is yet: no proven name, no device key, and the link is younger than
+    /// `UNSETTLED_IDENTITY_WINDOW`. That is not a verdict about the
+    /// device, so the close is the retryable settle refusal, never the final
+    /// not-granted one: a guest whose link raced its own proof was told it
+    /// "lacks shell grant" and its forward stopped for good. Never set for an
+    /// honestly anonymous identity, which is transfer-only by policy.
+    pub identity_unsettled: bool,
+    /// The re-invite admission already resolved for an expiry it attributed
+    /// by the link's proven name (the certificate identity unresolved), so
+    /// the caller's key-based lookup, which has no key to use, is not needed.
+    pub reinvite: Option<Reinvite>,
 }
 
 /// The sid and reason the driver passes to `park_on_deny` unchanged.
@@ -100,9 +117,11 @@ impl ForwardDenial {
     ///
     /// `as_name` is the acceptor's name for the peer, re-read by the caller
     /// after its parking attempt. A final cause (expired, revoked) carries its
-    /// code and name; otherwise the historical canonical not-granted frame is
-    /// used. `reinvite_for` is invoked only for an expired invitation, exactly
-    /// where the CLI read the device store before.
+    /// code and name; an unresolved identity gets the retryable settle close;
+    /// otherwise the historical canonical not-granted frame is used.
+    /// `reinvite_for` is invoked only for an expired invitation whose re-invite
+    /// admission did not already resolve, exactly where the CLI read the device
+    /// store before.
     pub fn close_frame<F>(&self, as_name: Option<String>, reinvite_for: F) -> Value
     where
         F: FnOnce() -> Option<Reinvite>,
@@ -110,10 +129,17 @@ impl ForwardDenial {
         match Refusal::final_cause(self.cap_reason.as_deref(), as_name.clone()) {
             Some(mut r) => {
                 if r.code == Code::Expired {
-                    r.reinvite = reinvite_for();
+                    r.reinvite = self.reinvite.clone().or_else(reinvite_for);
                 }
                 r.close_frame(self.sid)
             }
+            // Same frame shape as the settle path's own retryable denials: no
+            // code (none applies) and no name (none is known).
+            None if self.identity_unsettled => json!({
+                "type": "l2-close",
+                "sid": self.sid,
+                "err": IDENTITY_SETTLING_REASON,
+            }),
             None => {
                 let mut close = json!({
                     "type": "l2-close",
@@ -133,6 +159,37 @@ pub struct ForwardRefusal {
     pub reason: String,
     pub close: Value,
     pub transport: Arc<dyn Transport>,
+}
+
+/// How long a link with no proven name may answer a forward with the
+/// retryable settle refusal. A pair-proof that raced the link's fingerprints is
+/// held for 10 s and verified as soon as they are known; past this window the
+/// identity is not settling and the refusal is final, so a forward on a link
+/// that will never resolve still ends instead of retrying on it forever.
+pub const UNSETTLED_IDENTITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// May this link's unresolved identity still settle? Only a link with no
+/// proven name that came up within `UNSETTLED_IDENTITY_WINDOW`. A link that
+/// proved its name and still does not resolve is final (a revoked or
+/// uncertified record, a certificate that does not verify).
+fn identity_may_still_settle(conn: &Conn, pid: &str) -> bool {
+    conn.link(pid).is_some_and(|l| {
+        l.verified_name.is_none()
+            && l.established_at
+                .is_some_and(|at| at.elapsed() < UNSETTLED_IDENTITY_WINDOW)
+    })
+}
+
+/// When the link's proven name files the peer under a delegated record whose
+/// access has ended: that end time and the record's device key. Read from the
+/// host's own store by the proof-bound name, never from anything the peer
+/// claimed, and only ever used to refuse.
+fn named_record_expiry(conn: &Conn, pid: &str) -> Option<(u64, [u8; 32])> {
+    let name = conn.link(pid)?.verified_name.clone()?;
+    let host = conn.host.clone();
+    let key = host.device_cert_for(&name)?.device_pub;
+    let access = host.delegated_access_for(&key)?;
+    access.expired(host.now_secs()).then_some((access.deadline, key))
 }
 
 /// Admit one inbound forward frame and register an accepted stream on the
@@ -188,6 +245,10 @@ pub async fn admit_forward_open(
         None => (0, false),
     };
     let mut cap_reason: Option<String> = (!port_ok).then(|| "port out of range".to_string());
+    // Set below when the gate's only objection is the link's unresolved
+    // identity (see `ForwardDenial::identity_unsettled`). A bad port keeps its
+    // own final verdict whatever the identity says.
+    let mut identity_unsettled = false;
 
     let authorized = v["type"].as_str() != Some("l2-open") || {
         let (_dev, mut gate_inputs) =
@@ -218,6 +279,9 @@ pub async fn admit_forward_open(
         let d = forward_gate_decision(&gate_inputs, legacy_ok, host.as_ref());
         if let Err(Some(r)) = &d {
             cap_reason = Some(r.clone());
+            identity_unsettled = port_ok
+                && r == IDENTITY_NOT_PROVEN
+                && gate_inputs.identity_state != cap::IdentityState::ExplicitlyUnavailableAnonymous;
         }
         // port_ok is ANDed last: an out-of-range port denies even for a granted
         // peer (there is nothing valid to open), while keeping the recorded
@@ -226,6 +290,29 @@ pub async fn admit_forward_open(
     };
 
     if !authorized {
+        // An unresolved certificate identity does not hide an ended invitation
+        // when the link's proven NAME files the peer under a delegated record
+        // that has expired: that is final, and says so with its re-invite,
+        // exactly as exec does for the same guest on a resolved link.
+        let mut reinvite = None;
+        if identity_unsettled {
+            if let Some((at, key)) = named_record_expiry(conn, pid) {
+                reinvite = host.reinvite_for(&key);
+                let mut r = expired_reason(at);
+                if let Some(ri) = &reinvite {
+                    r.push_str(&reinvite_suffix(ri));
+                }
+                cap_reason = Some(r);
+                identity_unsettled = false;
+            } else if !identity_may_still_settle(conn, pid) {
+                // A link that already proved its name, or has had longer than
+                // the settle window to do so, is not racing its proof: its
+                // unresolved identity is final (a revoked or uncertified
+                // record, a certificate that does not verify), and so is the
+                // not-granted verdict it always got.
+                identity_unsettled = false;
+            }
+        }
         // wire_sid (not a wrapping cast) so the close names the real sid; 0
         // only if absent/out-of-range.
         let sid = l2::wire_sid(v).unwrap_or(0);
@@ -245,6 +332,8 @@ pub async fn admit_forward_open(
             reason,
             park,
             transport: t,
+            identity_unsettled,
+            reinvite,
         });
     }
 
@@ -356,7 +445,14 @@ mod tests {
         record_grant: AtomicBool,
         denied: AtomicBool,
         gates: Mutex<Vec<(bool, bool)>>, // (legacy_allowed, scoped_in_bounds)
+        /// The store files "guest" under a delegated record keyed by GUEST
+        /// whose invitation ended at GUEST_END, with a certificate that does
+        /// not verify and no principal ceiling, so the link cannot resolve it.
+        expired_record: AtomicBool,
     }
+
+    const GUEST: [u8; 32] = [8; 32];
+    const GUEST_END: u64 = 50;
 
     impl TestHost {
         fn new(verdict: Verdict) -> Arc<Self> {
@@ -365,6 +461,7 @@ mod tests {
                 record_grant: AtomicBool::new(false),
                 denied: AtomicBool::new(false),
                 gates: Mutex::new(Vec::new()),
+                expired_record: AtomicBool::new(false),
             })
         }
 
@@ -410,6 +507,31 @@ mod tests {
         }
         fn device_capability_denied(&self, _name: &str, _capability: &str) -> bool {
             self.denied.load(Ordering::Relaxed)
+        }
+        fn device_cert_for(&self, name: &str) -> Option<filament_id::DeviceCert> {
+            (name == "guest" && self.expired_record.load(Ordering::Relaxed)).then_some(
+                filament_id::DeviceCert {
+                    device_pub: GUEST,
+                    user_pub: [9; 32],
+                    expires: 0,
+                    issued: 0,
+                    sig: [0; 64],
+                },
+            )
+        }
+        fn delegated_access_for(&self, device_pub: &[u8; 32]) -> Option<crate::host::DelegatedAccess> {
+            (*device_pub == GUEST && self.expired_record.load(Ordering::Relaxed)).then(|| {
+                crate::host::DelegatedAccess {
+                    ceiling: vec!["shell".into(), "transfer".into()],
+                    deadline: GUEST_END,
+                }
+            })
+        }
+        fn reinvite_for(&self, device_pub: &[u8; 32]) -> Option<Reinvite> {
+            (*device_pub == GUEST && self.expired_record.load(Ordering::Relaxed)).then(|| Reinvite {
+                ceiling: vec!["shell".into(), "transfer".into()],
+                lifetime: 240,
+            })
         }
         fn cap_gate_effective(&self, gate: CapGate<'_>) -> cap::GateDecision {
             self.gates
@@ -672,6 +794,224 @@ mod tests {
         assert_eq!(close["err"], "device revoked");
         assert_eq!(close["code"], "cert-revoked");
         assert_eq!(close["as"], "phone");
+    }
+
+    /// The link carries a transport but has resolved nobody: no proven name,
+    /// no device key, identity Pending. The state the owner held for a guest
+    /// whose early pair-proof it dropped.
+    fn unresolve(conn: &mut Conn) {
+        let l = conn.links.get_mut(PID).unwrap();
+        l.verified_name = None;
+        l.identity_device_pub = None;
+        l.identity_user_pub = None;
+        l.identity_cert_expires = None;
+        l.identity_binding = cap::BindingStrength::None;
+        l.identity_state = cap::IdentityState::Pending;
+        // The race this models is a link that just came up.
+        l.established_at = Some(std::time::Instant::now());
+    }
+
+    #[tokio::test]
+    async fn unresolved_identity_gets_the_retryable_settle_close_not_a_final_not_granted() {
+        let host = TestHost::new(Verdict::Allow);
+        let t = Arc::new(CaptureTransport::default());
+        let (mut conn, _far) = connection(host.clone(), t.clone(), true).await;
+        unresolve(&mut conn);
+        let mut muxes = HashMap::new();
+        let policy = ShellPolicy::Granted;
+        let exposed = |_p: u16| false;
+        let allowed = |_n: &str, _h: &str, _p: u16| true;
+        let cfg = config(&policy, &exposed, &allowed, true, true);
+
+        // Premise: the exec/shell gate on this very link refuses for the
+        // unresolved identity, not for a missing grant.
+        let (_dev, inputs) = gather_shell_gate_inputs(&mut conn, PID, &policy, cap::CAP_SHELL);
+        assert_eq!(
+            crate::shell_gate::exec_gate_decision(&inputs, host.as_ref()),
+            Err(Some(IDENTITY_NOT_PROVEN.to_string()))
+        );
+
+        let out = admit_forward_open(
+            &mut conn,
+            PID,
+            &open("127.0.0.1", 22, SID),
+            &mut muxes,
+            &cfg,
+        )
+        .await;
+        let ForwardAdmission::Denied(d) = out else {
+            panic!("an unresolved identity must not be admitted");
+        };
+        assert!(d.identity_unsettled);
+        assert_eq!(d.cap_reason.as_deref(), Some(IDENTITY_NOT_PROVEN));
+        let close = d.close_frame(None, || panic!("no reinvite for an unresolved identity"));
+        assert_eq!(
+            close,
+            json!({
+                "type": "l2-close",
+                "sid": SID,
+                "err": IDENTITY_SETTLING_REASON,
+            })
+        );
+        assert_ne!(close["code"], Code::NotGranted.as_wire());
+        assert!(!close["err"].as_str().unwrap().contains("lacks shell grant"));
+        // Retryable to the initiator: it carries no refusal code at all.
+        assert_eq!(crate::refusal::code_from_reason(IDENTITY_SETTLING_REASON), None);
+        assert!(host.gates().is_empty(), "refused before the capability layer");
+        assert!(muxes.is_empty(), "no stream was admitted");
+        assert!(t.controls.lock().unwrap().is_empty(), "the caller sends the close");
+
+        // An honestly anonymous identity is transfer-only by policy: still final.
+        conn.links.get_mut(PID).unwrap().identity_state =
+            cap::IdentityState::ExplicitlyUnavailableAnonymous;
+        let out = admit_forward_open(
+            &mut conn,
+            PID,
+            &open("127.0.0.1", 22, SID + 1),
+            &mut muxes,
+            &cfg,
+        )
+        .await;
+        let ForwardAdmission::Denied(d) = out else {
+            panic!("an anonymous identity must not be admitted");
+        };
+        assert!(!d.identity_unsettled);
+        assert_eq!(d.close_frame(None, || None)["code"], "not-granted");
+        assert!(muxes.is_empty());
+
+        // A link that already proved its name and still does not resolve is
+        // not racing its proof (an uncertified or revoked record): final.
+        {
+            let l = conn.links.get_mut(PID).unwrap();
+            l.identity_state = cap::IdentityState::Pending;
+            l.verified_name = Some("guest".into());
+        }
+        let out = admit_forward_open(
+            &mut conn,
+            PID,
+            &open("127.0.0.1", 22, SID + 2),
+            &mut muxes,
+            &cfg,
+        )
+        .await;
+        let ForwardAdmission::Denied(d) = out else {
+            panic!("a named but unresolved link must not be admitted");
+        };
+        assert_eq!(d.cap_reason.as_deref(), Some(IDENTITY_NOT_PROVEN), "premise: still unresolved");
+        assert!(!d.identity_unsettled, "a proven name is not settling");
+        assert_eq!(d.close_frame(None, || None)["code"], "not-granted");
+
+        // An unnamed link older than the settle window will not resolve now:
+        // final, so a forward on it ends instead of retrying forever.
+        {
+            let l = conn.links.get_mut(PID).unwrap();
+            l.verified_name = None;
+            l.established_at = std::time::Instant::now()
+                .checked_sub(UNSETTLED_IDENTITY_WINDOW + std::time::Duration::from_secs(1));
+            assert!(l.established_at.is_some(), "premise: an aged link");
+        }
+        let out = admit_forward_open(
+            &mut conn,
+            PID,
+            &open("127.0.0.1", 22, SID + 3),
+            &mut muxes,
+            &cfg,
+        )
+        .await;
+        let ForwardAdmission::Denied(d) = out else {
+            panic!("an aged unresolved link must not be admitted");
+        };
+        assert_eq!(d.cap_reason.as_deref(), Some(IDENTITY_NOT_PROVEN), "premise: still unresolved");
+        assert!(!d.identity_unsettled, "past the window the identity is not settling");
+        assert_eq!(d.close_frame(None, || None)["code"], "not-granted");
+        assert!(muxes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unresolved_link_under_an_expired_record_name_gets_the_expiry() {
+        let host = TestHost::new(Verdict::Allow);
+        host.expired_record.store(true, Ordering::Relaxed);
+        let t = Arc::new(CaptureTransport::default());
+        let (mut conn, _far) = connection(host.clone(), t, true).await;
+        unresolve(&mut conn);
+        conn.links.get_mut(PID).unwrap().verified_name = Some("guest".into());
+        let mut muxes = HashMap::new();
+        let policy = ShellPolicy::Granted;
+        let exposed = |_p: u16| false;
+        let allowed = |_n: &str, _h: &str, _p: u16| true;
+        let cfg = config(&policy, &exposed, &allowed, true, true);
+
+        // Premise: the record's certificate does not resolve the link, so the
+        // gate's objection is the identity, not the expiry.
+        let (_dev, inputs) = gather_shell_gate_inputs(&mut conn, PID, &policy, cap::CAP_SHELL);
+        assert_eq!(
+            crate::shell_gate::exec_gate_decision(&inputs, host.as_ref()),
+            Err(Some(IDENTITY_NOT_PROVEN.to_string()))
+        );
+        assert_eq!(conn.link(PID).unwrap().identity_device_pub, None);
+
+        let out = admit_forward_open(
+            &mut conn,
+            PID,
+            &open("127.0.0.1", 22, SID),
+            &mut muxes,
+            &cfg,
+        )
+        .await;
+        let ForwardAdmission::Denied(d) = out else {
+            panic!("an expired guest must not be admitted");
+        };
+        assert!(!d.identity_unsettled, "an ended invitation is final");
+        // The settle path's own rule keeps an expiry out of the hold.
+        assert!(d.reason.starts_with(crate::refusal::EXPIRED_PREFIX));
+        let close = d.close_frame(Some("guest".into()), || {
+            panic!("admission already resolved the re-invite by the record key")
+        });
+        assert!(close["err"].as_str().unwrap().starts_with(&expired_reason(GUEST_END)));
+        assert_eq!(close["code"], "expired");
+        assert_eq!(close["as"], "guest");
+        assert_eq!(close["ceiling"], json!(["shell", "transfer"]));
+        assert_eq!(close["lifetime"], 240);
+        assert!(muxes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolved_link_without_a_grant_still_gets_the_final_not_granted() {
+        // The legacy fold decides: no blanket mode and no record grant.
+        let host = TestHost::new(Verdict::Legacy);
+        let t = Arc::new(CaptureTransport::default());
+        let (mut conn, _far) = connection(host.clone(), t, true).await;
+        conn.links.get_mut(PID).unwrap().verified_name = Some("phone".into());
+        let mut muxes = HashMap::new();
+        let policy = ShellPolicy::Granted;
+        let exposed = |_p: u16| false;
+        let allowed = |_n: &str, _h: &str, _p: u16| true;
+        let cfg = config(&policy, &exposed, &allowed, true, false);
+
+        let out = admit_forward_open(
+            &mut conn,
+            PID,
+            &open("127.0.0.1", 22, SID),
+            &mut muxes,
+            &cfg,
+        )
+        .await;
+        let ForwardAdmission::Denied(d) = out else {
+            panic!("a device without a grant must be refused");
+        };
+        assert!(!d.identity_unsettled);
+        assert_eq!(host.gates(), vec![(false, false)], "the capability layer decided");
+        assert_eq!(
+            d.close_frame(Some("phone".into()), || panic!("no reinvite for a plain deny")),
+            json!({
+                "type": "l2-close",
+                "sid": SID,
+                "err": "not authorized: device lacks shell grant",
+                "code": "not-granted",
+                "as": "phone",
+            })
+        );
+        assert!(muxes.is_empty());
     }
 
     #[tokio::test]

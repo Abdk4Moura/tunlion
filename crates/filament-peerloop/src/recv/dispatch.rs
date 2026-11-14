@@ -490,7 +490,14 @@ pub async fn park_on_deny(
     }
     let per_link = parked.iter().filter(|p| p.pid == pid).count();
     if !park_budget_ok(per_link, parked.len()) {
-        deny_unsettled(t, sid, kind, "identity settling, retry", conn.log.as_ref()).await;
+        deny_unsettled(
+            t,
+            sid,
+            kind,
+            crate::refusal::IDENTITY_SETTLING_REASON,
+            conn.log.as_ref(),
+        )
+        .await;
         return true;
     }
     let ms = settle_ms;
@@ -720,6 +727,117 @@ impl DeferredControl {
             None => Ev::LocalControl(pid.to_string(), self.value),
         }
     }
+}
+
+/// Most links holding an early `pair-proof` at once, daemon-wide.
+pub const EARLY_PROOF_MAX: usize = 32;
+/// How long an early `pair-proof` waits for its link's fingerprints.
+pub const EARLY_PROOF_HOLD: Duration = Duration::from_secs(10);
+
+/// `pair-proof`s that arrived before their link's DTLS fingerprints were
+/// known, held so the proof is verified once they are instead of lost.
+///
+/// The prover sends its proof once per channel and nothing re-sends it, so a
+/// proof dropped for arriving early left the link nameless on this side for
+/// its whole life: every shell-class open on it was then judged with no
+/// identity at all. Holding grants nothing. A held proof is only ever
+/// released back into the loop as the same sourced control event, and it is
+/// verified there by the one `pair-proof` arm, against the fingerprints of the
+/// link it arrived on (the MAC binds them), exactly as an on-time proof is.
+///
+/// Bounded: one proof per link (the latest replaces an older one), at most
+/// [`EARLY_PROOF_MAX`] links, each for [`EARLY_PROOF_HOLD`]. A proof whose
+/// link dropped or was replaced (a newer generation) is discarded, never
+/// replayed against a session it was not made for.
+#[derive(Default)]
+pub struct EarlyPairProofs {
+    held: HashMap<String, EarlyProof>,
+}
+
+struct EarlyProof {
+    generation: u32,
+    ctl: DeferredControl,
+    deadline: Instant,
+}
+
+impl EarlyPairProofs {
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// The links with a held proof.
+    pub fn pids(&self) -> Vec<String> {
+        self.held.keys().cloned().collect()
+    }
+
+    /// Hold `ctl`, which arrived on generation `generation` of `pid`'s link.
+    /// False when the bound refuses it (the proof is then dropped, as before).
+    pub fn hold(&mut self, pid: &str, generation: u32, ctl: DeferredControl, now: Instant) -> bool {
+        self.held.retain(|_, p| p.deadline > now);
+        if !self.held.contains_key(pid) && self.held.len() >= EARLY_PROOF_MAX {
+            return false;
+        }
+        self.held.insert(
+            pid.to_string(),
+            EarlyProof {
+                generation,
+                ctl,
+                deadline: now + EARLY_PROOF_HOLD,
+            },
+        );
+        true
+    }
+
+    /// A proof for `pid` is being verified now: an older held one is moot.
+    pub fn forget(&mut self, pid: &str) {
+        self.held.remove(pid);
+    }
+
+    /// One sweep. `live` answers, per held pid, its link's current generation
+    /// and whether its fingerprints are known now (absent: the link is gone).
+    /// Discards expired proofs and those whose link dropped or was replaced,
+    /// and returns the ones now ready to verify, removed from the hold.
+    pub fn sweep(
+        &mut self,
+        live: &HashMap<String, (u32, bool)>,
+        now: Instant,
+    ) -> Vec<(String, DeferredControl)> {
+        let mut ready = Vec::new();
+        self.held.retain(|pid, p| {
+            if p.deadline <= now {
+                return false;
+            }
+            match live.get(pid) {
+                Some((generation, _)) if *generation != p.generation => false,
+                Some((_, true)) => {
+                    ready.push((pid.clone(), p.ctl.clone()));
+                    false
+                }
+                Some((_, false)) => true,
+                None => false,
+            }
+        });
+        ready
+    }
+}
+
+/// The paired record whose secret produced `mac` for this link: the
+/// `pair-proof` check itself, bound to both DTLS fingerprints. Pure.
+pub fn pair_proof_hit<'a>(
+    devices: &'a [(String, String)],
+    mac: &str,
+    peer_uid: &str,
+    my_uid: &str,
+    my_fp: &str,
+    their_fp: &str,
+) -> Option<&'a (String, String)> {
+    devices
+        .iter()
+        .find(|(_, s)| proof_for(s, peer_uid, peer_uid, my_uid, my_fp, their_fp) == mac)
 }
 
 /// Receive-transfer and consent state for one dispatch.
@@ -2028,6 +2146,9 @@ async fn recv_run(
     // flight (settle-then-evaluate): re-driven on proof, denied at the
     // settle bound. Bounded (2 per link, 32 per daemon) at park time.
     let mut parked_opens: Vec<ParkedOpen> = Vec::new();
+    // Pair-proofs that arrived before their link's fingerprints (see
+    // `EarlyPairProofs`): replayed through the same arm once they are known.
+    let mut early_proofs = EarlyPairProofs::default();
     // Sweep counter for the settle retry cadence: while an open is parked,
     // every third sweep (about 300ms at the parked tick) re-issues the
     // possession challenge even when a hold is nominally live.
@@ -2756,7 +2877,7 @@ async fn recv_run(
                 // between "authenticating..." and "authenticated" (two such
                 // waits, measured 4.0 to 4.1s in 4 of 5 runs). The ceremony
                 // is budgeted, so the fast tick is too.
-                if parked_opens.is_empty() && !ceremony_live {
+                if parked_opens.is_empty() && !ceremony_live && early_proofs.is_empty() {
                     Duration::from_secs(2)
                 } else {
                     Duration::from_millis(100)
@@ -2784,6 +2905,30 @@ async fn recv_run(
             Some(ev) => conn.stage_event(ev),
             None => None,
         };
+
+        // Early pair-proofs: replay each one whose link's fingerprints are
+        // known now, as the same sourced event, so the ordinary `pair-proof`
+        // arm verifies it (and `stage_event` still rejects it if its source
+        // is no longer the link's). Dropped and replaced links discard theirs.
+        if !early_proofs.is_empty() {
+            let mut live = HashMap::new();
+            for p in early_proofs.pids() {
+                let Some((generation, peer)) =
+                    conn.link(&p).map(|l| (l.generation, l.peer.clone()))
+                else {
+                    continue;
+                };
+                let known = match peer {
+                    Some(peer) => peer.fingerprints().await.is_some(),
+                    None => false,
+                };
+                live.insert(p, (generation, known));
+            }
+            for (p, ctl) in early_proofs.sweep(&live, Instant::now()) {
+                log.debug(&format!("pair-proof from {p}: fingerprints known, verifying the held proof"));
+                let _ = tx.send(ctl.into_event(&p));
+            }
+        }
 
         // Settle sweep: re-drive parked shell-class opens whose link proved
         // since parking (same link AND same device key, else the proof is
@@ -7624,9 +7769,29 @@ async fn recv_run(
                         None => None,
                     };
                     let Some((my_fp, their_fp)) = fps else {
-                        log.debug("pair-proof received before fingerprints known, ignoring");
+                        // Held, not dropped: nothing re-sends a proof, so a
+                        // lost one left this link nameless here for good. The
+                        // sweep replays it through this arm once the link's
+                        // fingerprints are known; it proves nothing until then.
+                        let generation = conn.link(&pid).map(|l| l.generation);
+                        let held = generation.is_some_and(|g| {
+                            early_proofs.hold(
+                                &pid,
+                                g,
+                                DeferredControl {
+                                    value: v.clone(),
+                                    source: event_source,
+                                },
+                                Instant::now(),
+                            )
+                        });
+                        log.debug(&format!(
+                            "pair-proof from {pid} received before fingerprints known, {}",
+                            if held { "held until they are" } else { "ignoring" }
+                        ));
                         continue;
                     };
+                    early_proofs.forget(&pid);
                     // #9: pair secrets are symmetric, our own install holds
                     // every secret we do, so a same-host process could prove
                     // "pop2" and tunnel callers into the WRONG machine. Refuse.
@@ -7634,10 +7799,7 @@ async fn recv_run(
                         log.debug("pair-proof from our own install, refusing (self-connect)");
                         None
                     } else {
-                        devices.iter().find(|(_, s)| {
-                            proof_for(s, &peer_uid, &peer_uid, &conn.my_uid, &my_fp, &their_fp)
-                                == mac
-                        })
+                        pair_proof_hit(&devices, mac, &peer_uid, &conn.my_uid, &my_fp, &their_fp)
                     };
                     let ok = if let Some((n, secret)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
@@ -11635,4 +11797,110 @@ async fn lan_ownership(
         None => Vec::new(),
     };
     crate::lan_glue::Ownership::build(stored, live)
+}
+
+#[cfg(test)]
+mod early_pair_proof_tests {
+    use super::{
+        pair_proof_hit, proof_for, DeferredControl, EarlyPairProofs, EARLY_PROOF_HOLD,
+        EARLY_PROOF_MAX,
+    };
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    fn proof(mac: &str) -> DeferredControl {
+        DeferredControl {
+            value: json!({ "type": "pair-proof", "mac": mac }),
+            source: None,
+        }
+    }
+
+    fn live(entries: &[(&str, u32, bool)]) -> HashMap<String, (u32, bool)> {
+        entries
+            .iter()
+            .map(|(p, g, k)| (p.to_string(), (*g, *k)))
+            .collect()
+    }
+
+    #[test]
+    fn an_early_proof_is_kept_until_fingerprints_and_then_verified_by_the_normal_check() {
+        let devices = vec![("guest".to_string(), "s3cret".to_string())];
+        // The prover binds its proof to the session's two fingerprints.
+        let mac = proof_for("s3cret", "prover", "prover", "me", "FP-PROVER", "FP-ME");
+        let now = Instant::now();
+        let mut held = EarlyPairProofs::default();
+        assert!(held.hold("pid", 3, proof(&mac), now));
+
+        // Fingerprints not known yet: nothing is released, nothing is lost.
+        assert!(held.sweep(&live(&[("pid", 3, false)]), now).is_empty());
+        assert_eq!(held.len(), 1);
+
+        // Known now: the proof comes back exactly once, as the same control.
+        let ready = held.sweep(&live(&[("pid", 3, true)]), now);
+        assert_eq!(ready.len(), 1);
+        assert!(held.is_empty());
+        let (pid, ctl) = &ready[0];
+        assert_eq!(pid, "pid");
+        assert_eq!(ctl.value["type"], "pair-proof");
+        assert!(ctl.source.is_none(), "the original provenance travels with it");
+
+        // ...and the arm's own check names the device from it, against the
+        // link's fingerprints (from this side, mine and theirs are swapped).
+        let replayed = ctl.value["mac"].as_str().unwrap();
+        let hit = pair_proof_hit(&devices, replayed, "prover", "me", "FP-ME", "FP-PROVER");
+        assert_eq!(hit.map(|(n, _)| n.as_str()), Some("guest"));
+
+        // A proof that does not verify is still rejected: other fingerprints
+        // (another session), or a secret this store does not hold.
+        assert!(pair_proof_hit(&devices, replayed, "prover", "me", "FP-ME", "FP-OTHER").is_none());
+        let forged = proof_for("not-ours", "prover", "prover", "me", "FP-PROVER", "FP-ME");
+        assert!(pair_proof_hit(&devices, &forged, "prover", "me", "FP-ME", "FP-PROVER").is_none());
+    }
+
+    #[test]
+    fn a_held_proof_is_discarded_when_its_link_drops_is_replaced_or_waits_too_long() {
+        let now = Instant::now();
+        let mut held = EarlyPairProofs::default();
+        assert!(held.hold("dropped", 1, proof("a"), now));
+        assert!(held.hold("replaced", 1, proof("b"), now));
+        assert!(held.hold("slow", 1, proof("c"), now));
+        // The link was replaced: its fingerprints are known, but they belong
+        // to a session the proof was not made for. Never replayed.
+        let ready = held.sweep(&live(&[("replaced", 2, true), ("slow", 1, false)]), now);
+        assert!(ready.is_empty());
+        assert_eq!(held.pids(), vec!["slow".to_string()]);
+        // Past the hold, even fingerprints arriving do not release it.
+        let later = now + EARLY_PROOF_HOLD + Duration::from_millis(1);
+        assert!(held.sweep(&live(&[("slow", 1, true)]), later).is_empty());
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn one_proof_per_link_the_latest_and_a_bounded_total() {
+        let now = Instant::now();
+        let mut held = EarlyPairProofs::default();
+        assert!(held.hold("pid", 1, proof("old"), now));
+        assert!(held.hold("pid", 1, proof("new"), now));
+        assert_eq!(held.len(), 1);
+        let ready = held.sweep(&live(&[("pid", 1, true)]), now);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].1.value["mac"], "new");
+
+        for i in 0..EARLY_PROOF_MAX {
+            assert!(held.hold(&format!("p{i}"), 1, proof("m"), now));
+        }
+        assert!(!held.hold("one-too-many", 1, proof("m"), now), "the total is bounded");
+        assert_eq!(held.len(), EARLY_PROOF_MAX);
+        // A link already holding one may still replace it at the bound.
+        assert!(held.hold("p0", 1, proof("newer"), now));
+        assert_eq!(held.len(), EARLY_PROOF_MAX);
+        // Expired entries free their room for a new link.
+        let later = now + EARLY_PROOF_HOLD + Duration::from_millis(1);
+        assert!(held.hold("fresh", 1, proof("m"), later));
+        assert_eq!(held.len(), 1);
+        // A proof verified on time supersedes a held one for the same link.
+        held.forget("fresh");
+        assert!(held.is_empty());
+    }
 }

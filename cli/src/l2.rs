@@ -6907,6 +6907,28 @@ mod forward_refusal_tests {
         }
     }
 
+    /// The acceptor's answer while it has not resolved who this device is
+    /// (and the settle path's own timeout) is retryable: the forward keeps
+    /// listening, it does not exit as denied. The real "no grant" refusal on
+    /// a resolved link still ends it.
+    #[test]
+    fn identity_settling_keeps_the_forward_listening_and_no_grant_still_ends_it() {
+        for reason in [
+            filament_peerloop::refusal::IDENTITY_SETTLING_REASON.to_string(),
+            crate::recv_cmd::settle_timeout_reason(2000),
+        ] {
+            assert_eq!(
+                classify_forward_refusal(&reason),
+                ForwardRefusal::Transient,
+                "{reason:?} must not stop the forward"
+            );
+        }
+        assert_eq!(
+            classify_forward_refusal("not authorized: device lacks shell grant"),
+            ForwardRefusal::Policy
+        );
+    }
+
     #[test]
     fn ready_line_says_when_nothing_listens() {
         assert_eq!(forward_ready_word(8000, ForwardTarget::Open), "ready");

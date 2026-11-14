@@ -266,6 +266,12 @@ Control messages over the DataChannel; the browser implements both sides
   MITM'd by anyone — including the signaling server — fails verification.
   Both sides prove; each verifies against every stored secret. Cross-impl
   parity is pinned by test vectors (cli `proof_matches_browser`, gate 16).
+  A proof is sent once per channel and never re-sent, so a CLI verifier that
+  receives one before its link's DTLS fingerprints are known HOLDS it (one per
+  link, the latest; at most 32 links; 10 s) and verifies it, unchanged, once
+  they are. Holding grants nothing; a held proof whose link dropped or was
+  replaced (newer generation) is discarded, never verified against a session
+  it was not made for. No wire change.
 - `{ type: "pair-keep-ack", ok }` — C27: the HUMAN's answer to pair-keep.
   Remembering is a trust grant, so the browser asks (consent banner) instead
   of auto-storing; the CLI answers from its `--remember` flag. On `ok:false`
@@ -1589,6 +1595,20 @@ for a hold to bind to.
   may now name somebody else's stream.
 - Bounds: at most 2 parked opens per link, 32 per daemon; excess denies
   immediately with "identity settling, retry".
+- Unresolved identity is not a verdict. A forward (`l2-open`) whose gate
+  refuses only because the link has not resolved who the peer is (no proven
+  name, no device key: `identity-not-proven`, identity Pending), that came up
+  within the last 30 s (a raced pair-proof is held and verified well inside
+  that), and that cannot park (there is no key to bind a hold to) is answered with the same
+  retryable `l2-close{err:"identity settling, retry"}`, no `code`, never the
+  final `not-granted` refusal. No stream opens. The initiator's `forward`
+  keeps listening (the reason carries no refusal code, so it is not a policy
+  refusal) and the next connection asks again. Everything else stays final:
+  an identity that is honestly anonymous (transfer-only by policy), a link
+  that proved its name and still does not resolve, and an unnamed link older
+  than 30 s keep `not-granted`; a link whose proven name files the peer under
+  a delegated record that has expired gets `code:"expired"` with its
+  re-invite, as exec does.
 - Timeout denies with "identity not proven within N ms; retry" (never
   silently, never as success). One log line per outcome (parked with the
   gate's own reason, proven-in-N-ms re-drive, timed-out, replaced, dropped,
