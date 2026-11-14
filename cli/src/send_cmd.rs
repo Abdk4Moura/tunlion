@@ -69,7 +69,13 @@ use tokio::sync::mpsc;
 /// one; a single-transport send was lost exactly there, the sender stored its
 /// half, and neither side remembered the other. Repeats are safe because the
 /// receiver stores a repeated secret idempotently.
+///
+/// Only to the code's confirmed session on a link the ceremony covers
+/// (`Conn::holds_code_authority`): a rebuilt link is offered nothing.
 async fn offer_pair_keep(conn: &Conn, pid: &str, secret: &str) -> bool {
+    if !conn.holds_code_authority(pid).await {
+        return false;
+    }
     let Some(link) = conn.link(pid) else {
         return false;
     };
@@ -757,6 +763,9 @@ pub(crate) async fn send_cmd(
     // local / known-device sends; only after the ephemeral PAKE confirms for the
     // code path. The agreed secret is then DISCARDED (never stored).
     let mut pake_done = !use_code;
+    // Said once: the confirmed receiver's link was rebuilt, so this code
+    // covers nothing on it any more (see `Conn::holds_code_authority`).
+    let mut code_rebuilt_said = false;
     // Interop / downgrade: a code-path peer that never runs the v2 ceremony is on
     // an older build. Once the channel is up, give the ceremony a bounded budget;
     // if it doesn't confirm, fail LOUDLY ("update to transfer securely") rather
@@ -1756,6 +1765,13 @@ pub(crate) async fn send_cmd(
                                             ));
                                         }
                                         conn.active = Some(from.clone());
+                                        // The confirmed session: this sid, the DTLS
+                                        // fingerprint pair the confirmation bound and
+                                        // the promotion just armed. Offers, accepts and
+                                        // remember all check the current link against it.
+                                        if let Some((mine, theirs)) = cer.confirmed_fingerprints() {
+                                            conn.bind_code_session(&from, (mine, theirs), sec);
+                                        }
                                         // Offers were deferred pending this confirm, and
                                         // the ChannelReady handler ignores a non-active
                                         // pid, so this must follow the claim above.
@@ -1980,6 +1996,18 @@ pub(crate) async fn send_cmd(
                     // room that was another code's receiver.
                     if use_code && !is_direct && !pake_done {
                         continue; // offers/remember wait for PAKE confirm
+                    }
+                    // A code offers only on the link its ceremony confirmed (or
+                    // that ceremony's own direct promotion), never on a rebuilt one.
+                    if use_code && !conn.holds_code_authority(&pid).await {
+                        if pake_done && !code_rebuilt_said {
+                            code_rebuilt_said = true;
+                            ui::say(&ui::paint(
+                                ui::Tone::Warn,
+                                "  the connection to the receiver was rebuilt after the code was confirmed; nothing more is sent on this code. Run the send again for a FRESH code.",
+                            ));
+                        }
+                        continue;
                     }
                     // Same rule for a FLEET target, for the same reason: the link
                     // is authenticated but the PEER is not yet identified, and
@@ -2408,6 +2436,14 @@ pub(crate) async fn send_cmd(
                     }
                 }
                 Some("file-accept") => {
+                    // A code streams only to the confirmed session on a link
+                    // its ceremony covers.
+                    if use_code && !conn.holds_code_authority(&pid).await {
+                        ui::debug(&format!(
+                            "send: ignoring file-accept from {pid}: not the code's confirmed link"
+                        ));
+                        continue;
+                    }
                     answer_clock = Some(Instant::now());
                     receiver_asking = false;
                     // `--remember <name>`: hand the code's peer a FRESH long-lived

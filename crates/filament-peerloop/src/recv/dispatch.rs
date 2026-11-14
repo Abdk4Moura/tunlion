@@ -1137,9 +1137,11 @@ pub fn report_sync_join(log: &dyn LogSink, pid: &str, sid: u32, result: Result<(
 
 /// Is this the peer a transfer's explicit consent names, for identity
 /// settling purposes? A pair-trusted link is consent by construction (its MAC
-/// proved the paired device); a code send names its ceremony peer; a room send
-/// is consented by -y or a daemon, which accepts every offer it receives.
-fn consented_identity_peer(
+/// proved the paired device); a code send names its ceremony peer, on the
+/// exact session and transport the ceremony confirmed
+/// (`Conn::holds_code_authority`); a room send is consented by -y or a daemon,
+/// which accepts every offer it receives.
+pub(crate) async fn consented_identity_peer(
     conn: &Conn,
     pid: &str,
     recv_code_path: bool,
@@ -1151,7 +1153,7 @@ fn consented_identity_peer(
         return true;
     }
     if recv_code_path {
-        recv_pake_done && conn.is_bound_active_peer(pid)
+        recv_pake_done && conn.holds_code_authority(pid).await
     } else {
         // A room with -y / a daemon accepts every offer it consents to, so
         // each such link settles its own identity; no single active slot is
@@ -1466,6 +1468,9 @@ async fn recv_run(
     // challenge's entry does not expire and let a re-issue clobber the nonce.
     const RECV_IDENTITY_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
     let mut recv_pake_done = code.is_none(); // only the code path runs the PAKE
+    // Said once: the confirmed sender's link was rebuilt, so this code covers
+    // nothing on it any more (see `Conn::holds_code_authority`).
+    let mut recv_code_rebuilt_said = false;
     let recv_pake_budget = ports.env.pair_grace;
     // Overall bound: once we are matched into the sender's room, SOMEONE must
     // authenticate within this window or the whole `recv` fails loudly. Per-peer
@@ -5148,6 +5153,14 @@ async fn recv_run(
                         recv_pake_done = true;
                         st.recv_cers.retain(|pid, _| pid == &from);
                         st.recv_deadlines.clear();
+                        // The confirmed session: this exact sid and the DTLS
+                        // fingerprint pair the confirmation MAC bound. Every
+                        // code-receive decision is checked against it.
+                        let confirmed_fps = st
+                            .recv_cers
+                            .get(&from)
+                            .and_then(|c| c.confirmed_fingerprints())
+                            .map(|(mine, theirs)| (mine.to_string(), theirs.to_string()));
                         // The progression block stops once a sender is settled, and
                         // its confirmation can verify here before ours went out.
                         if let Some((my_fp, their_fp)) = fp_ref {
@@ -5179,6 +5192,14 @@ async fn recv_run(
                             crate::conn::Promotion::Retained
                         };
                         conn.bind_active(&from);
+                        match &confirmed_fps {
+                            Some((mine, theirs)) => {
+                                conn.bind_code_session(&from, (mine.as_str(), theirs.as_str()), &sec)
+                            }
+                            None => log.debug(
+                                "recv: confirmed ceremony carries no fingerprint pair; no code authority",
+                            ),
+                        }
                         // A retained link is unannounced here too, and this loop's
                         // ChannelReady arm sends `caps` and the signed L3 announce,
                         // which a peer on a retained link would otherwise never get.
@@ -5343,7 +5364,7 @@ async fn recv_run(
                     recv_pake_done,
                     yes,
                     daemon,
-                );
+                ).await;
                 let needs_challenge = if host.cap_authoritative() {
                     (idev_known && !proven) || (!idev_known && consent_identity)
                 } else {
@@ -5451,7 +5472,7 @@ async fn recv_run(
                     recv_pake_done,
                     yes,
                     daemon,
-                );
+                ).await;
                 if consent_identity {
                     if let Some(l) = conn.link_mut(&pid) {
                         crate::identity::resolve_peer_identity(l);
@@ -6557,7 +6578,7 @@ async fn recv_run(
                         recv_pake_done,
                         yes,
                         daemon,
-                    );
+                    ).await;
                     if consented_peer {
                         // A certificate is the only identity fact this answer can
                         // settle. It is the PEER's own link saying it cannot
@@ -7558,8 +7579,9 @@ async fn recv_run(
                         // the signaling server chose) is refused. And the secret
                         // always lands in a NEW record: a peer can never re-key
                         // an existing device by naming it.
-                        let ceremony_peer =
-                            recv_code_path && recv_pake_done && conn.is_bound_active_peer(&pid);
+                        let ceremony_peer = recv_code_path
+                            && recv_pake_done
+                            && conn.holds_code_authority(&pid).await;
                         let kept = match (&remember, ceremony_peer) {
                             (Some(name), true) => match ports.store.devices_store_remembered(name, &sec) {
                                 Ok(stored) => {
@@ -7992,7 +8014,9 @@ async fn recv_run(
                     // offer past while we were still authenticating; now it cannot.)
                     // If no peer has authenticated yet, the overall watchdog still
                     // fails loudly should the real sender never confirm.
-                    if recv_code_path && (!recv_pake_done || !conn.is_bound_active_peer(&pid)) {
+                    if recv_code_path
+                        && (!recv_pake_done || !conn.holds_code_authority(&pid).await)
+                    {
                         // A pre-auth offer from a peer we are STILL authenticating
                         // (it has a live ceremony) is buffered, not lost: the offer
                         // and the sender's confirm crossed on the wire. If that peer
@@ -8011,6 +8035,20 @@ async fn recv_run(
                             log.debug(
                                 "ignoring file-offer from a peer that has not authenticated via ephemeral PAKE",
                             );
+                            // The ceremony's own sid on a link the confirmation
+                            // does not cover: that connection was rebuilt.
+                            let rebuilt = recv_pake_done
+                                && conn
+                                    .code_session
+                                    .as_ref()
+                                    .is_some_and(|session| session.sid() == pid.as_str());
+                            if rebuilt && !recv_code_rebuilt_said {
+                                recv_code_rebuilt_said = true;
+                                log.critical(&log.paint(
+                                    Tone::Warn,
+                                    "the connection to the sender was rebuilt after the code was confirmed; nothing more is accepted on this code. Ask for a FRESH code.",
+                                ));
+                            }
                         }
                         continue;
                     }
@@ -8239,7 +8277,7 @@ async fn recv_run(
                             recv_pake_done,
                             yes,
                             daemon,
-                        );
+                        ).await;
                         let identity_hold = consented_peer
                             && identity_state == cap::IdentityState::Pending;
                         let expired = if identity_hold && link_ready {
@@ -8363,8 +8401,9 @@ async fn recv_run(
                     // --help` promises ("`receive <code>` never asks"). It
                     // asked `accept? [y/N]` anyway at a terminal. Only the
                     // ceremony peer carries that consent, never a bystander.
-                    let code_consent =
-                        recv_code_path && recv_pake_done && conn.is_bound_active_peer(&pid);
+                    let code_consent = recv_code_path
+                        && recv_pake_done
+                        && conn.holds_code_authority(&pid).await;
                     let legacy_ok = offer_has_consent(
                         daemon,
                         yes,

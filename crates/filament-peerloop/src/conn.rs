@@ -60,7 +60,8 @@ use filament_transport::net::{self, Ev, Peer, Transport};
 /// The host-free policy now lives in `filament-peerloop`; this module re-exports
 /// it so the ~200 call sites spread across the command modules stay unchanged.
 pub use crate::{
-    AdoptSource, LinkPetname, WarmHold, active_binding_matches, direct_permitted,
+    AdoptSource, CodeAuthorityRefusal, CodeSession, CodeTransport, LinkPetname, WarmHold,
+    active_binding_matches, code_authority_check, direct_permitted,
     ice_fallback_allowed, link_dead_for, link_has_live_for, link_petname, match_adoption_source,
     peer_targetable, schedule_retry, stuck_backoff,
 };
@@ -1570,7 +1571,14 @@ pub struct Conn {
     pub active: Option<String>, // the transfer-target sid (send side)
     /// A code-claimed receive is bound to the peer that completed PAKE. The sid
     /// may change on signaling reconnect, so retain its install uid as well.
+    /// Targeting only: authority is `code_session`.
     pub active_binding: Option<(String, Option<String>)>,
+    /// The session the code ceremony confirmed (`receive <code>` and
+    /// `send --code`): its exact sid, the DTLS fingerprint pair its
+    /// confirmation bound, and the ceremony secret. Every code-path accept,
+    /// consent and remember decision is `holds_code_authority`, which checks
+    /// the peer's CURRENT link against it.
+    pub code_session: Option<CodeSession>,
     pub next_gen: u32,
     /// Peer-absence / rejoin-grace state (the reconnect window + declared brb).
     pub rejoin: RejoinState,
@@ -1921,6 +1929,7 @@ impl Conn {
             suppressed_digest_adoptions: HashSet::new(),
             active: None,
             active_binding: None,
+            code_session: None,
             next_gen: 0,
             rejoin: RejoinState {
                 waiting_rejoin: None,
@@ -2320,19 +2329,73 @@ impl Conn {
         self.rejoin.waiting_rejoin = None;
     }
 
-    pub fn is_bound_active_peer(&self, peer_id: &str) -> bool {
-        let uid = self
-            .links
-            .get(peer_id)
-            .and_then(|link| link.uid.as_deref())
-            .or_else(|| {
-                self.roster
-                    .get(peer_id)
-                    .and_then(|peer| peer["uid"].as_str())
-            });
-        self.active_binding
-            .as_ref()
-            .is_some_and(|binding| active_binding_matches(binding, peer_id, uid))
+    /// Record the session a code ceremony confirmed with `sid`: the DTLS
+    /// fingerprint pair `(mine, theirs)` its confirmation MAC bound, the
+    /// ceremony secret, and the direct attempt its promotion armed
+    /// (`start_direct_promote`, called just before; none when it armed
+    /// nothing). Set once: a run confirms one ceremony, and a later call
+    /// never moves the session to another sid or transport.
+    pub fn bind_code_session(&mut self, sid: &str, fingerprints: (&str, &str), secret: &str) {
+        if self.code_session.is_some() {
+            self.log
+                .debug("tunlion: code session already bound; keeping the confirmed one");
+            return;
+        }
+        let promote_attempt = self
+            .direct_pending
+            .get(sid)
+            .filter(|pending| pending.ephemeral)
+            .map(|pending| pending.attempt);
+        self.code_session = Some(CodeSession::new(sid, fingerprints, secret, promote_attempt));
+    }
+
+    /// Code authority for `pid` on its CURRENT link (`code_authority_check`):
+    /// the exact sid the ceremony confirmed, on a WebRTC link whose DTLS
+    /// fingerprints are the confirmed pair or the direct link that ceremony's
+    /// own promotion attempt published with its secret. A uid, a roster
+    /// entry or a replacement transport for the same sid is not enough.
+    pub async fn code_authority(&self, pid: &str) -> Result<(), CodeAuthorityRefusal> {
+        let fps = match self.links.get(pid) {
+            Some(l) if !l.direct => match &l.peer {
+                Some(p) => p.fingerprints().await,
+                None => None,
+            },
+            _ => None,
+        };
+        self.code_authority_on(pid, fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str())))
+    }
+
+    /// [`Conn::code_authority`] once a WebRTC link's DTLS fingerprints have
+    /// been read (`webrtc_fps`, ignored for a direct link).
+    fn code_authority_on(
+        &self,
+        pid: &str,
+        webrtc_fps: Option<(&str, &str)>,
+    ) -> Result<(), CodeAuthorityRefusal> {
+        let transport = match self.links.get(pid) {
+            None => CodeTransport::Absent,
+            Some(l) if l.direct => CodeTransport::Direct {
+                attempt: l.attempt,
+                secret: l.expected_secret.as_ref().map(|(_, s)| s.as_str()),
+            },
+            Some(_) => CodeTransport::WebRtc(webrtc_fps),
+        };
+        code_authority_check(self.code_session.as_ref(), pid, transport)
+    }
+
+    /// [`Conn::code_authority`] as a decision, logging why at debug when it
+    /// is refused (never the fingerprints or the secret).
+    pub async fn holds_code_authority(&self, pid: &str) -> bool {
+        match self.code_authority(pid).await {
+            Ok(()) => true,
+            Err(why) => {
+                self.log.debug(&format!(
+                    "tunlion: code authority refused for {pid}: {}",
+                    why.reason()
+                ));
+                false
+            }
+        }
     }
 
     /// Track a roster entry and (re)connect to it. `want_active` marks it as
@@ -2434,10 +2497,13 @@ impl Conn {
             .active
             .as_ref()
             .is_some_and(|a| self.deferred_left.contains_key(a));
+        // A code-receive binding hands the slot only to the exact sid whose
+        // ceremony confirmed; a new sid (even the same install) needs a fresh
+        // code. No binding (every non-code path): unchanged.
         let binding_allows = self
             .active_binding
             .as_ref()
-            .is_none_or(|binding| active_binding_matches(binding, &peer_id, peer_uid.as_deref()));
+            .is_none_or(|binding| active_binding_matches(binding, &peer_id));
         if want_active && !binding_allows {
             self.log.debug("tunlion: ADOPT refused: peer is not the authenticated code sender");
         }
@@ -2457,9 +2523,6 @@ impl Conn {
                 }
             }
             self.active = Some(peer_id.clone());
-            if let Some(binding) = self.active_binding.as_mut() {
-                binding.0 = peer_id.clone();
-            }
             self.rejoin.waiting_rejoin = None;
         }
         Ok(self.is_active(&peer_id))
@@ -8532,7 +8595,13 @@ impl Conn {
         if let Some(uid) = data["uid"].as_str() {
             net::ensure_ascii_uid(uid)?;
             if let Some(info) = self.roster.get_mut(from) {
-                info["uid"] = json!(uid);
+                // A signal payload names a uid only for a peer we have none
+                // for yet. It never replaces one the roster already holds
+                // (from the server's welcome / peer-joined), and it is never
+                // authority: code authority is `holds_code_authority`.
+                if info["uid"].as_str().is_none() {
+                    info["uid"] = json!(uid);
+                }
             } else {
                 self.roster
                     .insert(from.to_string(), json!({ "id": from, "uid": uid }));
@@ -9671,6 +9740,163 @@ mod warm_identity_tests {
         assert_eq!(t.closes.load(Ordering::Relaxed), 0);
         assert!(conn.links.contains_key("sid-new"), "the new identity got no link");
         assert_eq!(conn.links.len(), 2, "an identity change must not reuse the old link");
+    }
+
+    /// A pending direct attempt shaped like the one `start_direct_promote`
+    /// arms for a confirmed code ceremony (`ephemeral`).
+    fn promote_pending(attempt: net::AttemptId, sid: &str, secret: &str) -> DirectPending {
+        DirectPending {
+            attempt,
+            auth: DirectAuth::device(1, "box", "00"),
+            race_task: None,
+            secret: (sid.into(), secret.into()),
+            fleet: false,
+            lan: false,
+            ephemeral: true,
+            deadline: Instant::now() + Duration::from_secs(30),
+            racing: false,
+            endpoint: None,
+            punch_sock: None,
+            my_srflx: None,
+            peer_server_public: None,
+            server_public_dialed: Arc::new(AtomicBool::new(false)),
+            probe: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The direct link that ceremony's promotion publishes: born untrusted,
+    /// keyed by the ceremony secret, owned by the promotion's attempt.
+    fn promoted_link(pid: &str, uid: &str, secret: &str, attempt: net::AttemptId) -> Link {
+        let mut l = linked_direct(pid, "peer", uid, FakeQuic::live());
+        l.trusted = false;
+        l.verified_name = None;
+        l.expected_secret = Some((pid.to_string(), secret.to_string()));
+        l.attempt = Some(attempt);
+        l
+    }
+
+    /// Code authority after a confirmed ceremony with S1: the confirmed
+    /// transport (WebRTC fingerprints, or the ceremony's own direct promotion)
+    /// is authorized; a same-uid NEW sid installed from signal data, a rebuilt
+    /// WebRTC link with other fingerprints, and a direct link some other
+    /// attempt published are not. The receive gates (file-offer, code
+    /// consent, pair-keep) and the identity-unavailable consent all read this.
+    #[tokio::test]
+    async fn code_authority_is_bound_to_the_confirmed_session_and_transport() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let promote = net::AttemptId::next();
+        conn.roster.insert("sid-s1".into(), json!({ "id": "sid-s1", "name": "user@s", "uid": "uid-u" }));
+        conn.direct_pending.insert("sid-s1".into(), promote_pending(promote, "sid-s1", "k-secret"));
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", promote));
+
+        // Unconfirmed: nothing is authorized, even the right link (policy
+        // unchanged: no authority before the ceremony confirms).
+        assert!(!conn.holds_code_authority("sid-s1").await);
+        // consented_identity_peer lives behind the `dispatch` feature.
+        #[cfg(feature = "dispatch")]
+        assert!(!crate::recv::dispatch::consented_identity_peer(&conn, "sid-s1", true, true, false, false).await);
+
+        conn.bind_active("sid-s1");
+        conn.bind_code_session("sid-s1", ("fp-a", "fp-b"), "k-secret");
+        assert_eq!(conn.code_session.as_ref().map(|c| c.sid()), Some("sid-s1"));
+
+        // Positive control: the ceremony's own direct promotion.
+        assert_eq!(conn.code_authority("sid-s1").await, Ok(()));
+        assert!(conn.holds_code_authority("sid-s1").await);
+        // consented_identity_peer lives behind the `dispatch` feature.
+        #[cfg(feature = "dispatch")]
+        assert!(crate::recv::dispatch::consented_identity_peer(&conn, "sid-s1", true, true, false, false).await);
+        // ... but not before this run's ceremony confirmed (recv_pake_done).
+        // consented_identity_peer lives behind the `dispatch` feature.
+        #[cfg(feature = "dispatch")]
+        assert!(!crate::recv::dispatch::consented_identity_peer(&conn, "sid-s1", true, false, false, false).await);
+
+        // Same uid U, NEW sid S2, named only by an unauthenticated signal.
+        conn.ensure_responder("sid-s2", &json!({ "type": "candidate", "uid": "uid-u" }))
+            .await
+            .expect("a candidate signal is not an error");
+        assert_eq!(conn.roster["sid-s2"]["uid"], "uid-u", "first-seen uid is still recorded");
+        conn.links.insert("sid-s2".into(), promoted_link("sid-s2", "uid-u", "k-secret", promote));
+        assert_eq!(conn.code_authority("sid-s2").await, Err(CodeAuthorityRefusal::SessionMismatch));
+        assert!(!conn.holds_code_authority("sid-s2").await);
+        // consented_identity_peer lives behind the `dispatch` feature.
+        #[cfg(feature = "dispatch")]
+        assert!(!crate::recv::dispatch::consented_identity_peer(&conn, "sid-s2", true, true, false, false).await);
+
+        // Same sid, a direct link some OTHER attempt published.
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", net::AttemptId::next()));
+        assert_eq!(conn.code_authority("sid-s1").await, Err(CodeAuthorityRefusal::ForeignDirect));
+        // consented_identity_peer lives behind the `dispatch` feature.
+        #[cfg(feature = "dispatch")]
+        assert!(!crate::recv::dispatch::consented_identity_peer(&conn, "sid-s1", true, true, false, false).await);
+
+        // Same sid on a WebRTC link: only the confirmed fingerprint pair.
+        let mut webrtc = promoted_link("sid-s1", "uid-u", "k-secret", promote);
+        webrtc.direct = false;
+        conn.links.insert("sid-s1".into(), webrtc);
+        assert_eq!(conn.code_authority_on("sid-s1", Some(("fp-a", "fp-b"))), Ok(()));
+        assert_eq!(
+            conn.code_authority_on("sid-s1", Some(("fp-a", "fp-c"))),
+            Err(CodeAuthorityRefusal::FingerprintMismatch)
+        );
+        // This fixture has no RTCPeerConnection, so no fingerprints to read.
+        assert_eq!(conn.code_authority("sid-s1").await, Err(CodeAuthorityRefusal::NoTransport));
+
+        // The confirmed session is set once and never moved.
+        conn.bind_code_session("sid-s2", ("fp-x", "fp-y"), "k-secret");
+        assert_eq!(conn.code_session.as_ref().map(|c| c.sid()), Some("sid-s1"));
+    }
+
+    /// The code-receive binding never hands the transfer slot to a new sid:
+    /// a same-install peer reconnecting on S2 (its S1 link gone) is refused
+    /// `want_active`, and the confirmed session still names S1. Control: the
+    /// exact sid takes the slot through the same path first.
+    #[tokio::test]
+    async fn a_same_uid_new_sid_cannot_take_the_code_receive_slot() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.roster.insert("sid-s1".into(), json!({ "id": "sid-s1", "name": "user@s", "uid": "uid-u" }));
+        conn.bind_active("sid-s1");
+        conn.bind_code_session("sid-s1", ("fp-a", "fp-b"), "k-secret");
+        conn.active = None;
+
+        // Control: the confirmed sid itself is claimable as the target.
+        let active = conn
+            .maybe_adopt(&json!({ "id": "sid-s1", "name": "user@s", "uid": "uid-u" }), true)
+            .await
+            .expect("adoption is not an error");
+        assert!(active, "the confirmed sid could not take its own slot");
+
+        // The S1 link dies and releases the slot; the same install returns on S2.
+        conn.drop_link("sid-s1");
+        assert!(conn.active.is_none());
+        let active = conn
+            .maybe_adopt(&json!({ "id": "sid-s2", "name": "user@s", "uid": "uid-u" }), true)
+            .await
+            .expect("adoption is not an error");
+        assert!(!active, "a same-uid new sid took the code-receive slot");
+        assert!(conn.active.is_none());
+        assert_eq!(conn.active_binding.as_ref().map(|b| b.0.as_str()), Some("sid-s1"));
+        assert_eq!(conn.code_session.as_ref().map(|c| c.sid()), Some("sid-s1"));
+        assert!(!conn.holds_code_authority("sid-s2").await);
+    }
+
+    /// A signal payload never replaces a roster uid the server already gave
+    /// (control: a peer with none yet still gets the first-seen one).
+    #[tokio::test]
+    async fn ensure_responder_does_not_overwrite_a_known_roster_uid() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.roster.insert("sid-a".into(), json!({ "id": "sid-a", "name": "a", "uid": "uid-real" }));
+        conn.ensure_responder("sid-a", &json!({ "type": "candidate", "uid": "uid-claimed" }))
+            .await
+            .expect("not an error");
+        assert_eq!(conn.roster["sid-a"]["uid"], "uid-real");
+
+        conn.roster.insert("sid-b".into(), json!({ "id": "sid-b", "name": "b" }));
+        conn.ensure_responder("sid-b", &json!({ "type": "candidate", "uid": "uid-first" }))
+            .await
+            .expect("not an error");
+        assert_eq!(conn.roster["sid-b"]["uid"], "uid-first");
     }
 
     #[tokio::test]
