@@ -443,6 +443,7 @@ fn code_meaning(verb: &str, code: i32) -> &'static str {
         ("send", 4) => "the receiver refused (its reason is printed, and in --json `error.reason`)",
         ("send", 8) => "some files were delivered and some were not",
         ("sync", 8) => "some files moved and some did not",
+        ("doctor", 2) => "a state file is damaged (the preflight lists it with its recovery), or bad arguments or flags",
         (_, 0) => "success",
         (_, 1) => "any other error",
         (_, 2) => "usage: bad arguments or flags, a local file problem, or a missing prerequisite",

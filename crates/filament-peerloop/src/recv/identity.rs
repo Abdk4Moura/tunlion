@@ -21,13 +21,13 @@
 
 use crate::conn::Conn;
 use crate::host::{LogSink, Tone};
-use crate::identity::principal_after_liveness;
+use crate::identity::{principal_after_proof, ProofFacts};
 use crate::recv::renewal;
 use crate::recv::store::{
     effective_principal_deadline, DeviceStore, OverlayKey, PRINCIPAL_STATE_LAPSED,
     PRINCIPAL_STATE_REVOKED,
 };
-use filament_cap::capability::{BindingStrength, IdentityState};
+use filament_cap::capability::{BindingStrength, IdentityState, PrincipalKind};
 use filament_id::{now_secs, DeviceCert, IntroScope, UserKey, CERT_TTL_SECS};
 use filament_transport::net::Transport;
 use serde_json::{json, Value};
@@ -262,6 +262,20 @@ impl IdentityService {
         if cert.device_pub == own_dpub {
             return fail("reflection: the certificate is this device's own");
         }
+        // A fleet-admitted sibling link may only be proven by the key it was
+        // admitted on. Checked before anything is stored or changed.
+        if conn.link(pid).is_some_and(|l| {
+            let f = ProofFacts {
+                current: &l.principal_kind,
+                admitted_device: l.identity_device_pub.as_ref(),
+                proven_device: &cert.device_pub,
+                recognized: true,
+                cert_expires: cert.expires,
+            };
+            principal_after_proof(&f, PrincipalKind::OwnerDevice, 0, 0).is_none()
+        }) {
+            return fail("the certificate names a different device than the sibling admitted on this link");
+        }
         let _ = self
             .store
             .store_provisional_identity(&format!("peer-{pid}"), &cert);
@@ -269,21 +283,41 @@ impl IdentityService {
         let (principal_kind, not_after, max_offline, last_seen) = self
             .store
             .persisted_principal_for_cert(&cert, own_user_pub.as_ref());
+        // Is the proven key a recognized sibling (recorded, or on a joined
+        // device listed by the owner's roster)? Read before the link is
+        // borrowed mutably.
+        let recognized = self.store.sibling_recognized(&cert.device_pub);
         if let Some(l) = conn.link_mut(pid) {
+            let (deadline, _clock) =
+                effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
+            // Decided against the link's state BEFORE it is overwritten: a
+            // sibling stays a sibling, with its certificate's own expiry rather
+            // than a persisted deadline (see `principal_after_proof`).
+            let f = ProofFacts {
+                current: &l.principal_kind,
+                admitted_device: l.identity_device_pub.as_ref(),
+                proven_device: &cert.device_pub,
+                recognized,
+                cert_expires: cert.expires,
+            };
+            let (next, expires) = principal_after_proof(&f, principal_kind, deadline, now_secs())
+                .unwrap_or((PrincipalKind::Delegated { caps: Vec::new() }, 0));
             l.identity_device_pub = Some(cert.device_pub);
             l.identity_user_pub = Some(cert.user_pub);
             l.identity_binding = BindingStrength::Proven;
             l.identity_state = IdentityState::Resolved;
-            let (deadline, _clock) =
-                effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
-            l.identity_cert_expires = Some(deadline);
-            let alive = deadline > now_secs();
-            l.principal_kind = principal_after_liveness(principal_kind, alive);
+            l.identity_cert_expires = Some(expires);
+            l.principal_kind = next;
         }
+        let principal = conn
+            .link(pid)
+            .map(|l| format!("{:?}", l.principal_kind))
+            .unwrap_or_default();
         self.log.debug(&format!(
-            "{} identity proven for peer {}",
+            "{} identity proven for peer {} principal={}",
             self.log.paint(Tone::Ok, self.log.glyph_ok()),
-            pid
+            pid,
+            principal
         ));
         let petname = conn.link(pid).map(|l| l.name.clone()).unwrap_or_default();
         if !petname.is_empty()

@@ -36,9 +36,11 @@ pub(crate) enum Shape {
 }
 
 /// The files checked, relative to the config directory.
-pub(crate) const FILES: [(&str, Shape); 6] = [
+pub(crate) const FILES: [(&str, Shape); 7] = [
     ("devices.json", Shape::JsonArray),
     ("revoked-keys.json", Shape::JsonArray),
+    // On a joined device: removed fleet siblings whose revocation is kept.
+    ("delisted-siblings.json", Shape::JsonArray),
     ("used-invitations.json", Shape::JsonArray),
     // The signed capability store: grants and their revocations.
     ("caps.json", Shape::JsonArray),
@@ -192,6 +194,26 @@ mod tests {
         assert_eq!(exit_codes::json_code(&e), "corrupt_state");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{garbage");
         assert_eq!(std::fs::read_to_string(backup_path(&p)).unwrap(), "[]");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The delisted-sibling store is a checked state file: a damaged one is
+    /// refused by name, never written over, and the refusal names its `.bak`.
+    #[test]
+    fn the_delisted_sibling_store_follows_the_doctrine() {
+        let name = filament_peerloop::recv::store::DELISTED_SIBLINGS_FILE;
+        assert!(FILES.iter().any(|(n, s)| *n == name && *s == Shape::JsonArray), "{name} is checked");
+        let d = std::env::temp_dir().join(format!("tunlion-state-delisted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join(name);
+        std::fs::write(&p, "[]").unwrap();
+        before_write(&p).unwrap();
+        std::fs::write(&p, "{garbage").unwrap();
+        let m = before_write(&p).unwrap_err().to_string();
+        assert!(m.contains(name) && m.contains("cp ") && m.contains(".bak"), "{m}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{garbage");
+        assert!(check_file(&p, Shape::JsonArray).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -256,7 +256,7 @@ test holds to the help text.
 |---|---|---|
 | 0 | | success |
 | 1 | `error` | anything not classified below |
-| 2 | `usage` | bad arguments or flags, or a missing local prerequisite (`mount` with no FUSE), or a local input `send` cannot use: missing, unreadable, not a regular file (a FIFO or device), or unreadable part way through |
+| 2 | `usage` | bad arguments or flags, or a missing local prerequisite (`mount` with no FUSE), or a local input `send` cannot use: missing, unreadable, not a regular file (a FIFO or device), or unreadable part way through; `doctor`: a damaged state file (the preflight still prints its full report, and `state_files.problems` under `--json`) |
 | 3 | `unknown_device` | no such device, or not paired with this one |
 | 4 | `denied` | refused by the peer, a capability or ceiling, or the system |
 | 5 | `still_relayed` | `reach --until-direct`: the link is up but still on a relay |

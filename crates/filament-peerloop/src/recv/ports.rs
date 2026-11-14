@@ -244,6 +244,11 @@ pub trait RecvStore: Send + Sync {
     ) -> anyhow::Result<String>;
     fn device_was_introduced(&self, name: &str) -> bool;
     fn devices_sweep_lapsed(&self, now: u64) -> usize;
+    /// A delisted-sibling store problem a person must hear about (see
+    /// `DeviceStore::delisted_siblings_problem`). The default is for mocks.
+    fn delisted_siblings_problem(&self) -> Option<String> {
+        None
+    }
     #[allow(clippy::too_many_arguments)]
     fn devices_upsert_atomic(
         &self,

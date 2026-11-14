@@ -3262,8 +3262,15 @@ impl Conn {
             };
             let pid = match decision {
                 WarmDecision::Skip { pid } => {
+                    // The live link's principal rides along, so a gate can see
+                    // what the link IS between events, not only at admission.
+                    let (kind, sibling) = self
+                        .links
+                        .get(&pid)
+                        .map(|l| (format!("{:?}", l.principal_kind), l.is_sibling_link()))
+                        .unwrap_or_default();
                     self.log.debug(&format!(
-                        "warm-hold: skip '{peer}' (link {pid} to it is live)"
+                        "warm-hold: skip '{peer}' (link {pid} to it is live) principal={kind} sibling={sibling}"
                     ));
                     continue;
                 }
