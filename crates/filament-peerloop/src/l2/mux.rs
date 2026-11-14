@@ -172,6 +172,15 @@ pub struct Mux {
     /// stream pipes, so a warm exec needs no second listener on the shared
     /// event channel. Bounded and dropped with the stream.
     exec_init: Mutex<HashMap<u32, mpsc::Sender<Value>>>,
+    /// The `link-revoked` frame this link received, kept for the life of the
+    /// mux. The per-exec channels above are bounded and lossy, so a warm exec
+    /// that ends on a transport failure reads this before reporting one: a
+    /// refusal recorded here outranks "the link died".
+    revoked: std::sync::Mutex<Option<Value>>,
+    /// Nonces this link has already answered with `link-revoked-ack`, so a
+    /// repeated frame is answered once and a flood is capped
+    /// (`MAX_REVOKED_ACKS`).
+    acked_nonces: std::sync::Mutex<Vec<String>>,
 }
 
 impl Mux {
@@ -207,6 +216,8 @@ impl Mux {
             close_err: Mutex::new(HashMap::new()),
             exec_ctl: Mutex::new(HashMap::new()),
             exec_init: Mutex::new(HashMap::new()),
+            revoked: std::sync::Mutex::new(None),
+            acked_nonces: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -669,12 +680,40 @@ impl Mux {
 
     /// INITIATOR: the link said `link-revoked` (which carries no sid). Every
     /// in-flight warm exec on THIS link is told, so it fails loudly instead of
-    /// waiting for an exit status that will never come.
-    pub async fn on_link_revoked(&self, v: Value) {
+    /// waiting for an exit status that will never come. Returns whether this
+    /// frame is the link's FIRST refusal and is now recorded; a repeat keeps
+    /// the first record and returns false (one cut, one answer).
+    pub async fn on_link_revoked(&self, v: Value) -> bool {
+        // Recorded first, so no exec can observe the link failing without it.
+        let first = {
+            let mut slot = self.revoked.lock().unwrap_or_else(|p| p.into_inner());
+            let first = slot.is_none();
+            if first {
+                *slot = Some(v.clone());
+            }
+            first
+        };
         let senders: Vec<_> = self.exec_init.lock().await.values().cloned().collect();
         for tx in senders {
             let _ = tx.try_send(v.clone());
         }
+        first
+    }
+
+    /// Claim `nonce` for one answer: true the first time it is seen on this
+    /// link while under the cap, false for a repeat or past the cap.
+    fn claim_ack_nonce(&self, nonce: &str) -> bool {
+        let mut seen = self.acked_nonces.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.iter().any(|n| n == nonce) || seen.len() >= MAX_REVOKED_ACKS {
+            return false;
+        }
+        seen.push(nonce.to_string());
+        true
+    }
+
+    /// The refusal this link received, if any (see `revoked`).
+    pub fn link_revoked(&self) -> Option<Value> {
+        self.revoked.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Take the mid-session close reason for a stream, if one was recorded, so the
@@ -699,13 +738,126 @@ impl Mux {
         self.exec_init.lock().await.clear();
         // Do NOT clear `close_err`: a denial that raced the transport's death
         // must still be readable by the pump that is about to end. The map is
-        // bounded by the streams drained here and sids are not reused.
+        // bounded by the streams drained here and sids are not reused. Nor
+        // `revoked`, for the same reason: it is why the link is dying.
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
             if let Some(h) = s.read_pump {
                 h.abort();
             }
         }
+    }
+}
+
+/// What `answer_link_revoked` did with one `link-revoked` frame. Logged by the
+/// receive loop, so a failed gate can say which branch b took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokedAnswer {
+    /// Recorded (now or by an earlier frame) and answered on this many
+    /// transports.
+    Acked(usize),
+    /// Recorded; the frame carried no nonce (an older peer), so no answer.
+    NoNonce,
+    /// No mux for the link: nothing was recorded, so nothing is answered.
+    NoMux,
+    /// Recorded, but there is no transport to answer on.
+    NoTransport,
+    /// Recorded; this nonce was already answered on this link, or the link
+    /// reached its cap of answers.
+    Repeat,
+}
+
+impl RevokedAnswer {
+    pub fn describe(self) -> String {
+        match self {
+            RevokedAnswer::Acked(n) => format!("recorded, ack sent on {n} transport(s)"),
+            RevokedAnswer::NoNonce => "recorded, no nonce so no ack".to_string(),
+            RevokedAnswer::NoMux => "no session mux for that link, not recorded, no ack".to_string(),
+            RevokedAnswer::NoTransport => "recorded, no transport to ack on".to_string(),
+            RevokedAnswer::Repeat => "recorded, nonce already answered (or cap reached)".to_string(),
+        }
+    }
+}
+
+/// A `link-revoked` frame arrived on a link. Record it on the link's mux (the
+/// first refusal is kept; a later one is still delivered to every exec) and
+/// then answer the frame's OWN nonce with `link-revoked-ack` on each of
+/// `transports`: the one that carried the frame first, then the link's
+/// current one if that differs, so the answer goes back the way the frame
+/// came even when the two ends disagree about which path is primary. Every
+/// distinct nonce is answered once (two links of one peer cut together each
+/// get their own answer), capped per link so a peer repeating the frame
+/// cannot multiply the tasks. No mux means nothing was recorded, so nothing is
+/// answered; no nonce (an older peer) asks for no answer. Sends run on tasks
+/// under a bound, so a peer that stopped reading cannot park the caller.
+///
+/// The ack is a diagnostic for the cutting side, never a delivery verdict:
+/// its absence proves nothing about what this side processed.
+pub async fn answer_link_revoked(
+    mux: Option<&Arc<Mux>>,
+    transports: Vec<Arc<dyn Transport>>,
+    v: &Value,
+) -> RevokedAnswer {
+    let Some(mux) = mux else {
+        return RevokedAnswer::NoMux;
+    };
+    let _first = mux.on_link_revoked(v.clone()).await;
+    let Some(nonce) = v["nonce"].as_str() else {
+        return RevokedAnswer::NoNonce;
+    };
+    if transports.is_empty() {
+        return RevokedAnswer::NoTransport;
+    }
+    if !mux.claim_ack_nonce(nonce) {
+        return RevokedAnswer::Repeat;
+    }
+    let ack = json!({ "type": "link-revoked-ack", "nonce": nonce });
+    let n = transports.len();
+    for t in transports {
+        let ack = ack.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(LINK_REVOKED_ACK_SEND, t.send_control(&ack)).await;
+        });
+    }
+    RevokedAnswer::Acked(n)
+}
+
+/// Distinct nonces one link answers at most. A real cut sends one frame per
+/// link; a few allow for duplicates of the same peer cut together.
+///
+/// Known residual: the cap is per mux and counts claimed nonces, so a peer
+/// that sends 8 nonce-bearing frames first can suppress the ack for a later,
+/// genuine one. That only costs the cutting side its diagnostic (it then logs
+/// the refusal as unconfirmed and closes at its budget): the ack authorizes
+/// nothing, and the refusal itself is still recorded and delivered here.
+const MAX_REVOKED_ACKS: usize = 8;
+
+/// Bound on writing one `link-revoked-ack`.
+const LINK_REVOKED_ACK_SEND: Duration = Duration::from_secs(5);
+
+/// Warm execs this process is running as the initiator. While any is live the
+/// receive loop ticks fast, so a refusal read on a link whose events wait for
+/// a loop turn reaches the exec (and is acknowledged) promptly.
+static WARM_EXECS_LIVE: AtomicU32 = AtomicU32::new(0);
+
+/// Whether this process has a warm exec in flight (see [`WarmExecLive`]).
+pub fn warm_exec_live() -> bool {
+    WARM_EXECS_LIVE.load(Ordering::Relaxed) > 0
+}
+
+/// Counts one in-flight warm exec for its lifetime.
+pub struct WarmExecLive(());
+
+impl WarmExecLive {
+    pub fn enter() -> Self {
+        WARM_EXECS_LIVE.fetch_add(1, Ordering::Relaxed);
+        WarmExecLive(())
+    }
+}
+
+impl Drop for WarmExecLive {
+    fn drop(&mut self) {
+        WARM_EXECS_LIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1553,6 +1705,153 @@ mod tests {
             "a closed warm exec must not keep a live waiter"
         );
         assert!(ctl.recv().await.is_none(), "the waiter channel is dropped");
+    }
+
+    /// The per-exec channel is bounded and its delivery is `try_send`, so a
+    /// revocation can be lost there when the channel is full. The link keeps
+    /// its own record, which a warm exec ending on a transport failure reads:
+    /// a full queue must not turn the refusal into "the link died".
+    #[tokio::test]
+    async fn a_revocation_lost_to_a_full_exec_queue_is_still_recorded_on_the_link() {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        let sid = L2_SID_BASE | 23;
+        let _stream = mux.register_stream(sid).await.unwrap();
+        let mut ctl = mux.register_exec_initiator(sid).await;
+        assert!(mux.link_revoked().is_none(), "no refusal before one arrives");
+        // Far more than the queue's bound, so it is certainly full.
+        for _ in 0..1000 {
+            assert!(
+                mux.on_exec_initiator_frame(sid, json!({ "type": "exec-alive-ack", "sid": sid }))
+                    .await
+            );
+        }
+        let revoked = json!({ "type": "link-revoked", "reason": "forgotten" });
+        mux.on_link_revoked(revoked.clone()).await;
+        let mut seen = false;
+        while let Ok(v) = ctl.try_recv() {
+            seen |= v["type"].as_str() == Some("link-revoked");
+        }
+        assert!(!seen, "the full queue dropped it (the case this record exists for)");
+        assert_eq!(mux.link_revoked(), Some(revoked), "the link must keep the refusal");
+    }
+
+    /// The record is why the link is dying, so the teardown keeps it for the
+    /// exec that is about to read it.
+    #[tokio::test]
+    async fn a_recorded_revocation_survives_shutdown_all() {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        let revoked = json!({ "type": "link-revoked", "reason": "forgotten" });
+        assert!(mux.on_link_revoked(revoked.clone()).await, "the first refusal is recorded");
+        mux.shutdown_all().await;
+        assert_eq!(mux.link_revoked(), Some(revoked));
+    }
+
+    fn acks_sent(t: &MockTransport) -> Vec<Value> {
+        t.controls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| v["type"].as_str() == Some("link-revoked-ack"))
+            .cloned()
+            .collect()
+    }
+
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// The receiving side: the ack answers the frame's own nonce, and only
+    /// once the refusal is recorded on the link. Two cuts of one peer (two
+    /// frames, two nonces) each get their own answer, even though only the
+    /// first refusal is kept as the record. A repeated nonce is not answered
+    /// again, and a flood of nonces is capped.
+    #[tokio::test]
+    async fn every_distinct_refusal_nonce_is_acknowledged_once_after_recording() {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        let transport: Arc<dyn Transport> = t.clone();
+        let first = json!({ "type": "link-revoked", "reason": "forgotten", "nonce": "n-1" });
+        assert_eq!(
+            answer_link_revoked(Some(&mux), vec![transport.clone()], &first).await,
+            RevokedAnswer::Acked(1)
+        );
+        assert_eq!(mux.link_revoked(), Some(first.clone()), "acked before it was recorded");
+        let second = json!({ "type": "link-revoked", "reason": "forgotten", "nonce": "n-2" });
+        assert_eq!(
+            answer_link_revoked(Some(&mux), vec![transport.clone()], &second).await,
+            RevokedAnswer::Acked(1),
+            "a second cut's frame was not answered (its own nonce)"
+        );
+        assert_eq!(
+            answer_link_revoked(Some(&mux), vec![transport.clone()], &first).await,
+            RevokedAnswer::Repeat
+        );
+        settle().await;
+        let nonces: Vec<String> =
+            acks_sent(&t).iter().map(|a| a["nonce"].as_str().unwrap_or("").to_string()).collect();
+        assert_eq!(nonces, vec!["n-1".to_string(), "n-2".to_string()]);
+        for i in 0..50 {
+            let spam = json!({ "type": "link-revoked", "reason": "x", "nonce": format!("spam-{i}") });
+            let _ = answer_link_revoked(Some(&mux), vec![transport.clone()], &spam).await;
+        }
+        settle().await;
+        assert_eq!(acks_sent(&t).len(), MAX_REVOKED_ACKS, "a flood of nonces was not capped");
+        assert_eq!(mux.link_revoked(), Some(first), "a later frame replaced the first record");
+    }
+
+    /// The answer goes back on the transport that CARRIED the frame and on the
+    /// link's current one when the two differ, with the same nonce.
+    #[tokio::test]
+    async fn the_ack_goes_back_on_the_carrying_transport_and_the_current_one() {
+        let carried = MockTransport::new();
+        let current = MockTransport::new();
+        let mux = Mux::new(current.clone(), Arc::new(NoHost));
+        let v = json!({ "type": "link-revoked", "reason": "forgotten", "nonce": "n-c" });
+        let ts: Vec<Arc<dyn Transport>> =
+            vec![carried.clone() as Arc<dyn Transport>, current.clone() as Arc<dyn Transport>];
+        assert_eq!(answer_link_revoked(Some(&mux), ts, &v).await, RevokedAnswer::Acked(2));
+        settle().await;
+        assert_eq!(acks_sent(&carried).len(), 1, "no ack on the carrying transport");
+        assert_eq!(acks_sent(&current).len(), 1, "no ack on the current transport");
+        assert_eq!(acks_sent(&carried)[0]["nonce"], "n-c");
+    }
+
+    /// No nonce (an older peer): recorded, not answered. No mux: nothing was
+    /// recorded, so nothing is answered. No transport: recorded, nothing to
+    /// answer on, and no panic.
+    #[tokio::test]
+    async fn a_revocation_is_not_acknowledged_without_a_nonce_a_mux_or_a_transport() {
+        let t = MockTransport::new();
+        let transport: Arc<dyn Transport> = t.clone();
+
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        let bare = json!({ "type": "link-revoked", "reason": "forgotten" });
+        assert_eq!(
+            answer_link_revoked(Some(&mux), vec![transport.clone()], &bare).await,
+            RevokedAnswer::NoNonce
+        );
+        assert_eq!(mux.link_revoked(), Some(bare), "a frame without a nonce is still recorded");
+
+        let with_nonce = json!({ "type": "link-revoked", "reason": "forgotten", "nonce": "n-2" });
+        assert_eq!(
+            answer_link_revoked(None, vec![transport.clone()], &with_nonce).await,
+            RevokedAnswer::NoMux
+        );
+
+        let other = Mux::new(t.clone(), Arc::new(NoHost));
+        assert_eq!(
+            answer_link_revoked(Some(&other), Vec::new(), &with_nonce).await,
+            RevokedAnswer::NoTransport
+        );
+        assert_eq!(other.link_revoked(), Some(with_nonce), "no transport must not lose the record");
+
+        settle().await;
+        assert!(acks_sent(&t).is_empty(), "an ack went out: {:?}", acks_sent(&t));
     }
 
     #[cfg(feature = "forward-server")]

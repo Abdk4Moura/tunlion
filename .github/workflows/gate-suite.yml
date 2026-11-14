@@ -329,7 +329,7 @@ jobs:
             [cli/tests/identity-relink-gates.sh]=3
             [cli/tests/scripting-contract-gates.sh]=11
             [cli/tests/net-blockers-gates.sh]=14
-            [cli/tests/daemon-path-gates.sh]=7
+            [cli/tests/daemon-path-gates.sh]=8
             # 8: R1 R2 K F1 Q P F2 X (fix/state-ux-blockers, plus Q from
             # the enrollment UX change: no trace lines at default verbosity).
             [cli/tests/state-ux-gates.sh]=8
