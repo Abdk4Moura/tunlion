@@ -73,6 +73,15 @@ FWD2_LPORT=9173
 source "$HERE/lib/fixture.sh"
 trap fixture_cleanup EXIT
 
+# Evidence for a failed forward gate: the owner daemon's own account of the
+# refusal (the gate's cap_reason, whether the open parked, whether the guest's
+# pair-proof was verified or held), which the guest's output never names.
+# Diagnostic only; no gate's verdict reads it.
+owner_log_tail() {
+  echo "## owner up.log (last 60 lines) for $1:"
+  tail -n 60 "$WORK/up.log" 2>/dev/null || echo "## (no owner up.log)"
+}
+
 KNOWN_RED_ALLOW=()
 O_ENV=(env TUNLION_CONFIG_DIR="$DA")
 G_ENV=(env TUNLION_CONFIG_DIR="$DG")
@@ -243,6 +252,7 @@ sleep 3
 for _ in $(seq 1 "$BOUND"); do kill -0 "$X4_PID" 2>/dev/null || break; sleep 1; done
 if kill -0 "$X4_PID" 2>/dev/null; then
   tail -5 "$WORK/X4.log"
+  owner_log_tail X4
   bad "gateX4: a new forward after the end is still running"
 else
   wait "$X4_PID"; rcX4=$?
@@ -250,6 +260,7 @@ else
   if [ "$rcX4" = "4" ] && grep -qi "expired" "$WORK/X4.log"; then
     ok "gateX4: a new forward after the end exited 4, naming the expiry"
   else
+    owner_log_tail X4
     bad "gateX4: a new forward after the end did not exit 4 naming the expiry (rc=$rcX4)"
   fi
 fi
@@ -263,6 +274,7 @@ echo "## forward --stdio rc=$rcX5"; cat "$WORK/X5.err"
 if [ "$rcX5" = "4" ] && ! grep -q "TICK-" "$WORK/X5.out" && grep -qi "expired" "$WORK/X5.err"; then
   ok "gateX5: a new forward --stdio after the end exited 4, naming the expiry, and carried nothing"
 else
+  owner_log_tail X5
   bad "gateX5: a new forward --stdio after the end was not refused as expired (rc=$rcX5)"
 fi
 

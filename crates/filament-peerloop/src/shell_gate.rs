@@ -625,6 +625,11 @@ fn decide_with_legacy(
     }
 }
 
+/// The gate reason [`require_shell_identity`] gives while the link's identity
+/// is unresolved. Callers that must tell "not known yet" from a real denial
+/// match on this, never on a copy of the words.
+pub const IDENTITY_NOT_PROVEN: &str = "identity-not-proven";
+
 /// Pair-secret trust does not settle the identity needed for certificate
 /// revocation. Refuse before capability evaluation until that identity exists;
 /// anonymous consent is transfer-only, never authority for a shell.
@@ -633,7 +638,7 @@ pub fn require_shell_identity(
     device_pub: Option<&[u8; 32]>,
 ) -> Result<(), Option<String>> {
     if state != filament_cap::capability::IdentityState::Resolved || device_pub.is_none() {
-        return Err(Some("identity-not-proven".to_string()));
+        return Err(Some(IDENTITY_NOT_PROVEN.to_string()));
     }
     Ok(())
 }

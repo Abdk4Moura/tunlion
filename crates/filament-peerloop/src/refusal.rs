@@ -43,6 +43,15 @@ pub const TUNNEL_OFF_REASON: &str =
 /// The part of [`TUNNEL_OFF_REASON`] every build has sent.
 pub const TUNNEL_OFF_PREFIX: &str = "tunnelling is off there";
 
+/// The acceptor has not yet resolved WHO the initiator is on this link (no
+/// proven name, no device key), so it cannot answer the capability question
+/// either way. Not a verdict: no stream opens, and the initiator retries. The
+/// same words the settle path sends when its hold budget is full, which
+/// clients already treat as retryable (they carry "retry" and "identity
+/// settling"), and which no code is recovered from, so a forward keeps
+/// listening instead of ending as denied.
+pub const IDENTITY_SETTLING_REASON: &str = "identity settling, retry";
+
 /// The peer's ENROLMENT CEILING excludes this capability. A grant cannot widen a
 /// ceiling, so any hint built on this reason must not prescribe one: the fix is a
 /// fresh invitation that includes the capability.
