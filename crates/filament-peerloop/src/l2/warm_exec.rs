@@ -156,6 +156,8 @@ async fn run_warm_exec(
     log: Arc<dyn crate::host::LogSink>,
     req: control::Req,
 ) {
+    // Keeps the receive loop on its fast tick for as long as this exec runs.
+    let _live = crate::l2::mux::WarmExecLive::enter();
     // H-1: the same per-link cap the acceptor applies. An exec needs TWO local
     // pipes (stdout and stderr), so require room for both; a warm path that
     // cannot fit is not a path, and falling back beats evicting somebody else's
@@ -469,6 +471,14 @@ async fn run_warm_exec(
             }
         }
     }
+    // A refusal the link recorded outranks a local transport verdict: the
+    // per-exec channel is lossy, and the link the peer revoked then dies under
+    // the exec, which must still end as that refusal, not as "link died".
+    if status.is_none() && terminal.as_ref().is_some_and(is_warm_error) {
+        if let Some(v) = mux.link_revoked() {
+            terminal = Some(v);
+        }
+    }
     // A terminal set above means a failure path; a status of None with no
     // terminal means the control channel ended silently. Either way, never
     // invent success.
@@ -655,6 +665,9 @@ async fn await_ack(
                 }
                 Some(_) => {}
                 None => {
+                    if let Some(v) = mux.link_revoked() {
+                        return Ack::Refused(v);
+                    }
                     return match mux.take_close_err(sid).await {
                         Some(reason) => Ack::Refused(json!({
                             "type": "l2-close",
@@ -668,6 +681,9 @@ async fn await_ack(
                 }
             },
             _ = ticker.tick() => {
+                if let Some(v) = mux.link_revoked() {
+                    return Ack::Refused(v);
+                }
                 if t.is_dead() {
                     return Ack::Failed("the warm link died before the peer answered".to_string());
                 }
@@ -685,6 +701,9 @@ async fn await_ack(
 /// recorded a peer close reason, forward that exact `l2-close` so the CLI can
 /// render the same refusal the cold path would.
 async fn stream_ended(mux: &Arc<Mux>, peer: &str, sid: u32) -> Value {
+    if let Some(v) = mux.link_revoked() {
+        return v;
+    }
     match mux.take_close_err(sid).await {
         Some(reason) => json!({ "type": "l2-close", "sid": sid, "err": reason }),
         None => json!({
@@ -698,6 +717,10 @@ async fn stream_ended(mux: &Arc<Mux>, peer: &str, sid: u32) -> Value {
 
 fn warm_error(why: &str) -> Value {
     json!({ "type": "warm-error", "err": why })
+}
+
+fn is_warm_error(v: &Value) -> bool {
+    v["type"].as_str() == Some("warm-error")
 }
 
 #[cfg(test)]

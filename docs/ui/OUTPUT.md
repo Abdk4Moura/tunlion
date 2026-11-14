@@ -256,14 +256,14 @@ test holds to the help text.
 |---|---|---|
 | 0 | | success |
 | 1 | `error` | anything not classified below |
-| 2 | `usage` | bad arguments or flags, or a missing local prerequisite (`mount` with no FUSE), or a local input `send` cannot use: missing, unreadable, not a regular file (a FIFO or device), or unreadable part way through |
+| 2 | `usage` | bad arguments or flags, or a missing local prerequisite (`mount` with no FUSE), or a local input `send` cannot use: missing, unreadable, not a regular file (a FIFO or device), or unreadable part way through; `doctor`: a damaged state file (the preflight still prints its full report, and `state_files.problems` under `--json`) |
 | 3 | `unknown_device` | no such device, or not paired with this one |
 | 4 | `denied` | refused by the peer, a capability or ceiling, or the system |
 | 5 | `still_relayed` | `reach --until-direct`: the link is up but still on a relay |
 | 6 | `unreachable` | the peer is offline, unreachable, or did not answer in time |
 | 7 | `network` | the tunlion server cannot be reached (no internet, DNS) |
 | 8 | `partial` | some files moved and some did not (`send`, `sync`). A `send` that got no delivery confirmation for ANY file is 6, not 8: the receiver is gone or stopped answering |
-| 9 | `no_identity` | this device has no identity yet: `tunlion init`, or `tunlion join <invitation>` |
+| 9 | `no_identity` | this device has no identity yet: `tunlion init`, or `tunlion join <invitation>`; also a fleet send or dial whose own device key cannot be read (the message names the file) |
 | 10 | | `up`: a daemon is already running with different settings; nothing was applied, and the message names the restart (`DAEMON_CONFLICT`) |
 | 11 | | `status`: no daemon is running for this config directory (`STATUS_NOT_RUNNING`) |
 | 12 | `local_resource` | a resource on THIS machine ran out: its disk or quota is full, it has no file descriptors or memory left (a full stdin spool, `add --out` onto a full disk). A receiver's full disk is 4 for the sender, the peer refusing, with `error.reason: "no_space"`, and 12 for `receive` itself |

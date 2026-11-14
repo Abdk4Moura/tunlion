@@ -289,8 +289,19 @@ run_scenario() {
   if [ -f "$got" ] && cmp -s "$got" "$WORK/payload-$name.bin"; then ok "$name/send-lan: file delivered byte exact, server blocked"
   else bad "$name/send-lan: rc=$rc, not delivered: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"; fi
   if [ "$name" = wg ]; then
-    cls=$(asA timeout 30 "$BIN" doctor --json 2>/dev/null | "$PYV" -I -c 'import json,sys; v=json.load(sys.stdin); print([i["class"] for i in v["lan"]["interfaces"] if i["name"]=="wg0"])' 2>&1)
-    if [ "$cls" = "['p2p']" ]; then ok "wg/p2p-class: doctor classes the $TUNNEL tunnel p2p by its flags"; else bad "wg/p2p-class: doctor said $cls"; fi
+    dstart=$(date +%s)
+    asA timeout 30 "$BIN" doctor --json > "$WORK/doctor-wg.out" 2> "$WORK/doctor-wg.err"; drc=$?
+    dsecs=$(( $(date +%s) - dstart ))
+    cls=$("$PYV" -I -c 'import json,sys; v=json.load(sys.stdin); print([i["class"] for i in v["lan"]["interfaces"] if i["name"]=="wg0"])' < "$WORK/doctor-wg.out" 2>&1)
+    if [ "$cls" = "['p2p']" ]; then ok "wg/p2p-class: doctor classes the $TUNNEL tunnel p2p by its flags"; else
+      # A fixed description: the class list is read from the document, and
+      # the document is not printed (it can carry the configured server URL).
+      bad "wg/p2p-class: doctor did not class the $TUNNEL tunnel exactly p2p"
+      # Failure-only evidence: how the doctor run ended and the shape of what
+      # it printed, allowlisted constants only (cli/tests/doctor_shape.py).
+      echo "  doctor: rc=$drc in ${dsecs}s, stdout $(wc -c < "$WORK/doctor-wg.out") bytes, stderr $(wc -l < "$WORK/doctor-wg.err") lines"
+      "$PYV" -I "$HERE/doctor_shape.py" < "$WORK/doctor-wg.out" 2>/dev/null | head -n 6
+    fi
   fi
   if [ "$name" = lan ]; then
     sleep 5

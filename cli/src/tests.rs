@@ -33,6 +33,22 @@ pub(crate) fn lock_test_config() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Both locks that guard writers of `TUNLION_CAP_AUTHORITATIVE`: the config
+/// lock and the capability-gate counter lock. A test whose verdict depends on
+/// that mode holds both, always in this order, so no writer under either lock
+/// can flip the mode under it. Nothing else takes both, so the order cannot
+/// deadlock.
+pub(crate) fn lock_cap_mode() -> (
+    std::sync::MutexGuard<'static, ()>,
+    std::sync::MutexGuard<'static, ()>,
+) {
+    let config = lock_test_config();
+    let gate = crate::capability::tests::CAP_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    (config, gate)
+}
+
 #[test]
 fn send_outcome_refuses_success_for_any_declined_file() {
     assert_eq!(send_outcome(1, 0), SendOutcome::Complete { completed: 1 });
@@ -5685,4 +5701,111 @@ fn a_daemon_running_from_the_update_renamed_old_binary_is_still_this_install() {
         "a .old elsewhere is not this install"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every `verify_hello` call and every `Announce::from_json` parse in the
+/// workspace members' sources is on this list, with its count, and each
+/// production site carries the own-key refusal. The scan roots come from the
+/// root `Cargo.toml` members (`<member>/src`, or the whole directory for a
+/// `dir/*` glob), so a new site in any member fails this test until it is
+/// listed and guarded. Blind spots: a site that verifies an already-parsed
+/// announce (`.verify(&cb)`) without either call (the peerloop source-order
+/// tests pin the one that exists, the replay at `ChannelReady`), and source
+/// outside a member's scanned root. Needles are built with `concat!` so this
+/// test does not count itself.
+#[test]
+fn every_fleet_proof_verify_site_is_listed_and_refuses_the_own_key() {
+    use std::collections::BTreeMap;
+    let hello = concat!("verify", "_hello(");
+    let hello_def = concat!("fn verify", "_hello(");
+    let announce = concat!("Announce::", "from_json(");
+    // (path, needle) -> expected count; `guard` names the text that must follow
+    // the site (None: a test-only or definition-internal occurrence).
+    let listed: &[(&str, &str, usize, Option<&str>)] = &[
+        // Fleet dialer used by exec and l2.
+        ("cli/src/l2.rs", hello, 1, Some("own_device")),
+        // Daemon fleet-hello arm (current, then retired candidates).
+        ("crates/filament-peerloop/src/recv/dispatch.rs", hello, 2, Some("is_own_device(")),
+        // Daemon l3-announce arm (its ChannelReady replay verifies the same
+        // parsed value; covered by the peerloop source-order test).
+        ("crates/filament-peerloop/src/recv/dispatch.rs", announce, 1, Some("is_own_device(")),
+        // One-shot FleetSession hello verdict.
+        ("crates/filament-fleet/src/session.rs", hello, 1, Some("own_device")),
+        // Inside verify_hello itself: the hello's own announce.
+        ("crates/filament-fleet/src/lib.rs", announce, 1, None),
+        // Test-only occurrences.
+        ("crates/filament-peerloop/src/recv/fleet_rv.rs", announce, 1, None),
+        ("crates/filament-overlay/src/lib.rs", announce, 3, None),
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    // Scan roots come from the workspace's own member list, so a member added
+    // outside `crates/` is scanned too. Outside the workspace (a packaged
+    // crate with no root manifest) there is nothing to pin.
+    let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return;
+    };
+    let members: Vec<String> = manifest
+        .lines()
+        .find(|l| l.trim_start().starts_with("members"))
+        .map(|l| {
+            l.split('"')
+                .enumerate()
+                .filter(|(i, _)| i % 2 == 1)
+                .map(|(_, m)| m.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(!members.is_empty(), "workspace members not found in the root Cargo.toml");
+    let mut stack: Vec<std::path::PathBuf> = members
+        .iter()
+        .map(|m| match m.strip_suffix("/*") {
+            Some(dir) => root.join(dir),
+            None => root.join(m).join("src"),
+        })
+        .collect();
+    let mut found: BTreeMap<(String, &str), usize> = BTreeMap::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                stack.push(p);
+            } else if p.extension().is_some_and(|e| e == "rs") {
+                let Ok(src) = std::fs::read_to_string(&p) else { continue };
+                let rel = p
+                    .strip_prefix(&root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let h = src.matches(hello).count() - src.matches(hello_def).count();
+                if h > 0 {
+                    found.insert((rel.clone(), hello), h);
+                }
+                let a = src.matches(announce).count();
+                if a > 0 {
+                    found.insert((rel, announce), a);
+                }
+            }
+        }
+    }
+    let mut want: BTreeMap<(String, &str), usize> = BTreeMap::new();
+    for (path, needle, n, guard) in listed {
+        want.insert((path.to_string(), *needle), *n);
+        if let Some(guard) = guard {
+            let src = std::fs::read_to_string(root.join(path)).expect("listed file readable");
+            let at = src.find(needle).expect("listed site present");
+            let window: String = src[at..].chars().take(4000).collect();
+            assert!(
+                window.contains(guard),
+                "{path}: the {needle} site is not followed by its own-key refusal ({guard})"
+            );
+        }
+    }
+    assert_eq!(
+        found, want,
+        "fleet proof verification sites changed; list each new one here with its own-key refusal"
+    );
 }

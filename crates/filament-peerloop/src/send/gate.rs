@@ -5,6 +5,8 @@
 //! replacement, even when it claims the same install UID or kept a partial
 //! file. A fresh send with a fresh code is the only way to resume.
 
+use filament_transfer::Outgoing;
+
 /// Which event class a code sender is deciding for. All three are tied to the
 /// one signaling peer the PAKE ceremony authenticated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,9 +52,171 @@ pub fn adopt_wants_active(code_claimed: bool, use_code: bool, _pake_done: bool) 
     code_claimed && !use_code
 }
 
+/// Receiver answers that are bound to the code-authorized link.
+pub const CODE_BOUND_ANSWERS: [&str; 5] = [
+    "file-accept",
+    "file-decline",
+    "file-pending",
+    "delivery-ack",
+    "pair-keep-ack",
+];
+
+/// Code path only: may the sender act on answer `kind`? Pure.
+pub fn code_answer_admitted(kind: &str, authority_holds: bool) -> bool {
+    authority_holds || !CODE_BOUND_ANSWERS.contains(&kind)
+}
+
+/// What an answer did to the sender's outgoing table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnswerEffect {
+    /// Not admitted on the code path: nothing changed.
+    Ignored,
+    /// Admitted, but names no outgoing file.
+    NoSuchFile,
+    /// Applied to `outgoing[index]`; `was_settled` is the file's state before
+    /// (`done` for a decline, `acked` for a delivery-ack).
+    Applied { index: usize, was_settled: bool },
+}
+
+/// `file-decline`: admitted on the code path only with authority. Pure.
+pub fn admit_file_decline(
+    use_code: bool,
+    authority_holds: bool,
+    outgoing: &mut [Outgoing],
+    id: &str,
+) -> AnswerEffect {
+    if use_code && !authority_holds {
+        return AnswerEffect::Ignored;
+    }
+    let Some(index) = outgoing.iter().position(|o| o.id == id) else {
+        return AnswerEffect::NoSuchFile;
+    };
+    let o = &mut outgoing[index];
+    let was_settled = o.done;
+    o.declined = true;
+    o.done = true;
+    AnswerEffect::Applied { index, was_settled }
+}
+
+/// `delivery-ack`: admitted on the code path only with authority. Pure.
+pub fn admit_delivery_ack(
+    use_code: bool,
+    authority_holds: bool,
+    outgoing: &mut [Outgoing],
+    id: &str,
+) -> AnswerEffect {
+    if use_code && !authority_holds {
+        return AnswerEffect::Ignored;
+    }
+    let Some(index) = outgoing.iter().position(|o| o.id == id) else {
+        return AnswerEffect::NoSuchFile;
+    };
+    let o = &mut outgoing[index];
+    let was_settled = o.acked;
+    // Only the first ack settles a file; a repeat leaves a file the sender
+    // has since reopened as it is.
+    if !was_settled {
+        o.acked = true;
+        o.done = true;
+    }
+    AnswerEffect::Applied { index, was_settled }
+}
+
+/// What a `pair-keep-ack` does to the sender's remembered record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RememberAck {
+    Ignore,
+    Remove,
+    Keep,
+}
+
+/// `pair-keep-ack`: admitted on the code path only with authority. Pure.
+pub fn remember_ack_effect(use_code: bool, authority_holds: bool, ok: Option<bool>) -> RememberAck {
+    if use_code && !authority_holds {
+        return RememberAck::Ignore;
+    }
+    if ok == Some(false) {
+        RememberAck::Remove
+    } else {
+        RememberAck::Keep
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn one_file() -> Vec<Outgoing> {
+        vec![Outgoing {
+            id: "f1".into(),
+            sid: 1,
+            name: "f1".into(),
+            size: 4,
+            head: None,
+            full: None,
+            path: std::path::PathBuf::from("f1"),
+            temp: false,
+            accepted_once: true,
+            sent: true,
+            acked: false,
+            declined: false,
+            done: false,
+            stream_started: None,
+            stream_bytes: 4,
+        }]
+    }
+
+    #[test]
+    fn a_code_sender_applies_a_decline_only_with_authority() {
+        let mut out = one_file();
+        assert_eq!(admit_file_decline(true, false, &mut out, "f1"), AnswerEffect::Ignored);
+        assert!(!out[0].done && !out[0].declined);
+        for (use_code, holds) in [(true, true), (false, false)] {
+            let mut out = one_file();
+            assert_eq!(
+                admit_file_decline(use_code, holds, &mut out, "f1"),
+                AnswerEffect::Applied { index: 0, was_settled: false }
+            );
+            assert!(out[0].done && out[0].declined);
+            assert_eq!(admit_file_decline(use_code, holds, &mut out, "f2"), AnswerEffect::NoSuchFile);
+        }
+    }
+
+    #[test]
+    fn a_code_sender_applies_a_delivery_ack_only_with_authority() {
+        let mut out = one_file();
+        assert_eq!(admit_delivery_ack(true, false, &mut out, "f1"), AnswerEffect::Ignored);
+        assert!(!out[0].done && !out[0].acked);
+        for (use_code, holds) in [(true, true), (false, false)] {
+            let mut out = one_file();
+            assert_eq!(
+                admit_delivery_ack(use_code, holds, &mut out, "f1"),
+                AnswerEffect::Applied { index: 0, was_settled: false }
+            );
+            assert!(out[0].done && out[0].acked);
+            assert_eq!(
+                admit_delivery_ack(use_code, holds, &mut out, "f1"),
+                AnswerEffect::Applied { index: 0, was_settled: true }
+            );
+            // A file the sender reopened after its ack stays open on a repeat.
+            out[0].done = false;
+            assert_eq!(
+                admit_delivery_ack(use_code, holds, &mut out, "f1"),
+                AnswerEffect::Applied { index: 0, was_settled: true }
+            );
+            assert!(!out[0].done);
+        }
+    }
+
+    #[test]
+    fn a_code_sender_removes_a_remembered_record_only_with_authority() {
+        assert_eq!(remember_ack_effect(true, false, Some(false)), RememberAck::Ignore);
+        assert_eq!(remember_ack_effect(true, false, Some(true)), RememberAck::Ignore);
+        assert_eq!(remember_ack_effect(true, true, Some(false)), RememberAck::Remove);
+        assert_eq!(remember_ack_effect(true, true, Some(true)), RememberAck::Keep);
+        assert_eq!(remember_ack_effect(false, false, Some(false)), RememberAck::Remove);
+        assert_eq!(remember_ack_effect(false, false, None), RememberAck::Keep);
+    }
 
     /// Adversarial: the authentic receiver ran the PAKE ceremony and then
     /// died mid-transfer. A different room peer (even one sharing the install
@@ -84,6 +248,64 @@ mod tests {
         // path let the event through: a code send never gives the slot to a
         // room peer, before or after the ceremony.
         assert!(!adopt_wants_active(true, true, true));
+    }
+
+    /// The event gate pins the ceremony's sid; the sender's offer, accept and
+    /// pair-keep also require the link the ceremony confirmed
+    /// (`Conn::holds_code_authority`, rule `code_authority_check`). A rebuilt
+    /// link under the SAME sid passes the event gate and is still refused.
+    #[test]
+    fn a_code_sender_offers_only_on_the_confirmed_link_or_its_own_promotion() {
+        use crate::{code_authority_check, CodeAuthorityRefusal, CodeSession, CodeTransport};
+        use filament_transport::net::AttemptId;
+
+        let ours = AttemptId::next();
+        let session = CodeSession::new("sid-receiver", ("fp-sender", "fp-receiver"), "k", Some(ours));
+        let s = Some(&session);
+        assert!(code_peer_event_allowed(
+            true,
+            true,
+            Some("sid-receiver"),
+            "sid-receiver",
+            CodePeerEvent::Channel
+        ));
+        // Positive controls: the confirmed WebRTC link and the ceremony's own
+        // direct promotion.
+        assert_eq!(
+            code_authority_check(s, "sid-receiver", CodeTransport::WebRtc(Some(("fp-sender", "fp-receiver")))),
+            Ok(())
+        );
+        assert_eq!(
+            code_authority_check(
+                s,
+                "sid-receiver",
+                CodeTransport::Direct { attempt: Some(ours), secret: Some("k") }
+            ),
+            Ok(())
+        );
+        // Same sid, rebuilt PeerConnection: refused.
+        assert_eq!(
+            code_authority_check(s, "sid-receiver", CodeTransport::WebRtc(Some(("fp-sender", "fp-other")))),
+            Err(CodeAuthorityRefusal::FingerprintMismatch)
+        );
+        // Same sid, a direct link another attempt published: refused.
+        assert_eq!(
+            code_authority_check(
+                s,
+                "sid-receiver",
+                CodeTransport::Direct { attempt: Some(AttemptId::next()), secret: Some("k") }
+            ),
+            Err(CodeAuthorityRefusal::ForeignDirect)
+        );
+    }
+
+    #[test]
+    fn a_code_senders_answers_count_only_from_the_confirmed_link() {
+        for kind in ["file-accept", "file-decline", "file-pending", "delivery-ack", "pair-keep-ack"] {
+            assert!(code_answer_admitted(kind, true), "{kind}");
+            assert!(!code_answer_admitted(kind, false), "{kind}");
+        }
+        assert!(code_answer_admitted("path-promote", false));
     }
 
     #[test]

@@ -63,6 +63,10 @@ pub struct RecvEnv {
     pub fleet_offer_grace: Duration,
     /// `TUNLION_TRACE_THROUGHPUT` snapshot.
     pub trace_throughput: bool,
+    /// `TUNLION_FLEET_HELLO_TRACE`: a file the receive loop appends each
+    /// fleet-hello binding record and verdict to. Diagnostic only; None writes
+    /// nothing beyond the debug log.
+    pub fleet_hello_trace: Option<std::path::PathBuf>,
     /// The daemon was started by a supervisor (INVOCATION_ID).
     pub supervised: bool,
     /// Loop-stall threshold for the watchdog.
@@ -102,6 +106,7 @@ impl Default for RecvEnv {
             pair_grace: Duration::from_secs(60),
             fleet_offer_grace: Duration::from_secs(8),
             trace_throughput: false,
+            fleet_hello_trace: None,
             supervised: false,
             loop_stall_secs: 20,
             remember_stored: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -244,6 +249,11 @@ pub trait RecvStore: Send + Sync {
     ) -> anyhow::Result<String>;
     fn device_was_introduced(&self, name: &str) -> bool;
     fn devices_sweep_lapsed(&self, now: u64) -> usize;
+    /// A delisted-sibling store problem a person must hear about (see
+    /// `DeviceStore::delisted_siblings_problem`). The default is for mocks.
+    fn delisted_siblings_problem(&self) -> Option<String> {
+        None
+    }
     #[allow(clippy::too_many_arguments)]
     fn devices_upsert_atomic(
         &self,

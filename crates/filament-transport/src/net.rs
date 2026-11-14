@@ -394,9 +394,13 @@ pub enum Ev {
     /// source) so a stale ready from a replaced primary cannot authorize old
     /// worker sources on the new link.
     DirectWorkersReady(String, Vec<Arc<dyn Transport>>, SourceId),
+    /// Loop-owned token to drain one buffered event after source adoption.
+    ReplaySource(SourceId),
+    /// Loop-owned, source-bound room departure deferred behind replay.
+    ReplayDeparture(String, SourceId, Value),
     Control(String, Value),
     /// A transport-origin event with immutable provenance. `pid` must match the
-    /// inner Control/PcState/ChannelReady pid; nested Sourced is invalid. The
+    /// inner Control/PcState/ChannelReady/Chunk pid; nested Sourced is invalid. The
     /// handler gate checks `source` against the current link immediately before
     /// dispatch.
     Sourced {
@@ -1768,6 +1772,22 @@ pub struct Peer {
     turn_bridges: Option<Arc<crate::turn_bridge::TurnBridges>>,
 }
 
+/// The remote DTLS fingerprint a live connection may record next. A
+/// connection's DTLS certificate is fixed for its life (an ICE restart keeps
+/// it, a rebuild is a new connection), so once one is recorded, a description
+/// that names a different one, or none, is refused.
+fn next_remote_fingerprint(recorded: Option<&str>, offered: Option<String>) -> Result<Option<String>> {
+    match (recorded, offered.as_deref()) {
+        (Some(old), Some(new)) if old != new => Err(anyhow!(
+            "remote DTLS fingerprint changed on a live connection; description refused"
+        )),
+        (Some(_), None) => Err(anyhow!(
+            "remote description names no DTLS fingerprint on a live connection; description refused"
+        )),
+        _ => Ok(offered),
+    }
+}
+
 /// Extract `a=fingerprint:...` from an SDP (normalized uppercase hex).
 fn sdp_fingerprint(sdp: &str) -> Option<String> {
     sdp.lines()
@@ -1802,9 +1822,10 @@ impl Peer {
         ice_servers: Vec<RTCIceServer>,
         relay_only: bool,
         sio: Client,
-        tx: mpsc::UnboundedSender<Ev>,
+        tx: impl Into<EvSink>,
         generation: u32,
     ) -> Result<Arc<Peer>> {
+        let tx: EvSink = tx.into();
         let source = SourceId::next();
         crate::hooks::debug(&format!(
             "tunlion: ICE-CONFIG peer={peer_id} servers={} urls={:?}",
@@ -2098,8 +2119,13 @@ impl Peer {
                     // Stale answer (e.g. to an offer this side abandoned).
                     return Ok(SignalOutcome::Handled);
                 }
-                self.fps.lock().await.1 = sdp_fingerprint(&desc.sdp);
+                let remote_fp = {
+                    let fps = self.fps.lock().await;
+                    next_remote_fingerprint(fps.1.as_deref(), sdp_fingerprint(&desc.sdp))?
+                };
                 self.pc.set_remote_description(desc).await?;
+                // Recorded only once the description is in force.
+                self.fps.lock().await.1 = remote_fp;
                 let pending = {
                     let mut st = self.state.lock().await;
                     st.has_remote = true;
@@ -2499,10 +2525,56 @@ fn resolve_iface_name(addr: &str) -> String {
     crate::hooks::resolve_iface_name(addr)
 }
 
+/// Where a WebRTC peer's events go. A plain sink is the bare channel. A waking
+/// sink also wakes the consumer's loop once per batch: it queues one
+/// `Ev::BuildWake` on `wake` when `pending` was clear, and the consumer clears
+/// `pending` before it drains. The event itself goes straight onto `tx`, with
+/// no intermediate queue or task, so whatever drains `tx` on departure or
+/// replacement sees every event that was sent.
+///
+/// The peerloop needs the waking form: an installed link's events land on a
+/// candidate-local channel that only `pump_builds` drains, once per loop turn,
+/// and without a wake they waited for an unrelated event (the 1200 ms
+/// DIRECT-OFFER re-emit, in practice).
+#[derive(Clone)]
+pub struct EvSink {
+    tx: mpsc::UnboundedSender<Ev>,
+    wake: Option<(mpsc::UnboundedSender<Ev>, Arc<std::sync::atomic::AtomicBool>)>,
+}
+
+impl EvSink {
+    pub fn waking(
+        tx: mpsc::UnboundedSender<Ev>,
+        wake: mpsc::UnboundedSender<Ev>,
+        pending: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        EvSink { tx, wake: Some((wake, pending)) }
+    }
+
+    /// Queue `ev`, then wake the consumer unless a wake is already pending. A
+    /// closed receiver (the link was dropped or replaced) gets nothing and
+    /// wakes nothing.
+    pub fn send(&self, ev: Ev) -> Result<(), mpsc::error::SendError<Ev>> {
+        self.tx.send(ev)?;
+        if let Some((wake, pending)) = &self.wake {
+            if !pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = wake.send(Ev::BuildWake);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl From<mpsc::UnboundedSender<Ev>> for EvSink {
+    fn from(tx: mpsc::UnboundedSender<Ev>) -> Self {
+        EvSink { tx, wake: None }
+    }
+}
+
 async fn wire_channel(
     peer_id: String,
     dc: Arc<RTCDataChannel>,
-    tx: mpsc::UnboundedSender<Ev>,
+    tx: EvSink,
     closed: Arc<std::sync::atomic::AtomicBool>,
     polite: bool,
     source: SourceId,
@@ -2615,12 +2687,14 @@ async fn wire_channel(
                                         buf[4], buf[5], buf[6], buf[7],
                                         buf[8], buf[9], buf[10], buf[11],
                                     ]);
-                                    let _ = tx.send(Ev::Chunk(
-                                        peer_id.clone(),
-                                        sid,
-                                        Some(offset),
-                                        Bytes::copy_from_slice(&buf[12..n]),
-                                    ));
+                                    let _ = tx.send(Ev::Sourced {
+                                        pid: peer_id.clone(),
+                                        source,
+                                        inner: Box::new(Ev::Chunk(
+                                            peer_id.clone(), sid, Some(offset),
+                                            Bytes::copy_from_slice(&buf[12..n]),
+                                        )),
+                                    });
                                 }
                             }
                         }
@@ -2728,7 +2802,7 @@ async fn wire_channel(
 /// stream until the reader takes them. `ready` is None when the link was
 /// closed while opening; the reader still runs so the channel is drained and
 /// marked dead, and it forwards nothing for a closed link.
-fn announce_then_read<F>(tx: &mpsc::UnboundedSender<Ev>, ready: Option<Ev>, reader: F)
+fn announce_then_read<F>(tx: &EvSink, ready: Option<Ev>, reader: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -2741,6 +2815,62 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A waking sink puts the event straight on the channel (no task, so it
+    /// is there when `send` returns), wakes once until the consumer clears
+    /// `pending`, and on a closed channel neither queues nor wakes.
+    #[test]
+    fn a_waking_sink_queues_directly_and_wakes_once_per_clear() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+        let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<Ev>();
+        let pending = Arc::new(AtomicBool::new(false));
+        let sink = EvSink::waking(tx, wake_tx, pending.clone());
+        for i in 0..3 {
+            sink.send(Ev::Control("p".into(), json!({ "i": i }))).unwrap();
+        }
+        for i in 0..3 {
+            match rx.try_recv() {
+                Ok(Ev::Control(_, v)) => assert_eq!(v["i"], i),
+                _ => panic!("event {i} was not queued synchronously"),
+            }
+        }
+        assert!(matches!(wake_rx.try_recv(), Ok(Ev::BuildWake)));
+        assert!(wake_rx.try_recv().is_err(), "more than one wake before a clear");
+
+        pending.store(false, Ordering::SeqCst);
+        sink.send(Ev::Control("p".into(), json!({}))).unwrap();
+        assert!(matches!(wake_rx.try_recv(), Ok(Ev::BuildWake)), "the clear must re-arm");
+
+        pending.store(false, Ordering::SeqCst);
+        drop(rx);
+        assert!(sink.send(Ev::Control("p".into(), json!({}))).is_err());
+        assert!(wake_rx.try_recv().is_err(), "a closed channel woke the consumer");
+    }
+
+    /// A plain sink is the bare channel: no wake channel, nothing else sent.
+    #[test]
+    fn a_plain_sink_only_queues() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+        let sink: EvSink = tx.into();
+        sink.send(Ev::BuildWake).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Ev::BuildWake)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_live_connection_keeps_its_remote_dtls_fingerprint() {
+        // First description records it.
+        assert_eq!(next_remote_fingerprint(None, Some("AA".into())).unwrap().as_deref(), Some("AA"));
+        // A renegotiation naming the same certificate is accepted.
+        assert_eq!(next_remote_fingerprint(Some("AA"), Some("AA".into())).unwrap().as_deref(), Some("AA"));
+        // Once recorded, a description without one is refused.
+        assert!(next_remote_fingerprint(Some("AA"), None).is_err());
+        // Before anything is recorded, a missing one records nothing.
+        assert_eq!(next_remote_fingerprint(None, None).unwrap(), None);
+        // A different certificate on the same connection is refused.
+        assert!(next_remote_fingerprint(Some("AA"), Some("BB".into())).is_err());
+    }
 
     struct StubTransport;
 
@@ -3023,7 +3153,7 @@ mod tests {
             };
             let transport: Arc<dyn Transport> = Arc::new(StubTransport);
             announce_then_read(
-                &tx,
+                &tx.clone().into(),
                 Some(Ev::ChannelReady("peer".into(), transport)),
                 reader,
             );
@@ -3238,7 +3368,7 @@ mod tests {
     async fn a_closed_channel_announces_nothing_but_still_reads() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
         let (ran_tx, ran_rx) = tokio::sync::oneshot::channel::<()>();
-        announce_then_read(&tx, None, async move {
+        announce_then_read(&tx.clone().into(), None, async move {
             let _ = ran_tx.send(());
         });
         tokio::time::timeout(Duration::from_secs(5), ran_rx)

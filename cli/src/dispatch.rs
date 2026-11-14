@@ -617,33 +617,23 @@ pub(crate) async fn async_main() -> Result<()> {
     }
     // A corrupt state file is an error naming it, never an empty store
     // (state_files.rs). The verbs that stop, repair or only print are exempt.
-    let exempt = matches!(
-        cmd,
-        Cmd::Reset
-            | Cmd::Down
-            | Cmd::Logs { .. }
-            | Cmd::Config { .. }
-            | Cmd::Completions { .. }
-            | Cmd::Man { .. }
-            | Cmd::Update { .. }
-            | Cmd::Skill { .. }
-            | Cmd::Demo { .. }
-            | Cmd::WinPtyRelay { .. }
-    );
+    let exempt = state_check_exempt(&cmd);
+    // A verb with its own --json flag must still answer in JSON, whether or
+    // not it is exempt from the state-file check below (the doctor preflight
+    // is exempt and still has to fail in JSON).
+    let own_json = match &cmd {
+        Cmd::Devices { json, .. } => Some((*json, "devices")),
+        Cmd::Status { json } => Some((*json, "status")),
+        Cmd::Reach { json, .. } => Some((*json, "reach")),
+        Cmd::Doctor { json, .. } => Some((*json, "doctor")),
+        Cmd::Promote { json, .. } => Some((*json, "promote")),
+        Cmd::Demote { json, .. } => Some((*json, "demote")),
+        _ => None,
+    };
+    if let Some((true, verb)) = own_json {
+        crate::exit_codes::set_json_mode(true, Some(verb));
+    }
     if !exempt {
-        // A verb with its own --json flag must still answer in JSON.
-        let own_json = match &cmd {
-            Cmd::Devices { json, .. } => Some((*json, "devices")),
-            Cmd::Status { json } => Some((*json, "status")),
-            Cmd::Reach { json, .. } => Some((*json, "reach")),
-            Cmd::Doctor { json, .. } => Some((*json, "doctor")),
-            Cmd::Promote { json, .. } => Some((*json, "promote")),
-            Cmd::Demote { json, .. } => Some((*json, "demote")),
-            _ => None,
-        };
-        if let Some((true, verb)) = own_json {
-            crate::exit_codes::set_json_mode(true, Some(verb));
-        }
         crate::state_files::check_all()?;
     }
     // Device names: a name given to a device takes the label rule, and a name
@@ -2883,6 +2873,64 @@ pub(crate) async fn devices_json_rows(all: &[(String, String)]) -> Vec<Value> {
         })
         .collect();
     arr
+}
+
+
+/// Is this command exempt from the corrupt-state refusal (state_files.rs)?
+/// The verbs that stop, repair or only print are; so is the doctor
+/// PREFLIGHT, which reports damaged files instead. A device probe is not.
+fn state_check_exempt(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Reset
+            | Cmd::Down
+            | Cmd::Logs { .. }
+            | Cmd::Config { .. }
+            | Cmd::Completions { .. }
+            | Cmd::Man { .. }
+            | Cmd::Update { .. }
+            | Cmd::Skill { .. }
+            | Cmd::Demo { .. }
+            | Cmd::WinPtyRelay { .. }
+            // The environment preflight is how a person finds a damaged state
+            // file: it reports them (doctor.rs `state_problems`) instead of
+            // refusing on the file it exists to diagnose. A device probe still
+            // needs a sound store, so it is not exempt.
+            | Cmd::Doctor { device: None, .. }
+    )
+}
+
+#[cfg(test)]
+mod state_check_tests {
+    use super::*;
+
+    fn doctor(device: Option<&str>) -> Cmd {
+        Cmd::Doctor {
+            device: device.map(str::to_string),
+            watch: false,
+            repeat: None,
+            timeout: None,
+            json: false,
+        }
+    }
+
+    /// Only the preflight skips the refusal; a device probe on a damaged store
+    /// is still refused (by `check_all`, which fails on the damaged file).
+    #[test]
+    fn the_doctor_preflight_is_exempt_and_a_device_probe_is_not() {
+        assert!(state_check_exempt(&doctor(None)));
+        assert!(!state_check_exempt(&doctor(Some("laptop"))), "a device probe must still be refused");
+        assert!(state_check_exempt(&Cmd::Reset), "control: an exempt repair verb");
+        let name = filament_peerloop::recv::store::DELISTED_SIBLINGS_FILE;
+        let d = std::env::temp_dir().join(format!("tunlion-probe-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), "{garbage").unwrap();
+        let e = crate::state_files::check_file(&d.join(name), crate::state_files::Shape::JsonArray)
+            .unwrap_err();
+        assert_eq!(crate::exit_codes::classify(&e).code(), 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 #[cfg(test)]

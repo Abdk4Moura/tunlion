@@ -711,13 +711,14 @@ async fn verify_fleet_identity(
     tx: &mpsc::UnboundedSender<Ev>,
     link: &str,
     expected: &str,
+    own_device: Option<[u8; 32]>,
 ) -> Result<()> {
     // Everything that is not this link's control traffic (presence, other
     // candidates' offers, timers) still belongs to the dial loop, which keeps
     // going if this candidate is not the one. Swallowing it here lost the
     // target's own transport-offer while the wrong sibling was being checked.
     let mut deferred = Vec::new();
-    let r = verify_fleet_identity_inner(t, rx, &mut deferred, link, expected).await;
+    let r = verify_fleet_identity_inner(t, rx, &mut deferred, link, expected, own_device).await;
     for ev in deferred {
         let _ = tx.send(ev);
     }
@@ -773,13 +774,29 @@ fn control_for_link<'a>(
 /// transport the mux selected. Anything else is a callback from a candidate
 /// that lost the race (or an earlier attempt on the same signaling id) and must
 /// not reach the mux after selection: an old `l2-close` would end the wrong
-/// stream. Untagged events keep the pre-attribution behaviour.
+/// stream. Chunks must always be attributed; the envelope and inner pid must
+/// agree before any data can be routed by stream id.
+///
+/// Only the inner events this gate can attribute are unwrapped: `Control`,
+/// `PcState`, `ChannelReady`, `Chunk` and `PeerLeft`. The last is the
+/// source-tagged departure barrier the daemon queues behind a link's
+/// already-read events; it carries no inner pid, so it is admitted on the
+/// source match alone. Any other inner event is dropped rather than
+/// unwrapped, because it cannot be shown to belong to this link.
 fn selected_event(ev: Ev, source: Option<net::SourceId>) -> Option<Ev> {
     match ev {
-        Ev::Sourced { source: event_source, inner, .. } if Some(event_source) == source => {
-            Some(*inner)
+        Ev::Sourced { pid, source: event_source, inner } if Some(event_source) == source => {
+            let valid = match inner.as_ref() {
+                Ev::Control(inner_pid, _) | Ev::PcState(inner_pid, _)
+                | Ev::ChannelReady(inner_pid, _) | Ev::Chunk(inner_pid, ..) => *inner_pid == pid,
+                // The departure barrier has no inner pid to compare.
+                Ev::PeerLeft(_) => true,
+                _ => false,
+            };
+            valid.then_some(*inner)
         }
         Ev::Sourced { .. } => None,
+        Ev::Chunk(..) => None,
         other => Some(other),
     }
 }
@@ -805,7 +822,15 @@ async fn verify_fleet_identity_inner(
     deferred: &mut Vec<Ev>,
     link: &str,
     expected: &str,
+    own_device: Option<[u8; 32]>,
 ) -> Result<()> {
+    // Fail closed: without our own key the own-key refusal below cannot run.
+    let own_device = own_device.ok_or_else(|| {
+        crate::exit_codes::err(
+            crate::exit_codes::ExitKind::NoIdentity,
+            format!("cannot verify '{expected}': this device's own key is unavailable"),
+        )
+    })?;
     let cb = t.channel_binding().ok_or_else(|| {
         anyhow!("cannot verify '{expected}': this link exposes no channel binding")
     })?;
@@ -847,6 +872,12 @@ async fn verify_fleet_identity_inner(
             continue;
         }
         let proven = crate::fleet::verify_hello(v, &cb, &owner, crate::identity::now_secs())?;
+        // Never accept a hello carrying this device's own key (own-device-key).
+        if proven.device_pub == own_device {
+            return Err(anyhow::Error::new(WrongFleetDevice(format!(
+                "refusing: the device answering as '{expected}' presented this device's own key (own-device-key). No command payload was sent."
+            ))));
+        }
         let name = crate::device_name_for_pub(&proven.device_pub);
         if name.as_deref().map(|n| n.eq_ignore_ascii_case(expected)) != Some(true) {
             return Err(anyhow::Error::new(WrongFleetDevice(format!(
@@ -968,6 +999,22 @@ pub(crate) async fn bring_up_to_known(
                 },
             }
         }
+    };
+    // This device's own key, read ONCE for a fleet dial. A hello carrying it is
+    // refused, and an unreadable key fails the dial instead of leaving that
+    // refusal inert for it.
+    let own_device: Option<[u8; 32]> = if fleet_mode {
+        Some(crate::overlay::overlay_pubkey_bytes().map_err(|e| {
+            crate::exit_codes::err(
+                crate::exit_codes::ExitKind::NoIdentity,
+                format!(
+                    "refusing the fleet dial to '{peer_name}': this device's own key at {} could not be read ({e}). Check that file's permissions, or run `tunlion init` if this device has no identity. No command payload was sent.",
+                    crate::overlay::key_path().display()
+                ),
+            )
+        })?)
+    } else {
+        None
     };
     let channel = crate::channel_of(&secret);
 
@@ -1543,7 +1590,7 @@ pub(crate) async fn bring_up_to_known(
                 // binding, because there is nothing to bind the proof to. A
                 // failed proof rejects THIS candidate, not the connect.
                 if fleet_mode {
-                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name).await {
+                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name, own_device).await {
                         crate::ui::debug(&format!("fleet: {e:#}; trying the next fleet device"));
                         t.force_close();
                         let mut uid = None;
@@ -1646,7 +1693,7 @@ pub(crate) async fn bring_up_to_known(
                 // Same certificate proof as the direct arm above; the binding
                 // exists here (checked at the top of this arm).
                 if fleet_mode {
-                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name).await {
+                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name, own_device).await {
                         crate::ui::debug(&format!("fleet: {e:#}; trying the next fleet device"));
                         t.force_close();
                         let mut uid = None;
@@ -6256,6 +6303,25 @@ mod h1_tests {
             selected_event(tagged(selected), Some(selected)),
             Some(Ev::Control(..))
         ));
+        let chunk = |source, inner: &str| Ev::Sourced {
+            pid: pid.into(), source,
+            inner: Box::new(Ev::Chunk(inner.into(), 42, Some(0), bytes::Bytes::from_static(b"data"))),
+        };
+        assert!(matches!(selected_event(chunk(selected, pid), Some(selected)), Some(Ev::Chunk(..))));
+        assert!(selected_event(chunk(stale, pid), Some(selected)).is_none());
+        assert!(selected_event(chunk(selected, "other"), Some(selected)).is_none());
+        assert!(selected_event(Ev::Chunk(pid.into(), 42, Some(0), bytes::Bytes::new()), Some(selected)).is_none());
+        // The source-tagged departure barrier is admitted on the source match.
+        let departure = Ev::Sourced {
+            pid: pid.into(), source: selected,
+            inner: Box::new(Ev::PeerLeft(json!({ "id": pid }))),
+        };
+        assert!(matches!(selected_event(departure, Some(selected)), Some(Ev::PeerLeft(..))));
+        let stale_departure = Ev::Sourced {
+            pid: pid.into(), source: stale,
+            inner: Box::new(Ev::PeerLeft(json!({ "id": pid }))),
+        };
+        assert!(selected_event(stale_departure, Some(selected)).is_none());
         assert!(
             selected_event(tagged(stale), Some(selected)).is_none(),
             "a stale transport's control reached the selected link's pump"

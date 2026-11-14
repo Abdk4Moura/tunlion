@@ -169,13 +169,14 @@ jobs:
             # (`tunlion status` run through exec sees the serving daemon).
             [cli/tests/exec-gates.sh]=29
             [cli/tests/sync-gates.sh]=18
-            # 23 gate slots (FORGET-REFUSED, from #385, is the 23rd). This was 24 while gateRECON existed, but RECON read
+            # 26 gate slots: 23 (FORGET-REFUSED, from #385, is the 23rd) plus one
+            # `exercised` verdict per impostor variant (I1-I3). This was 24 while gateRECON existed, but RECON read
             # AUTH-A's own exec result and printed a second PASS for it, so one
             # observation counted twice; it was removed and its honest-vs-silent
             # classification moved into AUTH-A's failure message. A gate that is
             # KNOWN-RED keeps its slot: the count below includes KNOWN-RED lines,
             # so a tracked failure can never make the total look short.
-            [cli/tests/fleet-cert-gates.sh]=23
+            [cli/tests/fleet-cert-gates.sh]=26
             [cli/tests/pty-revoke-gates.sh]=3
             # R1/R2 (a shell outlives its link, output intact), X1/X2 (a session
             # name never crosses devices), V1/V2 (revoke ends a DETACHED shell).
@@ -253,12 +254,22 @@ jobs:
             echo "::endgroup::"
             got=$(printf '%s\n' "$out" | grep -cE '^(PASS|KNOWN-RED):' || true)
             want=${EXPECT[$g]}
+            # NOT-EXERCISED: a scenario that never reached the code under test.
+            # A hard error of its own, reported apart from pass/fail counts.
+            nex=$(printf '%s\n' "$out" | grep -c '^NOT-EXERCISED:' || true)
+            if [ "$nex" -gt 0 ]; then
+              echo "::error::$g: $nex verdict(s) NOT EXERCISED: the scenario never reached the code under test, so the verdicts it qualifies are vacuous"; rc=1
+            fi
             if [ "$code" -eq 124 ]; then
               echo "::error::$g HUNG: killed by the 300s per-gate timeout, so the output above is partial and every gate after it in this suite still ran"; rc=1
-            elif [ "$code" -ne 0 ]; then
+            elif [ "$code" -ne 0 ] && { [ "$nex" -eq 0 ] || grep -q '^FAIL:' <<<"$out"; }; then
+              # A script exits nonzero for NOT-EXERCISED alone too; that case
+              # was reported above, so only a real failure is named here.
               echo "::error::$g exited $code"; rc=1
-            elif [ "$got" -ne "$want" ]; then
+            elif [ "$((got + nex))" -ne "$want" ]; then
               echo "::error::$g passed $got gates but $want were expected; a gate did not run"; rc=1
+            elif [ "$nex" -gt 0 ]; then
+              echo "$g: $got/$want gates passed, $nex NOT EXERCISED (reported above)"
             else
               echo "$g: $got/$want gates passed"
             fi
