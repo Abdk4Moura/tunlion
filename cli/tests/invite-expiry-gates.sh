@@ -156,8 +156,16 @@ say "PC: before the end, forward --stdio streams"
 # "candidate unresponsive, rotating") to stderr, and each stream line is
 # stamped with milliseconds since launch so a miss shows where the 6s went.
 # The budget and the assertion on PC.out are unchanged.
-pc_t0=$(date +%s%3N)
-pc_stamp() { while IFS= read -r l; do printf '+%sms %s\n' "$(( $(date +%s%3N) - pc_t0 ))" "$l"; done; }
+# The clock is read without forking (bash's EPOCHREALTIME, microseconds once its
+# separator is stripped), so stamping does not load the process it times. A
+# shell without it falls back to `date`.
+if [ -n "${EPOCHREALTIME:-}" ]; then
+  pc_us() { pc_now=${EPOCHREALTIME//[!0-9]/}; }
+else
+  pc_us() { pc_now=$(( $(date +%s%3N) * 1000 )); }
+fi
+pc_us; pc_t0=$pc_now
+pc_stamp() { while IFS= read -r l; do pc_us; printf '+%sms %s\n' "$(( (pc_now - pc_t0) / 1000 ))" "$l"; done; }
 timeout 6 "${G_ENV[@]}" "$BIN" --server "$SERVER" -v forward "alpha:$COUNTER_PORT" --stdio \
   </dev/null > >(tee "$WORK/PC.out" | pc_stamp >"$WORK/PC.out.t") 2> >(pc_stamp >"$WORK/PC.err")
 pc_rc=$?
@@ -165,7 +173,8 @@ sleep 0.3
 if grep -q "TICK-" "$WORK/PC.out"; then
   ok "gatePC: forward --stdio streamed from the owner before the end"
 else
-  echo "## PC: rc=$pc_rc after $(( $(date +%s%3N) - pc_t0 ))ms (budget 6000ms); stderr and stdout, stamped from launch:"
+  pc_us
+  echo "## PC: rc=$pc_rc after $(( (pc_now - pc_t0) / 1000 ))ms (budget 6000ms); stderr and stdout, stamped from launch:"
   cat "$WORK/PC.err"
   head -5 "$WORK/PC.out.t"
   bad "gatePC: the positive forward --stdio did not stream"
