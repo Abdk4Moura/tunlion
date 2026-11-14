@@ -445,7 +445,7 @@ unset TUNLION_FLEET_HELLO_TRACE
 # the restarted daemon was still connecting (~1 run in 7). Bounded at 60 s, then
 # a settle so the owner has had time to (wrongly) re-admit it before we look.
 #
-# The restarted device must also re-verify PROMPTLY and on its first signaling
+# The restarted device's hello must also be EVALUATED promptly and on its first signaling
 # session: within FG_HELLO_BOUND seconds of its start, with no signaling
 # reconnect logged before it. Before the bounded challenge retry a single lost
 # challenge stalled a link until a reconnect gave it a new peer id, which landed
@@ -463,7 +463,7 @@ for _ in $(seq 1 60); do
   fi
   sleep 1
 done
-echo "## FORGET restarted device re-verified after ${FG_HELLO_S}s (bound ${FG_HELLO_BOUND}s), signaling reconnects before it: $FG_RECONNECTS"
+echo "## FORGET restarted device evaluated (hello judged, refusal expected) after ${FG_HELLO_S}s (bound ${FG_HELLO_BOUND}s), signaling reconnects before it: $FG_RECONNECTS"
 [ "$FG_HELLO" = "1" ] || window_expired "FORGET-REVOKES restarted-device hello" 60 "no fleet-hello, identity or mesh line in up-$FORGOTTEN-again.log"
 sleep 5
 FG_REINDEXED=$(python3 -c "import json;print(1 if any(d.get('deviceCert',{}).get('devicePub')=='$FG_PUB' or d.get('name')=='$FORGOTTEN' for d in json.load(open('$DA/devices.json'))) else 0)" 2>/dev/null)
@@ -474,7 +474,7 @@ if [ "$rcFG" = "0" ] && [ -n "$FG_PUB" ] \
    && grep -qE "key refused for [0-9]+ days?" "$WORK/forget.log" \
    && [ "$FG_LISTED" = "1" ] && [ "$FG_REINDEXED" = "0" ] && [ "$FG_HELLO" = "1" ] \
    && [ "$FG_HELLO_S" -ge 0 ] && [ "$FG_HELLO_S" -le "$FG_HELLO_BOUND" ] && [ "$FG_RECONNECTS" = "0" ]; then
-  ok "gateFORGET-REVOKES: forget revoked the live key, freed the name, and fleet-hello did not re-admit it (re-verified in ${FG_HELLO_S}s, no reconnect)"
+  ok "gateFORGET-REVOKES: forget revoked the live key, freed the name, and fleet-hello did not re-admit it (hello evaluated in ${FG_HELLO_S}s, no reconnect)"
 else
   echo "-- forget.log (rc=$rcFG) --"; cat "$WORK/forget.log"
   echo "-- forgotten device log --"; tail -5 "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null
