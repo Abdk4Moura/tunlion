@@ -111,9 +111,11 @@ fn gate_inputs(
     // device's own record grant to a pair counts as an explicit grant. A pair
     // here is a record holding a pair secret (the link is assumed
     // authenticated, see ASSUMPTION) with no delegated ceiling; the record
-    // grants only "self".
+    // grants only "self". A record revoked on disk is never a pair, exactly as
+    // `PairFacts::read` refuses it.
     let paired = ak_caps.is_none()
         && resource == "self"
+        && !crate::device_view::device_record_revoked(name)
         && crate::devices_store::devices_load()
             .iter()
             .any(|(n, secret)| n == name && !secret.is_empty());
