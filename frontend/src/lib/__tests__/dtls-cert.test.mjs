@@ -27,13 +27,20 @@ function sources(dir) {
 }
 
 const files = sources(SRC)
-assert.ok(
-  files.some((f) => readFileSync(f, 'utf8').includes('new RTCPeerConnection(')),
-  'the scan did not reach the RTCPeerConnection construction, so it proves nothing',
-)
+// Every RTCPeerConnection is built in one place, from an inline options
+// literal, so what that literal holds is what every connection gets. An
+// options variable, a second construction site or a `certificates` key in any
+// spelling (shorthand included) fails here.
+const sites = []
 for (const f of files) {
   const text = readFileSync(f, 'utf8')
+  for (const m of text.matchAll(/new\s+RTCPeerConnection\s*\(\s*(\S)/g)) {
+    sites.push({ f, inline: m[1] === '{' })
+  }
   assert.ok(!/generateCertificate\s*\(/.test(text), `${f} generates a DTLS certificate`)
-  assert.ok(!/\bcertificates\s*:/.test(text), `${f} passes a persistent DTLS certificate`)
+  assert.ok(!/\bcertificates\b/.test(text), `${f} names DTLS certificates`)
 }
+assert.equal(sites.length, 1, `RTCPeerConnection construction sites: ${JSON.stringify(sites)}`)
+assert.ok(sites[0].f.endsWith(join('lib', 'webrtc.js')), `constructed outside lib/webrtc.js: ${sites[0].f}`)
+assert.ok(sites[0].inline, 'the RTCPeerConnection options must be an inline literal')
 console.log('dtls-cert.test: ok')

@@ -2755,6 +2755,56 @@ fn peer_connection_config(ice_servers: Vec<RTCIceServer>, relay_only: bool) -> R
 mod tests {
     /// The PAKE confirmation is only fresh per link because no connection is
     /// given a persistent DTLS certificate; see `peer_connection_config`.
+    /// Every RTCPeerConnection in the workspace is built in exactly one place,
+    /// through `peer_connection_config`, so the test above covers them all. A
+    /// new construction site (or a hand-built `RTCConfiguration`) fails here
+    /// until it goes through the helper.
+    #[test]
+    fn every_peer_connection_is_built_from_the_tested_config() {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = e.file_name();
+                if p.is_dir() {
+                    if name != "target" && name != ".git" && name != "node_modules" {
+                        rust_sources(&p, out);
+                    }
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        // Spelled in pieces so this test's own source is not a match.
+        let construct = ["new_peer", "_connection("].concat();
+        let via_helper = [construct.as_str(), "peer_connection_config("].concat();
+        let literal = ["RTC", "Configuration {"].concat();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        for top in ["crates", "cli"] {
+            rust_sources(&root.join(top), &mut files);
+        }
+        assert!(
+            files.iter().any(|f| f.ends_with("filament-transport/src/net.rs")),
+            "the scan did not reach net.rs, so it proves nothing"
+        );
+        let (mut built, mut literals) = (Vec::new(), Vec::new());
+        for f in &files {
+            let text = std::fs::read_to_string(f).unwrap_or_default();
+            for (n, line) in text.lines().enumerate() {
+                if line.contains(&construct) {
+                    built.push((f.display().to_string(), n + 1, line.contains(&via_helper)));
+                }
+                if line.contains(&literal) {
+                    literals.push(format!("{}:{}", f.display(), n + 1));
+                }
+            }
+        }
+        assert_eq!(built.len(), 1, "RTCPeerConnection construction sites: {built:?}");
+        assert!(built[0].2, "the one construction site bypasses peer_connection_config: {built:?}");
+        assert_eq!(literals.len(), 1, "hand-built RTCConfiguration outside the helper: {literals:?}");
+    }
+
     #[test]
     fn peer_connections_carry_no_persistent_dtls_certificate() {
         for relay_only in [false, true] {
