@@ -247,18 +247,26 @@ pub enum LinkedFleetOffer {
 /// offer names a meeting place (`ch`) that is exactly this fleet's channel,
 /// and the link is fleet-shaped (`recv::fleet::shaped_link`). A `ch`-less
 /// unicast offer and an offer for any other channel keep the old behavior.
+///
+/// `peer_is_fleet_pending` says we saw this peer on the fleet channel. It is
+/// not honored yet: the shape of the link decides alone, so a peer whose link
+/// still carries a pair expectation (the peer holds us as a paired device
+/// while we forgot it) is never fleet-shaped, the fleet direct is never armed
+/// for it, and the peer sits with no transport at all.
 pub fn linked_fleet_offer_action(
     has_link: bool,
     has_pending: bool,
     offer_ch: Option<&str>,
     fleet_ch: Option<&str>,
     link_is_fleet_shaped: bool,
+    peer_is_fleet_pending: bool,
     my_id: &str,
     pid: &str,
 ) -> LinkedFleetOffer {
     if has_pending {
         return LinkedFleetOffer::Feed;
     }
+    let _ = peer_is_fleet_pending;
     if !has_link || !link_is_fleet_shaped {
         return LinkedFleetOffer::Buffer;
     }
@@ -329,6 +337,20 @@ async fn refuse_unrecognized_dial(sio: &filament_signal::Client, pid: &str, log:
     log.debug(&format!(
         "refused a dial from {pid}: a device forgotten here"
     ));
+}
+
+/// The honest "not recognized" answer for a peer that dials on a meeting place
+/// we forgot or revoked.
+///
+/// The peer is waiting for this answer, but a link we still hold for it used
+/// to suppress the answer, so the forgotten device appeared, never connected,
+/// and said nothing about the owner. That suppression is not honored yet.
+pub fn refuse_forgotten_dial(
+    has_direct_pending: bool,
+    has_link: bool,
+    offer_channel_forgotten: bool,
+) -> bool {
+    offer_channel_forgotten && !has_direct_pending && !has_link
 }
 
 /// The outcome of ONE peer's step (adopt, answer, a control reply) inside the
@@ -5150,7 +5172,8 @@ async fn recv_run(
                     // A device forgotten here, dialing the meeting place it still
                     // finds us on: tell it, rather than leave it waiting.
                     if let Some(pid) = v["id"].as_str().filter(|p| !p.is_empty()) {
-                        if !conn.links.contains_key(pid) {
+                        let has_link = conn.links.contains_key(pid);
+                        if refuse_forgotten_dial(false, has_link, true) {
                             refuse_unrecognized_dial(&sio, pid, log.as_ref()).await;
                         }
                     }
@@ -5298,13 +5321,14 @@ async fn recv_run(
                     }
                     // A dial on the meeting place of a device forgotten here: it
                     // can never be matched, so refuse it now, by name.
-                    if !conn.direct_pending.contains_key(&from)
-                        && !conn.links.contains_key(&from)
-                        && data["ch"].as_str().is_some_and(|c| {
+                    if refuse_forgotten_dial(
+                        conn.direct_pending.contains_key(&from),
+                        conn.links.contains_key(&from),
+                        data["ch"].as_str().is_some_and(|c| {
                             forgotten_channels.contains(c)
                                 || revoked_secrets.iter().any(|s| host.channel_of(s) == c)
-                        })
-                    {
+                        }),
+                    ) {
                         refuse_unrecognized_dial(&sio, &from, log.as_ref()).await;
                         continue;
                     }
@@ -5373,6 +5397,7 @@ async fn recv_run(
                                     data["ch"].as_str(),
                                     Some(fleet_ch.as_str()),
                                     crate::recv::fleet::shaped_link(&conn, &from, Some(rv.as_str())),
+                                    fleet_pending.contains(&from),
                                     conn.my_id.as_str(),
                                     from.as_str(),
                                 );
@@ -12449,7 +12474,9 @@ mod expiry_redrive_tests {
 /// buffered with "no pending yet", so the direct path never armed.
 #[cfg(test)]
 mod linked_fleet_offer_tests {
-    use super::{linked_fleet_offer_action as decide, LinkedFleetOffer};
+    use super::{
+        linked_fleet_offer_action as decide, refuse_forgotten_dial, LinkedFleetOffer,
+    };
 
     const FLEET: &str = "chan-fleet";
     const LOW: &str = "sid-aaa";
@@ -12463,12 +12490,12 @@ mod linked_fleet_offer_tests {
     fn a_fleet_offer_on_a_shaped_link_with_no_pending_arms_one() {
         // We are the higher sid: the peer is the elected dialer, we answer.
         assert_eq!(
-            decide(true, false, Some(FLEET), Some(FLEET), true, HIGH, LOW),
+            decide(true, false, Some(FLEET), Some(FLEET), true, false, HIGH, LOW),
             LinkedFleetOffer::ArmAnswer
         );
         // We are the lower sid: we are the elected dialer.
         assert_eq!(
-            decide(true, false, Some(FLEET), Some(FLEET), true, LOW, HIGH),
+            decide(true, false, Some(FLEET), Some(FLEET), true, false, LOW, HIGH),
             LinkedFleetOffer::ArmDial
         );
     }
@@ -12483,7 +12510,7 @@ mod linked_fleet_offer_tests {
                 for shaped in [false, true] {
                     for ch in [None, Some(FLEET), Some("chan-pair")] {
                         assert_eq!(
-                            decide(has_link, true, ch, Some(FLEET), shaped, me, peer),
+                            decide(has_link, true, ch, Some(FLEET), shaped, false, me, peer),
                             LinkedFleetOffer::Feed,
                             "a pending peer was re-armed (link={has_link} shaped={shaped} ch={ch:?})"
                         );
@@ -12502,45 +12529,102 @@ mod linked_fleet_offer_tests {
         for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
             // ch-less unicast offer on a shaped link.
             assert_eq!(
-                decide(true, false, None, Some(FLEET), true, me, peer),
+                decide(true, false, None, Some(FLEET), true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // Another meeting place (a pair channel) on a shaped link.
             assert_eq!(
-                decide(true, false, Some("chan-pair"), Some(FLEET), true, me, peer),
+                decide(true, false, Some("chan-pair"), Some(FLEET), true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // An empty `ch` never matches, even against an empty fleet channel.
             assert_eq!(
-                decide(true, false, Some(""), Some(""), true, me, peer),
+                decide(true, false, Some(""), Some(""), true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // We are in no fleet.
             assert_eq!(
-                decide(true, false, Some(FLEET), None, true, me, peer),
+                decide(true, false, Some(FLEET), None, true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // No link to the peer: not this case (the one-shot and
             // known-device arms own it).
             assert_eq!(
-                decide(false, false, Some(FLEET), Some(FLEET), true, me, peer),
+                decide(false, false, Some(FLEET), Some(FLEET), true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             assert_eq!(
-                decide(false, false, Some(FLEET), Some(FLEET), false, me, peer),
+                decide(false, false, Some(FLEET), Some(FLEET), false, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // A link that is not fleet-shaped.
             assert_eq!(
-                decide(true, false, Some(FLEET), Some(FLEET), false, me, peer),
+                decide(true, false, Some(FLEET), Some(FLEET), false, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
         }
     }
 
+    /// A peer we saw on the FLEET CHANNEL is fleet-shaped for this decision
+    /// even when its link still carries a pair expectation. The two ends can
+    /// file the same peer under different relationships (the peer still holds
+    /// us as a paired device while we forgot it): the pair expectation kept
+    /// the link out of the fleet shape, so the fleet direct was never armed on
+    /// either end, the peer sat with no transport at all, and nothing was ever
+    /// refused or admitted. The fleet relationship is the certificate-proven
+    /// one and it wins here.
+    #[test]
+    fn a_fleet_pending_peer_arms_the_fleet_direct_despite_a_pair_expectation() {
+        for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
+            let want = if me < peer {
+                LinkedFleetOffer::ArmDial
+            } else {
+                LinkedFleetOffer::ArmAnswer
+            };
+            assert_eq!(
+                decide(true, false, Some(FLEET), Some(FLEET), false, true, me, peer),
+                want,
+                "a fleet-pending peer on a pair-shaped link was not armed (me={me})"
+            );
+        }
+    }
+
+    /// The fleet-pending escape does not reach past the other rules: a pending
+    /// is still fed, and an offer that does not name our fleet channel is
+    /// still buffered.
+    #[test]
+    fn the_fleet_pending_escape_respects_the_other_rules() {
+        // A pending peer is fed, never re-armed.
+        assert_eq!(
+            decide(true, true, Some(FLEET), Some(FLEET), false, true, HIGH, LOW),
+            LinkedFleetOffer::Feed
+        );
+        // Another meeting place (a pair channel) is still not the fleet one.
+        assert_eq!(
+            decide(true, false, Some("chan-pair"), Some(FLEET), false, true, HIGH, LOW),
+            LinkedFleetOffer::Buffer
+        );
+        // A ch-less unicast offer is still not the fleet one.
+        assert_eq!(
+            decide(true, false, None, Some(FLEET), false, true, HIGH, LOW),
+            LinkedFleetOffer::Buffer
+        );
+        // No link to the peer at all: not this case.
+        assert_eq!(
+            decide(false, false, Some(FLEET), Some(FLEET), false, true, HIGH, LOW),
+            LinkedFleetOffer::Buffer
+        );
+        // We are in no fleet, so there is no fleet channel to match.
+        assert_eq!(
+            decide(true, false, Some(FLEET), None, false, true, HIGH, LOW),
+            LinkedFleetOffer::Buffer
+        );
+    }
+
     /// The whole input space, so no combination slips between the rules:
-    /// arm iff link && !pending && ch == fleet channel (non-empty) && shaped,
-    /// feed iff pending, buffer otherwise; the arm's role is the sid order.
+    /// arm iff link && !pending && ch == fleet channel (non-empty) && (shaped
+    /// || the peer is fleet-pending), feed iff pending, buffer otherwise; the
+    /// arm's role is the sid order.
     #[test]
     fn the_decision_is_exhaustive() {
         let chans = [None, Some(""), Some(FLEET), Some("chan-pair")];
@@ -12549,31 +12633,74 @@ mod linked_fleet_offer_tests {
             for has_link in [false, true] {
                 for has_pending in [false, true] {
                     for shaped in [false, true] {
-                        for ch in chans {
-                            for fleet in fleets {
-                                let got = decide(has_link, has_pending, ch, fleet, shaped, me, peer);
-                                let on_fleet = ch.is_some_and(|c| !c.is_empty()) && ch == fleet;
-                                let want = if has_pending {
-                                    LinkedFleetOffer::Feed
-                                } else if has_link && shaped && on_fleet {
-                                    if me < peer {
-                                        LinkedFleetOffer::ArmDial
+                        for pending_fleet in [false, true] {
+                            for ch in chans {
+                                for fleet in fleets {
+                                    let got = decide(
+                                        has_link,
+                                        has_pending,
+                                        ch,
+                                        fleet,
+                                        shaped,
+                                        pending_fleet,
+                                        me,
+                                        peer,
+                                    );
+                                    let on_fleet =
+                                        ch.is_some_and(|c| !c.is_empty()) && ch == fleet;
+                                    let want = if has_pending {
+                                        LinkedFleetOffer::Feed
+                                    } else if has_link
+                                        && (shaped || pending_fleet)
+                                        && on_fleet
+                                    {
+                                        if me < peer {
+                                            LinkedFleetOffer::ArmDial
+                                        } else {
+                                            LinkedFleetOffer::ArmAnswer
+                                        }
                                     } else {
-                                        LinkedFleetOffer::ArmAnswer
-                                    }
-                                } else {
-                                    LinkedFleetOffer::Buffer
-                                };
-                                assert_eq!(
-                                    got, want,
-                                    "link={has_link} pending={has_pending} shaped={shaped} ch={ch:?} fleet={fleet:?} me={me}"
-                                );
+                                        LinkedFleetOffer::Buffer
+                                    };
+                                    assert_eq!(
+                                        got, want,
+                                        "link={has_link} pending={has_pending} shaped={shaped} fleet_pending={pending_fleet} ch={ch:?} fleet={fleet:?} me={me}"
+                                    );
+                                }
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    /// The honest "not recognized" answer is owed to a forgotten peer EVEN
+    /// WHILE we still hold a stale link to it. The link used to suppress the
+    /// answer, so the forgotten device appeared, never connected, and said
+    /// nothing about the owner: it waited out its whole window for a reply
+    /// that was already true.
+    #[test]
+    fn a_forgotten_peer_is_refused_despite_a_stale_link() {
+        assert!(
+            refuse_forgotten_dial(false, true, true),
+            "a stale link suppressed the honest refusal"
+        );
+    }
+
+    /// The refusal still does not fire for a peer that is not forgotten, and
+    /// a live direct pending (we are dialing that peer right now, on the same
+    /// credential) keeps the offer in our own race.
+    #[test]
+    fn the_refusal_fires_only_for_a_forgotten_channel() {
+        // Not forgotten: nothing to refuse.
+        assert!(!refuse_forgotten_dial(false, false, false));
+        assert!(!refuse_forgotten_dial(false, true, false));
+        // We are dialing this peer right now: its offer is part of our race.
+        assert!(!refuse_forgotten_dial(true, false, true));
+        assert!(!refuse_forgotten_dial(true, true, true));
+        // Forgotten, no pending, no link: the plain case still refuses.
+        assert!(refuse_forgotten_dial(false, false, true));
     }
 }
 
