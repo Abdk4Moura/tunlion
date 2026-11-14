@@ -13,7 +13,9 @@
 //! landed (or, only for a source with no digest, that every byte was written
 //! and acknowledged at the transport).
 
-use crate::send::gate::{adopt_wants_active, code_peer_event_allowed, CodePeerEvent};
+use crate::send::gate::{
+    adopt_wants_active, code_answer_admitted, code_peer_event_allowed, CodePeerEvent,
+};
 use crate::conn::Conn;
 use crate::driver::{Cancellation, DriverOutcome};
 use crate::host::{HostServices, LogSink};
@@ -1030,11 +1032,12 @@ async fn drive_over(
                 }
                 // A code offers only on the link its ceremony confirmed (or that
                 // ceremony's own direct promotion), never on a rebuilt one.
+                // Offers are bound to the code-authorized link.
                 if use_code && !conn.holds_code_authority(&pid).await {
                     if pake_done {
-                        ports.log.debug(
-                            "send: not offering on a link the code's ceremony does not cover",
-                        );
+                        return Err(SendFailure::unreachable(
+                            "transfer stopped: the connection to the receiver was rebuilt after the code was confirmed, so nothing more is sent on this code. Run the send again for a fresh code",
+                        ));
                     }
                     continue;
                 }
@@ -1050,7 +1053,9 @@ async fn drive_over(
                     }
                 }
                 Some("file-accept") => {
-                    if use_code && !conn.holds_code_authority(&pid).await {
+                    if use_code
+                        && !code_answer_admitted("file-accept", conn.holds_code_authority(&pid).await)
+                    {
                         continue;
                     }
                     let Some(t) = conn.transport_of(&pid) else {
@@ -1111,6 +1116,11 @@ async fn drive_over(
                     }));
                 }
                 Some("file-decline") => {
+                    if use_code
+                        && !code_answer_admitted("file-decline", conn.holds_code_authority(&pid).await)
+                    {
+                        continue;
+                    }
                     let id = v["id"].as_str().unwrap_or_default();
                     let why = v["error"].as_str().filter(|e| !e.trim().is_empty());
                     let mut out = outgoing.lock().await;
@@ -1127,6 +1137,11 @@ async fn drive_over(
                     }
                 }
                 Some("delivery-ack") => {
+                    if use_code
+                        && !code_answer_admitted("delivery-ack", conn.holds_code_authority(&pid).await)
+                    {
+                        continue;
+                    }
                     let id = v["id"].as_str().unwrap_or_default();
                     if let Some(name) = v["stored"].as_str() {
                         stored.insert(id.to_string(), name.to_string());
@@ -1148,6 +1163,7 @@ async fn drive_over(
                         )));
                     }
                 }
+                // Changes no state here, so there is nothing to gate.
                 Some("file-pending") => {}
                 Some("link-revoked") => {
                     return Err(SendFailure::denied(

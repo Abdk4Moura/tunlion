@@ -50,6 +50,20 @@ pub fn adopt_wants_active(code_claimed: bool, use_code: bool, _pake_done: bool) 
     code_claimed && !use_code
 }
 
+/// Receiver answers that are bound to the code-authorized link.
+pub const CODE_BOUND_ANSWERS: [&str; 5] = [
+    "file-accept",
+    "file-decline",
+    "file-pending",
+    "delivery-ack",
+    "pair-keep-ack",
+];
+
+/// Code path only: may the sender act on answer `kind`? Pure.
+pub fn code_answer_admitted(kind: &str, authority_holds: bool) -> bool {
+    authority_holds || !CODE_BOUND_ANSWERS.contains(&kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +147,15 @@ mod tests {
             ),
             Err(CodeAuthorityRefusal::ForeignDirect)
         );
+    }
+
+    #[test]
+    fn a_code_senders_answers_count_only_from_the_confirmed_link() {
+        for kind in ["file-accept", "file-decline", "file-pending", "delivery-ack", "pair-keep-ack"] {
+            assert!(code_answer_admitted(kind, true), "{kind}");
+            assert!(!code_answer_admitted(kind, false), "{kind}");
+        }
+        assert!(code_answer_admitted("path-promote", false));
     }
 
     #[test]

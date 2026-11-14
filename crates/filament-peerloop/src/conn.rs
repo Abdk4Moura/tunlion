@@ -73,6 +73,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
+/// An in-flight code transfer on its peer's current link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeContinuation {
+    Holds,
+    NoLink,
+    Lost,
+}
+
+/// Link facts a cached verdict is keyed by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CodeLinkKey {
+    generation: u32,
+    source: net::SourceId,
+    direct: bool,
+    attempt: Option<net::AttemptId>,
+}
+
+/// The last link that held code authority.
+#[derive(Default)]
+pub struct CodeAuthorityCache {
+    held: Option<(String, CodeLinkKey)>,
+}
+
 /// Why a direct attempt is being started. A bool pair gave four states, three
 /// meaningful and one nonsense (`probe && promote` = "a test dial that tears
 /// down a serving link", exactly what the guard exists to prevent), with
@@ -2395,6 +2418,35 @@ impl Conn {
                 ));
                 false
             }
+        }
+    }
+
+    /// Continuation of a code transfer is bound to the code-authorized link.
+    /// Only a holding verdict is cached, keyed by the link's generation,
+    /// source, kind and attempt.
+    pub async fn code_continuation(
+        &self,
+        pid: &str,
+        cache: &mut CodeAuthorityCache,
+    ) -> CodeContinuation {
+        let Some(l) = self.links.get(pid) else {
+            return CodeContinuation::NoLink;
+        };
+        let key = CodeLinkKey {
+            generation: l.generation,
+            source: l.source,
+            direct: l.direct,
+            attempt: l.attempt,
+        };
+        if cache.held.as_ref().is_some_and(|(p, k)| p == pid && *k == key) {
+            return CodeContinuation::Holds;
+        }
+        if self.holds_code_authority(pid).await {
+            cache.held = Some((pid.to_string(), key));
+            CodeContinuation::Holds
+        } else {
+            cache.held = None;
+            CodeContinuation::Lost
         }
     }
 
@@ -9879,6 +9931,38 @@ mod warm_identity_tests {
         assert_eq!(conn.active_binding.as_ref().map(|b| b.0.as_str()), Some("sid-s1"));
         assert_eq!(conn.code_session.as_ref().map(|c| c.sid()), Some("sid-s1"));
         assert!(!conn.holds_code_authority("sid-s2").await);
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_code_transfer_continues_only_on_the_covered_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let promote = net::AttemptId::next();
+        conn.direct_pending.insert("sid-s1".into(), promote_pending(promote, "sid-s1", "k-secret"));
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", promote));
+        let mut cache = CodeAuthorityCache::default();
+
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Lost);
+
+        conn.bind_code_session("sid-s1", ("fp-a", "fp-b"), "k-secret");
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Holds);
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Holds);
+
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", net::AttemptId::next()));
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Lost);
+
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", promote));
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Holds);
+
+        let mut rebuilt = promoted_link("sid-s1", "uid-u", "k-secret", promote);
+        rebuilt.direct = false;
+        conn.links.insert("sid-s1".into(), rebuilt);
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Lost);
+
+        conn.links.remove("sid-s1");
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::NoLink);
+
+        conn.links.insert("sid-s2".into(), promoted_link("sid-s2", "uid-u", "k-secret", promote));
+        assert_eq!(conn.code_continuation("sid-s2", &mut cache).await, CodeContinuation::Lost);
     }
 
     /// A signal payload never replaces a roster uid the server already gave
