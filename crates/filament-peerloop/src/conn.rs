@@ -5592,6 +5592,27 @@ impl Conn {
         if !self.direct_ok {
             return;
         }
+        // The retirement drain is BOUNDED (MAX_RETIRED_ATTEMPTS), and a full
+        // drain refuses every new direct attempt for the whole session. So the
+        // check comes FIRST: before a QUIC endpoint is bound, before candidates
+        // are gathered (that includes an HTTP whoami), before a transport-offer
+        // is emitted, and before the 6x/1.2s re-emitter is spawned. Checked
+        // last, every refused attempt had already paid all of that and left a
+        // re-emitter running with a cancel flag on a pending that was never
+        // created: one stuck build became a session-wide outage and an
+        // unstoppable burst.
+        if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
+            // Liveness backstop for a lost drain event. Only a tombstone whose
+            // producer is terminal is reaped; a live producer keeps its slot
+            // and this attempt fails closed below.
+            self.reap_drained_tombstones(Instant::now());
+            if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
+                self.log.debug(&format!(
+                    "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
+                ));
+                return;
+            }
+        }
         // Browser peers announced `direct:false` before their SDP. There is no
         // QUIC stack on the other end, so arming the ladder would buy nothing
         // and cost the whole DIRECT_BUDGET before WebRTC is offered. CLI peers
@@ -5856,18 +5877,6 @@ impl Conn {
         } else {
             Instant::now() + direct::DIRECT_BUDGET
         };
-        if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
-            // Liveness backstop for a lost drain event. Only a tombstone whose
-            // producer is terminal is reaped; a live producer keeps its slot
-            // and this attempt fails closed below.
-            self.reap_drained_tombstones(Instant::now());
-            if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
-                self.log.debug(&format!(
-                    "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
-                ));
-                return;
-            }
-        }
         self.next_gen += 1;
         let auth = match intent {
             DirectIntent::Fleet => DirectAuth::fleet(self.next_gen),
@@ -11725,8 +11734,11 @@ mod warm_identity_tests {
         conn.direct_ok = true;
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pid = "sid-fleet";
-        // The link before the adoption: pair-proven and trusted.
-        let mut link = direct_link(pid, "peer", "peer", Rec::new("webrtc", &log));
+        // The link before the adoption: a PAIR-proven WebRTC link, still
+        // live. A live DIRECT primary with another attempt is not replaceable
+        // through this path, so the fixture has to be the non-direct link that
+        // adopts a fleet direct IN PLACE, which is the case this is about.
+        let mut link = relay_link(pid, "peer", "peer", Rec::new("webrtc", &log));
         link.trusted = true;
         link.verified_name = Some("peer".to_string());
         link.principal_kind = PrincipalKind::OwnerDevice;

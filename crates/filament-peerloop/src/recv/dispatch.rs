@@ -387,6 +387,53 @@ pub fn fleet_arm_allowed(last_armed_at: Option<Instant>, now: Instant, cooldown:
     }
 }
 
+/// A fleet arm must not take over a LEGITIMATE PAIR link.
+///
+/// `expected_secret` is the secret the link is bound to (a pair secret, or the
+/// fleet rendezvous secret, which is never a store entry), `secret_is_held`
+/// says whether that secret is still in our device store, and `trusted` is the
+/// link's own standing.
+///
+/// - A link whose secret we STILL hold is a live pair relationship. Arming a
+///   fleet direct on it replaces the transport and strips its standing, which
+///   breaks the pair path for a device we still know.
+/// - A link whose secret we NO LONGER hold is stale: the peer was forgotten or
+///   revoked here, so the fleet relationship is exactly what may take it over.
+///   This is the restart case the fix is for.
+/// - A trusted link with NO secret has unknown standing (a code ceremony, an
+///   ephemeral link), so it is left alone.
+pub fn fleet_arm_skips_pair_link(
+    trusted: bool,
+    expected_secret: Option<&str>,
+    secret_is_held: bool,
+) -> bool {
+    match expected_secret {
+        Some(_) => secret_is_held,
+        None => trusted,
+    }
+}
+
+/// What a binding epoch rotation does to the fleet standing.
+///
+/// The binding moved, so what the OLD binding proved is stale. A fleet
+/// sibling verified on that binding must verify again on the new one: its
+/// standing is dropped and the hello is re-run, otherwise it stays a
+/// non-sibling forever (the reset to Delegated would never be undone).
+pub fn fleet_standing_after_rotation(
+    verified: &mut std::collections::HashSet<String>,
+    greeted: &mut std::collections::HashSet<String>,
+    pending: &mut std::collections::HashSet<String>,
+    pid: &str,
+) -> bool {
+    if verified.remove(pid) {
+        greeted.remove(pid);
+        pending.insert(pid.to_string());
+        true
+    } else {
+        false
+    }
+}
+
 /// The outcome of ONE peer's step (adopt, answer, a control reply) inside the
 /// serving loop.
 ///
@@ -5293,7 +5340,19 @@ async fn recv_run(
                             // starts a direct attempt that can be retired into
                             // the bounded retirement drain.
                             let now = Instant::now();
-                            if fleet_arm_allowed(
+                            let link = conn.link(&pid);
+                            let trusted = link.map(|l| l.trusted).unwrap_or(false);
+                            let expected = link
+                                .and_then(|l| l.expected_secret.as_ref().map(|(_, s)| s.clone()));
+                            let held = expected
+                                .as_ref()
+                                .map(|s| devices.iter().any(|(_, d)| d == s))
+                                .unwrap_or(false);
+                            if fleet_arm_skips_pair_link(trusted, expected.as_deref(), held) {
+                                log.debug(&format!(
+                                    "fleet: arm for {pid} skipped, it is a live pair link"
+                                ));
+                            } else if fleet_arm_allowed(
                                 fleet_arm_at.get(&pid).copied(),
                                 now,
                                 FLEET_ARM_COOLDOWN,
@@ -5418,7 +5477,21 @@ async fn recv_run(
                             conn.links.get(&from).map(|l| l.name == *n).unwrap_or(false)
                         });
                         if let Some((name, secret)) = known {
-                            conn.start_direct(&from, &name, &secret).await;
+                            // Bounded like the fleet arms: this offer site
+                            // fires on every transport-offer the peer sends.
+                            let now = Instant::now();
+                            if fleet_arm_allowed(
+                                fleet_arm_at.get(&from).copied(),
+                                now,
+                                FLEET_ARM_COOLDOWN,
+                            ) {
+                                fleet_arm_at.insert(from.clone(), now);
+                                conn.start_direct(&from, &name, &secret).await;
+                            } else {
+                                log.debug(&format!(
+                                    "fleet: re-arm for {from} skipped, armed recently"
+                                ));
+                            }
                         }
                         // A one-shot dialer on our FLEET channel (`tunlion
                         // shell/exec/reach <sibling>` from a device with no daemon
@@ -5438,10 +5511,36 @@ async fn recv_run(
                             && data["ch"].is_null()
                         {
                             if let Some(rv) = ports.identity.fleet_rv() {
-                                log.debug(&format!(
-                                    "fleet: answering a one-shot dialer's transport-offer from {from}"
-                                ));
-                                conn.start_direct_fleet(&from, &rv).await;
+                                // Bounded like the other arms, and it must not
+                                // take over a live pair link.
+                                let now = Instant::now();
+                                let link = conn.link(&from);
+                                let trusted = link.map(|l| l.trusted).unwrap_or(false);
+                                let expected = link
+                                    .and_then(|l| l.expected_secret.as_ref().map(|(_, s)| s.clone()));
+                                let held = expected
+                                    .as_ref()
+                                    .map(|s| host.devices_load().iter().any(|(_, d)| d == s))
+                                    .unwrap_or(false);
+                                if fleet_arm_skips_pair_link(trusted, expected.as_deref(), held) {
+                                    log.debug(&format!(
+                                        "fleet: answer for {from} skipped, it is a live pair link"
+                                    ));
+                                } else if fleet_arm_allowed(
+                                    fleet_arm_at.get(&from).copied(),
+                                    now,
+                                    FLEET_ARM_COOLDOWN,
+                                ) {
+                                    fleet_arm_at.insert(from.clone(), now);
+                                    log.debug(&format!(
+                                        "fleet: answering a one-shot dialer's transport-offer from {from}"
+                                    ));
+                                    conn.start_direct_fleet(&from, &rv).await;
+                                } else {
+                                    log.debug(&format!(
+                                        "fleet: answer for {from} skipped, armed recently"
+                                    ));
+                                }
                             }
                         }
                         // A daemon sibling re-dialing on our FLEET channel while
@@ -5483,9 +5582,23 @@ async fn recv_run(
                                     // arm starts a direct attempt that can be
                                     // retired into the bounded retirement
                                     // drain, which then refuses EVERY direct
-                                    // attempt for the whole session.
+                                    // attempt for the whole session. A live
+                                    // pair link is left alone: the fleet
+                                    // relationship must not replace it.
                                     let now = Instant::now();
-                                    if fleet_arm_allowed(
+                                    let link = conn.link(&from);
+                                    let trusted = link.map(|l| l.trusted).unwrap_or(false);
+                                    let expected = link
+                                        .and_then(|l| l.expected_secret.as_ref().map(|(_, s)| s.clone()));
+                                    let held = expected
+                                        .as_ref()
+                                        .map(|s| host.devices_load().iter().any(|(_, d)| d == s))
+                                        .unwrap_or(false);
+                                    if fleet_arm_skips_pair_link(trusted, expected.as_deref(), held) {
+                                        log.debug(&format!(
+                                            "fleet: arm for {from} skipped, it is a live pair link"
+                                        ));
+                                    } else if fleet_arm_allowed(
                                         fleet_arm_at.get(&from).copied(),
                                         now,
                                         FLEET_ARM_COOLDOWN,
@@ -6064,6 +6177,15 @@ async fn recv_run(
                 let held_epoch = bind_epoch.get(&pid).copied();
                 if fleet_bind::epoch_change(held_epoch, installed) == fleet_bind::EpochChange::Rotated {
                     let now = Instant::now();
+                    // The binding moved: what the OLD binding proved is stale.
+                    // A fleet sibling verified on it must verify again on the
+                    // new one, or it stays a non-sibling forever.
+                    fleet_standing_after_rotation(
+                        &mut fleet_verified,
+                        &mut fleet_greeted,
+                        &mut fleet_pending,
+                        &pid,
+                    );
                     let cleared_ours = match bind_ours.remove(&pid) {
                         Some(old) => {
                             bind_retired.entry(pid.clone()).or_default().retire(old, now);
@@ -12569,8 +12691,8 @@ mod expiry_redrive_tests {
 #[cfg(test)]
 mod linked_fleet_offer_tests {
     use super::{
-        fleet_arm_allowed, linked_fleet_offer_action as decide, refuse_forgotten_dial,
-        LinkedFleetOffer,
+        fleet_arm_allowed, fleet_arm_skips_pair_link, fleet_standing_after_rotation,
+        linked_fleet_offer_action as decide, refuse_forgotten_dial, LinkedFleetOffer,
     };
     use std::time::{Duration, Instant};
 
@@ -12823,6 +12945,57 @@ mod linked_fleet_offer_tests {
             start + Duration::from_secs(5),
             cooldown
         ));
+    }
+
+    /// A fleet arm must not take over a live PAIR link, and must still arm
+    /// for a forgotten one (the secret we no longer hold).
+    #[test]
+    fn a_fleet_arm_skips_a_live_pair_link_and_keeps_the_forgotten_one() {
+        // A pair secret we still hold: a live pair relationship, skipped.
+        assert!(fleet_arm_skips_pair_link(true, Some("pair-secret"), true));
+        assert!(fleet_arm_skips_pair_link(false, Some("pair-secret"), true));
+        // The same secret, but we no longer hold it: the peer was forgotten or
+        // revoked here, so the fleet relationship may take the link over.
+        assert!(!fleet_arm_skips_pair_link(true, Some("pair-secret"), false));
+        assert!(!fleet_arm_skips_pair_link(false, Some("pair-secret"), false));
+        // The fleet rendezvous secret is never a store entry: a fleet link
+        // keeps arming.
+        assert!(!fleet_arm_skips_pair_link(false, Some("fleet-rv"), false));
+        // A trusted link with no secret at all has unknown standing (a code
+        // ceremony, an ephemeral link): left alone.
+        assert!(fleet_arm_skips_pair_link(true, None, false));
+        // An untrusted link with no secret is the secretless fleet shape.
+        assert!(!fleet_arm_skips_pair_link(false, None, false));
+    }
+
+    /// A binding epoch rotation drops the fleet standing, so the hello runs
+    /// again on the new binding. Without this, a sibling verified on the old
+    /// binding stays a non-sibling forever.
+    #[test]
+    fn a_rotated_binding_re_earns_the_fleet_standing() {
+        let mut verified = std::collections::HashSet::new();
+        let mut greeted = std::collections::HashSet::new();
+        let mut pending = std::collections::HashSet::new();
+        verified.insert("sib".to_string());
+        greeted.insert("sib".to_string());
+        assert!(
+            fleet_standing_after_rotation(&mut verified, &mut greeted, &mut pending, "sib"),
+            "the rotation did not drop the standing"
+        );
+        assert!(!verified.contains("sib"), "the stale standing survived");
+        assert!(!greeted.contains("sib"), "the stale greeting survived");
+        assert!(pending.contains("sib"), "the hello was not queued again");
+        // A peer that was not verified keeps its pending state, and the
+        // rotation reports that nothing was standing.
+        let mut pending2 = std::collections::HashSet::new();
+        pending2.insert("other".to_string());
+        assert!(!fleet_standing_after_rotation(
+            &mut verified,
+            &mut greeted,
+            &mut pending2,
+            "other"
+        ));
+        assert!(pending2.contains("other"), "the pending state was changed");
     }
 }
 
