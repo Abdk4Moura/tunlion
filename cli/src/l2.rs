@@ -773,13 +773,29 @@ fn control_for_link<'a>(
 /// transport the mux selected. Anything else is a callback from a candidate
 /// that lost the race (or an earlier attempt on the same signaling id) and must
 /// not reach the mux after selection: an old `l2-close` would end the wrong
-/// stream. Untagged events keep the pre-attribution behaviour.
+/// stream. Chunks must always be attributed; the envelope and inner pid must
+/// agree before any data can be routed by stream id.
+///
+/// Only the inner events this gate can attribute are unwrapped: `Control`,
+/// `PcState`, `ChannelReady`, `Chunk` and `PeerLeft`. The last is the
+/// source-tagged departure barrier the daemon queues behind a link's
+/// already-read events; it carries no inner pid, so it is admitted on the
+/// source match alone. Any other inner event is dropped rather than
+/// unwrapped, because it cannot be shown to belong to this link.
 fn selected_event(ev: Ev, source: Option<net::SourceId>) -> Option<Ev> {
     match ev {
-        Ev::Sourced { source: event_source, inner, .. } if Some(event_source) == source => {
-            Some(*inner)
+        Ev::Sourced { pid, source: event_source, inner } if Some(event_source) == source => {
+            let valid = match inner.as_ref() {
+                Ev::Control(inner_pid, _) | Ev::PcState(inner_pid, _)
+                | Ev::ChannelReady(inner_pid, _) | Ev::Chunk(inner_pid, ..) => *inner_pid == pid,
+                // The departure barrier has no inner pid to compare.
+                Ev::PeerLeft(_) => true,
+                _ => false,
+            };
+            valid.then_some(*inner)
         }
         Ev::Sourced { .. } => None,
+        Ev::Chunk(..) => None,
         other => Some(other),
     }
 }
@@ -6256,6 +6272,25 @@ mod h1_tests {
             selected_event(tagged(selected), Some(selected)),
             Some(Ev::Control(..))
         ));
+        let chunk = |source, inner: &str| Ev::Sourced {
+            pid: pid.into(), source,
+            inner: Box::new(Ev::Chunk(inner.into(), 42, Some(0), bytes::Bytes::from_static(b"data"))),
+        };
+        assert!(matches!(selected_event(chunk(selected, pid), Some(selected)), Some(Ev::Chunk(..))));
+        assert!(selected_event(chunk(stale, pid), Some(selected)).is_none());
+        assert!(selected_event(chunk(selected, "other"), Some(selected)).is_none());
+        assert!(selected_event(Ev::Chunk(pid.into(), 42, Some(0), bytes::Bytes::new()), Some(selected)).is_none());
+        // The source-tagged departure barrier is admitted on the source match.
+        let departure = Ev::Sourced {
+            pid: pid.into(), source: selected,
+            inner: Box::new(Ev::PeerLeft(json!({ "id": pid }))),
+        };
+        assert!(matches!(selected_event(departure, Some(selected)), Some(Ev::PeerLeft(..))));
+        let stale_departure = Ev::Sourced {
+            pid: pid.into(), source: stale,
+            inner: Box::new(Ev::PeerLeft(json!({ "id": pid }))),
+        };
+        assert!(selected_event(stale_departure, Some(selected)).is_none());
         assert!(
             selected_event(tagged(stale), Some(selected)).is_none(),
             "a stale transport's control reached the selected link's pump"

@@ -499,10 +499,11 @@ pub struct Link {
     pub trusted: bool,
     /// (name, secret) hypothesis to prove/verify on this link
     pub expected_secret: Option<(String, String)>,
-    /// LAN-origin reservation identity. Deliberately separate from
-    /// `expected_secret` so a LAN link stays untrusted/delegated without a pair
-    /// binding, while revocation and dedup can still see its exact device
-    /// binding (device LAN only; never the fleet shared RV).
+    /// LAN-origin reservation identity. Separate from `expected_secret` so a
+    /// LAN link mints no worker key or pair-proof hypothesis, while revocation,
+    /// dedup and adoption can still see its exact device binding (device LAN
+    /// only; never the fleet shared RV). A live binding makes the link the pair
+    /// at adoption (`adopt_direct`).
     pub lan_binding: Option<LanBinding>,
     /// The devices.json PETNAME this link proved as (the cap-store key). Set on a
     /// verified `pair-proof` (WebRTC) or at birth for a direct link (already
@@ -577,12 +578,11 @@ impl Link {
     /// an exact authenticated LAN DEVICE reservation that is STILL the current
     /// store's binding.
     ///
-    /// This is not an identity proof and must never become one: it does not set
-    /// `trusted`, `verified_name` or `BindingStrength::Proven`, does not touch
-    /// `expected_secret`, mints no worker key, and grants no capability. It names
-    /// the device so request routing (`reach`/`send` warm reuse) can match the
-    /// link the local handshake already authenticated with that device's pair
-    /// secret. A forgotten, revoked, re-paired or fleet-reserved link resolves
+    /// This lookup itself sets nothing. Adoption uses it once to make a live
+    /// LAN device link the pair (`adopt_direct`); routing (`reach`/`send` warm
+    /// reuse) uses it to match a link the local handshake authenticated with
+    /// that device's pair secret. A forgotten, revoked, re-paired or
+    /// fleet-reserved link resolves
     /// nothing: the store lookup is exact on `(name, secret)` and the secret
     /// must not be in `revoked`.
     pub fn authenticated_device_name<'a>(
@@ -1344,6 +1344,7 @@ async fn run_build_task(
     plan: BuildPlan,
     candidate: mpsc::UnboundedSender<Ev>,
     wake: mpsc::UnboundedSender<Ev>,
+    wake_pending: Arc<AtomicBool>,
     cancel: Arc<BuildCancel>,
     out: mpsc::UnboundedSender<BuildDone>,
     context: filament_transport::TransportContext,
@@ -1357,6 +1358,10 @@ async fn run_build_task(
     let connect_polite = plan.polite;
     let connect_relay = plan.relay_ice;
     let connect_gen = plan.generation;
+    // The peer's events wake the loop: the candidate channel is drained only
+    // by `pump_builds`, and nothing else turns the loop when a data-channel
+    // event lands in it (see `EvSink::waking`).
+    let candidate = net::EvSink::waking(candidate, wake.clone(), wake_pending);
     let wake_tx = wake;
     let retry_plan = plan.clone();
     let connect_cfg = plan.config;
@@ -1730,9 +1735,15 @@ pub struct Conn {
     /// so a queued ChannelReady/Control from the old generation is discarded
     /// instead of being replayed onto the new link.
     pub link_events: HashMap<String, LinkEvents>,
+    /// Set by a candidate sender when it has queued a `BuildWake`, cleared by
+    /// `pump_builds` before it drains. One wake is outstanding at a time, so a
+    /// busy data channel cannot flood the main queue with wakes.
+    pub candidate_wake: Arc<AtomicBool>,
     /// Source-bound standby/upgrade events awaiting adoption. Bounded per source
     /// and in total; overflow closes the standby instead of growing forever.
     pub pending_sources: HashMap<net::SourceId, PendingSource>,
+    pub replaying_sources: HashMap<net::SourceId, PendingSource>,
+    pub replay_departures: HashMap<String, (net::SourceId, bool)>,
     /// Roster sids absent from consecutive channel/room digests, for the
     /// two-tick hysteresis in `prune_roster_absent`.
     pub roster_absent: HashMap<String, u8>,
@@ -1969,7 +1980,10 @@ impl Conn {
             revoked_peers: HashMap::new(),
             revoked_bindings: HashSet::new(),
             link_events: HashMap::new(),
+            candidate_wake: Arc::new(AtomicBool::new(false)),
             pending_sources: HashMap::new(),
+            replaying_sources: HashMap::new(),
+            replay_departures: HashMap::new(),
             roster_absent: HashMap::new(),
             log,
             host,
@@ -2579,6 +2593,10 @@ impl Conn {
     /// from the call sites the way a manual audit does.
     #[track_caller]
     pub fn drop_link(&mut self, pid: &str) {
+        self.replaying_sources.retain(|_, pending| pending.pid != pid);
+        if self.replay_departures.get(pid).is_some_and(|(_, ready)| !ready) {
+            self.replay_departures.remove(pid);
+        }
         // A drop is an invalidation: a candidate still building for this peer
         // must not publish after the link it was replacing is gone.
         self.cancel_build(pid);
@@ -3341,6 +3359,7 @@ impl Conn {
         // replayed onto the candidate after installation.
         let (candidate_tx, candidate_rx) = mpsc::unbounded_channel();
         let wake = self.tx.clone();
+        let wake_pending = self.candidate_wake.clone();
         let context = self.transport_context.clone();
         let server = self.server.clone();
         let sio = self.sio.clone();
@@ -3352,6 +3371,7 @@ impl Conn {
                 plan,
                 candidate_tx,
                 wake,
+                wake_pending,
                 task_cancel,
                 out,
                 context,
@@ -3385,6 +3405,10 @@ impl Conn {
     /// slots are free, and reap a task that outlived its grace. Every Conn
     /// driver calls this once per loop turn; it never awaits.
     pub fn pump_builds(&mut self) -> usize {
+        // Clear BEFORE draining. An event queued after this point sees the
+        // flag clear and sends a fresh wake, so it is never left for an
+        // unrelated event to collect; one queued before it is drained below.
+        self.candidate_wake.store(false, Ordering::SeqCst);
         // Installed-link event streams are candidate-local. Forward them only
         // while the link still carries the generation that created the stream;
         // a replaced/dropped link's queued events are discarded, never applied
@@ -3759,7 +3783,7 @@ impl Conn {
         }
     }
 
-    /// Final pre-dispatch gate. Transport-origin Control/PcState/ChannelReady
+    /// Final pre-dispatch gate. Transport-origin Control/PcState/ChannelReady/Chunk
     /// must carry an immutable SourceId; the event is accepted only if that
     /// source still belongs to the pid's CURRENT link at the moment the driver
     /// is about to handle it. A replacement after forwarding therefore cannot
@@ -3767,6 +3791,31 @@ impl Conn {
     /// handlers that defer/requeue the event).
     pub fn stage_event(&mut self, ev: Ev) -> Option<(Ev, Option<net::SourceId>)> {
         match ev {
+            Ev::ReplayDeparture(pid, source, payload) => {
+                if self.replay_departures.get(&pid) != Some(&(source, false)) {
+                    return None;
+                }
+                if self.links.get(&pid).map(|link| link.source) != Some(source) {
+                    self.replay_departures.remove(&pid);
+                    return None;
+                }
+                if self.replaying_sources.contains_key(&source) {
+                    let _ = self.tx.send(Ev::ReplayDeparture(pid, source, payload));
+                    return None;
+                }
+                self.replay_departures.insert(pid, (source, true));
+                return Some((Ev::PeerLeft(payload), Some(source)));
+            }
+            Ev::ReplaySource(source) => {
+                let pending = self.replaying_sources.get_mut(&source)?;
+                let pid = pending.pid.clone();
+                let inner = pending.events.pop_front()?;
+                pending.bytes = pending.bytes.saturating_sub(ev_weight(&inner));
+                if pending.events.is_empty() {
+                    self.replaying_sources.remove(&source);
+                }
+                return self.source_current(&pid, source, &inner).then_some((inner, Some(source)));
+            }
             Ev::AttemptDrained(attempt) => {
                 self.retired_attempts.remove(&attempt);
                 None
@@ -3789,6 +3838,10 @@ impl Conn {
                     if !self.source_current(&pid, source, inner.as_ref()) {
                         return None;
                     }
+                    if self.replaying_sources.contains_key(&source) {
+                        let _ = self.tx.send(Ev::Sourced { pid, source, inner });
+                        return None;
+                    }
                     match self.link_events.get_mut(&pid) {
                         Some(events)
                             if self.links.get(&pid).map(|link| link.generation)
@@ -3808,13 +3861,42 @@ impl Conn {
                 let valid_inner = match inner.as_ref() {
                     Ev::Control(ipid, _)
                     | Ev::PcState(ipid, _)
-                    | Ev::ChannelReady(ipid, _) => ipid == &pid,
+                    | Ev::ChannelReady(ipid, _)
+                    | Ev::Chunk(ipid, ..) => ipid == &pid,
                     _ => false,
                 };
                 if !valid_inner {
                     return None;
                 }
                 if self.source_current(&pid, source, inner.as_ref()) {
+                    if self.replaying_sources.contains_key(&source) {
+                        // The replay tokens were queued behind already-read newer
+                        // events. Swap this arrival behind the oldest buffered
+                        // event, so the consumer sees source order, not queue order.
+                        let total: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.bytes).sum();
+                        let Some(pending) = self.replaying_sources.get_mut(&source) else { return None; };
+                        if pending.pid != pid { return None; }
+                        // The token invariant says one buffered event per token.
+                        // If it does not hold, fail closed: drop the replay and
+                        // close the transport rather than panic in the daemon's
+                        // event loop.
+                        let Some(older) = pending.events.pop_front() else {
+                            self.replaying_sources.remove(&source);
+                            if let Some(t) = self.transport_of(&pid) { t.force_close(); }
+                            return None;
+                        };
+                        let bytes = pending.bytes.saturating_sub(ev_weight(&older))
+                            .saturating_add(ev_weight(&inner));
+                        let total_after = total.saturating_sub(pending.bytes).saturating_add(bytes);
+                        if bytes > MAX_BUILD_EVENT_BYTES || total_after > MAX_BUILD_EVENT_BYTES {
+                            self.replaying_sources.remove(&source);
+                            if let Some(t) = self.transport_of(&pid) { t.force_close(); }
+                            return None;
+                        }
+                        pending.bytes = bytes;
+                        pending.events.push_back(*inner);
+                        return self.source_current(&pid, source, &older).then_some((older, Some(source)));
+                    }
                     return Some((*inner, Some(source)));
                 }
                 // A standby/upgrade attempt may deliver before adoption. Buffer
@@ -3826,7 +3908,7 @@ impl Conn {
             }
             // A transport-origin event must never arrive untagged. Fail closed
             // whether or not a link exists.
-            Ev::Control(..) | Ev::PcState(..) | Ev::ChannelReady(..) => None,
+            Ev::Control(..) | Ev::PcState(..) | Ev::ChannelReady(..) | Ev::Chunk(..) => None,
             // Loop-authored events are explicitly trusted: they are created by
             // this loop, not a transport callback.
             Ev::LocalControl(pid, value) => Some((Ev::Control(pid, value), None)),
@@ -3836,7 +3918,7 @@ impl Conn {
     }
 
     /// A source is current when it is the link's primary source, or (for
-    /// Control only) one of its current worker sources. PcState/ChannelReady
+    /// Control and Chunk only) one of its current worker sources. PcState/ChannelReady
     /// and a departure barrier (`Ev::PeerLeft`) are primary-only so a worker
     /// can never trigger primary teardown/readiness or a departure.
     fn source_current(&self, pid: &str, source: net::SourceId, inner: &Ev) -> bool {
@@ -3846,7 +3928,7 @@ impl Conn {
         if link.source == source {
             return true;
         }
-        matches!(inner, Ev::Control(..)) && link.worker_sources.contains(&source)
+        matches!(inner, Ev::Control(..) | Ev::Chunk(..)) && link.worker_sources.contains(&source)
     }
 
     /// Buffer a pre-adoption event for a registered source. Per-source and total
@@ -3854,8 +3936,8 @@ impl Conn {
     /// dropping the pending source and its standby transport.
     fn buffer_pending_source(&mut self, pid: String, source: net::SourceId, inner: Ev) {
         let weight = ev_weight(&inner);
-        let total_events: usize = self.pending_sources.values().map(|p| p.events.len()).sum();
-        let total_bytes: usize = self.pending_sources.values().map(|p| p.bytes).sum();
+        let total_events: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.events.len()).sum();
+        let total_bytes: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.bytes).sum();
         let over_total = total_events >= MAX_BUILD_EVENTS
             || total_bytes.saturating_add(weight) > MAX_BUILD_EVENT_BYTES;
         let is_new = !self.pending_sources.contains_key(&source);
@@ -3912,18 +3994,17 @@ impl Conn {
         }
     }
 
-    /// Replay buffered standby events after adoption. They keep their tag, so a
-    /// second replacement still rejects them at the final gate.
+    /// Queue one token per buffered event. Newer already-queued events swap with
+    /// the oldest replay item at the final gate, preserving source order.
     fn flush_pending_source(&mut self, source: net::SourceId) {
         let Some(pending) = self.pending_sources.remove(&source) else {
             return;
         };
-        for inner in pending.events {
-            let _ = self.tx.send(Ev::Sourced {
-                pid: pending.pid.clone(),
-                source,
-                inner: Box::new(inner),
-            });
+        let count = pending.events.len();
+        if count == 0 { return; }
+        self.replaying_sources.insert(source, pending);
+        for _ in 0..count {
+            let _ = self.tx.send(Ev::ReplaySource(source));
         }
     }
 
@@ -4168,9 +4249,8 @@ impl Conn {
     ///
     /// The local LAN handshake already verified this device's pair-secret MAC,
     /// so for the transfer capability every paired device holds, a daemon may
-    /// accept the offer without asking. This does not set `trusted`, does not
-    /// make the identity Proven, and grants no owner/worker capability: under
-    /// authoritative mode the trust floor still refuses an untrusted link.
+    /// accept the offer without asking. This lookup sets nothing; a live LAN
+    /// device link is already trusted as the pair from adoption.
     /// A revoked record, or a record that denies transfer, fails closed here
     /// even while its pair secret is still present in the store.
     pub fn authenticated_lan_peer(&self, pid: &str) -> Option<String> {
@@ -4203,14 +4283,6 @@ impl Conn {
             .or_else(|| self.authenticated_lan_peer(pid))
     }
 
-    /// The delegated ceiling a LAN link may carry: the live store record's caps,
-    /// only while the link's exact authenticated binding still resolves. A
-    /// revoked, removed, unbound or fleet reservation gets the empty ceiling.
-    fn lan_delegated_caps(&self, pid: &str) -> Vec<String> {
-        self.authenticated_lan_peer(pid)
-            .map(|name| self.host.device_ceiling(&name))
-            .unwrap_or_default()
-    }
 
     /// Refusal predicate for a build intent.
     ///
@@ -5802,10 +5874,9 @@ impl Conn {
             .cloned()
             .unwrap_or_else(|| json!({ "id": pid, "name": name }));
         let uid = info["uid"].as_str().map(|s| s.to_string());
-        // LAN's proof is a shared local secret, not a pair binding. A LAN link
-        // must not inherit or mint `expected_secret`, or later identity/digest
-        // decisions would treat a local-network holder as that paired device.
-        // Its device reservation is kept separately in `lan_binding`.
+        // A LAN link never mints `expected_secret`: that field also keys worker
+        // transports and the pair-proof hypothesis, which a LAN route does not
+        // use. Its device reservation is kept separately in `lan_binding`.
         let expected_secret = if lan || secret.is_empty() {
             None
         } else {
@@ -5815,6 +5886,29 @@ impl Conn {
             name: name.clone(),
             device: lan_device_binding,
         });
+        // A LAN DEVICE link is the pair. Its handshake is the same pair-secret
+        // MAC as any direct link (`direct::authenticate` keyed by
+        // `transport_key(secret)`), and the listener only holds the secrets of
+        // live, unrevoked device records (`lan_glue::keys`). So when its exact
+        // binding still resolves in the current store, it gets what the pair
+        // link to that device gets: trusted, named by the canonical petname,
+        // born `OwnerDevice` and resolved from the record like any pair link.
+        // Pairwise trust must not depend on the route two paired devices found.
+        // A fleet reservation, or a binding the store no longer holds, stays
+        // untrusted with no ceiling.
+        let lan_pair_name: Option<String> = if lan && !fleet && !ephemeral {
+            let devices = self.host.devices_load();
+            authenticated_lan_device_name(
+                lan_binding.as_ref(),
+                &devices,
+                &self.revoked_bindings,
+                &|n: &str| self.host.device_record_revoked(n),
+            )
+            .map(str::to_string)
+        } else {
+            None
+        };
+        let lan_untrusted = lan && lan_pair_name.is_none();
         self.next_gen += 1;
         let generation = self.next_gen;
         // If a Link already exists for this pid (e.g. from a stall-watchdog
@@ -5868,12 +5962,31 @@ impl Conn {
                 }
             }
             if lan {
-                // The LAN handshake proves a local holder of a shared secret,
-                // not a device binding. It must never inherit owner trust or a
-                // worker key from another direct path.
+                // Never inherit a worker key from another direct path.
+                existing.expected_secret = None;
+            }
+            if lan {
+                // Whatever this link proved before, a LAN adoption starts its
+                // identity over: `resolve_peer_identity` keeps any cached key
+                // as already resolved, so a stale one would outlive the route
+                // that proved it.
+                existing.identity_device_pub = None;
+                existing.identity_user_pub = None;
+                existing.identity_binding = BindingStrength::None;
+                existing.identity_state = IdentityState::Pending;
+                existing.identity_cert_expires = None;
+            }
+            if let Some(n) = &lan_pair_name {
+                // Re-resolve from the record as a fresh pair link would, so a
+                // delegated record gets its ceiling.
+                existing.trusted = true;
+                existing.verified_name = Some(n.clone());
+                existing.principal_kind = PrincipalKind::OwnerDevice;
+            } else if lan_untrusted {
+                // A fleet reservation, or a binding the store no longer holds:
+                // no device trust, no identity, no ceiling.
                 existing.trusted = false;
                 existing.verified_name = None;
-                existing.expected_secret = None;
                 existing.principal_kind = PrincipalKind::Delegated { caps: Vec::new() };
             }
             resolve_peer_identity(existing);
@@ -5907,9 +6020,11 @@ impl Conn {
                     // that the peer is in the fleet. So it is born untrusted, with no
                     // petname and no owner-equivalence, until a verified fleet-hello
                     // names it.
-                    trusted: !fleet && !ephemeral && !lan,
-                    verified_name: if fleet || ephemeral || lan {
+                    trusted: !fleet && !ephemeral && !lan_untrusted,
+                    verified_name: if fleet || ephemeral || lan_untrusted {
                         None
+                    } else if lan_pair_name.is_some() {
+                        lan_pair_name.clone()
                     } else {
                         expected_secret.as_ref().map(|(n, _)| n.clone())
                     },
@@ -5924,7 +6039,7 @@ impl Conn {
                     identity_binding: BindingStrength::None,
                     identity_state: IdentityState::Pending,
                     identity_cert_expires: None,
-                    principal_kind: if fleet || lan {
+                    principal_kind: if fleet || lan_untrusted {
                         PrincipalKind::Delegated { caps: Vec::new() }
                     } else {
                         PrincipalKind::OwnerDevice
@@ -5933,18 +6048,11 @@ impl Conn {
                 },
             );
         }
-        if lan {
-            // The LAN link was admitted with the exact pair secret of a CURRENT
-            // live device record. Its delegated principal carries that record's
-            // ceiling, so the receiver's transfer gate does not read the empty
-            // caps an unverified direct link is born with. A revoked, removed,
-            // unbound or fleet reservation resolves nothing here and keeps the
-            // empty ceiling. This is authority for the LAN delegated principal
-            // only: `trusted` stays false, no `verified_name` is minted, and
-            // `expected_secret`/worker keys are untouched.
-            let caps = self.lan_delegated_caps(pid);
+        if lan_pair_name.is_some() {
+            // Resolve now, not at the later ready event: a delegated (invited)
+            // record must get its ceiling before anything can be gated on it.
             if let Some(link) = self.links.get_mut(pid) {
-                link.principal_kind = PrincipalKind::Delegated { caps };
+                resolve_peer_identity(link);
             }
         }
         // Replay anything the standby buffered before adoption. The tags remain,
@@ -6056,9 +6164,7 @@ impl Conn {
             tokio::spawn(async move {
                 let workers =
                     direct::accept_workers(endpoints, tkey, pid.clone(), tx.clone(), count).await;
-                if !workers.is_empty() {
-                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers, primary_source));
-                }
+                direct::announce_workers(workers, &tx, pid, primary_source);
             });
         } else {
             // DIALER: wait for the acceptor's worker ports, then connect to each.
@@ -6077,9 +6183,7 @@ impl Conn {
                 let workers =
                     direct::dial_workers(ports, peer_ip, tkey, pid.clone(), tx.clone(), count)
                         .await;
-                if !workers.is_empty() {
-                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers, primary_source));
-                }
+                direct::announce_workers(workers, &tx, pid, primary_source);
             });
         }
     }
@@ -7972,11 +8076,27 @@ impl Conn {
         // and finalizer below. Ordinary ready/pending behaviour is unchanged.
         let forced = v["__fil_force_drop"].as_bool() == Some(true);
         if forced {
+            self.replay_departures.remove(pid_val);
             if let Some(events) = self.link_events.get_mut(pid_val) {
                 events.departure_ready = None;
                 events.departure_pending = None;
             }
         } else {
+            if let Some((source, ready)) = self.replay_departures.get(pid_val).copied() {
+                if self.links.get(pid_val).map(|link| link.source) != Some(source) {
+                    self.replay_departures.remove(pid_val);
+                    if ready { return false; }
+                } else {
+                    if !ready { return false; }
+                    self.replay_departures.remove(pid_val);
+                }
+            } else if let Some(source) = self.links.get(pid_val).map(|link| link.source) {
+                if self.replaying_sources.contains_key(&source) {
+                    self.replay_departures.insert(pid_val.to_string(), (source, false));
+                    let _ = self.tx.send(Ev::ReplayDeparture(pid_val.to_string(), source, v.clone()));
+                    return false;
+                }
+            }
             // A departure barrier `stage_event` admitted: the departed link's
             // already-read events were dispatched ahead of it, and the marker is
             // bound to that exact source. Consume it once and run the ordinary
@@ -9069,6 +9189,8 @@ mod warm_identity_tests {
         transfer_allowed: bool,
         /// The live store record's capability ceiling for `device_ceiling`.
         ceilings: Vec<(String, Vec<String>)>,
+        /// Delegated (invited) records' ceilings for `principal_ceiling_for`.
+        principal_ceilings: Vec<(String, Vec<String>)>,
     }
 
     #[async_trait::async_trait]
@@ -9097,6 +9219,12 @@ mod warm_identity_tests {
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
                 .map(|(_, caps)| caps.clone())
                 .unwrap_or_default()
+        }
+        fn principal_ceiling_for(&self, name: &str) -> Option<Vec<String>> {
+            self.principal_ceilings
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, caps)| caps.clone())
         }
         fn is_self_uid(&self, _my_uid: &str, _peer_uid: Option<&str>) -> bool {
             false
@@ -9209,11 +9337,6 @@ mod warm_identity_tests {
             Some("boxb"),
             "reach-pong could not key a LAN link by its exact device binding"
         );
-        assert_eq!(
-            conn.lan_delegated_caps(pid),
-            vec!["transfer".to_string()],
-            "a live LAN device must carry its stored ceiling, not the empty one"
-        );
         assert!(!conn.link(pid).unwrap().trusted, "routing must not mint trust");
         assert!(
             conn.link(pid).unwrap().verified_name.is_none(),
@@ -9248,10 +9371,6 @@ mod warm_identity_tests {
         assert_eq!(revoked_conn.authenticated_lan_peer(pid), None);
         assert!(revoked_conn.link_peer_name(pid).is_none());
         assert!(
-            revoked_conn.lan_delegated_caps(pid).is_empty(),
-            "a revoked record's retained secret still minted a non-empty ceiling"
-        );
-        assert!(
             crate::lan_glue::keys(&*revoked_host).is_empty(),
             "a revoked record's retained secret was offered as a LAN MAC key"
         );
@@ -9267,7 +9386,6 @@ mod warm_identity_tests {
         let (mut removed_conn, _far, _rx) = test_conn_with_host(removed_host).await;
         removed_conn.links.insert(pid.to_string(), lan_link(pid));
         assert!(removed_conn.link_peer_name(pid).is_none());
-        assert!(removed_conn.lan_delegated_caps(pid).is_empty());
 
         // A live record that DENIES transfer still routes (routing is not
         // permission) but must not earn the daemon's baseline auto-consent or a
@@ -9283,7 +9401,166 @@ mod warm_identity_tests {
         denied_conn.links.insert(pid.to_string(), lan_link(pid));
         assert!(warm_link_for(&denied_conn, "boxb").is_some());
         assert_eq!(denied_conn.authenticated_lan_peer(pid), None);
-        assert!(denied_conn.lan_delegated_caps(pid).is_empty());
+    }
+
+    /// Re-adopting an EXISTING link over LAN starts its identity over. A link
+    /// that had proven a device key, or held sibling or owner standing, keeps
+    /// none of it when the LAN binding no longer resolves, and a LAN pair is
+    /// re-resolved from the record rather than inheriting the old key.
+    #[tokio::test]
+    async fn an_existing_link_adopted_over_lan_keeps_no_stale_identity() {
+        fn stale(pid: &str, log: &Arc<std::sync::Mutex<Vec<String>>>) -> Link {
+            let dead: Arc<dyn Transport> = Rec::new("dead-serving", log);
+            dead.force_close();
+            let mut link = relay_link(pid, "boxb", "boxb", dead);
+            link.trusted = true;
+            link.verified_name = Some("boxb".into());
+            link.identity_device_pub = Some([7; 32]);
+            link.identity_user_pub = Some([8; 32]);
+            link.identity_binding = BindingStrength::Proven;
+            link.identity_state = IdentityState::Resolved;
+            link.identity_cert_expires = Some(u64::MAX);
+            link.principal_kind = PrincipalKind::FleetSibling;
+            link
+        }
+        for (what, host) in [
+            (
+                "revoked record",
+                TestHost {
+                    devices: vec![("boxb".to_string(), "s1".to_string())],
+                    revoked_records: vec!["boxb".to_string()],
+                    ..Default::default()
+                },
+            ),
+            ("forgotten record", TestHost::default()),
+        ] {
+            let (mut conn, _far, _rx) = test_conn_with_host(Arc::new(host)).await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "sid-lan-stale";
+            conn.links.insert(pid.into(), stale(pid, &log));
+            let t: Arc<dyn Transport> = Rec::with_attempt("lan", &log, net::AttemptId::next());
+            conn.seed_lan(pid, "boxb", "s1", false, t.attempt_id().unwrap());
+            assert!(matches!(
+                conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN),
+                DirectAdoption::Adopted { tkey: None, .. }
+            ));
+            let link = &conn.links[pid];
+            assert!(!link.trusted, "{what}: stale trust survived");
+            assert!(link.verified_name.is_none(), "{what}: stale name survived");
+            assert!(link.identity_device_pub.is_none(), "{what}: stale device key survived");
+            assert!(link.identity_user_pub.is_none(), "{what}: stale user key survived");
+            assert_eq!(link.identity_binding, BindingStrength::None, "{what}");
+            assert!(link.identity_cert_expires.is_none(), "{what}");
+            assert!(!matches!(link.identity_state, IdentityState::Resolved), "{what}");
+            assert!(!link.fleet_proven(), "{what}: sibling standing survived");
+            assert!(
+                matches!(&link.principal_kind, PrincipalKind::Delegated { caps } if caps.is_empty()),
+                "{what}: stale principal survived"
+            );
+            assert!(link.expected_secret.is_none(), "{what}: a worker key survived");
+        }
+
+        // A live binding: the pair, re-resolved, with no inherited key.
+        let host = TestHost {
+            devices: vec![("boxb".to_string(), "s1".to_string())],
+            ..Default::default()
+        };
+        let (mut conn, _far, _rx) = test_conn_with_host(Arc::new(host)).await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-lan-stale";
+        conn.links.insert(pid.into(), stale(pid, &log));
+        let t: Arc<dyn Transport> = Rec::with_attempt("lan", &log, net::AttemptId::next());
+        conn.seed_lan(pid, "boxb", "s1", false, t.attempt_id().unwrap());
+        assert!(matches!(
+            conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN),
+            DirectAdoption::Adopted { tkey: None, .. }
+        ));
+        let link = &conn.links[pid];
+        assert!(link.trusted);
+        assert_eq!(link.verified_name.as_deref(), Some("boxb"));
+        assert!(link.identity_device_pub.is_none(), "the old device key was inherited");
+        assert!(matches!(link.principal_kind, PrincipalKind::OwnerDevice));
+    }
+
+    /// A LAN DEVICE link is the pair only while its exact binding is live. A
+    /// record revoked on disk (secret retained, no sweep yet) or a forgotten
+    /// record adopts untrusted, unnamed and with the empty ceiling, exactly
+    /// what the old blanket LAN rule gave every link. A session-revoked
+    /// binding is refused before adoption and installs no link at all.
+    #[tokio::test]
+    async fn a_lan_link_is_the_pair_only_while_its_binding_is_live() {
+        async fn try_adopt(host: TestHost, session_revoked: bool) -> Option<Link> {
+            let (mut conn, _far, _rx) = test_conn_with_host(Arc::new(host)).await;
+            if session_revoked {
+                conn.revoked_bindings.insert("s1".to_string());
+            }
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "sid-lan-binding";
+            let t: Arc<dyn Transport> = Rec::with_attempt("lan", &log, net::AttemptId::next());
+            let attempt = t.attempt_id().unwrap();
+            conn.seed_lan(pid, "boxb", "s1", false, attempt);
+            match conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN) {
+                DirectAdoption::Adopted { tkey, .. } => {
+                    assert!(tkey.is_none(), "a LAN adoption minted a worker key");
+                    Some(conn.links.remove(pid).unwrap())
+                }
+                DirectAdoption::Rejected => {
+                    assert!(!conn.links.contains_key(pid));
+                    None
+                }
+                _ => panic!("unexpected LAN adoption outcome"),
+            }
+        }
+        async fn adopt(host: TestHost) -> Link {
+            try_adopt(host, false).await.expect("LAN adoption was refused")
+        }
+        fn live() -> TestHost {
+            TestHost {
+                devices: vec![("BoxB".to_string(), "s1".to_string())],
+                transfer_allowed: true,
+                ..Default::default()
+            }
+        }
+        let pair = adopt(live()).await;
+        assert!(pair.trusted);
+        assert_eq!(
+            pair.verified_name.as_deref(),
+            Some("BoxB"),
+            "the LAN pair must be named by the canonical stored petname"
+        );
+        assert!(matches!(pair.principal_kind, PrincipalKind::OwnerDevice));
+        assert!(pair.expected_secret.is_none(), "a LAN link minted a worker key");
+
+        // An invited (delegated) record is resolved at adoption like any pair
+        // link: with no live certificate it is pinned to the empty ceiling,
+        // never left owner-equivalent by the LAN route.
+        let invited = TestHost {
+            principal_ceilings: vec![("boxb".to_string(), vec!["transfer".to_string()])],
+            ..live()
+        };
+        let invited = adopt(invited).await;
+        assert!(
+            matches!(&invited.principal_kind, PrincipalKind::Delegated { caps } if caps.is_empty()),
+            "a delegated record over LAN was not resolved from its record"
+        );
+
+        let revoked = TestHost { revoked_records: vec!["boxb".to_string()], ..live() };
+        let forgotten = TestHost { devices: vec![], ..live() };
+        assert!(
+            try_adopt(live(), true).await.is_none(),
+            "a session-revoked LAN binding installed a link"
+        );
+        for (what, link) in [
+            ("revoked record", adopt(revoked).await),
+            ("forgotten record", adopt(forgotten).await),
+        ] {
+            assert!(!link.trusted, "{what}: LAN link was trusted");
+            assert!(link.verified_name.is_none(), "{what}: LAN link was named");
+            assert!(
+                matches!(&link.principal_kind, PrincipalKind::Delegated { caps } if caps.is_empty()),
+                "{what}: LAN link carried authority"
+            );
+        }
     }
 
     // --- the pure decision ------------------------------------------------
@@ -11028,6 +11305,92 @@ mod warm_identity_tests {
         assert_eq!(conn.builds[pid].early.len(), 1);
     }
 
+    /// An installed WebRTC link's events wake the loop: the first event queues
+    /// one `BuildWake` on the main queue, further events before the next drain
+    /// queue none, and `pump_builds` forwards them in order and re-arms the
+    /// wake. Before this, nothing woke the loop and the events waited for an
+    /// unrelated one (promote-mbb M1/M3: 2.41 or 3.61 s instead of ~0.1 s).
+    #[tokio::test]
+    async fn an_installed_links_events_wake_the_loop_once_per_drain() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-wake";
+        let t = Rec::new("webrtc", &log);
+        let link = relay_link(pid, "peer", "peer", t);
+        let generation = link.generation;
+        conn.links.insert(pid.to_string(), link);
+        let (candidate_tx, candidate_rx) = mpsc::unbounded_channel();
+        conn.link_events.insert(
+            pid.to_string(),
+            LinkEvents {
+                generation,
+                rx: std::sync::Mutex::new(candidate_rx),
+                departure_ready: None,
+                departure_pending: None,
+            },
+        );
+        let sink = net::EvSink::waking(candidate_tx, conn.tx.clone(), conn.candidate_wake.clone());
+        let wakes = |rx: &mut mpsc::UnboundedReceiver<Ev>| {
+            let mut n = 0;
+            while let Ok(ev) = rx.try_recv() {
+                if matches!(ev, Ev::BuildWake) {
+                    n += 1;
+                }
+            }
+            n
+        };
+        let _ = wakes(&mut rx);
+
+        for i in 0..50 {
+            sink.send(Ev::Control(pid.to_string(), json!({ "type": "data", "i": i })))
+                .unwrap();
+        }
+        assert_eq!(wakes(&mut rx), 1, "a burst must wake the loop exactly once");
+
+        conn.pump_builds();
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Ev::Control(from, v) = ev {
+                assert_eq!(from, pid);
+                seen.push(v["i"].as_i64().unwrap());
+            }
+        }
+        assert_eq!(seen, (0..50).collect::<Vec<i64>>(), "forwarded in order, none lost");
+
+        sink.send(Ev::Control(pid.to_string(), json!({ "type": "data", "i": 50 })))
+            .unwrap();
+        assert_eq!(wakes(&mut rx), 1, "the drain must re-arm the wake");
+    }
+
+    /// The departure path drains the link's queue directly. With no forwarder
+    /// between the peer and that queue, an event the peer sent before departure
+    /// is already in it, so the drain sees it; and once the queue is gone a
+    /// late send fails and wakes nothing.
+    #[tokio::test]
+    async fn a_sent_event_is_in_the_queue_at_departure_and_a_dropped_queue_wakes_nothing() {
+        let (conn, _far, mut rx) = test_conn().await;
+        let (candidate_tx, mut candidate_rx) = mpsc::unbounded_channel();
+        let sink = net::EvSink::waking(candidate_tx, conn.tx.clone(), conn.candidate_wake.clone());
+        sink.send(Ev::Control("p".into(), json!({ "type": "l2-close", "sid": 1 })))
+            .unwrap();
+        // No await between the send and the drain: nothing else had to run.
+        match candidate_rx.try_recv() {
+            Ok(Ev::Control(_, v)) => assert_eq!(v["type"], "l2-close"),
+            _ => panic!("the final control was not in the link's queue"),
+        }
+        while rx.try_recv().is_ok() {}
+        conn.candidate_wake.store(false, Ordering::SeqCst);
+        drop(candidate_rx);
+        assert!(
+            sink.send(Ev::Control("p".into(), json!({ "type": "late" }))).is_err(),
+            "a dropped link's queue must refuse the event"
+        );
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|ev| matches!(ev, Ev::BuildWake)),
+            "a dropped link's event woke the loop"
+        );
+    }
+
     /// Signaling can arrive before installation; the envelope names the peer in
     /// `from`, which is what a candidate build must be matched on.
     #[tokio::test]
@@ -12760,7 +13123,8 @@ mod warm_identity_tests {
 
     /// A LAN reservation carries the exact checked attempt and authenticated
     /// device binding. It adopts once, consumes only that reservation, mints no
-    /// worker key, is not device-trusted, and a duplicate Arc is harmless.
+    /// worker key, is the pair (trusted, named, `OwnerDevice`) while its binding
+    /// is live, and a duplicate Arc is harmless.
     #[tokio::test]
     async fn lan_reservation_adopts_once_and_duplicate_is_harmless() {
         let host = Arc::new(TestHost {
@@ -12802,7 +13166,8 @@ mod warm_identity_tests {
         ));
         let link = &conn.links[pid];
         assert_eq!(link.direct_route, filament_transport::lan::ROUTE_LAN);
-        assert!(!link.trusted, "LAN was born device-trusted");
+        assert!(link.trusted, "a LAN link to a live paired device was not the pair");
+        assert_eq!(link.verified_name.as_deref(), Some("dev"));
         assert!(link.expected_secret.is_none());
         assert_eq!(
             link.lan_binding.as_ref().and_then(|b| b.device.clone()),
@@ -12851,16 +13216,16 @@ mod warm_identity_tests {
             conn.links[existing_pid].transport.as_ref().unwrap(),
             &lan_existing
         ));
-        // The link's DELEGATED ceiling comes from the authenticated device's
-        // current store record, not from the empty default that denied every
-        // transfer at the capability gate.
+        // Both paths give the pair link's principal and trust, resolved from
+        // the record exactly as a pair link is, not the empty delegated
+        // ceiling that refused the forward a granted pair carries.
         for owned in [pid, existing_pid] {
+            let link = &conn.links[owned];
+            assert!(link.trusted, "LAN adoption of {owned} was not the pair");
+            assert_eq!(link.verified_name.as_deref(), Some("dev"));
             assert!(
-                matches!(
-                    &conn.links[owned].principal_kind,
-                    PrincipalKind::Delegated { caps } if caps == &vec!["transfer".to_string()]
-                ),
-                "LAN adoption did not apply the stored transfer ceiling to {owned}"
+                matches!(&link.principal_kind, PrincipalKind::OwnerDevice),
+                "LAN adoption of {owned} did not carry the pair principal"
             );
         }
 
@@ -12875,6 +13240,8 @@ mod warm_identity_tests {
             conn.adopt_direct(fleet_pid, fleet_lan, filament_transport::lan::ROUTE_LAN),
             DirectAdoption::Adopted { tkey: None, .. }
         ));
+        assert!(!conn.links[fleet_pid].trusted, "a fleet LAN reservation was trusted");
+        assert!(conn.links[fleet_pid].verified_name.is_none());
         let fleet_binding = conn.links[fleet_pid].lan_binding.as_ref().unwrap();
         assert_eq!(fleet_binding.name, "fleet");
         assert!(fleet_binding.device.is_none());
@@ -12892,8 +13259,8 @@ mod warm_identity_tests {
         assert!(auth.transport_key().is_none());
     }
 
-    /// A live LAN link is deduped by its authenticated reservation even though
-    /// it is deliberately untrusted and unnamed. Its exact device binding drives
+    /// A live LAN link is deduped by its authenticated reservation. Its exact
+    /// device binding drives
     /// revocation, while a dead LAN link no longer dedups and unrelated device
     /// or fleet links survive the LAN link's removal.
     #[tokio::test]
@@ -12918,8 +13285,8 @@ mod warm_identity_tests {
             conn.adopt_direct(pid, t.clone(), filament_transport::lan::ROUTE_LAN),
             DirectAdoption::Adopted { .. }
         ));
-        assert!(!conn.links[pid].trusted);
-        assert!(conn.links[pid].verified_name.is_none());
+        assert!(conn.links[pid].trusted);
+        assert_eq!(conn.links[pid].verified_name.as_deref(), Some("dev"));
         assert!(conn.links[pid].expected_secret.is_none());
         assert_eq!(
             conn.links[pid].lan_binding.as_ref().and_then(|b| b.device.clone()),
@@ -13275,6 +13642,203 @@ mod warm_identity_tests {
         assert!(conn
             .stage_event(Ev::LocalControl(pid.into(), json!({ "type": "x" })))
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn chunk_attribution_fences_pairing_and_worker_dispatch() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "pairing-peer";
+        let primary = Rec::new("primary", &log);
+        let source = primary.source_id().unwrap();
+        let worker = Rec::new("worker", &log);
+        let worker_source = worker.source_id().unwrap();
+        let retired = net::SourceId::next();
+        let mut link = relay_link(pid, "peer", "peer", primary);
+        link.source = source;
+        link.worker_sources.insert(worker_source);
+        conn.links.insert(pid.into(), link);
+        let chunk = |s, envelope: &str, inner: &str| Ev::Sourced {
+            pid: envelope.into(), source: s,
+            inner: Box::new(Ev::Chunk(inner.into(), 42, Some(0), bytes::Bytes::from_static(b"pair"))),
+        };
+        assert!(matches!(conn.stage_event(chunk(source, pid, pid)), Some((Ev::Chunk(..), Some(s))) if s == source));
+        assert!(matches!(conn.stage_event(chunk(worker_source, pid, pid)), Some((Ev::Chunk(..), Some(s))) if s == worker_source));
+        assert!(conn.stage_event(chunk(retired, pid, pid)).is_none());
+        assert!(conn.stage_event(chunk(source, pid, "other")).is_none());
+        assert!(conn.stage_event(Ev::Chunk(pid.into(), 42, Some(0), bytes::Bytes::new())).is_none());
+
+        // A registered standby may read before adoption. Replay stays tagged,
+        // and replacement between flush and dispatch must still fence it.
+        let standby = Rec::new("standby", &log);
+        let standby_source = standby.source_id().unwrap();
+        conn.pending_sources.insert(standby_source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::new(), bytes: 0,
+        });
+        assert!(conn.stage_event(chunk(standby_source, pid, pid)).is_none());
+        assert_eq!(conn.pending_sources[&standby_source].events.len(), 1);
+        assert_eq!(conn.pending_sources[&standby_source].bytes, 4);
+        conn.links.get_mut(pid).unwrap().source = standby_source;
+        conn.flush_pending_source(standby_source);
+        assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(..), Some(s))) if s == standby_source));
+
+        conn.links.get_mut(pid).unwrap().source = source;
+        conn.pending_sources.insert(standby_source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::new(), bytes: 0,
+        });
+        assert!(conn.stage_event(chunk(standby_source, pid, pid)).is_none());
+        conn.links.get_mut(pid).unwrap().source = standby_source;
+        conn.flush_pending_source(standby_source);
+        conn.links.get_mut(pid).unwrap().source = source;
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
+        conn.links.get_mut(pid).unwrap().worker_sources.clear();
+        assert!(conn.stage_event(chunk(worker_source, pid, pid)).is_none());
+    }
+
+    #[tokio::test]
+    async fn buffered_standby_chunks_cannot_be_overtaken_at_adoption() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "ordered-standby";
+        let old = Rec::new("old", &log);
+        let old_source = old.source_id().unwrap();
+        let standby = Rec::new("standby", &log);
+        let source = standby.source_id().unwrap();
+        let mut link = relay_link(pid, "peer", "peer", old);
+        link.source = old_source;
+        conn.links.insert(pid.into(), link);
+        conn.pending_sources.insert(source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::new(), bytes: 0,
+        });
+        let chunk = |offset, data: &'static [u8]| Ev::Sourced {
+            pid: pid.into(), source,
+            inner: Box::new(Ev::Chunk(pid.into(), 42, Some(offset), bytes::Bytes::from_static(data))),
+        };
+        assert!(conn.stage_event(chunk(0, b"old")).is_none());
+        // This event is already in the normal queue when adoption happens.
+        conn.tx.send(chunk(3, b"new")).unwrap();
+        conn.links.get_mut(pid).unwrap().source = source;
+        conn.flush_pending_source(source);
+        let first = conn.stage_event(rx.try_recv().unwrap()).unwrap().0;
+        let second = conn.stage_event(rx.try_recv().unwrap()).unwrap().0;
+        assert!(matches!(first, Ev::Chunk(_, 42, Some(0), ref data) if data.as_ref() == b"old"));
+        assert!(matches!(second, Ev::Chunk(_, 42, Some(3), ref data) if data.as_ref() == b"new"));
+        assert!(conn.replaying_sources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_precedes_real_departure_paths_and_fences_replacement() {
+        for sourced_barrier in [false, true] {
+            let (mut conn, _far, mut rx) = test_conn().await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "replay-departure";
+            let transport = Rec::new("current", &log);
+            let source = transport.source_id().unwrap();
+            conn.links.insert(pid.into(), delegated_link(pid, transport));
+            if sourced_barrier {
+                let (_tx, queued) = tokio::sync::mpsc::unbounded_channel();
+                conn.link_events.insert(pid.into(), LinkEvents {
+                    generation: 7, rx: std::sync::Mutex::new(queued),
+                    departure_ready: None, departure_pending: Some(source),
+                });
+            }
+            conn.pending_sources.insert(source, PendingSource {
+                pid: pid.into(), attempt: None, at: Instant::now(),
+                events: std::collections::VecDeque::from([Ev::Chunk(
+                    pid.into(), 42, Some(0), bytes::Bytes::from_static(b"before-left"),
+                )]), bytes: 11,
+            });
+            let payload = json!({"id": pid});
+            let departure = if sourced_barrier {
+                Ev::Sourced { pid: pid.into(), source, inner: Box::new(Ev::PeerLeft(payload.clone())) }
+            } else { Ev::PeerLeft(payload.clone()) };
+            conn.tx.send(departure).unwrap();
+            conn.flush_pending_source(source);
+            if let Some((Ev::PeerLeft(v), _)) = conn.stage_event(rx.try_recv().unwrap()) {
+                assert!(!conn.on_peer_left(&v));
+            } else {
+                assert!(sourced_barrier, "ordinary room departure was not dispatched");
+            }
+            assert!(conn.links.contains_key(pid), "departure overtook buffered data");
+            assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(_, 42, Some(0), ref b), Some(s))) if s == source && b.as_ref() == b"before-left"));
+            let (Ev::PeerLeft(v), seen) = conn.stage_event(rx.try_recv().unwrap()).expect("deferred departure") else { panic!("expected departure") };
+            assert_eq!(seen, Some(source));
+            conn.on_peer_left(&v);
+            assert!(!conn.links.contains_key(pid), "departure did not finalize");
+        }
+
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "replay-replacement";
+        let old = Rec::new("old", &log);
+        let source = old.source_id().unwrap();
+        conn.links.insert(pid.into(), delegated_link(pid, old));
+        conn.pending_sources.insert(source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"x"))]), bytes: 1,
+        });
+        conn.flush_pending_source(source);
+        assert!(!conn.on_peer_left(&json!({"id": pid})));
+        let successor = Rec::new("successor", &log);
+        conn.links.insert(pid.into(), delegated_link(pid, successor));
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
+        assert!(conn.links.contains_key(pid), "stale deferred departure dropped replacement");
+
+        // A replacement after the deferred event passes staging but before its
+        // caller invokes on_peer_left must also survive.
+        let current = conn.links[pid].source;
+        conn.replaying_sources.insert(current, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"y"))]), bytes: 1,
+        });
+        conn.tx.send(Ev::ReplaySource(current)).unwrap();
+        assert!(!conn.on_peer_left(&json!({"id": pid})));
+        assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(..), _))));
+        let (Ev::PeerLeft(deferred), _) = conn.stage_event(rx.try_recv().unwrap()).unwrap() else { panic!("expected staged departure") };
+        conn.drop_link(pid);
+        let newer = Rec::new("newer", &log);
+        conn.links.insert(pid.into(), delegated_link(pid, newer));
+        assert!(!conn.on_peer_left(&deferred));
+        assert!(conn.links.contains_key(pid), "staged departure dropped a newer link");
+    }
+
+    /// The replay swap path closes the CURRENT, already adopted transport when
+    /// the replay would exceed the event budget. That is a behaviour change on
+    /// a live link, so it is pinned here rather than left implicit: the
+    /// standby's replay is dropped, the adopted link's transport is closed,
+    /// and the daemon keeps running.
+    #[tokio::test]
+    async fn a_replay_overflow_closes_the_adopted_link_not_the_standby() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "replay-overflow";
+        let adopted = Rec::new("adopted", &log);
+        let source = adopted.source_id().unwrap();
+        conn.links
+            .insert(pid.into(), delegated_link(pid, adopted.clone()));
+        // A replay already in flight for this source, with one buffered event.
+        conn.replaying_sources.insert(source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"old"))]), bytes: 3,
+        });
+        // A new event over the budget: the swap overflows and must close the
+        // adopted transport.
+        // The comparison is strict (`>`), so exactly the limit is allowed.
+        // One byte above it must take the overflow path.
+        let big = vec![0u8; MAX_BUILD_EVENT_BYTES + 1];
+        let ev = Ev::Sourced {
+            pid: pid.into(),
+            source,
+            inner: Box::new(Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from(big))),
+        };
+        assert!(conn.stage_event(ev).is_none(), "the overflowing event must not be dispatched");
+        assert!(!conn.replaying_sources.contains_key(&source), "the replay entry must be dropped");
+        assert!(conn.links.contains_key(pid), "the daemon must survive the overflow");
+        assert!(adopted.is_dead(), "overflow must close the adopted transport");
     }
 
     /// A registered standby source buffers until adoption, replays with its tag,

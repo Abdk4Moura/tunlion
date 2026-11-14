@@ -561,6 +561,11 @@ them). What a client must honour on the link and on the network:
   The dialer writes its tag first; the listener finds the secret by trying
   each it holds and then answers. No identifier precedes the tag. The
   observed-address exchange of the signaled path is not run on it.
+- **Authority**: that MAC is the pair proof, so a lan link to a paired device
+  IS the pair: it carries the same trust, petname and grants as that pair's
+  link by any other route, for as long as the record is live (not revoked,
+  not forgotten, not re-paired). Pairwise trust never depends on the route.
+  A link authenticated by the fleet secret keeps fleet rules.
 - **Route word**: a link made this way reports `route: "lan"` in `ping`/`reach`
   and `devices --json`; the human forms are `lan, direct` and `online lan`.
 - **Off switch**: `network.transports` without `lan` means no datagram, no
@@ -1496,6 +1501,45 @@ gate time and on every revoke tick (never cached at link open), keyed by
 the peer's verified device identity, and checks the requested action
 against it (`ceiling_covers_action`). Anything outside the ceiling needs
 an explicit grant exactly as before.
+
+## Pair grants count in both modes (pairwise-first)
+
+Any device may pair with any other, and the only restrictions on a pair come
+from fleet-wide rules. A grant one device gives its pair (`tunlion grant <peer>
+<cap>` on THIS device, written into its own `devices.json` record, no owner key
+involved) is an explicit grant for that action in shadow AND in authoritative
+mode (`TUNLION_CAP_AUTHORITATIVE=1`). Authoritative mode does not additionally
+require an owner-signed grant for a pair peer.
+
+- A pair is a link that proved the pair secret and carries no delegated
+  ceiling. A delegated or invited device is not a pair for this rule: its
+  record caps are its ceiling, and the ceiling stays its bound.
+- The record's STORED caps are what count, including the pairing default
+  `["transfer"]` and a v1 record with no `caps` key, which reads as
+  `["transfer"]`: a pairing itself grants transfer, so in authoritative mode a
+  trusted, Proven, unexpired pair with default caps is admitted for
+  file-offer and sync, as shadow mode already admits it. That default grants
+  no other action (shell, forward, mount each need their own grant).
+  `device_allows`' implied transfer answer is NOT used: a record with
+  `caps: []`, or whose `capExpires` entry for the action has lapsed, grants
+  nothing.
+- A record revoked on disk (`certRevoked` or a terminal `principalState`)
+  never counts as a pair grant, even before the revocation sweep reaches the
+  live link.
+- A local deny for the action, a revoked device, a delegated ceiling that
+  lacks the action, an expired certificate and a non-Proven binding each
+  refuse it exactly as they refuse an owner-signed grant, and the shell
+  identity requirement (a resolved device identity) is unchanged.
+- Fleet siblings keep their own rule (`fleet_sibling_inputs` below); this rule
+  neither widens nor narrows it. Shadow decisions are unchanged: shadow
+  already decides on the legacy fold, which read the record grant.
+
+The rule is `filament_cap::capability::pair_grant_inputs`, applied by every
+gate that reads a record grant: shell, pty, exec, ssh-sign and forward
+(`gather_shell_gate_inputs`, and the terminal recheck), mount, file-offer
+transfer and sync. Both hosts answer the record grant from the caps their own
+device views read: the CLI daemon from `device_caps`, Core from
+`devices::record_caps` (Core serves the transfer gate only).
 
 ## Owner-signed fleet grant sets (`fleet-grants`) and `fleet.owner_grants`
 
