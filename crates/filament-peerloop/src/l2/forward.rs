@@ -93,7 +93,8 @@ pub struct ForwardDenial {
     /// link the admission examined.
     pub transport: Arc<dyn Transport>,
     /// The gate refused only because this link has not resolved WHO the peer
-    /// is yet (no proven name, no device key). That is not a verdict about the
+    /// is yet: no proven name, no device key, and the link is younger than
+    /// `UNSETTLED_IDENTITY_WINDOW`. That is not a verdict about the
     /// device, so the close is the retryable settle refusal, never the final
     /// not-granted one: a guest whose link raced its own proof was told it
     /// "lacks shell grant" and its forward stopped for good. Never set for an
@@ -158,6 +159,25 @@ pub struct ForwardRefusal {
     pub reason: String,
     pub close: Value,
     pub transport: Arc<dyn Transport>,
+}
+
+/// How long a link with no proven name may answer a forward with the
+/// retryable settle refusal. A pair-proof that raced the link's fingerprints is
+/// held for 10 s and verified as soon as they are known; past this window the
+/// identity is not settling and the refusal is final, so a forward on a link
+/// that will never resolve still ends instead of retrying on it forever.
+pub const UNSETTLED_IDENTITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// May this link's unresolved identity still settle? Only a link with no
+/// proven name that came up within `UNSETTLED_IDENTITY_WINDOW`. A link that
+/// proved its name and still does not resolve is final (a revoked or
+/// uncertified record, a certificate that does not verify).
+fn identity_may_still_settle(conn: &Conn, pid: &str) -> bool {
+    conn.link(pid).is_some_and(|l| {
+        l.verified_name.is_none()
+            && l.established_at
+                .is_some_and(|at| at.elapsed() < UNSETTLED_IDENTITY_WINDOW)
+    })
 }
 
 /// When the link's proven name files the peer under a delegated record whose
@@ -283,6 +303,13 @@ pub async fn admit_forward_open(
                     r.push_str(&reinvite_suffix(ri));
                 }
                 cap_reason = Some(r);
+                identity_unsettled = false;
+            } else if !identity_may_still_settle(conn, pid) {
+                // A link that already proved its name, or has had longer than
+                // the settle window to do so, is not racing its proof: its
+                // unresolved identity is final (a revoked or uncertified
+                // record, a certificate that does not verify), and so is the
+                // not-granted verdict it always got.
                 identity_unsettled = false;
             }
         }
@@ -780,6 +807,8 @@ mod tests {
         l.identity_cert_expires = None;
         l.identity_binding = cap::BindingStrength::None;
         l.identity_state = cap::IdentityState::Pending;
+        // The race this models is a link that just came up.
+        l.established_at = Some(std::time::Instant::now());
     }
 
     #[tokio::test]
@@ -847,6 +876,53 @@ mod tests {
             panic!("an anonymous identity must not be admitted");
         };
         assert!(!d.identity_unsettled);
+        assert_eq!(d.close_frame(None, || None)["code"], "not-granted");
+        assert!(muxes.is_empty());
+
+        // A link that already proved its name and still does not resolve is
+        // not racing its proof (an uncertified or revoked record): final.
+        {
+            let l = conn.links.get_mut(PID).unwrap();
+            l.identity_state = cap::IdentityState::Pending;
+            l.verified_name = Some("guest".into());
+        }
+        let out = admit_forward_open(
+            &mut conn,
+            PID,
+            &open("127.0.0.1", 22, SID + 2),
+            &mut muxes,
+            &cfg,
+        )
+        .await;
+        let ForwardAdmission::Denied(d) = out else {
+            panic!("a named but unresolved link must not be admitted");
+        };
+        assert_eq!(d.cap_reason.as_deref(), Some(IDENTITY_NOT_PROVEN), "premise: still unresolved");
+        assert!(!d.identity_unsettled, "a proven name is not settling");
+        assert_eq!(d.close_frame(None, || None)["code"], "not-granted");
+
+        // An unnamed link older than the settle window will not resolve now:
+        // final, so a forward on it ends instead of retrying forever.
+        {
+            let l = conn.links.get_mut(PID).unwrap();
+            l.verified_name = None;
+            l.established_at = std::time::Instant::now()
+                .checked_sub(UNSETTLED_IDENTITY_WINDOW + std::time::Duration::from_secs(1));
+            assert!(l.established_at.is_some(), "premise: an aged link");
+        }
+        let out = admit_forward_open(
+            &mut conn,
+            PID,
+            &open("127.0.0.1", 22, SID + 3),
+            &mut muxes,
+            &cfg,
+        )
+        .await;
+        let ForwardAdmission::Denied(d) = out else {
+            panic!("an aged unresolved link must not be admitted");
+        };
+        assert_eq!(d.cap_reason.as_deref(), Some(IDENTITY_NOT_PROVEN), "premise: still unresolved");
+        assert!(!d.identity_unsettled, "past the window the identity is not settling");
         assert_eq!(d.close_frame(None, || None)["code"], "not-granted");
         assert!(muxes.is_empty());
     }
