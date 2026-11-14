@@ -509,6 +509,7 @@ export function useTunlion() {
           // thus the DTLS fingerprints) is exchanged, run the SPAKE2 ceremony.
           if (pendingPakeRef.current) {
             ensurePakePairing(id)
+            if (pakePeerRef.current === id) pakeRef.current?.observeFingerprints(link.fingerprints())
             drivePake()
           }
           // C20: if this peer was introduced via a known-device channel, prove
@@ -990,6 +991,9 @@ export function useTunlion() {
       // party; the code is burned; move both into the private room.
       sig.on('pair-matched', ({ room }) => {
         tracePake('pair-matched', { ceremony: pakeRef.current, link: linksRef.current.get(pakePeerRef.current), fingerprints: linksRef.current.get(pakePeerRef.current)?.fingerprints() })
+        // Preserve the bound link's fingerprints before rejoin tears it down.
+        // Its delayed MAC may arrive while the successor has no SDP yet.
+        pakeRef.current?.observeFingerprints(linksRef.current.get(pakePeerRef.current)?.fingerprints())
         log.debug('pair matched, joining room')
         setRoomCode(null)
         // Re-join even when `room` is the one we are in (same network): a CLI

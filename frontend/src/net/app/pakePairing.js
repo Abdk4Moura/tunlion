@@ -104,6 +104,14 @@ export class PakeCeremony {
     this._fpsHistory.push({ mine: fps.mine, theirs: fps.theirs })
     if (this._fpsHistory.length > 4) this._fpsHistory.shift()
   }
+
+  // Record the bound link while it is still present, even before an element
+  // arrives or we send a confirmation. A peer may confirm on that link while
+  // our copy arrives only after the link is torn down. The pair is used only
+  // to identify a stale MAC; success still requires the current pair.
+  observeFingerprints(fps) {
+    this._rememberFps(fps)
+  }
   /// Re-send the current message if its backoff slot is due. Call on a short
   /// cadence while the ceremony is live; a no-op once confirmed or refused.
   tick() {
