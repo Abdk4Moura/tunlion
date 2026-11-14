@@ -289,8 +289,22 @@ run_scenario() {
   if [ -f "$got" ] && cmp -s "$got" "$WORK/payload-$name.bin"; then ok "$name/send-lan: file delivered byte exact, server blocked"
   else bad "$name/send-lan: rc=$rc, not delivered: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"; fi
   if [ "$name" = wg ]; then
-    cls=$(asA timeout 30 "$BIN" doctor --json 2>/dev/null | "$PYV" -I -c 'import json,sys; v=json.load(sys.stdin); print([i["class"] for i in v["lan"]["interfaces"] if i["name"]=="wg0"])' 2>&1)
-    if [ "$cls" = "['p2p']" ]; then ok "wg/p2p-class: doctor classes the $TUNNEL tunnel p2p by its flags"; else bad "wg/p2p-class: doctor said $cls"; fi
+    dstart=$(date +%s)
+    asA timeout 30 "$BIN" doctor --json > "$WORK/doctor-wg.out" 2> "$WORK/doctor-wg.err"; drc=$?
+    dsecs=$(( $(date +%s) - dstart ))
+    cls=$("$PYV" -I -c 'import json,sys; v=json.load(sys.stdin); print([i["class"] for i in v["lan"]["interfaces"] if i["name"]=="wg0"])' < "$WORK/doctor-wg.out" 2>&1)
+    if [ "$cls" = "['p2p']" ]; then ok "wg/p2p-class: doctor classes the $TUNNEL tunnel p2p by its flags"; else
+      bad "wg/p2p-class: doctor said $cls"
+      # Failure-only evidence: how the doctor run ended and what it printed.
+      echo "  doctor: rc=$drc in ${dsecs}s"
+      echo "  doctor stdout (first 4000 bytes, top-level keys first):"
+      "$PYV" -I -c 'import json,sys
+try: print("    keys:", sorted(json.load(sys.stdin)))
+except Exception as e: print("    not one JSON document:", e)' < "$WORK/doctor-wg.out" 2>&1
+      head -c 4000 "$WORK/doctor-wg.out" | sed 's/^/    /'; echo
+      echo "  doctor stderr (last 40 lines):"
+      tail -n 40 "$WORK/doctor-wg.err" | sed 's/^/    /'
+    fi
   fi
   if [ "$name" = lan ]; then
     sleep 5
