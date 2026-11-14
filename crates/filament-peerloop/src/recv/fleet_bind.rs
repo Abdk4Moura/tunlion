@@ -208,6 +208,77 @@ where
     out
 }
 
+/// The fleet standing a link holds, each part stamped with the binding epoch
+/// it was earned on: `verified` (we verified the peer's hello) and `greeted`
+/// (we sent the peer our hello). A hello proves possession over ONE link
+/// binding, so each part is only good for the epoch it names.
+///
+/// The stamps are what make a rotation honest in both orders. A rotation used
+/// to clear the verdict unconditionally, so when the peer rotated first and
+/// its hello for the NEW binding was verified before our own rotation was
+/// processed, the rotation then threw that fresh verdict away; the peer,
+/// having already greeted us on that binding, never sent another, and the link
+/// stayed unverified for good. With the stamps a rotation drops only what an
+/// OLDER epoch earned, and a hello sent on an older epoch no longer counts as
+/// "already greeted", so the peer's next hello is answered.
+#[derive(Debug, Default)]
+pub struct Standing {
+    verified: std::collections::HashMap<String, Epoch>,
+    greeted: std::collections::HashMap<String, Epoch>,
+}
+
+impl Standing {
+    /// The peer's hello verified on the link installed at `epoch`. Returns
+    /// whether this is a new verdict for that epoch (not a repeat hello).
+    pub fn verified(&mut self, pid: &str, epoch: Epoch) -> bool {
+        self.verified.insert(pid.to_string(), epoch) != Some(epoch)
+    }
+
+    /// We sent the peer our hello on the link installed at `epoch`.
+    pub fn greeted(&mut self, pid: &str, epoch: Epoch) {
+        self.greeted.insert(pid.to_string(), epoch);
+    }
+
+    /// Do we still owe the peer our hello on the link installed at
+    /// `installed`? A hello sent on an older epoch was signed over a binding
+    /// the peer no longer verifies with, so it does not count.
+    pub fn hello_owed(&self, pid: &str, installed: Option<Epoch>) -> bool {
+        installed.is_some() && self.greeted.get(pid).copied() != installed
+    }
+
+    /// Forget this peer's standing entirely (its link was dropped or cut).
+    pub fn forget(&mut self, pid: &str) {
+        self.verified.remove(pid);
+        self.greeted.remove(pid);
+    }
+
+    /// Keep only the peers `keep` says still have a link.
+    pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.verified.retain(|p, _| keep(p.as_str()));
+        self.greeted.retain(|p, _| keep(p.as_str()));
+    }
+
+    /// The binding rotated to `installed`. Whatever an OLDER epoch earned is
+    /// dropped: the verdict (the hello has to verify again on the new binding)
+    /// and the hello marker (so the peer's next hello is answered, and the
+    /// peer, which needs our hello on the new binding, gets it). A verdict
+    /// already earned on `installed` (the peer rotated first and greeted us
+    /// before this rotation was processed) is KEPT. Returns whether a stale
+    /// verdict was dropped, so the caller can queue the hello again.
+    pub fn rotated(&mut self, pid: &str, installed: Epoch) -> bool {
+        if self.greeted.get(pid).is_some_and(|e| *e != installed) {
+            self.greeted.remove(pid);
+        }
+        match self.verified.get(pid) {
+            Some(e) if *e != installed => {
+                self.verified.remove(pid);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

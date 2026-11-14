@@ -708,6 +708,12 @@ pub struct IncomingFile {
     pub write_err: Arc<std::sync::Mutex<Option<WriteFailure>>>,
     /// `receive -o -`: the in-order writer to stdout. `None` for a file.
     pub stdout: Option<Arc<std::sync::Mutex<StdoutSink<std::fs::File>>>>,
+    /// The sender's AUTHENTICATED name (the link's `verified_name`) when the
+    /// stream was accepted. A completed transfer records its sender as warm
+    /// from this when the link no longer names it (the sender left before
+    /// file-end, or a fleet direct adopted in place is re-verifying). `None`
+    /// when the link had no proven name: a claimed name is never recorded.
+    pub sender: Option<String>,
 }
 
 /// P4 (GAP-5): recompute the whole-file sha256 of the received `.part` and
