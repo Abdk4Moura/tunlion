@@ -64,7 +64,7 @@ Two more rules, for peers that are not fleet siblings:
 
 - A certificate-less authenticated pair retains shell access granted explicitly
   on the serving machine.
-- An anonymous peer is transfer-only.
+- A peer with neither a certificate nor a pairing is transfer-only.
 
 There is no transitive trust across owners and no multi-hop routing through a
 sibling. A connection may use a direct transport or a relay. Discovery does not
