@@ -17,6 +17,7 @@
 // fingerprints of the link it was made on. A link that changed underneath must
 // not be reported as a wrong code.
 import { PakeCeremony } from '../pakePairing.js'
+import { readFileSync } from 'node:fs'
 
 let ok = true
 const check = (label, cond, detail = '') => {
@@ -40,9 +41,12 @@ function fakeSession(password) {
     s.k = `${password}|${[mine, dec(peer)].sort().join('|')}`
     return true
   }
-  const pair = (myFp, theirFp) => [myFp, theirFp].sort().join('|')
-  s.ourConfirm = (myFp, theirFp) => (s.k ? enc(`${s.k}|${pair(myFp, theirFp)}`) : undefined)
-  s.verifyPeerConfirm = (myFp, theirFp, _caps, mac) => !!s.k && dec(mac) === `${s.k}|${pair(myFp, theirFp)}`
+  const token = (myFp, theirFp, caps, sender) => {
+    const pair = [myFp, theirFp].sort().join('|')
+    return `${s.k}|${pair}|sender:${sender}|caps:${caps}|scope:browser`
+  }
+  s.ourConfirm = (myFp, theirFp, caps) => (s.k ? enc(token(myFp, theirFp, caps, myFp)) : undefined)
+  s.verifyPeerConfirm = (myFp, theirFp, caps, mac) => !!s.k && dec(mac) === token(myFp, theirFp, caps, theirFp)
   s.secret = () => (s.k ? `secret:${s.k}` : undefined)
   return s
 }
@@ -56,6 +60,7 @@ function side(name, pw, link) {
     nameplate: '314', caps: ['transfer'], capsCanon: 'transfer', session,
     getFingerprints: () => link.fp(),
     sendSignal: (payload) => { sent.push(payload); link.deliver(name, payload) },
+    now: () => link.now(),
   })
   return { c, sent, session }
 }
@@ -69,9 +74,10 @@ function side(name, pw, link) {
 function rig({ pwA = 'brave-otter', pwB = 'brave-otter' } = {}) {
   const queue = []
   const deferred = []
+  let clock = 1000
   let holdConfirms = false
-  const linkA = { fp: () => ({ mine: 'fp-a', theirs: 'fp-b' }), deliver: (from, p) => queue.push([from, p]) }
-  const linkB = { fp: () => ({ mine: 'fp-b', theirs: 'fp-a' }), deliver: (from, p) => queue.push([from, p]) }
+  const linkA = { fp: () => ({ mine: 'fp-a', theirs: 'fp-b' }), now: () => clock, deliver: (from, p) => queue.push([from, p]) }
+  const linkB = { fp: () => ({ mine: 'fp-b', theirs: 'fp-a' }), now: () => clock, deliver: (from, p) => queue.push([from, p]) }
   const a = side('a', pwA, linkA)
   const b = side('b', pwB, linkB)
   const pump = () => {
@@ -81,8 +87,9 @@ function rig({ pwA = 'brave-otter', pwB = 'brave-otter' } = {}) {
       if (holdConfirms && payload.type === 'pake-confirm') { deferred.push([from, payload]); continue }
       ;(from === 'a' ? b.c : a.c).onSignal(structuredClone(payload))
     }
+    if (queue.length) throw new Error('pairing relay exceeded 100 deliveries; possible ping-pong')
   }
-  const step = () => { a.c.tick(); b.c.tick(); pump() }
+  const step = () => { clock += 250; a.c.tick(); b.c.tick(); pump() }
   const hold = () => { holdConfirms = true }
   const release = () => { holdConfirms = false; while (deferred.length) queue.push(deferred.shift()); pump() }
   return { a, b, linkA, linkB, queue, deferred, pump, step, hold, release }
@@ -141,25 +148,62 @@ function rig({ pwA = 'brave-otter', pwB = 'brave-otter' } = {}) {
   r.linkB.fp = () => ({ mine: 'fp-b2', theirs: 'fp-a2' })
   r.b.c.tryConfirm()
   check('observed race does not abort the correct code', !r.b.c.aborted, `aborted=${r.b.c.aborted}`)
-  check('an old-link confirmation never authorizes the replacement link', !r.b.c.secret)
+  check('an old-link confirmation never authorizes either side on the replacement link', !r.a.c.secret && !r.b.c.secret)
   r.pump()
   // The receiver's next confirmation prompts the already-confirmed peer to
   // answer with its confirmation over the current fingerprint pair.
-  r.b.c.tryConfirm(); r.pump()
-  check('observed race eventually confirms both sides on the new link', !!r.a.c.secret && !!r.b.c.secret)
+  for (let i = 0; i < 10 && !(r.a.c.secret && r.b.c.secret); i++) r.step()
+  check('observed race eventually confirms both sides on the new link', !!r.a.c.secret && !!r.b.c.secret && r.a.c.secret === r.b.c.secret && !r.a.c.aborted && !r.b.c.aborted)
 }
 
-// Keeping an old fingerprint pair cannot turn a genuine password mismatch
-// into a successful pairing, including the no-current-fingerprint window.
+// First classify a valid but stale MAC, then deliver a deliberately invalid
+// CURRENT-link MAC. This cannot pass by rejecting the stale pair first.
 {
-  const r = rig({ pwA: 'brave-otter', pwB: 'wrong-otter' })
+  const r = rig()
   r.b.c.observeFingerprints?.(r.linkB.fp())
   r.linkB.fp = () => null
   r.a.c.sendOurMessage(); r.b.c.sendOurMessage(); r.pump()
+  r.linkA.fp = () => ({ mine: 'fp-a2', theirs: 'fp-b2' })
   r.linkB.fp = () => ({ mine: 'fp-b2', theirs: 'fp-a2' })
   r.b.c.tryConfirm()
-  check('observed ordering with wrong code is refused', !!r.b.c.aborted)
-  check('observed ordering with wrong code releases no secret', !r.b.c.secret)
+  const staleClassified = !r.b.c.aborted && !r.b.c.secret
+  check('valid stale confirmation is classified before the wrong-code control', staleClassified)
+  if (staleClassified) {
+    r.a.session.k += '|wrong-password'
+    r.b.c.onSignal(r.a.c._confirmPayload())
+  }
+  check('wrong current-link confirmation is specifically refused', staleClassified && /key confirmation failed/.test(r.b.c.aborted || ''))
+  check('wrong current-link confirmation releases no secret on either side', !r.a.c.secret && !r.b.c.secret)
+}
+
+// Same-pair controls isolate an actual wrong password, reflected confirmation,
+// and changed capabilities from the link-replacement path.
+{
+  const r = rig({ pwA: 'brave-otter', pwB: 'wrong-otter' })
+  r.a.c.sendOurMessage(); r.b.c.sendOurMessage(); r.pump()
+  check('wrong password on the current link has the specific rejection', /key confirmation failed/.test(r.a.c.aborted || '') || /key confirmation failed/.test(r.b.c.aborted || ''))
+  check('wrong current-link password yields no secret on either side', !r.a.c.secret && !r.b.c.secret)
+}
+{
+  const r = rig()
+  r.a.c.sendOurMessage(); r.b.c.sendOurMessage(); r.pump()
+  const fps = r.linkA.fp()
+  const reflected = r.a.session.ourConfirm(fps.mine, fps.theirs, 'transfer')
+  check('fake rejects a reflected confirmation', !r.a.session.verifyPeerConfirm(fps.mine, fps.theirs, 'transfer', reflected))
+  check('fake rejects changed capabilities', !r.b.session.verifyPeerConfirm(fps.theirs, fps.mine, 'shell', reflected))
+}
+
+// Production seam: the actual pair-matched handler must observe the bound
+// link before it asks the session to rejoin (which removes the link). This is
+// deliberately a source seam assertion, not a real-browser proof by itself.
+{
+  const hook = readFileSync(new URL('../../../lib/useTunlion.js', import.meta.url), 'utf8')
+  const start = hook.indexOf("sig.on('pair-matched'")
+  const end = hook.indexOf("sig.on('pair-used'", start)
+  const handler = hook.slice(start, end)
+  const observed = handler.indexOf('observeFingerprints(')
+  const rejoin = handler.indexOf("rejoinRef.current?.(room, 'pair')")
+  check('pair-matched captures the bound fingerprints before rejoin', start >= 0 && end > start && observed >= 0 && rejoin > observed)
 }
 
 // --- a genuinely wrong code is still refused ----------------------------------
