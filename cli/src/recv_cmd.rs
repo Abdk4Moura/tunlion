@@ -80,6 +80,9 @@ pub(crate) async fn recv_cmd(
             .map(std::time::Duration::from_secs)
             .unwrap_or(std::time::Duration::from_secs(8)),
         trace_throughput: trace_throughput_requested(),
+        fleet_hello_trace: std::env::var_os("TUNLION_FLEET_HELLO_TRACE")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from),
         supervised: std::env::var("INVOCATION_ID").is_ok(),
         loop_stall_secs: std::env::var("TUNLION_LOOP_STALL_SECS")
             .ok()

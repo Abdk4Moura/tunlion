@@ -137,6 +137,52 @@ KNOWN_RED_ALLOW=()
 O_ENV=(env TUNLION_CONFIG_DIR="$DA")
 S_ENV=(env TUNLION_CONFIG_DIR="$DS")
 
+# DIAGNOSTICS ONLY, no verdict reads them. Every section header carries the
+# script's elapsed time: the CI step captures this script's output whole, so
+# its own timestamps all read the moment the script ended, and a run killed by
+# the per-gate bound otherwise cannot say where its time went.
+say() { printf '\n\033[1m== %s ==\033[0m\n## t+%ss\n' "$*" "$SECONDS"; }
+# A bounded wait that ran out says WHICH window, how long, and what it saw.
+window_expired() { echo "## WINDOW EXPIRED: $1 after $2s at t+${SECONDS}s ($3)"; }
+# Fleet-hello verdicts. The owner, the impostor and the forgotten device each
+# write their own TUNLION_FLEET_HELLO_TRACE file: one `fhello-verdict` line per
+# hello they evaluated (binding inputs, outcome, reason, claimed and proven
+# device key) and one `fhello-bind` line per transport-source change that
+# cleared a link's nonces. Printed on failure only.
+OWNER_TRACE="$WORK/fhello-owner.trace"
+: >"$OWNER_TRACE"
+# $1 label, $2 trace file, $3 extended-regex filter (default: all), $4 lines to skip.
+dump_fhello() {
+  local label="$1" f="$2" filt="${3:-.}" from="${4:-0}"
+  echo "-- fhello trace ($label) --"
+  if [ ! -s "$f" ]; then
+    echo "(empty: this daemon evaluated no fleet-hello and saw no source change)"
+    return
+  fi
+  tail -n +"$((from + 1))" "$f" | grep -E "fhello-bind|$filt" | tail -20 | python3 -c '
+import sys, datetime
+for l in sys.stdin:
+    l = l.rstrip("\n")
+    ms, _, rest = l.partition(" ")
+    try:
+        t = datetime.datetime.fromtimestamp(int(ms[5:]) / 1000, datetime.timezone.utc)
+        print(t.strftime("%H:%M:%S.%f")[:-3] + "Z", rest)
+    except ValueError:
+        print(l)
+'
+}
+# Signaling health as each daemon logged it, and the fixture backend's tail,
+# so a signaling stall is evidenced on its own rather than folded into a
+# binding verdict.
+dump_signaling() {
+  local f
+  echo "-- signaling lines (all daemons) --"
+  for f in "$@"; do
+    [ -f "$f" ] && grep -E "signaling" "$f" | tail -4 | sed "s|^|$(basename "$f"): |"
+  done
+  echo "-- backend.log tail --"; tail -5 "$WORK/backend.log" 2>/dev/null
+}
+
 python3 -c "
 import socket
 s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -148,7 +194,9 @@ FIX_PIDS+=($!)
 
 start_backend
 init_owner "$DA"
+export TUNLION_FLEET_HELLO_TRACE="$OWNER_TRACE"
 start_acceptor "$DA"
+unset TUNLION_FLEET_HELLO_TRACE
 
 # The enrolment ceiling carries shell: that, and only that, is what authorises
 # the positive gates below. `--allow` replaces the default ceiling, so transfer
@@ -382,7 +430,10 @@ say "FORGET-REVOKES: forgetting a live certificate holder revokes its key and fr
 rcFG=$?
 pkill -f "up --dir $WORK/$FORGOTTEN-drop" 2>/dev/null || true
 sleep 2
+FG_OWNER_FROM=$(wc -l <"$OWNER_TRACE" 2>/dev/null || echo 0)
+export TUNLION_FLEET_HELLO_TRACE="$WORK/fhello-$FORGOTTEN-again.trace"
 start_spoke "$DFG" "$FORGOTTEN-again"
+unset TUNLION_FLEET_HELLO_TRACE
 # Wait for the hello itself, not a fixed time: a fixed `sleep 10` expired while
 # the restarted daemon was still connecting (~1 run in 7). Bounded at 60 s, then
 # a settle so the owner has had time to (wrongly) re-admit it before we look.
@@ -393,6 +444,7 @@ for _ in $(seq 1 60); do
   fi
   sleep 1
 done
+[ "$FG_HELLO" = "1" ] || window_expired "FORGET-REVOKES restarted-device hello" 60 "no fleet-hello, identity or mesh line in up-$FORGOTTEN-again.log"
 sleep 5
 FG_REINDEXED=$(python3 -c "import json;print(1 if any(d.get('deviceCert',{}).get('devicePub')=='$FG_PUB' or d.get('name')=='$FORGOTTEN' for d in json.load(open('$DA/devices.json'))) else 0)" 2>/dev/null)
 FG_LISTED=$(python3 -c "import json;print(1 if any(e.get('devicePub')=='$FG_PUB' for e in json.load(open('$DA/revoked-keys.json'))) else 0)" 2>/dev/null)
@@ -405,6 +457,9 @@ if [ "$rcFG" = "0" ] && [ -n "$FG_PUB" ] \
 else
   echo "-- forget.log (rc=$rcFG) --"; cat "$WORK/forget.log"
   echo "-- forgotten device log --"; tail -5 "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null
+  dump_fhello "owner, hellos since the restart, key ${FG_PUB:0:16}" "$OWNER_TRACE" "fhello-verdict.*dev=$FG_PUB" "$FG_OWNER_FROM"
+  dump_fhello "forgotten device, all" "$WORK/fhello-$FORGOTTEN-again.trace"
+  dump_signaling "$WORK/up.log" "$WORK/up-$FORGOTTEN-again.log" "$WORK/up-$SPOKE.log" "$WORK/up-$MALLORY.log"
   bad "gateFORGET-REVOKES: forget of a live certificate holder did not cut it off truthfully (rc=$rcFG listed=$FG_LISTED reindexed=$FG_REINDEXED hello=$FG_HELLO)"
 fi
 pkill -f "up --dir $WORK/$FORGOTTEN-again-drop" 2>/dev/null || true
@@ -413,6 +468,10 @@ pkill -f "up --dir $WORK/$FORGOTTEN-again-drop" 2>/dev/null || true
 # Build it the way forget used to: drop the record from the store under the
 # same devices.json.lock flock the CLI and daemon take, with the same atomic
 # owner-only replace. Fixture setup only; nothing asserted below changes.
+# The impostor's device key, read before its record is dropped: the owner's
+# verdict lines name it, which is how a dump tells the impostor's own hello
+# from the victim's (both claim the same name).
+MALLORY_PUB=$(python3 -c "import json;print(next((d.get('deviceCert',{}).get('devicePub','') for d in json.load(open('$DA/devices.json')) if d.get('name')=='$MALLORY'),''))" 2>/dev/null)
 python3 - "$DA" "$MALLORY" <<'PY'
 import fcntl, json, os, sys, tempfile
 d, name = sys.argv[1], sys.argv[2]
@@ -449,7 +508,8 @@ run_impostor_variant() {
   local refused_before=$(grep -c "reason=name-taken" "$WORK/up.log" || true)
   pkill -f "up --dir $WORK/$MALLORY-drop" 2>/dev/null || true
   sleep 2
-  env TUNLION_CONFIG_DIR="$DM" TUNLION_NAME="$variant" "$BIN" --server "$SERVER" up --dir "$WORK/$MALLORY-drop" >"$WORK/up-$MALLORY-$tag.log" 2>&1 &
+  local owner_from=$(wc -l <"$OWNER_TRACE" 2>/dev/null || echo 0)
+  env TUNLION_CONFIG_DIR="$DM" TUNLION_NAME="$variant" TUNLION_FLEET_HELLO_TRACE="$WORK/fhello-$MALLORY-$tag.trace" "$BIN" --server "$SERVER" up --dir "$WORK/$MALLORY-drop" >"$WORK/up-$MALLORY-$tag.log" 2>&1 &
   FIX_PIDS+=($!)
   # Wait for the attempt to happen rather than a fixed 8s. The impostor's
   # record was dropped from the owner's store, and since a running daemon
@@ -457,13 +517,15 @@ run_impostor_variant() {
   # no longer gets it a link: it reaches the owner only through fleet-hello,
   # after its pair-path attempt fails, which can take longer than 8s. Bounded:
   # a refusal that never comes still fails the verdicts below exactly as before.
+  local settled=0
   for _ in $(seq 1 45); do
     if [ "$(grep -c "reason=name-taken" "$WORK/up.log" || true)" -gt "$refused_before" ] \
        && grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$MALLORY-$tag.log"; then
-      break
+      settled=1; break
     fi
     sleep 1
   done
+  [ "$settled" = "1" ] || window_expired "I-$tag impostor attempt" 45 "refusals then=$(grep -c "reason=name-taken" "$WORK/up.log" || true) before=$refused_before; impostor-side mesh line=$(grep -cE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$MALLORY-$tag.log" 2>/dev/null || true)"
   local refused=0 intact=0 execref=0 attempted=0 victim_ok=0
   local refused_after=$(grep -c "reason=name-taken" "$WORK/up.log" || true)
   [ "$refused_after" -gt "$refused_before" ] && refused=1
@@ -491,8 +553,15 @@ sys.exit(0 if now==json.dumps(before,sort_keys=True) else 1)
 PY
   [ "$?" = "0" ] && intact=1
   OUTI=$(timeout 60 "${M_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/I-$tag.err" </dev/null)
-  [ "$?" != "0" ] && ! echo "$OUTI" | grep -q "SHOULD-NOT-RUN" && execref=1
+  local rcI=$?
+  [ "$rcI" != "0" ] && ! echo "$OUTI" | grep -q "SHOULD-NOT-RUN" && execref=1
+  [ "$rcI" = "124" ] && window_expired "I-$tag impostor exec" 60 "the refused exec did not return"
   echo "## (impostor $tag) refused=$refused attempted=$attempted victim=$victim_ok intact=$intact execref=$execref"
+  # Whether the OWNER evaluated the impostor's own hello, by its device key.
+  # Reported, not asserted (see the NOT EXERCISED proposal before it is).
+  local owner_eval=0
+  [ -n "$MALLORY_PUB" ] && owner_eval=$(tail -n +"$((owner_from + 1))" "$OWNER_TRACE" 2>/dev/null | grep -c "fhello-verdict.*dev=$MALLORY_PUB" || true)
+  echo "## (impostor $tag) owner verdicts on the impostor key: $owner_eval ($(tail -n +"$((owner_from + 1))" "$OWNER_TRACE" 2>/dev/null | grep "fhello-verdict.*dev=$MALLORY_PUB" | grep -oE "outcome=[a-z]+ why=[^ ]+" | sort | uniq -c | tr -s ' ' | tr '\n' ';'))"
   if [ "$attempted" = "1" ] && [ "$victim_ok" = "1" ] && [ "$intact" = "1" ] && [ "$execref" = "1" ]; then
     ok "gateI-$tag: squat as '$variant' CONTAINED (victim keyed + byte-identical, impostor reached the owner, exec refused)"
   else
@@ -501,6 +570,9 @@ PY
     echo "-- impostor log ($tag) --"; tail -5 "$WORK/up-$MALLORY-$tag.log" 2>/dev/null
     echo "-- forget log --"; cat "$WORK/forget.log" 2>/dev/null
     echo "-- owner log (fleet) --"; grep -i "fleet" "$WORK/up.log" | tail -5
+    dump_fhello "owner, this variant, impostor key ${MALLORY_PUB:0:16}" "$OWNER_TRACE" "fhello-verdict.*dev=$MALLORY_PUB" "$owner_from"
+    dump_fhello "impostor, this variant" "$WORK/fhello-$MALLORY-$tag.trace"
+    dump_signaling "$WORK/up.log" "$WORK/up-$MALLORY-$tag.log" "$WORK/up-$SPOKE.log"
     bad "gateI-$tag: impostor as '$variant' NOT contained (attempted=$attempted victim=$victim_ok intact=$intact execref=$execref refused=$refused)"
   fi
   # The refusal line is its OWN verdict: a log-environment difference must
@@ -508,6 +580,13 @@ PY
   if [ "$refused" = "1" ]; then
     ok "gateI-$tag: transplant refusal emitted (reason=name-taken seen)"
   else
+    if [ "$attempted$victim_ok$intact$execref" = "1111" ]; then
+      # Containment held, so the branch above printed nothing; print it here.
+      echo "-- impostor log ($tag) --"; tail -5 "$WORK/up-$MALLORY-$tag.log" 2>/dev/null
+      dump_fhello "owner, this variant, impostor key ${MALLORY_PUB:0:16}" "$OWNER_TRACE" "fhello-verdict.*dev=$MALLORY_PUB" "$owner_from"
+      dump_fhello "impostor, this variant" "$WORK/fhello-$MALLORY-$tag.trace"
+      dump_signaling "$WORK/up.log" "$WORK/up-$MALLORY-$tag.log" "$WORK/up-$SPOKE.log"
+    fi
     bad "gateI-$tag: transplant refusal line absent (containment=$([ "$attempted$victim_ok$intact$execref" = "1111" ] && echo held || echo broken); no refusal emitted for this attempt)"
   fi
 }

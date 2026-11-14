@@ -2103,6 +2103,10 @@ async fn recv_run(
     // transport can reuse the same peer id; nonces from the previous transport
     // must not be carried across (see the reset in `ChannelReady`).
     let mut bind_source: HashMap<String, net::SourceId> = HashMap::new();
+    // How many times a transport-source change cleared each pid's nonce maps.
+    // Diagnostic only: reported with every fleet-hello verdict (`fhello`).
+    let mut bind_resets: HashMap<String, u32> = HashMap::new();
+    let fleet_trace = ports.env.fleet_hello_trace.clone();
     let mut fleet_pending: std::collections::HashSet<String> = Default::default();
     let mut fleet_verified: std::collections::HashSet<String> = Default::default();
     // Offers that arrived while this link's `fleet-hello` was still in flight.
@@ -4260,6 +4264,7 @@ async fn recv_run(
         bind_ours.retain(|p, _| conn.links.contains_key(p));
         bind_theirs.retain(|p, _| conn.links.contains_key(p));
         bind_source.retain(|p, _| conn.links.contains_key(p));
+        bind_resets.retain(|p, _| conn.links.contains_key(p));
         fleet_deferred_offers.retain(|(p, _, _)| conn.links.contains_key(p));
 
         // C23: questions from links that died (supersede/peer-left) are
@@ -5518,10 +5523,22 @@ async fn recv_run(
                 // when the transport source changes; a genuinely same-transport
                 // re-announce keeps its nonce.
                 if let Some(source) = event_source {
-                    if bind_source.get(&pid).copied() != Some(source) {
+                    let prev = bind_source.get(&pid).copied();
+                    if prev != Some(source) {
                         bind_source.insert(pid.clone(), source);
-                        bind_ours.remove(&pid);
-                        bind_theirs.remove(&pid);
+                        let cleared_ours = bind_ours.remove(&pid).is_some();
+                        let cleared_theirs = bind_theirs.remove(&pid).is_some();
+                        if prev.is_some() && ports.identity.fleet_rv().is_some() {
+                            let n = bind_resets.entry(pid.clone()).or_insert(0);
+                            *n = n.saturating_add(1);
+                            fleet_hello_note(
+                                log.as_ref(),
+                                fleet_trace.as_deref(),
+                                &format!(
+                                    "fhello-bind pid={pid} event=source-change from={prev:?} to={source:?} cleared_ours={cleared_ours} cleared_theirs={cleared_theirs} resets={n}"
+                                ),
+                            );
+                        }
                     }
                 }
                 // No exporter on this transport: open the challenge. Our nonce
@@ -5881,10 +5898,28 @@ async fn recv_run(
                 #[cfg(feature = "fleet")]
                 Some(fleet::HELLO) => {
                     let link_fps = link_fingerprints(&conn, &pid).await;
-                    let cb = conn
-                        .transport_of(&pid)
-                        .and_then(|t| in_binding(&t, &pid, &bind_ours, link_fps.as_ref()));
+                    let hello_t = conn.transport_of(&pid);
+                    let cb = hello_t
+                        .as_ref()
+                        .and_then(|t| in_binding(t, &pid, &bind_ours, link_fps.as_ref()));
                     let owner = ports.identity.fleet_owner_pub();
+                    // What this hello's binding decision rested on, for the
+                    // `fhello-verdict` line every arm below emits exactly once.
+                    let fhello_ctx = fleet_hello_context(
+                        &pid,
+                        hello_t.as_ref(),
+                        cb.is_some(),
+                        bind_ours.contains_key(&pid),
+                        bind_theirs.contains_key(&pid),
+                        link_fps.as_ref(),
+                        bind_source.get(&pid).copied(),
+                        bind_resets.get(&pid).copied().unwrap_or(0),
+                        &v,
+                    );
+                    // Release this extra handle now: the arms below may drop the
+                    // link, and its close must not wait on a clone held here.
+                    let hello_had_transport = hello_t.is_some();
+                    drop(hello_t);
                     // A sibling link (met on the fleet channel, no pair secret):
                     // the only kind the owner's roster governs. A paired link
                     // carries its own, pairwise, authorization and is unchanged.
@@ -5907,6 +5942,14 @@ async fn recv_run(
                                     log.debug(&format!(
                                         "fleet-hello from {pid} held: not listed in the owner's roster"
                                     ));
+                                    fleet_hello_note(
+                                        log.as_ref(),
+                                        fleet_trace.as_deref(),
+                                        &format!(
+                                            "fhello-verdict {fhello_ctx} outcome=held why=not-in-owner-roster dev={}",
+                                            hex::encode(ok.device_pub)
+                                        ),
+                                    );
                                     fleet_unlisted_hellos.insert(
                                         pid.clone(),
                                         DeferredControl {
@@ -5920,6 +5963,14 @@ async fn recv_run(
                                     log.debug(&format!(
                                         "fleet-hello from {pid} refused: device revoked"
                                     ));
+                                    fleet_hello_note(
+                                        log.as_ref(),
+                                        fleet_trace.as_deref(),
+                                        &format!(
+                                            "fhello-verdict {fhello_ctx} outcome=refused why=device-revoked dev={}",
+                                            hex::encode(ok.device_pub)
+                                        ),
+                                    );
                                     fleet_pending.remove(&pid);
                                     fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
                                     // Drop first: its close releases a sync task parked in a write.
@@ -5929,6 +5980,9 @@ async fn recv_run(
                                 Ok(ok) => {
                                     fleet_unlisted_hellos.remove(&pid);
                                     let fresh = fleet_verified.insert(pid.clone());
+                                    // Overwritten below by the fresh-hello decision.
+                                    let mut fhello_outcome =
+                                        String::from("outcome=admitted why=repeat-hello-on-verified-link");
                                     // Identity has settled: replay whatever arrived
                                     // while it had not. This belongs HERE, beside
                                     // the insert, not in the `fresh` branch below:
@@ -6026,6 +6080,10 @@ async fn recv_run(
                                         // channel subscription or a dial target. It is
                                         // an INDEX ENTRY, not an authorization, and the
                                         // empty ceiling it carries matches the link's.
+                                        fhello_outcome = format!(
+                                            "outcome=admitted why=proven-name name={:?}",
+                                            shown
+                                        );
                                         if proven_name.is_none() {
                                             // Transplant refusal: compare the SANITIZED
                                             // name -- the store keys on the sanitized
@@ -6060,7 +6118,15 @@ async fn recv_run(
                                                         })
                                                     })
                                                     .unwrap_or(false);
+                                            fhello_outcome = format!(
+                                                "outcome=admitted why=unindexed-no-cert name={:?}",
+                                                shown
+                                            );
                                             if name_taken {
+                                                fhello_outcome = format!(
+                                                    "outcome=refused why=name-taken-by-existing-record name={:?}",
+                                                    shown
+                                                );
                                                 // A REFUSAL, not chatter: a peer tried to
                                                 // take over another device's identity. Emitted
                                                 // at Critical so `-q` cannot hide it, with a
@@ -6101,13 +6167,24 @@ async fn recv_run(
                                                         if let Some(l) = conn.link_mut(&pid) {
                                                             l.verified_name = Some(stored.clone());
                                                         }
+                                                        fhello_outcome = format!(
+                                                            "outcome=admitted why=indexed-new-record name={:?}",
+                                                            stored
+                                                        );
                                                         log.debug(&format!(
                                                             "fleet peer indexed as '{stored}'"
                                                         ));
                                                     }
-                                                    Err(e) => log.debug(&format!(
-                                                        "fleet peer not indexed: {e}"
-                                                    )),
+                                                    Err(e) => {
+                                                        fhello_outcome = format!(
+                                                            "outcome=admitted why=index-write-refused name={:?} err={:?}",
+                                                            shown,
+                                                            e.to_string()
+                                                        );
+                                                        log.debug(&format!(
+                                                            "fleet peer not indexed: {e}"
+                                                        ))
+                                                    }
                                                 }
                                             }
                                         }
@@ -6134,9 +6211,25 @@ async fn recv_run(
                                             .maybe_request_cert_renewal(&conn, &pid)
                                             .await;
                                     }
+                                    fleet_hello_note(
+                                        log.as_ref(),
+                                        fleet_trace.as_deref(),
+                                        &format!(
+                                            "fhello-verdict {fhello_ctx} {fhello_outcome} fresh={fresh} dev={}",
+                                            hex::encode(ok.device_pub)
+                                        ),
+                                    );
                                 }
                                 Err(e) => {
                                     log.debug(&format!("fleet-hello from {pid} rejected: {e}"));
+                                    fleet_hello_note(
+                                        log.as_ref(),
+                                        fleet_trace.as_deref(),
+                                        &format!(
+                                            "fhello-verdict {fhello_ctx} outcome=rejected why={:?}",
+                                            e.to_string()
+                                        ),
+                                    );
                                     fleet_pending.remove(&pid);
                                     fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
                                     // Drop first: its close releases a sync task parked in a write.
@@ -6145,9 +6238,27 @@ async fn recv_run(
                                 }
                             }
                         }
-                        _ => log.debug(&format!(
-                            "fleet-hello from {pid} ignored: no channel binding or no owner key"
-                        )),
+                        (cb, owner) => {
+                            log.debug(&format!(
+                                "fleet-hello from {pid} ignored: no channel binding or no owner key"
+                            ));
+                            let why = if owner.is_none() {
+                                "no-owner-key"
+                            } else if !hello_had_transport {
+                                "no-transport"
+                            } else if cb.is_none() && !bind_ours.contains_key(&pid) {
+                                "no-exporter-and-no-own-l3-nonce"
+                            } else if cb.is_none() && link_fps.is_none() {
+                                "no-exporter-and-no-dtls-fingerprints"
+                            } else {
+                                "no-binding"
+                            };
+                            fleet_hello_note(
+                                log.as_ref(),
+                                fleet_trace.as_deref(),
+                                &format!("fhello-verdict {fhello_ctx} outcome=ignored why={why}"),
+                            );
+                        }
                     }
                 }
                 // A sibling's daemon brokered a private meeting place for one of
@@ -10091,6 +10202,64 @@ fn out_binding(
 ) -> Option<Vec<u8>> {
     t.channel_binding()
         .or_else(|| theirs.get(pid).and_then(|n| nonce_binding(t, fps, n)))
+}
+
+/// One fleet-hello binding record (`fhello-bind`) or verdict (`fhello-verdict`).
+/// Always at debug; also appended, with a wall-clock millisecond stamp, to the
+/// file named by `TUNLION_FLEET_HELLO_TRACE` when set, so a gate can print the
+/// owner's decisions on failure without raising the whole daemon's verbosity.
+/// Best effort: a write that fails is dropped, never surfaced as an error.
+fn fleet_hello_note(log: &dyn LogSink, sink: Option<&Path>, line: &str) {
+    log.debug(line);
+    let Some(path) = sink else { return };
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write as _;
+        let _ = writeln!(f, "t_ms={ms} {line}");
+    }
+}
+
+/// The inputs a fleet-hello verdict rested on, in one line: whether the
+/// transport supplied an exporter binding, whether our own l3 nonce (the only
+/// other source `in_binding` reads) was present, the DTLS fingerprint pair it
+/// was combined with, the transport source and how many source changes have
+/// cleared this pid's nonce maps, and the name and device key the hello CLAIMS
+/// (unverified until the verdict says otherwise).
+#[cfg(feature = "fleet")]
+#[allow(clippy::too_many_arguments)]
+fn fleet_hello_context(
+    pid: &str,
+    t: Option<&Arc<dyn Transport>>,
+    cb: bool,
+    ours_nonce: bool,
+    theirs_nonce: bool,
+    fps: Option<&(String, String)>,
+    source: Option<net::SourceId>,
+    resets: u32,
+    v: &Value,
+) -> String {
+    let exporter = t.is_some_and(|t| t.channel_binding().is_some());
+    let dc = t.is_some_and(|t| t.as_any().is::<net::DataChannelTransport>());
+    let cb_from = match (cb, exporter) {
+        (false, _) => "none",
+        (true, true) => "exporter",
+        (true, false) => "ours-l3-nonce",
+    };
+    let short = |s: &str| s.chars().take(23).collect::<String>();
+    let fps = fps
+        .map(|(mine, theirs)| format!("{}/{}", short(mine), short(theirs)))
+        .unwrap_or_else(|| "none".into());
+    let claimed: String = v["name"].as_str().unwrap_or("").chars().take(64).collect();
+    let claimed_dev = identity::DeviceCert::from_json(&v["cert"])
+        .map(|c| hex::encode(c.device_pub))
+        .unwrap_or_else(|| "none".into());
+    format!(
+        "pid={pid} transport={} cb={cb_from} dc={dc} ours_nonce={ours_nonce} theirs_nonce={theirs_nonce} fps={fps} source={source:?} resets={resets} claimed={claimed:?} claimed_dev={claimed_dev}",
+        t.is_some()
+    )
 }
 
 fn in_binding(
