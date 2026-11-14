@@ -186,7 +186,8 @@ sleep 2
 if [ "$rc" = 0 ] && landed charlie t2.txt && ! landed alpha t2.txt && ! landed bravo t2.txt && ! landed dave t2.txt && [ ! -f "$WORK/Adrop/t2.txt" ] \
    && [ "$(cat "$WORK/charlie-drop/t2.txt")" = "t2-$$" ]; then
   ok "gateT3: granted bravo->charlie landed at charlie ONLY, content intact"
-else bad "gateT3: granted send rc=$rc: $(fs_out | tail -3); drops: $(ls "$WORK"/*-drop "$WORK/Adrop" | tr '\n' ' ')"; fi
+else bad "gateT3: granted send rc=$rc: $(fs_out | tail -3); drops: $(ls "$WORK"/*-drop "$WORK/Adrop" | tr '\n' ' ')"
+  echo "## evidence: the gateT3 send's full output"; fs_out | sed 's/^/  /'; fi
 # charlie's shell grant to bravo says nothing about bravo's shell.
 fs_cli 60 as_node charlie exec bravo -- echo EXEC-MARK-REV; rc=$(fs_rc)
 if [ "$rc" != 0 ] && ! fs_out | grep -q EXEC-MARK-REV; then ok "gateT4: charlie->bravo exec still refused: a grant is one-directional"
@@ -208,12 +209,22 @@ sleep 2
 if [ "$rc" = 0 ] && landed bravo u1.txt; then ok "gateU5: dave->bravo, the ordinary pairing, still delivers"
 else bad "gateU5: dave->bravo rc=$rc: $(fs_out | tail -3)"; fi
 
+# Failure-only evidence: both siblings' link, identity, roster, hello and
+# adoption lines. Prints only; no gate condition depends on it.
+am_evidence() {
+  local pat='link|identity|roster|fleet|hello|adopt|direct|revok|closed|joined|warm-hold|charlie|bravo'
+  for n in bravo charlie; do
+    echo "## evidence: up-$n.log (last matching lines)"
+    grep -iE "$pat" "$WORK/up-$n.log" 2>/dev/null | tail -n 60 || true
+  done
+}
+
 say "V: revoking charlie on the OWNER cuts bravo<->charlie"
 as_node alpha demote charlie --to cut --yes </dev/null >"$WORK/revoke.log" 2>&1 || bad "gateV-setup: owner revoke failed: $(cat "$WORK/revoke.log")"
 T0=$(date +%s)
 if wait_log "$WORK/up-bravo.log" "closed the link to 'charlie'" 30; then
   ok "gateV1: bravo closed its link to charlie within $(( $(date +%s) - T0 ))s of the owner's revoke"
-else bad "gateV1: bravo kept its link to charlie"; grep -iE "roster|charlie" "$WORK/up-bravo.log" | tail -15; fi
+else bad "gateV1: bravo kept its link to charlie"; grep -iE "roster|charlie" "$WORK/up-bravo.log" | tail -15; am_evidence; fi
 sleep 3
 fs_cli 60 as_node bravo exec charlie -- echo EXEC-MARK-REVOKED; rc=$(fs_rc)
 if [ "$rc" != 0 ] && ! fs_out | grep -q EXEC-MARK-REVOKED; then ok "gateV2: exec to revoked charlie refused (rc=$rc)"
@@ -231,7 +242,7 @@ n_after=$(awk -v t="$T0" '/fleet device .charlie. joined the mesh/ {print}' "$WO
 if grep -q "fleet-hello from .* refused: device revoked\|closed the link to 'charlie'" "$WORK/up-bravo.log" \
    && ! tail -n +"$(grep -n "closed the link to 'charlie'" "$WORK/up-bravo.log" | tail -1 | cut -d: -f1)" "$WORK/up-bravo.log" | grep -q "fleet device 'charlie' joined the mesh"; then
   ok "gateV4: charlie was not re-admitted after the cut ($n_after admissions in total, all before it)"
-else bad "gateV4: charlie re-admitted after the revoke"; fi
+else bad "gateV4: charlie re-admitted after the revoke"; am_evidence; fi
 echo "t5-$$" > "$WORK/t5.txt"
 fs_cli 90 as_node bravo send "$WORK/t5.txt" --to alpha; rc=$(fs_rc)
 sleep 2

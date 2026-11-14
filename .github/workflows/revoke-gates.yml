@@ -270,6 +270,9 @@ jobs:
       # with its own bound because it is the longest gate here (several
       # deliberately refused sends, each waiting out its answer).
       - name: Run fleet auto-mesh gates
+        # Diagnostic baseline only (do not merge): run even when an earlier
+        # step failed. The job still fails if any step fails.
+        if: ${{ !cancelled() }}
         env:
           TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
         run: |
