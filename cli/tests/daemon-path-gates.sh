@@ -273,9 +273,12 @@ sleep 3
 
 # ===================================================================== F1b =====
 say "F1b: a forgets c while c's daemon is frozen mid-exec: a answers before the ack budget"
-# The closer's whole wait (REFUSAL_ACK_BUDGET in filament-peerloop conn.rs).
-# An inline wait in a's loop would hold the forget and the probe past it.
-BUDGET_MS=2000
+# The closer's whole wait: REFUSAL_ACK_BUDGET in
+# crates/filament-peerloop/src/conn.rs (= DROP_CLOSE_GRACE, 2 s). Keep the
+# default equal to it; TUNLION_TEST_REFUSAL_BUDGET_MS overrides it for a build
+# that changes the constant. An inline wait in a's loop would hold the forget
+# and the probe past it.
+BUDGET_MS="${TUNLION_TEST_REFUSAL_BUDGET_MS:-2000}"
 # A third device, paired exactly as b was, so nothing b's gates rely on changes.
 DC="$WORK/cfg-C"; mkdir -p "$DC" "$WORK/C-drop"
 env TUNLION_CONFIG_DIR="$DA" timeout 45 "$BIN" --server "$SERVER" add --for boxc --allow shell --out "$WORK/invc.txt" --yes >"$WORK/addc.log" 2>&1

@@ -11125,6 +11125,44 @@ mod lifecycle_tests {
             "shutdown cancels, joins, and drains owners"
         );
     }
+
+    /// A revocation that dooms several peers cancels all their served syncs
+    /// first and joins them under ONE shared deadline, so the loop is held
+    /// for at most one SYNC_JOIN_BOUND for the whole set (not one per peer),
+    /// and a peer outside the set keeps its stream.
+    #[cfg(feature = "mount-server")]
+    #[tokio::test]
+    async fn a_doomed_set_cancels_its_syncs_under_one_shared_deadline() {
+        let cleanup = RecvCleanup::default();
+        let sync_tasks = cleanup.sync_tasks.clone();
+        let mut keep = Vec::new();
+        for (i, pid) in ["doomed-a", "doomed-b", "doomed-c", "survivor"].iter().enumerate() {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            keep.push(tx);
+            sync_tasks
+                .track_sync_task(
+                    (*pid).into(),
+                    0x8000_0200 + i as u32,
+                    SyncTask(sync_server(rx)),
+                    &NoLog,
+                )
+                .await;
+        }
+        let start = std::time::Instant::now();
+        sync_tasks
+            .cancel_sync_for_pids(&["doomed-a", "doomed-b", "doomed-c"], &NoLog)
+            .await;
+        assert!(
+            start.elapsed() < crate::sync::SYNC_JOIN_BOUND,
+            "the set was joined one bound per peer ({:?})",
+            start.elapsed()
+        );
+        let left: Vec<String> =
+            sync_tasks.0.lock().unwrap().keys().map(|(p, _)| p.clone()).collect();
+        assert_eq!(left, vec!["survivor".to_string()], "the doomed set was not fully cancelled");
+        sync_tasks.stop_sync_tasks(&NoLog).await;
+        drop(keep);
+    }
 }
 
 #[cfg(test)]

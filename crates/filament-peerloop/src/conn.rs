@@ -2835,7 +2835,14 @@ impl Conn {
         // so the closer reads that stream itself (no loop turn in between).
         // Otherwise the ack reaches the main queue and `stage_event` signals.
         let watch = if old.source != net::SourceId::UNASSIGNED {
-            let stream = events.map(|e| e.rx.into_inner().unwrap_or_else(|p| p.into_inner()));
+            // Only the stream of THIS link generation. A stale one (left by a
+            // replacement, such as a direct upgrade of a WebRTC link) is not
+            // where this transport delivers: watching it would end the wait at
+            // once (its reader is gone) and close before the ack, so such a
+            // link uses the main-queue signal instead.
+            let stream = events
+                .filter(|e| e.generation == old.generation)
+                .map(|e| e.rx.into_inner().unwrap_or_else(|p| p.into_inner()));
             let signal = if stream.is_none() {
                 let (ack_tx, ack_rx) = oneshot::channel();
                 // A second cut of the same source replaces the first entry,
@@ -4109,10 +4116,6 @@ impl Conn {
         }
     }
 
-    /// A source is current when it is the link's primary source, or (for
-    /// Control only) one of its current worker sources. PcState/ChannelReady
-    /// and a departure barrier (`Ev::PeerLeft`) are primary-only so a worker
-    /// can never trigger primary teardown/readiness or a departure.
     /// Forget cut-link entries whose closer has finished. Never awaits.
     fn pump_closing(&mut self) {
         self.closing.retain(|_, entry| entry.ack.as_ref().is_some_and(|a| !a.is_closed()));
@@ -4135,6 +4138,10 @@ impl Conn {
         true
     }
 
+    /// A source is current when it is the link's primary source, or (for
+    /// Control only) one of its current worker sources. PcState/ChannelReady
+    /// and a departure barrier (`Ev::PeerLeft`) are primary-only so a worker
+    /// can never trigger primary teardown/readiness or a departure.
     fn source_current(&self, pid: &str, source: net::SourceId, inner: &Ev) -> bool {
         let Some(link) = self.links.get(pid) else {
             return false;
@@ -14955,12 +14962,12 @@ mod warm_identity_tests {
     }
 
     /// An installed WebRTC link's event stream, as `apply_built_peer` leaves it.
-    fn own_stream(conn: &mut Conn, pid: &str) -> mpsc::UnboundedSender<Ev> {
+    fn own_stream(conn: &mut Conn, pid: &str, generation: u32) -> mpsc::UnboundedSender<Ev> {
         let (etx, erx) = mpsc::unbounded_channel();
         conn.link_events.insert(
             pid.to_string(),
             LinkEvents {
-                generation: 7,
+                generation,
                 rx: std::sync::Mutex::new(erx),
                 departure_ready: None,
                 departure_pending: None,
@@ -15014,7 +15021,7 @@ mod warm_identity_tests {
         let (mut conn, _far, mut rx) = test_conn().await;
         let t = refusal_t(false);
         conn.links.insert("sid-e".into(), direct_link("sid-e", "b", "user@b", t.clone()));
-        let etx = own_stream(&mut conn, "sid-e");
+        let etx = own_stream(&mut conn, "sid-e", 7);
         let start = Instant::now();
         assert!(conn.drop_link_after_refusal("sid-e", refusal()));
         assert!(conn.closing.is_empty(), "a stream-owning cut needs no loop-side entry");
@@ -15044,13 +15051,36 @@ mod warm_identity_tests {
         let (mut conn, _far, _rx) = test_conn().await;
         let t = refusal_t(false);
         conn.links.insert("sid-d".into(), direct_link("sid-d", "b", "user@b", t.clone()));
-        let etx = own_stream(&mut conn, "sid-d");
+        let etx = own_stream(&mut conn, "sid-d", 7);
         let start = Instant::now();
         assert!(conn.drop_link_after_refusal("sid-d", refusal()));
         let _ = written_refusal_nonce(&t).await;
         drop(etx);
         assert!(closed_within(&t, Duration::from_millis(500)).await, "left open after the reader ended");
         assert!(start.elapsed() < REFUSAL_ACK_BUDGET, "waited out the budget for a dead reader");
+    }
+
+    /// A candidate stream left from an EARLIER generation of the pid (a
+    /// replacement such as a direct upgrade) is not where this transport
+    /// delivers. It must not be watched: its reader is gone, so watching it
+    /// would end the wait at once and close before the ack. The cut uses the
+    /// main-queue signal instead and still waits for its ack.
+    #[tokio::test]
+    async fn a_stale_generation_stream_is_not_taken_for_the_ack() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-g".into(), direct_link("sid-g", "b", "user@b", t.clone()));
+        let stale = own_stream(&mut conn, "sid-g", 6);
+        assert!(conn.drop_link_after_refusal("sid-g", refusal()));
+        assert_eq!(conn.closing.len(), 1, "a stale stream was taken instead of the signal path");
+        let nonce = written_refusal_nonce(&t).await;
+        drop(stale);
+        assert!(
+            !closed_within(&t, Duration::from_millis(300)).await,
+            "the stale stream's end closed the cut before its ack"
+        );
+        assert!(conn.stage_event(revoked_ack("sid-g", t.source, &nonce)).is_none());
+        assert!(closed_within(&t, Duration::from_millis(500)).await, "not closed after the ack");
     }
 
     /// A peer that never acks (dead, or an older build) costs the budget and
@@ -15111,6 +15141,8 @@ mod warm_identity_tests {
     #[tokio::test]
     async fn a_revoked_link_with_no_transport_is_a_plain_drop() {
         let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(crate::host::VecLog::new());
+        conn.log = log.clone() as Arc<dyn LogSink>;
         let t = refusal_t(false);
         let mut l = direct_link("sid-t", "b", "user@b", t.clone());
         l.transport = None;
@@ -15120,6 +15152,11 @@ mod warm_identity_tests {
         assert!(conn.closing.is_empty());
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(t.sent.lock().unwrap().is_empty(), "a refusal went out with no transport");
+        let lines = log.take();
+        assert!(
+            lines.iter().any(|(_, l)| l.contains("link-revoked to sid-t: dropped_no_transport")),
+            "the skipped refusal was not logged: {lines:?}"
+        );
     }
 
     /// An unassigned source cannot carry a source-tagged ack: the refusal is
