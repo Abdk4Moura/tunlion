@@ -2175,6 +2175,10 @@ mod tests {
         /// Decide exactly on the legacy fold, as the real policy site does in
         /// shadow mode. Lets a test pin the fold the endpoint delivered.
         Legacy,
+        /// Decide on the capability inputs alone, as the real policy site does
+        /// for a non-same-owner peer in authoritative mode: allow only an
+        /// `Authorized` outcome carried with an explicit grant.
+        Capability,
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -2201,6 +2205,9 @@ mod tests {
         cert_revoked: AtomicBool,
         gates: Mutex<Vec<GateRecord>>,
         consent: Mutex<Vec<(String, String)>>,
+        /// THIS device's own record lists `transfer` for the peer (a pair
+        /// grant), read through `device_record_grants`.
+        record_grant: AtomicBool,
     }
 
     impl TestHost {
@@ -2211,6 +2218,7 @@ mod tests {
                 cert_revoked: AtomicBool::new(false),
                 gates: Mutex::new(Vec::new()),
                 consent: Mutex::new(Vec::new()),
+                record_grant: AtomicBool::new(false),
             })
         }
 
@@ -2258,6 +2266,9 @@ mod tests {
         fn cert_revoked_for(&self, _device_pub: Option<&[u8; 32]>) -> bool {
             self.cert_revoked.load(Ordering::Relaxed)
         }
+        fn device_record_grants(&self, _name: &str, capability: &str) -> bool {
+            self.record_grant.load(Ordering::Relaxed) && capability == cap::CAP_TRANSFER
+        }
         fn device_allows(&self, _name: &str, _capability: &str) -> bool {
             false
         }
@@ -2288,6 +2299,15 @@ mod tests {
                 },
                 Verdict::Legacy if gate.legacy_allowed => cap::GateDecision::Allow,
                 Verdict::Legacy => cap::GateDecision::Deny { cap_reason: None },
+                Verdict::Capability
+                    if gate.has_explicit_grant
+                        && matches!(gate.outcome, cap::CapOutcome::Authorized) =>
+                {
+                    cap::GateDecision::Allow
+                }
+                Verdict::Capability => cap::GateDecision::Deny {
+                    cap_reason: Some("not authorized".into()),
+                },
             }
         }
         fn enqueue_request_if_requestable(&self, peer: &str, capability: &str) {
@@ -2608,6 +2628,35 @@ mod tests {
             "sync must keep the exact file-offer transfer gate inputs"
         );
         assert!(host.consent().is_empty());
+    }
+
+    /// Pairwise-first, through the real sync admission: under authoritative,
+    /// a transfer grant this device gave its pair (the pairing default) is an
+    /// explicit grant, so the open is admitted with no owner-signed grant; with
+    /// no record grant the same open is refused. Pins the
+    /// `pair_facts(...).apply` line in `admit_sync_open`.
+    #[tokio::test]
+    async fn a_pair_record_transfer_grant_admits_sync_under_authoritative() {
+        let share = Share::new();
+        for record_grant in [true, false] {
+            let t = Arc::new(CaptureTransport::default());
+            let host = TestHost::new(true, Verdict::Capability);
+            host.record_grant.store(record_grant, Ordering::Relaxed);
+            let (mut conn, _far) =
+                connection(host.clone(), t.clone(), true, true, Some("phone")).await;
+            let mut muxes = MuxMap::new();
+            let out =
+                admit_sync_open(&mut conn, PID, &open("inbox", SID), &mut muxes, &share.0).await;
+            assert_eq!(host.gates()[0].has_grant, record_grant);
+            if record_grant {
+                assert!(
+                    matches!(out, SyncAdmission::Accepted(_)),
+                    "a pair transfer grant must admit sync under authoritative"
+                );
+            } else {
+                assert!(matches!(out, SyncAdmission::Denied(_)), "no grant is still refused");
+            }
+        }
     }
 
     #[tokio::test]

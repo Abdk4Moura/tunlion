@@ -303,7 +303,9 @@ mod tests {
     /// still refuse it, and no grant is still no shell.
     #[test]
     fn a_pair_record_grant_counts_under_authoritative() {
-        let _guard = crate::tests::lock_test_config();
+        // Both locks: this test writes TUNLION_CAP_AUTHORITATIVE, which tests
+        // under either lock also write.
+        let _guards = crate::tests::lock_cap_mode();
         let prior = std::env::var("TUNLION_CAP_AUTHORITATIVE").ok();
         unsafe { std::env::set_var("TUNLION_CAP_AUTHORITATIVE", "1") };
 

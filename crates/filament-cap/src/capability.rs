@@ -898,8 +898,11 @@ pub fn fleet_inputs_in(
 /// * `is_pair`: the link proved the pair secret and carries no delegated
 ///   ceiling. A delegated or invited peer is NOT a pair here: its record caps
 ///   are its ceiling, and the gate's ceiling check stays the bound for it.
-/// * `local_record_grant`: the record LITERALLY lists the action (no implied
-///   transfer baseline).
+/// * `local_record_grant`: the record's STORED caps hold the action. That
+///   includes the pairing default `["transfer"]` (and a v1 record with no
+///   `caps`, which reads as `["transfer"]`): a pairing itself grants transfer.
+///   `device_allows`' implied transfer answer is not used, so a record with
+///   `caps: []`, or whose `capExpires` entry lapsed, grants nothing.
 /// * `locally_denied`: a deny recorded here for the action. It outranks the
 ///   grant, so the inputs pass through unchanged and the gate refuses on it.
 ///

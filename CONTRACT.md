@@ -1509,8 +1509,18 @@ require an owner-signed grant for a pair peer.
 - A pair is a link that proved the pair secret and carries no delegated
   ceiling. A delegated or invited device is not a pair for this rule: its
   record caps are its ceiling, and the ceiling stays its bound.
-- The record must list the action literally; the implied `transfer` baseline
-  of `device_allows` does not count as a grant here.
+- The record's STORED caps are what count, including the pairing default
+  `["transfer"]` and a v1 record with no `caps` key, which reads as
+  `["transfer"]`: a pairing itself grants transfer, so in authoritative mode a
+  trusted, Proven, unexpired pair with default caps is admitted for
+  file-offer and sync, as shadow mode already admits it. That default grants
+  no other action (shell, forward, mount each need their own grant).
+  `device_allows`' implied transfer answer is NOT used: a record with
+  `caps: []`, or whose `capExpires` entry for the action has lapsed, grants
+  nothing.
+- A record revoked on disk (`certRevoked` or a terminal `principalState`)
+  never counts as a pair grant, even before the revocation sweep reaches the
+  live link.
 - A local deny for the action, a revoked device, a delegated ceiling that
   lacks the action, an expired certificate and a non-Proven binding each
   refuse it exactly as they refuse an owner-signed grant, and the shell
@@ -1522,7 +1532,9 @@ require an owner-signed grant for a pair peer.
 The rule is `filament_cap::capability::pair_grant_inputs`, applied by every
 gate that reads a record grant: shell, pty, exec, ssh-sign and forward
 (`gather_shell_gate_inputs`, and the terminal recheck), mount, file-offer
-transfer and sync.
+transfer and sync. Both hosts answer the record grant from the caps their own
+device views read: the CLI daemon from `device_caps`, Core from
+`devices::record_caps` (Core serves the transfer gate only).
 
 ## Owner-signed fleet grant sets (`fleet-grants`) and `fleet.owner_grants`
 

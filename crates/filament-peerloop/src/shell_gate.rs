@@ -561,7 +561,10 @@ pub fn sibling_gate_inputs(
 pub struct PairFacts {
     /// The link proved the pair secret and carries no delegated ceiling.
     pub is_pair: bool,
-    /// THIS machine's own record literally lists the action for the peer.
+    /// THIS machine's own record's STORED caps hold the action for the peer
+    /// (`device_record_grants`): the pairing default `["transfer"]` and a v1
+    /// record's implied `["transfer"]` count, `device_allows`' implied answer
+    /// does not, and `caps: []` or a lapsed `capExpires` entry grants nothing.
     pub local_grant: bool,
     /// THIS machine's record DENIES the action to the peer. Outranks the grant.
     pub denied: bool,
@@ -569,10 +572,12 @@ pub struct PairFacts {
 
 impl PairFacts {
     /// Read the facts for the record `name` resolves to. `is_pair` is the
-    /// caller's link fact; nothing is read for anything that is not a pair.
+    /// caller's link fact; nothing is read for anything that is not a pair. A
+    /// record revoked on disk is not a pair, even while the link's trust has
+    /// not been swept yet.
     pub fn read(host: &dyn HostServices, name: Option<&str>, is_pair: bool, action: &str) -> Self {
         match name {
-            Some(n) if is_pair => Self {
+            Some(n) if is_pair && !host.device_record_revoked(n) => Self {
                 is_pair,
                 local_grant: host.device_record_grants(n, action),
                 denied: host.device_capability_denied(n, action),
@@ -943,6 +948,12 @@ mod terminal_lifecycle_tests {
         ] {
             assert_eq!(facts.apply(denied.clone(), false), (denied.clone(), false));
         }
+        // A record revoked on disk never counts, whatever the link still says.
+        host.0.lock().unwrap().revoked_records.insert("paired".into());
+        let revoked = PairFacts::read(&host, Some("paired"), true, "shell");
+        assert_eq!(revoked, PairFacts::default());
+        assert_eq!(revoked.apply(denied.clone(), false), (denied.clone(), false));
+        host.0.lock().unwrap().revoked_records.clear();
         host.0.lock().unwrap().denies.insert("paired".into());
         let pair = PairFacts::read(&host, Some("paired"), true, "shell");
         assert!(pair.denied);
@@ -997,4 +1008,189 @@ pub fn ssh_gate_decision(
     host: &dyn HostServices,
 ) -> Result<(), Option<String>> {
     decide(inputs, host)
+}
+
+/// A live `Conn` with one trusted pair link, over a host whose policy site
+/// decides the way the real one does in authoritative mode for a peer under
+/// another owner key: only an `Authorized` outcome carried with an explicit
+/// grant is admitted, and a local deny or revocation refuses. The signed store
+/// is empty, so the only grant source is THIS device's own record. Shared by the
+/// pair-grant wiring tests here and in `recv::dispatch`.
+#[cfg(test)]
+pub(crate) mod pair_fixture {
+    use super::*;
+    use crate::conn::{Link, Presence};
+    use crate::host::{NoHost, NoLog};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    pub(crate) const PID: &str = "pair-peer";
+    pub(crate) const NAME: &str = "phone";
+
+    #[derive(Default)]
+    pub(crate) struct PairHost {
+        /// The actions THIS device's record for `NAME` lists.
+        pub(crate) grants: Mutex<HashSet<String>>,
+        /// The actions THIS device's record for `NAME` denies.
+        pub(crate) denies: Mutex<HashSet<String>>,
+        /// `NAME`'s record is revoked on disk.
+        pub(crate) revoked: AtomicBool,
+    }
+
+    impl PairHost {
+        pub(crate) fn grant(&self, action: &str) {
+            self.grants.lock().unwrap().insert(action.to_string());
+        }
+        pub(crate) fn ungrant(&self, action: &str) {
+            self.grants.lock().unwrap().remove(action);
+        }
+    }
+
+    impl HostServices for PairHost {
+        fn settings_get_str(&self, key: &str) -> Option<String> { NoHost.settings_get_str(key) }
+        fn devices_load(&self) -> Vec<(String, String)> { NoHost.devices_load() }
+        fn is_self_uid(&self, a: &str, b: Option<&str>) -> bool { NoHost.is_self_uid(a, b) }
+        fn rejoin_unwarned(&self) -> Duration { NoHost.rejoin_unwarned() }
+        fn relay_banner(&self) -> String { NoHost.relay_banner() }
+        fn relay_forbidden(&self) -> bool { NoHost.relay_forbidden() }
+        fn channel_of(&self, secret: &str) -> String { NoHost.channel_of(secret) }
+        fn roster_snapshot_json(&self) -> Option<String> { NoHost.roster_snapshot_json() }
+        fn fleet_rv_present(&self) -> bool { false }
+        fn now_secs(&self) -> u64 { 100 }
+        fn cap_authoritative(&self) -> bool { true }
+        fn device_record_grants(&self, name: &str, capability: &str) -> bool {
+            name == NAME && self.grants.lock().unwrap().contains(capability)
+        }
+        fn device_allows(&self, name: &str, capability: &str) -> bool {
+            self.device_record_grants(name, capability)
+        }
+        fn device_capability_denied(&self, name: &str, capability: &str) -> bool {
+            name == NAME && self.denies.lock().unwrap().contains(capability)
+        }
+        fn device_record_revoked(&self, name: &str) -> bool {
+            name == NAME && self.revoked.load(Ordering::Relaxed)
+        }
+        fn cap_gate_effective(&self, gate: CapGate<'_>) -> GateDecision {
+            if gate.denied || gate.cert_revoked {
+                return GateDecision::Deny { cap_reason: Some("denied".into()) };
+            }
+            if gate.has_explicit_grant && matches!(gate.outcome, CapOutcome::Authorized) {
+                GateDecision::Allow
+            } else {
+                GateDecision::Deny { cap_reason: Some("not authorized".into()) }
+            }
+        }
+    }
+
+    /// The `Conn` and its loopback socket (keep the socket alive for the test).
+    pub(crate) async fn pair_conn(host: Arc<PairHost>) -> (Conn, tokio::net::TcpStream) {
+        let (sio, far) = filament_signal::Client::loopback().await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let host: Arc<dyn HostServices> = host;
+        let mut conn = Conn::for_command(
+            filament_transport::TransportContext::default(),
+            "http://127.0.0.1:9",
+            sio,
+            tx,
+            "me".into(),
+            false,
+            None,
+            false,
+            false,
+            Arc::new(NoLog),
+            host.clone(),
+        );
+        conn.links.insert(
+            PID.into(),
+            Link {
+                peer: None,
+                info: serde_json::json!({"id": PID}),
+                name: "untrusted display name".into(),
+                uid: None,
+                transport: None,
+                workers: vec![],
+                generation: 1,
+                source: Default::default(),
+                attempt: None,
+                worker_sources: Default::default(),
+                attempts: 0,
+                // The pair secret was proven: a pair link, not a sibling.
+                trusted: true,
+                expected_secret: None,
+                lan_binding: None,
+                verified_name: Some(NAME.to_string()),
+                presence: Presence::Ready,
+                direct: true,
+                direct_route: "direct-quic",
+                established_at: None,
+                identity_device_pub: Some([0x42; 32]),
+                identity_user_pub: Some([0x33; 32]),
+                identity_binding: BindingStrength::Proven,
+                identity_state: filament_cap::capability::IdentityState::Resolved,
+                identity_cert_expires: Some(u64::MAX),
+                principal_kind: PrincipalKind::OwnerDevice,
+                host,
+            },
+        );
+        (conn, far)
+    }
+}
+
+#[cfg(test)]
+mod pair_wiring_tests {
+    use super::pair_fixture::{NAME, PID, PairHost, pair_conn};
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    fn gather_decides(conn: &mut Conn) -> Result<(), Option<String>> {
+        let (_, inputs) = gather_shell_gate_inputs(conn, PID, &ShellPolicy::Granted, "shell");
+        let host = conn.host.clone();
+        exec_gate_decision(&inputs, host.as_ref())
+    }
+
+    /// Pairwise-first, through the real `gather_shell_gate_inputs`: a shell
+    /// grant this device gave its pair admits under authoritative with no
+    /// owner-signed grant, and no grant, a local deny or a record revoked on disk
+    /// refuses. Pins the `pair_facts(...).apply` line in the gather.
+    #[tokio::test]
+    async fn gather_counts_a_pair_record_grant_under_authoritative() {
+        let host = Arc::new(PairHost::default());
+        let (mut conn, _far) = pair_conn(host.clone()).await;
+        assert!(gather_decides(&mut conn).is_err(), "no grant is still no shell");
+        host.grant("shell");
+        assert!(gather_decides(&mut conn).is_ok(), "a pair shell grant must admit");
+        let (_, inputs) = gather_shell_gate_inputs(&mut conn, PID, &ShellPolicy::Granted, "shell");
+        assert!(inputs.has_grant && matches!(inputs.outcome, CapOutcome::Authorized));
+        host.revoked.store(true, Ordering::Relaxed);
+        assert!(gather_decides(&mut conn).is_err(), "a record revoked on disk never counts");
+        host.revoked.store(false, Ordering::Relaxed);
+        host.denies.lock().unwrap().insert("shell".into());
+        assert!(gather_decides(&mut conn).is_err(), "a local deny outranks the grant");
+        host.denies.lock().unwrap().clear();
+        host.ungrant("shell");
+        assert!(gather_decides(&mut conn).is_err(), "withdrawing the grant refuses again");
+        assert_eq!(NAME, conn.link(PID).unwrap().verified_name.as_deref().unwrap());
+    }
+
+    /// Pairwise-first, through the real terminal recheck: a terminal admitted
+    /// on a pair shell grant is not withdrawn while the grant stands, and is
+    /// withdrawn once it is removed. The capture runs the gather; the recheck
+    /// recomputes its own inputs, so this pins the `pair.apply` line in
+    /// `TerminalSessionScope::withdrawn`.
+    #[tokio::test]
+    async fn the_terminal_recheck_keeps_a_pair_granted_session_under_authoritative() {
+        let host = Arc::new(PairHost::default());
+        host.grant("shell");
+        let (mut conn, _far) = pair_conn(host.clone()).await;
+        let scope = TerminalSessionScope::capture(&mut conn, PID, &ShellPolicy::Granted);
+        assert!(!scope.withdrawn(host.as_ref()), "a standing pair grant keeps the terminal");
+        host.ungrant("shell");
+        assert!(scope.withdrawn(host.as_ref()), "removing the grant ends the terminal");
+        host.grant("shell");
+        host.revoked.store(true, Ordering::Relaxed);
+        assert!(scope.withdrawn(host.as_ref()), "a record revoked on disk ends it");
+    }
 }
