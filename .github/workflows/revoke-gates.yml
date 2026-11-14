@@ -262,7 +262,7 @@ jobs:
             fi
             if [ "$code" -eq 124 ]; then
               echo "::error::$g HUNG: killed by the 300s per-gate timeout, so the output above is partial and every gate after it in this suite still ran"; rc=1
-            elif [ "$code" -ne 0 ] && { [ "$nex" -eq 0 ] || printf '%s\n' "$out" | grep -q '^FAIL:'; }; then
+            elif [ "$code" -ne 0 ] && { [ "$nex" -eq 0 ] || grep -q '^FAIL:' <<<"$out"; }; then
               # A script exits nonzero for NOT-EXERCISED alone too; that case
               # was reported above, so only a real failure is named here.
               echo "::error::$g exited $code"; rc=1
