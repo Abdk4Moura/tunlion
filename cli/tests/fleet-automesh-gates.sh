@@ -172,9 +172,23 @@ elif [ "$rc" = 0 ] && landed bravo t1r.txt && ! landed charlie t1r.txt && ! land
 else bad "gateT2: ungranted charlie->bravo rc=$rc, landed: $(ls "$WORK"/*-drop | tr '\n' ' ')"; fi
 if [ "$MIXED" = 1 ]; then
   echo "  (mixed: see gateT2)"
-elif grep -qE "transfer-gate: from=charlie allowed=true .*trusted=false" "$WORK/up-bravo.log"; then
-  ok "gateT2b: bravo's transfer gate admitted charlie on the kind, on an UNTRUSTED link (no pairing)"
-else bad "gateT2b: no transfer-gate admission of charlie in bravo's log"; grep -E "transfer-gate" "$WORK/up-bravo.log" | tail -3; fi
+else
+  # After both transfers (and whatever identity proofs they caused), bravo's
+  # LIVE link to charlie must still be a sibling link. Read off the daemon's
+  # own warm-hold line (every 10s), so a handler that relabels the link is
+  # caught here, not only at the pure decision function.
+  LT2=$(( $(wc -l < "$WORK/up-bravo.log") + 1 ))
+  kind_line=""
+  for _ in $(seq 1 50); do
+    kind_line=$(tail -n +"$LT2" "$WORK/up-bravo.log" | grep -E "warm-hold: skip 'charlie' .*principal=" | tail -1)
+    [ -n "$kind_line" ] && break; sleep 0.5
+  done
+  if grep -qE "transfer-gate: from=charlie allowed=true .*trusted=false" "$WORK/up-bravo.log" \
+     && printf '%s\n' "$kind_line" | grep -qE "principal=FleetSibling sibling=true"; then
+    ok "gateT2b: bravo's transfer gate admitted charlie on the kind, on an UNTRUSTED link (no pairing), and the live link is still a sibling link"
+  else bad "gateT2b: transfer-gate admission of charlie missing, or its live link is no longer a sibling link (${kind_line:-no warm-hold line in 25s})"
+    grep -E "transfer-gate|identity proven for peer" "$WORK/up-bravo.log" | tail -4; fi
+fi
 
 say "S: shell is the target's own grant decision"
 fs_cli 60 as_node bravo exec charlie -- echo EXEC-MARK-PRE; rc=$(fs_rc)
@@ -273,12 +287,29 @@ n_after=$(since_revoke | grep -c "fleet device 'charlie' joined the mesh" || tru
 # and a fresh charlie->bravo offer is still refused.
 v4_why=""
 post_has "fleet device 'charlie' joined the mesh" && v4_why="re-admitted after the revoke ($n_after)"
+# Budget: the record sweep runs every 30s, so allow 90s for it (one missed tick
+# and slack); with the 60s refusal wait below V4 adds at most ~3 minutes to a
+# suite that ran in ~3.5 under its 600s step timeout.
 if [ -z "$v4_why" ]; then
-  for _ in $(seq 1 90); do grep -q '"name": *"charlie"' "$WORK/bravo/devices.json" || break; sleep 0.5; done
-  if grep -q '"name": *"charlie"' "$WORK/bravo/devices.json"; then v4_why="bravo still holds charlie's record 45s on (its record sweep never removed it)"
+  for _ in $(seq 1 180); do grep -q '"name": *"charlie"' "$WORK/bravo/devices.json" || break; sleep 0.5; done
+  if grep -q '"name": *"charlie"' "$WORK/bravo/devices.json"; then v4_why="bravo still holds charlie's record 90s on (its record sweep never removed it)"
   elif ! post_has "device\(s\) lapsed or ended"; then v4_why="charlie's record went without bravo's sweep saying so (instrument did not fire)"; fi
 fi
 if [ -z "$v4_why" ] && { [ -z "$CHARLIE_KEY" ] || ! grep -q "$CHARLIE_KEY" "$WORK/bravo/delisted-siblings.json" 2>/dev/null; }; then v4_why="removing charlie's record left no delisted-sibling entry (key=${CHARLIE_KEY:-unread})"; fi
+# The denied arm must be a REFUSAL, not mere unreachability: after the sweep
+# line, bravo refuses charlie's own key by its fleet-hello (charlie's daemon
+# keeps re-dialing). With the record gone, only the kept revocation can say
+# "device revoked" here; without it the hello is merely held as unlisted.
+if [ -z "$v4_why" ]; then
+  LSW=$(since_revoke | grep -nE "device\(s\) lapsed or ended" | tail -1 | cut -d: -f1)
+  LSW=$(( LV0 + ${LSW:-1} - 1 ))
+  refused=""
+  for _ in $(seq 1 120); do
+    tail -n +"$LSW" "$WORK/up-bravo.log" | grep -E "fleet-hello from .* refused: device revoked \(device $CHARLIE_KEY\)" >/dev/null && { refused=1; break; }
+    sleep 0.5
+  done
+  [ -n "$refused" ] || v4_why="after the record sweep bravo never refused charlie's key by name in 60s (unreachable is not a refusal)"
+fi
 if [ -z "$v4_why" ]; then
   echo "t6-$$" > "$WORK/t6.txt"
   fs_cli 90 as_node charlie send "$WORK/t6.txt" --to bravo; rc6=$(fs_rc)
@@ -298,11 +329,17 @@ sleep 2
 echo "e1-$$" > "$WORK/e1.txt"
 fs_cli 90 as_node echo send "$WORK/e1.txt" --to bravo; rce=$(fs_rc)
 sleep 2
-if [ "$rc" = 0 ] && [ -f "$WORK/Adrop/t5.txt" ] \
-   && [ "$rce" = 0 ] && landed bravo e1.txt && ! landed charlie e1.txt && ! landed echo e1.txt \
-   && post_has "transfer-gate: from=echo allowed=true"; then
+v5_why=""
+if ! { [ "$rc" = 0 ] && [ -f "$WORK/Adrop/t5.txt" ]; }; then v5_why="the owner control bravo->alpha failed (rc=$rc)"; fi
+if ! { [ "$rce" = 0 ] && landed bravo e1.txt && ! landed charlie e1.txt && ! landed echo e1.txt; }; then
+  v5_why="${v5_why:+$v5_why; }the sibling control echo->bravo did not land at bravo only (rc=$rce)"
+elif ! post_has "transfer-gate: from=echo allowed=true .*trusted=false"; then
+  # Delivered, but not shown to be admitted as an untrusted SIBLING.
+  v5_why="${v5_why:+$v5_why; }echo->bravo landed but bravo's gate did not admit echo as a sibling (no allowed=true ... trusted=false)"
+fi
+if [ -z "$v5_why" ]; then
   ok "gateV5: CONTROL bravo->alpha and the unrevoked sibling echo->bravo still deliver after the revoke"
-else bad "gateV5: CONTROL bravo->alpha rc=$rc, sibling echo->bravo rc=$rce: $(fs_out | tail -3)"; since_revoke | grep -E "transfer-gate: from=echo|echo" | tail -5; fi
+else bad "gateV5: $v5_why: $(fs_out | tail -3)"; since_revoke | grep -E "transfer-gate: from=echo|echo" | tail -5; fi
 
 say "health"
 for n in bravo charlie dave; do

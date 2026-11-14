@@ -79,6 +79,17 @@ pub const KEY_REVOCATIONS_LOCK_FILE: &str = "revoked-keys.json.lock";
 /// forget block above: an entry here means "delisted by the owner", and it
 /// lifts by itself once the owner lists the device again.
 pub const DELISTED_SIBLINGS_FILE: &str = "delisted-siblings.json";
+
+/// A read of [`DELISTED_SIBLINGS_FILE`]: its entries, or why it is unusable.
+type DelistedRead = std::result::Result<Vec<Value>, String>;
+/// The last read, keyed by (path, mtime, length). Process-wide because callers
+/// open a fresh `DeviceStore` per call.
+#[allow(clippy::type_complexity)]
+static DELISTED_CACHE: std::sync::Mutex<
+    Option<(PathBuf, Option<SystemTime>, u64, DelistedRead)>,
+> = std::sync::Mutex::new(None);
+/// This process's last failed write to [`DELISTED_SIBLINGS_FILE`], if any.
+static DELISTED_WRITE_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// The local device certificate record, relative to the root.
 pub const LOCAL_DEVICE_CERT_FILE: &str = "identity/device-cert.json";
 /// How long a provisional identity is worth keeping. It exists to bridge one
@@ -1173,29 +1184,66 @@ impl DeviceStore {
         }
     }
 
+    /// The delisted-sibling entries: `None` when the file is absent, `Err`
+    /// (with why) when it exists but cannot be read or parsed. Parsed once per
+    /// change of the file (path, mtime, length), so an unknown key at the
+    /// transfer gate costs a `stat`, not a read.
+    fn delisted_entries(&self) -> Option<DelistedRead> {
+        let p = self.root.join(DELISTED_SIBLINGS_FILE);
+        let meta = match std::fs::metadata(&p) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+            Err(e) => return Some(Err(format!("cannot be read ({e})"))),
+        };
+        let (mtime, len) = (meta.modified().ok(), meta.len());
+        if let Ok(cache) = DELISTED_CACHE.lock() {
+            if let Some((cp, cm, cl, read)) = cache.as_ref() {
+                if *cp == p && *cm == mtime && *cl == len {
+                    return Some(read.clone());
+                }
+            }
+        }
+        // An empty file does not parse either: nothing writes one, so it is a
+        // truncation, never "no entries".
+        let read: DelistedRead = match std::fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str::<Vec<Value>>(&raw)
+                .map_err(|e| format!("cannot be parsed ({e})")),
+            Err(e) => Err(format!("cannot be read ({e})")),
+        };
+        if let Ok(mut cache) = DELISTED_CACHE.lock() {
+            *cache = Some((p, mtime, len, read.clone()));
+        }
+        Some(read)
+    }
+
     /// Does a delisted-sibling entry (see [`DELISTED_SIBLINGS_FILE`]) still
     /// refuse `device_pub`? Only on a joined device, only while the entry's
-    /// certificate has not run out, and only while the owner's held roster
-    /// still does not list the key. Fail-closed like the record read: absent is
-    /// nothing, unreadable or unparseable refuses.
+    /// certificate has not run out, and only while neither the entry's owner
+    /// nor the owner this device answers to NOW lists the key in the held
+    /// roster. Fail-closed like the record read: absent is nothing, unreadable
+    /// or unparseable refuses (and is reported, see
+    /// [`DeviceStore::delisted_siblings_problem`]).
     fn delisted_sibling_tombstoned(&self, device_pub: &[u8; 32]) -> bool {
         if self.owner_pub_from_keystore().is_some() {
             return false;
         }
-        let raw = match std::fs::read_to_string(self.root.join(DELISTED_SIBLINGS_FILE)) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
-            Err(_) => return true,
-        };
-        let Ok(entries) = serde_json::from_str::<Vec<Value>>(&raw) else {
-            return true;
+        let entries = match self.delisted_entries() {
+            None => return false,
+            Some(Err(_)) => return true,
+            Some(Ok(entries)) => entries,
         };
         let key = hex::encode(device_pub);
         let now = now_secs();
+        let current_owner = self.owner_pub_for_resources(None);
         entries.iter().any(|e| {
             if e["devicePub"].as_str() != Some(key.as_str())
                 || !e["certExpires"].as_u64().is_some_and(|exp| exp > now)
             {
+                return false;
+            }
+            // Lifted once the owner lists the device again, including an
+            // entry written under an earlier enrolment's owner.
+            if current_owner.is_some_and(|o| self.owner_roster_lists(device_pub, &o)) {
                 return false;
             }
             let owner = e["ownerPub"]
@@ -1209,10 +1257,33 @@ impl DeviceStore {
         })
     }
 
+    /// Why the delisted-sibling store needs a person, if it does: the file
+    /// exists but does not read or parse (every key with no record is then
+    /// refused as revoked), or this process's last write to it failed (a
+    /// removed sibling's revocation may not have been kept). The daemon says
+    /// this loudly; `None` when all is well.
+    pub fn delisted_siblings_problem(&self) -> Option<String> {
+        let p = self.root.join(DELISTED_SIBLINGS_FILE);
+        if let Some(Err(why)) = self.delisted_entries() {
+            let bak = backup_path(&p);
+            let recover = if bak.exists() {
+                format!("restore the last good copy: cp {} {}", bak.display(), p.display())
+            } else {
+                "move it aside to start with an empty one (that drops what it held)".to_string()
+            };
+            return Some(format!(
+                "{} {why}; until it is fixed every device with no record here is refused as revoked. Fix it, or {recover}",
+                p.display()
+            ));
+        }
+        DELISTED_WRITE_ERROR.lock().ok().and_then(|g| g.clone())
+    }
+
     /// Record that the sweep removed these delisted siblings' records:
     /// `(device key hex, certificate expiry)`. Called under the devices lock,
     /// BEFORE the shortened device list is written, so there is no moment at
-    /// which the record is gone and the entry is not there yet.
+    /// which the record is gone and the entry is not there yet. The outcome is
+    /// kept for [`DeviceStore::delisted_siblings_problem`].
     fn tombstone_delisted_siblings(
         &self,
         owner: &[u8; 32],
@@ -1220,9 +1291,33 @@ impl DeviceStore {
         now: u64,
     ) -> Result<()> {
         let p = self.root.join(DELISTED_SIBLINGS_FILE);
-        let mut entries: Vec<Value> = match std::fs::read_to_string(&p) {
+        let r = self.write_delisted(&p, owner, removed, now);
+        if let Ok(mut cache) = DELISTED_CACHE.lock() {
+            *cache = None;
+        }
+        if let Ok(mut last) = DELISTED_WRITE_ERROR.lock() {
+            *last = r.as_ref().err().map(|e| {
+                format!(
+                    "{}: a removed sibling's revocation could not be kept ({e:#}); its record was kept instead",
+                    p.display()
+                )
+            });
+        }
+        r
+    }
+
+    fn write_delisted(
+        &self,
+        p: &Path,
+        owner: &[u8; 32],
+        removed: &[(String, u64)],
+        now: u64,
+    ) -> Result<()> {
+        // A file that does not parse is never written over: it stays for a
+        // person to inspect or restore (the state-file doctrine).
+        let mut entries: Vec<Value> = match std::fs::read_to_string(p) {
             Ok(raw) => serde_json::from_str(&raw)
-                .map_err(|e| anyhow::anyhow!("parse {}: {e}", p.display()))?,
+                .map_err(|e| anyhow::anyhow!("{} cannot be parsed ({e})", p.display()))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(anyhow::anyhow!("read {}: {e}", p.display())),
         };
@@ -1240,7 +1335,8 @@ impl DeviceStore {
                 "certExpires": expires,
             }));
         }
-        secret_write::SecretFile::write_str(&p, &serde_json::to_string_pretty(&entries)?)
+        keep_backup(p);
+        secret_write::SecretFile::write_str(p, &serde_json::to_string_pretty(&entries)?)
             .context("atomic write delisted-siblings.json")?;
         Ok(())
     }
@@ -3030,6 +3126,9 @@ mod port_impl {
         fn devices_sweep_lapsed(&self, now: u64) -> usize {
             DeviceStore::devices_sweep_lapsed(self, now)
         }
+        fn delisted_siblings_problem(&self) -> Option<String> {
+            DeviceStore::delisted_siblings_problem(self)
+        }
 
         fn devices_upsert_atomic(
             &self,
@@ -4532,6 +4631,86 @@ mod sibling_roster_revocation {
         // Positive control: the owner lists it again, and the entry lifts.
         write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32], j.sib]);
         assert!(!j.store.device_cert_revoked(&j.sib));
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    fn write_delisted(j: &Joined, entries: &Value) {
+        std::fs::write(
+            j.root.join(DELISTED_SIBLINGS_FILE),
+            serde_json::to_string(entries).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_unparseable_delisted_store_refuses_unknown_keys_only_and_says_so() {
+        let j = joined("tomb-corrupt");
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32], j.sib]);
+        std::fs::write(j.root.join(DELISTED_SIBLINGS_FILE), "{garbage").unwrap();
+        // Unknown key: fail closed. Known (recorded, listed) key: its record
+        // decides, the damaged file does not.
+        assert!(j.store.device_cert_revoked(&[9u8; 32]));
+        assert!(!j.store.device_cert_revoked(&j.sib));
+        let why = j.store.delisted_siblings_problem().expect("a damaged store is reported");
+        assert!(why.contains(DELISTED_SIBLINGS_FILE), "{why}");
+        // And it is never written over: a sweep that would add an entry
+        // fails, keeping the record, and leaves the damage for a person.
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32]]);
+        assert_eq!(j.store.devices_sweep_lapsed(now_secs()), 0);
+        assert_eq!(names(&j.store), vec!["sib"], "the record stays when its revocation cannot be kept");
+        assert_eq!(
+            std::fs::read_to_string(j.root.join(DELISTED_SIBLINGS_FILE)).unwrap(),
+            "{garbage"
+        );
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn the_owner_device_ignores_delisted_entries() {
+        let j = joined("tomb-owner");
+        let k = [9u8; 32];
+        write_delisted(
+            &j,
+            &json!([{"devicePub": hex::encode(k), "ownerPub": hex::encode(j.owner.public_key_bytes()), "certExpires": now_secs() + 3600}]),
+        );
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32]]);
+        // Control: on the joined device the entry refuses the key.
+        assert!(j.store.device_cert_revoked(&k));
+        UserKey::generate(&j.store.keystore()).unwrap();
+        assert!(!j.store.device_cert_revoked(&k), "the owner's own records decide");
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn an_expired_delisted_entry_refuses_nothing() {
+        let j = joined("tomb-expired");
+        let k = [9u8; 32];
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32]]);
+        write_delisted(
+            &j,
+            &json!([{"devicePub": hex::encode(k), "ownerPub": hex::encode(j.owner.public_key_bytes()), "certExpires": now_secs() - 1}]),
+        );
+        // The roster still omits the key, and the certificate behind the entry
+        // has run out: not revoked (the expired certificate is refused anyway).
+        assert!(!j.store.device_cert_revoked(&k));
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn a_delisted_entry_from_an_earlier_owner_lifts_when_the_current_owner_lists_the_key() {
+        let j = joined("tomb-owner-change");
+        let k = [9u8; 32];
+        let earlier = UserKey::from_seed(&[44u8; 32]).unwrap();
+        write_delisted(
+            &j,
+            &json!([{"devicePub": hex::encode(k), "ownerPub": hex::encode(earlier.public_key_bytes()), "certExpires": now_secs() + 3600}]),
+        );
+        // Control: the current owner's roster omits it, so it is refused.
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32]]);
+        assert!(j.store.device_cert_revoked(&k));
+        // The current owner lists it: lifted, whatever the entry's owner was.
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32], k]);
+        assert!(!j.store.device_cert_revoked(&k));
         let _ = std::fs::remove_dir_all(&j.root);
     }
 

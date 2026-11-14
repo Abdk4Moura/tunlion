@@ -105,90 +105,127 @@ pub fn principal_after_liveness(stored: PrincipalKind, alive: bool) -> Principal
     }
 }
 
-/// The principal a link carries once a possession proof (`identity-expose`)
-/// lands on it, or `None` when the proof must be refused.
+/// What a possession proof (`identity-expose`) is decided on: the link's
+/// state BEFORE the proof is applied, and the proof itself.
+pub struct ProofFacts<'a> {
+    /// The link's principal now (set by admission, or by an earlier proof).
+    pub current: &'a PrincipalKind,
+    /// The device key the link was admitted on, if any.
+    pub admitted_device: Option<&'a [u8; 32]>,
+    /// The device key the proof names.
+    pub proven_device: &'a [u8; 32],
+    /// Does a device record carry the proven key (a sibling's index record)?
+    pub indexed: bool,
+    /// The proven certificate's own expiry.
+    pub cert_expires: u64,
+}
+
+/// The principal, and the deadline for `identity_cert_expires`, a link carries
+/// once a possession proof lands on it, or `None` when the proof must be
+/// refused.
 ///
-/// A link the fleet hello already admitted as a SIBLING keeps that kind when
-/// the proof names the same device key. The persisted principal cannot stand
-/// in for it: a sibling's index record carries no principal kind, which reads
-/// back as an owner device, and a sibling relabelled that way is no longer
-/// governed by the sibling rules (the cut-on-revocation sweep, the transfer
-/// scope). A proof naming a DIFFERENT key than the admitted one is refused:
-/// one link cannot be two devices.
+/// A link the fleet hello already admitted as a SIBLING keeps that kind, with
+/// its certificate's own expiry, when the proof names the same device key and
+/// that key is indexed. The persisted principal cannot stand in for it: a
+/// sibling's index record carries no principal kind and reads back as an owner
+/// device, and an unrelated record's deadline is not the sibling's. A proof
+/// naming a DIFFERENT key than the admitted one is refused: one link cannot be
+/// two devices. A sibling with no admitted key or no record fails closed to an
+/// empty ceiling that has already ended.
 ///
-/// Every other link takes the persisted principal, after liveness, exactly as
-/// before. Pure, so the decision is testable without a `Link`.
+/// Every other link takes the persisted principal, after liveness, and the
+/// persisted (composed) deadline, exactly as before. Pure, so the decision is
+/// testable without a `Link`.
 pub fn principal_after_proof(
-    current: &PrincipalKind,
-    admitted_device: Option<&[u8; 32]>,
-    proven_device: &[u8; 32],
+    f: &ProofFacts<'_>,
     persisted: PrincipalKind,
-    alive: bool,
-) -> Option<PrincipalKind> {
-    if matches!(current, PrincipalKind::FleetSibling) {
-        return match admitted_device {
-            Some(k) if k == proven_device => Some(PrincipalKind::FleetSibling),
-            Some(_) => None,
-            // Admission always records the key; a sibling without one is not a
-            // state admission produces. Fail closed to a ceiling that denies.
-            None => Some(PrincipalKind::Delegated { caps: Vec::new() }),
+    persisted_deadline: u64,
+    now: u64,
+) -> Option<(PrincipalKind, u64)> {
+    if matches!(f.current, PrincipalKind::FleetSibling) {
+        return match f.admitted_device {
+            Some(k) if k != f.proven_device => None,
+            Some(_) if f.indexed => Some((PrincipalKind::FleetSibling, f.cert_expires)),
+            _ => Some((PrincipalKind::Delegated { caps: Vec::new() }, 0)),
         };
     }
-    Some(principal_after_liveness(persisted, alive))
+    Some((
+        principal_after_liveness(persisted, persisted_deadline > now),
+        persisted_deadline,
+    ))
 }
 
 #[cfg(test)]
 mod proof_principal_tests {
     use super::*;
 
+    fn facts<'a>(
+        current: &'a PrincipalKind,
+        admitted: Option<&'a [u8; 32]>,
+        proven: &'a [u8; 32],
+        indexed: bool,
+    ) -> ProofFacts<'a> {
+        ProofFacts {
+            current,
+            admitted_device: admitted,
+            proven_device: proven,
+            indexed,
+            cert_expires: 5_000,
+        }
+    }
+
     #[test]
     fn a_proof_keeps_an_admitted_sibling_a_sibling_and_others_unchanged() {
         let k = [7u8; 32];
         let other = [8u8; 32];
-        // The decision point: a sibling's record reads back as OwnerDevice, and
-        // that must NOT replace the sibling admission for the same key.
+        let sib = PrincipalKind::FleetSibling;
+        // The decision point: a sibling's record reads back as OwnerDevice with
+        // an unrelated deadline; neither replaces the sibling admission, and
+        // the deadline is the certificate's own.
         assert_eq!(
-            principal_after_proof(
-                &PrincipalKind::FleetSibling,
-                Some(&k),
-                &k,
-                PrincipalKind::OwnerDevice,
-                true
-            ),
-            Some(PrincipalKind::FleetSibling)
+            principal_after_proof(&facts(&sib, Some(&k), &k, true), PrincipalKind::OwnerDevice, 0, 100),
+            Some((PrincipalKind::FleetSibling, 5_000))
         );
         // A different key on an admitted sibling link is refused outright.
         assert_eq!(
-            principal_after_proof(
-                &PrincipalKind::FleetSibling,
-                Some(&k),
-                &other,
-                PrincipalKind::OwnerDevice,
-                true
-            ),
+            principal_after_proof(&facts(&sib, Some(&k), &other, true), PrincipalKind::OwnerDevice, 9_000, 100),
             None
         );
-        // Positive controls: a non-sibling link takes the persisted principal,
-        // and an expired delegated one still collapses to an empty ceiling.
+        // Positive controls: a non-sibling link takes the persisted principal
+        // and deadline, and an expired delegated one still collapses to an
+        // empty ceiling.
+        let owner = PrincipalKind::OwnerDevice;
         assert_eq!(
-            principal_after_proof(
-                &PrincipalKind::OwnerDevice,
-                None,
-                &k,
-                PrincipalKind::OwnerDevice,
-                true
-            ),
-            Some(PrincipalKind::OwnerDevice)
+            principal_after_proof(&facts(&owner, None, &k, true), PrincipalKind::OwnerDevice, 9_000, 100),
+            Some((PrincipalKind::OwnerDevice, 9_000))
         );
         assert_eq!(
             principal_after_proof(
-                &PrincipalKind::OwnerDevice,
-                None,
-                &k,
+                &facts(&owner, None, &k, true),
                 PrincipalKind::Delegated { caps: vec!["transfer".into()] },
-                false
+                50,
+                100
             ),
-            Some(PrincipalKind::Delegated { caps: Vec::new() })
+            Some((PrincipalKind::Delegated { caps: Vec::new() }, 50))
+        );
+    }
+
+    #[test]
+    fn a_sibling_with_no_record_or_no_admitted_key_fails_closed() {
+        let k = [7u8; 32];
+        let sib = PrincipalKind::FleetSibling;
+        let closed = Some((PrincipalKind::Delegated { caps: Vec::new() }, 0));
+        // No index record carries the key: whatever the persisted principal
+        // says (an owner device, a live deadline), the link is not kept a
+        // sibling and is not owner-equivalent.
+        assert_eq!(
+            principal_after_proof(&facts(&sib, Some(&k), &k, false), PrincipalKind::OwnerDevice, 9_000, 100),
+            closed
+        );
+        // Admitted without a key: not a state admission produces.
+        assert_eq!(
+            principal_after_proof(&facts(&sib, None, &k, true), PrincipalKind::OwnerDevice, 9_000, 100),
+            closed
         );
     }
 }

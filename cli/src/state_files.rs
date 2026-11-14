@@ -36,9 +36,11 @@ pub(crate) enum Shape {
 }
 
 /// The files checked, relative to the config directory.
-pub(crate) const FILES: [(&str, Shape); 6] = [
+pub(crate) const FILES: [(&str, Shape); 7] = [
     ("devices.json", Shape::JsonArray),
     ("revoked-keys.json", Shape::JsonArray),
+    // On a joined device: removed fleet siblings whose revocation is kept.
+    ("delisted-siblings.json", Shape::JsonArray),
     ("used-invitations.json", Shape::JsonArray),
     // The signed capability store: grants and their revocations.
     ("caps.json", Shape::JsonArray),

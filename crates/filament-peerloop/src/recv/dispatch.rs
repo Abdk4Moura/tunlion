@@ -2238,6 +2238,9 @@ async fn recv_run(
     // observation revived them). State-only; the gate already denies past the
     // deadline, the sweep is what makes LAPSED visible in `devices`.
     let mut last_sweep = Instant::now();
+    // Whether the delisted-sibling store problem was already said (once per
+    // episode, not every sweep).
+    let mut delisted_problem_said = false;
     let mut last_renewal_check = Instant::now();
     let mut last_route_reconcile = Instant::now();
     let mut last_wg_check = Instant::now();
@@ -3507,6 +3510,14 @@ async fn recv_run(
                     "{} {lapsed} device(s) lapsed or ended (offline past their budget, lease over, or removed by the owner)",
                     log.paint(Tone::Warn, log.glyph_warn())
                 ));
+            }
+            match ports.store.delisted_siblings_problem() {
+                Some(why) if !delisted_problem_said => {
+                    delisted_problem_said = true;
+                    log.critical(&format!("fleet: delisted-sibling store: {why}"));
+                }
+                Some(_) => {}
+                None => delisted_problem_said = false,
             }
         }
 
@@ -5918,7 +5929,8 @@ async fn recv_run(
                                 Ok(ok) if ports.identity.device_cert_revoked(&ok.device_pub) => {
                                     fleet_unlisted_hellos.remove(&pid);
                                     log.debug(&format!(
-                                        "fleet-hello from {pid} refused: device revoked"
+                                        "fleet-hello from {pid} refused: device revoked (device {})",
+                                        hex::encode(ok.device_pub)
                                     ));
                                     fleet_pending.remove(&pid);
                                     fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
@@ -6180,11 +6192,16 @@ async fn recv_run(
                                     "fleet-rendezvous from {pid} ignored: no proven identity on the link"
                                 )),
                                 // A meeting place is only as good as the sibling
-                                // that brokered it: none from a revoked one.
+                                // that brokered it: none from a revoked one. The
+                                // link stops counting as verified, so this check
+                                // (and its store read) runs once per link, and
+                                // the sweep it requests closes it.
                                 Some(broker)
                                     if ports.identity.device_cert_revoked(&broker.device_pub) =>
                                 {
-                                    log.say(&format!(
+                                    fleet_verified.remove(&pid);
+                                    revocation_sweep_now = true;
+                                    log.debug(&format!(
                                         "fleet-rendezvous from {pid} refused: device revoked"
                                     ));
                                 }

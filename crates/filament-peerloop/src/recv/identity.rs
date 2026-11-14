@@ -21,7 +21,7 @@
 
 use crate::conn::Conn;
 use crate::host::{LogSink, Tone};
-use crate::identity::principal_after_proof;
+use crate::identity::{principal_after_proof, ProofFacts};
 use crate::recv::renewal;
 use crate::recv::store::{
     effective_principal_deadline, DeviceStore, OverlayKey, PRINCIPAL_STATE_LAPSED,
@@ -265,14 +265,14 @@ impl IdentityService {
         // A fleet-admitted sibling link may only be proven by the key it was
         // admitted on. Checked before anything is stored or changed.
         if conn.link(pid).is_some_and(|l| {
-            principal_after_proof(
-                &l.principal_kind,
-                l.identity_device_pub.as_ref(),
-                &cert.device_pub,
-                PrincipalKind::OwnerDevice,
-                true,
-            )
-            .is_none()
+            let f = ProofFacts {
+                current: &l.principal_kind,
+                admitted_device: l.identity_device_pub.as_ref(),
+                proven_device: &cert.device_pub,
+                indexed: true,
+                cert_expires: cert.expires,
+            };
+            principal_after_proof(&f, PrincipalKind::OwnerDevice, 0, 0).is_none()
         }) {
             return fail("the certificate names a different device than the sibling admitted on this link");
         }
@@ -283,31 +283,40 @@ impl IdentityService {
         let (principal_kind, not_after, max_offline, last_seen) = self
             .store
             .persisted_principal_for_cert(&cert, own_user_pub.as_ref());
+        // Is the proven key indexed (a sibling's record)? Read before the
+        // link is borrowed mutably.
+        let indexed = self.store.devices_find_by_device_pub(&cert.device_pub).is_some();
         if let Some(l) = conn.link_mut(pid) {
             let (deadline, _clock) =
                 effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
-            let alive = deadline > now_secs();
             // Decided against the link's state BEFORE it is overwritten: a
-            // sibling stays a sibling (see `principal_after_proof`).
-            let next = principal_after_proof(
-                &l.principal_kind,
-                l.identity_device_pub.as_ref(),
-                &cert.device_pub,
-                principal_kind,
-                alive,
-            )
-            .unwrap_or(PrincipalKind::Delegated { caps: Vec::new() });
+            // sibling stays a sibling, with its certificate's own expiry rather
+            // than a persisted deadline (see `principal_after_proof`).
+            let f = ProofFacts {
+                current: &l.principal_kind,
+                admitted_device: l.identity_device_pub.as_ref(),
+                proven_device: &cert.device_pub,
+                indexed,
+                cert_expires: cert.expires,
+            };
+            let (next, expires) = principal_after_proof(&f, principal_kind, deadline, now_secs())
+                .unwrap_or((PrincipalKind::Delegated { caps: Vec::new() }, 0));
             l.identity_device_pub = Some(cert.device_pub);
             l.identity_user_pub = Some(cert.user_pub);
             l.identity_binding = BindingStrength::Proven;
             l.identity_state = IdentityState::Resolved;
-            l.identity_cert_expires = Some(deadline);
+            l.identity_cert_expires = Some(expires);
             l.principal_kind = next;
         }
+        let principal = conn
+            .link(pid)
+            .map(|l| format!("{:?}", l.principal_kind))
+            .unwrap_or_default();
         self.log.debug(&format!(
-            "{} identity proven for peer {}",
+            "{} identity proven for peer {} principal={}",
             self.log.paint(Tone::Ok, self.log.glyph_ok()),
-            pid
+            pid,
+            principal
         ));
         let petname = conn.link(pid).map(|l| l.name.clone()).unwrap_or_default();
         if !petname.is_empty()
