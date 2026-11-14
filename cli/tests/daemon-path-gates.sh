@@ -23,11 +23,13 @@
 #   E1  exec b -> a works (positive control for E2-F1).
 #   E2  exec running when a's daemon is kill -9'd: exits 6 within 16 s.
 #   E3  exec to a's dead daemon: exits 6 within 20 s (was 45 s).
-#   F1a exec running when a forgets b: exits 4 with the refusal, not
-#       "link died" (6), and a's daemon logs that b ACKNOWLEDGED the refusal:
-#       a write that returned Ok is only queued here, and the close that
-#       follows the forget discarded it about half the time (b then saw a
-#       dead link).
+#   F1a exec running when a forgets b: exits 4 with the peer's structured
+#       refusal, not "link died" (6). The refusal cannot come from a dead
+#       link: that path renders as exit 6 with "died during exec". Whether a
+#       logs b's ACKNOWLEDGEMENT is REPORTED, not asserted: the protocol
+#       contract calls the ack diagnostic-only, and a peer with no session mux
+#       for that pid, or whose transport is already gone, legitimately cannot
+#       answer. The asserted guarantee is the refusal the user sees.
 #   F1b the no-hang side of that wait: a third device c is forgotten while
 #       its daemon is SIGSTOPped mid-exec. The forget returns, and a `status`
 #       probed 200 ms into it is answered, both before the closer's 2 s ack
@@ -246,7 +248,7 @@ start_a
 sleep 6
 
 # ===================================================================== F1a =====
-say "F1a: exec running when a forgets b: exit 4 with the refusal, acknowledged by b"
+say "F1a: exec running when a forgets b: exit 4 with the structured refusal"
 # Evidence printed only when F1a fails: both daemons' lines about the cut, the
 # ack and the links for this peer, so a failure says which side lost what.
 f1a_evidence() {
@@ -269,14 +271,21 @@ if kill -0 "$EP" 2>/dev/null; then
   env TUNLION_CONFIG_DIR="$DA" "$BIN" devices forget boxb -y >"$WORK/forget.log" 2>&1; frc=$?; t0=$(ts)
   wait "$EP"; rc=$?; took=$(since "$t0"); ran=$(since "$es")
   echo "## forget rc=$frc; exec rc=$rc ${took}s after it (the exec ran ${ran}s in all)"; tail -3 "$WORK/f1.err"
-  # The instrument: a's closer logs the refusal's fate. Only an ack from b's
-  # daemon, sent after it recorded the refusal, may read as acknowledged.
+  # The asserted guarantee is the peer's structured refusal, which cannot be
+  # produced by a dead link: that path renders as exit 6 with "died during
+  # exec", never as exit 4 with "not recognized". (Before the fix the refusal
+  # frame sometimes survived the close, so this is not a universal red on old
+  # builds; it is a red whenever the close wins, which is the defect.)
+  # The ack is reported, not required: the protocol contract calls it
+  # diagnostic-only, and a missing ack must never be read as non-delivery
+  # (a peer with no session mux for that pid, or whose transport is already
+  # gone, legitimately cannot answer).
   acked=no; wait_log 'link-revoked to [^ ]+: acknowledged by the peer' "$WORK/A-up.log" 5 && acked=yes
-  echo "## a's record of the refusal: acked=$acked"
+  echo "## a's record of the refusal: acked=$acked (reported, not asserted)"
   grep -E 'link-revoked to ' "$WORK/A-up.log" | tail -3
   if [ "$frc" = 0 ] && [ "$rc" = 4 ] && [ "$took" -le 10 ] && grep -q "not recognized" "$WORK/f1.err" \
-     && ! grep -q "died during exec" "$WORK/f1.err" && [ "$acked" = yes ]; then
-    ok "F1a: the running exec ended as a refusal in ${took}s (exit 4, not recognized), acknowledged by b"
+     && ! grep -q "died during exec" "$WORK/f1.err"; then
+    ok "F1a: the running exec ended as a refusal in ${took}s (exit 4, not recognized; acked=$acked)"
   else
     bad "F1a: exec when forgotten (forget rc=$frc, exec rc=$rc in ${took}s, acked=$acked)"
     echo "## a's log lines since F1a started: $(( $(wc -l <"$WORK/A-up.log") - f1a_lines_a ))"
