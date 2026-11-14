@@ -248,11 +248,20 @@ pub enum LinkedFleetOffer {
 /// and the link is fleet-shaped (`recv::fleet::shaped_link`). A `ch`-less
 /// unicast offer and an offer for any other channel keep the old behavior.
 ///
-/// `peer_is_fleet_pending` says we saw this peer on the fleet channel. It is
-/// not honored yet: the shape of the link decides alone, so a peer whose link
-/// still carries a pair expectation (the peer holds us as a paired device
-/// while we forgot it) is never fleet-shaped, the fleet direct is never armed
-/// for it, and the peer sits with no transport at all.
+/// A peer we saw ON THE FLEET CHANNEL counts as fleet-shaped here even when
+/// its link still carries a pair expectation. The two ends can file the same
+/// peer under different relationships: the peer still holds us as a paired
+/// device while we forgot it, so its link keeps the pair expectation, the
+/// link was never fleet-shaped, the fleet direct was never armed on either
+/// end, and the peer sat with no transport at all until the silence watchdog
+/// tore the link down. The fleet relationship is the certificate-proven one,
+/// so it wins here.
+///
+/// Arming grants NO authority: the link stays fleet-pending until the fleet
+/// hello verifies, and that verification is where a revoked or forgotten
+/// device is refused. A peer that was never seen on the fleet channel is not
+/// fleet-pending, so a pair-only peer keeps the old behaviour, and a pending
+/// still wins earlier, because a pending is fed, not armed.
 pub fn linked_fleet_offer_action(
     has_link: bool,
     has_pending: bool,
@@ -266,8 +275,7 @@ pub fn linked_fleet_offer_action(
     if has_pending {
         return LinkedFleetOffer::Feed;
     }
-    let _ = peer_is_fleet_pending;
-    if !has_link || !link_is_fleet_shaped {
+    if !has_link || !(link_is_fleet_shaped || peer_is_fleet_pending) {
         return LinkedFleetOffer::Buffer;
     }
     let on_fleet_channel = match (offer_ch, fleet_ch) {
@@ -342,15 +350,25 @@ async fn refuse_unrecognized_dial(sio: &filament_signal::Client, pid: &str, log:
 /// The honest "not recognized" answer for a peer that dials on a meeting place
 /// we forgot or revoked.
 ///
-/// The peer is waiting for this answer, but a link we still hold for it used
-/// to suppress the answer, so the forgotten device appeared, never connected,
-/// and said nothing about the owner. That suppression is not honored yet.
+/// The peer is waiting for this answer, and the truth does not change because
+/// we still hold a link to it: a stale link used to suppress the answer, so
+/// the forgotten device appeared, never connected, and said nothing about the
+/// owner. Only a live direct pending suppresses the answer: that means we are
+/// dialing this peer right now on the same credential, so its offer is part
+/// of our own race rather than a claim to be admitted.
+///
+/// The answer is a refusal over signaling: it builds no link and grants no
+/// authority, so a peer that gets it cannot use it as a second path.
+///
+/// `_has_link` is deliberately NOT consulted: a stale link must not swallow
+/// the answer. It stays in the signature so the rule is stated in one place
+/// and the tests can say "a link exists" out loud.
 pub fn refuse_forgotten_dial(
     has_direct_pending: bool,
-    has_link: bool,
+    _has_link: bool,
     offer_channel_forgotten: bool,
 ) -> bool {
-    offer_channel_forgotten && !has_direct_pending && !has_link
+    offer_channel_forgotten && !has_direct_pending
 }
 
 /// The outcome of ONE peer's step (adopt, answer, a control reply) inside the
@@ -5171,6 +5189,10 @@ async fn recv_run(
                 }) {
                     // A device forgotten here, dialing the meeting place it still
                     // finds us on: tell it, rather than leave it waiting.
+                    //
+                    // A stale link for that peer must NOT swallow the answer:
+                    // the peer is waiting for it, and the truth does not change
+                    // because we still hold a link to it.
                     if let Some(pid) = v["id"].as_str().filter(|p| !p.is_empty()) {
                         let has_link = conn.links.contains_key(pid);
                         if refuse_forgotten_dial(false, has_link, true) {
@@ -5321,6 +5343,13 @@ async fn recv_run(
                     }
                     // A dial on the meeting place of a device forgotten here: it
                     // can never be matched, so refuse it now, by name.
+                    //
+                    // The answer is owed REGARDLESS of the link we still hold
+                    // for that peer: a stale link used to suppress it, so the
+                    // peer waited out its whole window for an answer that was
+                    // already true. Only a live direct pending suppresses it:
+                    // that means we are dialing this peer right now, on the same
+                    // credential, so the offer is part of our own race.
                     if refuse_forgotten_dial(
                         conn.direct_pending.contains_key(&from),
                         conn.links.contains_key(&from),
@@ -5391,6 +5420,14 @@ async fn recv_run(
                         if !conn.direct_pending.contains_key(&from) && cfg!(feature = "fleet") {
                             if let Some(rv) = ports.identity.fleet_rv() {
                                 let fleet_ch = host.channel_of(&rv);
+                                // `fleet_pending` is the evidence: this peer was
+                                // seen on the fleet channel, which is derived
+                                // from the fleet secret, so the offer below can
+                                // only be the fleet relationship. Arming the
+                                // direct grants nothing: the link stays
+                                // fleet-pending until the certificate hello
+                                // verifies, and that is where a revoked peer is
+                                // refused.
                                 let action = linked_fleet_offer_action(
                                     conn.links.contains_key(&from),
                                     conn.direct_pending.contains_key(&from),
