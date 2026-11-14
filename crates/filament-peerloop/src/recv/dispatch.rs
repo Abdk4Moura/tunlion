@@ -1035,6 +1035,33 @@ impl SyncTasks {
         }
     }
 
+    /// [`Self::cancel_sync_for_pid`] for a whole set of peers under ONE shared
+    /// deadline: every task is cancelled first, then all are joined against
+    /// the same [`crate::sync::SYNC_JOIN_BOUND`]. N revoked peers therefore
+    /// hold the loop for at most one bound, not one bound each.
+    async fn cancel_sync_for_pids(&self, pids: &[&str], log: &dyn LogSink) {
+        let keys: Vec<_> = self
+            .0
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(task_pid, _)| pids.contains(&task_pid.as_str()))
+            .cloned()
+            .collect();
+        let mut joining = Vec::with_capacity(keys.len());
+        for key in keys {
+            let removed = self.0.lock().unwrap().remove(&key);
+            if let Some(task) = removed {
+                task.cancel();
+                joining.push((key, task));
+            }
+        }
+        let deadline = sync_join_deadline();
+        for ((task_pid, sid), task) in joining {
+            report_sync_join(log, &task_pid, sid, task.join(deadline).await);
+        }
+    }
+
     async fn stop_sync_tasks(&self, log: &dyn LogSink) {
         let mut joining = std::mem::take(&mut *self.0.lock().unwrap())
             .into_iter()
@@ -2756,7 +2783,11 @@ async fn recv_run(
                 // between "authenticating..." and "authenticated" (two such
                 // waits, measured 4.0 to 4.1s in 4 of 5 runs). The ceremony
                 // is budgeted, so the fast tick is too.
-                if parked_opens.is_empty() && !ceremony_live {
+                // And while a warm exec runs as initiator: a refusal for it
+                // rides a link stream that is drained once per loop turn, and
+                // the cutting side holds that link open only for a short
+                // budget waiting for the acknowledgement.
+                if parked_opens.is_empty() && !ceremony_live && !l2::mux::warm_exec_live() {
                     Duration::from_secs(2)
                 } else {
                     Duration::from_millis(100)
@@ -3788,26 +3819,21 @@ async fn recv_run(
                     });
                     // Tell each doomed peer WHY before the link goes: a peer
                     // mid-exec or mid-send otherwise sees only a dead link and
-                    // reports "link died" (exit 6) for what is a refusal.
-                    // drop_link closes the transport only after a grace, so
-                    // this frame leaves first.
-                    for (pid, _) in &doomed {
-                        if let Some(t) = conn.transport_of(pid) {
-                            let code = if cut_as_revoked.contains(pid) {
-                                crate::refusal::Code::CertRevoked
-                            } else {
-                                crate::refusal::Code::Unrecognized
-                            };
-                            let refusal = crate::refusal::Refusal::new(code, None);
-                            let mut f = json!({ "type": "link-revoked", "reason": refusal.reason });
-                            refusal.annotate(&mut f);
-                            let _ = t.send_control(&f).await;
-                        }
-                    }
+                    // reports "link died" (exit 6) for what is a refusal. The
+                    // link leaves routing now; its transport stays open only
+                    // until the peer acks the refusal or a bounded budget runs
+                    // out, on a task, never in this loop (a write returning Ok
+                    // is not delivery: the close would discard it).
                     for (pid, label) in &doomed {
-                        // Drop first: its close releases a sync task parked in a write.
-                        conn.drop_link(pid);
-                        sync_tasks.cancel_sync_for_pid(pid, log.as_ref()).await;
+                        let code = if cut_as_revoked.contains(pid) {
+                            crate::refusal::Code::CertRevoked
+                        } else {
+                            crate::refusal::Code::Unrecognized
+                        };
+                        let refusal = crate::refusal::Refusal::new(code, None);
+                        let mut f = json!({ "type": "link-revoked", "reason": refusal.reason });
+                        refusal.annotate(&mut f);
+                        conn.drop_link_after_refusal(pid, f);
                         l2_muxes.remove(pid);
                         fleet_pending.remove(pid);
                         fleet_verified.remove(pid);
@@ -3818,6 +3844,13 @@ async fn recv_run(
                             "closed the link to '{label}': it was forgotten or revoked here"
                         ));
                     }
+                    // Their served sync tasks, all at once under ONE join bound
+                    // (SYNC_JOIN_BOUND, 5 s) for the whole doomed set: that is
+                    // the longest this revocation can hold the loop. A task
+                    // parked in a write on a cut transport is released by the
+                    // closer's close at REFUSAL_ACK_BUDGET (2 s), inside it.
+                    let doomed_pids: Vec<&str> = doomed.iter().map(|(p, _)| p.as_str()).collect();
+                    sync_tasks.cancel_sync_for_pids(&doomed_pids, log.as_ref()).await;
                     // An overlay route is the one thing a revoked device keeps
                     // without opening anything, so it goes with the revocation
                     // (this is the explicit forget path `remove_by_pid` is for).
@@ -7325,9 +7358,19 @@ async fn recv_run(
                 // status that will never arrive. Other consumers (send, a served
                 // session) keep their existing handling.
                 Some("link-revoked") => {
-                    if let Some(mux) = l2_muxes.get(&pid) {
-                        mux.on_link_revoked(v.clone()).await;
-                    }
+                    // Recorded where every warm exec on this link reads it, and
+                    // only then acknowledged (see `answer_link_revoked`).
+                    let answer = l2::mux::answer_link_revoked(
+                        l2_muxes.get(&pid),
+                        conn.reply_transports(&pid, event_source),
+                        &v,
+                    )
+                    .await;
+                    log.debug(&format!(
+                        "link-revoked from {pid}: {} (nonce {})",
+                        answer.describe(),
+                        v["nonce"].as_str().unwrap_or("none")
+                    ));
                     continue;
                 }
                 // Remote command execution: parse, shell-gate, direct-spawn
@@ -11086,6 +11129,44 @@ mod lifecycle_tests {
             sync_tasks.0.lock().unwrap().is_empty(),
             "shutdown cancels, joins, and drains owners"
         );
+    }
+
+    /// A revocation that dooms several peers cancels all their served syncs
+    /// first and joins them under ONE shared deadline, so the loop is held
+    /// for at most one SYNC_JOIN_BOUND for the whole set (not one per peer),
+    /// and a peer outside the set keeps its stream.
+    #[cfg(feature = "mount-server")]
+    #[tokio::test]
+    async fn a_doomed_set_cancels_its_syncs_under_one_shared_deadline() {
+        let cleanup = RecvCleanup::default();
+        let sync_tasks = cleanup.sync_tasks.clone();
+        let mut keep = Vec::new();
+        for (i, pid) in ["doomed-a", "doomed-b", "doomed-c", "survivor"].iter().enumerate() {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            keep.push(tx);
+            sync_tasks
+                .track_sync_task(
+                    (*pid).into(),
+                    0x8000_0200 + i as u32,
+                    SyncTask(sync_server(rx)),
+                    &NoLog,
+                )
+                .await;
+        }
+        let start = std::time::Instant::now();
+        sync_tasks
+            .cancel_sync_for_pids(&["doomed-a", "doomed-b", "doomed-c"], &NoLog)
+            .await;
+        assert!(
+            start.elapsed() < crate::sync::SYNC_JOIN_BOUND,
+            "the set was joined one bound per peer ({:?})",
+            start.elapsed()
+        );
+        let left: Vec<String> =
+            sync_tasks.0.lock().unwrap().keys().map(|(p, _)| p.clone()).collect();
+        assert_eq!(left, vec!["survivor".to_string()], "the doomed set was not fully cancelled");
+        sync_tasks.stop_sync_tasks(&NoLog).await;
+        drop(keep);
     }
 }
 

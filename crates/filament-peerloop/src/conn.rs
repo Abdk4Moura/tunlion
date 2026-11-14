@@ -263,6 +263,195 @@ const DIRECT_FALLBACKS_PER_CALL: usize = 1;
 /// How long `drop_link` lets a dropped link's last frames reach the peer
 /// before it closes the QUIC connection under them.
 const DROP_CLOSE_GRACE: Duration = Duration::from_secs(2);
+/// One bound for a revoked link's last act: write the `link-revoked` refusal
+/// and wait for the peer's `link-revoked-ack`. The link is already out of
+/// routing when this starts, so the bound only decides how long the cut
+/// transport stays open for that one frame; it never holds the event loop.
+/// Kept equal to `DROP_CLOSE_GRACE` so a peer that never answers keeps the
+/// transport no longer than an ordinary drop did.
+const REFUSAL_ACK_BUDGET: Duration = DROP_CLOSE_GRACE;
+
+/// Close what a dropped link owned. Never awaited in the event loop (F8):
+/// the WebRTC peer is marked and closed on a task, the direct transports after
+/// a short grace.
+fn close_dropped_link(old: Link) {
+    // Never await close in the event loop (F8): mark + spawn.
+    if let Some(p) = old.peer.clone() {
+        p.mark_closed();
+        tokio::spawn(async move { p.close().await });
+    }
+    // CLOSE the direct transports explicitly. Dropping the Link only
+    // drops OUR Arc: the L3 overlay pump, the mesh accept loop, the
+    // endpoint keeper and any warm stream hold their own clones, so the
+    // QUIC connection stayed up and the peer never learned the link was
+    // gone. It kept its own direct link for this pid and ignored our
+    // WebRTC offers (no `peer` on its link to apply them to), our ladder
+    // exhausted, and the cycle repeated forever: split-brain. Closing
+    // sends ApplicationClose, the peer sees ConnectionLost, drops its
+    // side and both ends re-converge.
+    //
+    // After a short grace, not at once: QUIC has no flush-on-close
+    // (RFC 9000 s10.2), and several callers drop right after writing a
+    // last frame on this link (the l2-close that answers a parked open,
+    // a refusal). Closing immediately discarded that frame and the
+    // client saw "no answer" instead of the reason. No-op for transports
+    // without a connection to close (DataChannel, local).
+    let closing: Vec<Arc<dyn Transport>> =
+        old.transport.into_iter().chain(old.workers).collect();
+    if !closing.is_empty() {
+        tokio::spawn(async move {
+            tokio::time::sleep(DROP_CLOSE_GRACE).await;
+            for t in closing {
+                t.force_close();
+            }
+        });
+    }
+}
+
+/// A link cut by a revocation whose refusal is still in flight, keyed in
+/// `Conn::closing` by the refusal's nonce. Control-plane only: the link is
+/// gone from `links`, so no Control/PcState/ChannelReady from its source is
+/// dispatched, and this entry only recognizes the peer's `link-revoked-ack`
+/// carrying exactly this nonce, read for this pid on any of its paths. The
+/// nonce is ours, fresh and random per cut, and only the peer that received
+/// the frame holds it, so accepting the ack from any path of that peer does
+/// not widen what it proves; two links cut together each wait for their own.
+/// It authorizes nothing either way: it only lets the closer close sooner.
+/// Untagged data events from a main-queue link can still reach the loop until
+/// the close, exactly as during the plain drop's grace; they open nothing new.
+pub struct ClosingLink {
+    pid: String,
+    ack: Option<oneshot::Sender<()>>,
+}
+
+/// `inner` is a `link-revoked-ack` from `ipid`: its pid and nonce.
+fn refusal_ack_nonce(inner: &Ev) -> Option<(&str, &str)> {
+    match inner {
+        Ev::Control(ipid, v) if v["type"].as_str() == Some("link-revoked-ack") => {
+            v["nonce"].as_str().map(|n| (ipid.as_str(), n))
+        }
+        _ => None,
+    }
+}
+
+/// What became of a revoked link's refusal. A DIAGNOSTIC, never a delivery
+/// verdict: only `Acknowledged` says something positive (the peer recorded
+/// it), and nothing may read the others as "not delivered". A one-shot peer
+/// never acknowledges at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalOutcome {
+    /// The peer answered with `link-revoked-ack` for this nonce, which it sends
+    /// only after it recorded the refusal on the link.
+    Acknowledged,
+    /// Written, no ack within the budget (a dead, frozen, older or one-shot
+    /// peer, or a link whose reader ended).
+    Unconfirmed,
+    /// The write itself failed: the transport was already gone.
+    SendFailed,
+    /// The write did not complete within the budget.
+    SendTimedOut,
+}
+
+impl RefusalOutcome {
+    fn describe(self) -> &'static str {
+        match self {
+            RefusalOutcome::Acknowledged => "acknowledged by the peer",
+            RefusalOutcome::Unconfirmed => "sent, not acknowledged within the budget (unconfirmed)",
+            RefusalOutcome::SendFailed => "send failed, the link was already gone",
+            RefusalOutcome::SendTimedOut => "send did not complete within the budget",
+        }
+    }
+}
+
+/// Where a cut link's ack may show up. Both are optional: `signal` is fired by
+/// `Conn` when the ack reaches the main queue; `stream` is the link's own
+/// candidate stream, read here directly so no loop turn is needed.
+pub struct AckWatch {
+    pub pid: String,
+    pub nonce: String,
+    pub signal: Option<oneshot::Receiver<()>>,
+    pub stream: Option<mpsc::UnboundedReceiver<Ev>>,
+}
+
+async fn ack_signal(signal: &mut Option<oneshot::Receiver<()>>) -> bool {
+    match signal {
+        Some(rx) => rx.await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
+async fn ack_stream(stream: &mut Option<mpsc::UnboundedReceiver<Ev>>) -> Option<Ev> {
+    match stream {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+enum AckStep {
+    Acked,
+    SignalGone,
+    Event(Ev),
+    StreamEnded,
+    Deadline,
+}
+
+/// Write `frame` and wait for its ack, both under ONE deadline `budget` from
+/// now. A peer that never reads, never acks, or whose write parks forever
+/// costs at most `budget`; a link whose reader ended on a dead transport ends
+/// the wait at once. Everything else read from the stream is discarded. Must run off the event loop (it awaits the peer).
+pub async fn deliver_refusal(
+    t: &dyn Transport,
+    frame: &Value,
+    watch: Option<AckWatch>,
+    budget: Duration,
+) -> RefusalOutcome {
+    let deadline = tokio::time::Instant::now() + budget;
+    match tokio::time::timeout_at(deadline, t.send_control(frame)).await {
+        Err(_) => return RefusalOutcome::SendTimedOut,
+        Ok(Err(_)) => return RefusalOutcome::SendFailed,
+        Ok(Ok(())) => {}
+    }
+    let Some(mut watch) = watch else {
+        return RefusalOutcome::Unconfirmed;
+    };
+    loop {
+        if watch.signal.is_none() && watch.stream.is_none() {
+            return RefusalOutcome::Unconfirmed;
+        }
+        let step = tokio::select! {
+            acked = ack_signal(&mut watch.signal) => {
+                if acked { AckStep::Acked } else { AckStep::SignalGone }
+            }
+            ev = ack_stream(&mut watch.stream) => match ev {
+                Some(ev) => AckStep::Event(ev),
+                None => AckStep::StreamEnded,
+            },
+            _ = tokio::time::sleep_until(deadline) => AckStep::Deadline,
+        };
+        match step {
+            AckStep::Acked => return RefusalOutcome::Acknowledged,
+            AckStep::SignalGone => watch.signal = None,
+            AckStep::StreamEnded => {
+                watch.stream = None;
+                // The reader ended. With the transport dead too, nothing can
+                // answer on any path any more: stop now, not at the deadline.
+                if t.is_dead() {
+                    return RefusalOutcome::Unconfirmed;
+                }
+            }
+            AckStep::Deadline => return RefusalOutcome::Unconfirmed,
+            AckStep::Event(Ev::Sourced { pid, inner, .. }) => {
+                let ours = refusal_ack_nonce(&inner).is_some_and(|(ipid, nonce)| {
+                    ipid == pid && pid == watch.pid && nonce == watch.nonce
+                });
+                if ours {
+                    return RefusalOutcome::Acknowledged;
+                }
+            }
+            AckStep::Event(_) => {}
+        }
+    }
+}
 /// A link absent from a channel/room digest is retired only after its transport
 /// has been quiet this long. Presence is best-effort and a signaling reconnect
 /// gives the peer a new sid, so the old sid vanishes from the digest while its
@@ -1730,6 +1919,9 @@ pub struct Conn {
     /// so a queued ChannelReady/Control from the old generation is discarded
     /// instead of being replayed onto the new link.
     pub link_events: HashMap<String, LinkEvents>,
+    /// Links cut by a revocation whose refusal is still in flight, keyed by the
+    /// refusal's nonce. See `ClosingLink` and `drop_link_after_refusal`.
+    pub closing: HashMap<String, ClosingLink>,
     /// Source-bound standby/upgrade events awaiting adoption. Bounded per source
     /// and in total; overflow closes the standby instead of growing forever.
     pub pending_sources: HashMap<net::SourceId, PendingSource>,
@@ -1969,6 +2161,7 @@ impl Conn {
             revoked_peers: HashMap::new(),
             revoked_bindings: HashSet::new(),
             link_events: HashMap::new(),
+            closing: HashMap::new(),
             pending_sources: HashMap::new(),
             roster_absent: HashMap::new(),
             log,
@@ -2032,6 +2225,31 @@ impl Conn {
     }
     pub fn transport_of(&self, pid: &str) -> Option<Arc<dyn Transport>> {
         self.links.get(pid).and_then(|l| l.transport.clone())
+    }
+
+    /// The transports to answer a frame from `pid` on: the one whose source
+    /// carried it (the primary, or a worker), then the link's current primary
+    /// if that is a different one. Empty when the link is gone.
+    pub fn reply_transports(
+        &self,
+        pid: &str,
+        source: Option<net::SourceId>,
+    ) -> Vec<Arc<dyn Transport>> {
+        let Some(link) = self.links.get(pid) else {
+            return Vec::new();
+        };
+        let carrying = match source {
+            Some(s) if s == link.source => link.transport.clone(),
+            Some(s) => link.workers.iter().find(|w| w.source_id() == Some(s)).cloned(),
+            None => None,
+        };
+        let mut out: Vec<Arc<dyn Transport>> = carrying.into_iter().collect();
+        if let Some(primary) = link.transport.clone() {
+            if !out.iter().any(|t| Arc::ptr_eq(t, &primary)) {
+                out.push(primary);
+            }
+        }
+        out
     }
 
     /// Owner-only: mint the current roster and push it to every live link whose
@@ -2579,6 +2797,117 @@ impl Conn {
     /// from the call sites the way a manual audit does.
     #[track_caller]
     pub fn drop_link(&mut self, pid: &str) {
+        // The link's queued events are discarded with its stream.
+        let (old, _events) = self.unlink(pid);
+        if let Some(old) = old {
+            close_dropped_link(old);
+        }
+    }
+
+    /// Drop a link cut by a revocation, delivering `frame` (the
+    /// `link-revoked` refusal) first. Everything `drop_link` invalidates is
+    /// invalidated here at once: the link leaves `links`, its builds, intents
+    /// and routing go, and no further event from it is admitted. Only the
+    /// CLOSE is deferred, to a spawned task that owns the transport: it writes
+    /// the frame with a fresh nonce, waits for the peer's matching
+    /// `link-revoked-ack` (read by the task itself from the link's own
+    /// candidate stream, or signalled by `closing` when the link's events
+    /// reach the main queue), then closes, all under one `REFUSAL_ACK_BUDGET`.
+    /// The event loop never awaits the peer, so a dead or frozen peer costs it
+    /// nothing. The ack is a diagnostic: its absence is logged as unconfirmed
+    /// and nothing treats it as "not delivered".
+    ///
+    /// Why an ack and not a flush: a successful write only means the frame is
+    /// queued in this process (the QUIC send buffer, the SCTP stream queue),
+    /// and both QUIC's CONNECTION_CLOSE and a WebRTC peer close discard what
+    /// is still queued or unacknowledged. A transport-level flush would prove
+    /// at most that the peer's stack received the bytes, not that its daemon
+    /// processed the refusal before its own teardown of the dying link.
+    ///
+    /// Returns whether a refusal was attempted (false: no such link, or no
+    /// transport to carry it, in which case this is a plain `drop_link`).
+    #[track_caller]
+    pub fn drop_link_after_refusal(&mut self, pid: &str, mut frame: Value) -> bool {
+        let (old, events) = self.unlink(pid);
+        let Some(mut old) = old else {
+            return false;
+        };
+        let Some(t) = old.transport.clone() else {
+            // A WebRTC link that never reached ChannelReady has nothing to
+            // carry the refusal on. Say so rather than attempt nothing silently.
+            self.log.debug(&format!(
+                "link-revoked to {pid}: dropped_no_transport (no channel to carry the refusal)"
+            ));
+            close_dropped_link(old);
+            return false;
+        };
+        let mut random = [0u8; 16];
+        let nonce = match getrandom::getrandom(&mut random) {
+            Ok(()) => hex::encode(random),
+            // No randomness: still unique per process and never reused.
+            Err(_) => {
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                format!("n{}", SEQ.fetch_add(1, Ordering::Relaxed))
+            }
+        };
+        frame["nonce"] = Value::String(nonce.clone());
+        // Bind the ack to this cut's nonce and pid. A
+        // link whose source is unassigned emits no source-tagged events, so
+        // no ack can come back and none is awaited. The ack is looked for in
+        // BOTH places it can arrive: the link's own candidate stream, read by
+        // the closer itself (no loop turn in between), and the main queue,
+        // where `stage_event` signals the closer. A WebRTC link promoted to a
+        // direct path, or a peer that answers on another path of the same
+        // session, delivers there.
+        let watch = if old.source != net::SourceId::UNASSIGNED {
+            // Only the stream of THIS link generation. A stale one (left by a
+            // replacement, such as a direct upgrade of a WebRTC link) is not
+            // where this transport delivers: watching it would end the wait at
+            // once (its reader is gone) and close before the ack, so such a
+            // link uses the main-queue signal instead.
+            let stream = events
+                .filter(|e| e.generation == old.generation)
+                .map(|e| e.rx.into_inner().unwrap_or_else(|p| p.into_inner()));
+            let (ack_tx, ack_rx) = oneshot::channel();
+            self.closing.insert(
+                nonce.clone(),
+                ClosingLink { pid: pid.to_string(), ack: Some(ack_tx) },
+            );
+            Some(AckWatch {
+                pid: pid.to_string(),
+                nonce,
+                signal: Some(ack_rx),
+                stream,
+            })
+        } else {
+            None
+        };
+        let peer = old.peer.take();
+        let closing: Vec<Arc<dyn Transport>> =
+            old.transport.take().into_iter().chain(std::mem::take(&mut old.workers)).collect();
+        drop(old);
+        let log = self.log.clone();
+        let pid = pid.to_string();
+        tokio::spawn(async move {
+            let outcome = deliver_refusal(t.as_ref(), &frame, watch, REFUSAL_ACK_BUDGET).await;
+            log.debug(&format!("link-revoked to {pid}: {}", outcome.describe()));
+            for t in closing {
+                t.force_close();
+            }
+            if let Some(p) = peer {
+                p.mark_closed();
+                p.close().await;
+            }
+        });
+        true
+    }
+
+    /// Everything `drop_link` does except closing the transports: the caller
+    /// owns the returned link and decides when its transports close. The
+    /// link's event stream is returned too; dropping it discards what is
+    /// queued on it.
+    #[track_caller]
+    fn unlink(&mut self, pid: &str) -> (Option<Link>, Option<LinkEvents>) {
         // A drop is an invalidation: a candidate still building for this peer
         // must not publish after the link it was replacing is gone.
         self.cancel_build(pid);
@@ -2591,7 +2920,7 @@ impl Conn {
         // The installed link owns its candidate-origin stream; dropping the
         // receiver discards any queued ChannelReady/Control from this
         // generation instead of forwarding it to a later link.
-        self.link_events.remove(pid);
+        let events = self.link_events.remove(pid);
         self.log.debug(&format!(
             "  drop_link({pid}) ordered by {}",
             std::panic::Location::caller()
@@ -2630,42 +2959,11 @@ impl Conn {
         if let Some(attempt) = link_attempt {
             self.retire_direct_ownership(pid, attempt);
         }
-        if let Some(old) = self.links.remove(pid) {
-            // Never await close in the event loop (F8): mark + spawn.
-            if let Some(p) = old.peer.clone() {
-                p.mark_closed();
-                tokio::spawn(async move { p.close().await });
-            }
-            // CLOSE the direct transports explicitly. Dropping the Link only
-            // drops OUR Arc: the L3 overlay pump, the mesh accept loop, the
-            // endpoint keeper and any warm stream hold their own clones, so the
-            // QUIC connection stayed up and the peer never learned the link was
-            // gone. It kept its own direct link for this pid and ignored our
-            // WebRTC offers (no `peer` on its link to apply them to), our ladder
-            // exhausted, and the cycle repeated forever: split-brain. Closing
-            // sends ApplicationClose, the peer sees ConnectionLost, drops its
-            // side and both ends re-converge.
-            //
-            // After a short grace, not at once: QUIC has no flush-on-close
-            // (RFC 9000 s10.2), and several callers drop right after writing a
-            // last frame on this link (the l2-close that answers a parked open,
-            // a refusal). Closing immediately discarded that frame and the
-            // client saw "no answer" instead of the reason. No-op for transports
-            // without a connection to close (DataChannel, local).
-            let closing: Vec<Arc<dyn Transport>> =
-                old.transport.into_iter().chain(old.workers).collect();
-            if !closing.is_empty() {
-                tokio::spawn(async move {
-                    tokio::time::sleep(DROP_CLOSE_GRACE).await;
-                    for t in closing {
-                        t.force_close();
-                    }
-                });
-            }
-        }
+        let old = self.links.remove(pid);
         if self.is_active(pid) {
             self.active = None;
         }
+        (old, events)
     }
 
     /// Exit path: close every link's QUIC connection NOW, so each peer learns
@@ -3411,6 +3709,7 @@ impl Conn {
                 }
             }
         }
+        self.pump_closing();
         // Candidate events are drained here, never taken from the main queue.
         // An event from the previously serving link therefore cannot be
         // replayed onto a candidate that is about to install.
@@ -3814,6 +4113,12 @@ impl Conn {
                 if !valid_inner {
                     return None;
                 }
+                // The ack for a cut link's refusal, from whichever path of that
+                // peer it came back on (current or not). It is consumed here:
+                // it authorizes nothing and is never dispatched.
+                if self.closing_ack(&pid, inner.as_ref()) {
+                    return None;
+                }
                 if self.source_current(&pid, source, inner.as_ref()) {
                     return Some((*inner, Some(source)));
                 }
@@ -3833,6 +4138,37 @@ impl Conn {
             Ev::LocalPcState(pid, state) => Some((Ev::PcState(pid, state), None)),
             other => Some((other, None)),
         }
+    }
+
+    /// Forget cut-link entries whose closer has finished. Never awaits.
+    fn pump_closing(&mut self) {
+        self.closing.retain(|_, entry| entry.ack.as_ref().is_some_and(|a| !a.is_closed()));
+    }
+
+    /// A `link-revoked-ack` answering a cut in flight completes it: the nonce
+    /// must be that cut's, read for that cut's pid (on any of its paths).
+    /// Returns whether `inner` was a `link-revoked-ack` at all; every
+    /// one is consumed (a stale or unknown one is logged), since it authorizes
+    /// nothing and has no handler.
+    fn closing_ack(&mut self, pid: &str, inner: &Ev) -> bool {
+        let Some((ipid, nonce)) = refusal_ack_nonce(inner) else {
+            return false;
+        };
+        let matched =
+            ipid == pid && self.closing.get(nonce).is_some_and(|entry| entry.pid == pid);
+        if matched {
+            if let Some(mut entry) = self.closing.remove(nonce) {
+                if let Some(ack) = entry.ack.take() {
+                    let _ = ack.send(());
+                }
+            }
+        } else {
+            self.log.debug(&format!(
+                "link-revoked-ack from {pid} for nonce {nonce}: already settled or unknown \
+                 (duplicate acks on a second path are expected)"
+            ));
+        }
+        true
     }
 
     /// A source is current when it is the link's primary source, or (for
@@ -14556,6 +14892,414 @@ mod warm_identity_tests {
             .expect("prepare");
         assert!(plan.is_some(), "a changed authorized binding could not replace");
         assert!(!conn.builds.contains_key(other), "the revoked-bound candidate survived");
+    }
+
+    /// A transport for the revoked-link closer: it records each control it
+    /// writes and each close, carries a real source (so an ack can be bound
+    /// to it), and can be told to never complete a write (a frozen peer) or
+    /// to fail every write (a transport already gone).
+    struct RefusalT {
+        source: net::SourceId,
+        sent: std::sync::Mutex<Vec<Value>>,
+        closes: AtomicUsize,
+        hang: bool,
+        fail: bool,
+        dead: AtomicBool,
+    }
+    fn refusal_t(hang: bool) -> Arc<RefusalT> {
+        Arc::new(RefusalT {
+            source: net::SourceId::next(),
+            sent: std::sync::Mutex::new(Vec::new()),
+            closes: AtomicUsize::new(0),
+            hang,
+            fail: false,
+            dead: AtomicBool::new(false),
+        })
+    }
+    fn failing_refusal_t() -> Arc<RefusalT> {
+        Arc::new(RefusalT {
+            source: net::SourceId::next(),
+            sent: std::sync::Mutex::new(Vec::new()),
+            closes: AtomicUsize::new(0),
+            hang: false,
+            fail: true,
+            dead: AtomicBool::new(false),
+        })
+    }
+    #[async_trait::async_trait]
+    impl Transport for RefusalT {
+        async fn send_control(&self, msg: &Value) -> Result<()> {
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            if self.fail {
+                anyhow::bail!("channel closed");
+            }
+            self.sent.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+        fn force_close(&self) {
+            self.closes.fetch_add(1, Ordering::Relaxed);
+        }
+        fn is_dead(&self) -> bool {
+            self.dead.load(Ordering::Relaxed)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn source_id(&self) -> Option<net::SourceId> {
+            Some(self.source)
+        }
+    }
+
+    fn refusal() -> Value {
+        json!({ "type": "link-revoked", "reason": "forgotten" })
+    }
+
+    /// The nonce of the `link-revoked` the closer task wrote, once it has.
+    async fn written_refusal_nonce(t: &RefusalT) -> String {
+        for _ in 0..100 {
+            if let Some(v) = t.sent.lock().unwrap().first() {
+                assert_eq!(v["type"], "link-revoked", "the refusal is the first frame");
+                assert_eq!(v["reason"], "forgotten", "the refusal keeps its reason");
+                return v["nonce"].as_str().expect("the refusal carries a nonce").to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the closer never wrote the refusal");
+    }
+
+    fn revoked_ack(pid: &str, source: net::SourceId, nonce: &str) -> Ev {
+        Ev::Sourced {
+            pid: pid.to_string(),
+            source,
+            inner: Box::new(Ev::Control(
+                pid.to_string(),
+                json!({ "type": "link-revoked-ack", "nonce": nonce }),
+            )),
+        }
+    }
+
+    async fn closed_within(t: &RefusalT, bound: Duration) -> bool {
+        let until = Instant::now() + bound;
+        while Instant::now() < until {
+            if t.closes.load(Ordering::Relaxed) > 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        t.closes.load(Ordering::Relaxed) > 0
+    }
+
+    /// An installed WebRTC link's event stream, as `apply_built_peer` leaves it.
+    fn own_stream(conn: &mut Conn, pid: &str, generation: u32) -> mpsc::UnboundedSender<Ev> {
+        let (etx, erx) = mpsc::unbounded_channel();
+        conn.link_events.insert(
+            pid.to_string(),
+            LinkEvents {
+                generation,
+                rx: std::sync::Mutex::new(erx),
+                departure_ready: None,
+                departure_pending: None,
+            },
+        );
+        etx
+    }
+
+    /// F1 (daemon-path gate): a write returning Ok is not delivery, and the
+    /// close discards what is still queued. The revoked link leaves routing at
+    /// once, but its transport closes only on the peer's ack for THIS cut,
+    /// bound by NONCE only (pid plus nonce): a stale nonce, or the right nonce
+    /// for another pid, does nothing, while the right nonce for this pid counts
+    /// from any source. This is the main-queue path (a link with no candidate
+    /// stream).
+    #[tokio::test]
+    async fn a_revoked_link_closes_on_the_peers_ack_and_not_before() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-r".into(), direct_link("sid-r", "b", "user@b", t.clone()));
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-r", refusal()));
+        assert!(!conn.links.contains_key("sid-r"), "the cut link stayed routable");
+        let nonce = written_refusal_nonce(&t).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0, "closed before the peer acked");
+        assert!(conn.stage_event(revoked_ack("sid-r", t.source, "not-this-cut")).is_none());
+        assert!(conn.stage_event(revoked_ack("sid-x", t.source, &nonce)).is_none());
+        assert_eq!(conn.closing.len(), 1, "a stale nonce or another pid completed the cut");
+        assert!(!closed_within(&t, Duration::from_millis(100)).await, "closed on a stale ack");
+        // The peer may answer on another path of the same session (its primary
+        // after a promotion, a worker): the nonce binds it, not the source.
+        assert!(
+            conn.stage_event(revoked_ack("sid-r", net::SourceId::next(), &nonce)).is_none(),
+            "the ack authorizes nothing and is never dispatched"
+        );
+        assert!(conn.closing.is_empty(), "the matching ack did not complete the cut");
+        assert!(closed_within(&t, Duration::from_millis(500)).await, "not closed after the ack");
+        assert!(
+            start.elapsed() < REFUSAL_ACK_BUDGET,
+            "closed by the budget, not by the ack ({:?})",
+            start.elapsed()
+        );
+    }
+
+    /// The path the first version missed: a link built by `apply_built_peer`
+    /// (a WebRTC DataChannel link) delivers ONLY on its own candidate stream,
+    /// which the loop drains once per turn (up to 2 s on an idle daemon). The
+    /// closer reads that stream itself, so the ack closes the link with no
+    /// loop turn at all: nothing here calls `pump_builds` or `stage_event`.
+    /// Nothing else read from the cut link is forwarded.
+    #[tokio::test]
+    async fn a_cut_links_own_stream_ack_needs_no_loop_turn() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-e".into(), direct_link("sid-e", "b", "user@b", t.clone()));
+        let etx = own_stream(&mut conn, "sid-e", 7);
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-e", refusal()));
+        assert_eq!(conn.closing.len(), 1, "the main-queue path is watched as well");
+        let nonce = written_refusal_nonce(&t).await;
+        let _ = etx.send(Ev::Sourced {
+            pid: "sid-e".into(),
+            source: t.source,
+            inner: Box::new(Ev::Control("sid-e".into(), json!({ "type": "exec-close", "sid": 1 }))),
+        });
+        let _ = etx.send(revoked_ack("sid-e", t.source, "not-this-cut"));
+        let _ = etx.send(revoked_ack("sid-x", t.source, &nonce));
+        assert!(!closed_within(&t, Duration::from_millis(150)).await, "closed on a stale ack");
+        let _ = etx.send(revoked_ack("sid-e", t.source, &nonce));
+        assert!(closed_within(&t, Duration::from_millis(300)).await, "not closed after the ack");
+        assert!(start.elapsed() < REFUSAL_ACK_BUDGET, "closed by the budget, not by the ack");
+        while let Ok(ev) = rx.try_recv() {
+            if let Ev::Sourced { pid, .. } = &ev {
+                assert_ne!(pid, "sid-e", "an event from the cut link was forwarded");
+            }
+        }
+    }
+
+    /// The cut link's reader ended (its stream's sender dropped) on a dead
+    /// transport: no ack can arrive on any path, so the closer closes at once,
+    /// not at the budget.
+    #[tokio::test]
+    async fn a_cut_link_whose_reader_ended_closes_at_once() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-d".into(), direct_link("sid-d", "b", "user@b", t.clone()));
+        let etx = own_stream(&mut conn, "sid-d", 7);
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-d", refusal()));
+        let _ = written_refusal_nonce(&t).await;
+        t.dead.store(true, Ordering::Relaxed);
+        drop(etx);
+        assert!(closed_within(&t, Duration::from_millis(500)).await, "left open after the reader ended");
+        assert!(start.elapsed() < REFUSAL_ACK_BUDGET, "waited out the budget for a dead reader");
+    }
+
+    /// The branch the two-link fix relies on: a cut link with its OWN stream
+    /// whose reader ends while the transport is still alive (the peer answers
+    /// on another path of the same session). The closer must keep waiting,
+    /// and the ack for the SAME nonce from a DIFFERENT source, delivered
+    /// through the main queue, completes the cut. Fails if the stream's end
+    /// stopped the wait unconditionally, or if the main-queue signal were not
+    /// registered alongside the stream.
+    #[tokio::test]
+    async fn an_ack_on_another_path_completes_a_cut_whose_own_stream_ended() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-s".into(), direct_link("sid-s", "b", "user@b", t.clone()));
+        let etx = own_stream(&mut conn, "sid-s", 7);
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-s", refusal()));
+        let nonce = written_refusal_nonce(&t).await;
+        drop(etx);
+        assert!(
+            !closed_within(&t, Duration::from_millis(300)).await,
+            "the stream's end on a live transport stopped the wait"
+        );
+        assert!(
+            conn.stage_event(revoked_ack("sid-s", net::SourceId::next(), &nonce)).is_none(),
+            "the ack was dispatched"
+        );
+        assert!(
+            closed_within(&t, REFUSAL_ACK_BUDGET.saturating_sub(start.elapsed())).await,
+            "the ack on another path did not complete the cut"
+        );
+        assert!(start.elapsed() < REFUSAL_ACK_BUDGET, "closed by the budget, not by the ack");
+    }
+
+    /// A candidate stream left from an EARLIER generation of the pid (a
+    /// replacement such as a direct upgrade) is not where this transport
+    /// delivers, and must not be watched: an event on it is not this link's.
+    /// The cut still waits on the main-queue signal for its ack.
+    #[tokio::test]
+    async fn a_stale_generation_stream_is_not_taken_for_the_ack() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-g".into(), direct_link("sid-g", "b", "user@b", t.clone()));
+        let stale = own_stream(&mut conn, "sid-g", 6);
+        assert!(conn.drop_link_after_refusal("sid-g", refusal()));
+        assert_eq!(conn.closing.len(), 1, "a stale stream was taken instead of the signal path");
+        let nonce = written_refusal_nonce(&t).await;
+        let _ = stale.send(revoked_ack("sid-g", t.source, &nonce));
+        assert!(
+            !closed_within(&t, Duration::from_millis(300)).await,
+            "the stale stream was watched"
+        );
+        assert!(conn.stage_event(revoked_ack("sid-g", t.source, &nonce)).is_none());
+        assert!(closed_within(&t, Duration::from_millis(500)).await, "not closed after the ack");
+    }
+
+    /// A peer that never acks (dead, or an older build) costs the budget and
+    /// no more: the transport is closed then, and the entry is forgotten. An
+    /// ack arriving after that is consumed, never dispatched, and closes
+    /// nothing twice.
+    #[tokio::test]
+    async fn a_revoked_link_with_no_ack_closes_at_the_budget() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-n".into(), direct_link("sid-n", "b", "user@b", t.clone()));
+        assert!(conn.drop_link_after_refusal("sid-n", refusal()));
+        let nonce = written_refusal_nonce(&t).await;
+        tokio::time::sleep(REFUSAL_ACK_BUDGET - Duration::from_millis(500)).await;
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0, "closed before the budget");
+        assert!(closed_within(&t, Duration::from_millis(1500)).await, "left open past the budget");
+        assert!(
+            conn.stage_event(revoked_ack("sid-n", t.source, &nonce)).is_none(),
+            "a late ack was dispatched"
+        );
+        conn.pump_builds();
+        assert!(conn.closing.is_empty(), "a finished cut stayed registered");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(t.closes.load(Ordering::Relaxed), 1, "a late ack closed the link again");
+    }
+
+    /// A frozen peer whose write never completes: the drop returns at once (it
+    /// is synchronous; the wait is on a task), and the transport is still
+    /// closed at the budget.
+    #[tokio::test]
+    async fn a_revoked_link_to_a_frozen_peer_never_holds_the_caller() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(true);
+        conn.links.insert("sid-f".into(), direct_link("sid-f", "b", "user@b", t.clone()));
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-f", refusal()));
+        assert!(start.elapsed() < Duration::from_millis(200), "the drop waited on the peer");
+        assert!(
+            closed_within(&t, REFUSAL_ACK_BUDGET + Duration::from_millis(1500)).await,
+            "a frozen peer kept the cut transport open"
+        );
+    }
+
+    /// A write that fails (the transport is already gone) closes at once.
+    #[tokio::test]
+    async fn a_revoked_link_whose_write_fails_closes_at_once() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = failing_refusal_t();
+        conn.links.insert("sid-w".into(), direct_link("sid-w", "b", "user@b", t.clone()));
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-w", refusal()));
+        assert!(closed_within(&t, Duration::from_millis(500)).await, "left open after a failed write");
+        assert!(start.elapsed() < REFUSAL_ACK_BUDGET);
+    }
+
+    /// No transport (a WebRTC link that never reached ChannelReady): nothing
+    /// is attempted, the link is still dropped, and nothing is registered.
+    #[tokio::test]
+    async fn a_revoked_link_with_no_transport_is_a_plain_drop() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(crate::host::VecLog::new());
+        conn.log = log.clone() as Arc<dyn LogSink>;
+        let t = refusal_t(false);
+        let mut l = direct_link("sid-t", "b", "user@b", t.clone());
+        l.transport = None;
+        conn.links.insert("sid-t".into(), l);
+        assert!(!conn.drop_link_after_refusal("sid-t", refusal()));
+        assert!(!conn.links.contains_key("sid-t"), "the link survived");
+        assert!(conn.closing.is_empty());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(t.sent.lock().unwrap().is_empty(), "a refusal went out with no transport");
+        let lines = log.take();
+        assert!(
+            lines.iter().any(|(_, l)| l.contains("link-revoked to sid-t: dropped_no_transport")),
+            "the skipped refusal was not logged: {lines:?}"
+        );
+    }
+
+    /// An unassigned source cannot carry a source-tagged ack: the refusal is
+    /// still written, nothing is awaited or registered, and the link closes
+    /// at once.
+    #[tokio::test]
+    async fn a_revoked_link_with_an_unassigned_source_awaits_no_ack() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        let mut l = direct_link("sid-u", "b", "user@b", t.clone());
+        l.source = net::SourceId::UNASSIGNED;
+        conn.links.insert("sid-u".into(), l);
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-u", refusal()));
+        assert!(conn.closing.is_empty(), "an unbindable cut was registered");
+        let _ = written_refusal_nonce(&t).await;
+        assert!(closed_within(&t, Duration::from_millis(500)).await);
+        assert!(start.elapsed() < REFUSAL_ACK_BUDGET, "waited for an ack that cannot come");
+    }
+
+    /// F1a's shape: a forget dooms TWO links to one peer together (here a
+    /// stale one whose transport is already gone, and the live one). Each cut
+    /// has its own nonce and waits for its own ack: the dead one closes at once
+    /// on its failed write, the live one only on ITS nonce. An ack with the
+    /// other cut's nonce, or for the other pid, cannot complete it.
+    #[tokio::test]
+    async fn two_links_of_one_peer_cut_together_each_wait_for_their_own_ack() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let gone = failing_refusal_t();
+        let live = refusal_t(false);
+        conn.links.insert("sid-old".into(), direct_link("sid-old", "b", "user@b", gone.clone()));
+        conn.links.insert("sid-new".into(), direct_link("sid-new", "b", "user@b", live.clone()));
+        assert!(conn.drop_link_after_refusal("sid-old", refusal()));
+        assert!(conn.drop_link_after_refusal("sid-new", refusal()));
+        assert!(closed_within(&gone, Duration::from_millis(500)).await, "the dead link stayed open");
+        let n_live = written_refusal_nonce(&live).await;
+        let n_other = conn
+            .closing
+            .iter()
+            .find(|(n, e)| e.pid == "sid-old" && **n != n_live)
+            .map(|(n, _)| n.clone())
+            .expect("the dead cut keeps its own entry until the next prune");
+        assert!(conn.stage_event(revoked_ack("sid-new", live.source, &n_other)).is_none());
+        assert!(conn.stage_event(revoked_ack("sid-old", live.source, &n_live)).is_none());
+        assert!(!closed_within(&live, Duration::from_millis(150)).await, "closed on another cut's ack");
+        assert!(conn.stage_event(revoked_ack("sid-new", live.source, &n_live)).is_none());
+        assert!(closed_within(&live, Duration::from_millis(500)).await, "not closed after its ack");
+    }
+
+    /// An ack that comes back on a CURRENT link of the same pid (the peer
+    /// answered on a path this side re-established) still completes the cut,
+    /// and is consumed, never dispatched.
+    #[tokio::test]
+    async fn an_ack_on_a_current_link_of_the_same_pid_completes_the_cut() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let cut = refusal_t(false);
+        conn.links.insert("sid-c".into(), direct_link("sid-c", "b", "user@b", cut.clone()));
+        assert!(conn.drop_link_after_refusal("sid-c", refusal()));
+        let nonce = written_refusal_nonce(&cut).await;
+        let again = refusal_t(false);
+        conn.links.insert("sid-c".into(), direct_link("sid-c", "b", "user@b", again.clone()));
+        assert!(
+            conn.stage_event(revoked_ack("sid-c", again.source, &nonce)).is_none(),
+            "an ack on a current link was dispatched"
+        );
+        assert!(conn.closing.is_empty());
+        assert!(closed_within(&cut, Duration::from_millis(500)).await, "not closed after the ack");
+        assert_eq!(again.closes.load(Ordering::Relaxed), 0, "the current link was closed");
     }
 }
 
