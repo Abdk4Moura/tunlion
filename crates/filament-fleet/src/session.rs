@@ -99,11 +99,19 @@ impl Default for PeerState {
 #[derive(Debug, Default)]
 pub struct FleetSession {
     peers: HashMap<String, PeerState>,
+    /// This device's own key. A verified hello carrying it is refused, never
+    /// Proved. None (not set, or the key unavailable) leaves that refusal inert.
+    own_device: Option<[u8; 32]>,
 }
 
 impl FleetSession {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set this device's own key, so a hello carrying it is refused.
+    pub fn set_own_device(&mut self, own: Option<[u8; 32]>) {
+        self.own_device = own;
     }
 
     fn st(&mut self, pid: &str) -> &mut PeerState {
@@ -282,6 +290,10 @@ impl FleetSession {
                     return Outcome::Refused("no channel binding".into());
                 };
                 match crate::verify_hello(v, &cb, &owner, now_secs) {
+                    Ok(ok) if self.own_device == Some(ok.device_pub) => {
+                        self.st(pid).wrong = true;
+                        Outcome::Refused("own-device-key".into())
+                    }
                     Ok(ok) => {
                         // The name is resolved from the PROVEN certificate key,
                         // never from the name the peer asserted. A peer that
@@ -464,6 +476,25 @@ mod tests {
             "a", &theirs, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({ "signed": true })), |_| None, raw,
         );
         assert_eq!(out, Outcome::Send(json!({ "signed": true })));
+    }
+
+    /// On an exporter link both ends hold the same binding, so an echoed hello
+    /// of ours verifies. The verified arm must refuse our own key before it can
+    /// return Proved. Pinned on the source order (building a real signed hello
+    /// needs host keys this crate does not have) plus the setter.
+    #[test]
+    fn a_hello_carrying_our_own_key_is_refused_before_proved() {
+        const SRC: &str = include_str!("session.rs");
+        let guard = SRC
+            .find(concat!("self.own_device == ", "Some(ok.device_pub)"))
+            .expect("own-key arm present");
+        let proved = SRC.find(concat!("Outcome::", "Proved {")).expect("Proved arm present");
+        assert!(guard < proved, "the own-key refusal must precede Proved");
+        assert!(SRC[guard..proved].contains(concat!("own-device", "-key")));
+        let mut s = FleetSession::new();
+        assert_eq!(s.own_device, None, "inert until the host sets it (known limitation)");
+        s.set_own_device(Some([3u8; 32]));
+        assert_eq!(s.own_device, Some([3u8; 32]));
     }
 
     #[test]

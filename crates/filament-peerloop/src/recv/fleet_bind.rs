@@ -347,11 +347,34 @@ mod tests {
     }
 
     #[test]
-    fn a_hello_carrying_our_own_key_is_ours() {
+    fn a_hello_or_announce_carrying_our_own_key_is_ours() {
         let own = [8u8; 32];
         assert!(is_own_device(&own, Some(own)));
         assert!(!is_own_device(&[9u8; 32], Some(own)));
-        assert!(!is_own_device(&own, None));
+    }
+
+    /// KNOWN LIMITATION, pinned so it cannot change unnoticed: with the local
+    /// overlay key unavailable the own-key refusal is inert. This is not the
+    /// intended property; admission then rests on the reflected-challenge
+    /// refusal alone (and on exporter links, on nothing).
+    #[test]
+    fn own_key_refusal_is_inert_without_the_local_key() {
+        assert!(!is_own_device(&[8u8; 32], None));
+    }
+
+    /// Shipped builds carry the local overlay key wherever fleet admission is
+    /// compiled: the daemon's own-key refusals read it through the `mesh`
+    /// host API. The peerloop feature graph does NOT make `fleet` imply `mesh`;
+    /// the CLI default and tunlion-core's `fleet` enable both. A peerloop build
+    /// with `fleet` and without `mesh` fails here on purpose.
+    #[test]
+    fn fleet_builds_carry_the_local_overlay_key() {
+        if cfg!(feature = "fleet") {
+            assert!(
+                cfg!(feature = "mesh"),
+                "fleet without mesh: the own-key refusals have no local key and are inert"
+            );
+        }
     }
 
     #[test]

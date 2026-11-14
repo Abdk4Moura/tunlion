@@ -5828,7 +5828,25 @@ async fn recv_run(
                                 // channel binding and possession; none of those
                                 // stop a genuine announce being replayed onto
                                 // the SAME channel later.
-                                if !crate::recv::fleet::route_ok(
+                                if fleet_bind::is_own_device(&pending.pubkey, host.overlay_pubkey().ok()) {
+                                    // Our own overlay key, from a peer: never a
+                                    // route to install.
+                                    log.debug(&format!(
+                                        "  l3-announce from {pid} ignored: {}",
+                                        fleet_bind::OWN_DEVICE_KEY
+                                    ));
+                                    fleet_step(
+                                        log.as_ref(),
+                                        daemon,
+                                        fleet_trace.as_deref(),
+                                        &conn,
+                                        &pid,
+                                        "ignored",
+                                        concat!("announce-", "own-device-key"),
+                                        "none",
+                                        "none",
+                                    );
+                                } else if !crate::recv::fleet::route_ok(
                                     &conn,
                                     &pid,
                                     pending.relay_datagrams,
@@ -6787,6 +6805,29 @@ async fn recv_run(
                                 }) {
                                     Some((t, cb)) => match ann.verify(&cb) {
                                         Ok(ip) => {
+                                            // Our own overlay key, from a peer: never
+                                            // a route to install.
+                                            if fleet_bind::is_own_device(
+                                                &ann.pubkey,
+                                                host.overlay_pubkey().ok(),
+                                            ) {
+                                                log.debug(&format!(
+                                                    "  l3-announce from {pid} ignored: {}",
+                                                    fleet_bind::OWN_DEVICE_KEY
+                                                ));
+                                                fleet_step(
+                                                    log.as_ref(),
+                                                    daemon,
+                                                    fleet_trace.as_deref(),
+                                                    &conn,
+                                                    &pid,
+                                                    "ignored",
+                                                    concat!("announce-", "own-device-key"),
+                                                    "none",
+                                                    "none",
+                                                );
+                                                continue;
+                                            }
                                             // The overlay key IS the device key: a
                                             // revoked or forgotten device gets no route.
                                             if overlay_key_refused(
@@ -12355,6 +12396,8 @@ mod signing_call_sites {
     const HELLO_ARM: &str = concat!("Some(fleet::", "HELLO) =>");
     const OWN_GUARD: &str = concat!("is_own", "_device(");
     const ADMIT: &str = concat!("admit", "_fleet(");
+    const ANN_VERIFIES: [&str; 2] = [concat!("pending.verify", "(&cb)"), concat!("ann.verify", "(&cb)")];
+    const ACCEPT_SEQ: &str = concat!("accept", "_seq(");
 
     fn squash(s: &str) -> String {
         s.chars().filter(|c| !c.is_whitespace()).collect()
@@ -12442,6 +12485,24 @@ mod signing_call_sites {
         let guard = arm + SRC[arm..].find(OWN_GUARD).expect("own-key guard in the fleet-hello arm");
         let admit = arm + SRC[arm..].find(ADMIT).expect("admission in the fleet-hello arm");
         assert!(guard < admit, "the own-key guard must precede admission");
+    }
+
+    /// Every verified announce is checked against our own overlay key before
+    /// its sequence is accepted and a route can be installed.
+    #[test]
+    fn an_announce_carrying_our_own_key_is_dropped_before_routing() {
+        let mut sites = 0;
+        for needle in ANN_VERIFIES {
+            for (at, _) in SRC.match_indices(needle) {
+                let seq = at + SRC[at..].find(ACCEPT_SEQ).expect("sequence check after verify");
+                assert!(
+                    SRC[at..seq].contains(OWN_GUARD),
+                    "an announce verified at byte {at} reaches accept_seq without the own-key refusal"
+                );
+                sites += 1;
+            }
+        }
+        assert_eq!(sites, 2, "both announce verification sites are covered");
     }
 
     #[test]

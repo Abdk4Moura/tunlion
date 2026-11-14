@@ -2107,6 +2107,10 @@ pub(crate) async fn send_cmd(
                         tr.as_ref()
                             .and_then(|t| crate::nonce_binding(t, link_fps.as_ref(), n))
                     };
+                    // Our own key, so a hello carrying it is refused. Read here,
+                    // on the fleet path only: this device is enrolled, so the key
+                    // exists and the read has no side effect.
+                    fleet_sess.set_own_device(crate::overlay::overlay_pubkey_bytes().ok());
                     let outcome = fleet_sess.on_control(
                         &pid,
                         &v,

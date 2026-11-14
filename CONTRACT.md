@@ -355,8 +355,24 @@ Challenge lifecycle (no exporter):
   issued (current or retired; a daemon checks every link, a one-shot its own) is refused: it is not stored and
   nothing is signed over it. The refusal is logged with the stable reason
   `reflected-challenge`.
-- **Own key.** A verified `fleet-hello` whose device key is this device's own
-  key is refused before admission, reason `own-device-key`.
+- **Own key.** A verified `fleet-hello` or `l3-announce` whose device key is
+  this device's own key is refused before admission or routing, reason
+  `own-device-key` (`announce-own-device-key` on the step line for an
+  announce). Carried on: the daemon's `fleet-hello` arm, the daemon's
+  `l3-announce` arm, the daemon's replay of an announce held until
+  `ChannelReady`, and the one-shot `FleetSession` hello verdict.
+  - The comparison uses the local overlay key (`overlay_pubkey()`). When that
+    key is unavailable the refusal is inert: in the daemon only when built with
+    `fleet` and without `mesh` (no shipped build; the peerloop feature graph
+    does not itself make `fleet` imply `mesh`, the CLI default and
+    tunlion-core's `fleet` enable both), and in a one-shot when the key cannot
+    be read.
+  - That this device's certificate key equals `overlay_pubkey()` is a host
+    obligation; no type enforces it.
+  - Residual risk: on exporter links, where both ends compute the same binding,
+    fleet admission rests on this comparison being present on every path that
+    accepts a verified hello or announce with the key known. A new path that
+    omits it accepts an echoed proof. Source-order tests pin the paths above.
 - **Announces.** An `l3-announce` is verified against the current nonce only,
   not a retired one. One signed over a retired nonce is dropped; the peer
   re-announces after the next verified hello. (Known limitation.)
@@ -366,7 +382,7 @@ What a verified binding establishes: that the message was signed for THIS link
 arrived on) and over a nonce the verifier chose (current, or retired within its
 10 s TTL). It does not by itself establish that the PEER produced the message.
 Admission additionally requires that, and the reflection and own-key refusals
-above are what enforce it. Retrying re-sends a value already sent in the clear
+above are what enforce it (on exporter links, the own-key refusal alone). Retrying re-sends a value already sent in the clear
 on the same link. Challenge roles are not yet domain-separated in the binding
 hash; that is a planned change and will alter the bytes signed on WebRTC
 links.
