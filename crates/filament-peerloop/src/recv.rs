@@ -68,6 +68,8 @@ pub mod events;
 pub mod files;
 #[cfg(feature = "dispatch")]
 pub mod fleet;
+#[cfg(feature = "dispatch")]
+pub mod fleet_bind;
 #[cfg(all(feature = "dispatch", feature = "mesh", feature = "fleet"))]
 pub mod fleet_rv;
 #[cfg(feature = "dispatch")]

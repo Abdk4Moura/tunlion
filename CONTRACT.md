@@ -336,6 +336,74 @@ is the link's channel binding:
   verified (never a fallback to the bare nonce).
 - **same-host `local-tcp`** (no DTLS): the bare nonce, as before.
 
+Challenge lifecycle (no exporter):
+
+- **Epoch.** A challenge belongs to the installed link's (generation, source).
+  When a different transport is installed for the same peer id, the verifier
+  retires its nonce and mints a fresh one, and the signer drops the peer's nonce
+  it held for the previous transport. A `ChannelReady` from a transport that is
+  not the installed one changes neither.
+- **Retry.** While the peer is unverified on the installed link, the verifier
+  re-sends the SAME nonce on a bounded backoff (2, 4, 8, 16 s; four retries).
+  A peer answers every `l3-nonce` with a `fleet-hello` signed over that nonce.
+- **Retired nonces.** A retired nonce stays acceptable for VERIFYING only, for
+  10 s, at most two per peer, and only combined with the CURRENT link's
+  fingerprint pair. It is never used to sign.
+- **Signing.** Every outgoing `fleet-hello` and `l3-announce` is signed over the
+  peer's challenge for the installed transport; with none held, nothing is
+  signed.
+- **Reflected challenges.** A received `l3-nonce` equal to a nonce this side
+  issued (current or retired; a daemon checks every link, a one-shot its own) is refused: it is not stored and
+  nothing is signed over it. The refusal is logged with the stable reason
+  `reflected-challenge`.
+- **Own key.** A verified `fleet-hello` or `l3-announce` whose device key is
+  this device's own key is refused before admission or routing, reason
+  `own-device-key` (`announce-own-device-key` on the step line for an
+  announce). Carried on the paths listed here: the daemon's `fleet-hello`
+  arm, the daemon's `l3-announce` arm, the daemon's replay of an announce held
+  until `ChannelReady`, the one-shot `FleetSession` hello verdict, and the
+  fleet dialer used by `exec` and l2 (`verify_fleet_identity`). A CLI test
+  pins every `verify_hello` call and every `Announce::from_json` parse in the
+  workspace members' sources (its roots come from the root `Cargo.toml`), each
+  production one with its own-key refusal; the peerloop source-order tests pin
+  the announce replay at `ChannelReady`. Blind spots: a site that verifies an
+  already-parsed announce (`.verify(&cb)`) without either call, and source
+  outside a member's scanned root.
+  - The comparison uses the local overlay key (`overlay_pubkey()`). When that
+    key is unavailable the refusal is inert: in the daemon only when built with
+    `fleet` and without `mesh` (no shipped build; the peerloop feature graph
+    does not itself make `fleet` imply `mesh`, the CLI default and
+    tunlion-core's `fleet` enable both). The one-shot send and the fleet dialer
+    read the key once at the start and fail with exit 9 (`no_identity`), naming
+    the key file, when it cannot be read; the send fails before any fleet
+    handshake or file byte, the dial before any command payload. `FleetSession` takes the key in its
+    constructor (no `Default`); passing `None` leaves its refusal inert.
+  - That this device's certificate key equals `overlay_pubkey()` is a host
+    obligation; no type enforces it.
+  - Residual risk: on exporter links, where both ends compute the same binding,
+    fleet admission rests on this comparison being present on every path that
+    accepts a verified hello or announce with the key known. A new path that
+    omits it accepts an echoed proof. Source-order tests pin the paths above.
+- **Announces.** An `l3-announce` is verified against the current nonce only,
+  not a retired one. One signed over a retired nonce is dropped; the peer
+  re-announces after the next verified hello. (Known limitation.)
+
+What a verified binding establishes: that the message was signed for THIS link
+(its exporter, or its DTLS fingerprint pair, recomputed from the link it
+arrived on) and over a nonce the verifier chose (current, or retired within its
+10 s TTL). It does not by itself establish that the PEER produced the message.
+
+- **Hello admission** additionally requires that the peer produced the hello,
+  enforced by the reflected-challenge refusal and the own-key refusal (on
+  exporter links, the own-key refusal alone).
+- **Announce route installation** additionally requires that the announced
+  key is not this device's own, enforced by the own-key refusal on both
+  announce verification sites; the key must also not be revoked here.
+
+Retrying re-sends a value already sent in the clear on the same link. Challenge
+roles are not yet domain-separated in the binding hash; that is a planned
+change and will alter the bytes signed on WebRTC links.
+
 This changed what a `fleet-hello` / `l3-announce` signs on WebRTC links (it was
 the bare nonce). Pre-launch, so a mixed-version pair over WebRTC simply fails
 fleet verification until both ends upgrade; direct-QUIC links are unaffected.

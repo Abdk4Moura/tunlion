@@ -43,7 +43,7 @@ the exit codes that command can return.
 | 6 | `unreachable` | peer offline or did not answer in time | retry once after `tunlion reach <device> --json`; if still 6, tell the user the device looks offline |
 | 7 | `network` | cannot reach the tunlion server | check this machine's internet; stop |
 | 8 | `partial` | some files moved, some did not | report which; re-running `sync` moves only what is missing |
-| 9 | `no_identity` | this device was never set up | stop; the user must run `tunlion init` or `tunlion join` |
+| 9 | `no_identity` | this device was never set up, or its own device key could not be read (the message names the file) | stop; the user must run `tunlion init` or `tunlion join`, or fix that file's permissions |
 | 10 | | `up`: a daemon already runs with different settings | run `tunlion down -y` first only if the user wants the new settings |
 | 11 | | `status`: no daemon running | start one with `tunlion up --detach` if the task needs it |
 | 12 | `local_resource` | disk, quota, open files or memory ran out here | stop and report |
