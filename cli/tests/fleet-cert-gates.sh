@@ -171,14 +171,20 @@ for l in sys.stdin:
         print(l)
 '
 }
+# The info-level establishment transitions (`fleet pid=... step=...`) and the
+# unverified watchdog, as a daemon logged them. $1 label, $2 log, $3 lines to skip.
+dump_fleet_steps() {
+  echo "-- fleet steps ($1) --"
+  tail -n +"$((${3:-0} + 1))" "$2" 2>/dev/null | grep -E "fleet pid=|fleet unverified for" | tail -20
+}
 # Signaling health as each daemon logged it, and the fixture backend's tail,
 # so a signaling stall is evidenced on its own rather than folded into a
 # binding verdict.
 dump_signaling() {
   local f
-  echo "-- signaling lines (all daemons) --"
+  echo "-- signaling and loop-stall lines (all daemons) --"
   for f in "$@"; do
-    [ -f "$f" ] && grep -E "signaling" "$f" | tail -4 | sed "s|^|$(basename "$f"): |"
+    [ -f "$f" ] && grep -E "signaling|event loop (stalled|recovered)" "$f" | tail -6 | sed "s|^|$(basename "$f"): |"
   done
   echo "-- backend.log tail --"; tail -5 "$WORK/backend.log" 2>/dev/null
 }
@@ -431,6 +437,7 @@ rcFG=$?
 pkill -f "up --dir $WORK/$FORGOTTEN-drop" 2>/dev/null || true
 sleep 2
 FG_OWNER_FROM=$(wc -l <"$OWNER_TRACE" 2>/dev/null || echo 0)
+FG_OWNER_LOG_FROM=$(wc -l <"$WORK/up.log" 2>/dev/null || echo 0)
 export TUNLION_FLEET_HELLO_TRACE="$WORK/fhello-$FORGOTTEN-again.trace"
 start_spoke "$DFG" "$FORGOTTEN-again"
 unset TUNLION_FLEET_HELLO_TRACE
@@ -459,6 +466,8 @@ else
   echo "-- forgotten device log --"; tail -5 "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null
   dump_fhello "owner, hellos since the restart, key ${FG_PUB:0:16}" "$OWNER_TRACE" "fhello-verdict.*dev=$FG_PUB" "$FG_OWNER_FROM"
   dump_fhello "forgotten device, all" "$WORK/fhello-$FORGOTTEN-again.trace"
+  dump_fleet_steps "owner, since the restart" "$WORK/up.log" "$FG_OWNER_LOG_FROM"
+  dump_fleet_steps "forgotten device" "$WORK/up-$FORGOTTEN-again.log"
   dump_signaling "$WORK/up.log" "$WORK/up-$FORGOTTEN-again.log" "$WORK/up-$SPOKE.log" "$WORK/up-$MALLORY.log"
   bad "gateFORGET-REVOKES: forget of a live certificate holder did not cut it off truthfully (rc=$rcFG listed=$FG_LISTED reindexed=$FG_REINDEXED hello=$FG_HELLO)"
 fi
@@ -509,6 +518,7 @@ run_impostor_variant() {
   pkill -f "up --dir $WORK/$MALLORY-drop" 2>/dev/null || true
   sleep 2
   local owner_from=$(wc -l <"$OWNER_TRACE" 2>/dev/null || echo 0)
+  local owner_log_from=$(wc -l <"$WORK/up.log" 2>/dev/null || echo 0)
   env TUNLION_CONFIG_DIR="$DM" TUNLION_NAME="$variant" TUNLION_FLEET_HELLO_TRACE="$WORK/fhello-$MALLORY-$tag.trace" "$BIN" --server "$SERVER" up --dir "$WORK/$MALLORY-drop" >"$WORK/up-$MALLORY-$tag.log" 2>&1 &
   FIX_PIDS+=($!)
   # Wait for the attempt to happen rather than a fixed 8s. The impostor's
@@ -557,11 +567,18 @@ PY
   [ "$rcI" != "0" ] && ! echo "$OUTI" | grep -q "SHOULD-NOT-RUN" && execref=1
   [ "$rcI" = "124" ] && window_expired "I-$tag impostor exec" 60 "the refused exec did not return"
   echo "## (impostor $tag) refused=$refused attempted=$attempted victim=$victim_ok intact=$intact execref=$execref"
-  # Whether the OWNER evaluated the impostor's own hello, by its device key.
-  # Reported, not asserted (see the NOT EXERCISED proposal before it is).
-  local owner_eval=0
-  [ -n "$MALLORY_PUB" ] && owner_eval=$(tail -n +"$((owner_from + 1))" "$OWNER_TRACE" 2>/dev/null | grep -c "fhello-verdict.*dev=$MALLORY_PUB" || true)
-  echo "## (impostor $tag) owner verdicts on the impostor key: $owner_eval ($(tail -n +"$((owner_from + 1))" "$OWNER_TRACE" 2>/dev/null | grep "fhello-verdict.*dev=$MALLORY_PUB" | grep -oE "outcome=[a-z]+ why=[^ ]+" | sort | uniq -c | tr -s ' ' | tr '\n' ';'))"
+  # Whether the OWNER evaluated the impostor's OWN hello: an info-level
+  # `fleet ... step=<verdict>` line in the owner's log naming the impostor's
+  # device key, since this variant started. Direction-specific, unlike
+  # `attempted` (which the impostor's own log satisfies when IT admits a
+  # sibling). Reported, not asserted, until the NOT EXERCISED verdict lands.
+  local owner_eval=0 owner_steps=""
+  if [ -n "$MALLORY_PUB" ]; then
+    owner_steps=$(tail -n +"$((owner_log_from + 1))" "$WORK/up.log" 2>/dev/null \
+      | grep -E "fleet pid=[^ ]+ gen=[^ ]+ src=.* step=(verified|refused|held|ignored|dropped) .*dev=${MALLORY_PUB:0:16}" || true)
+    [ -n "$owner_steps" ] && owner_eval=$(printf '%s\n' "$owner_steps" | wc -l)
+  fi
+  echo "## (impostor $tag) owner evaluated the impostor's own hello: $owner_eval ($(printf '%s\n' "$owner_steps" | grep -oE "step=[a-z]+ reason=[^ ]+" | sort | uniq -c | tr -s ' ' | tr '\n' ';'))"
   if [ "$attempted" = "1" ] && [ "$victim_ok" = "1" ] && [ "$intact" = "1" ] && [ "$execref" = "1" ]; then
     ok "gateI-$tag: squat as '$variant' CONTAINED (victim keyed + byte-identical, impostor reached the owner, exec refused)"
   else
@@ -572,6 +589,8 @@ PY
     echo "-- owner log (fleet) --"; grep -i "fleet" "$WORK/up.log" | tail -5
     dump_fhello "owner, this variant, impostor key ${MALLORY_PUB:0:16}" "$OWNER_TRACE" "fhello-verdict.*dev=$MALLORY_PUB" "$owner_from"
     dump_fhello "impostor, this variant" "$WORK/fhello-$MALLORY-$tag.trace"
+    dump_fleet_steps "owner, this variant" "$WORK/up.log" "$owner_log_from"
+    dump_fleet_steps "impostor, this variant" "$WORK/up-$MALLORY-$tag.log"
     dump_signaling "$WORK/up.log" "$WORK/up-$MALLORY-$tag.log" "$WORK/up-$SPOKE.log"
     bad "gateI-$tag: impostor as '$variant' NOT contained (attempted=$attempted victim=$victim_ok intact=$intact execref=$execref refused=$refused)"
   fi
@@ -585,6 +604,8 @@ PY
       echo "-- impostor log ($tag) --"; tail -5 "$WORK/up-$MALLORY-$tag.log" 2>/dev/null
       dump_fhello "owner, this variant, impostor key ${MALLORY_PUB:0:16}" "$OWNER_TRACE" "fhello-verdict.*dev=$MALLORY_PUB" "$owner_from"
       dump_fhello "impostor, this variant" "$WORK/fhello-$MALLORY-$tag.trace"
+      dump_fleet_steps "owner, this variant" "$WORK/up.log" "$owner_log_from"
+      dump_fleet_steps "impostor, this variant" "$WORK/up-$MALLORY-$tag.log"
       dump_signaling "$WORK/up.log" "$WORK/up-$MALLORY-$tag.log" "$WORK/up-$SPOKE.log"
     fi
     bad "gateI-$tag: transplant refusal line absent (containment=$([ "$attempted$victim_ok$intact$execref" = "1111" ] && echo held || echo broken); no refusal emitted for this attempt)"

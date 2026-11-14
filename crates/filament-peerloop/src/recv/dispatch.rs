@@ -2107,6 +2107,8 @@ async fn recv_run(
     // Diagnostic only: reported with every fleet-hello verdict (`fhello`).
     let mut bind_resets: HashMap<String, u32> = HashMap::new();
     let fleet_trace = ports.env.fleet_hello_trace.clone();
+    // Links already reported by the unverified watchdog, by (pid, generation).
+    let mut fleet_unverified_said: HashSet<(String, u32)> = HashSet::new();
     let mut fleet_pending: std::collections::HashSet<String> = Default::default();
     let mut fleet_verified: std::collections::HashSet<String> = Default::default();
     // Offers that arrived while this link's `fleet-hello` was still in flight.
@@ -4265,6 +4267,63 @@ async fn recv_run(
         bind_theirs.retain(|p, _| conn.links.contains_key(p));
         bind_source.retain(|p, _| conn.links.contains_key(p));
         bind_resets.retain(|p, _| conn.links.contains_key(p));
+        fleet_unverified_said.retain(|(p, _)| conn.links.contains_key(p));
+        // Unverified watchdog, once per link: a fleet-shaped link that has been
+        // up this long without a verified hello says what it is still waiting
+        // on. Diagnostic only; it changes no state the handshake reads.
+        if let Some(rv) = ports.identity.fleet_rv() {
+            let stale: Vec<(String, u32, u64)> = conn
+                .links
+                .iter()
+                .filter(|(p, _)| !fleet_verified.contains(*p))
+                .filter_map(|(p, l)| {
+                    let age = l.established_at?.elapsed().as_secs();
+                    (age >= FLEET_UNVERIFIED_SAY_SECS
+                        && !fleet_unverified_said.contains(&(p.clone(), l.generation)))
+                    .then(|| (p.clone(), l.generation, age))
+                })
+                .collect();
+            for (p, generation, age) in stale {
+                if !crate::recv::fleet::shaped_link(&conn, &p, Some(rv.as_str())) {
+                    continue;
+                }
+                fleet_unverified_said.insert((p.clone(), generation));
+                let t = conn.transport_of(&p);
+                let exporter = t.as_ref().is_some_and(|t| t.channel_binding().is_some());
+                let dc = t
+                    .as_ref()
+                    .is_some_and(|t| t.as_any().is::<net::DataChannelTransport>());
+                let fps = if dc && !exporter {
+                    link_fingerprints(&conn, &p).await.is_some()
+                } else {
+                    true
+                };
+                let waiting = if t.is_none() {
+                    "transport"
+                } else if !exporter && !bind_theirs.contains_key(&p) {
+                    "theirs"
+                } else if !fps {
+                    "fps"
+                } else if !exporter && !bind_ours.contains_key(&p) {
+                    "exporter"
+                } else {
+                    "peer-hello"
+                };
+                let src = conn
+                    .link(&p)
+                    .map(|l| format!("{:?}", l.source))
+                    .unwrap_or_else(|| "none".into());
+                let line = format!(
+                    "fleet unverified for {age}s: waiting on {waiting} pid={p} gen={generation} src={src}"
+                );
+                if daemon {
+                    log.say(&line);
+                } else {
+                    log.debug(&line);
+                }
+                fleet_trace_append(fleet_trace.as_deref(), &line);
+            }
+        }
         fleet_deferred_offers.retain(|(p, _, _)| conn.links.contains_key(p));
 
         // C23: questions from links that died (supersede/peer-left) are
@@ -5529,6 +5588,19 @@ async fn recv_run(
                         let cleared_ours = bind_ours.remove(&pid).is_some();
                         let cleared_theirs = bind_theirs.remove(&pid).is_some();
                         if prev.is_some() && ports.identity.fleet_rv().is_some() {
+                            fleet_step(
+                                log.as_ref(),
+                                daemon,
+                                fleet_trace.as_deref(),
+                                &conn,
+                                &pid,
+                                "rechallenged",
+                                &format!(
+                                    "source-change cleared_ours={cleared_ours} cleared_theirs={cleared_theirs}"
+                                ),
+                                "none",
+                                "none",
+                            );
                             let n = bind_resets.entry(pid.clone()).or_insert(0);
                             *n = n.saturating_add(1);
                             fleet_hello_note(
@@ -5552,16 +5624,48 @@ async fn recv_run(
                     // dropped with the link, so a genuinely new link still gets a
                     // new one. Re-send the stored value every time, so a peer
                     // that missed the first copy still gets it.
+                    let minted = !bind_ours.contains_key(&pid);
                     let nonce = bind_ours
                         .entry(pid.clone())
                         .or_insert_with(link_nonce)
                         .clone();
-                    let _ = t
+                    let sent = t
                         .send_control(&json!({
                             "type": "l3-nonce",
                             "nonce": base64::engine::general_purpose::STANDARD.encode(&nonce),
                         }))
-                        .await;
+                        .await
+                        .is_ok();
+                    if ports.identity.fleet_rv().is_some() {
+                        let prefix = nonce_prefix(&nonce);
+                        if minted {
+                            fleet_step(
+                                log.as_ref(),
+                                daemon,
+                                fleet_trace.as_deref(),
+                                &conn,
+                                &pid,
+                                "minted",
+                                &format!("channel-ready nonce={prefix}"),
+                                "dtls",
+                                "none",
+                            );
+                        }
+                        fleet_step(
+                            log.as_ref(),
+                            daemon,
+                            fleet_trace.as_deref(),
+                            &conn,
+                            &pid,
+                            "sent-nonce",
+                            &format!(
+                                "{} nonce={prefix}",
+                                if sent { "channel-ready" } else { "send-failed" }
+                            ),
+                            "dtls",
+                            "none",
+                        );
+                    }
                 }
                 // Only for a node that is actually IN a fleet: this fires on every
                 // ChannelReady, and a user with no fleet has nothing to diagnose
@@ -5602,7 +5706,18 @@ async fn recv_run(
                         {
                             Ok(hello) => {
                                 fleet_greeted.insert(pid.clone());
-                                let _ = t.send_control(&hello).await;
+                                let sent = t.send_control(&hello).await.is_ok();
+                                fleet_step(
+                                    log.as_ref(),
+                                    daemon,
+                                    fleet_trace.as_deref(),
+                                    &conn,
+                                    &pid,
+                                    "sent-hello",
+                                    if sent { "channel-ready" } else { "send-failed" },
+                                    cb_kind(&t),
+                                    "none",
+                                );
                             }
                             Err(e) => log.debug(&format!("fleet-hello not sent to {pid}: {e}")),
                         }
@@ -5851,6 +5966,19 @@ async fn recv_run(
                 Some("l3-nonce") => {
                     match v["nonce"].as_str().map(unb64) {
                         Some(Ok(nonce)) if nonce.len() >= 16 => {
+                            if ports.identity.fleet_rv().is_some() {
+                                fleet_step(
+                                    log.as_ref(),
+                                    daemon,
+                                    fleet_trace.as_deref(),
+                                    &conn,
+                                    &pid,
+                                    "recv-nonce",
+                                    &format!("ok nonce={}", nonce_prefix(&nonce)),
+                                    "dtls",
+                                    "none",
+                                );
+                            }
                             bind_theirs.insert(pid.clone(), nonce);
                             if let Some(t) = conn.transport_of(&pid) {
                                 let link_fps = link_fingerprints(&conn, &pid).await;
@@ -5876,7 +6004,18 @@ async fn recv_run(
                                             .make_fleet_hello(&cb, &ports.env.display_name)
                                         {
                                             fleet_greeted.insert(pid.clone());
-                                            let _ = t.send_control(&hello).await;
+                                            let sent = t.send_control(&hello).await.is_ok();
+                                            fleet_step(
+                                                log.as_ref(),
+                                                daemon,
+                                                fleet_trace.as_deref(),
+                                                &conn,
+                                                &pid,
+                                                "sent-hello",
+                                                if sent { "nonce-answer" } else { "send-failed" },
+                                                cb_kind(&t),
+                                                "none",
+                                            );
                                         }
                                     }
                                 }
@@ -5885,9 +6024,24 @@ async fn recv_run(
                         // A short or malformed nonce is refused rather than used:
                         // a peer that picks a weak challenge would weaken OUR
                         // replay protection, not theirs.
-                        _ => log.debug(&format!(
-                            "l3-nonce from {pid} ignored: missing or too short"
-                        )),
+                        _ => {
+                            log.debug(&format!(
+                                "l3-nonce from {pid} ignored: missing or too short"
+                            ));
+                            if ports.identity.fleet_rv().is_some() {
+                                fleet_step(
+                                    log.as_ref(),
+                                    daemon,
+                                    fleet_trace.as_deref(),
+                                    &conn,
+                                    &pid,
+                                    "recv-nonce",
+                                    "missing-or-short",
+                                    "none",
+                                    "none",
+                                );
+                            }
+                        }
                     }
                 }
                 // Fleet auto-mesh: a same-owner device is presenting its
@@ -5919,6 +6073,13 @@ async fn recv_run(
                     // Release this extra handle now: the arms below may drop the
                     // link, and its close must not wait on a clone held here.
                     let hello_had_transport = hello_t.is_some();
+                    let hello_cb = match &hello_t {
+                        Some(t) if cb.is_some() => cb_kind(t),
+                        _ => "none",
+                    };
+                    let claimed_dev: String = identity::DeviceCert::from_json(&v["cert"])
+                        .map(|c| hex::encode(c.device_pub).chars().take(16).collect())
+                        .unwrap_or_else(|| "none".into());
                     drop(hello_t);
                     // A sibling link (met on the fleet channel, no pair secret):
                     // the only kind the owner's roster governs. A paired link
@@ -5950,6 +6111,17 @@ async fn recv_run(
                                             hex::encode(ok.device_pub)
                                         ),
                                     );
+                                    fleet_step(
+                                        log.as_ref(),
+                                        daemon,
+                                        fleet_trace.as_deref(),
+                                        &conn,
+                                        &pid,
+                                        "held",
+                                        "not-in-owner-roster",
+                                        hello_cb,
+                                        &hex::encode(ok.device_pub)[..16],
+                                    );
                                     fleet_unlisted_hellos.insert(
                                         pid.clone(),
                                         DeferredControl {
@@ -5970,6 +6142,17 @@ async fn recv_run(
                                             "fhello-verdict {fhello_ctx} outcome=refused why=device-revoked dev={}",
                                             hex::encode(ok.device_pub)
                                         ),
+                                    );
+                                    fleet_step(
+                                        log.as_ref(),
+                                        daemon,
+                                        fleet_trace.as_deref(),
+                                        &conn,
+                                        &pid,
+                                        "refused",
+                                        "device-revoked",
+                                        hello_cb,
+                                        &hex::encode(ok.device_pub)[..16],
                                     );
                                     fleet_pending.remove(&pid);
                                     fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
@@ -6033,7 +6216,27 @@ async fn recv_run(
                                                 .identity
                                                 .make_fleet_hello(&cb, &ports.env.display_name)
                                             {
-                                                let _ = t.send_control(&hello).await;
+                                                let sent = t.send_control(&hello).await.is_ok();
+                                                // Signed over the binding WE verify
+                                                // with (our own nonce on a
+                                                // DataChannel), which is not the one
+                                                // the peer verifies with: named
+                                                // `dtls-ours` so a trace shows it.
+                                                fleet_step(
+                                                    log.as_ref(),
+                                                    daemon,
+                                                    fleet_trace.as_deref(),
+                                                    &conn,
+                                                    &pid,
+                                                    "sent-hello",
+                                                    if sent { "answer-once" } else { "send-failed" },
+                                                    if t.channel_binding().is_some() {
+                                                        "exporter"
+                                                    } else {
+                                                        "dtls-ours"
+                                                    },
+                                                    "none",
+                                                );
                                             }
                                         }
                                     }
@@ -6219,6 +6422,27 @@ async fn recv_run(
                                             hex::encode(ok.device_pub)
                                         ),
                                     );
+                                    let fhello_why = fhello_outcome
+                                        .split_whitespace()
+                                        .find_map(|w| w.strip_prefix("why="))
+                                        .unwrap_or("unknown");
+                                    let (fhello_step, fhello_reason) =
+                                        if fhello_outcome.starts_with("outcome=refused") {
+                                            ("refused", "claimed-name-in-use")
+                                        } else {
+                                            ("verified", fhello_why)
+                                        };
+                                    fleet_step(
+                                        log.as_ref(),
+                                        daemon,
+                                        fleet_trace.as_deref(),
+                                        &conn,
+                                        &pid,
+                                        fhello_step,
+                                        fhello_reason,
+                                        hello_cb,
+                                        &hex::encode(ok.device_pub)[..16],
+                                    );
                                 }
                                 Err(e) => {
                                     log.debug(&format!("fleet-hello from {pid} rejected: {e}"));
@@ -6229,6 +6453,17 @@ async fn recv_run(
                                             "fhello-verdict {fhello_ctx} outcome=rejected why={:?}",
                                             e.to_string()
                                         ),
+                                    );
+                                    fleet_step(
+                                        log.as_ref(),
+                                        daemon,
+                                        fleet_trace.as_deref(),
+                                        &conn,
+                                        &pid,
+                                        "dropped",
+                                        "verify-failed",
+                                        hello_cb,
+                                        &claimed_dev,
                                     );
                                     fleet_pending.remove(&pid);
                                     fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
@@ -6257,6 +6492,17 @@ async fn recv_run(
                                 log.as_ref(),
                                 fleet_trace.as_deref(),
                                 &format!("fhello-verdict {fhello_ctx} outcome=ignored why={why}"),
+                            );
+                            fleet_step(
+                                log.as_ref(),
+                                daemon,
+                                fleet_trace.as_deref(),
+                                &conn,
+                                &pid,
+                                "ignored",
+                                why,
+                                hello_cb,
+                                &claimed_dev,
                             );
                         }
                     }
@@ -10204,13 +10450,26 @@ fn out_binding(
         .or_else(|| theirs.get(pid).and_then(|n| nonce_binding(t, fps, n)))
 }
 
-/// One fleet-hello binding record (`fhello-bind`) or verdict (`fhello-verdict`).
-/// Always at debug; also appended, with a wall-clock millisecond stamp, to the
-/// file named by `TUNLION_FLEET_HELLO_TRACE` when set, so a gate can print the
-/// owner's decisions on failure without raising the whole daemon's verbosity.
-/// Best effort: a write that fails is dropped, never surfaced as an error.
-fn fleet_hello_note(log: &dyn LogSink, sink: Option<&Path>, line: &str) {
-    log.debug(line);
+/// How often the unverified watchdog may speak: once per link, after this long.
+const FLEET_UNVERIFIED_SAY_SECS: u64 = 20;
+
+/// The first 8 hex characters of a binding nonce. Nonces travel in the clear,
+/// so a prefix is safe to log; it lets two daemons' lines be matched up.
+fn nonce_prefix(nonce: &[u8]) -> String {
+    hex::encode(nonce).chars().take(8).collect()
+}
+
+/// What a hello on this transport is bound to: the transport's own exporter,
+/// or (a DataChannel) the DTLS fingerprint pair plus a nonce.
+fn cb_kind(t: &Arc<dyn Transport>) -> &'static str {
+    if t.channel_binding().is_some() {
+        "exporter"
+    } else {
+        "dtls"
+    }
+}
+
+fn fleet_trace_append(sink: Option<&Path>, line: &str) {
     let Some(path) = sink else { return };
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -10220,6 +10479,47 @@ fn fleet_hello_note(log: &dyn LogSink, sink: Option<&Path>, line: &str) {
         use std::io::Write as _;
         let _ = writeln!(f, "t_ms={ms} {line}");
     }
+}
+
+/// One fleet establishment transition, with stable tokens:
+/// `fleet pid=<pid> gen=<n> src=<id> step=<step> reason=<..> cb=<..> dev=<..>`.
+/// INFO on a daemon (where the gates and an operator read it), debug for a
+/// one-shot. `dev` is a device-key prefix (16 hex), `none` when unknown.
+#[allow(clippy::too_many_arguments)]
+fn fleet_step(
+    log: &dyn LogSink,
+    info: bool,
+    sink: Option<&Path>,
+    conn: &Conn,
+    pid: &str,
+    step: &str,
+    reason: &str,
+    cb: &str,
+    dev: &str,
+) {
+    let (generation, src) = conn
+        .link(pid)
+        .map(|l| (l.generation.to_string(), format!("{:?}", l.source)))
+        .unwrap_or_else(|| ("none".into(), "none".into()));
+    let line = format!(
+        "fleet pid={pid} gen={generation} src={src} step={step} reason={reason} cb={cb} dev={dev}"
+    );
+    if info {
+        log.say(&line);
+    } else {
+        log.debug(&line);
+    }
+    fleet_trace_append(sink, &line);
+}
+
+/// One fleet-hello binding record (`fhello-bind`) or verdict (`fhello-verdict`).
+/// Always at debug; also appended, with a wall-clock millisecond stamp, to the
+/// file named by `TUNLION_FLEET_HELLO_TRACE` when set, so a gate can print the
+/// owner's decisions on failure without raising the whole daemon's verbosity.
+/// Best effort: a write that fails is dropped, never surfaced as an error.
+fn fleet_hello_note(log: &dyn LogSink, sink: Option<&Path>, line: &str) {
+    log.debug(line);
+    fleet_trace_append(sink, line);
 }
 
 /// The inputs a fleet-hello verdict rested on, in one line: whether the
