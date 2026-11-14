@@ -3801,7 +3801,12 @@ async fn recv_run(
                             let refusal = crate::refusal::Refusal::new(code, None);
                             let mut f = json!({ "type": "link-revoked", "reason": refusal.reason });
                             refusal.annotate(&mut f);
-                            let _ = t.send_control(&f).await;
+                            match t.send_control(&f).await {
+                                Ok(()) => log.debug(&format!("link-revoked to {pid}: sent")),
+                                Err(e) => log.debug(&format!("link-revoked to {pid}: send failed: {e}")),
+                            }
+                        } else {
+                            log.debug(&format!("link-revoked to {pid}: no transport, not sent"));
                         }
                     }
                     for (pid, label) in &doomed {
@@ -7326,7 +7331,10 @@ async fn recv_run(
                 // session) keep their existing handling.
                 Some("link-revoked") => {
                     if let Some(mux) = l2_muxes.get(&pid) {
+                        log.debug(&format!("link-revoked from {pid}: delivered to its sessions"));
                         mux.on_link_revoked(v.clone()).await;
+                    } else {
+                        log.debug(&format!("link-revoked from {pid}: no session mux for that link"));
                     }
                     continue;
                 }

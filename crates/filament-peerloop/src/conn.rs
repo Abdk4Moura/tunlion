@@ -3817,6 +3817,13 @@ impl Conn {
                 if self.source_current(&pid, source, inner.as_ref()) {
                     return Some((*inner, Some(source)));
                 }
+                if let Ev::Control(_, v) = inner.as_ref() {
+                    if v["type"].as_str() == Some("link-revoked") {
+                        self.log.debug(&format!(
+                            "link-revoked from {pid}: not from the link's current source, not staged"
+                        ));
+                    }
+                }
                 // A standby/upgrade attempt may deliver before adoption. Buffer
                 // it only for its registered source and pid, bounded.
                 if self.pending_sources.get(&source).is_some_and(|p| p.pid == pid) {

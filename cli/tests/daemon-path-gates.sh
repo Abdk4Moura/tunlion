@@ -225,6 +225,17 @@ fi
 start_a
 sleep 6
 
+# After F1, pass or fail, show both ends: whether A sent link-revoked, whether B
+# staged and delivered it, and when each side dropped the link. Evidence only;
+# the gate's conditions are unchanged.
+f1_evidence() {
+  local pat='link-revoked|closed the link to|drop_link|not staged|died during exec|warm link'
+  for side in A B; do
+    echo "## F1 evidence: $side-up.log (last matching lines)"
+    grep -E "$pat" "$WORK/$side-up.log" 2>/dev/null | tail -n 40 || true
+  done
+}
+
 # ===================================================================== F1 ======
 say "F1: exec running when a forgets b: exit 4 with the refusal"
 env TUNLION_CONFIG_DIR="$DB" timeout 90 "$BIN" --server "$SERVER" exec boxa -- /bin/sleep 80 >/dev/null 2>"$WORK/f1.err" </dev/null &
@@ -240,6 +251,7 @@ if kill -0 "$EP" 2>/dev/null; then
   else
     bad "F1: exec when forgotten (forget rc=$frc, exec rc=$rc in ${took}s)"
   fi
+  f1_evidence
 else
   wait "$EP"; bad "F1: the exec ended before the forget (rc=$?)"; tail -5 "$WORK/f1.err"
   env TUNLION_CONFIG_DIR="$DA" "$BIN" devices forget boxb -y >"$WORK/forget.log" 2>&1
