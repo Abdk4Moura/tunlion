@@ -60,13 +60,11 @@ For a **fleet sibling** (same owner, never paired directly with the receiver):
 - Ordinary paired devices, owner links and invitation-bounded devices have
   their own policies. Do not infer their permissions from sibling defaults.
 
-Validated at integration head `9144ee749`, not yet merged to main:
+Two more rules, for peers that are not fleet siblings:
 
 - A certificate-less authenticated pair retains shell access granted explicitly
   on the serving machine.
 - An anonymous peer is transfer-only.
-- A replacement transport does not inherit the previous transport's fleet
-  verification or nonces.
 
 There is no transitive trust across owners and no multi-hop routing through a
 sibling. A connection may use a direct transport or a relay. Discovery does not
