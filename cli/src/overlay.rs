@@ -9,7 +9,7 @@ use anyhow::Result;
 
 pub use filament_overlay::*;
 
-fn key_path() -> std::path::PathBuf {
+pub(crate) fn key_path() -> std::path::PathBuf {
     crate::platform::Paths::config_path("overlay.ed25519")
 }
 

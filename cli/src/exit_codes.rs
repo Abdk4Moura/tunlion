@@ -70,7 +70,8 @@ pub(crate) enum ExitKind {
     TlsCertificate,
     /// Some of the work landed and some did not.
     Partial,
-    /// This device has no identity yet (`tunlion init` or `tunlion join`).
+    /// This device has no identity yet (`tunlion init` or `tunlion join`), or
+    /// its own device key cannot be read for a fleet send or dial.
     NoIdentity,
     /// A resource on THIS machine ran out: its disk (or quota) is full, it
     /// has no file descriptors or memory left. Distinct from 2 (the input was

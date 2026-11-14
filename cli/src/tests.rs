@@ -5718,8 +5718,35 @@ fn every_fleet_proof_verify_site_is_listed_and_refuses_the_own_key() {
         ("crates/filament-overlay/src/lib.rs", announce, 3, None),
     ];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    // Scan roots come from the workspace's own member list, so a member added
+    // outside `crates/` is scanned too. Outside the workspace (a packaged
+    // crate, no root manifest or no `crates/`) there is nothing to pin.
+    let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return;
+    };
+    if !root.join("crates").is_dir() {
+        return;
+    }
+    let members: Vec<String> = manifest
+        .lines()
+        .find(|l| l.trim_start().starts_with("members"))
+        .map(|l| {
+            l.split('"')
+                .enumerate()
+                .filter(|(i, _)| i % 2 == 1)
+                .map(|(_, m)| m.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(!members.is_empty(), "workspace members not found in the root Cargo.toml");
+    let mut stack: Vec<std::path::PathBuf> = members
+        .iter()
+        .map(|m| match m.strip_suffix("/*") {
+            Some(dir) => root.join(dir),
+            None => root.join(m).join("src"),
+        })
+        .collect();
     let mut found: BTreeMap<(String, &str), usize> = BTreeMap::new();
-    let mut stack = vec![root.join("cli/src"), root.join("crates")];
     while let Some(dir) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {

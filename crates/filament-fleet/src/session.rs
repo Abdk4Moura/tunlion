@@ -96,7 +96,12 @@ impl Default for PeerState {
 }
 
 /// Per-process fleet handshake state, keyed by peer id.
-#[derive(Debug, Default)]
+///
+/// Constructed with this device's own key: a verified hello carrying it is
+/// refused, never Proved. There is deliberately no `Default`, so a consumer
+/// has to state the key (or `None`, which leaves that refusal inert and is
+/// visible at the call site).
+#[derive(Debug)]
 pub struct FleetSession {
     peers: HashMap<String, PeerState>,
     /// This device's own key. A verified hello carrying it is refused, never
@@ -105,13 +110,8 @@ pub struct FleetSession {
 }
 
 impl FleetSession {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set this device's own key, so a hello carrying it is refused.
-    pub fn set_own_device(&mut self, own: Option<[u8; 32]>) {
-        self.own_device = own;
+    pub fn new(own_device: Option<[u8; 32]>) -> Self {
+        Self { peers: HashMap::new(), own_device }
     }
 
     fn st(&mut self, pid: &str) -> &mut PeerState {
@@ -345,7 +345,7 @@ mod tests {
     // every peer. Proof is per link or it is worthless.
     #[test]
     fn proof_is_per_peer() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         s.st("a").proved = Some(Some("laptop".into()));
         assert!(s.proved("a"));
         assert!(!s.proved("b"));
@@ -355,7 +355,7 @@ mod tests {
     // binding the previous one signed against.
     #[test]
     fn nonces_do_not_collide_across_peers() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         let a = s.nonce("a", n1);
         let b = s.nonce("b", n2);
         assert_ne!(a, b);
@@ -367,7 +367,7 @@ mod tests {
     // An exporter, when present, outranks the nonce.
     #[test]
     fn exporter_outranks_nonce() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         s.nonce("a", n1);
         assert_eq!(s.in_binding("a", Some(vec![9u8; 32])), Some(vec![9u8; 32]));
     }
@@ -375,7 +375,7 @@ mod tests {
     // One sibling must not spend the retry another needs.
     #[test]
     fn rechallenge_budget_is_per_peer() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         s.st("a").rechallenged = true;
         assert!(s.st("a").rechallenged);
         assert!(!s.st("b").rechallenged);
@@ -385,7 +385,7 @@ mod tests {
     // real case: paired with us, so it never speaks fleet at all.
     #[test]
     fn unproven_peer_lapses_and_is_marked_wrong() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         s.arm_deadline("a", Duration::from_millis(0));
         std::thread::sleep(Duration::from_millis(5));
         let lapsed = s.lapsed(Instant::now());
@@ -397,7 +397,7 @@ mod tests {
     // A proven peer is never reaped by the deadline sweep.
     #[test]
     fn proved_peer_never_lapses() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         s.arm_deadline("a", Duration::from_millis(0));
         s.st("a").proved = Some(Some("phone".into()));
         std::thread::sleep(Duration::from_millis(5));
@@ -408,7 +408,7 @@ mod tests {
     // and must re-prove against it.
     #[test]
     fn forget_clears_everything_for_a_peer() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         s.nonce("a", n1);
         s.st("a").proved = Some(Some("laptop".into()));
         s.st("a").wrong = true;
@@ -421,7 +421,7 @@ mod tests {
     // Their challenge is answered by signing THEIR nonce, not ours.
     #[test]
     fn their_nonce_is_answered_with_a_hello() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         let msg = json!({ "type": "l3-nonce", "nonce": filament_overlay::b64(&[7u8; 32]) });
         let out = s.on_control(
             "a", &msg, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None, raw,
@@ -439,7 +439,7 @@ mod tests {
     // binder that cannot bind yet (fingerprints unknown) means no hello at all.
     #[test]
     fn their_nonce_is_signed_through_the_binder() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         let nonce = [7u8; 32];
         let msg = json!({ "type": "l3-nonce", "nonce": filament_overlay::b64(&nonce) });
         let fp_bind =
@@ -463,7 +463,7 @@ mod tests {
     // A too-short nonce is not a challenge.
     #[test]
     fn a_challenge_we_issued_is_not_answered() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         let _ = s.greet("a", None, n1, |_| Ok(json!({})));
         let msg = json!({ "type": "l3-nonce", "nonce": filament_overlay::b64(&n1()) });
         let out = s.on_control(
@@ -491,15 +491,15 @@ mod tests {
         let proved = SRC.find(concat!("Outcome::", "Proved {")).expect("Proved arm present");
         assert!(guard < proved, "the own-key refusal must precede Proved");
         assert!(SRC[guard..proved].contains(concat!("own-device", "-key")));
-        let mut s = FleetSession::new();
-        assert_eq!(s.own_device, None, "inert until the host sets it (known limitation)");
-        s.set_own_device(Some([3u8; 32]));
+        let s = FleetSession::new(Some([3u8; 32]));
         assert_eq!(s.own_device, Some([3u8; 32]));
+        // Known limitation, explicit at the call site: None leaves it inert.
+        assert_eq!(FleetSession::new(None).own_device, None);
     }
 
     #[test]
     fn short_nonce_is_rejected() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         let msg = json!({ "type": "l3-nonce", "nonce": filament_overlay::b64(&[7u8; 4]) });
         let out =
             s.on_control("a", &msg, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None, raw);
@@ -509,7 +509,7 @@ mod tests {
     // A hello with no binding and no retry left is refused, not admitted.
     #[test]
     fn hello_without_binding_challenges_once_then_refuses() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         let hello = json!({ "type": crate::HELLO });
         let first =
             s.on_control("a", &hello, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None, raw);
@@ -522,7 +522,7 @@ mod tests {
     // Without an owner key nothing can be verified, so nothing is admitted.
     #[test]
     fn no_owner_key_refuses() {
-        let mut s = FleetSession::new();
+        let mut s = FleetSession::new(None);
         let hello = json!({ "type": crate::HELLO });
         let out = s.on_control("a", &hello, None, None, None, 0, n1, |_| Ok(json!({})), |_| None, raw);
         assert!(matches!(out, Outcome::Refused(_)));

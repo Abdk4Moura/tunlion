@@ -361,16 +361,22 @@ Challenge lifecycle (no exporter):
   announce). Carried on the paths listed here: the daemon's `fleet-hello`
   arm, the daemon's `l3-announce` arm, the daemon's replay of an announce held
   until `ChannelReady`, the one-shot `FleetSession` hello verdict, and the
-  fleet dialer used by `exec` and l2 (`verify_fleet_identity`). A workspace
-  test fails when a hello or announce verification site exists that is not on
-  its list.
+  fleet dialer used by `exec` and l2 (`verify_fleet_identity`). A CLI test
+  pins every `verify_hello` call and every `Announce::from_json` parse in the
+  workspace members' sources (its roots come from the root `Cargo.toml`), each
+  production one with its own-key refusal; the peerloop source-order tests pin
+  the announce replay at `ChannelReady`. Blind spots: a site that verifies an
+  already-parsed announce (`.verify(&cb)`) without either call, and source
+  outside a member's scanned root.
   - The comparison uses the local overlay key (`overlay_pubkey()`). When that
     key is unavailable the refusal is inert: in the daemon only when built with
     `fleet` and without `mesh` (no shipped build; the peerloop feature graph
     does not itself make `fleet` imply `mesh`, the CLI default and
     tunlion-core's `fleet` enable both). The one-shot send and the fleet dialer
-    read the key once at the start and fail (exit 4, nothing sent) when it
-    cannot be read.
+    read the key once at the start and fail with exit 9 (`no_identity`), naming
+    the key file, when it cannot be read; the send fails before connecting, the
+    dial before any command payload. `FleetSession` takes the key in its
+    constructor (no `Default`); passing `None` leaves its refusal inert.
   - That this device's certificate key equals `overlay_pubkey()` is a host
     obligation; no type enforces it.
   - Residual risk: on exporter links, where both ends compute the same binding,

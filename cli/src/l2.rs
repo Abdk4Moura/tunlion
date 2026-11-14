@@ -856,7 +856,7 @@ async fn verify_fleet_identity_inner(
         // Never accept a hello carrying this device's own key (own-device-key).
         if proven.device_pub == own_device {
             return Err(anyhow::Error::new(WrongFleetDevice(format!(
-                "refusing: the device answering as '{expected}' presented this device's own key (own-device-key). Nothing was sent."
+                "refusing: the device answering as '{expected}' presented this device's own key (own-device-key). No command payload was sent."
             ))));
         }
         let name = crate::device_name_for_pub(&proven.device_pub);
@@ -987,9 +987,10 @@ pub(crate) async fn bring_up_to_known(
     let own_device: Option<[u8; 32]> = if fleet_mode {
         Some(crate::overlay::overlay_pubkey_bytes().map_err(|e| {
             crate::exit_codes::err(
-                crate::exit_codes::ExitKind::Denied,
+                crate::exit_codes::ExitKind::NoIdentity,
                 format!(
-                    "refusing the fleet dial to '{peer_name}': this device's own key could not be read ({e}). Nothing was sent."
+                    "refusing the fleet dial to '{peer_name}': this device's own key at {} could not be read ({e}). Check that file's permissions, or run `tunlion init` if this device has no identity. No command payload was sent.",
+                    crate::overlay::key_path().display()
                 ),
             )
         })?)

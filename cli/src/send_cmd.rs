@@ -624,21 +624,24 @@ pub(crate) async fn send_cmd(
     // The daemon's copy was the one that already got this right (its bindings
     // were per-peer HashMaps), so `fleet_session.rs` follows THAT implementation,
     // not this one.
-    let mut fleet_sess = fleet_session::FleetSession::new();
     // This device's own key, read ONCE for a fleet send, so a hello carrying it
-    // is refused. An unreadable key fails the send rather than leaving that
-    // refusal inert.
-    if fleet_target {
-        let own = crate::overlay::overlay_pubkey_bytes().map_err(|e| {
+    // is refused. An unreadable key fails the send (before any connection)
+    // rather than leaving that refusal inert. Not a fleet send: no fleet hello
+    // is verified, so there is no key to hold.
+    let own_device: Option<[u8; 32]> = if fleet_target {
+        Some(crate::overlay::overlay_pubkey_bytes().map_err(|e| {
             exit_codes::err(
-                ExitKind::Denied,
+                ExitKind::NoIdentity,
                 format!(
-                    "refusing the fleet send: this device's own key could not be read ({e}). Nothing was sent."
+                    "refusing the fleet send: this device's own key at {} could not be read ({e}). Check that file's permissions, or run `tunlion init` if this device has no identity. Nothing was sent.",
+                    crate::overlay::key_path().display()
                 ),
             )
-        })?;
-        fleet_sess.set_own_device(Some(own));
-    }
+        })?)
+    } else {
+        None
+    };
+    let mut fleet_sess = fleet_session::FleetSession::new(own_device);
     let fleet_proof_budget = Duration::from_secs(
         std::env::var("TUNLION_FLEET_PROOF_SECS")
             .ok()
