@@ -5686,3 +5686,82 @@ fn a_daemon_running_from_the_update_renamed_old_binary_is_still_this_install() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Every place in the workspace that verifies a `fleet-hello` or parses an
+/// `l3-announce` for verification is on this list, with its count, and each
+/// production site carries the own-key refusal. A new site anywhere in
+/// `cli/src` or `crates` fails this test until it is listed (and guarded), so
+/// the list is exhaustive by construction. Needles are built with `concat!` so
+/// this test does not count itself.
+#[test]
+fn every_fleet_proof_verify_site_is_listed_and_refuses_the_own_key() {
+    use std::collections::BTreeMap;
+    let hello = concat!("verify", "_hello(");
+    let hello_def = concat!("fn verify", "_hello(");
+    let announce = concat!("Announce::", "from_json(");
+    // (path, needle) -> expected count; `guard` names the text that must follow
+    // the site (None: a test-only or definition-internal occurrence).
+    let listed: &[(&str, &str, usize, Option<&str>)] = &[
+        // Fleet dialer used by exec and l2.
+        ("cli/src/l2.rs", hello, 1, Some("own_device")),
+        // Daemon fleet-hello arm (current, then retired candidates).
+        ("crates/filament-peerloop/src/recv/dispatch.rs", hello, 2, Some("is_own_device(")),
+        // Daemon l3-announce arm (its ChannelReady replay verifies the same
+        // parsed value; covered by the peerloop source-order test).
+        ("crates/filament-peerloop/src/recv/dispatch.rs", announce, 1, Some("is_own_device(")),
+        // One-shot FleetSession hello verdict.
+        ("crates/filament-fleet/src/session.rs", hello, 1, Some("own_device")),
+        // Inside verify_hello itself: the hello's own announce.
+        ("crates/filament-fleet/src/lib.rs", announce, 1, None),
+        // Test-only occurrences.
+        ("crates/filament-peerloop/src/recv/fleet_rv.rs", announce, 1, None),
+        ("crates/filament-overlay/src/lib.rs", announce, 3, None),
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut found: BTreeMap<(String, &str), usize> = BTreeMap::new();
+    let mut stack = vec![root.join("cli/src"), root.join("crates")];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                stack.push(p);
+            } else if p.extension().is_some_and(|e| e == "rs") {
+                let Ok(src) = std::fs::read_to_string(&p) else { continue };
+                let rel = p
+                    .strip_prefix(&root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let h = src.matches(hello).count() - src.matches(hello_def).count();
+                if h > 0 {
+                    found.insert((rel.clone(), hello), h);
+                }
+                let a = src.matches(announce).count();
+                if a > 0 {
+                    found.insert((rel, announce), a);
+                }
+            }
+        }
+    }
+    let mut want: BTreeMap<(String, &str), usize> = BTreeMap::new();
+    for (path, needle, n, guard) in listed {
+        want.insert((path.to_string(), *needle), *n);
+        if let Some(guard) = guard {
+            let src = std::fs::read_to_string(root.join(path)).expect("listed file readable");
+            let at = src.find(needle).expect("listed site present");
+            let window: String = src[at..].chars().take(4000).collect();
+            assert!(
+                window.contains(guard),
+                "{path}: the {needle} site is not followed by its own-key refusal ({guard})"
+            );
+        }
+    }
+    assert_eq!(
+        found, want,
+        "fleet proof verification sites changed; list each new one here with its own-key refusal"
+    );
+}

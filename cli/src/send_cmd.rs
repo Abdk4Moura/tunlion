@@ -625,6 +625,20 @@ pub(crate) async fn send_cmd(
     // were per-peer HashMaps), so `fleet_session.rs` follows THAT implementation,
     // not this one.
     let mut fleet_sess = fleet_session::FleetSession::new();
+    // This device's own key, read ONCE for a fleet send, so a hello carrying it
+    // is refused. An unreadable key fails the send rather than leaving that
+    // refusal inert.
+    if fleet_target {
+        let own = crate::overlay::overlay_pubkey_bytes().map_err(|e| {
+            exit_codes::err(
+                ExitKind::Denied,
+                format!(
+                    "refusing the fleet send: this device's own key could not be read ({e}). Nothing was sent."
+                ),
+            )
+        })?;
+        fleet_sess.set_own_device(Some(own));
+    }
     let fleet_proof_budget = Duration::from_secs(
         std::env::var("TUNLION_FLEET_PROOF_SECS")
             .ok()
@@ -2107,10 +2121,6 @@ pub(crate) async fn send_cmd(
                         tr.as_ref()
                             .and_then(|t| crate::nonce_binding(t, link_fps.as_ref(), n))
                     };
-                    // Our own key, so a hello carrying it is refused. Read here,
-                    // on the fleet path only: this device is enrolled, so the key
-                    // exists and the read has no side effect.
-                    fleet_sess.set_own_device(crate::overlay::overlay_pubkey_bytes().ok());
                     let outcome = fleet_sess.on_control(
                         &pid,
                         &v,
