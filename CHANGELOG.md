@@ -31,10 +31,6 @@ release build failed and nothing was published under it.
 
 ### Changed
 
-- A transfer code works for one receiver only: the one that completed the
-  code exchange. Another device that connects afterwards cannot take over the
-  transfer, even from the same install. To send again, start a new send and
-  use its new code.
 - `tunlion revoke <device> shell` now also ends that device's SSH session if
   one is already open, not just new ones. Terminals and remote commands
   already stopped when their permission was withdrawn.
