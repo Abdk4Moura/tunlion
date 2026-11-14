@@ -40,7 +40,9 @@
 //!     by this user and carry a label of Medium or above (a Low creator always
 //!     gets a Low label and cannot raise it), and when the server process's
 //!     token is readable, it must be this user at Medium or above AND at least
-//!     the client's own integrity. Clients open with the default
+//!     the client's own integrity. An unreadable token passes only for a
+//!     client at Medium or below; an elevated client requires it readable
+//!     (see `daemon_trusted`). Clients open with the default
 //!     `SECURITY_IDENTIFICATION` quality of service, so a server can never
 //!     impersonate them.
 //!
@@ -57,6 +59,16 @@
 //! (`"eof":"frames"`, the exec framing's stdin and stdin-EOF frames; see
 //! [`upstream`] and `filament_peerloop::control::decode_upstream`). Exec already
 //! frames EOF. A piped one-shot pty keeps the cold path (see `l2.rs`).
+//!
+//! Known limitations, accepted for now:
+//!   * the daemon identifies a client by the process id the pipe reports
+//!     (`GetNamedPipeClientProcessId`) and then opens that process's token. A
+//!     client that exits and has its pid reused between the two calls would
+//!     be judged by the new process; the window is tiny and the new process
+//!     still has to pass the same user and integrity check;
+//!   * `bind_daemon_endpoint` rotates the salt on ANY bind failure, not only a
+//!     held name, so a failure with another cause also changes the name (and
+//!     strands clients that computed the old one until they recompute it).
 
 use std::path::{Path, PathBuf};
 
@@ -265,11 +277,15 @@ pub(crate) struct DaemonFacts {
 /// above, and, when the server token is readable, this user at Medium or above
 /// and no lower than the client itself.
 ///
-/// An unreadable token is accepted on the owner and label alone. That is
-/// sound: the label is the integrity proof (a Low process's objects always get
-/// a Low label it cannot raise), and the token of a same-user process is only
-/// unreadable from here when that process runs above us, which the rule would
-/// accept anyway.
+/// An unreadable token is accepted only by a client at Medium or below, on the
+/// owner and the label. The label proves the server is not below Medium (a Low
+/// process's objects always get a Low label it cannot raise), which is all a
+/// Medium client requires. It is NOT proof against a same-user Medium process
+/// posing to an elevated client: that process holds WRITE_DAC on its own
+/// process object and can deny the client `OpenProcess`, so the token comes
+/// back unreadable on purpose. An elevated client therefore requires a
+/// readable token, and loses nothing by it: a High client can always read a
+/// same-user High daemon's token.
 #[cfg(any(windows, test))]
 pub(crate) fn daemon_trusted(f: &DaemonFacts, own_il: u32) -> bool {
     if !f.owner_is_me {
@@ -281,7 +297,7 @@ pub(crate) fn daemon_trusted(f: &DaemonFacts, own_il: u32) -> bool {
     }
     match f.token {
         Some((user_is_me, il)) => user_is_me && il >= integrity::MEDIUM && il >= own_il,
-        None => true,
+        None => own_il <= integrity::MEDIUM,
     }
 }
 
@@ -296,7 +312,7 @@ pub(crate) fn client_trusted(token: Option<(bool, u32)>) -> bool {
 /// instance joins whatever pipe holds the name, so it is only safe while we
 /// hold a live instance of our own; otherwise only a FIRST instance is, which
 /// fails rather than join a pipe someone else created.
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(crate) fn may_add_instance(holding_live_instance: bool) -> bool {
     holding_live_instance
 }
@@ -736,6 +752,9 @@ mod win {
         pub(super) name: std::ffi::OsString,
         pub(super) security: PipeSecurity,
         pub(super) next: Option<NamedPipeServer>,
+        /// The listener could not make a first instance last time it tried;
+        /// kept so that is logged once per change, not every retry.
+        pub(super) refill_failing: bool,
     }
 
     impl PipeListener {
@@ -744,6 +763,7 @@ mod win {
                 name: path.as_os_str().to_os_string(),
                 security: PipeSecurity::owner_only()?,
                 next: None,
+                refill_failing: false,
             };
             // The FIRST instance: fails if anyone already holds this name.
             me.refill()?;
@@ -779,12 +799,28 @@ mod win {
 
         pub(super) async fn accept(&mut self) -> io::Result<NamedPipeServer> {
             loop {
-                if self.refill().is_err() {
-                    // Our earlier connections still hold the name (so a first
-                    // instance is refused) or the name was taken: wait for them
-                    // to close rather than add an instance while holding none.
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    continue;
+                match self.refill() {
+                    Err(e) => {
+                        // Our earlier connections still hold the name (so a
+                        // first instance is refused) or the name was taken:
+                        // wait for them to close rather than add an instance
+                        // while holding none. Said once, loudly: until it
+                        // clears, no sibling command can reach this daemon.
+                        if !self.refill_failing {
+                            self.refill_failing = true;
+                            crate::ui::critical(&format!(
+                                "tunlion: the control pipe has no listening instance ({e}); \
+                                 warm links, `status` and `set` cannot reach this daemon until it recovers"
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    Ok(()) if self.refill_failing => {
+                        self.refill_failing = false;
+                        crate::ui::critical("tunlion: the control pipe is listening again");
+                    }
+                    Ok(()) => {}
                 }
                 let Some(server) = self.next.take() else { continue };
                 let connected = server.connect().await;
@@ -923,6 +959,9 @@ mod tests {
         assert!(daemon_trusted(&DaemonFacts { token: Some((true, HIGH)), ..ok }, MEDIUM));
         // ...even when its token is unreadable from below.
         assert!(daemon_trusted(&DaemonFacts { token: None, ..ok }, MEDIUM));
+        // An elevated client never trusts an unreadable token: a same-user
+        // Medium process can deny it OpenProcess on purpose.
+        assert!(!daemon_trusted(&DaemonFacts { token: None, ..ok }, HIGH));
         // An elevated client does not hand requests to a lower daemon.
         assert!(!daemon_trusted(&ok, HIGH));
     }
@@ -937,13 +976,6 @@ mod tests {
         assert!(!client_trusted(Some((true, 0))), "Untrusted");
         assert!(!client_trusted(Some((false, HIGH))));
         assert!(!client_trusted(None), "an unreadable client is not served");
-    }
-
-    /// Holding nothing, the listener may only create a FIRST instance.
-    #[test]
-    fn an_additional_instance_needs_a_live_one_of_ours() {
-        assert!(may_add_instance(true));
-        assert!(!may_add_instance(false));
     }
 
     /// A raw connect/accept round trip through the listener: bytes both ways,
@@ -1061,6 +1093,7 @@ mod tests {
             ))
             .unwrap(),
             next: None,
+            refill_failing: false,
         };
         assert!(listener.refill().is_err(), "must not add an instance to a foreign pipe");
         assert!(listener.next.is_none());
