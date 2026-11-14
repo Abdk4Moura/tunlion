@@ -5884,21 +5884,26 @@ impl Conn {
                 // Never inherit a worker key from another direct path.
                 existing.expected_secret = None;
             }
-            if let Some(n) = &lan_pair_name {
-                // Re-resolve from the record as a fresh pair link would, so a
-                // delegated record gets its ceiling and nothing carries over
-                // from whatever this link was before.
-                existing.trusted = true;
-                existing.verified_name = Some(n.clone());
+            if lan {
+                // Whatever this link proved before, a LAN adoption starts its
+                // identity over: `resolve_peer_identity` keeps any cached key
+                // as already resolved, so a stale one would outlive the route
+                // that proved it.
                 existing.identity_device_pub = None;
                 existing.identity_user_pub = None;
                 existing.identity_binding = BindingStrength::None;
                 existing.identity_state = IdentityState::Pending;
                 existing.identity_cert_expires = None;
+            }
+            if let Some(n) = &lan_pair_name {
+                // Re-resolve from the record as a fresh pair link would, so a
+                // delegated record gets its ceiling.
+                existing.trusted = true;
+                existing.verified_name = Some(n.clone());
                 existing.principal_kind = PrincipalKind::OwnerDevice;
             } else if lan_untrusted {
                 // A fleet reservation, or a binding the store no longer holds:
-                // no device trust, no ceiling.
+                // no device trust, no identity, no ceiling.
                 existing.trusted = false;
                 existing.verified_name = None;
                 existing.principal_kind = PrincipalKind::Delegated { caps: Vec::new() };
@@ -9303,6 +9308,85 @@ mod warm_identity_tests {
         denied_conn.links.insert(pid.to_string(), lan_link(pid));
         assert!(warm_link_for(&denied_conn, "boxb").is_some());
         assert_eq!(denied_conn.authenticated_lan_peer(pid), None);
+    }
+
+    /// Re-adopting an EXISTING link over LAN starts its identity over. A link
+    /// that had proven a device key, or held sibling or owner standing, keeps
+    /// none of it when the LAN binding no longer resolves, and a LAN pair is
+    /// re-resolved from the record rather than inheriting the old key.
+    #[tokio::test]
+    async fn an_existing_link_adopted_over_lan_keeps_no_stale_identity() {
+        fn stale(pid: &str, log: &Arc<std::sync::Mutex<Vec<String>>>) -> Link {
+            let dead: Arc<dyn Transport> = Rec::new("dead-serving", log);
+            dead.force_close();
+            let mut link = relay_link(pid, "boxb", "boxb", dead);
+            link.trusted = true;
+            link.verified_name = Some("boxb".into());
+            link.identity_device_pub = Some([7; 32]);
+            link.identity_user_pub = Some([8; 32]);
+            link.identity_binding = BindingStrength::Proven;
+            link.identity_state = IdentityState::Resolved;
+            link.identity_cert_expires = Some(u64::MAX);
+            link.principal_kind = PrincipalKind::FleetSibling;
+            link
+        }
+        for (what, host) in [
+            (
+                "revoked record",
+                TestHost {
+                    devices: vec![("boxb".to_string(), "s1".to_string())],
+                    revoked_records: vec!["boxb".to_string()],
+                    ..Default::default()
+                },
+            ),
+            ("forgotten record", TestHost::default()),
+        ] {
+            let (mut conn, _far, _rx) = test_conn_with_host(Arc::new(host)).await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "sid-lan-stale";
+            conn.links.insert(pid.into(), stale(pid, &log));
+            let t: Arc<dyn Transport> = Rec::with_attempt("lan", &log, net::AttemptId::next());
+            conn.seed_lan(pid, "boxb", "s1", false, t.attempt_id().unwrap());
+            assert!(matches!(
+                conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN),
+                DirectAdoption::Adopted { tkey: None, .. }
+            ));
+            let link = &conn.links[pid];
+            assert!(!link.trusted, "{what}: stale trust survived");
+            assert!(link.verified_name.is_none(), "{what}: stale name survived");
+            assert!(link.identity_device_pub.is_none(), "{what}: stale device key survived");
+            assert!(link.identity_user_pub.is_none(), "{what}: stale user key survived");
+            assert_eq!(link.identity_binding, BindingStrength::None, "{what}");
+            assert!(link.identity_cert_expires.is_none(), "{what}");
+            assert!(!matches!(link.identity_state, IdentityState::Resolved), "{what}");
+            assert!(!link.fleet_proven(), "{what}: sibling standing survived");
+            assert!(
+                matches!(&link.principal_kind, PrincipalKind::Delegated { caps } if caps.is_empty()),
+                "{what}: stale principal survived"
+            );
+            assert!(link.expected_secret.is_none(), "{what}: a worker key survived");
+        }
+
+        // A live binding: the pair, re-resolved, with no inherited key.
+        let host = TestHost {
+            devices: vec![("boxb".to_string(), "s1".to_string())],
+            ..Default::default()
+        };
+        let (mut conn, _far, _rx) = test_conn_with_host(Arc::new(host)).await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-lan-stale";
+        conn.links.insert(pid.into(), stale(pid, &log));
+        let t: Arc<dyn Transport> = Rec::with_attempt("lan", &log, net::AttemptId::next());
+        conn.seed_lan(pid, "boxb", "s1", false, t.attempt_id().unwrap());
+        assert!(matches!(
+            conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN),
+            DirectAdoption::Adopted { tkey: None, .. }
+        ));
+        let link = &conn.links[pid];
+        assert!(link.trusted);
+        assert_eq!(link.verified_name.as_deref(), Some("boxb"));
+        assert!(link.identity_device_pub.is_none(), "the old device key was inherited");
+        assert!(matches!(link.principal_kind, PrincipalKind::OwnerDevice));
     }
 
     /// A LAN DEVICE link is the pair only while its exact binding is live. A
@@ -12964,6 +13048,8 @@ mod warm_identity_tests {
             conn.adopt_direct(fleet_pid, fleet_lan, filament_transport::lan::ROUTE_LAN),
             DirectAdoption::Adopted { tkey: None, .. }
         ));
+        assert!(!conn.links[fleet_pid].trusted, "a fleet LAN reservation was trusted");
+        assert!(conn.links[fleet_pid].verified_name.is_none());
         let fleet_binding = conn.links[fleet_pid].lan_binding.as_ref().unwrap();
         assert_eq!(fleet_binding.name, "fleet");
         assert!(fleet_binding.device.is_none());
