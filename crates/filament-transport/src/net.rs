@@ -2779,6 +2779,10 @@ mod tests {
         let construct = ["new_peer", "_connection("].concat();
         let via_helper = [construct.as_str(), "peer_connection_config("].concat();
         let literal = ["RTC", "Configuration {"].concat();
+        // A persistent DTLS certificate cannot be built without naming its
+        // type or module; nothing in the workspace names either.
+        let cert = ["RTC", "Certificate"].concat();
+        let cert_mod = ["peer_connection", "::certificate"].concat();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut files = Vec::new();
         for top in ["crates", "cli"] {
@@ -2788,23 +2792,27 @@ mod tests {
             files.iter().any(|f| f.ends_with("filament-transport/src/net.rs")),
             "the scan did not reach net.rs, so it proves nothing"
         );
-        let (mut built, mut literals) = (Vec::new(), Vec::new());
+        let (mut built, mut literals, mut certs) = (Vec::new(), Vec::new(), Vec::new());
         for f in &files {
             let text = std::fs::read_to_string(f).unwrap_or_default();
             for (n, line) in text.lines().enumerate() {
                 if line.contains(&construct) {
                     built.push((f.display().to_string(), n + 1, line.contains(&via_helper)));
                 }
-                // A struct literal starts its line; the helper's signature
-                // (`-> RTCConfiguration {`) does not.
-                if line.trim_start().starts_with(&literal) {
+                // Any struct literal, wherever it sits on its line; the
+                // helper's signature (`-> RTCConfiguration {`) is not one.
+                if line.contains(&literal) && !line.contains("-> ") {
                     literals.push(format!("{}:{}", f.display(), n + 1));
+                }
+                if line.contains(&cert) || line.contains(&cert_mod) {
+                    certs.push(format!("{}:{}", f.display(), n + 1));
                 }
             }
         }
         assert_eq!(built.len(), 1, "RTCPeerConnection construction sites: {built:?}");
         assert!(built[0].2, "the one construction site bypasses peer_connection_config: {built:?}");
         assert_eq!(literals.len(), 1, "hand-built RTCConfiguration outside the helper: {literals:?}");
+        assert!(certs.is_empty(), "a DTLS certificate is constructed or imported: {certs:?}");
     }
 
     #[test]

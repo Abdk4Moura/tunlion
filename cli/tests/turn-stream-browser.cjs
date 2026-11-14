@@ -16,7 +16,7 @@ function recordPeerConnections() {
   if (!Native) return;
   window.__diagPcs = [];
   function Recorded(...args) {
-    const pc = new Native(...args);
+    const pc = Reflect.construct(Native, args, new.target || Recorded);
     const entry = { pc, chans: [] };
     window.__diagPcs.push(entry);
     pc.addEventListener('datachannel', (ev) => entry.chans.push(ev.channel));
@@ -67,7 +67,7 @@ async function dumpReceiveState(page) {
     }
     return out;
   }), 5000, [{ error: 'page did not answer within 5s' }]);
-  const rows = await bounded(page.locator('body').innerText(), 3000, '');
+  const rows = (await bounded(page.locator('body').innerText(), 3000, '')).slice(0, 20000);
   const progress = (rows.match(/[^\n]*\d+\s?%[^\n]*/g) || []).slice(0, 5);
   console.log('[pw] DIAG peer-connections', JSON.stringify(state));
   console.log('[pw] DIAG progress-lines', JSON.stringify(progress));
@@ -98,9 +98,20 @@ async function dumpReceiveState(page) {
   await accept.click();
 
   const save = page.getByRole('button', { name: /^save$/i }).first();
+  // The gate may stop this helper before the Save wait times out (it waits
+  // 60 s after the sender exits), so the receive state is also printed every
+  // 30 s while the transfer has not completed. Each dump is bounded.
+  let completed = false;
+  const progressTimer = setInterval(() => {
+    if (!completed) bounded(dumpReceiveState(page), 15000, undefined).catch(() => {});
+  }, 30000);
   try {
     await save.waitFor({ timeout: 150000 });
+    completed = true;
+    clearInterval(progressTimer);
   } catch (e) {
+    completed = true;
+    clearInterval(progressTimer);
     // The wait's own error is what fails the cell, whatever the dump does.
     await bounded(dumpReceiveState(page), 15000, undefined).catch(() => {});
     throw e;
