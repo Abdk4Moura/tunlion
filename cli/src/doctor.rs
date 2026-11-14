@@ -108,6 +108,34 @@ async fn probe_mode(
     probe_result(&outcomes)
 }
 
+/// Every state-file problem under `dir`, one line each: the corrupt-state
+/// error (path, parse error, `.bak` recovery) for each checked file, and for
+/// the delisted-sibling store its own report (which also covers a failed
+/// write) plus where its last good copy is.
+pub(crate) fn state_problems(dir: &std::path::Path) -> Vec<String> {
+    let delisted = filament_peerloop::recv::store::DELISTED_SIBLINGS_FILE;
+    let mut out: Vec<String> = crate::state_files::FILES
+        .iter()
+        .filter(|(name, _)| *name != delisted)
+        .filter_map(|(name, shape)| {
+            crate::state_files::check_file(&dir.join(name), *shape)
+                .err()
+                .map(|e| e.to_string())
+        })
+        .collect();
+    let store = filament_peerloop::recv::store::DeviceStore::open(dir.to_path_buf());
+    if let Some(why) = store.delisted_siblings_problem() {
+        let bak = crate::state_files::backup_path(&dir.join(delisted));
+        let copy = if bak.exists() {
+            format!(" (last good copy: {})", bak.display())
+        } else {
+            " (no backup copy exists)".to_string()
+        };
+        out.push(format!("{why}{copy}"));
+    }
+    out
+}
+
 /// The line doctor prints before a probe: who, and the longest it will wait.
 fn probe_progress_line(device: &str, secs: u64) -> String {
     format!(
@@ -453,13 +481,17 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     // it. See daemon_health.
     let daemon = crate::daemon_health::inspect().await;
     let lan = crate::lan_doctor::facts(&context);
+    let state = state_problems(&crate::settings::config_dir());
 
     if json_out {
         let mut v = preflight_json(server, &sig, &ice, &ifaces, &history, &sshca);
         v["daemon"] = daemon.to_json();
         v["lan"] = lan;
+        v["state_files"] = json!({ "ok": state.is_empty(), "problems": state });
+        // `ok` agrees with the exit code (see `preflight_result`).
+        v["ok"] = json!(sig.is_ok() && state.is_empty());
         ui::json_out(&v);
-        return preflight_result(&sig);
+        return preflight_result(&sig, !state.is_empty());
     }
 
     crate::outln!();
@@ -495,6 +527,20 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
             ui::paint(Tone::Err, "UNREACHABLE"),
             ui::paint(Tone::Dim, &format!("{server}: {e}")),
         ),
+    }
+
+    // State files: a damaged one is reported here, by path, with its recovery.
+    if state.is_empty() {
+        ui::say(&format!("  {:<13} {}", "state files", ui::paint(Tone::Ok, "ok")));
+    } else {
+        for p in &state {
+            ui::say(&format!(
+                "  {:<13} {}  {}",
+                "state files",
+                ui::paint(Tone::Err, "DAMAGED"),
+                ui::paint(Tone::Dim, p),
+            ));
+        }
     }
 
     // The running daemon (its own signaling link, not this probe's).
@@ -598,16 +644,21 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     if !crate::identity_flow::has_identity() {
         ui::say(&format!("  {}", crate::identity_flow::NO_IDENTITY_MSG));
     }
-    preflight_result(&sig)
+    preflight_result(&sig, !state.is_empty())
 }
 
 /// The preflight is healthy when the tunlion server answered; without it
 /// nothing else works, so that is exit 7 rather than 0 (13 when it answered
 /// with a certificate this machine does not trust).
-fn preflight_result(sig: &std::result::Result<u64, String>) -> Result<()> {
+/// The preflight's exit: the signaling failure's code when the server was not
+/// reached (7, or 13), else 2 (a local file problem, as every other command
+/// says for it) when a state file is damaged, else 0. The damage itself was
+/// already printed, with its recovery.
+fn preflight_result(sig: &std::result::Result<u64, String>, state_damaged: bool) -> Result<()> {
     match sig {
-        Ok(_) => Ok(()),
         Err(e) => Err(exit_codes::reported(signaling_failure_kind(e))),
+        Ok(_) if state_damaged => Err(exit_codes::reported(ExitKind::Usage)),
+        Ok(_) => Ok(()),
     }
 }
 
@@ -955,6 +1006,33 @@ fn median(sorted: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A damaged state file is a nonzero preflight (2, the local-file-problem
+    /// code every other command uses for it); a clean one with the server
+    /// reached is 0.
+    #[test]
+    fn a_damaged_state_file_makes_the_preflight_exit_2() {
+        assert!(preflight_result(&Ok(5), false).is_ok());
+        let err = preflight_result(&Ok(5), true).unwrap_err();
+        assert_eq!(exit_codes::classify(&err).code(), 2);
+    }
+
+    #[test]
+    fn the_preflight_reports_a_damaged_delisted_store_and_its_backup() {
+        let name = filament_peerloop::recv::store::DELISTED_SIBLINGS_FILE;
+        let d = std::env::temp_dir().join(format!("tunlion-doctor-delisted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(state_problems(&d).is_empty(), "a clean directory has no problems");
+        std::fs::write(d.join(name), "{garbage").unwrap();
+        let p = state_problems(&d);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains(name) && p[0].contains("no backup copy exists"), "{p:?}");
+        std::fs::write(crate::state_files::backup_path(&d.join(name)), "[]").unwrap();
+        let p = state_problems(&d);
+        assert!(p[0].contains("last good copy") && p[0].contains(".bak"), "{p:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
     use crate::diag::PhaseTiming;
     use crate::l2::ProbeOutcome;
 
@@ -1040,7 +1118,10 @@ mod tests {
         let raw = "GET https://x/api/config: error sending request for url (https://x/api/config): client error (Connect): invalid peer certificate: UnknownIssuer";
         assert_eq!(signaling_failure_kind(raw), ExitKind::TlsCertificate);
         assert_eq!(signaling_failure_kind("GET https://x/api/config: dns error: failed to lookup address information"), ExitKind::Network);
-        let err = preflight_result(&Err(raw.to_string())).unwrap_err();
+        let err = preflight_result(&Err(raw.to_string()), false).unwrap_err();
+        assert_eq!(exit_codes::classify(&err).code(), 13);
+        // A signaling failure keeps its own code over a damaged state file.
+        let err = preflight_result(&Err(raw.to_string()), true).unwrap_err();
         assert_eq!(exit_codes::classify(&err).code(), 13);
         let e = verb_error(ExitKind::TlsCertificate, Some(raw));
         assert_eq!(e["code"], json!("tls_certificate"));

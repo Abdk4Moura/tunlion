@@ -447,6 +447,9 @@ impl RecvStore for CliRecv {
     fn devices_sweep_lapsed(&self, now: u64) -> usize {
         crate::device_view::devices_sweep_lapsed(now)
     }
+    fn delisted_siblings_problem(&self) -> Option<String> {
+        crate::devices_store::store().delisted_siblings_problem()
+    }
     fn devices_upsert_atomic(
         &self,
         name: &str,
