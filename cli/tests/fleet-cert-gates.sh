@@ -654,7 +654,7 @@ PY
     owner_steps=$(imp_owner_steps)
     owner_traces=$(imp_owner_traces)
     # The same predicate as `attempted`: step lines OR trace lines.
-    imp_owner_evaluated && owner_eval=$(grep -c . <<<"$owner_steps$owner_traces")
+    imp_owner_evaluated && owner_eval=$(( $(grep -c . <<<"$owner_steps") + $(grep -c . <<<"$owner_traces") ))
     # The summary names the step/reason when step lines exist, else the trace
     # outcome/why.
     if [ -n "$owner_steps" ]; then
