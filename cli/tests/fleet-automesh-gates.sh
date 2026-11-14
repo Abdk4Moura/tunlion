@@ -296,26 +296,34 @@ if [ -z "$v4_why" ]; then
   elif ! post_has "device\(s\) lapsed or ended"; then v4_why="charlie's record went without bravo's sweep saying so (instrument did not fire)"; fi
 fi
 if [ -z "$v4_why" ] && { [ -z "$CHARLIE_KEY" ] || ! grep -q "$CHARLIE_KEY" "$WORK/bravo/delisted-siblings.json" 2>/dev/null; }; then v4_why="removing charlie's record left no delisted-sibling entry (key=${CHARLIE_KEY:-unread})"; fi
-# The denied arm must be a REFUSAL, not mere unreachability: after the sweep
-# line, bravo refuses charlie's own key by its fleet-hello (charlie's daemon
-# keeps re-dialing). With the record gone, only the kept revocation can say
-# "device revoked" here; without it the hello is merely held as unlisted.
+# The denied arm must be a REFUSAL, not mere unreachability. After the sweep
+# line, charlie's one-shot is sent over the fleet channel itself
+# (TUNLION_FLEET_SEND=1: it presents charlie's certificate in a fleet-hello
+# rather than giving up for want of a broker), so bravo is MADE to judge
+# charlie's key now instead of waiting on a warm re-dial. It must fail, land
+# nowhere, and bravo must refuse charlie's key by name: with the record gone,
+# only the kept revocation says "device revoked"; without it the hello is only
+# held as unlisted. The refusal wait is 30s (a re-dial would come on the 10s
+# warm tick as well); with the 90s send bound this arm adds at most ~2 minutes,
+# far inside the 600s step timeout.
 if [ -z "$v4_why" ]; then
   LSW=$(since_revoke | grep -nE "device\(s\) lapsed or ended" | tail -1 | cut -d: -f1)
   LSW=$(( LV0 + ${LSW:-1} - 1 ))
-  refused=""
-  for _ in $(seq 1 120); do
-    tail -n +"$LSW" "$WORK/up-bravo.log" | grep -E "fleet-hello from .* refused: device revoked \(device $CHARLIE_KEY\)" >/dev/null && { refused=1; break; }
-    sleep 0.5
-  done
-  [ -n "$refused" ] || v4_why="after the record sweep bravo never refused charlie's key by name in 60s (unreachable is not a refusal)"
-fi
-if [ -z "$v4_why" ]; then
   echo "t6-$$" > "$WORK/t6.txt"
-  fs_cli 90 as_node charlie send "$WORK/t6.txt" --to bravo; rc6=$(fs_rc)
+  export TUNLION_FLEET_SEND=1
+  fs_cli 90 as_node charlie send "$WORK/t6.txt" --to bravo; rc6=$(fs_rc)  # broker retry 12s + fleet path 45s
+  unset TUNLION_FLEET_SEND
   sleep 2
-  if ! nowhere t6.txt || post_has "transfer-gate: from=charlie allowed=true|fleet device 'charlie' joined the mesh"; then
+  if [ "$rc6" = 0 ] || ! nowhere t6.txt \
+     || post_has "transfer-gate: from=charlie allowed=true|fleet device 'charlie' joined the mesh"; then
     v4_why="after the record sweep charlie->bravo was admitted (rc=$rc6)"
+  else
+    refused=""
+    for _ in $(seq 1 60); do
+      tail -n +"$LSW" "$WORK/up-bravo.log" | grep -E "fleet-hello from .* refused: device revoked \(device $CHARLIE_KEY\)" >/dev/null && { refused=1; break; }
+      sleep 0.5
+    done
+    [ -n "$refused" ] || v4_why="after the record sweep bravo never refused charlie's key by name within 30s of charlie's hello (rc=$rc6; unreachable is not a refusal)"
   fi
 fi
 if [ -z "$v4_why" ]; then

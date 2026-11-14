@@ -108,6 +108,34 @@ async fn probe_mode(
     probe_result(&outcomes)
 }
 
+/// Every state-file problem under `dir`, one line each: the corrupt-state
+/// error (path, parse error, `.bak` recovery) for each checked file, and for
+/// the delisted-sibling store its own report (which also covers a failed
+/// write) plus where its last good copy is.
+pub(crate) fn state_problems(dir: &std::path::Path) -> Vec<String> {
+    let delisted = filament_peerloop::recv::store::DELISTED_SIBLINGS_FILE;
+    let mut out: Vec<String> = crate::state_files::FILES
+        .iter()
+        .filter(|(name, _)| *name != delisted)
+        .filter_map(|(name, shape)| {
+            crate::state_files::check_file(&dir.join(name), *shape)
+                .err()
+                .map(|e| e.to_string())
+        })
+        .collect();
+    let store = filament_peerloop::recv::store::DeviceStore::open(dir.to_path_buf());
+    if let Some(why) = store.delisted_siblings_problem() {
+        let bak = crate::state_files::backup_path(&dir.join(delisted));
+        let copy = if bak.exists() {
+            format!(" (last good copy: {})", bak.display())
+        } else {
+            " (no backup copy exists)".to_string()
+        };
+        out.push(format!("{why}{copy}"));
+    }
+    out
+}
+
 /// The line doctor prints before a probe: who, and the longest it will wait.
 fn probe_progress_line(device: &str, secs: u64) -> String {
     format!(
@@ -453,11 +481,13 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     // it. See daemon_health.
     let daemon = crate::daemon_health::inspect().await;
     let lan = crate::lan_doctor::facts(&context);
+    let state = state_problems(&crate::settings::config_dir());
 
     if json_out {
         let mut v = preflight_json(server, &sig, &ice, &ifaces, &history, &sshca);
         v["daemon"] = daemon.to_json();
         v["lan"] = lan;
+        v["state_files"] = json!({ "ok": state.is_empty(), "problems": state });
         ui::json_out(&v);
         return preflight_result(&sig);
     }
@@ -495,6 +525,20 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
             ui::paint(Tone::Err, "UNREACHABLE"),
             ui::paint(Tone::Dim, &format!("{server}: {e}")),
         ),
+    }
+
+    // State files: a damaged one is reported here, by path, with its recovery.
+    if state.is_empty() {
+        ui::say(&format!("  {:<13} {}", "state files", ui::paint(Tone::Ok, "ok")));
+    } else {
+        for p in &state {
+            ui::say(&format!(
+                "  {:<13} {}  {}",
+                "state files",
+                ui::paint(Tone::Err, "DAMAGED"),
+                ui::paint(Tone::Dim, p),
+            ));
+        }
     }
 
     // The running daemon (its own signaling link, not this probe's).
@@ -955,6 +999,23 @@ fn median(sorted: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_preflight_reports_a_damaged_delisted_store_and_its_backup() {
+        let name = filament_peerloop::recv::store::DELISTED_SIBLINGS_FILE;
+        let d = std::env::temp_dir().join(format!("tunlion-doctor-delisted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(state_problems(&d).is_empty(), "a clean directory has no problems");
+        std::fs::write(d.join(name), "{garbage").unwrap();
+        let p = state_problems(&d);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains(name) && p[0].contains("no backup copy exists"), "{p:?}");
+        std::fs::write(crate::state_files::backup_path(&d.join(name)), "[]").unwrap();
+        let p = state_problems(&d);
+        assert!(p[0].contains("last good copy") && p[0].contains(".bak"), "{p:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
     use crate::diag::PhaseTiming;
     use crate::l2::ProbeOutcome;
 

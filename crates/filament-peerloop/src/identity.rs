@@ -114,8 +114,12 @@ pub struct ProofFacts<'a> {
     pub admitted_device: Option<&'a [u8; 32]>,
     /// The device key the proof names.
     pub proven_device: &'a [u8; 32],
-    /// Does a device record carry the proven key (a sibling's index record)?
-    pub indexed: bool,
+    /// Is the proven key a recognized sibling: a device record carries it, OR
+    /// the owner's roster lists it ([`crate::recv::store::DeviceStore::sibling_recognized`]).
+    /// The roster is the authorization fact; the index record is presentation
+    /// and may be missing (a failed or refused index write), so it is never
+    /// required on its own.
+    pub recognized: bool,
     /// The proven certificate's own expiry.
     pub cert_expires: u64,
 }
@@ -126,12 +130,12 @@ pub struct ProofFacts<'a> {
 ///
 /// A link the fleet hello already admitted as a SIBLING keeps that kind, with
 /// its certificate's own expiry, when the proof names the same device key and
-/// that key is indexed. The persisted principal cannot stand in for it: a
+/// that key is recognized (recorded, or listed by the owner's roster). The persisted principal cannot stand in for it: a
 /// sibling's index record carries no principal kind and reads back as an owner
 /// device, and an unrelated record's deadline is not the sibling's. A proof
 /// naming a DIFFERENT key than the admitted one is refused: one link cannot be
-/// two devices. A sibling with no admitted key or no record fails closed to an
-/// empty ceiling that has already ended.
+/// two devices. A sibling with no admitted key, or a key neither recorded nor
+/// listed, fails closed to an empty ceiling that has already ended.
 ///
 /// Every other link takes the persisted principal, after liveness, and the
 /// persisted (composed) deadline, exactly as before. Pure, so the decision is
@@ -145,7 +149,7 @@ pub fn principal_after_proof(
     if matches!(f.current, PrincipalKind::FleetSibling) {
         return match f.admitted_device {
             Some(k) if k != f.proven_device => None,
-            Some(_) if f.indexed => Some((PrincipalKind::FleetSibling, f.cert_expires)),
+            Some(_) if f.recognized => Some((PrincipalKind::FleetSibling, f.cert_expires)),
             _ => Some((PrincipalKind::Delegated { caps: Vec::new() }, 0)),
         };
     }
@@ -163,13 +167,13 @@ mod proof_principal_tests {
         current: &'a PrincipalKind,
         admitted: Option<&'a [u8; 32]>,
         proven: &'a [u8; 32],
-        indexed: bool,
+        recognized: bool,
     ) -> ProofFacts<'a> {
         ProofFacts {
             current,
             admitted_device: admitted,
             proven_device: proven,
-            indexed,
+            recognized,
             cert_expires: 5_000,
         }
     }
@@ -211,13 +215,13 @@ mod proof_principal_tests {
     }
 
     #[test]
-    fn a_sibling_with_no_record_or_no_admitted_key_fails_closed() {
+    fn an_unrecognized_sibling_or_one_with_no_admitted_key_fails_closed() {
         let k = [7u8; 32];
         let sib = PrincipalKind::FleetSibling;
         let closed = Some((PrincipalKind::Delegated { caps: Vec::new() }, 0));
-        // No index record carries the key: whatever the persisted principal
-        // says (an owner device, a live deadline), the link is not kept a
-        // sibling and is not owner-equivalent.
+        // Neither recorded nor listed: whatever the persisted principal says
+        // (an owner device, a live deadline), the link is not kept a sibling
+        // and is not owner-equivalent.
         assert_eq!(
             principal_after_proof(&facts(&sib, Some(&k), &k, false), PrincipalKind::OwnerDevice, 9_000, 100),
             closed

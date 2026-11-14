@@ -269,7 +269,7 @@ impl IdentityService {
                 current: &l.principal_kind,
                 admitted_device: l.identity_device_pub.as_ref(),
                 proven_device: &cert.device_pub,
-                indexed: true,
+                recognized: true,
                 cert_expires: cert.expires,
             };
             principal_after_proof(&f, PrincipalKind::OwnerDevice, 0, 0).is_none()
@@ -283,9 +283,9 @@ impl IdentityService {
         let (principal_kind, not_after, max_offline, last_seen) = self
             .store
             .persisted_principal_for_cert(&cert, own_user_pub.as_ref());
-        // Is the proven key indexed (a sibling's record)? Read before the
-        // link is borrowed mutably.
-        let indexed = self.store.devices_find_by_device_pub(&cert.device_pub).is_some();
+        // Is the proven key a recognized sibling (recorded, or listed by the
+        // owner's roster)? Read before the link is borrowed mutably.
+        let recognized = self.store.sibling_recognized(&cert.device_pub);
         if let Some(l) = conn.link_mut(pid) {
             let (deadline, _clock) =
                 effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
@@ -296,7 +296,7 @@ impl IdentityService {
                 current: &l.principal_kind,
                 admitted_device: l.identity_device_pub.as_ref(),
                 proven_device: &cert.device_pub,
-                indexed,
+                recognized,
                 cert_expires: cert.expires,
             };
             let (next, expires) = principal_after_proof(&f, principal_kind, deadline, now_secs())

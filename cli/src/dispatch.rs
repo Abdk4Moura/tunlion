@@ -629,6 +629,11 @@ pub(crate) async fn async_main() -> Result<()> {
             | Cmd::Skill { .. }
             | Cmd::Demo { .. }
             | Cmd::WinPtyRelay { .. }
+            // The environment preflight is how a person finds a damaged state
+            // file: it reports them (doctor.rs `state_problems`) instead of
+            // refusing on the file it exists to diagnose. A device probe still
+            // needs a sound store, so it is not exempt.
+            | Cmd::Doctor { device: None, .. }
     );
     if !exempt {
         // A verb with its own --json flag must still answer in JSON.

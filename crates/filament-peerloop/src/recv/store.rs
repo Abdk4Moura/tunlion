@@ -82,14 +82,42 @@ pub const DELISTED_SIBLINGS_FILE: &str = "delisted-siblings.json";
 
 /// A read of [`DELISTED_SIBLINGS_FILE`]: its entries, or why it is unusable.
 type DelistedRead = std::result::Result<Vec<Value>, String>;
-/// The last read, keyed by (path, mtime, length). Process-wide because callers
-/// open a fresh `DeviceStore` per call.
+/// The last read: path, mtime, length, when it was read, and what it held.
+/// Process-wide because callers open a fresh `DeviceStore` per call.
 #[allow(clippy::type_complexity)]
 static DELISTED_CACHE: std::sync::Mutex<
-    Option<(PathBuf, Option<SystemTime>, u64, DelistedRead)>,
+    Option<(PathBuf, Option<SystemTime>, u64, SystemTime, DelistedRead)>,
 > = std::sync::Mutex::new(None);
-/// This process's last failed write to [`DELISTED_SIBLINGS_FILE`], if any.
-static DELISTED_WRITE_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// A cached read is trusted only for a file whose mtime was at least this far
+/// before the read. File times are coarse (a clock tick, or worse on some
+/// filesystems), so a same-length rewrite inside one tick of the previous
+/// write keeps (mtime, length); such a recently written file is re-read every
+/// time instead, and any later rewrite lands on a later mtime.
+const DELISTED_CACHE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+/// This process's last failed write to [`DELISTED_SIBLINGS_FILE`], by the
+/// path it was for.
+static DELISTED_WRITE_ERROR: std::sync::Mutex<Option<(PathBuf, String)>> =
+    std::sync::Mutex::new(None);
+
+/// How to recover a damaged delisted-sibling store at `p`: restore its `.bak`
+/// when there is one, else move it aside. Shared with `tunlion doctor`.
+pub fn delisted_recovery(p: &Path) -> String {
+    let bak = backup_path(p);
+    if bak.exists() {
+        format!("restore the last good copy: cp {} {}", bak.display(), p.display())
+    } else {
+        "move it aside to start with an empty one (that drops what it held)".to_string()
+    }
+}
+
+/// May a cached read of a file with this mtime, taken at `read_at`, stand in
+/// for reading it again? Only when the file had settled before the read. Pure.
+fn delisted_cache_trusted(mtime: Option<SystemTime>, read_at: SystemTime) -> bool {
+    mtime.is_some_and(|m| {
+        m.checked_add(DELISTED_CACHE_SETTLE)
+            .is_some_and(|settled| settled <= read_at)
+    })
+}
 /// The local device certificate record, relative to the root.
 pub const LOCAL_DEVICE_CERT_FILE: &str = "identity/device-cert.json";
 /// How long a provisional identity is worth keeping. It exists to bridge one
@@ -1187,7 +1215,8 @@ impl DeviceStore {
     /// The delisted-sibling entries: `None` when the file is absent, `Err`
     /// (with why) when it exists but cannot be read or parsed. Parsed once per
     /// change of the file (path, mtime, length), so an unknown key at the
-    /// transfer gate costs a `stat`, not a read.
+    /// transfer gate costs a `stat`, not a read; a file written within
+    /// [`DELISTED_CACHE_SETTLE`] of the read is always re-read.
     fn delisted_entries(&self) -> Option<DelistedRead> {
         let p = self.root.join(DELISTED_SIBLINGS_FILE);
         let meta = match std::fs::metadata(&p) {
@@ -1197,12 +1226,13 @@ impl DeviceStore {
         };
         let (mtime, len) = (meta.modified().ok(), meta.len());
         if let Ok(cache) = DELISTED_CACHE.lock() {
-            if let Some((cp, cm, cl, read)) = cache.as_ref() {
-                if *cp == p && *cm == mtime && *cl == len {
+            if let Some((cp, cm, cl, read_at, read)) = cache.as_ref() {
+                if *cp == p && *cm == mtime && *cl == len && delisted_cache_trusted(*cm, *read_at) {
                     return Some(read.clone());
                 }
             }
         }
+        let read_at = SystemTime::now();
         // An empty file does not parse either: nothing writes one, so it is a
         // truncation, never "no entries".
         let read: DelistedRead = match std::fs::read_to_string(&p) {
@@ -1211,7 +1241,7 @@ impl DeviceStore {
             Err(e) => Err(format!("cannot be read ({e})")),
         };
         if let Ok(mut cache) = DELISTED_CACHE.lock() {
-            *cache = Some((p, mtime, len, read.clone()));
+            *cache = Some((p, mtime, len, read_at, read.clone()));
         }
         Some(read)
     }
@@ -1227,6 +1257,9 @@ impl DeviceStore {
         if self.owner_pub_from_keystore().is_some() {
             return false;
         }
+        // No owner key here, so the owner this device answers to is its own
+        // certificate's issuer: the rest of `owner_pub_for_resources`, without
+        // loading the keystore a second time.
         let entries = match self.delisted_entries() {
             None => return false,
             Some(Err(_)) => return true,
@@ -1234,7 +1267,7 @@ impl DeviceStore {
         };
         let key = hex::encode(device_pub);
         let now = now_secs();
-        let current_owner = self.owner_pub_for_resources(None);
+        let current_owner = self.joined_owner_pub();
         entries.iter().any(|e| {
             if e["devicePub"].as_str() != Some(key.as_str())
                 || !e["certExpires"].as_u64().is_some_and(|exp| exp > now)
@@ -1257,26 +1290,40 @@ impl DeviceStore {
         })
     }
 
+    /// The owner a joined device answers to, from its own certificate record:
+    /// `owner_pub_for_resources(None)` minus the keystore load, for callers
+    /// that already found no owner key.
+    fn joined_owner_pub(&self) -> Option<[u8; 32]> {
+        self.local_device_cert_record()
+            .as_ref()
+            .and_then(|record| DeviceCert::from_json(&record["cert"]))
+            .map(|cert| cert.user_pub)
+    }
+
     /// Why the delisted-sibling store needs a person, if it does: the file
     /// exists but does not read or parse (every key with no record is then
-    /// refused as revoked), or this process's last write to it failed (a
-    /// removed sibling's revocation may not have been kept). The daemon says
-    /// this loudly; `None` when all is well.
+    /// refused as revoked), and/or this process's last write to it failed (a
+    /// removed sibling's revocation could not be kept, so its record was; the
+    /// next successful sweep clears this). The daemon says this loudly;
+    /// `None` when all is well.
     pub fn delisted_siblings_problem(&self) -> Option<String> {
         let p = self.root.join(DELISTED_SIBLINGS_FILE);
-        if let Some(Err(why)) = self.delisted_entries() {
-            let bak = backup_path(&p);
-            let recover = if bak.exists() {
-                format!("restore the last good copy: cp {} {}", bak.display(), p.display())
-            } else {
-                "move it aside to start with an empty one (that drops what it held)".to_string()
-            };
-            return Some(format!(
-                "{} {why}; until it is fixed every device with no record here is refused as revoked. Fix it, or {recover}",
-                p.display()
-            ));
+        let damaged = match self.delisted_entries() {
+            Some(Err(why)) => Some(format!(
+                "{} {why}; until it is fixed every device with no record here is refused as revoked. Fix it, or {}",
+                p.display(),
+                delisted_recovery(&p)
+            )),
+            _ => None,
+        };
+        let failed_write = DELISTED_WRITE_ERROR
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().filter(|(at, _)| *at == p).map(|(_, why)| why.clone()));
+        match (damaged, failed_write) {
+            (Some(d), Some(w)) => Some(format!("{d}; and {w}")),
+            (d, w) => d.or(w),
         }
-        DELISTED_WRITE_ERROR.lock().ok().and_then(|g| g.clone())
     }
 
     /// Record that the sweep removed these delisted siblings' records:
@@ -1296,12 +1343,23 @@ impl DeviceStore {
             *cache = None;
         }
         if let Ok(mut last) = DELISTED_WRITE_ERROR.lock() {
-            *last = r.as_ref().err().map(|e| {
-                format!(
-                    "{}: a removed sibling's revocation could not be kept ({e:#}); its record was kept instead",
-                    p.display()
-                )
-            });
+            match &r {
+                Err(e) => {
+                    *last = Some((
+                        p.clone(),
+                        format!(
+                            "{}: a removed sibling's revocation could not be kept ({e:#}); its record was kept instead",
+                            p.display()
+                        ),
+                    ))
+                }
+                // A success clears this path's failure, never another's.
+                Ok(()) => {
+                    if last.as_ref().is_some_and(|(at, _)| *at == p) {
+                        *last = None;
+                    }
+                }
+            }
         }
         r
     }
@@ -1396,6 +1454,16 @@ impl DeviceStore {
             return false;
         };
         self.owner_roster_lists(device_pub, &owner)
+    }
+
+    /// Is `device_pub` a sibling this device recognizes for a possession proof:
+    /// a device record carries it, OR the owner's roster admits it
+    /// ([`DeviceStore::sibling_admissible`]). The roster is the authorization
+    /// fact; the record is only an index entry and its write can fail or be
+    /// refused, so a listed sibling without one keeps its kind. Revocation is
+    /// unaffected: a recognized but revoked key is still cut by the sweep.
+    pub fn sibling_recognized(&self, device_pub: &[u8; 32]) -> bool {
+        self.devices_find_by_device_pub(device_pub).is_some() || self.sibling_admissible(device_pub)
     }
 
     /// Does the stored roster (signed by `owner`, verified at receipt) list
@@ -4662,6 +4730,85 @@ mod sibling_roster_revocation {
             std::fs::read_to_string(j.root.join(DELISTED_SIBLINGS_FILE)).unwrap(),
             "{garbage"
         );
+        // The failed write is reported too, for this store's path.
+        let why = j.store.delisted_siblings_problem().unwrap();
+        assert!(why.contains("could not be kept"), "{why}");
+        assert!(why.contains("cannot be parsed"), "{why}");
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn delisted_recovery_names_the_backup_when_there_is_one() {
+        let j = joined("tomb-recovery");
+        let p = j.root.join(DELISTED_SIBLINGS_FILE);
+        let none = delisted_recovery(&p);
+        assert!(none.contains("move it aside"), "{none}");
+        assert!(!none.contains("cp "), "{none}");
+        std::fs::write(backup_path(&p), "[]").unwrap();
+        let with = delisted_recovery(&p);
+        assert!(with.contains("cp ") && with.contains(".bak"), "{with}");
+        assert!(with.contains(&p.display().to_string()), "{with}");
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn only_a_settled_file_may_be_served_from_the_cache() {
+        let now = SystemTime::now();
+        assert!(!delisted_cache_trusted(None, now));
+        assert!(!delisted_cache_trusted(Some(now), now), "written in the same tick as the read");
+        assert!(delisted_cache_trusted(
+            Some(now - std::time::Duration::from_secs(60)),
+            now
+        ));
+    }
+
+    #[test]
+    fn a_rewritten_delisted_store_is_read_again_even_at_the_same_length() {
+        let j = joined("tomb-rewrite");
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32]]);
+        let (a, b) = ([8u8; 32], [9u8; 32]);
+        let expires = now_secs() + 3600;
+        let owner_hex = hex::encode(j.owner.public_key_bytes());
+        let entry = |k: [u8; 32]| {
+            json!([{"devicePub": hex::encode(k), "ownerPub": owner_hex, "certExpires": expires}])
+        };
+        let path = j.root.join(DELISTED_SIBLINGS_FILE);
+        write_delisted(&j, &entry(a));
+        assert!(j.store.device_cert_revoked(&a) && !j.store.device_cert_revoked(&b));
+        // Rewritten at once, same length (likely inside one timestamp tick).
+        write_delisted(&j, &entry(b));
+        assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, entry(a).to_string().len());
+        assert!(!j.store.device_cert_revoked(&a) && j.store.device_cert_revoked(&b));
+        // Settled (mtime well in the past): this read may be cached ...
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
+        assert!(j.store.device_cert_revoked(&b));
+        // ... and an external in-place rewrite of the same length moves the
+        // mtime, so it is read again rather than served stale.
+        write_delisted(&j, &entry(a));
+        assert!(j.store.device_cert_revoked(&a), "a stale cache kept the old entry");
+        assert!(!j.store.device_cert_revoked(&b));
+        let _ = std::fs::remove_dir_all(&j.root);
+    }
+
+    #[test]
+    fn a_roster_listed_sibling_is_recognized_without_its_index_record() {
+        let j = joined("recognized");
+        let k = [9u8; 32];
+        // Neither recorded nor listed: not recognized (fails closed).
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32]]);
+        assert!(!j.store.sibling_recognized(&k));
+        // Listed by the owner's roster, no index record (a failed index
+        // write): recognized, so a proof keeps its sibling kind.
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32], k]);
+        assert!(j.store.sibling_recognized(&k));
+        // Recorded (the fixture's sibling), whatever the roster says.
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32]]);
+        assert!(j.store.sibling_recognized(&j.sib));
         let _ = std::fs::remove_dir_all(&j.root);
     }
 
