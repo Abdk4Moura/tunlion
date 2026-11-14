@@ -5687,12 +5687,16 @@ fn a_daemon_running_from_the_update_renamed_old_binary_is_still_this_install() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Every place in the workspace that verifies a `fleet-hello` or parses an
-/// `l3-announce` for verification is on this list, with its count, and each
-/// production site carries the own-key refusal. A new site anywhere in
-/// `cli/src` or `crates` fails this test until it is listed (and guarded), so
-/// the list is exhaustive by construction. Needles are built with `concat!` so
-/// this test does not count itself.
+/// Every `verify_hello` call and every `Announce::from_json` parse in the
+/// workspace members' sources is on this list, with its count, and each
+/// production site carries the own-key refusal. The scan roots come from the
+/// root `Cargo.toml` members (`<member>/src`, or the whole directory for a
+/// `dir/*` glob), so a new site in any member fails this test until it is
+/// listed and guarded. Blind spots: a site that verifies an already-parsed
+/// announce (`.verify(&cb)`) without either call (the peerloop source-order
+/// tests pin the one that exists, the replay at `ChannelReady`), and source
+/// outside a member's scanned root. Needles are built with `concat!` so this
+/// test does not count itself.
 #[test]
 fn every_fleet_proof_verify_site_is_listed_and_refuses_the_own_key() {
     use std::collections::BTreeMap;
@@ -5720,13 +5724,10 @@ fn every_fleet_proof_verify_site_is_listed_and_refuses_the_own_key() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     // Scan roots come from the workspace's own member list, so a member added
     // outside `crates/` is scanned too. Outside the workspace (a packaged
-    // crate, no root manifest or no `crates/`) there is nothing to pin.
+    // crate with no root manifest) there is nothing to pin.
     let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
         return;
     };
-    if !root.join("crates").is_dir() {
-        return;
-    }
     let members: Vec<String> = manifest
         .lines()
         .find(|l| l.trim_start().starts_with("members"))

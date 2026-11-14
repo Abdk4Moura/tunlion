@@ -633,7 +633,7 @@ pub(crate) async fn send_cmd(
             exit_codes::err(
                 ExitKind::NoIdentity,
                 format!(
-                    "refusing the fleet send: this device's own key at {} could not be read ({e}). Check that file's permissions, or run `tunlion init` if this device has no identity. Nothing was sent.",
+                    "refusing the fleet send: this device's own key at {} could not be read ({e}). Check that file's permissions, or run `tunlion init` if this device has no identity. No fleet handshake or file was sent.",
                     crate::overlay::key_path().display()
                 ),
             )

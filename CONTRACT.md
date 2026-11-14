@@ -374,8 +374,8 @@ Challenge lifecycle (no exporter):
     does not itself make `fleet` imply `mesh`, the CLI default and
     tunlion-core's `fleet` enable both). The one-shot send and the fleet dialer
     read the key once at the start and fail with exit 9 (`no_identity`), naming
-    the key file, when it cannot be read; the send fails before connecting, the
-    dial before any command payload. `FleetSession` takes the key in its
+    the key file, when it cannot be read; the send fails before any fleet
+    handshake or file byte, the dial before any command payload. `FleetSession` takes the key in its
     constructor (no `Default`); passing `None` leaves its refusal inert.
   - That this device's certificate key equals `overlay_pubkey()` is a host
     obligation; no type enforces it.

@@ -453,7 +453,7 @@ fn code_meaning(verb: &str, code: i32) -> &'static str {
         (_, 6) => "the peer is offline, unreachable, or did not answer in time",
         (_, 7) => "can't reach the tunlion server (no internet or DNS)",
         (_, 8) => "partial: some of the work landed and some did not",
-        (_, 9) => "this device has no identity yet (init, or join an invitation)",
+        (_, 9) => "no identity yet (init, or join an invitation), or this device's own key could not be read",
         (_, 10) => "a daemon is already running with different settings (not applied)",
         (_, 11) => "no daemon is running for this config directory",
         (_, 12) => "a resource on this machine ran out (disk full, quota, open files, memory)",

@@ -810,7 +810,10 @@ async fn verify_fleet_identity_inner(
 ) -> Result<()> {
     // Fail closed: without our own key the own-key refusal below cannot run.
     let own_device = own_device.ok_or_else(|| {
-        anyhow!("cannot verify '{expected}': this device's own key is unavailable")
+        crate::exit_codes::err(
+            crate::exit_codes::ExitKind::NoIdentity,
+            format!("cannot verify '{expected}': this device's own key is unavailable"),
+        )
     })?;
     let cb = t.channel_binding().ok_or_else(|| {
         anyhow!("cannot verify '{expected}': this link exposes no channel binding")
