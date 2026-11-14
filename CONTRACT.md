@@ -421,7 +421,10 @@ single emit is load-bearing (C30):
   identity-unavailable consent and `pair-keep` all require it. On the sender,
   offering files, acting on a `file-accept` and offering `pair-keep` require
   it. The covered session is recorded once at confirmation and never moves; a
-  rebuilt link needs a fresh code.
+  rebuilt link needs a fresh code. Continuation of an accepted transfer
+  (chunks, `file-end`, completion) and the sender's handling of
+  `delivery-ack`, `file-decline`, `file-pending` and `pair-keep-ack` are bound
+  to the same link; losing it ends the transfer on both sides.
 
 ### Pairing certificates (`identity-expose`, `identity-expose-ack`)
 After a code pairing's key confirmation, a side that holds a device

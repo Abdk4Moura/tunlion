@@ -13,7 +13,9 @@
 //! through the narrow traits in [`crate::recv::ports`].
 
 use crate::adoption::AdoptSource;
-use crate::conn::{Conn, DigestSurface, Presence, Promotion, Rung};
+use crate::conn::{
+    CodeAuthorityCache, CodeContinuation, Conn, DigestSurface, Presence, Promotion, Rung,
+};
 use crate::consent::REQUEST_WITHDRAWN;
 use crate::control::{Req, ReqKind};
 use crate::daemon_ctl::sshd_listening;
@@ -1241,6 +1243,131 @@ pub(crate) async fn consented_identity_peer(
     }
 }
 
+/// A code receive's transfer events are bound to the code-authorized link. Pure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeStreamAction {
+    Continue,
+    Ignore,
+    /// End the transfer: release the peer's in-flight streams.
+    Retire,
+}
+
+/// The transfer event a code receive is deciding for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeStreamEvent {
+    Ready,
+    Chunk,
+    FileEnd,
+    Completion,
+    Cancel,
+}
+
+impl CodeStreamEvent {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "a ready channel",
+            Self::Chunk => "a chunk",
+            Self::FileEnd => "file-end",
+            Self::Completion => "a completion",
+            Self::Cancel => "file-cancel",
+        }
+    }
+}
+
+fn code_stream_action(
+    recv_code_path: bool,
+    recv_pake_done: bool,
+    code_peer: bool,
+    continuation: Option<CodeContinuation>,
+    event: CodeStreamEvent,
+) -> CodeStreamAction {
+    if !recv_code_path {
+        return CodeStreamAction::Continue;
+    }
+    if !recv_pake_done {
+        return CodeStreamAction::Ignore;
+    }
+    match continuation {
+        Some(CodeContinuation::Holds) => CodeStreamAction::Continue,
+        Some(CodeContinuation::Lost) if code_peer => CodeStreamAction::Retire,
+        // A completion finishes bytes already written; it needs no link.
+        Some(CodeContinuation::NoLink) if code_peer && event == CodeStreamEvent::Completion => {
+            CodeStreamAction::Continue
+        }
+        _ => CodeStreamAction::Ignore,
+    }
+}
+
+/// Remove and return `pid`'s in-flight streams.
+fn take_streams_of<V>(by_sid: &mut HashMap<(String, u32), V>, pid: &str) -> Vec<V> {
+    let keys: Vec<(String, u32)> = by_sid.keys().filter(|(p, _)| p == pid).cloned().collect();
+    keys.into_iter().filter_map(|k| by_sid.remove(&k)).collect()
+}
+
+const CODE_LINK_REBUILT_RECV: &str = "transfer stopped: the connection to the sender was rebuilt after the code was confirmed, so nothing more is accepted on this code. Any partial file is kept; ask for a FRESH code.";
+
+/// `Ok(true)`: act on the event. `Ok(false)`: ignore it. `Err`: the transfer
+/// ends; `pid`'s streams are flushed to their `.part` (kept) and released.
+async fn apply_code_stream_action(
+    action: CodeStreamAction,
+    by_sid: &mut HashMap<(String, u32), IncomingFile>,
+    pid: &str,
+    log: &dyn LogSink,
+    event: CodeStreamEvent,
+) -> Result<bool> {
+    match action {
+        CodeStreamAction::Continue => Ok(true),
+        CodeStreamAction::Ignore => {
+            log.debug(&format!(
+                "recv: ignoring {} from {pid}: not on the code's confirmed link",
+                event.label()
+            ));
+            Ok(false)
+        }
+        CodeStreamAction::Retire => {
+            for inc in take_streams_of(by_sid, pid) {
+                let f = inc.file.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = f.sync_all();
+                })
+                .await;
+                log.debug(&format!(
+                    "{}: kept at {}",
+                    inc.name,
+                    crate::present::human(inc.received.load(Ordering::Relaxed))
+                ));
+            }
+            log.critical(&log.paint(Tone::Warn, CODE_LINK_REBUILT_RECV));
+            Err(anyhow!(CODE_LINK_REBUILT_RECV))
+        }
+    }
+}
+
+/// Code path: decide and apply [`code_stream_action`] for `pid`'s current link.
+#[allow(clippy::too_many_arguments)]
+async fn admit_code_stream_event(
+    conn: &Conn,
+    cache: &mut CodeAuthorityCache,
+    recv_code_path: bool,
+    recv_pake_done: bool,
+    pid: &str,
+    by_sid: &mut HashMap<(String, u32), IncomingFile>,
+    log: &dyn LogSink,
+    event: CodeStreamEvent,
+) -> Result<bool> {
+    if !recv_code_path {
+        return Ok(true);
+    }
+    let code_peer = conn.code_session.as_ref().is_some_and(|s| s.sid() == pid);
+    let continuation = if recv_pake_done {
+        Some(conn.code_continuation(pid, cache).await)
+    } else {
+        None
+    };
+    let action = code_stream_action(recv_code_path, recv_pake_done, code_peer, continuation, event);
+    apply_code_stream_action(action, by_sid, pid, log, event).await
+}
+
 async fn recv_run(
     server: &str,
     mut code: Option<String>,
@@ -1551,6 +1678,8 @@ async fn recv_run(
     // Said once: the confirmed sender's link was rebuilt, so this code covers
     // nothing on it any more (see `Conn::holds_code_authority`).
     let mut recv_code_rebuilt_said = false;
+    // See `Conn::code_continuation`.
+    let mut code_authority_cache = CodeAuthorityCache::default();
     let recv_pake_budget = ports.env.pair_grace;
     // Overall bound: once we are matched into the sender's room, SOMEONE must
     // authenticate within this window or the whole `recv` fails loudly. Per-peer
@@ -5511,6 +5640,23 @@ async fn recv_run(
                 conn.stash_upgrade_standby(&pid, t, route);
             }
             Ev::ChannelReady(pid, t) => {
+                // Continuation is bound to the code-authorized link.
+                if recv_code_path
+                    && recv_pake_done
+                    && conn.code_session.as_ref().is_some_and(|s| s.sid() == pid.as_str())
+                {
+                    admit_code_stream_event(
+                        &conn,
+                        &mut code_authority_cache,
+                        recv_code_path,
+                        recv_pake_done,
+                        &pid,
+                        &mut st.by_sid,
+                        log.as_ref(),
+                        CodeStreamEvent::Ready,
+                    )
+                    .await?;
+                }
                 // #39 (fleet-trust): the WebRTC/relay path's possession challenge is
                 // NOT issued here. At ChannelReady on the WebRTC path, verified_name is
                 // not set yet (the pair-proof round-trip sets it AFTER the channel opens),
@@ -8960,6 +9106,20 @@ async fn recv_run(
                 // never kept as junk (`unread`, `unread.part`, `unread.part.meta`
                 // were left behind before this message existed).
                 Some("file-cancel") => {
+                    if !admit_code_stream_event(
+                        &conn,
+                        &mut code_authority_cache,
+                        recv_code_path,
+                        recv_pake_done,
+                        &pid,
+                        &mut st.by_sid,
+                        log.as_ref(),
+                        CodeStreamEvent::Cancel,
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
                     let id = v["id"].as_str().unwrap_or_default().to_string();
                     let reason: String = v["reason"]
                         .as_str()
@@ -9016,6 +9176,20 @@ async fn recv_run(
                     // by_sid, mirrors a sender whose PC tears down before the
                     // best-effort file-end is delivered.
                     if test_hooks::drop_file_end() {
+                        continue;
+                    }
+                    if !admit_code_stream_event(
+                        &conn,
+                        &mut code_authority_cache,
+                        recv_code_path,
+                        recv_pake_done,
+                        &pid,
+                        &mut st.by_sid,
+                        log.as_ref(),
+                        CodeStreamEvent::FileEnd,
+                    )
+                    .await?
+                    {
                         continue;
                     }
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
@@ -9259,6 +9433,22 @@ async fn recv_run(
             Ev::MaybeComplete(pid, sid) => {
                 // A background writer task finished and was the last inflight,
                 // and end_seen was already set. Finalize (verify + delv ack).
+                // Continuation is bound to the code-authorized link; a
+                // completion with no link finishes bytes already written.
+                if !admit_code_stream_event(
+                    &conn,
+                    &mut code_authority_cache,
+                    recv_code_path,
+                    recv_pake_done,
+                    &pid,
+                    &mut st.by_sid,
+                    log.as_ref(),
+                    CodeStreamEvent::Completion,
+                )
+                .await?
+                {
+                    continue;
+                }
                 let ack_sid = {
                     st.by_sid
                         .get(&(pid.clone(), sid))
@@ -9463,6 +9653,22 @@ async fn recv_run(
                 }
             }
             Ev::Chunk(pid, sid, offset, data) => {
+                // Continuation is bound to the code-authorized link.
+                if !l2::is_l2_sid(sid)
+                    && !admit_code_stream_event(
+                        &conn,
+                        &mut code_authority_cache,
+                        recv_code_path,
+                        recv_pake_done,
+                        &pid,
+                        &mut st.by_sid,
+                        log.as_ref(),
+                        CodeStreamEvent::Chunk,
+                    )
+                    .await?
+                {
+                    continue;
+                }
                 // L2 streams live in the HIGH half of the sid space, route them
                 // to the tunnel mux, never the file-transfer table (the pure
                 // high-bit prefix check keeps file send/recv byte-identical).
@@ -11731,5 +11937,138 @@ mod pair_grant_tests {
         assert!(offer(&mut conn), "a pair transfer grant must admit under authoritative");
         host.denies.lock().unwrap().insert("transfer".into());
         assert!(!offer(&mut conn), "a local transfer deny outranks the grant");
+    }
+}
+
+#[cfg(test)]
+mod code_stream_tests {
+    use super::{
+        apply_code_stream_action, code_stream_action, take_streams_of, CodeStreamAction,
+        CodeStreamEvent,
+    };
+    use crate::recv::IncomingFile;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
+    use std::sync::Arc;
+
+    const EVENTS: [CodeStreamEvent; 5] = [
+        CodeStreamEvent::Ready,
+        CodeStreamEvent::Chunk,
+        CodeStreamEvent::FileEnd,
+        CodeStreamEvent::Completion,
+        CodeStreamEvent::Cancel,
+    ];
+
+    #[test]
+    fn a_code_transfer_event_acts_only_on_the_covered_link() {
+        use crate::conn::CodeContinuation::{Holds, Lost, NoLink};
+        for e in EVENTS {
+            assert_eq!(code_stream_action(true, true, true, Some(Holds), e), CodeStreamAction::Continue, "{e:?}");
+            assert_eq!(code_stream_action(true, true, true, Some(Lost), e), CodeStreamAction::Retire, "{e:?}");
+            assert_eq!(code_stream_action(true, true, false, Some(Lost), e), CodeStreamAction::Ignore, "{e:?}");
+            assert_eq!(code_stream_action(true, true, false, Some(NoLink), e), CodeStreamAction::Ignore, "{e:?}");
+            assert_eq!(code_stream_action(true, false, true, None, e), CodeStreamAction::Ignore, "{e:?}");
+            assert_eq!(code_stream_action(false, false, false, None, e), CodeStreamAction::Continue, "{e:?}");
+            assert_eq!(code_stream_action(false, true, false, Some(Lost), e), CodeStreamAction::Continue, "{e:?}");
+            let no_link = code_stream_action(true, true, true, Some(NoLink), e);
+            if e == CodeStreamEvent::Completion {
+                assert_eq!(no_link, CodeStreamAction::Continue);
+            } else {
+                assert_eq!(no_link, CodeStreamAction::Ignore, "{e:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn retiring_takes_only_that_peers_streams() {
+        let mut by_sid: HashMap<(String, u32), &str> = HashMap::new();
+        by_sid.insert(("sid-s1".into(), 1), "s1-a");
+        by_sid.insert(("sid-s1".into(), 3), "s1-b");
+        by_sid.insert(("sid-other".into(), 1), "other");
+        let mut taken = take_streams_of(&mut by_sid, "sid-s1");
+        taken.sort();
+        assert_eq!(taken, vec!["s1-a", "s1-b"]);
+        assert!(!by_sid.keys().any(|(p, _)| p == "sid-s1"));
+        assert_eq!(by_sid.len(), 1);
+        assert!(take_streams_of(&mut by_sid, "sid-s1").is_empty());
+    }
+
+    /// An in-flight stream with `bytes` already written to its `.part`.
+    fn incoming(part_path: &PathBuf, bytes: &[u8]) -> IncomingFile {
+        std::fs::write(part_path, bytes).expect("write fixture part");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(part_path)
+            .expect("open fixture part");
+        IncomingFile {
+            id: "id-1".into(),
+            name: "f.bin".into(),
+            size: bytes.len() as u64 * 2,
+            received: Arc::new(AtomicU64::new(bytes.len() as u64)),
+            ranges: Arc::new(std::sync::Mutex::new(vec![(0, bytes.len() as u64)])),
+            file: Arc::new(file),
+            part_path: part_path.clone(),
+            full: None,
+            inflight: Arc::new(AtomicI64::new(0)),
+            end_seen: Arc::new(AtomicBool::new(false)),
+            completion: Arc::new(crate::recv::CompletionGate::default()),
+            ack_sid: 0,
+            last_tick: 0,
+            bar: Box::new(crate::present::NoBar),
+            write_err: Arc::new(std::sync::Mutex::new(None)),
+            stdout: None,
+        }
+    }
+
+    fn part_in_temp(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("code-stream-{tag}-{}-{nanos}.part", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn applying_the_action_keeps_or_retires_the_stream() {
+        use crate::conn::CodeContinuation::{Holds, Lost, NoLink};
+        let log = crate::host::NoLog;
+        let mine = part_in_temp("mine");
+        let other = part_in_temp("other");
+        let mut by_sid: HashMap<(String, u32), IncomingFile> = HashMap::new();
+        by_sid.insert(("sid-s1".into(), 1), incoming(&mine, b"abcd"));
+        by_sid.insert(("sid-x".into(), 1), incoming(&other, b"wxyz"));
+
+        // Holds: every event acts; the stream stays.
+        for e in EVENTS {
+            let action = code_stream_action(true, true, true, Some(Holds), e);
+            assert!(apply_code_stream_action(action, &mut by_sid, "sid-s1", &log, e).await.unwrap());
+        }
+        assert!(by_sid.contains_key(&("sid-s1".to_string(), 1)));
+
+        // NoLink: a completion finishes; chunk and file-end are not acted on.
+        let action = code_stream_action(true, true, true, Some(NoLink), CodeStreamEvent::Completion);
+        assert!(apply_code_stream_action(action, &mut by_sid, "sid-s1", &log, CodeStreamEvent::Completion)
+            .await
+            .unwrap());
+        for e in [CodeStreamEvent::Chunk, CodeStreamEvent::FileEnd] {
+            let action = code_stream_action(true, true, true, Some(NoLink), e);
+            assert!(!apply_code_stream_action(action, &mut by_sid, "sid-s1", &log, e).await.unwrap());
+        }
+        assert!(by_sid.contains_key(&("sid-s1".to_string(), 1)));
+
+        // Lost on a file-cancel: the transfer ends before the cancel runs; the
+        // stream is released and its `.part` is kept with its bytes.
+        let action = code_stream_action(true, true, true, Some(Lost), CodeStreamEvent::Cancel);
+        assert!(apply_code_stream_action(action, &mut by_sid, "sid-s1", &log, CodeStreamEvent::Cancel)
+            .await
+            .is_err());
+        assert!(!by_sid.contains_key(&("sid-s1".to_string(), 1)));
+        assert_eq!(std::fs::read(&mine).expect("the .part is kept"), b"abcd");
+        assert!(by_sid.contains_key(&("sid-x".to_string(), 1)));
+
+        let _ = std::fs::remove_file(&mine);
+        let _ = std::fs::remove_file(&other);
     }
 }

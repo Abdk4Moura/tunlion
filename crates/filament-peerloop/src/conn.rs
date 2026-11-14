@@ -73,6 +73,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
+/// An in-flight code transfer on its peer's current link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeContinuation {
+    Holds,
+    NoLink,
+    Lost,
+}
+
+/// Link facts a cached verdict is keyed by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CodeLinkKey {
+    generation: u32,
+    source: net::SourceId,
+    direct: bool,
+    attempt: Option<net::AttemptId>,
+    /// A digest of the link's `expected_secret`, never the secret itself.
+    secret_tag: u64,
+}
+
+/// The last link that held code authority.
+#[derive(Default)]
+pub struct CodeAuthorityCache {
+    held: Option<(String, CodeLinkKey)>,
+}
+
 /// Why a direct attempt is being started. A bool pair gave four states, three
 /// meaningful and one nonsense (`probe && promote` = "a test dial that tears
 /// down a serving link", exactly what the guard exists to prevent), with
@@ -2409,6 +2434,42 @@ impl Conn {
                 ));
                 false
             }
+        }
+    }
+
+    /// Continuation of a code transfer is bound to the code-authorized link.
+    /// Only a holding verdict is cached, keyed by the link's generation,
+    /// source, kind, attempt and secret digest.
+    pub async fn code_continuation(
+        &self,
+        pid: &str,
+        cache: &mut CodeAuthorityCache,
+    ) -> CodeContinuation {
+        let Some(l) = self.links.get(pid) else {
+            return CodeContinuation::NoLink;
+        };
+        let secret_tag = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            l.expected_secret.as_ref().map(|(_, s)| s.as_str()).hash(&mut h);
+            h.finish()
+        };
+        let key = CodeLinkKey {
+            generation: l.generation,
+            source: l.source,
+            direct: l.direct,
+            attempt: l.attempt,
+            secret_tag,
+        };
+        if cache.held.as_ref().is_some_and(|(p, k)| p == pid && *k == key) {
+            return CodeContinuation::Holds;
+        }
+        if self.holds_code_authority(pid).await {
+            cache.held = Some((pid.to_string(), key));
+            CodeContinuation::Holds
+        } else {
+            cache.held = None;
+            CodeContinuation::Lost
         }
     }
 
@@ -10158,6 +10219,38 @@ mod warm_identity_tests {
         assert!(!conn.holds_code_authority("sid-s2").await);
     }
 
+    #[tokio::test]
+    async fn an_in_flight_code_transfer_continues_only_on_the_covered_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let promote = net::AttemptId::next();
+        conn.direct_pending.insert("sid-s1".into(), promote_pending(promote, "sid-s1", "k-secret"));
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", promote));
+        let mut cache = CodeAuthorityCache::default();
+
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Lost);
+
+        conn.bind_code_session("sid-s1", ("fp-a", "fp-b"), "k-secret");
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Holds);
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Holds);
+
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", net::AttemptId::next()));
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Lost);
+
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", promote));
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Holds);
+
+        let mut rebuilt = promoted_link("sid-s1", "uid-u", "k-secret", promote);
+        rebuilt.direct = false;
+        conn.links.insert("sid-s1".into(), rebuilt);
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Lost);
+
+        conn.links.remove("sid-s1");
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::NoLink);
+
+        conn.links.insert("sid-s2".into(), promoted_link("sid-s2", "uid-u", "k-secret", promote));
+        assert_eq!(conn.code_continuation("sid-s2", &mut cache).await, CodeContinuation::Lost);
+    }
+
     /// A signal payload never replaces a roster uid the server already gave
     /// (control: a peer with none yet still gets the first-seen one).
     #[tokio::test]
@@ -11252,6 +11345,112 @@ mod warm_identity_tests {
         // The race's expiry still falls back to WebRTC, as before.
         conn.direct_pending.get_mut(pid).unwrap().deadline = Instant::now() - Duration::from_millis(1);
         assert_eq!(conn.expired_direct().len(), 1, "the old fallback was not armed");
+    }
+
+    /// Code authority follows the old-peer promotion: the direct link the
+    /// ceremony's armed attempt publishes holds; another attempt is refused.
+    #[tokio::test]
+    async fn a_replaced_promotion_carries_code_authority_to_its_own_direct_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-code-old";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        let promo = conn
+            .start_direct_promote(pid, pid, "ceremony", PromoteRole::Lead, false)
+            .await;
+        assert_eq!(promo, Promotion::Replaced);
+        conn.bind_code_session(pid, ("fp-a", "fp-b"), "ceremony");
+        let attempt = conn.direct_pending.get(pid).expect("an armed attempt").attempt;
+        let mut cache = CodeAuthorityCache::default();
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::NoLink);
+
+        let quic: Arc<dyn Transport> = Rec::with_attempt("quic", &log, attempt);
+        assert!(matches!(
+            conn.adopt_direct(pid, quic.clone(), "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+        assert_eq!(conn.code_authority(pid).await, Ok(()));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
+
+        let foreign: Arc<dyn Transport> = Rec::with_attempt("foreign", &log, net::AttemptId::next());
+        assert!(!matches!(
+            conn.adopt_direct(pid, foreign, "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+        assert!(conn.transport_of(pid).is_some_and(|t| Arc::ptr_eq(&t, &quic)));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
+
+        // The same link under another attempt is not this ceremony's.
+        conn.links.get_mut(pid).unwrap().attempt = Some(net::AttemptId::next());
+        assert_eq!(conn.code_authority(pid).await, Err(CodeAuthorityRefusal::ForeignDirect));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Lost);
+    }
+
+    /// Code authority follows the make-before-break handoff: the confirmed
+    /// WebRTC link holds before it, the ceremony's direct link after it.
+    #[tokio::test]
+    async fn a_handed_promotion_carries_code_authority_to_its_own_direct_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-code-new";
+        let webrtc: Arc<dyn Transport> = Rec::new("webrtc", &log);
+        let webrtc_attempt = webrtc.attempt_id().expect("a fixture attempt");
+        code_link(&mut conn, pid, webrtc);
+        let promo = conn
+            .start_direct_promote(pid, pid, "ceremony", PromoteRole::Lead, true)
+            .await;
+        assert_eq!(promo, Promotion::Retained);
+        conn.bind_code_session(pid, ("fp-a", "fp-b"), "ceremony");
+        let attempt = conn.direct_pending.get(pid).expect("an armed attempt").attempt;
+        assert_eq!(conn.code_authority_on(pid, Some(("fp-a", "fp-b"))), Ok(()));
+
+        let quic: Arc<dyn Transport> = Rec::with_attempt("quic", &log, attempt);
+        {
+            let promotion = conn.promotions.get_mut(pid).expect("a promotion");
+            promotion.standby = Some((quic.clone(), "direct-quic"));
+            promotion.handed = true;
+        }
+        // While handed, another attempt is not adopted and changes nothing.
+        let foreign: Arc<dyn Transport> = Rec::with_attempt("foreign", &log, net::AttemptId::next());
+        assert_eq!(conn.adopt_direct(pid, foreign.clone(), "direct-quic"), DirectAdoption::Rejected);
+        assert!(foreign.is_dead());
+        assert!(!conn.link(pid).expect("the serving link").direct);
+        assert!(conn.promotions.get(pid).is_some_and(|p| p.handed));
+        assert!(conn.direct_pending.contains_key(pid));
+        assert!(matches!(
+            conn.adopt_direct(pid, quic.clone(), "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+        let l = conn.link(pid).expect("the link");
+        assert!(l.direct, "the serving link was not retired");
+        assert!(l.transport.as_ref().is_some_and(|t| Arc::ptr_eq(t, &quic)));
+        assert_eq!(l.attempt, Some(attempt));
+        // Retired and replaced, not updated in place: the serving link's own
+        // attempt is retired and the promotion is gone.
+        assert!(conn.retired_attempts.contains_key(&webrtc_attempt));
+        assert!(!conn.promotions.contains_key(pid));
+        let mut cache = CodeAuthorityCache::default();
+        assert_eq!(conn.code_authority(pid).await, Ok(()));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
+
+        // After adoption, another attempt is still not adopted.
+        let late: Arc<dyn Transport> = Rec::with_attempt("late", &log, net::AttemptId::next());
+        assert_eq!(conn.adopt_direct(pid, late, "direct-quic"), DirectAdoption::Rejected);
+        assert!(conn.transport_of(pid).is_some_and(|t| Arc::ptr_eq(&t, &quic)));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
+
+        // A cached verdict does not survive a changed secret on the same link.
+        conn.links.get_mut(pid).unwrap().expected_secret = Some((pid.to_string(), "other".into()));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Lost);
+
+        // Restored, it holds; under another attempt it does not.
+        conn.links.get_mut(pid).unwrap().expected_secret = Some((pid.to_string(), "ceremony".into()));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
+        conn.links.get_mut(pid).unwrap().attempt = Some(net::AttemptId::next());
+        assert_eq!(conn.code_authority(pid).await, Err(CodeAuthorityRefusal::ForeignDirect));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Lost);
     }
 
     /// QUIC never comes up: WebRTC keeps serving. No fallback establish (the
