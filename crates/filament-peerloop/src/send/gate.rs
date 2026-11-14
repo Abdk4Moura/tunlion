@@ -86,6 +86,55 @@ mod tests {
         assert!(!adopt_wants_active(true, true, true));
     }
 
+    /// The event gate pins the ceremony's sid; the sender's offer, accept and
+    /// pair-keep also require the link the ceremony confirmed
+    /// (`Conn::holds_code_authority`, rule `code_authority_check`). A rebuilt
+    /// link under the SAME sid passes the event gate and is still refused.
+    #[test]
+    fn a_code_sender_offers_only_on_the_confirmed_link_or_its_own_promotion() {
+        use crate::{code_authority_check, CodeAuthorityRefusal, CodeSession, CodeTransport};
+        use filament_transport::net::AttemptId;
+
+        let ours = AttemptId::next();
+        let session = CodeSession::new("sid-receiver", ("fp-sender", "fp-receiver"), "k", Some(ours));
+        let s = Some(&session);
+        assert!(code_peer_event_allowed(
+            true,
+            true,
+            Some("sid-receiver"),
+            "sid-receiver",
+            CodePeerEvent::Channel
+        ));
+        // Positive controls: the confirmed WebRTC link and the ceremony's own
+        // direct promotion.
+        assert_eq!(
+            code_authority_check(s, "sid-receiver", CodeTransport::WebRtc(Some(("fp-sender", "fp-receiver")))),
+            Ok(())
+        );
+        assert_eq!(
+            code_authority_check(
+                s,
+                "sid-receiver",
+                CodeTransport::Direct { attempt: Some(ours), secret: Some("k") }
+            ),
+            Ok(())
+        );
+        // Same sid, rebuilt PeerConnection: refused.
+        assert_eq!(
+            code_authority_check(s, "sid-receiver", CodeTransport::WebRtc(Some(("fp-sender", "fp-other")))),
+            Err(CodeAuthorityRefusal::FingerprintMismatch)
+        );
+        // Same sid, a direct link another attempt published: refused.
+        assert_eq!(
+            code_authority_check(
+                s,
+                "sid-receiver",
+                CodeTransport::Direct { attempt: Some(AttemptId::next()), secret: Some("k") }
+            ),
+            Err(CodeAuthorityRefusal::ForeignDirect)
+        );
+    }
+
     #[test]
     fn an_unclaimed_code_still_accepts_the_room_channel_that_carries_the_ceremony() {
         assert!(code_peer_event_allowed(

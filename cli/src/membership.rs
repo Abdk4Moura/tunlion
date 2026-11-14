@@ -317,6 +317,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         suppressed_digest_adoptions: HashSet::new(),
         active: None,
         active_binding: None,
+        code_session: None,
         next_gen: 0,
         rejoin: RejoinState {
             waiting_rejoin: None,

@@ -937,6 +937,11 @@ async fn drive_over(
                                         };
                                         // The authenticated peer is the target.
                                         conn.active = Some(from.clone());
+                                        // The confirmed session: offers and accepts
+                                        // check the current link against it.
+                                        if let Some((mine, theirs)) = cer.confirmed_fingerprints() {
+                                            conn.bind_code_session(&from, (mine, theirs), &secret);
+                                        }
                                         conn.rearm_channel_ready(&from, promotion);
                                     }
                                 }
@@ -1023,6 +1028,16 @@ async fn drive_over(
                 if use_code && !is_direct && !pake_done {
                     continue;
                 }
+                // A code offers only on the link its ceremony confirmed (or that
+                // ceremony's own direct promotion), never on a rebuilt one.
+                if use_code && !conn.holds_code_authority(&pid).await {
+                    if pake_done {
+                        ports.log.debug(
+                            "send: not offering on a link the code's ceremony does not cover",
+                        );
+                    }
+                    continue;
+                }
                 offer_unfinished(&outgoing, &t).await?;
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
@@ -1035,6 +1050,9 @@ async fn drive_over(
                     }
                 }
                 Some("file-accept") => {
+                    if use_code && !conn.holds_code_authority(&pid).await {
+                        continue;
+                    }
                     let Some(t) = conn.transport_of(&pid) else {
                         continue;
                     };
