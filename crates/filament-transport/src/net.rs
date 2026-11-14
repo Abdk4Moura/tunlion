@@ -1768,7 +1768,6 @@ pub struct Peer {
     turn_bridges: Option<Arc<crate::turn_bridge::TurnBridges>>,
 }
 
-/// Extract `a=fingerprint:...` from an SDP (normalized uppercase hex).
 /// The remote DTLS fingerprint a live connection may record next. A
 /// connection's DTLS certificate is fixed for its life (an ICE restart keeps
 /// it, a rebuild is a new connection), so once one is recorded, a description
@@ -1785,6 +1784,7 @@ fn next_remote_fingerprint(recorded: Option<&str>, offered: Option<String>) -> R
     }
 }
 
+/// Extract `a=fingerprint:...` from an SDP (normalized uppercase hex).
 fn sdp_fingerprint(sdp: &str) -> Option<String> {
     sdp.lines()
         .find_map(|l| l.strip_prefix("a=fingerprint:"))
@@ -2114,11 +2114,13 @@ impl Peer {
                     // Stale answer (e.g. to an offer this side abandoned).
                     return Ok(SignalOutcome::Handled);
                 }
-                {
-                    let mut fps = self.fps.lock().await;
-                    fps.1 = next_remote_fingerprint(fps.1.as_deref(), sdp_fingerprint(&desc.sdp))?;
-                }
+                let remote_fp = {
+                    let fps = self.fps.lock().await;
+                    next_remote_fingerprint(fps.1.as_deref(), sdp_fingerprint(&desc.sdp))?
+                };
                 self.pc.set_remote_description(desc).await?;
+                // Recorded only once the description is in force.
+                self.fps.lock().await.1 = remote_fp;
                 let pending = {
                     let mut st = self.state.lock().await;
                     st.has_remote = true;
