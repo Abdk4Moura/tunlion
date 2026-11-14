@@ -172,6 +172,11 @@ pub struct Mux {
     /// stream pipes, so a warm exec needs no second listener on the shared
     /// event channel. Bounded and dropped with the stream.
     exec_init: Mutex<HashMap<u32, mpsc::Sender<Value>>>,
+    /// The `link-revoked` frame this link received, kept for the life of the
+    /// mux. The per-exec channels above are bounded and lossy, so a warm exec
+    /// that ends on a transport failure reads this before reporting one: a
+    /// refusal recorded here outranks "the link died".
+    revoked: std::sync::Mutex<Option<Value>>,
 }
 
 impl Mux {
@@ -207,6 +212,7 @@ impl Mux {
             close_err: Mutex::new(HashMap::new()),
             exec_ctl: Mutex::new(HashMap::new()),
             exec_init: Mutex::new(HashMap::new()),
+            revoked: std::sync::Mutex::new(None),
         })
     }
 
@@ -671,10 +677,17 @@ impl Mux {
     /// in-flight warm exec on THIS link is told, so it fails loudly instead of
     /// waiting for an exit status that will never come.
     pub async fn on_link_revoked(&self, v: Value) {
+        // Recorded first, so no exec can observe the link failing without it.
+        *self.revoked.lock().unwrap_or_else(|p| p.into_inner()) = Some(v.clone());
         let senders: Vec<_> = self.exec_init.lock().await.values().cloned().collect();
         for tx in senders {
             let _ = tx.try_send(v.clone());
         }
+    }
+
+    /// The refusal this link received, if any (see `revoked`).
+    pub fn link_revoked(&self) -> Option<Value> {
+        self.revoked.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Take the mid-session close reason for a stream, if one was recorded, so the
@@ -1553,6 +1566,35 @@ mod tests {
             "a closed warm exec must not keep a live waiter"
         );
         assert!(ctl.recv().await.is_none(), "the waiter channel is dropped");
+    }
+
+    /// The per-exec channel is bounded and its delivery is `try_send`, so a
+    /// revocation can be lost there when the channel is full. The link keeps
+    /// its own record, which a warm exec ending on a transport failure reads:
+    /// a full queue must not turn the refusal into "the link died".
+    #[tokio::test]
+    async fn a_revocation_lost_to_a_full_exec_queue_is_still_recorded_on_the_link() {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone(), Arc::new(NoHost));
+        let sid = L2_SID_BASE | 23;
+        let _stream = mux.register_stream(sid).await.unwrap();
+        let mut ctl = mux.register_exec_initiator(sid).await;
+        assert!(mux.link_revoked().is_none(), "no refusal before one arrives");
+        // Far more than the queue's bound, so it is certainly full.
+        for _ in 0..1000 {
+            assert!(
+                mux.on_exec_initiator_frame(sid, json!({ "type": "exec-alive-ack", "sid": sid }))
+                    .await
+            );
+        }
+        let revoked = json!({ "type": "link-revoked", "reason": "forgotten" });
+        mux.on_link_revoked(revoked.clone()).await;
+        let mut seen = false;
+        while let Ok(v) = ctl.try_recv() {
+            seen |= v["type"].as_str() == Some("link-revoked");
+        }
+        assert!(!seen, "the full queue dropped it (the case this record exists for)");
+        assert_eq!(mux.link_revoked(), Some(revoked), "the link must keep the refusal");
     }
 
     #[cfg(feature = "forward-server")]

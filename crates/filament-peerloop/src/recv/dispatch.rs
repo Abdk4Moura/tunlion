@@ -3788,25 +3788,24 @@ async fn recv_run(
                     });
                     // Tell each doomed peer WHY before the link goes: a peer
                     // mid-exec or mid-send otherwise sees only a dead link and
-                    // reports "link died" (exit 6) for what is a refusal.
-                    // drop_link closes the transport only after a grace, so
-                    // this frame leaves first.
-                    for (pid, _) in &doomed {
-                        if let Some(t) = conn.transport_of(pid) {
-                            let code = if cut_as_revoked.contains(pid) {
-                                crate::refusal::Code::CertRevoked
-                            } else {
-                                crate::refusal::Code::Unrecognized
-                            };
-                            let refusal = crate::refusal::Refusal::new(code, None);
-                            let mut f = json!({ "type": "link-revoked", "reason": refusal.reason });
-                            refusal.annotate(&mut f);
-                            let _ = t.send_control(&f).await;
-                        }
-                    }
+                    // reports "link died" (exit 6) for what is a refusal. The
+                    // link leaves routing now; its transport stays open only
+                    // until the peer acks the refusal or a bounded budget runs
+                    // out, on a task, never in this loop (a write returning Ok
+                    // is not delivery: the close would discard it).
                     for (pid, label) in &doomed {
-                        // Drop first: its close releases a sync task parked in a write.
-                        conn.drop_link(pid);
+                        let code = if cut_as_revoked.contains(pid) {
+                            crate::refusal::Code::CertRevoked
+                        } else {
+                            crate::refusal::Code::Unrecognized
+                        };
+                        let refusal = crate::refusal::Refusal::new(code, None);
+                        let mut f = json!({ "type": "link-revoked", "reason": refusal.reason });
+                        refusal.annotate(&mut f);
+                        conn.drop_link_after_refusal(pid, f);
+                        // A sync task parked in a write on that transport is
+                        // released by its cancel, or by the close at the
+                        // budget, and the join is bounded either way.
                         sync_tasks.cancel_sync_for_pid(pid, log.as_ref()).await;
                         l2_muxes.remove(pid);
                         fleet_pending.remove(pid);
@@ -7327,6 +7326,21 @@ async fn recv_run(
                 Some("link-revoked") => {
                     if let Some(mux) = l2_muxes.get(&pid) {
                         mux.on_link_revoked(v.clone()).await;
+                    }
+                    // Only now, with the refusal recorded where every warm exec
+                    // on this link reads it, tell the peer it may close. The
+                    // nonce binds the ack to that one cut; a frame without one
+                    // (an older peer) asks for none. Off the loop: a peer that
+                    // stopped reading must not park this daemon.
+                    if let (Some(nonce), Some(t)) = (v["nonce"].as_str(), conn.transport_of(&pid)) {
+                        let ack = json!({ "type": "link-revoked-ack", "nonce": nonce });
+                        tokio::spawn(async move {
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                t.send_control(&ack),
+                            )
+                            .await;
+                        });
                     }
                     continue;
                 }
