@@ -244,6 +244,11 @@ impl FleetSession {
                 if nonce.len() < 16 {
                     return Outcome::Ignored;
                 }
+                // A challenge is answered only when the peer chose it: one equal
+                // to the nonce we issued on this link is refused.
+                if self.peers.get(pid).and_then(|p| p.bind_ours.as_deref()) == Some(nonce.as_slice()) {
+                    return Outcome::Ignored;
+                }
                 let Some(cb) = exporter.or_else(|| bind(&nonce)) else {
                     return Outcome::Ignored;
                 };
@@ -444,6 +449,23 @@ mod tests {
     }
 
     // A too-short nonce is not a challenge.
+    #[test]
+    fn a_challenge_we_issued_is_not_answered() {
+        let mut s = FleetSession::new();
+        let _ = s.greet("a", None, n1, |_| Ok(json!({})));
+        let msg = json!({ "type": "l3-nonce", "nonce": filament_overlay::b64(&n1()) });
+        let out = s.on_control(
+            "a", &msg, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({ "signed": true })), |_| None, raw,
+        );
+        assert_eq!(out, Outcome::Ignored, "no hello is signed over our own challenge");
+        // A nonce the peer chose is still answered.
+        let theirs = json!({ "type": "l3-nonce", "nonce": filament_overlay::b64(&n2()) });
+        let out = s.on_control(
+            "a", &theirs, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({ "signed": true })), |_| None, raw,
+        );
+        assert_eq!(out, Outcome::Send(json!({ "signed": true })));
+    }
+
     #[test]
     fn short_nonce_is_rejected() {
         let mut s = FleetSession::new();

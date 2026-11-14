@@ -142,6 +142,37 @@ impl Retired {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Is `nonce` one of ours, expired or not?
+    pub fn holds(&self, nonce: &[u8]) -> bool {
+        self.entries.iter().any(|(n, _)| n.as_slice() == nonce)
+    }
+}
+
+/// The stable reason a received challenge is refused when it is one we issued.
+pub const REFLECTED_CHALLENGE: &str = "reflected-challenge";
+
+/// The stable reason a verified hello is refused when it carries our own key.
+pub const OWN_DEVICE_KEY: &str = "own-device-key";
+
+/// May a received `l3-nonce` be kept as the peer's challenge? Not when it
+/// equals a nonce WE issued, current or retired, on any link: a challenge is
+/// answered only when the peer chose it.
+pub fn accept_peer_nonce<'a>(
+    nonce: &[u8],
+    ours: impl IntoIterator<Item = &'a [u8]>,
+    retired: impl IntoIterator<Item = &'a Retired>,
+) -> Result<(), &'static str> {
+    if ours.into_iter().any(|o| o == nonce) || retired.into_iter().any(|r| r.holds(nonce)) {
+        return Err(REFLECTED_CHALLENGE);
+    }
+    Ok(())
+}
+
+/// Does a verified hello carry this device's own key? Such a hello is never
+/// admitted as a peer.
+pub fn is_own_device(device_pub: &[u8; 32], own: Option<[u8; 32]>) -> bool {
+    own.is_some_and(|o| &o == device_pub)
 }
 
 /// The bindings a hello on the CURRENT link may verify against, in order: the
@@ -292,6 +323,35 @@ mod tests {
         assert!(!on_b.contains(&on_a), "a binding from another link must not verify here");
         // The same nonce under the same link's inputs is what verifies.
         assert!(on_b.contains(&dtls(("B1", "B2"), &nonce)));
+    }
+
+    #[test]
+    fn a_challenge_we_issued_is_refused_when_received() {
+        let t0 = Instant::now();
+        let current = vec![4u8; 32];
+        let mut r = Retired::default();
+        r.retire(vec![5u8; 32], t0);
+        let ours = [current.as_slice()];
+        // Our current nonce, echoed back.
+        assert_eq!(
+            accept_peer_nonce(&current, ours, [&r]),
+            Err(REFLECTED_CHALLENGE)
+        );
+        // A retired one, echoed back.
+        assert_eq!(accept_peer_nonce(&[5u8; 32], ours, [&r]), Err(REFLECTED_CHALLENGE));
+        // A nonce the peer chose is kept.
+        assert_eq!(accept_peer_nonce(&[6u8; 32], ours, [&r]), Ok(()));
+        // Refused means nothing is bound from it: the only binding we would
+        // sign is over a kept peer nonce, and there is none.
+        assert!(accept_peer_nonce(&current, ours, [&r]).is_err());
+    }
+
+    #[test]
+    fn a_hello_carrying_our_own_key_is_ours() {
+        let own = [8u8; 32];
+        assert!(is_own_device(&own, Some(own)));
+        assert!(!is_own_device(&[9u8; 32], Some(own)));
+        assert!(!is_own_device(&own, None));
     }
 
     #[test]

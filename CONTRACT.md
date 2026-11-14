@@ -349,17 +349,27 @@ Challenge lifecycle (no exporter):
   10 s, at most two per peer, and only combined with the CURRENT link's
   fingerprint pair. It is never used to sign.
 - **Signing.** Every outgoing `fleet-hello` and `l3-announce` is signed over the
-  peer's nonce for the installed transport; with none held, nothing is signed.
+  peer's challenge for the installed transport; with none held, nothing is
+  signed.
+- **Reflected challenges.** A received `l3-nonce` equal to a nonce this side
+  issued (current or retired; a daemon checks every link, a one-shot its own) is refused: it is not stored and
+  nothing is signed over it. The refusal is logged with the stable reason
+  `reflected-challenge`.
+- **Own key.** A verified `fleet-hello` whose device key is this device's own
+  key is refused before admission, reason `own-device-key`.
+- **Announces.** An `l3-announce` is verified against the current nonce only,
+  not a retired one. One signed over a retired nonce is dropped; the peer
+  re-announces after the next verified hello. (Known limitation.)
 
-Why this admits no replay: a binding is recomputed per verification from the
-link the message ARRIVED on (its exporter, or its DTLS fingerprint pair) and a
-nonce the verifier itself chose. A message captured on another link carries a
-binding over that link's fingerprints and fails here, whichever nonce it used.
-A message captured earlier on the SAME link was signed over a nonce that is
-either current (the same session, which the binding already ties it to) or
-retired, and a retired nonce expires after 10 s and was chosen by the verifier,
-so a third party cannot pick it. Retrying re-sends a value already sent in the
-clear on the same link, so it reveals nothing new.
+What a verified binding establishes: that the message was signed for THIS link
+(its exporter, or its DTLS fingerprint pair, recomputed from the link it
+arrived on) and over a nonce the verifier chose (current, or retired within its
+10 s TTL). It does not by itself establish that the PEER produced the message.
+Admission additionally requires that, and the reflection and own-key refusals
+above are what enforce it. Retrying re-sends a value already sent in the clear
+on the same link. Challenge roles are not yet domain-separated in the binding
+hash; that is a planned change and will alter the bytes signed on WebRTC
+links.
 
 This changed what a `fleet-hello` / `l3-announce` signs on WebRTC links (it was
 the bare nonce). Pre-launch, so a mixed-version pair over WebRTC simply fails

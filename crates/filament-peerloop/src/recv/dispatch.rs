@@ -6054,6 +6054,38 @@ async fn recv_run(
                 #[cfg(feature = "mesh")]
                 Some("l3-nonce") => {
                     match v["nonce"].as_str().map(unb64) {
+                        // A challenge is answered only when the peer chose it:
+                        // one equal to a nonce we issued is refused and nothing
+                        // is bound or signed from it (recv/fleet_bind.rs).
+                        Some(Ok(nonce))
+                            if nonce.len() >= 16
+                                && fleet_bind::accept_peer_nonce(
+                                    &nonce,
+                                    bind_ours.values().map(|n| n.as_slice()),
+                                    bind_retired.values(),
+                                )
+                                .is_err() =>
+                        {
+                            fleet_step(
+                                log.as_ref(),
+                                daemon,
+                                fleet_trace.as_deref(),
+                                &conn,
+                                &pid,
+                                "ignored",
+                                fleet_bind::REFLECTED_CHALLENGE,
+                                "none",
+                                "none",
+                            );
+                            fleet_hello_note(
+                                log.as_ref(),
+                                fleet_trace.as_deref(),
+                                &format!(
+                                    "fhello-bind pid={pid} event=challenge-refused why={}",
+                                    fleet_bind::REFLECTED_CHALLENGE
+                                ),
+                            );
+                        }
                         Some(Ok(nonce)) if nonce.len() >= 16 => {
                             if ports.identity.fleet_rv().is_some() {
                                 fleet_step(
@@ -6210,7 +6242,45 @@ async fn recv_run(
                                     ));
                                 }
                             }
+                            #[cfg(feature = "mesh")]
+                            let own_device_pub: Option<[u8; 32]> = host.overlay_pubkey().ok();
+                            #[cfg(not(feature = "mesh"))]
+                            let own_device_pub: Option<[u8; 32]> = None;
                             match verdict {
+                                // A verified hello carrying this device's own key
+                                // is never admitted as a peer.
+                                Ok(ok) if fleet_bind::is_own_device(&ok.device_pub, own_device_pub) => {
+                                    fleet_unlisted_hellos.remove(&pid);
+                                    log.debug(&format!(
+                                        "fleet-hello from {pid} refused: {}",
+                                        fleet_bind::OWN_DEVICE_KEY
+                                    ));
+                                    fleet_hello_note(
+                                        log.as_ref(),
+                                        fleet_trace.as_deref(),
+                                        &format!(
+                                            "fhello-verdict {fhello_ctx} outcome=refused why={} dev={}",
+                                            fleet_bind::OWN_DEVICE_KEY,
+                                            hex::encode(ok.device_pub)
+                                        ),
+                                    );
+                                    fleet_step(
+                                        log.as_ref(),
+                                        daemon,
+                                        fleet_trace.as_deref(),
+                                        &conn,
+                                        &pid,
+                                        "refused",
+                                        fleet_bind::OWN_DEVICE_KEY,
+                                        hello_cb,
+                                        &hex::encode(ok.device_pub)[..16],
+                                    );
+                                    fleet_pending.remove(&pid);
+                                    fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
+                                    // Drop first: its close releases a sync task parked in a write.
+                                    conn.drop_link(&pid);
+                                    sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
+                                }
                                 Ok(ok)
                                     if sibling_link
                                         && !ports.identity.device_cert_revoked(&ok.device_pub)
@@ -10576,10 +10646,11 @@ fn nonce_binding(
 }
 
 /// The binding an OUTGOING `fleet-hello` or `l3-announce` is signed over: the
-/// exporter, or the PEER's nonce for this link (CONTRACT.md: the signer uses
-/// the peer's nonce, the verifier its own). Every signing call site takes its
-/// binding from here, bound to a variable named `sign_cb`; the
-/// `signing_uses_the_peers_nonce` test holds the call sites to that.
+/// exporter, or the nonce held in the peer-nonce map for this link (CONTRACT.md:
+/// the signer uses the peer's challenge, the verifier its own). That map only
+/// receives nonces `fleet_bind::accept_peer_nonce` kept, never one we issued.
+/// Every signing call site takes its binding from here, bound to a variable
+/// named `sign_cb`; the `signing_call_sites` tests hold the call sites to that.
 fn signing_binding(
     t: &Arc<dyn Transport>,
     pid: &str,
@@ -12268,7 +12339,7 @@ async fn lan_ownership(
 /// `signing_binding` over the peer's nonce map. The needles are built with
 /// `concat!` so this module never matches itself.
 #[cfg(test)]
-mod signing_uses_the_peers_nonce {
+mod signing_call_sites {
     const SRC: &str = include_str!("dispatch.rs");
     const HELLO: &str = concat!("make_fleet", "_hello(");
     const ANNOUNCE: &str = concat!("make", "_announce(");
@@ -12278,6 +12349,12 @@ mod signing_uses_the_peers_nonce {
     const SIGNING_FN: &str = concat!("fn signing", "_binding(");
     const THEIRS: &str = concat!("&bind", "_theirs");
     const OURS: &str = concat!("bind", "_ours");
+    const NONCE_ARM: &str = concat!("Some(\"l3", "-nonce\") =>");
+    const ACCEPT: &str = concat!("accept_peer", "_nonce(");
+    const STORE_THEIRS: &str = concat!("bind_theirs", ".insert(");
+    const HELLO_ARM: &str = concat!("Some(fleet::", "HELLO) =>");
+    const OWN_GUARD: &str = concat!("is_own", "_device(");
+    const ADMIT: &str = concat!("admit", "_fleet(");
 
     fn squash(s: &str) -> String {
         s.chars().filter(|c| !c.is_whitespace()).collect()
@@ -12321,7 +12398,7 @@ mod signing_uses_the_peers_nonce {
     }
 
     #[test]
-    fn every_sign_cb_comes_from_signing_binding_over_the_peers_nonce() {
+    fn every_sign_cb_comes_from_signing_binding_over_the_peer_nonce_map() {
         let flat = squash(SRC);
         let mut bound = 0;
         for (at, _) in flat.match_indices(BOUND) {
@@ -12345,8 +12422,30 @@ mod signing_uses_the_peers_nonce {
         }
     }
 
+    /// The l3-nonce arm refuses a challenge we issued BEFORE it can store it
+    /// as the peer's, and logs the stable reason.
     #[test]
-    fn signing_binding_reads_the_peers_nonce() {
+    fn a_reflected_challenge_is_refused_before_it_is_stored() {
+        let arm = SRC.find(NONCE_ARM).expect("l3-nonce arm");
+        let guard = arm + SRC[arm..].find(ACCEPT).expect("reflection guard in the l3-nonce arm");
+        let store = arm + SRC[arm..].find(STORE_THEIRS).expect("peer nonce stored");
+        assert!(guard < store, "the reflection guard must run before the nonce is stored");
+        let logged = &SRC[guard..store];
+        assert!(logged.contains("REFLECTED_CHALLENGE"), "the refusal is logged with its stable reason");
+    }
+
+    /// The fleet-hello arm refuses a hello carrying our own key BEFORE any
+    /// admission.
+    #[test]
+    fn our_own_key_is_refused_before_admission() {
+        let arm = SRC.find(HELLO_ARM).expect("fleet-hello arm");
+        let guard = arm + SRC[arm..].find(OWN_GUARD).expect("own-key guard in the fleet-hello arm");
+        let admit = arm + SRC[arm..].find(ADMIT).expect("admission in the fleet-hello arm");
+        assert!(guard < admit, "the own-key guard must precede admission");
+    }
+
+    #[test]
+    fn signing_binding_reads_the_peer_nonce_map() {
         let at = SRC.find(SIGNING_FN).expect("signing_binding exists");
         let body = &SRC[at..];
         let body = &body[..body.find("\n}\n").expect("function end")];
