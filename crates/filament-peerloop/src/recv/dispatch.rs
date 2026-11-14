@@ -5254,11 +5254,9 @@ async fn recv_run(
                 if peer_step(daemon, &from, "responder", r, log.as_ref())?.is_none() {
                     continue;
                 }
-                if conn.build_pending(&from) {
-                    conn.stage_signal(&v);
-                    continue;
-                }
-                conn.apply_signal(&from, data).await;
+                // Stage into a pending build, hold during a pending direct
+                // attempt (the offer is sent once per connection), else apply.
+                conn.deliver_sdp_signal(&v).await;
             }
             // rung-1: authenticated direct-QUIC won the race, adopt as a
             // pre-trusted Link, then funnel into the normal ChannelReady handler.

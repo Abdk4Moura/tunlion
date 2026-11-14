@@ -401,11 +401,9 @@ async fn run(
                 conn.ensure_responder(&from, &data)
                     .await
                     .map_err(|e| JoinFailure::Signaling(e.to_string()))?;
-                if conn.build_pending(&from) {
-                    conn.stage_signal(&v);
-                    continue;
-                }
-                conn.apply_signal(&from, data).await;
+                // Stage into a pending build, hold during a pending direct
+                // attempt (the offer is sent once per connection), else apply.
+                conn.deliver_sdp_signal(&v).await;
             }
             Ev::DirectReady(pid, transport, route) => {
                 if !matches!(

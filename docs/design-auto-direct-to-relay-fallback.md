@@ -29,9 +29,11 @@ Two failure modes need automatic fallback:
 2. **Stall timeout**: direct-QUIC is in the candidate race, ICE `checking`
    produces srflx candidates, but the nominated pair never completes within
    budget. Today the per-candidate budget (7s default,
-   TUNLION_L2_CANDIDATE_SECS) fires and rotates to the next signaling
-   candidate — but the direct race is never abandoned; the initiator just
-   re-attempts WebRTC to the same peer.
+   TUNLION_L2_CANDIDATE_SECS) rotates only a candidate that has sent nothing;
+   one that has answered (any signal, or ICE with a remote description or
+   checking) is left to the 15s C3 watchdog, which then rotates it. The direct
+   race is never abandoned; the initiator just re-attempts WebRTC to the same
+   peer.
 
 The unifying trigger: **L2 stream not acknowledged within T_fallback** after
 `DirectReady` is received.
