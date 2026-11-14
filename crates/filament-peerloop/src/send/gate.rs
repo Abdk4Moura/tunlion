@@ -113,8 +113,12 @@ pub fn admit_delivery_ack(
     };
     let o = &mut outgoing[index];
     let was_settled = o.acked;
-    o.acked = true;
-    o.done = true;
+    // Only the first ack settles a file; a repeat leaves a file the sender
+    // has since reopened as it is.
+    if !was_settled {
+        o.acked = true;
+        o.done = true;
+    }
     AnswerEffect::Applied { index, was_settled }
 }
 
@@ -194,6 +198,13 @@ mod tests {
                 admit_delivery_ack(use_code, holds, &mut out, "f1"),
                 AnswerEffect::Applied { index: 0, was_settled: true }
             );
+            // A file the sender reopened after its ack stays open on a repeat.
+            out[0].done = false;
+            assert_eq!(
+                admit_delivery_ack(use_code, holds, &mut out, "f1"),
+                AnswerEffect::Applied { index: 0, was_settled: true }
+            );
+            assert!(!out[0].done);
         }
     }
 
