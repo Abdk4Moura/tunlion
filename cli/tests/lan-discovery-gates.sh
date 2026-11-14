@@ -295,15 +295,19 @@ run_scenario() {
     cls=$("$PYV" -I -c 'import json,sys; v=json.load(sys.stdin); print([i["class"] for i in v["lan"]["interfaces"] if i["name"]=="wg0"])' < "$WORK/doctor-wg.out" 2>&1)
     if [ "$cls" = "['p2p']" ]; then ok "wg/p2p-class: doctor classes the $TUNNEL tunnel p2p by its flags"; else
       bad "wg/p2p-class: doctor said $cls"
-      # Failure-only evidence: how the doctor run ended and what it printed.
-      echo "  doctor: rc=$drc in ${dsecs}s"
-      echo "  doctor stdout (first 4000 bytes, top-level keys first):"
-      "$PYV" -I -c 'import json,sys
-try: print("    keys:", sorted(json.load(sys.stdin)))
-except Exception as e: print("    not one JSON document:", e)' < "$WORK/doctor-wg.out" 2>&1
-      head -c 4000 "$WORK/doctor-wg.out" | sed 's/^/    /'; echo
-      echo "  doctor stderr (last 40 lines):"
-      tail -n 40 "$WORK/doctor-wg.err" | sed 's/^/    /'
+      # Failure-only evidence: how the doctor run ended and the shape of what
+      # it printed. Structure only: the output can carry the configured
+      # server URL, so no free text from it is printed.
+      echo "  doctor: rc=$drc in ${dsecs}s, stdout $(wc -c < "$WORK/doctor-wg.out") bytes, stderr $(wc -l < "$WORK/doctor-wg.err") lines"
+      "$PYV" -I -c 'import json,re,sys
+tok = lambda v: v if isinstance(v, str) and re.fullmatch(r"[a-z0-9_-]{1,40}", v) else ("<int %d>" % v if isinstance(v, int) and not isinstance(v, bool) else "<%s>" % type(v).__name__)
+try: v = json.load(sys.stdin)
+except Exception as e: print("  doctor stdout: not one JSON document (%s)" % type(e).__name__); sys.exit(0)
+if not isinstance(v, dict): print("  doctor stdout: JSON %s, not an object" % type(v).__name__); sys.exit(0)
+print("  doctor stdout keys:", sorted(tok(k) for k in v))
+print("  doctor kind:", tok(v.get("kind")), "has lan:", "lan" in v)
+e = v.get("error")
+if isinstance(e, dict): print("  doctor error: code", tok(e.get("code")), "exit", tok(e.get("exit")), "signal", tok(e.get("signal")))' < "$WORK/doctor-wg.out" 2>&1 | head -n 6
     fi
   fi
   if [ "$name" = lan ]; then
