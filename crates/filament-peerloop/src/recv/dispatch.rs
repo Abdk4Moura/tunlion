@@ -247,19 +247,35 @@ pub enum LinkedFleetOffer {
 /// offer names a meeting place (`ch`) that is exactly this fleet's channel,
 /// and the link is fleet-shaped (`recv::fleet::shaped_link`). A `ch`-less
 /// unicast offer and an offer for any other channel keep the old behavior.
+///
+/// A peer we saw ON THE FLEET CHANNEL counts as fleet-shaped here even when
+/// its link still carries a pair expectation. The two ends can file the same
+/// peer under different relationships: the peer still holds us as a paired
+/// device while we forgot it, so its link keeps the pair expectation, the
+/// link was never fleet-shaped, the fleet direct was never armed on either
+/// end, and the peer sat with no transport at all until the silence watchdog
+/// tore the link down. The fleet relationship is the certificate-proven one,
+/// so it wins here.
+///
+/// Arming grants NO authority: the link stays fleet-pending until the fleet
+/// hello verifies, and that verification is where a revoked or forgotten
+/// device is refused. A peer that was never seen on the fleet channel is not
+/// fleet-pending, so a pair-only peer keeps the old behaviour, and a pending
+/// still wins earlier, because a pending is fed, not armed.
 pub fn linked_fleet_offer_action(
     has_link: bool,
     has_pending: bool,
     offer_ch: Option<&str>,
     fleet_ch: Option<&str>,
     link_is_fleet_shaped: bool,
+    peer_is_fleet_pending: bool,
     my_id: &str,
     pid: &str,
 ) -> LinkedFleetOffer {
     if has_pending {
         return LinkedFleetOffer::Feed;
     }
-    if !has_link || !link_is_fleet_shaped {
+    if !has_link || !(link_is_fleet_shaped || peer_is_fleet_pending) {
         return LinkedFleetOffer::Buffer;
     }
     let on_fleet_channel = match (offer_ch, fleet_ch) {
@@ -329,6 +345,46 @@ async fn refuse_unrecognized_dial(sio: &filament_signal::Client, pid: &str, log:
     log.debug(&format!(
         "refused a dial from {pid}: a device forgotten here"
     ));
+}
+
+/// The honest "not recognized" answer for a peer that dials on a meeting place
+/// we forgot or revoked.
+///
+/// The peer is waiting for this answer, and the truth does not change because
+/// we still hold a link to it: a stale link used to suppress the answer, so
+/// the forgotten device appeared, never connected, and said nothing about the
+/// owner. Only a live direct pending suppresses the answer: that means we are
+/// dialing this peer right now on the same credential, so its offer is part
+/// of our own race rather than a claim to be admitted.
+///
+/// The answer is a refusal over signaling: it builds no link and grants no
+/// authority, so a peer that gets it cannot use it as a second path.
+///
+/// `_has_link` is deliberately NOT consulted: a stale link must not swallow
+/// the answer. It stays in the signature so the rule is stated in one place
+/// and the tests can say "a link exists" out loud.
+pub fn refuse_forgotten_dial(
+    has_direct_pending: bool,
+    _has_link: bool,
+    offer_channel_forgotten: bool,
+) -> bool {
+    offer_channel_forgotten && !has_direct_pending
+}
+
+/// One fleet arm per peer per window.
+///
+/// The fleet arm sites are driven by repeated events: the server re-pushes the
+/// roster on every sync tick, and a sibling re-offers its transport every
+/// ~1.2 s. Each arm starts a direct attempt, and a retired attempt leaves a
+/// tombstone in the retirement drain, which is bounded (16). Armed without a
+/// bound, a handful of peers fill that drain in seconds and then EVERY direct
+/// attempt fails closed ("retirement drain capacity full"), which reads as
+/// "can't reach the tunlion server" on the whole fleet.
+pub fn fleet_arm_allowed(last_armed_at: Option<Instant>, now: Instant, cooldown: Duration) -> bool {
+    match last_armed_at {
+        Some(at) => now.duration_since(at) >= cooldown,
+        None => true,
+    }
 }
 
 /// The outcome of ONE peer's step (adopt, answer, a control reply) inside the
@@ -2358,6 +2414,10 @@ async fn recv_run(
     // Links already reported by the unverified watchdog, by (pid, generation).
     let mut fleet_unverified_said: HashSet<(String, u32)> = HashSet::new();
     let mut fleet_pending: std::collections::HashSet<String> = Default::default();
+    // When we last armed a fleet direct for a peer, so the arm sites (the
+    // roster push and the sibling's repeated transport-offer) cannot start an
+    // unbounded number of direct attempts and fill the retirement drain.
+    let mut fleet_arm_at: std::collections::HashMap<String, Instant> = Default::default();
     let mut fleet_verified: std::collections::HashSet<String> = Default::default();
     // Offers that arrived while this link's `fleet-hello` was still in flight.
     // Verification is MUTUAL and the two directions are not synchronized: the
@@ -5149,8 +5209,13 @@ async fn recv_run(
                 }) {
                     // A device forgotten here, dialing the meeting place it still
                     // finds us on: tell it, rather than leave it waiting.
+                    //
+                    // A stale link for that peer must NOT swallow the answer:
+                    // the peer is waiting for it, and the truth does not change
+                    // because we still hold a link to it.
                     if let Some(pid) = v["id"].as_str().filter(|p| !p.is_empty()) {
-                        if !conn.links.contains_key(pid) {
+                        let has_link = conn.links.contains_key(pid);
+                        if refuse_forgotten_dial(false, has_link, true) {
                             refuse_unrecognized_dial(&sio, pid, log.as_ref()).await;
                         }
                     }
@@ -5223,7 +5288,23 @@ async fn recv_run(
                     // so exactly one dials and the other accepts.
                     if conn.my_id < pid {
                         if let Some(rv) = ports.identity.fleet_rv() {
-                            conn.start_direct_fleet(&pid, &rv).await;
+                            // Bounded: one arm per peer per window. The roster
+                            // is re-pushed on every sync tick, and each arm
+                            // starts a direct attempt that can be retired into
+                            // the bounded retirement drain.
+                            let now = Instant::now();
+                            if fleet_arm_allowed(
+                                fleet_arm_at.get(&pid).copied(),
+                                now,
+                                FLEET_ARM_COOLDOWN,
+                            ) {
+                                fleet_arm_at.insert(pid.clone(), now);
+                                conn.start_direct_fleet(&pid, &rv).await;
+                            } else {
+                                log.debug(&format!(
+                                    "fleet: arm for {pid} skipped, armed recently"
+                                ));
+                            }
                         }
                     }
                     let r = conn.maybe_adopt(&v, true).await;
@@ -5298,13 +5379,21 @@ async fn recv_run(
                     }
                     // A dial on the meeting place of a device forgotten here: it
                     // can never be matched, so refuse it now, by name.
-                    if !conn.direct_pending.contains_key(&from)
-                        && !conn.links.contains_key(&from)
-                        && data["ch"].as_str().is_some_and(|c| {
+                    //
+                    // The answer is owed REGARDLESS of the link we still hold
+                    // for that peer: a stale link used to suppress it, so the
+                    // peer waited out its whole window for an answer that was
+                    // already true. Only a live direct pending suppresses it:
+                    // that means we are dialing this peer right now, on the same
+                    // credential, so the offer is part of our own race.
+                    if refuse_forgotten_dial(
+                        conn.direct_pending.contains_key(&from),
+                        conn.links.contains_key(&from),
+                        data["ch"].as_str().is_some_and(|c| {
                             forgotten_channels.contains(c)
                                 || revoked_secrets.iter().any(|s| host.channel_of(s) == c)
-                        })
-                    {
+                        }),
+                    ) {
                         refuse_unrecognized_dial(&sio, &from, log.as_ref()).await;
                         continue;
                     }
@@ -5367,12 +5456,21 @@ async fn recv_run(
                         if !conn.direct_pending.contains_key(&from) && cfg!(feature = "fleet") {
                             if let Some(rv) = ports.identity.fleet_rv() {
                                 let fleet_ch = host.channel_of(&rv);
+                                // `fleet_pending` is the evidence: this peer was
+                                // seen on the fleet channel, which is derived
+                                // from the fleet secret, so the offer below can
+                                // only be the fleet relationship. Arming the
+                                // direct grants nothing: the link stays
+                                // fleet-pending until the certificate hello
+                                // verifies, and that is where a revoked peer is
+                                // refused.
                                 let action = linked_fleet_offer_action(
                                     conn.links.contains_key(&from),
                                     conn.direct_pending.contains_key(&from),
                                     data["ch"].as_str(),
                                     Some(fleet_ch.as_str()),
                                     crate::recv::fleet::shaped_link(&conn, &from, Some(rv.as_str())),
+                                    fleet_pending.contains(&from),
                                     conn.my_id.as_str(),
                                     from.as_str(),
                                 );
@@ -5380,15 +5478,33 @@ async fn recv_run(
                                     action,
                                     LinkedFleetOffer::ArmDial | LinkedFleetOffer::ArmAnswer
                                 ) {
-                                    log.debug(&format!(
-                                        "fleet: arming direct for linked sibling {from}'s transport-offer ({})",
-                                        if action == LinkedFleetOffer::ArmDial {
-                                            "dialer"
-                                        } else {
-                                            "answer"
-                                        }
-                                    ));
-                                    conn.start_direct_fleet(&from, &rv).await;
+                                    // Bounded: one arm per peer per window. The
+                                    // sibling re-offers every ~1.2 s, and each
+                                    // arm starts a direct attempt that can be
+                                    // retired into the bounded retirement
+                                    // drain, which then refuses EVERY direct
+                                    // attempt for the whole session.
+                                    let now = Instant::now();
+                                    if fleet_arm_allowed(
+                                        fleet_arm_at.get(&from).copied(),
+                                        now,
+                                        FLEET_ARM_COOLDOWN,
+                                    ) {
+                                        fleet_arm_at.insert(from.clone(), now);
+                                        log.debug(&format!(
+                                            "fleet: arming direct for linked sibling {from}'s transport-offer ({})",
+                                            if action == LinkedFleetOffer::ArmDial {
+                                                "dialer"
+                                            } else {
+                                                "answer"
+                                            }
+                                        ));
+                                        conn.start_direct_fleet(&from, &rv).await;
+                                    } else {
+                                        log.debug(&format!(
+                                            "fleet: arm for {from} skipped, armed recently"
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -11038,6 +11154,9 @@ fn signing_binding(
 
 /// How often the unverified watchdog may speak: once per link, after this long.
 const FLEET_UNVERIFIED_SAY_SECS: u64 = 20;
+/// How long one fleet direct arm per peer is allowed to stand before the next
+/// arm site may start another attempt for that peer.
+const FLEET_ARM_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// The first 8 hex characters of a binding nonce. Nonces travel in the clear,
 /// so a prefix is safe to log; it lets two daemons' lines be matched up.
@@ -12449,7 +12568,11 @@ mod expiry_redrive_tests {
 /// buffered with "no pending yet", so the direct path never armed.
 #[cfg(test)]
 mod linked_fleet_offer_tests {
-    use super::{linked_fleet_offer_action as decide, LinkedFleetOffer};
+    use super::{
+        fleet_arm_allowed, linked_fleet_offer_action as decide, refuse_forgotten_dial,
+        LinkedFleetOffer,
+    };
+    use std::time::{Duration, Instant};
 
     const FLEET: &str = "chan-fleet";
     const LOW: &str = "sid-aaa";
@@ -12463,12 +12586,12 @@ mod linked_fleet_offer_tests {
     fn a_fleet_offer_on_a_shaped_link_with_no_pending_arms_one() {
         // We are the higher sid: the peer is the elected dialer, we answer.
         assert_eq!(
-            decide(true, false, Some(FLEET), Some(FLEET), true, HIGH, LOW),
+            decide(true, false, Some(FLEET), Some(FLEET), true, false, HIGH, LOW),
             LinkedFleetOffer::ArmAnswer
         );
         // We are the lower sid: we are the elected dialer.
         assert_eq!(
-            decide(true, false, Some(FLEET), Some(FLEET), true, LOW, HIGH),
+            decide(true, false, Some(FLEET), Some(FLEET), true, false, LOW, HIGH),
             LinkedFleetOffer::ArmDial
         );
     }
@@ -12483,7 +12606,7 @@ mod linked_fleet_offer_tests {
                 for shaped in [false, true] {
                     for ch in [None, Some(FLEET), Some("chan-pair")] {
                         assert_eq!(
-                            decide(has_link, true, ch, Some(FLEET), shaped, me, peer),
+                            decide(has_link, true, ch, Some(FLEET), shaped, false, me, peer),
                             LinkedFleetOffer::Feed,
                             "a pending peer was re-armed (link={has_link} shaped={shaped} ch={ch:?})"
                         );
@@ -12502,45 +12625,102 @@ mod linked_fleet_offer_tests {
         for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
             // ch-less unicast offer on a shaped link.
             assert_eq!(
-                decide(true, false, None, Some(FLEET), true, me, peer),
+                decide(true, false, None, Some(FLEET), true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // Another meeting place (a pair channel) on a shaped link.
             assert_eq!(
-                decide(true, false, Some("chan-pair"), Some(FLEET), true, me, peer),
+                decide(true, false, Some("chan-pair"), Some(FLEET), true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // An empty `ch` never matches, even against an empty fleet channel.
             assert_eq!(
-                decide(true, false, Some(""), Some(""), true, me, peer),
+                decide(true, false, Some(""), Some(""), true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // We are in no fleet.
             assert_eq!(
-                decide(true, false, Some(FLEET), None, true, me, peer),
+                decide(true, false, Some(FLEET), None, true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // No link to the peer: not this case (the one-shot and
             // known-device arms own it).
             assert_eq!(
-                decide(false, false, Some(FLEET), Some(FLEET), true, me, peer),
+                decide(false, false, Some(FLEET), Some(FLEET), true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             assert_eq!(
-                decide(false, false, Some(FLEET), Some(FLEET), false, me, peer),
+                decide(false, false, Some(FLEET), Some(FLEET), false, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // A link that is not fleet-shaped.
             assert_eq!(
-                decide(true, false, Some(FLEET), Some(FLEET), false, me, peer),
+                decide(true, false, Some(FLEET), Some(FLEET), false, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
         }
     }
 
+    /// A peer we saw on the FLEET CHANNEL is fleet-shaped for this decision
+    /// even when its link still carries a pair expectation. The two ends can
+    /// file the same peer under different relationships (the peer still holds
+    /// us as a paired device while we forgot it): the pair expectation kept
+    /// the link out of the fleet shape, so the fleet direct was never armed on
+    /// either end, the peer sat with no transport at all, and nothing was ever
+    /// refused or admitted. The fleet relationship is the certificate-proven
+    /// one and it wins here.
+    #[test]
+    fn a_fleet_pending_peer_arms_the_fleet_direct_despite_a_pair_expectation() {
+        for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
+            let want = if me < peer {
+                LinkedFleetOffer::ArmDial
+            } else {
+                LinkedFleetOffer::ArmAnswer
+            };
+            assert_eq!(
+                decide(true, false, Some(FLEET), Some(FLEET), false, true, me, peer),
+                want,
+                "a fleet-pending peer on a pair-shaped link was not armed (me={me})"
+            );
+        }
+    }
+
+    /// The fleet-pending escape does not reach past the other rules: a pending
+    /// is still fed, and an offer that does not name our fleet channel is
+    /// still buffered.
+    #[test]
+    fn the_fleet_pending_escape_respects_the_other_rules() {
+        // A pending peer is fed, never re-armed.
+        assert_eq!(
+            decide(true, true, Some(FLEET), Some(FLEET), false, true, HIGH, LOW),
+            LinkedFleetOffer::Feed
+        );
+        // Another meeting place (a pair channel) is still not the fleet one.
+        assert_eq!(
+            decide(true, false, Some("chan-pair"), Some(FLEET), false, true, HIGH, LOW),
+            LinkedFleetOffer::Buffer
+        );
+        // A ch-less unicast offer is still not the fleet one.
+        assert_eq!(
+            decide(true, false, None, Some(FLEET), false, true, HIGH, LOW),
+            LinkedFleetOffer::Buffer
+        );
+        // No link to the peer at all: not this case.
+        assert_eq!(
+            decide(false, false, Some(FLEET), Some(FLEET), false, true, HIGH, LOW),
+            LinkedFleetOffer::Buffer
+        );
+        // We are in no fleet, so there is no fleet channel to match.
+        assert_eq!(
+            decide(true, false, Some(FLEET), None, false, true, HIGH, LOW),
+            LinkedFleetOffer::Buffer
+        );
+    }
+
     /// The whole input space, so no combination slips between the rules:
-    /// arm iff link && !pending && ch == fleet channel (non-empty) && shaped,
-    /// feed iff pending, buffer otherwise; the arm's role is the sid order.
+    /// arm iff link && !pending && ch == fleet channel (non-empty) && (shaped
+    /// || the peer is fleet-pending), feed iff pending, buffer otherwise; the
+    /// arm's role is the sid order.
     #[test]
     fn the_decision_is_exhaustive() {
         let chans = [None, Some(""), Some(FLEET), Some("chan-pair")];
@@ -12549,31 +12729,100 @@ mod linked_fleet_offer_tests {
             for has_link in [false, true] {
                 for has_pending in [false, true] {
                     for shaped in [false, true] {
-                        for ch in chans {
-                            for fleet in fleets {
-                                let got = decide(has_link, has_pending, ch, fleet, shaped, me, peer);
-                                let on_fleet = ch.is_some_and(|c| !c.is_empty()) && ch == fleet;
-                                let want = if has_pending {
-                                    LinkedFleetOffer::Feed
-                                } else if has_link && shaped && on_fleet {
-                                    if me < peer {
-                                        LinkedFleetOffer::ArmDial
+                        for pending_fleet in [false, true] {
+                            for ch in chans {
+                                for fleet in fleets {
+                                    let got = decide(
+                                        has_link,
+                                        has_pending,
+                                        ch,
+                                        fleet,
+                                        shaped,
+                                        pending_fleet,
+                                        me,
+                                        peer,
+                                    );
+                                    let on_fleet =
+                                        ch.is_some_and(|c| !c.is_empty()) && ch == fleet;
+                                    let want = if has_pending {
+                                        LinkedFleetOffer::Feed
+                                    } else if has_link
+                                        && (shaped || pending_fleet)
+                                        && on_fleet
+                                    {
+                                        if me < peer {
+                                            LinkedFleetOffer::ArmDial
+                                        } else {
+                                            LinkedFleetOffer::ArmAnswer
+                                        }
                                     } else {
-                                        LinkedFleetOffer::ArmAnswer
-                                    }
-                                } else {
-                                    LinkedFleetOffer::Buffer
-                                };
-                                assert_eq!(
-                                    got, want,
-                                    "link={has_link} pending={has_pending} shaped={shaped} ch={ch:?} fleet={fleet:?} me={me}"
-                                );
+                                        LinkedFleetOffer::Buffer
+                                    };
+                                    assert_eq!(
+                                        got, want,
+                                        "link={has_link} pending={has_pending} shaped={shaped} fleet_pending={pending_fleet} ch={ch:?} fleet={fleet:?} me={me}"
+                                    );
+                                }
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    /// The honest "not recognized" answer is owed to a forgotten peer EVEN
+    /// WHILE we still hold a stale link to it. The link used to suppress the
+    /// answer, so the forgotten device appeared, never connected, and said
+    /// nothing about the owner: it waited out its whole window for a reply
+    /// that was already true.
+    #[test]
+    fn a_forgotten_peer_is_refused_despite_a_stale_link() {
+        assert!(
+            refuse_forgotten_dial(false, true, true),
+            "a stale link suppressed the honest refusal"
+        );
+    }
+    /// The refusal still does not fire for a peer that is not forgotten, and
+    /// a live direct pending (we are dialing that peer right now, on the same
+    /// credential) keeps the offer in our own race.
+    #[test]
+    fn the_refusal_fires_only_for_a_forgotten_channel() {
+        // Not forgotten: nothing to refuse.
+        assert!(!refuse_forgotten_dial(false, false, false));
+        assert!(!refuse_forgotten_dial(false, true, false));
+        // We are dialing this peer right now: its offer is part of our race.
+        assert!(!refuse_forgotten_dial(true, false, true));
+        assert!(!refuse_forgotten_dial(true, true, true));
+        // Forgotten, no pending, no link: the plain case still refuses.
+        assert!(refuse_forgotten_dial(false, false, true));
+    }
+
+    /// The fleet arm is bounded: one per peer per window. The arm sites are
+    /// event-driven (a roster push on every sync tick, a sibling re-offer
+    /// every ~1.2 s) and each arm starts a direct attempt, so an unbounded arm
+    /// fills the bounded retirement drain and then EVERY direct attempt fails
+    /// closed for the whole session.
+    #[test]
+    fn the_fleet_arm_is_bounded_per_peer() {
+        let start = Instant::now();
+        let cooldown = Duration::from_secs(5);
+        // A peer we never armed: allowed.
+        assert!(fleet_arm_allowed(None, start, cooldown));
+        // Armed just now: refused.
+        assert!(!fleet_arm_allowed(Some(start), start, cooldown));
+        // Still inside the window: refused.
+        assert!(!fleet_arm_allowed(
+            Some(start),
+            start + Duration::from_secs(4),
+            cooldown
+        ));
+        // The window has passed: allowed again.
+        assert!(fleet_arm_allowed(
+            Some(start),
+            start + Duration::from_secs(5),
+            cooldown
+        ));
     }
 }
 

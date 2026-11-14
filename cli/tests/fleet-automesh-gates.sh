@@ -359,5 +359,25 @@ else bad "gateH-panic: $(grep -iE 'panicked' "$WORK"/up*.log | head -3)"; fi
 
 echo
 echo "fleet-automesh-gates: $PASS passed, $FAIL failed (mixed=$MIXED)"
+# Failure-only, bounded evidence about the fixture backend. A gate that fails
+# with "Can't reach the tunlion server" says nothing about the product unless
+# we can show whether the BACKEND was alive: its process lifetime, whether it
+# was still listening, and its own last log lines. The verdict above is not
+# changed by any of this.
+if [ "$FAIL" != 0 ]; then
+  echo "## evidence: the fixture backend at the end of the run"
+  if [ -n "${BACKEND_PID:-}" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
+    echo "  backend: pid=$BACKEND_PID alive=yes started=$(cat "/proc/$BACKEND_PID/stat" 2>/dev/null | awk '{print $22}') lifetime=$(ps -o etime= -p "$BACKEND_PID" 2>/dev/null | tr -d ' ')"
+  else
+    echo "  backend: pid=${BACKEND_PID:-none} alive=no"
+  fi
+  if ss -tln 2>/dev/null | grep -q ":$PORT "; then
+    echo "  backend: listening=yes port=$PORT"
+  else
+    echo "  backend: listening=no port=$PORT"
+  fi
+  echo "  backend log (last 12 lines):"
+  tail -12 "$WORK/backend.log" 2>/dev/null | sed 's/^/    /' || echo "    (no backend log)"
+fi
 declare_known_red_summary
 [ "$FAIL" = 0 ]
