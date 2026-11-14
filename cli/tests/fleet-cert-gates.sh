@@ -568,14 +568,16 @@ PY
   [ "$rcI" = "124" ] && window_expired "I-$tag impostor exec" 60 "the refused exec did not return"
   echo "## (impostor $tag) refused=$refused attempted=$attempted victim=$victim_ok intact=$intact execref=$execref"
   # Whether the OWNER evaluated the impostor's OWN hello: an info-level
-  # `fleet ... step=<verdict>` line in the owner's log naming the impostor's
-  # device key, since this variant started. Direction-specific, unlike
-  # `attempted` (which the impostor's own log satisfies when IT admits a
-  # sibling). Reported, not asserted, until the NOT EXERCISED verdict lands.
+  # `fleet ... step=<verdict>` line in the OWNER's log (never the impostor's),
+  # since this variant started, whose `dev=` is the impostor's device-key
+  # prefix. The owner prints `dev=` only from the certificate carried by the
+  # hello it is judging, so the impostor admitting the real spoke (logged in
+  # the impostor's own log, with the spoke's key) cannot satisfy this. This is
+  # the NOT EXERCISED verdict below, kept separate from containment and refusal.
   local owner_eval=0 owner_steps=""
-  if [ -n "$MALLORY_PUB" ]; then
+  if printf '%s' "$MALLORY_PUB" | grep -qE '^[0-9a-f]{64}$'; then
     owner_steps=$(tail -n +"$((owner_log_from + 1))" "$WORK/up.log" 2>/dev/null \
-      | grep -E "fleet pid=[^ ]+ gen=[^ ]+ src=.* step=(verified|refused|held|ignored|dropped) .*dev=${MALLORY_PUB:0:16}" || true)
+      | grep -E "fleet pid=[^ ]+ gen=[^ ]+ src=[^ ]+ step=(verified|refused|held|ignored|dropped) reason=[^ ]+ cb=[^ ]+ dev=${MALLORY_PUB:0:16}\$" || true)
     [ -n "$owner_steps" ] && owner_eval=$(printf '%s\n' "$owner_steps" | wc -l)
   fi
   echo "## (impostor $tag) owner evaluated the impostor's own hello: $owner_eval ($(printf '%s\n' "$owner_steps" | grep -oE "step=[a-z]+ reason=[^ ]+" | sort | uniq -c | tr -s ' ' | tr '\n' ';'))"
@@ -609,6 +611,15 @@ PY
       dump_signaling "$WORK/up.log" "$WORK/up-$MALLORY-$tag.log" "$WORK/up-$SPOKE.log"
     fi
     bad "gateI-$tag: transplant refusal line absent (containment=$([ "$attempted$victim_ok$intact$execref" = "1111" ] && echo held || echo broken); no refusal emitted for this attempt)"
+  fi
+  # NOT EXERCISED is its own verdict, neither a pass nor a product failure:
+  # it says the scenario never reached the code under test, so the two
+  # verdicts above are vacuous for this variant. The workflow fails the step
+  # on any NOT-EXERCISED line and names it as such.
+  if [ "$owner_eval" -ge 1 ]; then
+    ok "gateI-$tag: exercised (the owner evaluated the impostor's own hello: $(printf '%s\n' "$owner_steps" | grep -oE "step=[a-z]+ reason=[^ ]+" | sort -u | tr '\n' ' '))"
+  else
+    echo "NOT-EXERCISED: gateI-$tag: the owner evaluated no fleet-hello carrying the impostor's key (${MALLORY_PUB:0:16}) in this variant, so containment and refusal above are vacuous"
   fi
 }
 say "I1: exact-name squat refused"
