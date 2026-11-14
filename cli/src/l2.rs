@@ -876,6 +876,27 @@ impl std::error::Error for WrongFleetDevice {}
 /// before saying it is offline. A live daemon answers the moment it sees us.
 const EXEC_SILENT_PEER: Duration = Duration::from_secs(15);
 
+/// Should the per-candidate establish timer leave this candidate alone?
+///
+/// The timer exists to rotate past GHOSTS: dead or wrong sids that never say a
+/// word. A candidate that has answered (any signal from its sid, or ICE that has
+/// a remote description or is checking) is a real peer still negotiating, and
+/// abandoning it rebuilds the connection the far end is answering, so the next
+/// attempt starts over against stale state. Such a candidate is left to the C3
+/// watchdog (`net::WATCHDOG_SECS`), whose own `Stuck` arrives once `age` has
+/// reached it and does rotate. A timer configured at or past the watchdog
+/// (`TUNLION_L2_CANDIDATE_SECS`) rotates exactly as before. A CONNECTED peer
+/// connection still waiting here (a fleet link waiting for its direct proof)
+/// gets no watchdog `Stuck`, so this timer stays its only bound and rotates it.
+fn keep_answering_candidate(
+    age: Duration,
+    heard: bool,
+    progressing: bool,
+    connected: bool,
+) -> bool {
+    !connected && age < Duration::from_secs(net::WATCHDOG_SECS) && (heard || progressing)
+}
+
 /// The one transient "waiting" line an `exec` may show. Created only after
 /// [`crate::ui::wait_status_enabled`] said a live, non-quiet, non-JSON TTY is
 /// watching, so a pipe never receives it. The delay is owned by the caller's
@@ -1034,7 +1055,10 @@ pub(crate) async fn bring_up_to_known(
     // never came up ("establishment timed out", reproduced live as a consistent
     // pop-os -> do-vm failure that 7s/12s established cleanly). Back to 7s, which
     // clears the real ICE time with margin; field-overridable via
-    // TUNLION_L2_CANDIDATE_SECS.
+    // TUNLION_L2_CANDIDATE_SECS. It rotates only a SILENT candidate: one that has
+    // answered keeps its connection until the C3 watchdog (a relayed or
+    // direct-fallback path can need longer than 7s, and rotating it threw away
+    // the connection the far end was answering).
     let candidate_secs: u64 = std::env::var("TUNLION_L2_CANDIDATE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1067,6 +1091,11 @@ pub(crate) async fn bring_up_to_known(
     // answered first, reported as "can't reach" even when the target was online
     // and would have refused or served the shell in milliseconds.
     let mut fleet = FleetDial::default();
+    // Sids that have sent us any signal (transport-offer, description,
+    // candidate): those are answering peers, not ghosts, and the per-candidate
+    // timer leaves them to the watchdog (`keep_answering_candidate`).
+    let mut heard_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut candidate_started = tokio::time::Instant::now();
 
     let spawn_timer = |pid: String, g: u32| {
         let tx = tx.clone();
@@ -1168,6 +1197,7 @@ pub(crate) async fn bring_up_to_known(
                     }
                 };
                 generation += 1;
+                candidate_started = tokio::time::Instant::now();
                 spawn_timer(pid.clone(), generation);
                 let p = Peer::connect(
                     pid.clone(),
@@ -1365,6 +1395,11 @@ pub(crate) async fn bring_up_to_known(
             }
             Ev::Signal(v) => {
                 heard_from_peer = true;
+                if let Some(from) = v["from"].as_str() {
+                    if heard_sids.len() < 64 || heard_sids.contains(from) {
+                        heard_sids.insert(from.to_string());
+                    }
+                }
                 let data = v["data"].clone();
                 // Item 3: a relayed `transport-offer` carries the peer's direct
                 // candidates. Do NOT hand it to the WebRTC `Peer`; instead consume
@@ -1579,10 +1614,28 @@ pub(crate) async fn bring_up_to_known(
             }
             Ev::Stuck(pid, g) => {
                 // Per-candidate timer (or the 15s watchdog) fired for the
-                // CURRENT attempt: drop it and rotate. The sid goes to the
-                // back of the queue, a slow-but-real peer gets retried, a
-                // ghost just cycles until the server evicts it.
+                // CURRENT attempt. A silent candidate (a ghost) is dropped and
+                // rotated: the sid goes to the back of the queue and just cycles
+                // until the server evicts it. One that is answering is kept
+                // until the watchdog's own Stuck (`keep_answering_candidate`).
                 if g == generation && peer.as_ref().is_some_and(|p| p.id == pid) {
+                    let (progressing, connected) = match peer.as_ref() {
+                        Some(p) => (p.establishing_progress().await, p.is_connected()),
+                        None => (false, false),
+                    };
+                    if keep_answering_candidate(
+                        candidate_started.elapsed(),
+                        heard_sids.contains(&pid),
+                        progressing,
+                        connected,
+                    ) {
+                        // DEBUG: the timer fired on a peer that is answering.
+                        crate::ui::debug(&format!(
+                            "tunlion: candidate answering (ice progress: {progressing}), keeping it; the {}s watchdog bounds it",
+                            net::WATCHDOG_SECS
+                        ));
+                        continue;
+                    }
                     let p = peer.take().unwrap();
                     p.mark_closed();
                     tokio::spawn(async move { p.close().await });
@@ -5774,6 +5827,35 @@ mod term_tests {
         for hostile in hostile_names {
             assert_eq!(effective_term(hostile), "xterm-256color", "{hostile:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod candidate_timer_tests {
+    use super::*;
+
+    /// The 7s timer rotates a candidate that never said a word (a ghost).
+    #[test]
+    fn a_silent_candidate_is_rotated() {
+        assert!(!keep_answering_candidate(Duration::from_secs(7), false, false, false));
+    }
+
+    /// It keeps one whose ICE is checking or whose answer was applied, and one
+    /// that has sent anything at all (its transport-offer), until the watchdog.
+    #[test]
+    fn an_answering_candidate_is_kept_until_the_watchdog() {
+        let at_timer = Duration::from_secs(7);
+        assert!(keep_answering_candidate(at_timer, false, true, false), "checking PC kept");
+        assert!(keep_answering_candidate(at_timer, true, false, false), "heard sid kept");
+        let at_watchdog = Duration::from_secs(net::WATCHDOG_SECS);
+        assert!(
+            !keep_answering_candidate(at_watchdog, true, true, false),
+            "the watchdog's own Stuck rotates even a progressing candidate"
+        );
+        assert!(
+            !keep_answering_candidate(at_timer, true, true, true),
+            "a connected PC gets no watchdog Stuck, so its timer still rotates it"
+        );
     }
 }
 
