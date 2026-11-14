@@ -12381,7 +12381,13 @@ async fn lan_ownership(
 /// `concat!` so this module never matches itself.
 #[cfg(test)]
 mod signing_call_sites {
-    const SRC: &str = include_str!("dispatch.rs");
+    /// This file, cut just before this module, so the scans below cannot
+    /// match their own needles, test names or messages.
+    const FULL: &str = include_str!("dispatch.rs");
+    fn src() -> &'static str {
+        let end = FULL.find(concat!("mod signing", "_call_sites")).expect("this module");
+        &FULL[..end]
+    }
     const HELLO: &str = concat!("make_fleet", "_hello(");
     const ANNOUNCE: &str = concat!("make", "_announce(");
     const SIGN_VAR: &str = concat!("&sign", "_cb");
@@ -12422,11 +12428,11 @@ mod signing_call_sites {
     }
 
     #[test]
-    fn every_signing_site_signs_over_signing_binding() {
+    fn every_signing_site_signs_over_the_peer_binding() {
         let mut sites = 0;
         for needle in [HELLO, ANNOUNCE] {
-            for (at, _) in SRC.match_indices(needle) {
-                let args = squash(call_args(SRC, at + needle.len() - 1));
+            for (at, _) in src().match_indices(needle) {
+                let args = squash(call_args(src(), at + needle.len() - 1));
                 assert!(
                     args.starts_with(SIGN_VAR),
                     "a signing call signs over `{args}`, not the peer-nonce binding (`sign_cb`)"
@@ -12442,7 +12448,7 @@ mod signing_call_sites {
 
     #[test]
     fn every_sign_cb_comes_from_signing_binding_over_the_peer_nonce_map() {
-        let flat = squash(SRC);
+        let flat = squash(src());
         let mut bound = 0;
         for (at, _) in flat.match_indices(BOUND) {
             let rest = &flat[at + BOUND.len()..];
@@ -12455,11 +12461,11 @@ mod signing_call_sites {
             bound += 1;
         }
         assert!(bound >= 5, "found only {bound} sign_cb bindings");
-        for (at, _) in SRC.match_indices(SIGNING_CALL) {
-            if SRC[..at].ends_with("fn ") {
+        for (at, _) in src().match_indices(SIGNING_CALL) {
+            if src()[..at].ends_with("fn ") {
                 continue;
             }
-            let args = call_args(SRC, at + SIGNING_CALL.len() - 1);
+            let args = call_args(src(), at + SIGNING_CALL.len() - 1);
             assert!(args.contains(THEIRS), "signing_binding called without the peer-nonce map: {args}");
             assert!(!args.contains(OURS), "signing_binding called with OUR nonce map: {args}");
         }
@@ -12469,11 +12475,11 @@ mod signing_call_sites {
     /// as the peer's, and logs the stable reason.
     #[test]
     fn a_reflected_challenge_is_refused_before_it_is_stored() {
-        let arm = SRC.find(NONCE_ARM).expect("l3-nonce arm");
-        let guard = arm + SRC[arm..].find(ACCEPT).expect("reflection guard in the l3-nonce arm");
-        let store = arm + SRC[arm..].find(STORE_THEIRS).expect("peer nonce stored");
+        let arm = src().find(NONCE_ARM).expect("l3-nonce arm");
+        let guard = arm + src()[arm..].find(ACCEPT).expect("reflection guard in the l3-nonce arm");
+        let store = arm + src()[arm..].find(STORE_THEIRS).expect("peer nonce stored");
         assert!(guard < store, "the reflection guard must run before the nonce is stored");
-        let logged = &SRC[guard..store];
+        let logged = &src()[guard..store];
         assert!(logged.contains("REFLECTED_CHALLENGE"), "the refusal is logged with its stable reason");
     }
 
@@ -12481,9 +12487,9 @@ mod signing_call_sites {
     /// admission.
     #[test]
     fn our_own_key_is_refused_before_admission() {
-        let arm = SRC.find(HELLO_ARM).expect("fleet-hello arm");
-        let guard = arm + SRC[arm..].find(OWN_GUARD).expect("own-key guard in the fleet-hello arm");
-        let admit = arm + SRC[arm..].find(ADMIT).expect("admission in the fleet-hello arm");
+        let arm = src().find(HELLO_ARM).expect("fleet-hello arm");
+        let guard = arm + src()[arm..].find(OWN_GUARD).expect("own-key guard in the fleet-hello arm");
+        let admit = arm + src()[arm..].find(ADMIT).expect("admission in the fleet-hello arm");
         assert!(guard < admit, "the own-key guard must precede admission");
     }
 
@@ -12493,10 +12499,10 @@ mod signing_call_sites {
     fn an_announce_carrying_our_own_key_is_dropped_before_routing() {
         let mut sites = 0;
         for needle in ANN_VERIFIES {
-            for (at, _) in SRC.match_indices(needle) {
-                let seq = at + SRC[at..].find(ACCEPT_SEQ).expect("sequence check after verify");
+            for (at, _) in src().match_indices(needle) {
+                let seq = at + src()[at..].find(ACCEPT_SEQ).expect("sequence check after verify");
                 assert!(
-                    SRC[at..seq].contains(OWN_GUARD),
+                    src()[at..seq].contains(OWN_GUARD),
                     "an announce verified at byte {at} reaches accept_seq without the own-key refusal"
                 );
                 sites += 1;
@@ -12507,8 +12513,8 @@ mod signing_call_sites {
 
     #[test]
     fn signing_binding_reads_the_peer_nonce_map() {
-        let at = SRC.find(SIGNING_FN).expect("signing_binding exists");
-        let body = &SRC[at..];
+        let at = src().find(SIGNING_FN).expect("signing_binding exists");
+        let body = &src()[at..];
         let body = &body[..body.find("\n}\n").expect("function end")];
         assert!(body.contains("theirs.get(pid)"));
         assert!(!body.contains("ours"));
