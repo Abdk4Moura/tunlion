@@ -157,6 +157,7 @@ on:
       - 'cli/tests/whoami-candidate-gates.sh'
       - 'cli/tests/warm-hold-idle-gates.sh'
       - 'cli/tests/lan-discovery-gates.sh'
+      - 'cli/tests/doctor_shape.py'
       - 'cli/tests/hostile-env-gates.sh'
       - 'cli/tests/reenrol-advice-gates.sh'
       - 'cli/tests/daemon-stop-gates.sh'
@@ -207,6 +208,12 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      # Cheap and first, outside the gates' PASS accounting: the helper that
+      # describes a failed lan-discovery class check must never echo the
+      # document's content (doctor_shape.py --self-test plants secrets).
+      - name: Doctor shape self-test
+        run: python3 -I cli/tests/doctor_shape.py --self-test
 
       - name: Run sccache
         uses: mozilla-actions/sccache-action@v0.0.9

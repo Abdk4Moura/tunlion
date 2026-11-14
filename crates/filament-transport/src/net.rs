@@ -1768,6 +1768,22 @@ pub struct Peer {
     turn_bridges: Option<Arc<crate::turn_bridge::TurnBridges>>,
 }
 
+/// The remote DTLS fingerprint a live connection may record next. A
+/// connection's DTLS certificate is fixed for its life (an ICE restart keeps
+/// it, a rebuild is a new connection), so once one is recorded, a description
+/// that names a different one, or none, is refused.
+fn next_remote_fingerprint(recorded: Option<&str>, offered: Option<String>) -> Result<Option<String>> {
+    match (recorded, offered.as_deref()) {
+        (Some(old), Some(new)) if old != new => Err(anyhow!(
+            "remote DTLS fingerprint changed on a live connection; description refused"
+        )),
+        (Some(_), None) => Err(anyhow!(
+            "remote description names no DTLS fingerprint on a live connection; description refused"
+        )),
+        _ => Ok(offered),
+    }
+}
+
 /// Extract `a=fingerprint:...` from an SDP (normalized uppercase hex).
 fn sdp_fingerprint(sdp: &str) -> Option<String> {
     sdp.lines()
@@ -2098,8 +2114,13 @@ impl Peer {
                     // Stale answer (e.g. to an offer this side abandoned).
                     return Ok(SignalOutcome::Handled);
                 }
-                self.fps.lock().await.1 = sdp_fingerprint(&desc.sdp);
+                let remote_fp = {
+                    let fps = self.fps.lock().await;
+                    next_remote_fingerprint(fps.1.as_deref(), sdp_fingerprint(&desc.sdp))?
+                };
                 self.pc.set_remote_description(desc).await?;
+                // Recorded only once the description is in force.
+                self.fps.lock().await.1 = remote_fp;
                 let pending = {
                     let mut st = self.state.lock().await;
                     st.has_remote = true;
@@ -2741,6 +2762,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_connection_keeps_its_remote_dtls_fingerprint() {
+        // First description records it.
+        assert_eq!(next_remote_fingerprint(None, Some("AA".into())).unwrap().as_deref(), Some("AA"));
+        // A renegotiation naming the same certificate is accepted.
+        assert_eq!(next_remote_fingerprint(Some("AA"), Some("AA".into())).unwrap().as_deref(), Some("AA"));
+        // Once recorded, a description without one is refused.
+        assert!(next_remote_fingerprint(Some("AA"), None).is_err());
+        // Before anything is recorded, a missing one records nothing.
+        assert_eq!(next_remote_fingerprint(None, None).unwrap(), None);
+        // A different certificate on the same connection is refused.
+        assert!(next_remote_fingerprint(Some("AA"), Some("BB".into())).is_err());
+    }
 
     struct StubTransport;
 

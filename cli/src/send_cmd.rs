@@ -49,7 +49,10 @@ use crate::session;
 use crate::shutdown;
 use crate::test_hooks;
 use crate::ui;
-use filament_peerloop::send::gate::{adopt_wants_active, code_peer_event_allowed, CodePeerEvent};
+use filament_peerloop::send::gate::{
+    admit_delivery_ack, admit_file_decline, adopt_wants_active, code_answer_admitted,
+    code_peer_event_allowed, remember_ack_effect, AnswerEffect, CodePeerEvent, RememberAck,
+};
 use crate::exit_codes::{self, ExitKind};
 use anyhow::{Context, Result, anyhow, bail};
 use filament_transfer::Outgoing;
@@ -763,9 +766,6 @@ pub(crate) async fn send_cmd(
     // local / known-device sends; only after the ephemeral PAKE confirms for the
     // code path. The agreed secret is then DISCARDED (never stored).
     let mut pake_done = !use_code;
-    // Said once: the confirmed receiver's link was rebuilt, so this code
-    // covers nothing on it any more (see `Conn::holds_code_authority`).
-    let mut code_rebuilt_said = false;
     // Interop / downgrade: a code-path peer that never runs the v2 ceremony is on
     // an older build. Once the channel is up, give the ceremony a bounded budget;
     // if it doesn't confirm, fail LOUDLY ("update to transfer securely") rather
@@ -1999,13 +1999,13 @@ pub(crate) async fn send_cmd(
                     }
                     // A code offers only on the link its ceremony confirmed (or
                     // that ceremony's own direct promotion), never on a rebuilt one.
+                    // Offers are bound to the code-authorized link.
                     if use_code && !conn.holds_code_authority(&pid).await {
-                        if pake_done && !code_rebuilt_said {
-                            code_rebuilt_said = true;
-                            ui::say(&ui::paint(
-                                ui::Tone::Warn,
-                                "  the connection to the receiver was rebuilt after the code was confirmed; nothing more is sent on this code. Run the send again for a FRESH code.",
-                            ));
+                        if pake_done {
+                            ui::clear_sticky();
+                            bail!(
+                                "transfer stopped: the connection to the receiver was rebuilt after the code was confirmed, so nothing more is sent on this code. Run the send again for a FRESH code."
+                            );
                         }
                         continue;
                     }
@@ -2360,12 +2360,21 @@ pub(crate) async fn send_cmd(
                 }
                 // C27: the human on the other side answered our remember offer.
                 Some("pair-keep-ack") => {
+                    let holds = !use_code || conn.holds_code_authority(&pid).await;
+                    let effect = remember_ack_effect(use_code, holds, v["ok"].as_bool());
+                    if effect == RememberAck::Ignore {
+                        ui::debug(&format!(
+                            "send: ignoring {} from {pid}: not the code's confirmed link",
+                            v["type"].as_str().unwrap_or_default()
+                        ));
+                        continue;
+                    }
                     remember_acked = true;
                     if let Some(name) = remembered_as.clone() {
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         crate::shared_defs::REMEMBER_ANSWERED
                             .store(true, std::sync::atomic::Ordering::Relaxed);
-                        if v["ok"].as_bool() == Some(false) {
+                        if effect == RememberAck::Remove {
                             devices_remove(&name)?;
                             crate::shared_defs::REMEMBER_STORED
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2438,7 +2447,9 @@ pub(crate) async fn send_cmd(
                 Some("file-accept") => {
                     // A code streams only to the confirmed session on a link
                     // its ceremony covers.
-                    if use_code && !conn.holds_code_authority(&pid).await {
+                    if use_code
+                        && !code_answer_admitted("file-accept", conn.holds_code_authority(&pid).await)
+                    {
                         ui::debug(&format!(
                             "send: ignoring file-accept from {pid}: not the code's confirmed link"
                         ));
@@ -2558,11 +2569,21 @@ pub(crate) async fn send_cmd(
                     });
                 }
                 Some("file-decline") => {
-                    answer_clock = Some(Instant::now());
-                    receiver_asking = false;
+                    let holds = !use_code || conn.holds_code_authority(&pid).await;
                     let id = v["id"].as_str().unwrap_or_default();
                     let mut out = outgoing.lock().await;
-                    if let Some(o) = out.iter_mut().find(|o| o.id == id) {
+                    let effect = admit_file_decline(use_code, holds, &mut out[..], id);
+                    if effect == AnswerEffect::Ignored {
+                        ui::debug(&format!(
+                            "send: ignoring {} from {pid}: not the code's confirmed link",
+                            v["type"].as_str().unwrap_or_default()
+                        ));
+                        continue;
+                    }
+                    answer_clock = Some(Instant::now());
+                    receiver_asking = false;
+                    if let AnswerEffect::Applied { index, was_settled } = effect {
+                        let o = &out[index];
                         // A refusal carries the receiver's reason: say it, in its
                         // words, instead of a bare "declined" that reads as a person
                         // saying no.
@@ -2575,7 +2596,7 @@ pub(crate) async fn send_cmd(
                                 // The typed reason and the sentence, for
                                 // `send --json` (files[].refusal, error.reason).
                                 crate::send_report::note_refused(id, v["reason"].as_str(), &why);
-                                if !o.done {
+                                if !was_settled {
                                     refused.push(format!("{}: {why}", o.name));
                                 }
                                 // The same remedy exec, forward and mount give
@@ -2594,13 +2615,24 @@ pub(crate) async fn send_cmd(
                                 ui::say(&format!("declined: {}", o.name))
                             }
                         }
-                        o.declined = true;
-                        o.done = true;
                     }
                 }
                 // The receiver parked the offer for a person's yes/no; silence
                 // from here on is someone deciding, so the no-answer clock stops.
                 Some("file-pending") => {
+                    // Acted on only from the code's confirmed link.
+                    if use_code
+                        && !code_answer_admitted(
+                            v["type"].as_str().unwrap_or_default(),
+                            conn.holds_code_authority(&pid).await,
+                        )
+                    {
+                        ui::debug(&format!(
+                            "send: ignoring {} from {pid}: not the code's confirmed link",
+                            v["type"].as_str().unwrap_or_default()
+                        ));
+                        continue;
+                    }
                     receiver_asking = true;
                     answer_clock = Some(Instant::now());
                 }
@@ -2611,18 +2643,26 @@ pub(crate) async fn send_cmd(
                 // it). This closes the loop the runner had to fake above the
                 // transport: the sender deterministically KNOWS it landed whole.
                 Some("delivery-ack") => {
-                    answer_clock = Some(Instant::now());
+                    let holds = !use_code || conn.holds_code_authority(&pid).await;
                     let id = v["id"].as_str().unwrap_or_default();
+                    let mut out = outgoing.lock().await;
+                    let effect = admit_delivery_ack(use_code, holds, &mut out[..], id);
+                    if effect == AnswerEffect::Ignored {
+                        ui::debug(&format!(
+                            "send: ignoring {} from {pid}: not the code's confirmed link",
+                            v["type"].as_str().unwrap_or_default()
+                        ));
+                        continue;
+                    }
+                    answer_clock = Some(Instant::now());
                     // Additive: a receiver that reports the name it stored the
                     // file under says so here; an older one omits it.
                     if let Some(stored) = v["stored"].as_str() {
                         crate::send_report::note_stored(id, stored);
                     }
-                    let mut out = outgoing.lock().await;
-                    if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-                        if !o.acked {
-                            o.acked = true;
-                            o.done = true;
+                    if let AnswerEffect::Applied { index, was_settled } = effect {
+                        let o = &out[index];
+                        if !was_settled {
                             // #262: THIS is the instant the bytes are known to be
                             // on the far side, so this is the interval the
                             // throughput line is entitled to divide by. Printing
