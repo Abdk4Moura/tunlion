@@ -313,6 +313,31 @@ jobs:
           WEBSHELL_BROWSER: webkit
         run: node frontend/tests/webshell-scroll.spec.cjs
 
+      # Clipboard: pinned Paste/Select, xterm paste semantics (CR, bracketed
+      # paste), bracket-marker stripping, review of multi-line/large pastes,
+      # the refused-read paste sheet, native paste on the terminal, the iPad
+      # hardware Cmd+V readonly lift, and Select mode copy. Chromium runs the
+      # Android + desktop profiles, WebKit the iPad + iPhone + desktop ones.
+      - name: webshell-clipboard (Chromium / Android + desktop)
+        run: node frontend/tests/webshell-clipboard.spec.cjs
+
+      - name: webshell-clipboard (WebKit / iPad + iPhone + desktop)
+        env:
+          WEBSHELL_BROWSER: webkit
+        run: node frontend/tests/webshell-clipboard.spec.cjs
+
+      # OSC 52 (tmux/vim yank -> device clipboard): write-only addon provider,
+      # query suppression (no reads, no PTY response), payload/control-character
+      # bounds, and the refused-write tap prompt whose trusted click performs
+      # the write. Same two engines and profiles as the clipboard gate.
+      - name: webshell-osc52 (Chromium / Android + desktop)
+        run: node frontend/tests/webshell-osc52.spec.cjs
+
+      - name: webshell-osc52 (WebKit / iPad + iPhone + desktop)
+        env:
+          WEBSHELL_BROWSER: webkit
+        run: node frontend/tests/webshell-osc52.spec.cjs
+
       # Screenshots are the evidence a browser actually rendered, rather than the
       # harness reporting on itself. Keep them when a gate fails.
       #

@@ -84,21 +84,6 @@ async function waitInputs(page, n, msg) {
     fail(`${msg}: ${e && e.message ? e.message : e}`);
   }
 }
-async function stubClipboard(page, { read = '' } = {}) {
-  await page.evaluate(({ read }) => {
-    window.__copied = null
-    Object.defineProperty(navigator, 'clipboard', {
-      configurable: true,
-      value: {
-        writeText: async (text) => { window.__copied = text; return true },
-        readText: async () => {
-          if (read === null) throw new Error('clipboard read denied')
-          return read
-        },
-      },
-    })
-  }, { read })
-}
 async function tapHostAt(page, x, y) {
   const host = page.locator('[data-testid="term-host"]');
   const box = await host.boundingBox();
@@ -414,53 +399,7 @@ function legacyWheel(code, col, row) {
     await page.close();
   }
 
-  // Clipboard: Copy puts the visible screen into the browser clipboard with a
-  // scope-specific confirmation. Paste uses a direct clipboard read when the
-  // browser allows it, and falls back to a real textarea + Insert when it does
-  // not (the iOS Safari case). No path pretends a blocked read succeeded.
-  {
-    const page = await openPage(browser);
-    await feed(page, HISTORY);
-    await stubClipboard(page, { read: '' });
-    await page.locator('[data-key="Copy"]').tap();
-    await page.waitForFunction(() => !!(window.__copied && window.__copied.length), null, { timeout: 5000 })
-      .catch(() => fail('Copy did not write to the browser clipboard'));
-    const copied = await page.evaluate(() => window.__copied);
-    if (!copied.includes('history line 140')) fail(`copied screen is missing the live line: ${JSON.stringify(copied.slice(-80))}`);
-    if (copied.includes('history line 001')) fail('copied screen unexpectedly contains off-screen history');
-    await page.waitForFunction(() => /copied (screen|selection)/.test((document.querySelector('[data-testid="term-toast"]') || {}).textContent || ''), null, { timeout: 3000 })
-      .catch(() => fail('Copy did not confirm what it copied'));
-    ok('copy: visible screen reached the browser clipboard with a scope confirmation');
-
-    await clearInputs(page);
-    await stubClipboard(page, { read: 'typed-from-clipboard\r' });
-    await page.locator('[data-key="Paste"]').tap();
-    await waitInputs(page, 1, 'direct clipboard paste did not reach the PTY');
-    eq((await inputs(page)).join(''), 'typed-from-clipboard\n', 'direct clipboard paste must send the clipboard text with normalized line endings');
-    ok('paste: direct clipboard read inserts the text once');
-
-    await clearInputs(page);
-    await stubClipboard(page, { read: null });
-    await page.locator('[data-key="Paste"]').tap();
-    await page.locator('[data-testid="paste-sheet"]').waitFor({ state: 'visible', timeout: 5000 })
-      .catch(() => fail('blocked clipboard read did not open the paste sheet'));
-    await page.locator('[data-testid="paste-input"]').fill('fallback paste\r');
-    await page.locator('[data-testid="paste-insert"]').click();
-    await waitInputs(page, 1, 'paste-sheet Insert did not reach the PTY');
-    // A textarea normalizes CR to LF; the sheet must forward its value exactly.
-    eq((await inputs(page)).join(''), 'fallback paste\n', 'paste sheet must insert exactly the typed text');
-    eq(await page.locator('[data-testid="paste-sheet"]').count(), 0, 'paste sheet did not close after Insert');
-    ok('paste: blocked clipboard read falls back to a real textarea and inserts once');
-
-    await clearInputs(page);
-    await page.locator('[data-key="Paste"]').tap();
-    await page.locator('[data-testid="paste-sheet"]').waitFor({ state: 'visible', timeout: 5000 });
-    await page.locator('[data-testid="paste-cancel"]').click();
-    eq(await page.locator('[data-testid="paste-sheet"]').count(), 0, 'paste sheet did not close on Cancel');
-    eq(await inputs(page), [], 'cancelling the paste sheet must send nothing');
-    ok('paste: Cancel closes the sheet without sending anything');
-    await page.close();
-  }
+  // Clipboard (copy, paste, Select mode) lives in webshell-clipboard.spec.cjs.
 
   // 12. Local recovery must not consume server stream slots. A healthy link
   // with an acked PTY gets repaints only; repeated Redraw/watchdog recovery
