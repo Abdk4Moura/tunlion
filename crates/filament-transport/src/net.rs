@@ -2795,7 +2795,9 @@ mod tests {
                 if line.contains(&construct) {
                     built.push((f.display().to_string(), n + 1, line.contains(&via_helper)));
                 }
-                if line.contains(&literal) {
+                // A struct literal starts its line; the helper's signature
+                // (`-> RTCConfiguration {`) does not.
+                if line.trim_start().starts_with(&literal) {
                     literals.push(format!("{}:{}", f.display(), n + 1));
                 }
             }
