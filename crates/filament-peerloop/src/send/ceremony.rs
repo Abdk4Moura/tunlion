@@ -365,6 +365,24 @@ impl Ceremony {
 
     pub fn temporary_role(&self) -> Option<TemporaryRole> { self.temporary.as_ref().map(|(_,role)|*role) }
 
+    /// The DTLS fingerprint pair `(mine, theirs)` this ceremony's confirmation
+    /// verified over, once (and only once) it confirmed and was not refused.
+    pub fn confirmed_fingerprints(&self) -> Option<(&str, &str)> {
+        if self.secret.is_none() || self.aborted.is_some() {
+            return None;
+        }
+        self.confirmed_fingerprints
+            .as_ref()
+            .map(|(mine, theirs)| (mine.as_str(), theirs.as_str()))
+    }
+
+    /// Did this ceremony confirm over exactly this transport? `mine`/`theirs`
+    /// are a link's DTLS fingerprints in the order `Peer::fingerprints` gives
+    /// them (ours, the peer's), the same order the confirmation bound.
+    pub fn confirmed_transport(&self, mine: &str, theirs: &str) -> bool {
+        self.confirmed_fingerprints() == Some((mine, theirs))
+    }
+
     fn decorate(&self, mut payload: Value) -> Value {
         if let Some((binding, role)) = &self.temporary {
             payload["purpose"] = json!("temporary-access-v1");
@@ -1378,5 +1396,36 @@ mod tests {
         new_cli.on_signal(&old, None);
         assert!(!new_cli.peer_acks_expose() && !new_cli.peer_will_expose(),
             "`exposes` without `expose_ack` is not the new protocol");
+    }
+
+    /// The confirmed transport is exactly the fingerprint pair the verified
+    /// confirmation bound, recorded only on verification. A later copy of the
+    /// peer's confirmation that verifies over DIFFERENT fingerprints (a rebuilt
+    /// link) is answered as a duplicate and adds no authority for that link.
+    #[test]
+    fn the_confirmed_transport_is_the_pair_the_confirmation_verified_over() {
+        let (mut a, mut b) = honest();
+        let a_msg = a.take_msg_payload().unwrap();
+        let b_msg = b.take_msg_payload().unwrap();
+        b.on_signal(&a_msg, None);
+        a.on_signal(&b_msg, None);
+        let a_conf = a.take_confirm_payload(A_FPS.0, A_FPS.1).unwrap();
+        // Before verification nothing is confirmed.
+        assert_eq!(b.confirmed_fingerprints(), None);
+        assert!(!b.confirmed_transport(B_FPS.0, B_FPS.1));
+        assert!(matches!(b.on_signal(&a_conf, Some(B_FPS)), Inbound::Consumed));
+        // Positive control: recorded on verify, in (mine, theirs) order.
+        assert!(b.secret().is_some());
+        assert_eq!(b.confirmed_fingerprints(), Some(B_FPS));
+        assert!(b.confirmed_transport(B_FPS.0, B_FPS.1));
+        assert!(!b.confirmed_transport(B_FPS.1, B_FPS.0), "the order is (mine, theirs)");
+        // The same K over a rebuilt link's fingerprints: it verifies, so it
+        // is answered, but the confirmed transport does not move.
+        let rebuilt: (&str, &str) = ("SHA-256 CC", "SHA-256 BB");
+        let a_conf_rebuilt = a.confirm_payload(rebuilt.0, rebuilt.1).unwrap();
+        let b_view = (rebuilt.1, rebuilt.0);
+        assert!(matches!(b.on_signal(&a_conf_rebuilt, Some(b_view)), Inbound::Reply(_)));
+        assert_eq!(b.confirmed_fingerprints(), Some(B_FPS));
+        assert!(!b.confirmed_transport(b_view.0, b_view.1));
     }
 }

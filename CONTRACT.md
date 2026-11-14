@@ -308,7 +308,8 @@ record, so re-keying a record in place would hand its grants to whoever sent
 the secret.
 
 - `pair-keep` is honoured only from the peer whose code ceremony (SPAKE2)
-  confirmed in this receive, and only with `--remember`.
+  confirmed in this receive, on the link that ceremony covers (see
+  "One code, one link" below), and only with `--remember`.
 - `pair-intro` is honoured only from a link that resolved to one of our
   records by pair-proof (`verified_name`), and only if that record was paired
   directly: a record created by `pair-intro` carries `introducedBy` and may not
@@ -410,6 +411,17 @@ single emit is load-bearing (C30):
   the first verification, and only that one can refuse the ceremony.
 - A receiver that has authenticated its sender keeps that one ceremony to
   answer re-sends; it still ignores PAKE traffic from every other peer.
+- **One code, one link.** A one-time code authorizes exactly one link, on both
+  sides: the ceremony peer's exact signaling sid and either the WebRTC link
+  whose DTLS fingerprint pair the confirmation MAC verified, or the direct QUIC
+  link published by the promotion attempt that ceremony armed with its secret.
+  A new sid, a matching install uid, or a rebuilt PeerConnection is never
+  covered, and an answered duplicate confirmation over other fingerprints adds
+  no link. On the receiver, file-offer acceptance, code consent,
+  identity-unavailable consent and `pair-keep` all require it. On the sender,
+  offering files, acting on a `file-accept` and offering `pair-keep` require
+  it. The covered session is recorded once at confirmation and never moves; a
+  rebuilt link needs a fresh code.
 
 ### Pairing certificates (`identity-expose`, `identity-expose-ack`)
 After a code pairing's key confirmation, a side that holds a device
