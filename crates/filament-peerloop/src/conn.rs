@@ -5592,27 +5592,6 @@ impl Conn {
         if !self.direct_ok {
             return;
         }
-        // The retirement drain is BOUNDED (MAX_RETIRED_ATTEMPTS), and a full
-        // drain refuses every new direct attempt for the whole session. So the
-        // check comes FIRST: before a QUIC endpoint is bound, before candidates
-        // are gathered (that includes an HTTP whoami), before a transport-offer
-        // is emitted, and before the 6x/1.2s re-emitter is spawned. Checked
-        // last, every refused attempt had already paid all of that and left a
-        // re-emitter running with a cancel flag on a pending that was never
-        // created: one stuck build became a session-wide outage and an
-        // unstoppable burst.
-        if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
-            // Liveness backstop for a lost drain event. Only a tombstone whose
-            // producer is terminal is reaped; a live producer keeps its slot
-            // and this attempt fails closed below.
-            self.reap_drained_tombstones(Instant::now());
-            if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
-                self.log.debug(&format!(
-                    "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
-                ));
-                return;
-            }
-        }
         // Browser peers announced `direct:false` before their SDP. There is no
         // QUIC stack on the other end, so arming the ladder would buy nothing
         // and cost the whole DIRECT_BUDGET before WebRTC is offered. CLI peers
@@ -5706,6 +5685,21 @@ impl Conn {
         // create).
         if intent == DirectIntent::Normal && self.has_live_transport(pid) {
             return; // already linked via a live transport
+        }
+
+        // Check before binding or emitting any direct attempt, but after the
+        // relay recovery and no-op paths above, which consume no drain capacity.
+        // Checked later (after the bind, the candidate gather, the offer emit
+        // and the re-emitter spawn) one refused attempt became a session-wide
+        // outage and an unstoppable burst.
+        if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
+            self.reap_drained_tombstones(Instant::now());
+            if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
+                self.log.debug(&format!(
+                    "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
+                ));
+                return;
+            }
         }
 
         // Check if target is same-machine peer (local transport).

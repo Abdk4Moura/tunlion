@@ -413,6 +413,25 @@ pub fn fleet_arm_skips_pair_link(
     }
 }
 
+/// Record the authenticated sender of a completed transfer so the warm tier
+/// can keep or reconnect it.
+///
+/// The completion sweep removes the stream from `by_sid`, so the later warm
+/// scan cannot name the sender that just finished; with another stream open it
+/// names the wrong peer instead. The certificate-proven name is the identity
+/// here; the link petname is the fallback for a pair link. Only ever called
+/// after a successful completion, never for a failed, truncated or refused
+/// transfer.
+fn note_completed_sender(conn: &mut Conn, pid: &str) {
+    let name = conn
+        .link(pid)
+        .map(|l| l.verified_name.clone().unwrap_or_else(|| l.name.clone()))
+        .filter(|n| !n.is_empty());
+    if let Some(name) = name {
+        conn.note_warm_use(&name);
+    }
+}
+
 /// What a binding epoch rotation does to the fleet standing.
 ///
 /// The binding moved, so what the OLD binding proved is stale. A fleet
@@ -421,17 +440,28 @@ pub fn fleet_arm_skips_pair_link(
 /// non-sibling forever (the reset to Delegated would never be undone).
 pub fn fleet_standing_after_rotation(
     verified: &mut std::collections::HashSet<String>,
+    verified_at: &mut std::collections::HashMap<String, fleet_bind::Epoch>,
     greeted: &mut std::collections::HashSet<String>,
     pending: &mut std::collections::HashSet<String>,
     pid: &str,
+    installed: Option<fleet_bind::Epoch>,
 ) -> bool {
-    if verified.remove(pid) {
-        greeted.remove(pid);
-        pending.insert(pid.to_string());
-        true
-    } else {
-        false
+    if !verified.contains(pid) {
+        return false;
     }
+    // Current, not stale: the peer rotated and greeted us before OUR rotation
+    // ran, and we verified it on the binding that is now installed. Clearing
+    // this would wait for a hello the peer has no reason to send again.
+    if let (Some(earned), Some(now)) = (verified_at.get(pid), installed) {
+        if *earned == now {
+            return false;
+        }
+    }
+    verified.remove(pid);
+    verified_at.remove(pid);
+    greeted.remove(pid);
+    pending.insert(pid.to_string());
+    true
 }
 
 /// The outcome of ONE peer's step (adopt, answer, a control reply) inside the
@@ -2466,6 +2496,12 @@ async fn recv_run(
     // unbounded number of direct attempts and fill the retirement drain.
     let mut fleet_arm_at: std::collections::HashMap<String, Instant> = Default::default();
     let mut fleet_verified: std::collections::HashSet<String> = Default::default();
+    // The binding epoch each verdict in `fleet_verified` was earned on. A
+    // verdict stamped with the installed epoch is current; one from an older
+    // binding is stale. Without the stamp, a rotation could clear a verdict the
+    // peer just earned by rotating first, and the peer (already greeted) has no
+    // reason to send another hello: the link would stay non-sibling forever.
+    let mut fleet_verified_at: HashMap<String, fleet_bind::Epoch> = HashMap::new();
     // Offers that arrived while this link's `fleet-hello` was still in flight.
     // Verification is MUTUAL and the two directions are not synchronized: the
     // sender proves US, then offers, and its offer can beat our verification of
@@ -4182,6 +4218,7 @@ async fn recv_run(
                         l2_muxes.remove(pid);
                         fleet_pending.remove(pid);
                         fleet_verified.remove(pid);
+                        fleet_verified_at.remove(pid);
                         fleet_greeted.remove(pid);
                         fleet_deferred_offers.retain(|(p, _, _)| p != pid);
                         unrouted.push(pid.clone());
@@ -4689,6 +4726,7 @@ async fn recv_run(
         // path, including future ones, starts the replacement unverified.
         fleet_pending.retain(|p| conn.links.contains_key(p));
         fleet_verified.retain(|p| conn.links.contains_key(p));
+        fleet_verified_at.retain(|p, _| conn.links.contains_key(p));
         fleet_greeted.retain(|p| conn.links.contains_key(p));
         bind_ours.retain(|p, _| conn.links.contains_key(p));
         bind_theirs.retain(|p, _| conn.links.contains_key(p));
@@ -4829,6 +4867,7 @@ async fn recv_run(
                     // binding exists to prevent.
                     fleet_pending.remove(&pid);
                     fleet_verified.remove(&pid);
+                    fleet_verified_at.remove(&pid);
                     fleet_greeted.remove(&pid);
                     // Deferred offers die with the link that carried them. A new
                     // link must re-prove on a NEW binding, so replaying an offer
@@ -6182,9 +6221,11 @@ async fn recv_run(
                     // new one, or it stays a non-sibling forever.
                     fleet_standing_after_rotation(
                         &mut fleet_verified,
+                        &mut fleet_verified_at,
                         &mut fleet_greeted,
                         &mut fleet_pending,
                         &pid,
+                        installed,
                     );
                     let cleared_ours = match bind_ours.remove(&pid) {
                         Some(old) => {
@@ -6900,6 +6941,15 @@ async fn recv_run(
                                 Ok(ok) => {
                                     fleet_unlisted_hellos.remove(&pid);
                                     let fresh = fleet_verified.insert(pid.clone());
+                                    if let Some(link) = conn.link(&pid) {
+                                        fleet_verified_at.insert(
+                                            pid.clone(),
+                                            fleet_bind::Epoch {
+                                                generation: link.generation,
+                                                source: link.source,
+                                            },
+                                        );
+                                    }
                                     // Overwritten below by the fresh-hello decision.
                                     let mut fhello_outcome =
                                         String::from("outcome=admitted why=repeat-hello-on-verified-link");
@@ -7298,6 +7348,7 @@ async fn recv_run(
                                     if ports.identity.device_cert_revoked(&broker.device_pub) =>
                                 {
                                     fleet_verified.remove(&pid);
+                                    fleet_verified_at.remove(&pid);
                                     revocation_sweep_now = true;
                                     log.debug(&format!(
                                         "fleet-rendezvous from {pid} refused: device revoked"
@@ -10133,6 +10184,7 @@ async fn recv_run(
                     if to_stdout {
                         stdout_delivered(&inc, &conn, &pid, sid, &report).await?;
                         st.completed += 1;
+                        note_completed_sender(&mut conn, &pid);
                         continue;
                     }
                     let id = inc.id.clone();
@@ -10186,6 +10238,7 @@ async fn recv_run(
                                 .await?
                                 {
                                     st.completed += 1;
+                                    note_completed_sender(&mut conn, &pid);
                                     // BUG-ACKLOSS reproducer: tear the link DOWN at the
                                     // instant the ack is due, so the sender never sees it and
                                     // its transport observes ApplicationClosed(0,""). In
@@ -10335,6 +10388,7 @@ async fn recv_run(
                         .await?
                         {
                             st.completed += 1;
+                            note_completed_sender(&mut conn, &pid);
                         }
                     }
                 }
@@ -10369,6 +10423,7 @@ async fn recv_run(
                     if to_stdout {
                         stdout_delivered(&inc, &conn, &pid, ack_sid, &report).await?;
                         st.completed += 1;
+                        note_completed_sender(&mut conn, &pid);
                         continue;
                     }
                     let id = inc.id.clone();
@@ -10422,6 +10477,7 @@ async fn recv_run(
                                 .await?
                                 {
                                     st.completed += 1;
+                                    note_completed_sender(&mut conn, &pid);
                                     // BUG-ACKLOSS reproducer: tear the link DOWN at the
                                     // instant the ack is due, so the sender never sees it and
                                     // its transport observes ApplicationClosed(0,""). In
@@ -10558,6 +10614,7 @@ async fn recv_run(
                         .await?
                         {
                             st.completed += 1;
+                            note_completed_sender(&mut conn, &pid);
                         }
                     }
                 }
@@ -12694,6 +12751,8 @@ mod linked_fleet_offer_tests {
         fleet_arm_allowed, fleet_arm_skips_pair_link, fleet_standing_after_rotation,
         linked_fleet_offer_action as decide, refuse_forgotten_dial, LinkedFleetOffer,
     };
+    use crate::recv::fleet_bind;
+    use filament_transport::net::SourceId;
     use std::time::{Duration, Instant};
 
     const FLEET: &str = "chan-fleet";
@@ -12976,10 +13035,27 @@ mod linked_fleet_offer_tests {
         let mut verified = std::collections::HashSet::new();
         let mut greeted = std::collections::HashSet::new();
         let mut pending = std::collections::HashSet::new();
+        let mut verified_at = std::collections::HashMap::new();
+        let old_epoch = fleet_bind::Epoch {
+            generation: 7,
+            source: SourceId::next(),
+        };
+        let new_epoch = fleet_bind::Epoch {
+            generation: 8,
+            source: SourceId::next(),
+        };
         verified.insert("sib".to_string());
         greeted.insert("sib".to_string());
+        verified_at.insert("sib".to_string(), old_epoch);
         assert!(
-            fleet_standing_after_rotation(&mut verified, &mut greeted, &mut pending, "sib"),
+            fleet_standing_after_rotation(
+                &mut verified,
+                &mut verified_at,
+                &mut greeted,
+                &mut pending,
+                "sib",
+                Some(new_epoch),
+            ),
             "the rotation did not drop the standing"
         );
         assert!(!verified.contains("sib"), "the stale standing survived");
@@ -12991,11 +13067,46 @@ mod linked_fleet_offer_tests {
         pending2.insert("other".to_string());
         assert!(!fleet_standing_after_rotation(
             &mut verified,
+            &mut verified_at,
             &mut greeted,
             &mut pending2,
-            "other"
+            "other",
+            Some(new_epoch),
         ));
         assert!(pending2.contains("other"), "the pending state was changed");
+    }
+
+    /// A verdict earned on the INSTALLED binding is current, not stale. The
+    /// peer rotates first and greets us; we verify it; our own rotation then
+    /// runs. Clearing that verdict would leave us waiting for a hello the peer
+    /// has no reason to send again.
+    #[test]
+    fn a_verdict_on_the_installed_binding_survives_our_rotation() {
+        let mut verified = std::collections::HashSet::new();
+        let mut verified_at = std::collections::HashMap::new();
+        let mut greeted = std::collections::HashSet::new();
+        let mut pending = std::collections::HashSet::new();
+        let installed = fleet_bind::Epoch {
+            generation: 9,
+            source: SourceId::next(),
+        };
+        verified.insert("sib".to_string());
+        greeted.insert("sib".to_string());
+        verified_at.insert("sib".to_string(), installed);
+        assert!(
+            !fleet_standing_after_rotation(
+                &mut verified,
+                &mut verified_at,
+                &mut greeted,
+                &mut pending,
+                "sib",
+                Some(installed),
+            ),
+            "a current verdict was dropped as stale"
+        );
+        assert!(verified.contains("sib"), "the current verdict was removed");
+        assert!(greeted.contains("sib"), "the greeting was cleared");
+        assert!(!pending.contains("sib"), "a hello was queued unnecessarily");
     }
 }
 
