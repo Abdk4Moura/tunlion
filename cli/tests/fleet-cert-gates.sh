@@ -358,7 +358,9 @@ SIGNED_AFTER=$(grep -c "ssh-ca: signed for '$SPOKE'" "$WORK/up.log")
 echo "## (ssh sign after revoke) rc=$rcE issuances=$SIGNED_BEFORE -> $SIGNED_AFTER"
 if [ "$rcE" != "0" ] \
    && ! grep -q "SHOULD-NOT-RUN" "$WORK/E.out" \
-   && tail -n +"$E_OWNER_START" "$WORK/up.log" | grep -qE "(ssh-sign refused: device revoked|shell bootstrap refused: $SPOKE: device revoked|ssh-sign refused: identity-not-proven)" \
+   && { tail -n +"$E_OWNER_START" "$WORK/up.log" | grep -qE "ssh-sign refused: device revoked|shell bootstrap refused: $SPOKE: device revoked" || \
+         { tail -n +"$E_OWNER_START" "$WORK/up.log" | grep -q "ssh-sign refused: identity-not-proven" && \
+           tail -n +"$E_OWNER_START" "$WORK/up.log" | grep -qE "fleet-hello from .* refused: device revoked \(device $SPOKE_KEY\)|fleet-rendezvous from .* refused: device revoked"; }; } \
    && [ "$SIGNED_AFTER" = "$SIGNED_BEFORE" ]; then
   ok "gateE: revoked certificate REFUSED shell --ssh and issued no certificate"
 else
