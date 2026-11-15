@@ -3,22 +3,22 @@
 class Tunlion < Formula
   desc "P2P file transfer between terminals and browsers - no upload, no account"
   homepage "https://tunlion.autumated.com"
-  version "0.9.3"
+  version "0.9.4"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.3/tunlion-aarch64-apple-darwin.tar.gz"
-      sha256 "1db0dc080ae5c557c993d4282a0433fb626b6b99f58bf546b53affe6c526396b"
+      url "https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.4/tunlion-aarch64-apple-darwin.tar.gz"
+      sha256 "d312974843fb23f6d7308af10b2cfa6e240267d53aad41089a7406b09450733b"
     else
-      url "https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.3/tunlion-x86_64-apple-darwin.tar.gz"
-      sha256 "ffd0c094cae0338c7ab443fd5ca77050795ca4ffc49f4bceab4703a71ca7fd40"
+      url "https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.4/tunlion-x86_64-apple-darwin.tar.gz"
+      sha256 "2b260f6ea3f9a8cf6e7821873335d442a0a2d48233d85b02a8e77a651f1952ef"
     end
   end
 
   on_linux do
-    url "https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.3/tunlion-x86_64-unknown-linux-musl.tar.gz"
-    sha256 "123a5c3f5ffab5cf04cca44b1df7ef0698a1463ddba7bffe9846ef927bc2ea8e"
+    url "https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.9.4/tunlion-x86_64-unknown-linux-musl.tar.gz"
+    sha256 "e53c14f8816250c792256ea1d4e9803a6ad9e4b3c58eb1ddd29a413ea1679669"
   end
 
   def install
