@@ -125,17 +125,17 @@ filament-id = { path = "../crates/filament-id", version = "0.1.3" }
 # Capability primitives + pure authorization evaluation. `crate::capability` and
 # `crate::ephemeral` re-export it; the host-bound orchestration (store I/O, mode
 # flag, observability counters, DeviceCert-reading glue) stays in those modules.
-filament-cap = { path = "../crates/filament-cap", version = "0.2.0" }
+filament-cap = { path = "../crates/filament-cap", version = "0.2.1" }
 filament-transfer = { package = "tunlion-transfer", path = "../crates/filament-transfer", version = "0.1.0" }
 filament-proto = { package = "tunlion-proto", path = "../crates/filament-proto", version = "0.1.0" }
 filament-overlay = { package = "tunlion-overlay", path = "../crates/filament-overlay", version = "0.1.0" }
-filament-fleet = { package = "tunlion-fleet", path = "../crates/filament-fleet", version = "0.1.0" }
+filament-fleet = { package = "tunlion-fleet", path = "../crates/filament-fleet", version = "0.2.0" }
 # The host-free policy of `cli/src/conn.rs` (warm-hold, liveness/route,
 # adoption, the petname rule), carved out in issue #465 slice 3 so the later move
 # of `Conn` itself is a `git mv`. Re-exported by `crate::conn`, so no call site
 # moved with it.
-filament-peerloop = { package = "tunlion-peerloop", path = "../crates/filament-peerloop", version = "0.1.1", default-features = false }
-filament-transport = { package = "tunlion-transport", path = "../crates/filament-transport", version = "0.1.1" }
+filament-peerloop = { package = "tunlion-peerloop", path = "../crates/filament-peerloop", version = "0.2.0", default-features = false }
+filament-transport = { package = "tunlion-transport", path = "../crates/filament-transport", version = "0.2.0" }
 tunlion-lan = { path = "../crates/tunlion-lan", version = "0.1.0" }
 hex = "0.4"
 rand_core = "0.6"
