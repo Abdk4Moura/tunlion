@@ -347,6 +347,7 @@ fi
 # turns "the flow stopped" into "no certificate for a revoked device exists",
 # and A3 is what makes that absence meaningful.
 say "E: the revoked spoke's shell --ssh is refused, and nothing is signed"
+E_OWNER_START=$(( $(wc -l < "$WORK/up.log") + 1 ))
 timeout 60 "${SSH_ENV[@]}" TUNLION_CONFIG_DIR="$DS" "$BIN" --server "$SERVER" \
   shell --ssh alpha -- 'echo SHOULD-NOT-RUN' >"$WORK/E.out" 2>"$WORK/E.err" </dev/null
 rcE=$?
@@ -354,7 +355,7 @@ SIGNED_AFTER=$(grep -c "ssh-ca: signed for '$SPOKE'" "$WORK/up.log")
 echo "## (ssh sign after revoke) rc=$rcE issuances=$SIGNED_BEFORE -> $SIGNED_AFTER"
 if [ "$rcE" != "0" ] \
    && ! grep -q "SHOULD-NOT-RUN" "$WORK/E.out" \
-   && grep -qE "(ssh-sign refused: device revoked|shell bootstrap refused: $SPOKE: device revoked)" "$WORK/up.log" \
+   && tail -n +"$E_OWNER_START" "$WORK/up.log" | grep -qE "(ssh-sign refused: device revoked|shell bootstrap refused: $SPOKE: device revoked|ssh-sign refused: identity-not-proven)" \
    && [ "$SIGNED_AFTER" = "$SIGNED_BEFORE" ]; then
   ok "gateE: revoked certificate REFUSED shell --ssh and issued no certificate"
 else

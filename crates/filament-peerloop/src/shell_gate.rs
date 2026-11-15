@@ -1002,11 +1002,16 @@ pub fn forward_gate_decision(
 
 /// SSH-sign's entry point: the certificate signer asks the same gate before
 /// signing (a cert is B's statement about A, so the shell grant gates it
-/// like any shell-class open). Delegates to the shared core (no local logic).
+/// like any shell-class open). A known revoked key is refused before the
+/// identity-settlement check; this only changes the local reason, never grants
+/// access, and cannot identify a peer whose link has no device key.
 pub fn ssh_gate_decision(
     inputs: &ShellGateInputs,
     host: &dyn HostServices,
 ) -> Result<(), Option<String>> {
+    if inputs.idev.is_some() && inputs.cert_revoked {
+        return Err(Some("device revoked".into()));
+    }
     decide(inputs, host)
 }
 
@@ -1149,6 +1154,24 @@ mod pair_wiring_tests {
         let (_, inputs) = gather_shell_gate_inputs(conn, PID, &ShellPolicy::Granted, "shell");
         let host = conn.host.clone();
         exec_gate_decision(&inputs, host.as_ref())
+    }
+
+    #[tokio::test]
+    async fn ssh_sign_reports_only_a_known_revoked_key_before_identity_settles() {
+        use filament_cap::capability::IdentityState;
+        let host = Arc::new(PairHost::default());
+        let (mut conn, _far) = pair_conn(host.clone()).await;
+        let (_, mut inputs) = gather_shell_gate_inputs(&mut conn, PID, &ShellPolicy::Granted, "shell");
+        inputs.certless_pair = None;
+        inputs.identity_state = IdentityState::Pending;
+        inputs.idev = Some([7; 32]);
+        inputs.cert_revoked = true;
+        assert_eq!(ssh_gate_decision(&inputs, host.as_ref()), Err(Some("device revoked".into())));
+        inputs.cert_revoked = false;
+        assert_eq!(ssh_gate_decision(&inputs, host.as_ref()), Err(Some("identity-not-proven".into())));
+        inputs.idev = None;
+        inputs.cert_revoked = true;
+        assert_eq!(ssh_gate_decision(&inputs, host.as_ref()), Err(Some("identity-not-proven".into())));
     }
 
     /// Pairwise-first, through the real `gather_shell_gate_inputs`: a shell
