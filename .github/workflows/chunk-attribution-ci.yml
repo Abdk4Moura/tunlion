@@ -1,0 +1,65 @@
+name: Chunk attribution regression
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  changes:
+    uses: ./.github/workflows/changes.yml
+
+  regression:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Real QUIC worker reader and readiness ordering
+        run: |
+          set -o pipefail
+          cargo test -p tunlion-transport --lib direct::tests::worker_ready_precedes_actual_sourced_chunk -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-reader.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-reader.log"
+      - name: Daemon chunk admission, worker and pre-adoption fencing
+        run: |
+          set -o pipefail
+          cargo test -p tunlion-peerloop --lib conn::warm_identity_tests::chunk_attribution_fences_pairing_and_worker_dispatch -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-admission.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-admission.log"
+      - name: Standby replay preserves stream order
+        run: |
+          set -o pipefail
+          cargo test -p tunlion-peerloop --lib conn::warm_identity_tests::buffered_standby_chunks_cannot_be_overtaken_at_adoption -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-order.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-order.log"
+      - name: Departure waits for replay and cannot drop replacement
+        run: |
+          set -o pipefail
+          cargo test -p tunlion-peerloop --lib conn::warm_identity_tests::replay_precedes_real_departure_paths_and_fences_replacement -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-departure.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-departure.log"
+      - name: Replay overflow closes the adopted link and fails closed
+        run: |
+          set -o pipefail
+          cargo test -p tunlion-peerloop --lib conn::warm_identity_tests::a_replay_overflow_closes_the_adopted_link_not_the_standby -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-overflow.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-overflow.log"
+      - name: Selected link chunk fencing and CLI compilation
+        run: |
+          set -o pipefail
+          cargo test -p tunlion --bin tunlion l2::h1_tests::the_selected_pump_reads_only_the_selected_transports_source -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-selected.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-selected.log"
+      - name: Sync reads an ack record across tagged chunks only
+        run: |
+          set -o pipefail
+          cargo test -p tunlion --bin tunlion sync_cmd::tests::next_json_reads_an_ack_record_across_tagged_chunks -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-sync-record.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-sync-record.log"
+      - name: Install isolated signaling backend dependencies
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+      - name: Real temporary pairing and byte-exact service echo
+        run: |
+          set -o pipefail
+          cargo test -p tunlion --test pty_flows temporary_service_pairing_uses_real_transport_and_end_closes_the_socket -- --exact --nocapture | tee "$RUNNER_TEMP/chunk-pair.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/chunk-pair.log"

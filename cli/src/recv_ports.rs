@@ -336,6 +336,9 @@ impl RecvIdentity for CliRecv {
     fn device_cert_revoked(&self, device_pub: &[u8; 32]) -> bool {
         self.identity().device_cert_revoked(device_pub)
     }
+    fn device_tombstoned(&self, device_pub: &[u8; 32]) -> bool {
+        self.identity().device_tombstoned(device_pub)
+    }
     fn sibling_admissible(&self, device_pub: &[u8; 32]) -> bool {
         self.identity.store().sibling_admissible(device_pub)
     }
@@ -446,6 +449,9 @@ impl RecvStore for CliRecv {
     }
     fn devices_sweep_lapsed(&self, now: u64) -> usize {
         crate::device_view::devices_sweep_lapsed(now)
+    }
+    fn delisted_siblings_problem(&self) -> Option<String> {
+        crate::devices_store::store().delisted_siblings_problem()
     }
     fn devices_upsert_atomic(
         &self,

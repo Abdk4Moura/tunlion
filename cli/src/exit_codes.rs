@@ -70,7 +70,8 @@ pub(crate) enum ExitKind {
     TlsCertificate,
     /// Some of the work landed and some did not.
     Partial,
-    /// This device has no identity yet (`tunlion init` or `tunlion join`).
+    /// This device has no identity yet (`tunlion init` or `tunlion join`), or
+    /// its own device key cannot be read for a fleet send or dial.
     NoIdentity,
     /// A resource on THIS machine ran out: its disk (or quota) is full, it
     /// has no file descriptors or memory left. Distinct from 2 (the input was
@@ -443,6 +444,7 @@ fn code_meaning(verb: &str, code: i32) -> &'static str {
         ("send", 4) => "the receiver refused (its reason is printed, and in --json `error.reason`)",
         ("send", 8) => "some files were delivered and some were not",
         ("sync", 8) => "some files moved and some did not",
+        ("doctor", 2) => "a state file is damaged (the preflight lists it with its recovery), or bad arguments or flags",
         (_, 0) => "success",
         (_, 1) => "any other error",
         (_, 2) => "usage: bad arguments or flags, a local file problem, or a missing prerequisite",
@@ -452,7 +454,7 @@ fn code_meaning(verb: &str, code: i32) -> &'static str {
         (_, 6) => "the peer is offline, unreachable, or did not answer in time",
         (_, 7) => "can't reach the tunlion server (no internet or DNS)",
         (_, 8) => "partial: some of the work landed and some did not",
-        (_, 9) => "this device has no identity yet (init, or join an invitation)",
+        (_, 9) => "no identity yet (init, or join an invitation), or this device's own key could not be read",
         (_, 10) => "a daemon is already running with different settings (not applied)",
         (_, 11) => "no daemon is running for this config directory",
         (_, 12) => "a resource on this machine ran out (disk full, quota, open files, memory)",

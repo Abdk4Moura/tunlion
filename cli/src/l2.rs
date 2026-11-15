@@ -711,13 +711,14 @@ async fn verify_fleet_identity(
     tx: &mpsc::UnboundedSender<Ev>,
     link: &str,
     expected: &str,
+    own_device: Option<[u8; 32]>,
 ) -> Result<()> {
     // Everything that is not this link's control traffic (presence, other
     // candidates' offers, timers) still belongs to the dial loop, which keeps
     // going if this candidate is not the one. Swallowing it here lost the
     // target's own transport-offer while the wrong sibling was being checked.
     let mut deferred = Vec::new();
-    let r = verify_fleet_identity_inner(t, rx, &mut deferred, link, expected).await;
+    let r = verify_fleet_identity_inner(t, rx, &mut deferred, link, expected, own_device).await;
     for ev in deferred {
         let _ = tx.send(ev);
     }
@@ -773,13 +774,29 @@ fn control_for_link<'a>(
 /// transport the mux selected. Anything else is a callback from a candidate
 /// that lost the race (or an earlier attempt on the same signaling id) and must
 /// not reach the mux after selection: an old `l2-close` would end the wrong
-/// stream. Untagged events keep the pre-attribution behaviour.
+/// stream. Chunks must always be attributed; the envelope and inner pid must
+/// agree before any data can be routed by stream id.
+///
+/// Only the inner events this gate can attribute are unwrapped: `Control`,
+/// `PcState`, `ChannelReady`, `Chunk` and `PeerLeft`. The last is the
+/// source-tagged departure barrier the daemon queues behind a link's
+/// already-read events; it carries no inner pid, so it is admitted on the
+/// source match alone. Any other inner event is dropped rather than
+/// unwrapped, because it cannot be shown to belong to this link.
 fn selected_event(ev: Ev, source: Option<net::SourceId>) -> Option<Ev> {
     match ev {
-        Ev::Sourced { source: event_source, inner, .. } if Some(event_source) == source => {
-            Some(*inner)
+        Ev::Sourced { pid, source: event_source, inner } if Some(event_source) == source => {
+            let valid = match inner.as_ref() {
+                Ev::Control(inner_pid, _) | Ev::PcState(inner_pid, _)
+                | Ev::ChannelReady(inner_pid, _) | Ev::Chunk(inner_pid, ..) => *inner_pid == pid,
+                // The departure barrier has no inner pid to compare.
+                Ev::PeerLeft(_) => true,
+                _ => false,
+            };
+            valid.then_some(*inner)
         }
         Ev::Sourced { .. } => None,
+        Ev::Chunk(..) => None,
         other => Some(other),
     }
 }
@@ -805,7 +822,15 @@ async fn verify_fleet_identity_inner(
     deferred: &mut Vec<Ev>,
     link: &str,
     expected: &str,
+    own_device: Option<[u8; 32]>,
 ) -> Result<()> {
+    // Fail closed: without our own key the own-key refusal below cannot run.
+    let own_device = own_device.ok_or_else(|| {
+        crate::exit_codes::err(
+            crate::exit_codes::ExitKind::NoIdentity,
+            format!("cannot verify '{expected}': this device's own key is unavailable"),
+        )
+    })?;
     let cb = t.channel_binding().ok_or_else(|| {
         anyhow!("cannot verify '{expected}': this link exposes no channel binding")
     })?;
@@ -847,6 +872,12 @@ async fn verify_fleet_identity_inner(
             continue;
         }
         let proven = crate::fleet::verify_hello(v, &cb, &owner, crate::identity::now_secs())?;
+        // Never accept a hello carrying this device's own key (own-device-key).
+        if proven.device_pub == own_device {
+            return Err(anyhow::Error::new(WrongFleetDevice(format!(
+                "refusing: the device answering as '{expected}' presented this device's own key (own-device-key). No command payload was sent."
+            ))));
+        }
         let name = crate::device_name_for_pub(&proven.device_pub);
         if name.as_deref().map(|n| n.eq_ignore_ascii_case(expected)) != Some(true) {
             return Err(anyhow::Error::new(WrongFleetDevice(format!(
@@ -875,6 +906,72 @@ impl std::error::Error for WrongFleetDevice {}
 /// How long `exec` waits for a single signal from the device it is reaching
 /// before saying it is offline. A live daemon answers the moment it sees us.
 const EXEC_SILENT_PEER: Duration = Duration::from_secs(15);
+
+/// The establish bound of the candidate being dialed.
+///
+/// The per-candidate timer (`TUNLION_L2_CANDIDATE_SECS`, 7s) exists to rotate
+/// past GHOSTS: dead or wrong sids that never say a word. A candidate that has
+/// answered (any signal from its sid, or ICE with a remote description, checking
+/// or connected) is a real peer still negotiating; abandoning it rebuilds the
+/// connection the far end is answering. Such a candidate is KEPT, and keeping
+/// arms a one-shot `Stuck` at its hard bound (`started + bound`, the C3 watchdog
+/// time), so it is rotated there whatever its peer connection state. The C3
+/// watchdog alone is not that bound: it stays silent for a CONNECTED peer
+/// connection (a fleet link waiting for its direct proof, or a data channel that
+/// never opens). A timer configured at or past the bound rotates as before.
+struct CandidateBound {
+    started: tokio::time::Instant,
+    bound: Duration,
+    rearmed: bool,
+}
+
+impl CandidateBound {
+    fn new(bound: Duration) -> Self {
+        CandidateBound {
+            started: tokio::time::Instant::now(),
+            bound,
+            rearmed: false,
+        }
+    }
+
+    /// A new peer connection is being dialed (a new candidate, or a glare
+    /// rebuild): its bound starts now.
+    fn restart(&mut self) {
+        self.started = tokio::time::Instant::now();
+        self.rearmed = false;
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// A `Stuck` fired for the current candidate `pid` at generation `g`.
+    /// Returns true to rotate it. When it is kept, the hard bound is armed
+    /// (once) on `tx`, so a kept candidate is always rotated by then.
+    fn on_stuck(
+        &mut self,
+        heard: bool,
+        progressing: bool,
+        tx: &mpsc::UnboundedSender<Ev>,
+        pid: &str,
+        g: u32,
+    ) -> bool {
+        let hard = self.started + self.bound;
+        if tokio::time::Instant::now() >= hard || !(heard || progressing) {
+            return true;
+        }
+        if !self.rearmed {
+            self.rearmed = true;
+            let tx = tx.clone();
+            let pid = pid.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(hard).await;
+                let _ = tx.send(Ev::Stuck(pid, g));
+            });
+        }
+        false
+    }
+}
 
 /// The one transient "waiting" line an `exec` may show. Created only after
 /// [`crate::ui::wait_status_enabled`] said a live, non-quiet, non-JSON TTY is
@@ -969,6 +1066,22 @@ pub(crate) async fn bring_up_to_known(
             }
         }
     };
+    // This device's own key, read ONCE for a fleet dial. A hello carrying it is
+    // refused, and an unreadable key fails the dial instead of leaving that
+    // refusal inert for it.
+    let own_device: Option<[u8; 32]> = if fleet_mode {
+        Some(crate::overlay::overlay_pubkey_bytes().map_err(|e| {
+            crate::exit_codes::err(
+                crate::exit_codes::ExitKind::NoIdentity,
+                format!(
+                    "refusing the fleet dial to '{peer_name}': this device's own key at {} could not be read ({e}). Check that file's permissions, or run `tunlion init` if this device has no identity. No command payload was sent.",
+                    crate::overlay::key_path().display()
+                ),
+            )
+        })?)
+    } else {
+        None
+    };
     let channel = crate::channel_of(&secret);
 
     // Establishment telemetry: a connect span, peer tagged by SHORT HASH (never
@@ -1034,7 +1147,11 @@ pub(crate) async fn bring_up_to_known(
     // never came up ("establishment timed out", reproduced live as a consistent
     // pop-os -> do-vm failure that 7s/12s established cleanly). Back to 7s, which
     // clears the real ICE time with margin; field-overridable via
-    // TUNLION_L2_CANDIDATE_SECS.
+    // TUNLION_L2_CANDIDATE_SECS. It rotates only a SILENT candidate: one that has
+    // answered keeps its connection until its hard bound, the C3 watchdog time
+    // (`CandidateBound`): a relayed or direct-fallback path can need longer
+    // than 7s, and rotating it threw away the connection the far end was
+    // answering.
     let candidate_secs: u64 = std::env::var("TUNLION_L2_CANDIDATE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1067,6 +1184,11 @@ pub(crate) async fn bring_up_to_known(
     // answered first, reported as "can't reach" even when the target was online
     // and would have refused or served the shell in milliseconds.
     let mut fleet = FleetDial::default();
+    // Sids that have sent us any signal (transport-offer, description,
+    // candidate): those are answering peers, not ghosts, and the per-candidate
+    // timer keeps them until their hard bound (`CandidateBound`).
+    let mut heard_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut candidate_bound = CandidateBound::new(Duration::from_secs(net::WATCHDOG_SECS));
 
     let spawn_timer = |pid: String, g: u32| {
         let tx = tx.clone();
@@ -1168,6 +1290,7 @@ pub(crate) async fn bring_up_to_known(
                     }
                 };
                 generation += 1;
+                candidate_bound.restart();
                 spawn_timer(pid.clone(), generation);
                 let p = Peer::connect(
                     pid.clone(),
@@ -1365,6 +1488,11 @@ pub(crate) async fn bring_up_to_known(
             }
             Ev::Signal(v) => {
                 heard_from_peer = true;
+                if let Some(from) = v["from"].as_str() {
+                    if heard_sids.len() < 64 || heard_sids.contains(from) {
+                        heard_sids.insert(from.to_string());
+                    }
+                }
                 let data = v["data"].clone();
                 // Item 3: a relayed `transport-offer` carries the peer's direct
                 // candidates. Do NOT hand it to the WebRTC `Peer`; instead consume
@@ -1490,6 +1618,7 @@ pub(crate) async fn bring_up_to_known(
                         old.mark_closed();
                         tokio::spawn(async move { old.close().await });
                         generation += 1;
+                        candidate_bound.restart();
                         spawn_timer(pid.clone(), generation);
                         let p = Peer::connect(
                             pid,
@@ -1543,7 +1672,7 @@ pub(crate) async fn bring_up_to_known(
                 // binding, because there is nothing to bind the proof to. A
                 // failed proof rejects THIS candidate, not the connect.
                 if fleet_mode {
-                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name).await {
+                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name, own_device).await {
                         crate::ui::debug(&format!("fleet: {e:#}; trying the next fleet device"));
                         t.force_close();
                         let mut uid = None;
@@ -1579,17 +1708,36 @@ pub(crate) async fn bring_up_to_known(
             }
             Ev::Stuck(pid, g) => {
                 // Per-candidate timer (or the 15s watchdog) fired for the
-                // CURRENT attempt: drop it and rotate. The sid goes to the
-                // back of the queue, a slow-but-real peer gets retried, a
-                // ghost just cycles until the server evicts it.
+                // CURRENT attempt. A silent candidate (a ghost) is dropped and
+                // rotated: the sid goes to the back of the queue and just cycles
+                // until the server evicts it. One that is answering is kept
+                // until its hard bound (`CandidateBound::on_stuck`).
                 if g == generation && peer.as_ref().is_some_and(|p| p.id == pid) {
+                    let progressing = match peer.as_ref() {
+                        Some(p) => p.is_connected() || p.establishing_progress().await,
+                        None => false,
+                    };
+                    if !candidate_bound.on_stuck(
+                        heard_sids.contains(&pid),
+                        progressing,
+                        &tx,
+                        &pid,
+                        g,
+                    ) {
+                        // DEBUG: the timer fired on a peer that is answering.
+                        crate::ui::debug(&format!(
+                            "tunlion: candidate answering (ice progress: {progressing}), keeping it until its {}s bound",
+                            net::WATCHDOG_SECS
+                        ));
+                        continue;
+                    }
                     let p = peer.take().unwrap();
                     p.mark_closed();
                     tokio::spawn(async move { p.close().await });
                     // The per-candidate establish budget fired: this candidate
                     // wedged and we rotate. Record a stall (the "burns the budget
                     // then succeeds on retry" signal we are hunting).
-                    diag.stall(crate::diag::Phase::Establishing, candidate_secs * 1000);
+                    diag.stall(crate::diag::Phase::Establishing, candidate_bound.elapsed_ms());
                     crate::ui::debug("tunlion: candidate unresponsive, rotating");
                     queue.push_back((pid, peer_uid.take(), peer_present));
                     // On the fleet channel the next candidate may be the target,
@@ -1646,7 +1794,7 @@ pub(crate) async fn bring_up_to_known(
                 // Same certificate proof as the direct arm above; the binding
                 // exists here (checked at the top of this arm).
                 if fleet_mode {
-                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name).await {
+                    if let Err(e) = verify_fleet_identity(&t, &mut rx, &tx, &pid, peer_name, own_device).await {
                         crate::ui::debug(&format!("fleet: {e:#}; trying the next fleet device"));
                         t.force_close();
                         let mut uid = None;
@@ -5778,6 +5926,57 @@ mod term_tests {
 }
 
 #[cfg(test)]
+mod candidate_timer_tests {
+    use super::*;
+
+    /// The timer rotates a candidate that never said a word (a ghost).
+    #[tokio::test]
+    async fn a_silent_candidate_is_rotated() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Ev>();
+        let mut b = CandidateBound::new(Duration::from_secs(net::WATCHDOG_SECS));
+        assert!(b.on_stuck(false, false, &tx, "sid-ghost", 1));
+    }
+
+    /// B1: a kept candidate is re-bounded. Keeping it arms exactly one Stuck
+    /// for the same pid and generation at the hard bound, and that Stuck
+    /// rotates it even though its peer connection is CONNECTED (progressing),
+    /// which the C3 watchdog would never report.
+    #[tokio::test]
+    async fn a_kept_candidate_is_rotated_at_its_bound_even_when_connected() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+        let mut b = CandidateBound::new(Duration::from_millis(150));
+        assert!(!b.on_stuck(true, true, &tx, "sid-real", 7), "answering candidate kept");
+        assert!(!b.on_stuck(true, true, &tx, "sid-real", 7), "kept again before the bound");
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the hard bound never fired")
+            .expect("channel open");
+        match ev {
+            Ev::Stuck(pid, g) => assert_eq!((pid.as_str(), g), ("sid-real", 7)),
+            _ => panic!("the bound sent something other than Stuck"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
+            "the bound was armed more than once"
+        );
+        assert!(b.on_stuck(true, true, &tx, "sid-real", 7), "a connected candidate outlived its bound");
+    }
+
+    /// A rebuilt peer connection (glare, or the next candidate) gets a fresh
+    /// bound and may arm it again.
+    #[tokio::test]
+    async fn restart_gives_a_fresh_bound() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Ev>();
+        let mut b = CandidateBound::new(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(b.on_stuck(true, true, &tx, "sid-real", 1), "past the bound");
+        b.restart();
+        assert!(!b.on_stuck(true, false, &tx, "sid-real", 2), "fresh bound keeps it");
+        assert!(b.rearmed);
+    }
+}
+
+#[cfg(test)]
 mod proxy_auth_tests {
     use super::*;
 
@@ -6256,6 +6455,25 @@ mod h1_tests {
             selected_event(tagged(selected), Some(selected)),
             Some(Ev::Control(..))
         ));
+        let chunk = |source, inner: &str| Ev::Sourced {
+            pid: pid.into(), source,
+            inner: Box::new(Ev::Chunk(inner.into(), 42, Some(0), bytes::Bytes::from_static(b"data"))),
+        };
+        assert!(matches!(selected_event(chunk(selected, pid), Some(selected)), Some(Ev::Chunk(..))));
+        assert!(selected_event(chunk(stale, pid), Some(selected)).is_none());
+        assert!(selected_event(chunk(selected, "other"), Some(selected)).is_none());
+        assert!(selected_event(Ev::Chunk(pid.into(), 42, Some(0), bytes::Bytes::new()), Some(selected)).is_none());
+        // The source-tagged departure barrier is admitted on the source match.
+        let departure = Ev::Sourced {
+            pid: pid.into(), source: selected,
+            inner: Box::new(Ev::PeerLeft(json!({ "id": pid }))),
+        };
+        assert!(matches!(selected_event(departure, Some(selected)), Some(Ev::PeerLeft(..))));
+        let stale_departure = Ev::Sourced {
+            pid: pid.into(), source: stale,
+            inner: Box::new(Ev::PeerLeft(json!({ "id": pid }))),
+        };
+        assert!(selected_event(stale_departure, Some(selected)).is_none());
         assert!(
             selected_event(tagged(stale), Some(selected)).is_none(),
             "a stale transport's control reached the selected link's pump"

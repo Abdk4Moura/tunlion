@@ -125,7 +125,10 @@ start_acceptor_l2() {
 # ended by itself before listening (the fail-fast refusal of gate A).
 run_forward() {
   local lport="$1" rport="$2" ncurl="${3:-1}"
-  FORWARD_UP=0; FORWARD_EXITED=0; FWD_RC=""; FWD_SECS=""
+  # Reset every per-run result: a forward that never listens sets none of
+  # them, and under `set -u` a gate reading a stale or unset one aborted the
+  # whole suite instead of reporting that the forward never came up.
+  FORWARD_UP=0; FORWARD_EXITED=0; FWD_RC=""; FWD_SECS=""; CURL_RC=""; ELAPSED=""
   local s0; s0=$(date +%s)
   env TUNLION_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" forward "bravo:$rport" --lport "$lport" \
     >"$WORK/fwd-$lport.log" 2>&1 &

@@ -55,6 +55,17 @@ pub fn link_must_close(
     f.device_pub.as_ref().is_some_and(|k| key_listed(k))
 }
 
+/// A revoked fleet identity must not survive on a pair-shaped link whose
+/// independent pair binding is no longer held. A current, key-matched pair is
+/// a separate local authorization and is not withdrawn by the owner's roster.
+pub fn revoked_identity_must_close(
+    device_pub: Option<&[u8; 32]>,
+    held_pair_for_device: bool,
+    revoked: &dyn Fn(&[u8; 32]) -> bool,
+) -> bool {
+    !held_pair_for_device && device_pub.is_some_and(revoked)
+}
+
 /// Must this fleet SIBLING link close now? A sibling (a `FleetSibling`
 /// principal: admitted on its owner-signed certificate, never paired) holds its
 /// link on exactly two facts, and loses it the moment either stops being true:
@@ -144,7 +155,17 @@ fn _arc(_: &Arc<dyn std::any::Any>) {}
 
 #[cfg(test)]
 mod sibling_cut_tests {
-    use super::sibling_link_must_close;
+    use super::{revoked_identity_must_close, sibling_link_must_close};
+
+    #[test]
+    fn revoked_identity_without_a_held_pair_is_closed() {
+        let dev = [7u8; 32];
+        let revoked = |k: &[u8; 32]| k == &dev;
+        assert!(revoked_identity_must_close(Some(&dev), false, &revoked));
+        assert!(!revoked_identity_must_close(Some(&dev), true, &revoked));
+        assert!(!revoked_identity_must_close(Some(&[8u8; 32]), false, &revoked));
+        assert!(!revoked_identity_must_close(None, false, &revoked));
+    }
 
     #[test]
     fn a_sibling_link_closes_on_revocation_or_expiry_and_nothing_else() {

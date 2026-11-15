@@ -60,7 +60,8 @@ use filament_transport::net::{self, Ev, Peer, Transport};
 /// The host-free policy now lives in `filament-peerloop`; this module re-exports
 /// it so the ~200 call sites spread across the command modules stay unchanged.
 pub use crate::{
-    AdoptSource, LinkPetname, WarmHold, active_binding_matches, direct_permitted,
+    AdoptSource, CodeAuthorityRefusal, CodeSession, CodeTransport, LinkPetname, WarmHold,
+    active_binding_matches, code_authority_check, direct_permitted,
     ice_fallback_allowed, link_dead_for, link_has_live_for, link_petname, match_adoption_source,
     peer_targetable, schedule_retry, stuck_backoff,
 };
@@ -71,6 +72,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
+
+/// An in-flight code transfer on its peer's current link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeContinuation {
+    Holds,
+    NoLink,
+    Lost,
+}
+
+/// Link facts a cached verdict is keyed by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CodeLinkKey {
+    generation: u32,
+    source: net::SourceId,
+    direct: bool,
+    attempt: Option<net::AttemptId>,
+    /// A digest of the link's `expected_secret`, never the secret itself.
+    secret_tag: u64,
+}
+
+/// The last link that held code authority.
+#[derive(Default)]
+pub struct CodeAuthorityCache {
+    held: Option<(String, CodeLinkKey)>,
+}
 
 /// Why a direct attempt is being started. A bool pair gave four states, three
 /// meaningful and one nonsense (`probe && promote` = "a test dial that tears
@@ -231,6 +257,49 @@ const MAX_BUILD_EVENTS: usize = 64;
 const MAX_BUILD_EVENT_BYTES: usize = 256 * 1024;
 const MAX_BUILD_SIGNALS: usize = 64;
 const MAX_BUILD_SIGNAL_BYTES: usize = 256 * 1024;
+/// Peers whose WebRTC offer may be held while our direct attempt for them is
+/// pending (`hold_for_direct`). Beyond this a new peer's offer is not held.
+const MAX_HELD_PEERS: usize = 32;
+/// How long a held offer stays answerable: the direct budget plus the time the
+/// initiator keeps that peer connection alive while it is making progress.
+fn held_signal_ttl() -> Duration {
+    direct::DIRECT_BUDGET + Duration::from_secs(10)
+}
+
+/// A peer's WebRTC offer and trickled candidates that arrived while our direct
+/// attempt for that sid was still pending, when no responder may be built yet
+/// (`prepare_build` refuses during a pending). Without this hold the offer was
+/// discarded, and an initiator that sends one offer per peer connection could
+/// never be answered on its first attempt. `pc` is the sender's peer-connection
+/// tag (`None` from builds that do not send one); a different tag, or a second
+/// offer, starts a new hold because it belongs to a newer attempt.
+pub struct HeldSignals {
+    since: Instant,
+    pc: Option<u64>,
+    has_offer: bool,
+    signals: std::collections::VecDeque<Value>,
+    bytes: usize,
+}
+
+/// Is this signal payload (the envelope's `data`) a WebRTC offer?
+fn is_offer_data(data: &Value) -> bool {
+    data["type"].as_str() == Some("description")
+        && data["description"]["type"].as_str() == Some("offer")
+}
+
+/// Does this signal payload belong to a newer attempt than the one `held`
+/// captured (aged out, another peer-connection tag, or a second offer)?
+fn supersedes_held(held: &HeldSignals, data: &Value) -> bool {
+    held.since.elapsed() >= held_signal_ttl()
+        || held.pc != data["pc"].as_u64()
+        || (held.has_offer && is_offer_data(data))
+}
+/// An offer from a different peer connection than the one this responder
+/// answered: both sides tagged, and the tags differ. Untagged senders (older
+/// builds, browsers) never match, so they keep the renegotiation path.
+fn new_peer_connection(answered: Option<u64>, offered: Option<u64>) -> bool {
+    matches!((answered, offered), (Some(a), Some(o)) if a != o)
+}
 /// Terminal-drain tombstones and inbound registrations are bounded. New direct
 /// attempts fail closed when full.
 const MAX_RETIRED_ATTEMPTS: usize = 16;
@@ -263,6 +332,195 @@ const DIRECT_FALLBACKS_PER_CALL: usize = 1;
 /// How long `drop_link` lets a dropped link's last frames reach the peer
 /// before it closes the QUIC connection under them.
 const DROP_CLOSE_GRACE: Duration = Duration::from_secs(2);
+/// One bound for a revoked link's last act: write the `link-revoked` refusal
+/// and wait for the peer's `link-revoked-ack`. The link is already out of
+/// routing when this starts, so the bound only decides how long the cut
+/// transport stays open for that one frame; it never holds the event loop.
+/// Kept equal to `DROP_CLOSE_GRACE` so a peer that never answers keeps the
+/// transport no longer than an ordinary drop did.
+const REFUSAL_ACK_BUDGET: Duration = DROP_CLOSE_GRACE;
+
+/// Close what a dropped link owned. Never awaited in the event loop (F8):
+/// the WebRTC peer is marked and closed on a task, the direct transports after
+/// a short grace.
+fn close_dropped_link(old: Link) {
+    // Never await close in the event loop (F8): mark + spawn.
+    if let Some(p) = old.peer.clone() {
+        p.mark_closed();
+        tokio::spawn(async move { p.close().await });
+    }
+    // CLOSE the direct transports explicitly. Dropping the Link only
+    // drops OUR Arc: the L3 overlay pump, the mesh accept loop, the
+    // endpoint keeper and any warm stream hold their own clones, so the
+    // QUIC connection stayed up and the peer never learned the link was
+    // gone. It kept its own direct link for this pid and ignored our
+    // WebRTC offers (no `peer` on its link to apply them to), our ladder
+    // exhausted, and the cycle repeated forever: split-brain. Closing
+    // sends ApplicationClose, the peer sees ConnectionLost, drops its
+    // side and both ends re-converge.
+    //
+    // After a short grace, not at once: QUIC has no flush-on-close
+    // (RFC 9000 s10.2), and several callers drop right after writing a
+    // last frame on this link (the l2-close that answers a parked open,
+    // a refusal). Closing immediately discarded that frame and the
+    // client saw "no answer" instead of the reason. No-op for transports
+    // without a connection to close (DataChannel, local).
+    let closing: Vec<Arc<dyn Transport>> =
+        old.transport.into_iter().chain(old.workers).collect();
+    if !closing.is_empty() {
+        tokio::spawn(async move {
+            tokio::time::sleep(DROP_CLOSE_GRACE).await;
+            for t in closing {
+                t.force_close();
+            }
+        });
+    }
+}
+
+/// A link cut by a revocation whose refusal is still in flight, keyed in
+/// `Conn::closing` by the refusal's nonce. Control-plane only: the link is
+/// gone from `links`, so no Control/PcState/ChannelReady from its source is
+/// dispatched, and this entry only recognizes the peer's `link-revoked-ack`
+/// carrying exactly this nonce, read for this pid on any of its paths. The
+/// nonce is ours, fresh and random per cut, and only the peer that received
+/// the frame holds it, so accepting the ack from any path of that peer does
+/// not widen what it proves; two links cut together each wait for their own.
+/// It authorizes nothing either way: it only lets the closer close sooner.
+/// Untagged data events from a main-queue link can still reach the loop until
+/// the close, exactly as during the plain drop's grace; they open nothing new.
+pub struct ClosingLink {
+    pid: String,
+    ack: Option<oneshot::Sender<()>>,
+}
+
+/// `inner` is a `link-revoked-ack` from `ipid`: its pid and nonce.
+fn refusal_ack_nonce(inner: &Ev) -> Option<(&str, &str)> {
+    match inner {
+        Ev::Control(ipid, v) if v["type"].as_str() == Some("link-revoked-ack") => {
+            v["nonce"].as_str().map(|n| (ipid.as_str(), n))
+        }
+        _ => None,
+    }
+}
+
+/// What became of a revoked link's refusal. A DIAGNOSTIC, never a delivery
+/// verdict: only `Acknowledged` says something positive (the peer recorded
+/// it), and nothing may read the others as "not delivered". A one-shot peer
+/// never acknowledges at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalOutcome {
+    /// The peer answered with `link-revoked-ack` for this nonce, which it sends
+    /// only after it recorded the refusal on the link.
+    Acknowledged,
+    /// Written, no ack within the budget (a dead, frozen, older or one-shot
+    /// peer, or a link whose reader ended).
+    Unconfirmed,
+    /// The write itself failed: the transport was already gone.
+    SendFailed,
+    /// The write did not complete within the budget.
+    SendTimedOut,
+}
+
+impl RefusalOutcome {
+    fn describe(self) -> &'static str {
+        match self {
+            RefusalOutcome::Acknowledged => "acknowledged by the peer",
+            RefusalOutcome::Unconfirmed => "sent, not acknowledged within the budget (unconfirmed)",
+            RefusalOutcome::SendFailed => "send failed, the link was already gone",
+            RefusalOutcome::SendTimedOut => "send did not complete within the budget",
+        }
+    }
+}
+
+/// Where a cut link's ack may show up. Both are optional: `signal` is fired by
+/// `Conn` when the ack reaches the main queue; `stream` is the link's own
+/// candidate stream, read here directly so no loop turn is needed.
+pub struct AckWatch {
+    pub pid: String,
+    pub nonce: String,
+    pub signal: Option<oneshot::Receiver<()>>,
+    pub stream: Option<mpsc::UnboundedReceiver<Ev>>,
+}
+
+async fn ack_signal(signal: &mut Option<oneshot::Receiver<()>>) -> bool {
+    match signal {
+        Some(rx) => rx.await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
+async fn ack_stream(stream: &mut Option<mpsc::UnboundedReceiver<Ev>>) -> Option<Ev> {
+    match stream {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+enum AckStep {
+    Acked,
+    SignalGone,
+    Event(Ev),
+    StreamEnded,
+    Deadline,
+}
+
+/// Write `frame` and wait for its ack, both under ONE deadline `budget` from
+/// now. A peer that never reads, never acks, or whose write parks forever
+/// costs at most `budget`; a link whose reader ended on a dead transport ends
+/// the wait at once. Everything else read from the stream is discarded. Must run off the event loop (it awaits the peer).
+pub async fn deliver_refusal(
+    t: &dyn Transport,
+    frame: &Value,
+    watch: Option<AckWatch>,
+    budget: Duration,
+) -> RefusalOutcome {
+    let deadline = tokio::time::Instant::now() + budget;
+    match tokio::time::timeout_at(deadline, t.send_control(frame)).await {
+        Err(_) => return RefusalOutcome::SendTimedOut,
+        Ok(Err(_)) => return RefusalOutcome::SendFailed,
+        Ok(Ok(())) => {}
+    }
+    let Some(mut watch) = watch else {
+        return RefusalOutcome::Unconfirmed;
+    };
+    loop {
+        if watch.signal.is_none() && watch.stream.is_none() {
+            return RefusalOutcome::Unconfirmed;
+        }
+        let step = tokio::select! {
+            acked = ack_signal(&mut watch.signal) => {
+                if acked { AckStep::Acked } else { AckStep::SignalGone }
+            }
+            ev = ack_stream(&mut watch.stream) => match ev {
+                Some(ev) => AckStep::Event(ev),
+                None => AckStep::StreamEnded,
+            },
+            _ = tokio::time::sleep_until(deadline) => AckStep::Deadline,
+        };
+        match step {
+            AckStep::Acked => return RefusalOutcome::Acknowledged,
+            AckStep::SignalGone => watch.signal = None,
+            AckStep::StreamEnded => {
+                watch.stream = None;
+                // The reader ended. With the transport dead too, nothing can
+                // answer on any path any more: stop now, not at the deadline.
+                if t.is_dead() {
+                    return RefusalOutcome::Unconfirmed;
+                }
+            }
+            AckStep::Deadline => return RefusalOutcome::Unconfirmed,
+            AckStep::Event(Ev::Sourced { pid, inner, .. }) => {
+                let ours = refusal_ack_nonce(&inner).is_some_and(|(ipid, nonce)| {
+                    ipid == pid && pid == watch.pid && nonce == watch.nonce
+                });
+                if ours {
+                    return RefusalOutcome::Acknowledged;
+                }
+            }
+            AckStep::Event(_) => {}
+        }
+    }
+}
 /// A link absent from a channel/room digest is retired only after its transport
 /// has been quiet this long. Presence is best-effort and a signaling reconnect
 /// gives the peer a new sid, so the old sid vanishes from the digest while its
@@ -499,10 +757,11 @@ pub struct Link {
     pub trusted: bool,
     /// (name, secret) hypothesis to prove/verify on this link
     pub expected_secret: Option<(String, String)>,
-    /// LAN-origin reservation identity. Deliberately separate from
-    /// `expected_secret` so a LAN link stays untrusted/delegated without a pair
-    /// binding, while revocation and dedup can still see its exact device
-    /// binding (device LAN only; never the fleet shared RV).
+    /// LAN-origin reservation identity. Separate from `expected_secret` so a
+    /// LAN link mints no worker key or pair-proof hypothesis, while revocation,
+    /// dedup and adoption can still see its exact device binding (device LAN
+    /// only; never the fleet shared RV). A live binding makes the link the pair
+    /// at adoption (`adopt_direct`).
     pub lan_binding: Option<LanBinding>,
     /// The devices.json PETNAME this link proved as (the cap-store key). Set on a
     /// verified `pair-proof` (WebRTC) or at birth for a direct link (already
@@ -577,12 +836,11 @@ impl Link {
     /// an exact authenticated LAN DEVICE reservation that is STILL the current
     /// store's binding.
     ///
-    /// This is not an identity proof and must never become one: it does not set
-    /// `trusted`, `verified_name` or `BindingStrength::Proven`, does not touch
-    /// `expected_secret`, mints no worker key, and grants no capability. It names
-    /// the device so request routing (`reach`/`send` warm reuse) can match the
-    /// link the local handshake already authenticated with that device's pair
-    /// secret. A forgotten, revoked, re-paired or fleet-reserved link resolves
+    /// This lookup itself sets nothing. Adoption uses it once to make a live
+    /// LAN device link the pair (`adopt_direct`); routing (`reach`/`send` warm
+    /// reuse) uses it to match a link the local handshake authenticated with
+    /// that device's pair secret. A forgotten, revoked, re-paired or
+    /// fleet-reserved link resolves
     /// nothing: the store lookup is exact on `(name, secret)` and the secret
     /// must not be in `revoked`.
     pub fn authenticated_device_name<'a>(
@@ -1344,6 +1602,7 @@ async fn run_build_task(
     plan: BuildPlan,
     candidate: mpsc::UnboundedSender<Ev>,
     wake: mpsc::UnboundedSender<Ev>,
+    wake_pending: Arc<AtomicBool>,
     cancel: Arc<BuildCancel>,
     out: mpsc::UnboundedSender<BuildDone>,
     context: filament_transport::TransportContext,
@@ -1357,6 +1616,10 @@ async fn run_build_task(
     let connect_polite = plan.polite;
     let connect_relay = plan.relay_ice;
     let connect_gen = plan.generation;
+    // The peer's events wake the loop: the candidate channel is drained only
+    // by `pump_builds`, and nothing else turns the loop when a data-channel
+    // event lands in it (see `EvSink::waking`).
+    let candidate = net::EvSink::waking(candidate, wake.clone(), wake_pending);
     let wake_tx = wake;
     let retry_plan = plan.clone();
     let connect_cfg = plan.config;
@@ -1570,7 +1833,14 @@ pub struct Conn {
     pub active: Option<String>, // the transfer-target sid (send side)
     /// A code-claimed receive is bound to the peer that completed PAKE. The sid
     /// may change on signaling reconnect, so retain its install uid as well.
+    /// Targeting only: authority is `code_session`.
     pub active_binding: Option<(String, Option<String>)>,
+    /// The session the code ceremony confirmed (`receive <code>` and
+    /// `send --code`): its exact sid, the DTLS fingerprint pair its
+    /// confirmation bound, and the ceremony secret. Every code-path accept,
+    /// consent and remember decision is `holds_code_authority`, which checks
+    /// the peer's CURRENT link against it.
+    pub code_session: Option<CodeSession>,
     pub next_gen: u32,
     /// Peer-absence / rejoin-grace state (the reconnect window + declared brb).
     pub rejoin: RejoinState,
@@ -1643,6 +1913,12 @@ pub struct Conn {
     /// server_public, proto, ch) plus the intent/link facts captured when it
     /// was buffered (`StagedOffer`). Insert only through `buffer_offer`.
     pub buffered_offers: HashMap<String, StagedOffer>,
+    /// WebRTC offers (and their candidates) held while a direct attempt for the
+    /// same sid is pending; replayed into the fallback responder's build. Insert
+    /// only through `hold_for_direct`. `pub` only because the CLI builds a
+    /// `Conn` with a struct literal (cli/src/membership.rs); its contents stay
+    /// private, so start it as `HashMap::new()` and never insert directly.
+    pub held_signals: HashMap<String, HeldSignals>,
     /// Post-PAKE promotions in progress (make-before-break; see `handoff`),
     /// keyed by peer sid. Each pairs with an ephemeral `direct_pending` entry
     /// that must survive beside the serving link until the handoff resolves.
@@ -1730,9 +2006,18 @@ pub struct Conn {
     /// so a queued ChannelReady/Control from the old generation is discarded
     /// instead of being replayed onto the new link.
     pub link_events: HashMap<String, LinkEvents>,
+    /// Set by a candidate sender when it has queued a `BuildWake`, cleared by
+    /// `pump_builds` before it drains. One wake is outstanding at a time, so a
+    /// busy data channel cannot flood the main queue with wakes.
+    pub candidate_wake: Arc<AtomicBool>,
+    /// Links cut by a revocation whose refusal is still in flight, keyed by the
+    /// refusal's nonce. See `ClosingLink` and `drop_link_after_refusal`.
+    pub closing: HashMap<String, ClosingLink>,
     /// Source-bound standby/upgrade events awaiting adoption. Bounded per source
     /// and in total; overflow closes the standby instead of growing forever.
     pub pending_sources: HashMap<net::SourceId, PendingSource>,
+    pub replaying_sources: HashMap<net::SourceId, PendingSource>,
+    pub replay_departures: HashMap<String, (net::SourceId, bool)>,
     /// Roster sids absent from consecutive channel/room digests, for the
     /// two-tick hysteresis in `prune_roster_absent`.
     pub roster_absent: HashMap<String, u8>,
@@ -1921,6 +2206,7 @@ impl Conn {
             suppressed_digest_adoptions: HashSet::new(),
             active: None,
             active_binding: None,
+            code_session: None,
             next_gen: 0,
             rejoin: RejoinState {
                 waiting_rejoin: None,
@@ -1938,6 +2224,7 @@ impl Conn {
             lan: None,
             webrtc_only: HashSet::new(),
             buffered_offers: HashMap::new(),
+            held_signals: HashMap::new(),
             promotions: HashMap::new(),
             resil: ResilienceState {
                 stall_repairs: HashMap::new(),
@@ -1969,7 +2256,11 @@ impl Conn {
             revoked_peers: HashMap::new(),
             revoked_bindings: HashSet::new(),
             link_events: HashMap::new(),
+            candidate_wake: Arc::new(AtomicBool::new(false)),
+            closing: HashMap::new(),
             pending_sources: HashMap::new(),
+            replaying_sources: HashMap::new(),
+            replay_departures: HashMap::new(),
             roster_absent: HashMap::new(),
             log,
             host,
@@ -2032,6 +2323,31 @@ impl Conn {
     }
     pub fn transport_of(&self, pid: &str) -> Option<Arc<dyn Transport>> {
         self.links.get(pid).and_then(|l| l.transport.clone())
+    }
+
+    /// The transports to answer a frame from `pid` on: the one whose source
+    /// carried it (the primary, or a worker), then the link's current primary
+    /// if that is a different one. Empty when the link is gone.
+    pub fn reply_transports(
+        &self,
+        pid: &str,
+        source: Option<net::SourceId>,
+    ) -> Vec<Arc<dyn Transport>> {
+        let Some(link) = self.links.get(pid) else {
+            return Vec::new();
+        };
+        let carrying = match source {
+            Some(s) if s == link.source => link.transport.clone(),
+            Some(s) => link.workers.iter().find(|w| w.source_id() == Some(s)).cloned(),
+            None => None,
+        };
+        let mut out: Vec<Arc<dyn Transport>> = carrying.into_iter().collect();
+        if let Some(primary) = link.transport.clone() {
+            if !out.iter().any(|t| Arc::ptr_eq(t, &primary)) {
+                out.push(primary);
+            }
+        }
+        out
     }
 
     /// Owner-only: mint the current roster and push it to every live link whose
@@ -2320,19 +2636,109 @@ impl Conn {
         self.rejoin.waiting_rejoin = None;
     }
 
-    pub fn is_bound_active_peer(&self, peer_id: &str) -> bool {
-        let uid = self
-            .links
-            .get(peer_id)
-            .and_then(|link| link.uid.as_deref())
-            .or_else(|| {
-                self.roster
-                    .get(peer_id)
-                    .and_then(|peer| peer["uid"].as_str())
-            });
-        self.active_binding
-            .as_ref()
-            .is_some_and(|binding| active_binding_matches(binding, peer_id, uid))
+    /// Record the session a code ceremony confirmed with `sid`: the DTLS
+    /// fingerprint pair `(mine, theirs)` its confirmation MAC bound, the
+    /// ceremony secret, and the direct attempt its promotion armed
+    /// (`start_direct_promote`, called just before; none when it armed
+    /// nothing). Set once: a run confirms one ceremony, and a later call
+    /// never moves the session to another sid or transport.
+    pub fn bind_code_session(&mut self, sid: &str, fingerprints: (&str, &str), secret: &str) {
+        if self.code_session.is_some() {
+            self.log
+                .debug("tunlion: code session already bound; keeping the confirmed one");
+            return;
+        }
+        let promote_attempt = self
+            .direct_pending
+            .get(sid)
+            .filter(|pending| pending.ephemeral)
+            .map(|pending| pending.attempt);
+        self.code_session = Some(CodeSession::new(sid, fingerprints, secret, promote_attempt));
+    }
+
+    /// Code authority for `pid` on its CURRENT link (`code_authority_check`):
+    /// the exact sid the ceremony confirmed, on a WebRTC link whose DTLS
+    /// fingerprints are the confirmed pair or the direct link that ceremony's
+    /// own promotion attempt published with its secret. A uid, a roster
+    /// entry or a replacement transport for the same sid is not enough.
+    pub async fn code_authority(&self, pid: &str) -> Result<(), CodeAuthorityRefusal> {
+        let fps = match self.links.get(pid) {
+            Some(l) if !l.direct => match &l.peer {
+                Some(p) => p.fingerprints().await,
+                None => None,
+            },
+            _ => None,
+        };
+        self.code_authority_on(pid, fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str())))
+    }
+
+    /// [`Conn::code_authority`] once a WebRTC link's DTLS fingerprints have
+    /// been read (`webrtc_fps`, ignored for a direct link).
+    fn code_authority_on(
+        &self,
+        pid: &str,
+        webrtc_fps: Option<(&str, &str)>,
+    ) -> Result<(), CodeAuthorityRefusal> {
+        let transport = match self.links.get(pid) {
+            None => CodeTransport::Absent,
+            Some(l) if l.direct => CodeTransport::Direct {
+                attempt: l.attempt,
+                secret: l.expected_secret.as_ref().map(|(_, s)| s.as_str()),
+            },
+            Some(_) => CodeTransport::WebRtc(webrtc_fps),
+        };
+        code_authority_check(self.code_session.as_ref(), pid, transport)
+    }
+
+    /// [`Conn::code_authority`] as a decision, logging why at debug when it
+    /// is refused (never the fingerprints or the secret).
+    pub async fn holds_code_authority(&self, pid: &str) -> bool {
+        match self.code_authority(pid).await {
+            Ok(()) => true,
+            Err(why) => {
+                self.log.debug(&format!(
+                    "tunlion: code authority refused for {pid}: {}",
+                    why.reason()
+                ));
+                false
+            }
+        }
+    }
+
+    /// Continuation of a code transfer is bound to the code-authorized link.
+    /// Only a holding verdict is cached, keyed by the link's generation,
+    /// source, kind, attempt and secret digest.
+    pub async fn code_continuation(
+        &self,
+        pid: &str,
+        cache: &mut CodeAuthorityCache,
+    ) -> CodeContinuation {
+        let Some(l) = self.links.get(pid) else {
+            return CodeContinuation::NoLink;
+        };
+        let secret_tag = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            l.expected_secret.as_ref().map(|(_, s)| s.as_str()).hash(&mut h);
+            h.finish()
+        };
+        let key = CodeLinkKey {
+            generation: l.generation,
+            source: l.source,
+            direct: l.direct,
+            attempt: l.attempt,
+            secret_tag,
+        };
+        if cache.held.as_ref().is_some_and(|(p, k)| p == pid && *k == key) {
+            return CodeContinuation::Holds;
+        }
+        if self.holds_code_authority(pid).await {
+            cache.held = Some((pid.to_string(), key));
+            CodeContinuation::Holds
+        } else {
+            cache.held = None;
+            CodeContinuation::Lost
+        }
     }
 
     /// Track a roster entry and (re)connect to it. `want_active` marks it as
@@ -2434,10 +2840,13 @@ impl Conn {
             .active
             .as_ref()
             .is_some_and(|a| self.deferred_left.contains_key(a));
+        // A code-receive binding hands the slot only to the exact sid whose
+        // ceremony confirmed; a new sid (even the same install) needs a fresh
+        // code. No binding (every non-code path): unchanged.
         let binding_allows = self
             .active_binding
             .as_ref()
-            .is_none_or(|binding| active_binding_matches(binding, &peer_id, peer_uid.as_deref()));
+            .is_none_or(|binding| active_binding_matches(binding, &peer_id));
         if want_active && !binding_allows {
             self.log.debug("tunlion: ADOPT refused: peer is not the authenticated code sender");
         }
@@ -2457,9 +2866,6 @@ impl Conn {
                 }
             }
             self.active = Some(peer_id.clone());
-            if let Some(binding) = self.active_binding.as_mut() {
-                binding.0 = peer_id.clone();
-            }
             self.rejoin.waiting_rejoin = None;
         }
         Ok(self.is_active(&peer_id))
@@ -2579,6 +2985,123 @@ impl Conn {
     /// from the call sites the way a manual audit does.
     #[track_caller]
     pub fn drop_link(&mut self, pid: &str) {
+        // The link's queued events are discarded with its stream.
+        let (old, _events) = self.unlink(pid);
+        if let Some(old) = old {
+            close_dropped_link(old);
+        }
+    }
+
+    /// Drop a link cut by a revocation, delivering `frame` (the
+    /// `link-revoked` refusal) first. Everything `drop_link` invalidates is
+    /// invalidated here at once: the link leaves `links`, its builds, intents
+    /// and routing go, and no further event from it is admitted. Only the
+    /// CLOSE is deferred, to a spawned task that owns the transport: it writes
+    /// the frame with a fresh nonce, waits for the peer's matching
+    /// `link-revoked-ack` (read by the task itself from the link's own
+    /// candidate stream, or signalled by `closing` when the link's events
+    /// reach the main queue), then closes, all under one `REFUSAL_ACK_BUDGET`.
+    /// The event loop never awaits the peer, so a dead or frozen peer costs it
+    /// nothing. The ack is a diagnostic: its absence is logged as unconfirmed
+    /// and nothing treats it as "not delivered".
+    ///
+    /// Why an ack and not a flush: a successful write only means the frame is
+    /// queued in this process (the QUIC send buffer, the SCTP stream queue),
+    /// and both QUIC's CONNECTION_CLOSE and a WebRTC peer close discard what
+    /// is still queued or unacknowledged. A transport-level flush would prove
+    /// at most that the peer's stack received the bytes, not that its daemon
+    /// processed the refusal before its own teardown of the dying link.
+    ///
+    /// Returns whether a refusal was attempted (false: no such link, or no
+    /// transport to carry it, in which case this is a plain `drop_link`).
+    #[track_caller]
+    pub fn drop_link_after_refusal(&mut self, pid: &str, mut frame: Value) -> bool {
+        let (old, events) = self.unlink(pid);
+        let Some(mut old) = old else {
+            return false;
+        };
+        let Some(t) = old.transport.clone() else {
+            // A WebRTC link that never reached ChannelReady has nothing to
+            // carry the refusal on. Say so rather than attempt nothing silently.
+            self.log.debug(&format!(
+                "link-revoked to {pid}: dropped_no_transport (no channel to carry the refusal)"
+            ));
+            close_dropped_link(old);
+            return false;
+        };
+        let mut random = [0u8; 16];
+        let nonce = match getrandom::getrandom(&mut random) {
+            Ok(()) => hex::encode(random),
+            // No randomness: still unique per process and never reused.
+            Err(_) => {
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                format!("n{}", SEQ.fetch_add(1, Ordering::Relaxed))
+            }
+        };
+        frame["nonce"] = Value::String(nonce.clone());
+        // Bind the ack to this cut's nonce and pid. A
+        // link whose source is unassigned emits no source-tagged events, so
+        // no ack can come back and none is awaited. The ack is looked for in
+        // BOTH places it can arrive: the link's own candidate stream, read by
+        // the closer itself (no loop turn in between), and the main queue,
+        // where `stage_event` signals the closer. A WebRTC link promoted to a
+        // direct path, or a peer that answers on another path of the same
+        // session, delivers there.
+        let watch = if old.source != net::SourceId::UNASSIGNED {
+            // Only the stream of THIS link generation. A stale one (left by a
+            // replacement, such as a direct upgrade of a WebRTC link) is not
+            // where this transport delivers: watching it would end the wait at
+            // once (its reader is gone) and close before the ack, so such a
+            // link uses the main-queue signal instead.
+            let stream = events
+                .filter(|e| e.generation == old.generation)
+                .map(|e| e.rx.into_inner().unwrap_or_else(|p| p.into_inner()));
+            let (ack_tx, ack_rx) = oneshot::channel();
+            self.closing.insert(
+                nonce.clone(),
+                ClosingLink { pid: pid.to_string(), ack: Some(ack_tx) },
+            );
+            Some(AckWatch {
+                pid: pid.to_string(),
+                nonce,
+                signal: Some(ack_rx),
+                stream,
+            })
+        } else {
+            None
+        };
+        let peer = old.peer.take();
+        let closing: Vec<Arc<dyn Transport>> =
+            old.transport.take().into_iter().chain(std::mem::take(&mut old.workers)).collect();
+        drop(old);
+        let log = self.log.clone();
+        let pid = pid.to_string();
+        tokio::spawn(async move {
+            let outcome = deliver_refusal(t.as_ref(), &frame, watch, REFUSAL_ACK_BUDGET).await;
+            log.debug(&format!("link-revoked to {pid}: {}", outcome.describe()));
+            for t in closing {
+                t.force_close();
+            }
+            if let Some(p) = peer {
+                p.mark_closed();
+                p.close().await;
+            }
+        });
+        true
+    }
+
+    /// Everything `drop_link` does except closing the transports: the caller
+    /// owns the returned link and decides when its transports close. The
+    /// link's event stream is returned too; dropping it discards what is
+    /// queued on it.
+    #[track_caller]
+    fn unlink(&mut self, pid: &str) -> (Option<Link>, Option<LinkEvents>) {
+        // #686: fence the departure behind any adopted-source replay. This
+        // runs on every invalidation, an ordinary drop and a revocation cut.
+        self.replaying_sources.retain(|_, pending| pending.pid != pid);
+        if self.replay_departures.get(pid).is_some_and(|(_, ready)| !ready) {
+            self.replay_departures.remove(pid);
+        }
         // A drop is an invalidation: a candidate still building for this peer
         // must not publish after the link it was replacing is gone.
         self.cancel_build(pid);
@@ -2591,7 +3114,7 @@ impl Conn {
         // The installed link owns its candidate-origin stream; dropping the
         // receiver discards any queued ChannelReady/Control from this
         // generation instead of forwarding it to a later link.
-        self.link_events.remove(pid);
+        let events = self.link_events.remove(pid);
         self.log.debug(&format!(
             "  drop_link({pid}) ordered by {}",
             std::panic::Location::caller()
@@ -2609,6 +3132,7 @@ impl Conn {
         self.channel_digest_absent.remove(pid);
         self.room_digest_absent.remove(pid);
         self.buffered_offers.remove(pid);
+        self.held_signals.remove(pid);
         self.stuck_retry.remove(pid);
         // A promotion dies with its link: nothing will adopt the standby, and a
         // barrier still waiting on the peer must release onto the old path. One
@@ -2630,42 +3154,11 @@ impl Conn {
         if let Some(attempt) = link_attempt {
             self.retire_direct_ownership(pid, attempt);
         }
-        if let Some(old) = self.links.remove(pid) {
-            // Never await close in the event loop (F8): mark + spawn.
-            if let Some(p) = old.peer.clone() {
-                p.mark_closed();
-                tokio::spawn(async move { p.close().await });
-            }
-            // CLOSE the direct transports explicitly. Dropping the Link only
-            // drops OUR Arc: the L3 overlay pump, the mesh accept loop, the
-            // endpoint keeper and any warm stream hold their own clones, so the
-            // QUIC connection stayed up and the peer never learned the link was
-            // gone. It kept its own direct link for this pid and ignored our
-            // WebRTC offers (no `peer` on its link to apply them to), our ladder
-            // exhausted, and the cycle repeated forever: split-brain. Closing
-            // sends ApplicationClose, the peer sees ConnectionLost, drops its
-            // side and both ends re-converge.
-            //
-            // After a short grace, not at once: QUIC has no flush-on-close
-            // (RFC 9000 s10.2), and several callers drop right after writing a
-            // last frame on this link (the l2-close that answers a parked open,
-            // a refusal). Closing immediately discarded that frame and the
-            // client saw "no answer" instead of the reason. No-op for transports
-            // without a connection to close (DataChannel, local).
-            let closing: Vec<Arc<dyn Transport>> =
-                old.transport.into_iter().chain(old.workers).collect();
-            if !closing.is_empty() {
-                tokio::spawn(async move {
-                    tokio::time::sleep(DROP_CLOSE_GRACE).await;
-                    for t in closing {
-                        t.force_close();
-                    }
-                });
-            }
-        }
+        let old = self.links.remove(pid);
         if self.is_active(pid) {
             self.active = None;
         }
+        (old, events)
     }
 
     /// Exit path: close every link's QUIC connection NOW, so each peer learns
@@ -2699,6 +3192,28 @@ impl Conn {
     /// LRU and marks the peer as warm so the daemon proactively connects/reconnects.
     pub fn note_warm_use(&mut self, peer: &str) {
         self.warm_hold.note_use(peer);
+    }
+
+    /// Record the sender of a COMPLETED inbound transfer as warm. Called only
+    /// after a successful completion, never for a failed, truncated or refused
+    /// transfer. The name is the link's proven `verified_name` now, else the
+    /// one `captured` when the stream was accepted (`IncomingFile::sender`);
+    /// never a name the peer claimed.
+    ///
+    /// The warm tier used to be fed from the streams STILL in flight once
+    /// anything had completed. The finished stream had already been removed
+    /// by then, so a single transfer warmed nobody, and with another sender
+    /// mid-transfer it warmed that one instead.
+    pub fn note_completed_transfer(&mut self, pid: &str, captured: Option<&str>) {
+        let name = self
+            .links
+            .get(pid)
+            .and_then(|l| l.verified_name.clone())
+            .or_else(|| captured.map(str::to_string))
+            .filter(|n| !n.is_empty());
+        if let Some(name) = name {
+            self.note_warm_use(&name);
+        }
     }
 
     /// Load configured warm-peers from settings. Called at daemon startup and
@@ -2820,8 +3335,15 @@ impl Conn {
             };
             let pid = match decision {
                 WarmDecision::Skip { pid } => {
+                    // The live link's principal rides along, so a gate can see
+                    // what the link IS between events, not only at admission.
+                    let (kind, sibling) = self
+                        .links
+                        .get(&pid)
+                        .map(|l| (format!("{:?}", l.principal_kind), l.is_sibling_link()))
+                        .unwrap_or_default();
                     self.log.debug(&format!(
-                        "warm-hold: skip '{peer}' (link {pid} to it is live)"
+                        "warm-hold: skip '{peer}' (link {pid} to it is live) principal={kind} sibling={sibling}"
                     ));
                     continue;
                 }
@@ -3143,8 +3665,18 @@ impl Conn {
         let uid = info["uid"].as_str().map(|s| s.to_string());
         let peer_present = self.roster.contains_key(&peer_id);
         let name = info["name"].as_str().unwrap_or("peer").to_string();
+        // An offer held during the direct attempt makes this build its
+        // responder: the peer already offered, so answering it is the only role
+        // that cannot glare (the same reason `ensure_responder` forces polite).
+        // Peek here and take the hold only after the role is decided, so a role
+        // error leaves it in place for the next build.
+        let held_offer = self
+            .held_signals
+            .get(&peer_id)
+            .is_some_and(|h| h.has_offer && h.since.elapsed() < held_signal_ttl());
         let polite = match force_polite {
             Some(value) => value,
+            None if held_offer => true,
             None => match uid.as_deref() {
                 Some(uid) => net::polite_role(&self.my_uid, uid, &self.my_id, &peer_id)?,
                 None => {
@@ -3159,6 +3691,16 @@ impl Conn {
                     )?
                 }
             },
+        };
+        let (signals, signal_bytes) = match self.take_held(&peer_id) {
+            Some(h) => {
+                self.log.debug(&format!(
+                    "tunlion: HOLD-REPLAY peer={peer_id} caller={caller}: {} held signal(s) staged into its build",
+                    h.signals.len()
+                ));
+                (h.signals, h.bytes)
+            }
+            None => (std::collections::VecDeque::new(), 0),
         };
         self.next_gen += 1;
         let generation = self.next_gen;
@@ -3212,8 +3754,8 @@ impl Conn {
             caller,
             attempt: 0,
             prior_generation,
-            signals: std::collections::VecDeque::new(),
-            signal_bytes: 0,
+            signals,
+            signal_bytes,
         }))
     }
 
@@ -3240,8 +3782,11 @@ impl Conn {
     /// Test-only synchronous path. It uses the same plan, peer construction and
     /// installer as the build task; only the task boundary is absent.
     #[cfg(test)]
-    async fn establish_inline(&mut self, plan: BuildPlan) -> Result<()> {
+    async fn establish_inline(&mut self, mut plan: BuildPlan) -> Result<()> {
         let pid = plan.peer_id.clone();
+        // Signals staged into the plan (an offer held during a direct attempt)
+        // replay on install exactly as the off-loop build's do.
+        let staged = std::mem::take(&mut plan.signals);
         let mut cfg = match plan.config {
             BuildIce::Cached(cfg) => cfg,
             BuildIce::Fetch => match tokio::time::timeout(
@@ -3295,7 +3840,7 @@ impl Conn {
                 prior_generation: plan.prior_generation,
             },
             std::collections::VecDeque::new(),
-            std::collections::VecDeque::new(),
+            staged,
             binding,
             pending_active,
         );
@@ -3341,6 +3886,7 @@ impl Conn {
         // replayed onto the candidate after installation.
         let (candidate_tx, candidate_rx) = mpsc::unbounded_channel();
         let wake = self.tx.clone();
+        let wake_pending = self.candidate_wake.clone();
         let context = self.transport_context.clone();
         let server = self.server.clone();
         let sio = self.sio.clone();
@@ -3352,6 +3898,7 @@ impl Conn {
                 plan,
                 candidate_tx,
                 wake,
+                wake_pending,
                 task_cancel,
                 out,
                 context,
@@ -3385,6 +3932,10 @@ impl Conn {
     /// slots are free, and reap a task that outlived its grace. Every Conn
     /// driver calls this once per loop turn; it never awaits.
     pub fn pump_builds(&mut self) -> usize {
+        // Clear BEFORE draining. An event queued after this point sees the
+        // flag clear and sends a fresh wake, so it is never left for an
+        // unrelated event to collect; one queued before it is drained below.
+        self.candidate_wake.store(false, Ordering::SeqCst);
         // Installed-link event streams are candidate-local. Forward them only
         // while the link still carries the generation that created the stream;
         // a replaced/dropped link's queued events are discarded, never applied
@@ -3411,6 +3962,7 @@ impl Conn {
                 }
             }
         }
+        self.pump_closing();
         // Candidate events are drained here, never taken from the main queue.
         // An event from the previously serving link therefore cannot be
         // replayed onto a candidate that is about to install.
@@ -3759,7 +4311,7 @@ impl Conn {
         }
     }
 
-    /// Final pre-dispatch gate. Transport-origin Control/PcState/ChannelReady
+    /// Final pre-dispatch gate. Transport-origin Control/PcState/ChannelReady/Chunk
     /// must carry an immutable SourceId; the event is accepted only if that
     /// source still belongs to the pid's CURRENT link at the moment the driver
     /// is about to handle it. A replacement after forwarding therefore cannot
@@ -3767,6 +4319,31 @@ impl Conn {
     /// handlers that defer/requeue the event).
     pub fn stage_event(&mut self, ev: Ev) -> Option<(Ev, Option<net::SourceId>)> {
         match ev {
+            Ev::ReplayDeparture(pid, source, payload) => {
+                if self.replay_departures.get(&pid) != Some(&(source, false)) {
+                    return None;
+                }
+                if self.links.get(&pid).map(|link| link.source) != Some(source) {
+                    self.replay_departures.remove(&pid);
+                    return None;
+                }
+                if self.replaying_sources.contains_key(&source) {
+                    let _ = self.tx.send(Ev::ReplayDeparture(pid, source, payload));
+                    return None;
+                }
+                self.replay_departures.insert(pid, (source, true));
+                return Some((Ev::PeerLeft(payload), Some(source)));
+            }
+            Ev::ReplaySource(source) => {
+                let pending = self.replaying_sources.get_mut(&source)?;
+                let pid = pending.pid.clone();
+                let inner = pending.events.pop_front()?;
+                pending.bytes = pending.bytes.saturating_sub(ev_weight(&inner));
+                if pending.events.is_empty() {
+                    self.replaying_sources.remove(&source);
+                }
+                return self.source_current(&pid, source, &inner).then_some((inner, Some(source)));
+            }
             Ev::AttemptDrained(attempt) => {
                 self.retired_attempts.remove(&attempt);
                 None
@@ -3789,6 +4366,10 @@ impl Conn {
                     if !self.source_current(&pid, source, inner.as_ref()) {
                         return None;
                     }
+                    if self.replaying_sources.contains_key(&source) {
+                        let _ = self.tx.send(Ev::Sourced { pid, source, inner });
+                        return None;
+                    }
                     match self.link_events.get_mut(&pid) {
                         Some(events)
                             if self.links.get(&pid).map(|link| link.generation)
@@ -3808,13 +4389,48 @@ impl Conn {
                 let valid_inner = match inner.as_ref() {
                     Ev::Control(ipid, _)
                     | Ev::PcState(ipid, _)
-                    | Ev::ChannelReady(ipid, _) => ipid == &pid,
+                    | Ev::ChannelReady(ipid, _)
+                    | Ev::Chunk(ipid, ..) => ipid == &pid,
                     _ => false,
                 };
                 if !valid_inner {
                     return None;
                 }
+                // The ack for a cut link's refusal, from whichever path of that
+                // peer it came back on (current or not). It is consumed here:
+                // it authorizes nothing and is never dispatched.
+                if self.closing_ack(&pid, inner.as_ref()) {
+                    return None;
+                }
                 if self.source_current(&pid, source, inner.as_ref()) {
+                    if self.replaying_sources.contains_key(&source) {
+                        // The replay tokens were queued behind already-read newer
+                        // events. Swap this arrival behind the oldest buffered
+                        // event, so the consumer sees source order, not queue order.
+                        let total: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.bytes).sum();
+                        let Some(pending) = self.replaying_sources.get_mut(&source) else { return None; };
+                        if pending.pid != pid { return None; }
+                        // The token invariant says one buffered event per token.
+                        // If it does not hold, fail closed: drop the replay and
+                        // close the transport rather than panic in the daemon's
+                        // event loop.
+                        let Some(older) = pending.events.pop_front() else {
+                            self.replaying_sources.remove(&source);
+                            if let Some(t) = self.transport_of(&pid) { t.force_close(); }
+                            return None;
+                        };
+                        let bytes = pending.bytes.saturating_sub(ev_weight(&older))
+                            .saturating_add(ev_weight(&inner));
+                        let total_after = total.saturating_sub(pending.bytes).saturating_add(bytes);
+                        if bytes > MAX_BUILD_EVENT_BYTES || total_after > MAX_BUILD_EVENT_BYTES {
+                            self.replaying_sources.remove(&source);
+                            if let Some(t) = self.transport_of(&pid) { t.force_close(); }
+                            return None;
+                        }
+                        pending.bytes = bytes;
+                        pending.events.push_back(*inner);
+                        return self.source_current(&pid, source, &older).then_some((older, Some(source)));
+                    }
                     return Some((*inner, Some(source)));
                 }
                 // A standby/upgrade attempt may deliver before adoption. Buffer
@@ -3826,7 +4442,7 @@ impl Conn {
             }
             // A transport-origin event must never arrive untagged. Fail closed
             // whether or not a link exists.
-            Ev::Control(..) | Ev::PcState(..) | Ev::ChannelReady(..) => None,
+            Ev::Control(..) | Ev::PcState(..) | Ev::ChannelReady(..) | Ev::Chunk(..) => None,
             // Loop-authored events are explicitly trusted: they are created by
             // this loop, not a transport callback.
             Ev::LocalControl(pid, value) => Some((Ev::Control(pid, value), None)),
@@ -3835,8 +4451,39 @@ impl Conn {
         }
     }
 
+    /// Forget cut-link entries whose closer has finished. Never awaits.
+    fn pump_closing(&mut self) {
+        self.closing.retain(|_, entry| entry.ack.as_ref().is_some_and(|a| !a.is_closed()));
+    }
+
+    /// A `link-revoked-ack` answering a cut in flight completes it: the nonce
+    /// must be that cut's, read for that cut's pid (on any of its paths).
+    /// Returns whether `inner` was a `link-revoked-ack` at all; every
+    /// one is consumed (a stale or unknown one is logged), since it authorizes
+    /// nothing and has no handler.
+    fn closing_ack(&mut self, pid: &str, inner: &Ev) -> bool {
+        let Some((ipid, nonce)) = refusal_ack_nonce(inner) else {
+            return false;
+        };
+        let matched =
+            ipid == pid && self.closing.get(nonce).is_some_and(|entry| entry.pid == pid);
+        if matched {
+            if let Some(mut entry) = self.closing.remove(nonce) {
+                if let Some(ack) = entry.ack.take() {
+                    let _ = ack.send(());
+                }
+            }
+        } else {
+            self.log.debug(&format!(
+                "link-revoked-ack from {pid} for nonce {nonce}: already settled or unknown \
+                 (duplicate acks on a second path are expected)"
+            ));
+        }
+        true
+    }
+
     /// A source is current when it is the link's primary source, or (for
-    /// Control only) one of its current worker sources. PcState/ChannelReady
+    /// Control and Chunk only) one of its current worker sources. PcState/ChannelReady
     /// and a departure barrier (`Ev::PeerLeft`) are primary-only so a worker
     /// can never trigger primary teardown/readiness or a departure.
     fn source_current(&self, pid: &str, source: net::SourceId, inner: &Ev) -> bool {
@@ -3846,7 +4493,7 @@ impl Conn {
         if link.source == source {
             return true;
         }
-        matches!(inner, Ev::Control(..)) && link.worker_sources.contains(&source)
+        matches!(inner, Ev::Control(..) | Ev::Chunk(..)) && link.worker_sources.contains(&source)
     }
 
     /// Buffer a pre-adoption event for a registered source. Per-source and total
@@ -3854,8 +4501,8 @@ impl Conn {
     /// dropping the pending source and its standby transport.
     fn buffer_pending_source(&mut self, pid: String, source: net::SourceId, inner: Ev) {
         let weight = ev_weight(&inner);
-        let total_events: usize = self.pending_sources.values().map(|p| p.events.len()).sum();
-        let total_bytes: usize = self.pending_sources.values().map(|p| p.bytes).sum();
+        let total_events: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.events.len()).sum();
+        let total_bytes: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.bytes).sum();
         let over_total = total_events >= MAX_BUILD_EVENTS
             || total_bytes.saturating_add(weight) > MAX_BUILD_EVENT_BYTES;
         let is_new = !self.pending_sources.contains_key(&source);
@@ -3912,18 +4559,17 @@ impl Conn {
         }
     }
 
-    /// Replay buffered standby events after adoption. They keep their tag, so a
-    /// second replacement still rejects them at the final gate.
+    /// Queue one token per buffered event. Newer already-queued events swap with
+    /// the oldest replay item at the final gate, preserving source order.
     fn flush_pending_source(&mut self, source: net::SourceId) {
         let Some(pending) = self.pending_sources.remove(&source) else {
             return;
         };
-        for inner in pending.events {
-            let _ = self.tx.send(Ev::Sourced {
-                pid: pending.pid.clone(),
-                source,
-                inner: Box::new(inner),
-            });
+        let count = pending.events.len();
+        if count == 0 { return; }
+        self.replaying_sources.insert(source, pending);
+        for _ in 0..count {
+            let _ = self.tx.send(Ev::ReplaySource(source));
         }
     }
 
@@ -3968,6 +4614,112 @@ impl Conn {
             return true;
         }
         false
+    }
+
+    /// Hold a WebRTC offer or candidate that cannot be answered yet because our
+    /// direct attempt for that sid is still pending (`prepare_build` refuses
+    /// any build during a pending, and there is neither a link nor a build to
+    /// stage into). The fallback responder's build takes the hold
+    /// (`take_held`), so the offer is answered the moment the direct path
+    /// loses; a direct win discards it. Returns true when the signal was
+    /// consumed (held, or dropped by the bound), false when the caller should
+    /// apply it as before.
+    pub fn hold_for_direct(&mut self, envelope: &Value) -> bool {
+        if !is_candidate_sdp_signal(envelope) {
+            return false;
+        }
+        let Some(pid) = envelope["from"].as_str() else {
+            return false;
+        };
+        if !self.direct_pending.contains_key(pid)
+            || self.links.contains_key(pid)
+            || self.build_pending(pid)
+        {
+            return false;
+        }
+        if self
+            .held_signals
+            .get(pid)
+            .is_some_and(|h| supersedes_held(h, &envelope["data"]))
+        {
+            self.discard_held(pid, "a newer connection attempt arrived");
+        }
+        if !self.held_signals.contains_key(pid) {
+            if self.held_signals.len() >= MAX_HELD_PEERS {
+                self.held_signals.retain(|_, h| h.since.elapsed() < held_signal_ttl());
+            }
+            if self.held_signals.len() >= MAX_HELD_PEERS {
+                return false;
+            }
+            self.held_signals.insert(
+                pid.to_string(),
+                HeldSignals {
+                    since: Instant::now(),
+                    pc: envelope["data"]["pc"].as_u64(),
+                    has_offer: false,
+                    signals: std::collections::VecDeque::new(),
+                    bytes: 0,
+                },
+            );
+        }
+        let len = envelope.to_string().len();
+        let offer = is_offer_data(&envelope["data"]);
+        let Some(held) = self.held_signals.get_mut(pid) else {
+            return false;
+        };
+        if held.signals.len() >= MAX_BUILD_SIGNALS || held.bytes + len > MAX_BUILD_SIGNAL_BYTES {
+            return true;
+        }
+        held.has_offer |= offer;
+        held.bytes += len;
+        held.signals.push_back(envelope.clone());
+        if offer {
+            self.log.debug(&format!(
+                "tunlion: HOLD-OFFER peer={pid}: direct attempt pending, holding its WebRTC offer for the fallback responder"
+            ));
+        }
+        true
+    }
+
+    /// Drop `pid`'s held offer, if any, saying why.
+    fn discard_held(&mut self, pid: &str, why: &str) {
+        if let Some(held) = self.held_signals.remove(pid) {
+            self.log.debug(&format!(
+                "tunlion: HOLD-DISCARD peer={pid}: {} held signal(s) dropped, {why}",
+                held.signals.len()
+            ));
+        }
+    }
+
+    /// Drop holds whose direct pending is gone with no build or link to take
+    /// them, and holds past their age.
+    fn reap_orphan_holds(&mut self) {
+        let orphans: Vec<String> = self
+            .held_signals
+            .iter()
+            .filter(|(pid, h)| {
+                h.since.elapsed() >= held_signal_ttl()
+                    || (!self.direct_pending.contains_key(pid.as_str())
+                        && !self.build_pending(pid.as_str()))
+            })
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        for pid in orphans {
+            self.discard_held(&pid, "its direct attempt ended with no build to answer it");
+        }
+    }
+
+    /// Take `pid`'s held signals for the build being prepared, unless they aged out.
+    fn take_held(&mut self, pid: &str) -> Option<HeldSignals> {
+        let held = self.held_signals.remove(pid)?;
+        if held.since.elapsed() >= held_signal_ttl() {
+            self.log.debug(&format!(
+                "tunlion: HOLD-DISCARD peer={pid}: {} held signal(s) dropped, expired",
+                held.signals.len()
+            ));
+            return None;
+        }
+        Some(held)
     }
 
     /// True when a build for this peer is pending and no transport is installed
@@ -4168,9 +4920,8 @@ impl Conn {
     ///
     /// The local LAN handshake already verified this device's pair-secret MAC,
     /// so for the transfer capability every paired device holds, a daemon may
-    /// accept the offer without asking. This does not set `trusted`, does not
-    /// make the identity Proven, and grants no owner/worker capability: under
-    /// authoritative mode the trust floor still refuses an untrusted link.
+    /// accept the offer without asking. This lookup sets nothing; a live LAN
+    /// device link is already trusted as the pair from adoption.
     /// A revoked record, or a record that denies transfer, fails closed here
     /// even while its pair secret is still present in the store.
     pub fn authenticated_lan_peer(&self, pid: &str) -> Option<String> {
@@ -4203,14 +4954,6 @@ impl Conn {
             .or_else(|| self.authenticated_lan_peer(pid))
     }
 
-    /// The delegated ceiling a LAN link may carry: the live store record's caps,
-    /// only while the link's exact authenticated binding still resolves. A
-    /// revoked, removed, unbound or fleet reservation gets the empty ceiling.
-    fn lan_delegated_caps(&self, pid: &str) -> Vec<String> {
-        self.authenticated_lan_peer(pid)
-            .map(|name| self.host.device_ceiling(&name))
-            .unwrap_or_default()
-    }
 
     /// Refusal predicate for a build intent.
     ///
@@ -5146,6 +5889,30 @@ impl Conn {
             return; // already linked via a live transport
         }
 
+        // The retirement drain is BOUNDED (MAX_RETIRED_ATTEMPTS), and a full
+        // drain refuses every new direct attempt for the whole session. So the
+        // check comes before a QUIC endpoint is bound, before candidates are
+        // gathered (that includes an HTTP whoami), before a transport-offer is
+        // emitted, and before the 6x/1.2s re-emitter is spawned. Checked last,
+        // every refused attempt had already paid all of that and left a
+        // re-emitter running with a cancel flag on a pending that was never
+        // created: one stuck build became a session-wide outage and an
+        // unstoppable burst. It comes AFTER the relay recovery and the no-op
+        // returns above, which consume no drain capacity: refusing those on a
+        // full drain left a relay-committed peer disconnected.
+        if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
+            // Liveness backstop for a lost drain event. Only a tombstone whose
+            // producer is terminal is reaped; a live producer keeps its slot
+            // and this attempt fails closed below.
+            self.reap_drained_tombstones(Instant::now());
+            if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
+                self.log.debug(&format!(
+                    "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
+                ));
+                return;
+            }
+        }
+
         // Check if target is same-machine peer (local transport).
         let peer_uid = self.roster.get(pid).and_then(|info| info["uid"].as_str());
         let is_local = LOCAL_TCP_TRANSPORT && self.host.is_self_uid(&self.my_uid, peer_uid);
@@ -5315,18 +6082,6 @@ impl Conn {
         } else {
             Instant::now() + direct::DIRECT_BUDGET
         };
-        if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
-            // Liveness backstop for a lost drain event. Only a tombstone whose
-            // producer is terminal is reaped; a live producer keeps its slot
-            // and this attempt fails closed below.
-            self.reap_drained_tombstones(Instant::now());
-            if self.retired_attempts.len() >= MAX_RETIRED_ATTEMPTS {
-                self.log.debug(&format!(
-                    "tunlion: direct attempt for {pid} refused: retirement drain capacity full"
-                ));
-                return;
-            }
-        }
         self.next_gen += 1;
         let auth = match intent {
             DirectIntent::Fleet => DirectAuth::fleet(self.next_gen),
@@ -5769,7 +6524,18 @@ impl Conn {
         // have a fleet secret at all, is treated as a fleet link and stays
         // untrusted until `fleet-hello` names it.
         let fleet = match pend.as_ref() {
-            Some(p) => p.fleet,
+            Some(p) => {
+                let stale_device_binding = p.auth.domain == DirectAuthDomain::Device
+                    && self.host.fleet_rv_present()
+                    && !p.auth.device_binding.as_ref().is_some_and(|(name, secret)| {
+                        !secret.is_empty()
+                            && !self.host.device_record_revoked(name)
+                            && self.host.devices_load().iter().any(|(n, held)| {
+                                n.eq_ignore_ascii_case(name) && held == secret
+                            })
+                    });
+                p.fleet || stale_device_binding
+            }
             None => {
                 let claimed = self
                     .roster
@@ -5777,9 +6543,10 @@ impl Conn {
                     .and_then(|v| v["name"].as_str().map(str::to_string))
                     .unwrap_or_default();
                 let paired = !claimed.is_empty()
+                    && !self.host.device_record_revoked(&claimed)
                     && self.host.devices_load()
                         .iter()
-                        .any(|(n, _)| n.eq_ignore_ascii_case(&claimed));
+                        .any(|(n, secret)| !secret.is_empty() && n.eq_ignore_ascii_case(&claimed));
                 self.host.fleet_rv_present() && !paired
             }
         };
@@ -5802,10 +6569,9 @@ impl Conn {
             .cloned()
             .unwrap_or_else(|| json!({ "id": pid, "name": name }));
         let uid = info["uid"].as_str().map(|s| s.to_string());
-        // LAN's proof is a shared local secret, not a pair binding. A LAN link
-        // must not inherit or mint `expected_secret`, or later identity/digest
-        // decisions would treat a local-network holder as that paired device.
-        // Its device reservation is kept separately in `lan_binding`.
+        // A LAN link never mints `expected_secret`: that field also keys worker
+        // transports and the pair-proof hypothesis, which a LAN route does not
+        // use. Its device reservation is kept separately in `lan_binding`.
         let expected_secret = if lan || secret.is_empty() {
             None
         } else {
@@ -5815,6 +6581,29 @@ impl Conn {
             name: name.clone(),
             device: lan_device_binding,
         });
+        // A LAN DEVICE link is the pair. Its handshake is the same pair-secret
+        // MAC as any direct link (`direct::authenticate` keyed by
+        // `transport_key(secret)`), and the listener only holds the secrets of
+        // live, unrevoked device records (`lan_glue::keys`). So when its exact
+        // binding still resolves in the current store, it gets what the pair
+        // link to that device gets: trusted, named by the canonical petname,
+        // born `OwnerDevice` and resolved from the record like any pair link.
+        // Pairwise trust must not depend on the route two paired devices found.
+        // A fleet reservation, or a binding the store no longer holds, stays
+        // untrusted with no ceiling.
+        let lan_pair_name: Option<String> = if lan && !fleet && !ephemeral {
+            let devices = self.host.devices_load();
+            authenticated_lan_device_name(
+                lan_binding.as_ref(),
+                &devices,
+                &self.revoked_bindings,
+                &|n: &str| self.host.device_record_revoked(n),
+            )
+            .map(str::to_string)
+        } else {
+            None
+        };
+        let lan_untrusted = lan && lan_pair_name.is_none();
         self.next_gen += 1;
         let generation = self.next_gen;
         // If a Link already exists for this pid (e.g. from a stall-watchdog
@@ -5868,12 +6657,50 @@ impl Conn {
                 }
             }
             if lan {
-                // The LAN handshake proves a local holder of a shared secret,
-                // not a device binding. It must never inherit owner trust or a
-                // worker key from another direct path.
+                // Never inherit a worker key from another direct path.
+                existing.expected_secret = None;
+            }
+            if lan {
+                // Whatever this link proved before, a LAN adoption starts its
+                // identity over: `resolve_peer_identity` keeps any cached key
+                // as already resolved, so a stale one would outlive the route
+                // that proved it.
+                existing.identity_device_pub = None;
+                existing.identity_user_pub = None;
+                existing.identity_binding = BindingStrength::None;
+                existing.identity_state = IdentityState::Pending;
+                existing.identity_cert_expires = None;
+            }
+            if fleet {
+                // A FLEET direct is keyed by the secret the whole fleet shares:
+                // it proves fleet membership, not who the peer is. So NOTHING
+                // pair-derived may survive on this link: the standing has to be
+                // re-established by the verified fleet hello. Before this, a
+                // link that had been pair-proven kept `trusted`, its verified
+                // name and its principal kind across the adoption, so a
+                // transport that authenticates only against the fleet secret
+                // still carried pair standing, and a cut in place (revoke
+                // without a close) left that standing behind.
                 existing.trusted = false;
                 existing.verified_name = None;
-                existing.expected_secret = None;
+                existing.principal_kind = PrincipalKind::Delegated { caps: Vec::new() };
+                existing.identity_device_pub = None;
+                existing.identity_user_pub = None;
+                existing.identity_binding = BindingStrength::None;
+                existing.identity_state = IdentityState::Pending;
+                existing.identity_cert_expires = None;
+            }
+            if let Some(n) = &lan_pair_name {
+                // Re-resolve from the record as a fresh pair link would, so a
+                // delegated record gets its ceiling.
+                existing.trusted = true;
+                existing.verified_name = Some(n.clone());
+                existing.principal_kind = PrincipalKind::OwnerDevice;
+            } else if lan_untrusted {
+                // A fleet reservation, or a binding the store no longer holds:
+                // no device trust, no identity, no ceiling.
+                existing.trusted = false;
+                existing.verified_name = None;
                 existing.principal_kind = PrincipalKind::Delegated { caps: Vec::new() };
             }
             resolve_peer_identity(existing);
@@ -5907,9 +6734,11 @@ impl Conn {
                     // that the peer is in the fleet. So it is born untrusted, with no
                     // petname and no owner-equivalence, until a verified fleet-hello
                     // names it.
-                    trusted: !fleet && !ephemeral && !lan,
-                    verified_name: if fleet || ephemeral || lan {
+                    trusted: !fleet && !ephemeral && !lan_untrusted,
+                    verified_name: if fleet || ephemeral || lan_untrusted {
                         None
+                    } else if lan_pair_name.is_some() {
+                        lan_pair_name.clone()
                     } else {
                         expected_secret.as_ref().map(|(n, _)| n.clone())
                     },
@@ -5924,7 +6753,7 @@ impl Conn {
                     identity_binding: BindingStrength::None,
                     identity_state: IdentityState::Pending,
                     identity_cert_expires: None,
-                    principal_kind: if fleet || lan {
+                    principal_kind: if fleet || lan_untrusted {
                         PrincipalKind::Delegated { caps: Vec::new() }
                     } else {
                         PrincipalKind::OwnerDevice
@@ -5933,23 +6762,17 @@ impl Conn {
                 },
             );
         }
-        if lan {
-            // The LAN link was admitted with the exact pair secret of a CURRENT
-            // live device record. Its delegated principal carries that record's
-            // ceiling, so the receiver's transfer gate does not read the empty
-            // caps an unverified direct link is born with. A revoked, removed,
-            // unbound or fleet reservation resolves nothing here and keeps the
-            // empty ceiling. This is authority for the LAN delegated principal
-            // only: `trusted` stays false, no `verified_name` is minted, and
-            // `expected_secret`/worker keys are untouched.
-            let caps = self.lan_delegated_caps(pid);
+        if lan_pair_name.is_some() {
+            // Resolve now, not at the later ready event: a delegated (invited)
+            // record must get its ceiling before anything can be gated on it.
             if let Some(link) = self.links.get_mut(pid) {
-                link.principal_kind = PrincipalKind::Delegated { caps };
+                resolve_peer_identity(link);
             }
         }
         // Replay anything the standby buffered before adoption. The tags remain,
         // so a second replacement still rejects them at the handler gate.
         self.flush_pending_source(source);
+        self.discard_held(pid, "the direct path was adopted");
         DirectAdoption::Adopted { attempt, tkey }
     }
 
@@ -6056,9 +6879,7 @@ impl Conn {
             tokio::spawn(async move {
                 let workers =
                     direct::accept_workers(endpoints, tkey, pid.clone(), tx.clone(), count).await;
-                if !workers.is_empty() {
-                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers, primary_source));
-                }
+                direct::announce_workers(workers, &tx, pid, primary_source);
             });
         } else {
             // DIALER: wait for the acceptor's worker ports, then connect to each.
@@ -6077,9 +6898,7 @@ impl Conn {
                 let workers =
                     direct::dial_workers(ports, peer_ip, tkey, pid.clone(), tx.clone(), count)
                         .await;
-                if !workers.is_empty() {
-                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers, primary_source));
-                }
+                direct::announce_workers(workers, &tx, pid, primary_source);
             });
         }
     }
@@ -6093,6 +6912,10 @@ impl Conn {
     /// they have no signaling peer, so expiry retires them without a fallback.
     pub fn expired_direct(&mut self) -> Vec<(String, Value, (String, String))> {
         let now = Instant::now();
+        // A hold outlives its direct pending only until the build that takes
+        // it. One whose pending ended (fallback, retirement, revocation) with no
+        // build to take it is an orphan by the next reaper call: purge it.
+        self.reap_orphan_holds();
         let mut fell_back = Vec::new();
         // Post-PAKE promotions first: one whose race lost leaves WebRTC serving
         // (nothing was torn down, so nothing falls back), one whose race won is
@@ -7269,6 +8092,7 @@ impl Conn {
             },
         );
         self.flush_pending_source(source);
+        self.discard_held(pid, "the direct path was adopted");
         DirectAdoption::Adopted { attempt, tkey }
     }
 
@@ -7972,11 +8796,27 @@ impl Conn {
         // and finalizer below. Ordinary ready/pending behaviour is unchanged.
         let forced = v["__fil_force_drop"].as_bool() == Some(true);
         if forced {
+            self.replay_departures.remove(pid_val);
             if let Some(events) = self.link_events.get_mut(pid_val) {
                 events.departure_ready = None;
                 events.departure_pending = None;
             }
         } else {
+            if let Some((source, ready)) = self.replay_departures.get(pid_val).copied() {
+                if self.links.get(pid_val).map(|link| link.source) != Some(source) {
+                    self.replay_departures.remove(pid_val);
+                    if ready { return false; }
+                } else {
+                    if !ready { return false; }
+                    self.replay_departures.remove(pid_val);
+                }
+            } else if let Some(source) = self.links.get(pid_val).map(|link| link.source) {
+                if self.replaying_sources.contains_key(&source) {
+                    self.replay_departures.insert(pid_val.to_string(), (source, false));
+                    let _ = self.tx.send(Ev::ReplayDeparture(pid_val.to_string(), source, v.clone()));
+                    return false;
+                }
+            }
             // A departure barrier `stage_event` admitted: the departed link's
             // already-read events were dispatched ahead of it, and the marker is
             // bound to that exact source. Consume it once and run the ordinary
@@ -8510,6 +9350,41 @@ impl Conn {
             Some(p) => p,
             None => return,
         };
+        // The initiator rebuilt its peer connection on the same sid (a
+        // rotation): its offer carries a new `pc` tag. Applying it to the
+        // responder that answered the OLD connection is a renegotiation across
+        // two different DTLS endpoints, which never connects. Rebuild a fresh
+        // responder for it instead, unless the link is already serving bytes.
+        let serving = self
+            .links
+            .get(from)
+            .and_then(|l| l.transport.as_ref())
+            .is_some_and(|t| !t.is_dead());
+        if !serving
+            && peer.polite
+            && is_offer_data(&data)
+            && new_peer_connection(peer.remote_pc().await, data["pc"].as_u64())
+        {
+            self.log.debug(&format!(
+                "tunlion: FRESH-RESPONDER peer={from}: offer from a new peer connection, rebuilding the responder"
+            ));
+            self.drop_link(from);
+            if let Err(e) = self.ensure_responder(from, &data).await {
+                self.log.trace(&format!("signal: fresh responder failed: {e} (recovering)"));
+                return;
+            }
+            let envelope = json!({ "from": from, "data": data.clone() });
+            if self.build_pending(from) {
+                self.stage_signal(&envelope);
+            } else if !self.hold_for_direct(&envelope) {
+                if let Some(p) = self.link(from).and_then(|l| l.peer.clone()) {
+                    if let Err(e) = p.handle_signal(data).await {
+                        self.log.trace(&format!("signal failed to apply: {e} (recovering)"));
+                    }
+                }
+            }
+            return;
+        }
         match peer.handle_signal(data).await {
             Ok(net::SignalOutcome::Handled) => {}
             Ok(net::SignalOutcome::Glare(offer)) => {
@@ -8528,11 +9403,42 @@ impl Conn {
         }
     }
 
+    /// The SDP tail every driver loop runs after `ensure_responder`: stage the
+    /// signal into a build still in flight for its sid, else HOLD it when our
+    /// direct attempt for that sid is pending (no responder may be built yet,
+    /// and the peer sends its offer once per connection), else apply it.
+    pub async fn deliver_sdp_signal(&mut self, envelope: &Value) {
+        let from = envelope["from"].as_str().unwrap_or_default().to_string();
+        if self.build_pending(&from) {
+            self.stage_signal(envelope);
+            return;
+        }
+        if self.hold_for_direct(envelope) {
+            return;
+        }
+        self.apply_signal(&from, envelope["data"].clone()).await;
+    }
+
     pub async fn ensure_responder(&mut self, from: &str, data: &Value) -> Result<()> {
+        // A held offer from an older attempt must not be replayed in front of
+        // this newer one (the build below would answer the stale offer first).
+        if self
+            .held_signals
+            .get(from)
+            .is_some_and(|h| supersedes_held(h, data))
+        {
+            self.discard_held(from, "a newer connection attempt arrived");
+        }
         if let Some(uid) = data["uid"].as_str() {
             net::ensure_ascii_uid(uid)?;
             if let Some(info) = self.roster.get_mut(from) {
-                info["uid"] = json!(uid);
+                // A signal payload names a uid only for a peer we have none
+                // for yet. It never replaces one the roster already holds
+                // (from the server's welcome / peer-joined), and it is never
+                // authority: code authority is `holds_code_authority`.
+                if info["uid"].as_str().is_none() {
+                    info["uid"] = json!(uid);
+                }
             } else {
                 self.roster
                     .insert(from.to_string(), json!({ "id": from, "uid": uid }));
@@ -9058,6 +9964,7 @@ mod warm_identity_tests {
     #[derive(Default)]
     struct TestHost {
         devices: Vec<(String, String)>,
+        fleet_rv: bool,
         /// Records the store still carries with their pair secret but which are
         /// REVOKED (`certRevoked` / terminal `principalState`).
         revoked_records: Vec<String>,
@@ -9069,6 +9976,8 @@ mod warm_identity_tests {
         transfer_allowed: bool,
         /// The live store record's capability ceiling for `device_ceiling`.
         ceilings: Vec<(String, Vec<String>)>,
+        /// Delegated (invited) records' ceilings for `principal_ceiling_for`.
+        principal_ceilings: Vec<(String, Vec<String>)>,
     }
 
     #[async_trait::async_trait]
@@ -9098,6 +10007,12 @@ mod warm_identity_tests {
                 .map(|(_, caps)| caps.clone())
                 .unwrap_or_default()
         }
+        fn principal_ceiling_for(&self, name: &str) -> Option<Vec<String>> {
+            self.principal_ceilings
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, caps)| caps.clone())
+        }
         fn is_self_uid(&self, _my_uid: &str, _peer_uid: Option<&str>) -> bool {
             false
         }
@@ -9117,7 +10032,7 @@ mod warm_identity_tests {
             None
         }
         fn fleet_rv_present(&self) -> bool {
-            false
+            self.fleet_rv
         }
         fn now_secs(&self) -> u64 {
             filament_id::now_secs()
@@ -9209,11 +10124,6 @@ mod warm_identity_tests {
             Some("boxb"),
             "reach-pong could not key a LAN link by its exact device binding"
         );
-        assert_eq!(
-            conn.lan_delegated_caps(pid),
-            vec!["transfer".to_string()],
-            "a live LAN device must carry its stored ceiling, not the empty one"
-        );
         assert!(!conn.link(pid).unwrap().trusted, "routing must not mint trust");
         assert!(
             conn.link(pid).unwrap().verified_name.is_none(),
@@ -9248,10 +10158,6 @@ mod warm_identity_tests {
         assert_eq!(revoked_conn.authenticated_lan_peer(pid), None);
         assert!(revoked_conn.link_peer_name(pid).is_none());
         assert!(
-            revoked_conn.lan_delegated_caps(pid).is_empty(),
-            "a revoked record's retained secret still minted a non-empty ceiling"
-        );
-        assert!(
             crate::lan_glue::keys(&*revoked_host).is_empty(),
             "a revoked record's retained secret was offered as a LAN MAC key"
         );
@@ -9267,7 +10173,6 @@ mod warm_identity_tests {
         let (mut removed_conn, _far, _rx) = test_conn_with_host(removed_host).await;
         removed_conn.links.insert(pid.to_string(), lan_link(pid));
         assert!(removed_conn.link_peer_name(pid).is_none());
-        assert!(removed_conn.lan_delegated_caps(pid).is_empty());
 
         // A live record that DENIES transfer still routes (routing is not
         // permission) but must not earn the daemon's baseline auto-consent or a
@@ -9283,7 +10188,166 @@ mod warm_identity_tests {
         denied_conn.links.insert(pid.to_string(), lan_link(pid));
         assert!(warm_link_for(&denied_conn, "boxb").is_some());
         assert_eq!(denied_conn.authenticated_lan_peer(pid), None);
-        assert!(denied_conn.lan_delegated_caps(pid).is_empty());
+    }
+
+    /// Re-adopting an EXISTING link over LAN starts its identity over. A link
+    /// that had proven a device key, or held sibling or owner standing, keeps
+    /// none of it when the LAN binding no longer resolves, and a LAN pair is
+    /// re-resolved from the record rather than inheriting the old key.
+    #[tokio::test]
+    async fn an_existing_link_adopted_over_lan_keeps_no_stale_identity() {
+        fn stale(pid: &str, log: &Arc<std::sync::Mutex<Vec<String>>>) -> Link {
+            let dead: Arc<dyn Transport> = Rec::new("dead-serving", log);
+            dead.force_close();
+            let mut link = relay_link(pid, "boxb", "boxb", dead);
+            link.trusted = true;
+            link.verified_name = Some("boxb".into());
+            link.identity_device_pub = Some([7; 32]);
+            link.identity_user_pub = Some([8; 32]);
+            link.identity_binding = BindingStrength::Proven;
+            link.identity_state = IdentityState::Resolved;
+            link.identity_cert_expires = Some(u64::MAX);
+            link.principal_kind = PrincipalKind::FleetSibling;
+            link
+        }
+        for (what, host) in [
+            (
+                "revoked record",
+                TestHost {
+                    devices: vec![("boxb".to_string(), "s1".to_string())],
+                    revoked_records: vec!["boxb".to_string()],
+                    ..Default::default()
+                },
+            ),
+            ("forgotten record", TestHost::default()),
+        ] {
+            let (mut conn, _far, _rx) = test_conn_with_host(Arc::new(host)).await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "sid-lan-stale";
+            conn.links.insert(pid.into(), stale(pid, &log));
+            let t: Arc<dyn Transport> = Rec::with_attempt("lan", &log, net::AttemptId::next());
+            conn.seed_lan(pid, "boxb", "s1", false, t.attempt_id().unwrap());
+            assert!(matches!(
+                conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN),
+                DirectAdoption::Adopted { tkey: None, .. }
+            ));
+            let link = &conn.links[pid];
+            assert!(!link.trusted, "{what}: stale trust survived");
+            assert!(link.verified_name.is_none(), "{what}: stale name survived");
+            assert!(link.identity_device_pub.is_none(), "{what}: stale device key survived");
+            assert!(link.identity_user_pub.is_none(), "{what}: stale user key survived");
+            assert_eq!(link.identity_binding, BindingStrength::None, "{what}");
+            assert!(link.identity_cert_expires.is_none(), "{what}");
+            assert!(!matches!(link.identity_state, IdentityState::Resolved), "{what}");
+            assert!(!link.fleet_proven(), "{what}: sibling standing survived");
+            assert!(
+                matches!(&link.principal_kind, PrincipalKind::Delegated { caps } if caps.is_empty()),
+                "{what}: stale principal survived"
+            );
+            assert!(link.expected_secret.is_none(), "{what}: a worker key survived");
+        }
+
+        // A live binding: the pair, re-resolved, with no inherited key.
+        let host = TestHost {
+            devices: vec![("boxb".to_string(), "s1".to_string())],
+            ..Default::default()
+        };
+        let (mut conn, _far, _rx) = test_conn_with_host(Arc::new(host)).await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-lan-stale";
+        conn.links.insert(pid.into(), stale(pid, &log));
+        let t: Arc<dyn Transport> = Rec::with_attempt("lan", &log, net::AttemptId::next());
+        conn.seed_lan(pid, "boxb", "s1", false, t.attempt_id().unwrap());
+        assert!(matches!(
+            conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN),
+            DirectAdoption::Adopted { tkey: None, .. }
+        ));
+        let link = &conn.links[pid];
+        assert!(link.trusted);
+        assert_eq!(link.verified_name.as_deref(), Some("boxb"));
+        assert!(link.identity_device_pub.is_none(), "the old device key was inherited");
+        assert!(matches!(link.principal_kind, PrincipalKind::OwnerDevice));
+    }
+
+    /// A LAN DEVICE link is the pair only while its exact binding is live. A
+    /// record revoked on disk (secret retained, no sweep yet) or a forgotten
+    /// record adopts untrusted, unnamed and with the empty ceiling, exactly
+    /// what the old blanket LAN rule gave every link. A session-revoked
+    /// binding is refused before adoption and installs no link at all.
+    #[tokio::test]
+    async fn a_lan_link_is_the_pair_only_while_its_binding_is_live() {
+        async fn try_adopt(host: TestHost, session_revoked: bool) -> Option<Link> {
+            let (mut conn, _far, _rx) = test_conn_with_host(Arc::new(host)).await;
+            if session_revoked {
+                conn.revoked_bindings.insert("s1".to_string());
+            }
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "sid-lan-binding";
+            let t: Arc<dyn Transport> = Rec::with_attempt("lan", &log, net::AttemptId::next());
+            let attempt = t.attempt_id().unwrap();
+            conn.seed_lan(pid, "boxb", "s1", false, attempt);
+            match conn.adopt_direct(pid, t, filament_transport::lan::ROUTE_LAN) {
+                DirectAdoption::Adopted { tkey, .. } => {
+                    assert!(tkey.is_none(), "a LAN adoption minted a worker key");
+                    Some(conn.links.remove(pid).unwrap())
+                }
+                DirectAdoption::Rejected => {
+                    assert!(!conn.links.contains_key(pid));
+                    None
+                }
+                _ => panic!("unexpected LAN adoption outcome"),
+            }
+        }
+        async fn adopt(host: TestHost) -> Link {
+            try_adopt(host, false).await.expect("LAN adoption was refused")
+        }
+        fn live() -> TestHost {
+            TestHost {
+                devices: vec![("BoxB".to_string(), "s1".to_string())],
+                transfer_allowed: true,
+                ..Default::default()
+            }
+        }
+        let pair = adopt(live()).await;
+        assert!(pair.trusted);
+        assert_eq!(
+            pair.verified_name.as_deref(),
+            Some("BoxB"),
+            "the LAN pair must be named by the canonical stored petname"
+        );
+        assert!(matches!(pair.principal_kind, PrincipalKind::OwnerDevice));
+        assert!(pair.expected_secret.is_none(), "a LAN link minted a worker key");
+
+        // An invited (delegated) record is resolved at adoption like any pair
+        // link: with no live certificate it is pinned to the empty ceiling,
+        // never left owner-equivalent by the LAN route.
+        let invited = TestHost {
+            principal_ceilings: vec![("boxb".to_string(), vec!["transfer".to_string()])],
+            ..live()
+        };
+        let invited = adopt(invited).await;
+        assert!(
+            matches!(&invited.principal_kind, PrincipalKind::Delegated { caps } if caps.is_empty()),
+            "a delegated record over LAN was not resolved from its record"
+        );
+
+        let revoked = TestHost { revoked_records: vec!["boxb".to_string()], ..live() };
+        let forgotten = TestHost { devices: vec![], ..live() };
+        assert!(
+            try_adopt(live(), true).await.is_none(),
+            "a session-revoked LAN binding installed a link"
+        );
+        for (what, link) in [
+            ("revoked record", adopt(revoked).await),
+            ("forgotten record", adopt(forgotten).await),
+        ] {
+            assert!(!link.trusted, "{what}: LAN link was trusted");
+            assert!(link.verified_name.is_none(), "{what}: LAN link was named");
+            assert!(
+                matches!(&link.principal_kind, PrincipalKind::Delegated { caps } if caps.is_empty()),
+                "{what}: LAN link carried authority"
+            );
+        }
     }
 
     // --- the pure decision ------------------------------------------------
@@ -9440,6 +10504,108 @@ mod warm_identity_tests {
         assert!(conn.direct_pending.is_empty(), "a re-dial was armed");
         assert!(!conn.links.contains_key("sid-ghost"), "a ghost sid was dialled");
         assert!(conn.warm_hold.auto.contains("x"), "the device is warm-held by petname");
+    }
+
+    /// A live, certificate-admitted fleet sibling with no device record (no
+    /// pair secret, so the auto tier never holds it): the shape gate T2b reads.
+    fn cert_only_sibling(pid: &str, name: &str, t: Arc<dyn Transport>) -> Link {
+        let mut l = direct_link(pid, name, &format!("user@{name}"), t);
+        l.trusted = false;
+        l.expected_secret = None;
+        l.verified_name = Some(name.to_string());
+        l.admit_fleet([1u8; 32], [2u8; 32], u64::MAX);
+        l
+    }
+
+    /// The pair-link rule as every fleet arm site reads it, on real links: a
+    /// pair link whose secret the store still holds blocks the arm; the same
+    /// link after the device was forgotten (secret no longer held) does not;
+    /// a fleet-shaped link (untrusted, no pair secret) does not.
+    #[cfg(feature = "dispatch")]
+    #[tokio::test]
+    async fn a_fleet_arm_is_blocked_only_by_a_held_pair_link() {
+        use crate::recv::dispatch::fleet_arm_blocked_by_pair_link as blocked;
+        let (mut conn, _far, _rx) = test_conn().await;
+        let held = vec![("dev".to_string(), "s3cret".to_string())];
+        conn.links.insert("sid-p".into(), direct_link("sid-p", "dev", "user@dev", FakeQuic::live()));
+        assert!(blocked(&conn, "sid-p", &held), "a fleet arm may take over a held pair link");
+        assert!(!blocked(&conn, "sid-p", &[]), "a forgotten device's stale link blocked the arm");
+        conn.links.insert("sid-f".into(), cert_only_sibling("sid-f", "sib", FakeQuic::live()));
+        assert!(!blocked(&conn, "sid-f", &held), "a fleet link blocked the fleet arm");
+        assert!(!blocked(&conn, "sid-none", &held), "a peer with no link blocked the arm");
+    }
+
+    /// One completed receive from a certificate-only sibling, with no other
+    /// stream in flight, leaves that sender warm, and the next warm tick
+    /// reports its live link as a FleetSibling without dialling. Before, the
+    /// warm tier was fed from the streams still in flight once something had
+    /// completed; the finished stream was already gone, so this sender was
+    /// never recorded and the tick never named it.
+    #[tokio::test]
+    async fn a_completed_receive_warms_its_certificate_only_sender() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(crate::host::VecLog::new());
+        conn.log = log.clone() as Arc<dyn LogSink>;
+        conn.links.insert(
+            "sid-c".into(),
+            cert_only_sibling("sid-c", "charlie", FakeQuic::live()),
+        );
+
+        // Nothing completed yet: not warm, and the tick says nothing of it.
+        assert!(!conn.warm_hold.peers_to_connect().iter().any(|p| p == "charlie"));
+        assert!(conn.warm_hold_tick(true).await.is_empty());
+        assert!(
+            !log.take().iter().any(|(_, l)| l.contains("warm-hold: skip 'charlie'")),
+            "the tick named a sender before any transfer completed"
+        );
+
+        conn.note_completed_transfer("sid-c", Some("charlie"));
+        assert!(
+            conn.warm_hold.peers_to_connect().iter().any(|p| p == "charlie"),
+            "the completed sender is not warm"
+        );
+        let dialled = conn.warm_hold_tick(true).await;
+        assert!(dialled.is_empty(), "warm-hold dialled {dialled:?} over a live link");
+        let lines = log.take();
+        assert!(
+            lines.iter().any(|(_, l)| l.contains("warm-hold: skip 'charlie'")
+                && l.contains("principal=FleetSibling sibling=true")),
+            "the tick did not report the live sibling link: {lines:?}"
+        );
+    }
+
+    /// Two senders, one completes while the other is still in flight: the
+    /// one that COMPLETED is recorded, and only that one.
+    #[tokio::test]
+    async fn the_completed_sender_is_the_one_recorded() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.links.insert("sid-a".into(), cert_only_sibling("sid-a", "alpha", FakeQuic::live()));
+        conn.links.insert("sid-b".into(), cert_only_sibling("sid-b", "bravo", FakeQuic::live()));
+        conn.note_completed_transfer("sid-a", Some("alpha"));
+        let warm = conn.warm_hold.peers_to_connect();
+        assert!(warm.iter().any(|p| p == "alpha"), "the completed sender was not recorded");
+        assert!(!warm.iter().any(|p| p == "bravo"), "the in-flight sender was recorded instead");
+    }
+
+    /// Only a PROVEN name is recorded. The live link's verified name wins;
+    /// with the link gone (the sender left before file-end) the name captured
+    /// when the stream was accepted is used; a link with no proven name and
+    /// nothing captured records nothing, whatever name the peer claimed.
+    #[tokio::test]
+    async fn a_completed_transfer_records_only_a_proven_name() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        // The link is gone: the captured name stands in.
+        conn.note_completed_transfer("sid-gone", Some("delta"));
+        assert!(conn.warm_hold.peers_to_connect().iter().any(|p| p == "delta"));
+        // An unproven link: its claimed petname is never recorded.
+        let mut l = direct_link("sid-u", "mallory", "user@mallory", FakeQuic::live());
+        l.verified_name = None;
+        conn.links.insert("sid-u".into(), l);
+        conn.note_completed_transfer("sid-u", None);
+        assert!(
+            !conn.warm_hold.peers_to_connect().iter().any(|p| p == "mallory"),
+            "a claimed name was recorded as warm"
+        );
     }
 
     #[tokio::test]
@@ -9671,6 +10837,195 @@ mod warm_identity_tests {
         assert_eq!(t.closes.load(Ordering::Relaxed), 0);
         assert!(conn.links.contains_key("sid-new"), "the new identity got no link");
         assert_eq!(conn.links.len(), 2, "an identity change must not reuse the old link");
+    }
+
+    /// A pending direct attempt shaped like the one `start_direct_promote`
+    /// arms for a confirmed code ceremony (`ephemeral`).
+    fn promote_pending(attempt: net::AttemptId, sid: &str, secret: &str) -> DirectPending {
+        DirectPending {
+            attempt,
+            auth: DirectAuth::device(1, "box", "00"),
+            race_task: None,
+            secret: (sid.into(), secret.into()),
+            fleet: false,
+            lan: false,
+            ephemeral: true,
+            deadline: Instant::now() + Duration::from_secs(30),
+            racing: false,
+            endpoint: None,
+            punch_sock: None,
+            my_srflx: None,
+            peer_server_public: None,
+            server_public_dialed: Arc::new(AtomicBool::new(false)),
+            probe: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The direct link that ceremony's promotion publishes: born untrusted,
+    /// keyed by the ceremony secret, owned by the promotion's attempt.
+    fn promoted_link(pid: &str, uid: &str, secret: &str, attempt: net::AttemptId) -> Link {
+        let mut l = linked_direct(pid, "peer", uid, FakeQuic::live());
+        l.trusted = false;
+        l.verified_name = None;
+        l.expected_secret = Some((pid.to_string(), secret.to_string()));
+        l.attempt = Some(attempt);
+        l
+    }
+
+    /// Code authority after a confirmed ceremony with S1: the confirmed
+    /// transport (WebRTC fingerprints, or the ceremony's own direct promotion)
+    /// is authorized; a same-uid NEW sid installed from signal data, a rebuilt
+    /// WebRTC link with other fingerprints, and a direct link some other
+    /// attempt published are not. The receive gates (file-offer, code
+    /// consent, pair-keep) and the identity-unavailable consent all read this.
+    #[tokio::test]
+    async fn code_authority_is_bound_to_the_confirmed_session_and_transport() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let promote = net::AttemptId::next();
+        conn.roster.insert("sid-s1".into(), json!({ "id": "sid-s1", "name": "user@s", "uid": "uid-u" }));
+        conn.direct_pending.insert("sid-s1".into(), promote_pending(promote, "sid-s1", "k-secret"));
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", promote));
+
+        // Unconfirmed: nothing is authorized, even the right link (policy
+        // unchanged: no authority before the ceremony confirms).
+        assert!(!conn.holds_code_authority("sid-s1").await);
+        // consented_identity_peer lives behind the `dispatch` feature.
+        #[cfg(feature = "dispatch")]
+        assert!(!crate::recv::dispatch::consented_identity_peer(&conn, "sid-s1", true, true, false, false).await);
+
+        conn.bind_active("sid-s1");
+        conn.bind_code_session("sid-s1", ("fp-a", "fp-b"), "k-secret");
+        assert_eq!(conn.code_session.as_ref().map(|c| c.sid()), Some("sid-s1"));
+
+        // Positive control: the ceremony's own direct promotion.
+        assert_eq!(conn.code_authority("sid-s1").await, Ok(()));
+        assert!(conn.holds_code_authority("sid-s1").await);
+        // consented_identity_peer lives behind the `dispatch` feature.
+        #[cfg(feature = "dispatch")]
+        assert!(crate::recv::dispatch::consented_identity_peer(&conn, "sid-s1", true, true, false, false).await);
+        // ... but not before this run's ceremony confirmed (recv_pake_done).
+        // consented_identity_peer lives behind the `dispatch` feature.
+        #[cfg(feature = "dispatch")]
+        assert!(!crate::recv::dispatch::consented_identity_peer(&conn, "sid-s1", true, false, false, false).await);
+
+        // Same uid U, NEW sid S2, named only by an unauthenticated signal.
+        conn.ensure_responder("sid-s2", &json!({ "type": "candidate", "uid": "uid-u" }))
+            .await
+            .expect("a candidate signal is not an error");
+        assert_eq!(conn.roster["sid-s2"]["uid"], "uid-u", "first-seen uid is still recorded");
+        conn.links.insert("sid-s2".into(), promoted_link("sid-s2", "uid-u", "k-secret", promote));
+        assert_eq!(conn.code_authority("sid-s2").await, Err(CodeAuthorityRefusal::SessionMismatch));
+        assert!(!conn.holds_code_authority("sid-s2").await);
+        // consented_identity_peer lives behind the `dispatch` feature.
+        #[cfg(feature = "dispatch")]
+        assert!(!crate::recv::dispatch::consented_identity_peer(&conn, "sid-s2", true, true, false, false).await);
+
+        // Same sid, a direct link some OTHER attempt published.
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", net::AttemptId::next()));
+        assert_eq!(conn.code_authority("sid-s1").await, Err(CodeAuthorityRefusal::ForeignDirect));
+        // consented_identity_peer lives behind the `dispatch` feature.
+        #[cfg(feature = "dispatch")]
+        assert!(!crate::recv::dispatch::consented_identity_peer(&conn, "sid-s1", true, true, false, false).await);
+
+        // Same sid on a WebRTC link: only the confirmed fingerprint pair.
+        let mut webrtc = promoted_link("sid-s1", "uid-u", "k-secret", promote);
+        webrtc.direct = false;
+        conn.links.insert("sid-s1".into(), webrtc);
+        assert_eq!(conn.code_authority_on("sid-s1", Some(("fp-a", "fp-b"))), Ok(()));
+        assert_eq!(
+            conn.code_authority_on("sid-s1", Some(("fp-a", "fp-c"))),
+            Err(CodeAuthorityRefusal::FingerprintMismatch)
+        );
+        // This fixture has no RTCPeerConnection, so no fingerprints to read.
+        assert_eq!(conn.code_authority("sid-s1").await, Err(CodeAuthorityRefusal::NoTransport));
+
+        // The confirmed session is set once and never moved.
+        conn.bind_code_session("sid-s2", ("fp-x", "fp-y"), "k-secret");
+        assert_eq!(conn.code_session.as_ref().map(|c| c.sid()), Some("sid-s1"));
+    }
+
+    /// The code-receive binding never hands the transfer slot to a new sid:
+    /// a same-install peer reconnecting on S2 (its S1 link gone) is refused
+    /// `want_active`, and the confirmed session still names S1. Control: the
+    /// exact sid takes the slot through the same path first.
+    #[tokio::test]
+    async fn a_same_uid_new_sid_cannot_take_the_code_receive_slot() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.roster.insert("sid-s1".into(), json!({ "id": "sid-s1", "name": "user@s", "uid": "uid-u" }));
+        conn.bind_active("sid-s1");
+        conn.bind_code_session("sid-s1", ("fp-a", "fp-b"), "k-secret");
+        conn.active = None;
+
+        // Control: the confirmed sid itself is claimable as the target.
+        let active = conn
+            .maybe_adopt(&json!({ "id": "sid-s1", "name": "user@s", "uid": "uid-u" }), true)
+            .await
+            .expect("adoption is not an error");
+        assert!(active, "the confirmed sid could not take its own slot");
+
+        // The S1 link dies and releases the slot; the same install returns on S2.
+        conn.drop_link("sid-s1");
+        assert!(conn.active.is_none());
+        let active = conn
+            .maybe_adopt(&json!({ "id": "sid-s2", "name": "user@s", "uid": "uid-u" }), true)
+            .await
+            .expect("adoption is not an error");
+        assert!(!active, "a same-uid new sid took the code-receive slot");
+        assert!(conn.active.is_none());
+        assert_eq!(conn.active_binding.as_ref().map(|b| b.0.as_str()), Some("sid-s1"));
+        assert_eq!(conn.code_session.as_ref().map(|c| c.sid()), Some("sid-s1"));
+        assert!(!conn.holds_code_authority("sid-s2").await);
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_code_transfer_continues_only_on_the_covered_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let promote = net::AttemptId::next();
+        conn.direct_pending.insert("sid-s1".into(), promote_pending(promote, "sid-s1", "k-secret"));
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", promote));
+        let mut cache = CodeAuthorityCache::default();
+
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Lost);
+
+        conn.bind_code_session("sid-s1", ("fp-a", "fp-b"), "k-secret");
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Holds);
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Holds);
+
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", net::AttemptId::next()));
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Lost);
+
+        conn.links.insert("sid-s1".into(), promoted_link("sid-s1", "uid-u", "k-secret", promote));
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Holds);
+
+        let mut rebuilt = promoted_link("sid-s1", "uid-u", "k-secret", promote);
+        rebuilt.direct = false;
+        conn.links.insert("sid-s1".into(), rebuilt);
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::Lost);
+
+        conn.links.remove("sid-s1");
+        assert_eq!(conn.code_continuation("sid-s1", &mut cache).await, CodeContinuation::NoLink);
+
+        conn.links.insert("sid-s2".into(), promoted_link("sid-s2", "uid-u", "k-secret", promote));
+        assert_eq!(conn.code_continuation("sid-s2", &mut cache).await, CodeContinuation::Lost);
+    }
+
+    /// A signal payload never replaces a roster uid the server already gave
+    /// (control: a peer with none yet still gets the first-seen one).
+    #[tokio::test]
+    async fn ensure_responder_does_not_overwrite_a_known_roster_uid() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.roster.insert("sid-a".into(), json!({ "id": "sid-a", "name": "a", "uid": "uid-real" }));
+        conn.ensure_responder("sid-a", &json!({ "type": "candidate", "uid": "uid-claimed" }))
+            .await
+            .expect("not an error");
+        assert_eq!(conn.roster["sid-a"]["uid"], "uid-real");
+
+        conn.roster.insert("sid-b".into(), json!({ "id": "sid-b", "name": "b" }));
+        conn.ensure_responder("sid-b", &json!({ "type": "candidate", "uid": "uid-first" }))
+            .await
+            .expect("not an error");
+        assert_eq!(conn.roster["sid-b"]["uid"], "uid-first");
     }
 
     #[tokio::test]
@@ -10751,6 +12106,273 @@ mod warm_identity_tests {
         assert_eq!(conn.expired_direct().len(), 1, "the old fallback was not armed");
     }
 
+    /// A FLEET direct is keyed by the secret the whole fleet shares: it proves
+    /// fleet membership, not who the peer is. So a link that had been
+    /// PAIR-PROVEN must not keep that standing when it adopts a fleet-keyed
+    /// direct: the standing has to be re-established by the verified fleet
+    /// hello. Before this, the adopted link still read as pair-trusted with the
+    /// pair's name and principal, so a transport that authenticates only
+    /// against the fleet secret carried pair standing (and a cut in place left
+    /// it behind).
+    #[tokio::test]
+    async fn a_pair_proven_link_that_adopts_a_fleet_direct_loses_the_pair_standing() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-fleet";
+        // The link before the adoption: a PAIR-proven WebRTC link, still
+        // live. A live DIRECT primary with another attempt is not replaceable
+        // through this path, so the fixture has to be the non-direct link that
+        // adopts a fleet direct IN PLACE, which is the case this is about.
+        let mut link = relay_link(pid, "peer", "peer", Rec::new("webrtc", &log));
+        link.trusted = true;
+        link.verified_name = Some("peer".to_string());
+        link.principal_kind = PrincipalKind::OwnerDevice;
+        link.expected_secret = Some(("peer".to_string(), "pair-secret".to_string()));
+        conn.links.insert(pid.to_string(), link);
+
+        // A fleet-keyed attempt for that peer: the pending says the attempt is
+        // a fleet one, so the adoption is the fleet case.
+        let attempt = net::AttemptId::next();
+        let mut pending = direct_pending_with(attempt, ("peer", "fleet-rv"));
+        pending.fleet = true;
+        pending.auth = DirectAuth::fleet(1);
+        conn.direct_pending.insert(pid.to_string(), pending);
+
+        let quic: Arc<dyn Transport> = Rec::with_attempt("quic", &log, attempt);
+        assert!(matches!(
+            conn.adopt_direct(pid, quic.clone(), "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+        let l = conn.link(pid).expect("the adopted link");
+        assert!(l.direct, "the adoption did not replace the transport");
+        // The pair standing is gone: the fleet hello has to re-establish it.
+        assert!(!l.trusted, "a fleet-keyed link kept pair trust");
+        assert!(l.verified_name.is_none(), "a fleet-keyed link kept the pair name");
+        assert!(
+            matches!(l.principal_kind, PrincipalKind::Delegated { .. }),
+            "a fleet-keyed link kept the pair principal"
+        );
+        assert!(!l.is_sibling_link(), "a fleet-keyed link read as a sibling");
+        assert!(!l.fleet_proven(), "a fleet-keyed link claimed a proven fleet link");
+        // The binding is the fleet one now, and the link is not yet a sibling
+        // until the hello names it.
+        assert_eq!(
+            l.expected_secret.as_ref().map(|(_, s)| s.as_str()),
+            Some("fleet-rv"),
+            "the fleet binding did not replace the pair one"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_adoption_does_not_grant_pair_standing_for_stale_or_revoked_binding() {
+        for (held, revoked, expect_trusted) in [
+            (None, false, false),
+            (Some("different"), false, false),
+            (Some("pair-secret"), true, false),
+            (Some("pair-secret"), false, true),
+        ] {
+            let host = Arc::new(TestHost {
+                fleet_rv: true,
+                devices: held.map(|s| vec![("peer".into(), s.into())]).unwrap_or_default(),
+                revoked_records: if revoked { vec!["peer".into()] } else { vec![] },
+                ..TestHost::default()
+            });
+            let (mut conn, _far, _rx) = test_conn_with_host(host).await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "sid-pair";
+            conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", Rec::new("webrtc", &log)));
+            let attempt = net::AttemptId::next();
+            conn.direct_pending.insert(pid.into(), direct_pending_with(attempt, ("peer", "pair-secret")));
+            let quic: Arc<dyn Transport> = Rec::with_attempt("quic", &log, attempt);
+            assert!(matches!(conn.adopt_direct(pid, quic, "direct-quic"), DirectAdoption::Adopted { .. }));
+            assert_eq!(conn.link(pid).unwrap().trusted, expect_trusted, "held={held:?}, revoked={revoked}");
+        }
+    }
+
+    /// The whole fleet standing cycle on a real Link, through the same
+    /// functions the hello arm and the ChannelReady rotation call: an
+    /// admitted sibling adopts a fleet-keyed direct in place (Delegated, the
+    /// binding rotated), the rotation drops the verdict earned on the old
+    /// binding and leaves our hello owed, and the next verified hello makes
+    /// the link a FleetSibling again. Before the epoch stamps, nothing in
+    /// this path tied the verdict to the binding that earned it.
+    #[cfg(feature = "dispatch")]
+    #[tokio::test]
+    async fn a_sibling_that_adopts_a_fleet_direct_is_a_sibling_again_after_its_hello() {
+        use crate::recv::dispatch::{
+            admit_verified_fleet_hello, fleet_standing_after_rotation, link_epoch,
+        };
+        use crate::recv::fleet_bind::Standing;
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-sib";
+        let mut link = relay_link(pid, "sib", "sib", Rec::new("webrtc", &log));
+        link.trusted = false;
+        link.verified_name = None;
+        link.expected_secret = None;
+        link.principal_kind = PrincipalKind::Delegated { caps: Vec::new() };
+        conn.links.insert(pid.to_string(), link);
+        let mut standing = Standing::default();
+        let mut verified = std::collections::HashSet::new();
+        let mut pending = std::collections::HashSet::new();
+        let (owner, device) = ([1u8; 32], [2u8; 32]);
+
+        // 1. FleetSibling: the hello verified on the WebRTC binding.
+        let old = link_epoch(&conn, pid).expect("installed");
+        assert!(admit_verified_fleet_hello(
+            &mut conn, &mut standing, &mut verified, pid, Some("sib".into()), owner, device, u64::MAX
+        ));
+        standing.greeted(pid, old);
+        assert!(conn.link(pid).unwrap().is_sibling_link(), "the hello did not admit a sibling");
+
+        // 2. Rotate: a fleet-keyed direct is adopted in place.
+        let attempt = net::AttemptId::next();
+        let mut p = direct_pending_with(attempt, ("sib", "fleet-rv"));
+        p.fleet = true;
+        p.auth = DirectAuth::fleet(1);
+        conn.direct_pending.insert(pid.to_string(), p);
+        let quic: Arc<dyn Transport> = Rec::with_attempt("quic", &log, attempt);
+        assert!(matches!(
+            conn.adopt_direct(pid, quic, "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+        let new = link_epoch(&conn, pid).expect("installed");
+        assert_ne!(old, new, "the adoption did not rotate the binding epoch");
+
+        // 3. Delegated: nothing the old binding proved stands on the new one.
+        let l = conn.link(pid).unwrap();
+        assert!(matches!(l.principal_kind, PrincipalKind::Delegated { .. }));
+        assert!(!l.is_sibling_link());
+        assert!(
+            fleet_standing_after_rotation(&mut standing, &mut verified, &mut pending, pid, new),
+            "the rotation kept a verdict from the old binding"
+        );
+        assert!(!verified.contains(pid));
+        assert!(pending.contains(pid), "the hello was not queued again");
+        assert!(standing.hello_owed(pid, Some(new)), "our hello is not owed on the new binding");
+
+        // 4. Hello on the new binding: a sibling again, and the verdict is
+        // stamped with the new epoch, so the same rotation event replayed
+        // does not drop it.
+        assert!(admit_verified_fleet_hello(
+            &mut conn, &mut standing, &mut verified, pid, Some("sib".into()), owner, device, u64::MAX
+        ));
+        let l = conn.link(pid).unwrap();
+        assert!(matches!(l.principal_kind, PrincipalKind::FleetSibling));
+        assert!(l.is_sibling_link(), "the link did not become a sibling again");
+        assert_eq!(l.verified_name.as_deref(), Some("sib"));
+        assert!(!fleet_standing_after_rotation(&mut standing, &mut verified, &mut pending, pid, new));
+        assert!(verified.contains(pid), "a verdict on the installed binding was dropped");
+    }
+
+    /// Code authority follows the old-peer promotion: the direct link the
+    /// ceremony's armed attempt publishes holds; another attempt is refused.
+    #[tokio::test]
+    async fn a_replaced_promotion_carries_code_authority_to_its_own_direct_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-code-old";
+        code_link(&mut conn, pid, Rec::new("webrtc", &log));
+        let promo = conn
+            .start_direct_promote(pid, pid, "ceremony", PromoteRole::Lead, false)
+            .await;
+        assert_eq!(promo, Promotion::Replaced);
+        conn.bind_code_session(pid, ("fp-a", "fp-b"), "ceremony");
+        let attempt = conn.direct_pending.get(pid).expect("an armed attempt").attempt;
+        let mut cache = CodeAuthorityCache::default();
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::NoLink);
+
+        let quic: Arc<dyn Transport> = Rec::with_attempt("quic", &log, attempt);
+        assert!(matches!(
+            conn.adopt_direct(pid, quic.clone(), "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+        assert_eq!(conn.code_authority(pid).await, Ok(()));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
+
+        let foreign: Arc<dyn Transport> = Rec::with_attempt("foreign", &log, net::AttemptId::next());
+        assert!(!matches!(
+            conn.adopt_direct(pid, foreign, "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+        assert!(conn.transport_of(pid).is_some_and(|t| Arc::ptr_eq(&t, &quic)));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
+
+        // The same link under another attempt is not this ceremony's.
+        conn.links.get_mut(pid).unwrap().attempt = Some(net::AttemptId::next());
+        assert_eq!(conn.code_authority(pid).await, Err(CodeAuthorityRefusal::ForeignDirect));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Lost);
+    }
+
+    /// Code authority follows the make-before-break handoff: the confirmed
+    /// WebRTC link holds before it, the ceremony's direct link after it.
+    #[tokio::test]
+    async fn a_handed_promotion_carries_code_authority_to_its_own_direct_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-code-new";
+        let webrtc: Arc<dyn Transport> = Rec::new("webrtc", &log);
+        let webrtc_attempt = webrtc.attempt_id().expect("a fixture attempt");
+        code_link(&mut conn, pid, webrtc);
+        let promo = conn
+            .start_direct_promote(pid, pid, "ceremony", PromoteRole::Lead, true)
+            .await;
+        assert_eq!(promo, Promotion::Retained);
+        conn.bind_code_session(pid, ("fp-a", "fp-b"), "ceremony");
+        let attempt = conn.direct_pending.get(pid).expect("an armed attempt").attempt;
+        assert_eq!(conn.code_authority_on(pid, Some(("fp-a", "fp-b"))), Ok(()));
+
+        let quic: Arc<dyn Transport> = Rec::with_attempt("quic", &log, attempt);
+        {
+            let promotion = conn.promotions.get_mut(pid).expect("a promotion");
+            promotion.standby = Some((quic.clone(), "direct-quic"));
+            promotion.handed = true;
+        }
+        // While handed, another attempt is not adopted and changes nothing.
+        let foreign: Arc<dyn Transport> = Rec::with_attempt("foreign", &log, net::AttemptId::next());
+        assert_eq!(conn.adopt_direct(pid, foreign.clone(), "direct-quic"), DirectAdoption::Rejected);
+        assert!(foreign.is_dead());
+        assert!(!conn.link(pid).expect("the serving link").direct);
+        assert!(conn.promotions.get(pid).is_some_and(|p| p.handed));
+        assert!(conn.direct_pending.contains_key(pid));
+        assert!(matches!(
+            conn.adopt_direct(pid, quic.clone(), "direct-quic"),
+            DirectAdoption::Adopted { .. }
+        ));
+        let l = conn.link(pid).expect("the link");
+        assert!(l.direct, "the serving link was not retired");
+        assert!(l.transport.as_ref().is_some_and(|t| Arc::ptr_eq(t, &quic)));
+        assert_eq!(l.attempt, Some(attempt));
+        // Retired and replaced, not updated in place: the serving link's own
+        // attempt is retired and the promotion is gone.
+        assert!(conn.retired_attempts.contains_key(&webrtc_attempt));
+        assert!(!conn.promotions.contains_key(pid));
+        let mut cache = CodeAuthorityCache::default();
+        assert_eq!(conn.code_authority(pid).await, Ok(()));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
+
+        // After adoption, another attempt is still not adopted.
+        let late: Arc<dyn Transport> = Rec::with_attempt("late", &log, net::AttemptId::next());
+        assert_eq!(conn.adopt_direct(pid, late, "direct-quic"), DirectAdoption::Rejected);
+        assert!(conn.transport_of(pid).is_some_and(|t| Arc::ptr_eq(&t, &quic)));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
+
+        // A cached verdict does not survive a changed secret on the same link.
+        conn.links.get_mut(pid).unwrap().expected_secret = Some((pid.to_string(), "other".into()));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Lost);
+
+        // Restored, it holds; under another attempt it does not.
+        conn.links.get_mut(pid).unwrap().expected_secret = Some((pid.to_string(), "ceremony".into()));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Holds);
+        conn.links.get_mut(pid).unwrap().attempt = Some(net::AttemptId::next());
+        assert_eq!(conn.code_authority(pid).await, Err(CodeAuthorityRefusal::ForeignDirect));
+        assert_eq!(conn.code_continuation(pid, &mut cache).await, CodeContinuation::Lost);
+    }
+
     /// QUIC never comes up: WebRTC keeps serving. No fallback establish (the
     /// old rebuild), no teardown, nothing left armed.
     #[tokio::test]
@@ -11026,6 +12648,92 @@ mod warm_identity_tests {
             .unwrap();
         conn.pump_builds();
         assert_eq!(conn.builds[pid].early.len(), 1);
+    }
+
+    /// An installed WebRTC link's events wake the loop: the first event queues
+    /// one `BuildWake` on the main queue, further events before the next drain
+    /// queue none, and `pump_builds` forwards them in order and re-arms the
+    /// wake. Before this, nothing woke the loop and the events waited for an
+    /// unrelated one (promote-mbb M1/M3: 2.41 or 3.61 s instead of ~0.1 s).
+    #[tokio::test]
+    async fn an_installed_links_events_wake_the_loop_once_per_drain() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-wake";
+        let t = Rec::new("webrtc", &log);
+        let link = relay_link(pid, "peer", "peer", t);
+        let generation = link.generation;
+        conn.links.insert(pid.to_string(), link);
+        let (candidate_tx, candidate_rx) = mpsc::unbounded_channel();
+        conn.link_events.insert(
+            pid.to_string(),
+            LinkEvents {
+                generation,
+                rx: std::sync::Mutex::new(candidate_rx),
+                departure_ready: None,
+                departure_pending: None,
+            },
+        );
+        let sink = net::EvSink::waking(candidate_tx, conn.tx.clone(), conn.candidate_wake.clone());
+        let wakes = |rx: &mut mpsc::UnboundedReceiver<Ev>| {
+            let mut n = 0;
+            while let Ok(ev) = rx.try_recv() {
+                if matches!(ev, Ev::BuildWake) {
+                    n += 1;
+                }
+            }
+            n
+        };
+        let _ = wakes(&mut rx);
+
+        for i in 0..50 {
+            sink.send(Ev::Control(pid.to_string(), json!({ "type": "data", "i": i })))
+                .unwrap();
+        }
+        assert_eq!(wakes(&mut rx), 1, "a burst must wake the loop exactly once");
+
+        conn.pump_builds();
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Ev::Control(from, v) = ev {
+                assert_eq!(from, pid);
+                seen.push(v["i"].as_i64().unwrap());
+            }
+        }
+        assert_eq!(seen, (0..50).collect::<Vec<i64>>(), "forwarded in order, none lost");
+
+        sink.send(Ev::Control(pid.to_string(), json!({ "type": "data", "i": 50 })))
+            .unwrap();
+        assert_eq!(wakes(&mut rx), 1, "the drain must re-arm the wake");
+    }
+
+    /// The departure path drains the link's queue directly. With no forwarder
+    /// between the peer and that queue, an event the peer sent before departure
+    /// is already in it, so the drain sees it; and once the queue is gone a
+    /// late send fails and wakes nothing.
+    #[tokio::test]
+    async fn a_sent_event_is_in_the_queue_at_departure_and_a_dropped_queue_wakes_nothing() {
+        let (conn, _far, mut rx) = test_conn().await;
+        let (candidate_tx, mut candidate_rx) = mpsc::unbounded_channel();
+        let sink = net::EvSink::waking(candidate_tx, conn.tx.clone(), conn.candidate_wake.clone());
+        sink.send(Ev::Control("p".into(), json!({ "type": "l2-close", "sid": 1 })))
+            .unwrap();
+        // No await between the send and the drain: nothing else had to run.
+        match candidate_rx.try_recv() {
+            Ok(Ev::Control(_, v)) => assert_eq!(v["type"], "l2-close"),
+            _ => panic!("the final control was not in the link's queue"),
+        }
+        while rx.try_recv().is_ok() {}
+        conn.candidate_wake.store(false, Ordering::SeqCst);
+        drop(candidate_rx);
+        assert!(
+            sink.send(Ev::Control("p".into(), json!({ "type": "late" }))).is_err(),
+            "a dropped link's queue must refuse the event"
+        );
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|ev| matches!(ev, Ev::BuildWake)),
+            "a dropped link's event woke the loop"
+        );
     }
 
     /// Signaling can arrive before installation; the envelope names the peer in
@@ -12284,6 +13992,261 @@ mod warm_identity_tests {
         assert!(Arc::ptr_eq(conn.links[pid].transport.as_ref().unwrap(), &t));
     }
 
+    /// A real WebRTC offer envelope from `pid`, tagged with peer connection `pc`.
+    async fn offer_from(conn: &Conn, pid: &str, pc: u32) -> Value {
+        let (otx, _orx) = mpsc::unbounded_channel();
+        let offerer = net::Peer::connect(
+            "sid-acceptor".to_string(),
+            "cli-l2-far".to_string(),
+            false,
+            Vec::new(),
+            false,
+            conn.sio.clone(),
+            otx,
+            pc,
+        )
+        .await
+        .expect("local offerer");
+        let ld = offerer.pc.local_description().await.expect("offer");
+        json!({
+            "from": pid,
+            "data": { "type": "description", "uid": "cli-l2-far", "pc": pc, "description": ld }
+        })
+    }
+
+    /// Cause 1 of the cold-connect failure: the initiator's offer arrived
+    /// while our direct attempt for its sid was pending. It used to be dropped
+    /// (no build may start during a pending) and, sent once per connection,
+    /// was never answered. It is held, and the fallback responder answers it.
+    #[tokio::test]
+    async fn an_offer_during_a_pending_direct_attempt_is_held_then_answered() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let pid = "sid-cold-cli";
+        expired_direct_pending(&mut conn, pid, Instant::now() + Duration::from_secs(30));
+        let offer = offer_from(&conn, pid, 1).await;
+        let cand = json!({
+            "from": pid,
+            "data": { "type": "candidate", "pc": 1, "candidate": { "candidate": "candidate:1 1 udp 1 10.0.0.9 9 typ host" } }
+        });
+        assert!(conn.hold_for_direct(&offer), "the offer was not held");
+        assert!(conn.hold_for_direct(&cand), "its candidate was not held");
+        assert_eq!(conn.held_signals[pid].signals.len(), 2);
+        // A signal for a sid with no pending is not ours to hold.
+        assert!(!conn.hold_for_direct(&json!({ "from": "sid-other", "data": offer["data"].clone() })));
+
+        // The direct path loses: the reaper falls back and establishes.
+        conn.direct_pending.get_mut(pid).unwrap().deadline = Instant::now();
+        let fell = conn.expired_direct();
+        assert_eq!(fell.len(), 1);
+        conn.establish_as(json!({ "id": pid, "uid": "cli-l2-far", "name": "far" }), None)
+            .await
+            .expect("fallback establish");
+        assert!(conn.held_signals.is_empty(), "the hold outlived its replay");
+        let peer = conn.links[pid].peer.clone().expect("responder link");
+        assert!(peer.polite, "a held offer must make the fallback its responder");
+
+        // The replayed signals reach the loop in order; applying them answers.
+        let mut replayed = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Ev::Signal(v) = ev {
+                replayed.push(v);
+            }
+        }
+        assert_eq!(replayed.len(), 2, "held offer and candidate are replayed once");
+        assert_eq!(replayed[0]["data"]["description"]["type"], "offer");
+        for v in replayed {
+            conn.apply_signal(pid, v["data"].clone()).await;
+        }
+        let local = peer.pc.local_description().await.expect("answer");
+        assert_eq!(local.sdp_type.to_string(), "answer");
+        assert_eq!(peer.remote_pc().await, Some(1));
+    }
+
+    /// A held offer is discarded when the direct path wins and adopts, so a
+    /// later rebuild can never answer a connection the peer has abandoned. A
+    /// newer offer from the same sid replaces an older held one.
+    #[tokio::test]
+    async fn a_held_offer_is_discarded_when_direct_adopts() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-held-direct-wins";
+        let t: Arc<dyn Transport> = Rec::new("direct", &log);
+        let attempt = t.attempt_id().unwrap();
+        conn.direct_pending
+            .insert(pid.into(), direct_pending_with(attempt, ("peer", "secret")));
+        let first = json!({
+            "from": pid,
+            "data": { "type": "description", "pc": 1, "description": { "type": "offer", "sdp": "v=0" } }
+        });
+        let second = json!({
+            "from": pid,
+            "data": { "type": "description", "pc": 2, "description": { "type": "offer", "sdp": "v=0" } }
+        });
+        assert!(conn.hold_for_direct(&first));
+        assert!(conn.hold_for_direct(&second));
+        assert_eq!(conn.held_signals[pid].pc, Some(2), "a newer connection replaces the hold");
+        assert_eq!(conn.held_signals[pid].signals.len(), 1);
+        assert!(matches!(
+            conn.adopt_direct(pid, t.clone(), "direct-quic"),
+            DirectAdoption::Adopted { attempt: seen, .. } if seen == attempt
+        ));
+        assert!(!conn.held_signals.contains_key(pid), "direct adopted but the offer stayed held");
+    }
+
+    /// Cause 3: an offer from a NEW peer connection on the same sid (the
+    /// initiator rotated) rebuilds the responder instead of renegotiating the
+    /// one that answered the old connection.
+    #[tokio::test]
+    async fn an_offer_from_a_new_peer_connection_gets_a_fresh_responder() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-rotated-cli";
+        let first = offer_from(&conn, pid, 1).await;
+        conn.ensure_responder(pid, &first["data"]).await.expect("responder");
+        conn.apply_signal(pid, first["data"].clone()).await;
+        let old = conn.links[pid].peer.clone().expect("first responder");
+        assert_eq!(old.remote_pc().await, Some(1));
+
+        let second = offer_from(&conn, pid, 2).await;
+        conn.apply_signal(pid, second["data"].clone()).await;
+        let new = conn.links[pid].peer.clone().expect("fresh responder");
+        assert!(!Arc::ptr_eq(&old, &new), "the old responder was renegotiated");
+        assert_eq!(new.remote_pc().await, Some(2));
+        let local = new.pc.local_description().await.expect("answer");
+        assert_eq!(local.sdp_type.to_string(), "answer");
+    }
+
+    /// The DoS guard: a link that is SERVING bytes is never torn down for an
+    /// offer that merely claims a new peer connection; it keeps the old
+    /// renegotiation path and its transport.
+    #[tokio::test]
+    async fn a_serving_link_never_gets_a_fresh_responder() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-serving";
+        let first = offer_from(&conn, pid, 1).await;
+        conn.ensure_responder(pid, &first["data"]).await.expect("responder");
+        conn.apply_signal(pid, first["data"].clone()).await;
+        let old = conn.links[pid].peer.clone().expect("responder");
+        let serving: Arc<dyn Transport> = Rec::new("serving", &log);
+        conn.links.get_mut(pid).unwrap().transport = Some(serving.clone());
+
+        let second = offer_from(&conn, pid, 2).await;
+        conn.apply_signal(pid, second["data"].clone()).await;
+        let link = &conn.links[pid];
+        assert!(
+            Arc::ptr_eq(link.peer.as_ref().expect("peer kept"), &old),
+            "a serving link was rebuilt for a new-pc offer"
+        );
+        assert!(
+            link.transport.as_ref().is_some_and(|t| Arc::ptr_eq(t, &serving)),
+            "the serving transport was replaced"
+        );
+        assert!(!serving.is_dead(), "the serving transport was closed");
+    }
+
+    /// An untagged sender (a browser, an older build) keeps the renegotiation
+    /// path: its second offer is applied to the same responder.
+    #[tokio::test]
+    async fn an_untagged_peer_keeps_the_renegotiation_path() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-untagged";
+        let untag = |mut v: Value| {
+            if let Some(d) = v["data"].as_object_mut() {
+                d.remove("pc");
+            }
+            v
+        };
+        let first = untag(offer_from(&conn, pid, 1).await);
+        conn.ensure_responder(pid, &first["data"]).await.expect("responder");
+        conn.apply_signal(pid, first["data"].clone()).await;
+        let old = conn.links[pid].peer.clone().expect("responder");
+        assert_eq!(old.remote_pc().await, None);
+        let second = untag(offer_from(&conn, pid, 2).await);
+        conn.apply_signal(pid, second["data"].clone()).await;
+        let now = conn.links[pid].peer.clone().expect("responder");
+        assert!(Arc::ptr_eq(&old, &now), "an untagged offer rebuilt the responder");
+    }
+
+    /// The driver loops' shared SDP tail (`deliver_sdp_signal`, called by
+    /// recv dispatch, send engine and join after `ensure_responder`): during a
+    /// pending direct attempt the offer is held, not applied or dropped; with
+    /// no pending it is applied to the responder.
+    #[tokio::test]
+    async fn the_driver_sdp_tail_holds_during_a_pending_direct_attempt() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-driver-tail";
+        expired_direct_pending(&mut conn, pid, Instant::now() + Duration::from_secs(30));
+        let offer = offer_from(&conn, pid, 1).await;
+        conn.ensure_responder(pid, &offer["data"]).await.expect("no error during a pending");
+        assert!(!conn.links.contains_key(pid), "a responder was built during the pending");
+        conn.deliver_sdp_signal(&offer).await;
+        assert!(conn.held_signals.get(pid).is_some_and(|h| h.has_offer), "the offer was not held");
+
+        let other = "sid-driver-tail-nopending";
+        let offer2 = offer_from(&conn, other, 1).await;
+        conn.ensure_responder(other, &offer2["data"]).await.expect("responder");
+        conn.deliver_sdp_signal(&offer2).await;
+        assert!(!conn.held_signals.contains_key(other), "held with no pending");
+        let p = conn.links[other].peer.clone().expect("responder");
+        assert!(p.pc.local_description().await.is_some(), "the offer was not applied");
+    }
+
+    /// The upgrade adoption site discards a hold too.
+    #[tokio::test]
+    async fn upgrade_adoption_discards_a_held_offer() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "sid-upgrade-held";
+        conn.held_signals.insert(
+            pid.to_string(),
+            HeldSignals {
+                since: Instant::now(),
+                pc: Some(1),
+                has_offer: true,
+                signals: std::collections::VecDeque::new(),
+                bytes: 0,
+            },
+        );
+        let t: Arc<dyn Transport> = Rec::new("upgrade", &log);
+        let attempt = t.attempt_id().unwrap();
+        let adopted = conn.adopt_direct_transport(
+            pid,
+            t,
+            "direct-quic",
+            attempt,
+            Some(("peer".into(), "secret".into())),
+            None,
+            Some(DirectAuth::device(1, "peer", "secret")),
+        );
+        assert!(matches!(adopted, DirectAdoption::Adopted { .. }));
+        assert!(!conn.held_signals.contains_key(pid), "upgrade adopted but the offer stayed held");
+    }
+
+    /// A hold whose direct attempt ended with nothing built to take it is
+    /// purged by the next reaper call; one still pending is kept.
+    #[tokio::test]
+    async fn an_orphan_hold_is_purged_by_the_reaper() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-orphan";
+        let live = "sid-still-pending";
+        expired_direct_pending(&mut conn, live, Instant::now() + Duration::from_secs(30));
+        for p in [pid, live] {
+            conn.held_signals.insert(
+                p.to_string(),
+                HeldSignals {
+                    since: Instant::now(),
+                    pc: None,
+                    has_offer: true,
+                    signals: std::collections::VecDeque::new(),
+                    bytes: 0,
+                },
+            );
+        }
+        let _ = conn.expired_direct();
+        assert!(!conn.held_signals.contains_key(pid), "an orphan hold survived the reaper");
+        assert!(conn.held_signals.contains_key(live), "a pending's hold was purged");
+    }
+
     /// Cold adoption keys workers from the immutable AUTHORIZATION, exactly
     /// like upgrade adoption. A fleet rendezvous secret or an ephemeral
     /// ceremony secret must never become a worker key; a device binding does.
@@ -12760,7 +14723,8 @@ mod warm_identity_tests {
 
     /// A LAN reservation carries the exact checked attempt and authenticated
     /// device binding. It adopts once, consumes only that reservation, mints no
-    /// worker key, is not device-trusted, and a duplicate Arc is harmless.
+    /// worker key, is the pair (trusted, named, `OwnerDevice`) while its binding
+    /// is live, and a duplicate Arc is harmless.
     #[tokio::test]
     async fn lan_reservation_adopts_once_and_duplicate_is_harmless() {
         let host = Arc::new(TestHost {
@@ -12802,7 +14766,8 @@ mod warm_identity_tests {
         ));
         let link = &conn.links[pid];
         assert_eq!(link.direct_route, filament_transport::lan::ROUTE_LAN);
-        assert!(!link.trusted, "LAN was born device-trusted");
+        assert!(link.trusted, "a LAN link to a live paired device was not the pair");
+        assert_eq!(link.verified_name.as_deref(), Some("dev"));
         assert!(link.expected_secret.is_none());
         assert_eq!(
             link.lan_binding.as_ref().and_then(|b| b.device.clone()),
@@ -12851,16 +14816,16 @@ mod warm_identity_tests {
             conn.links[existing_pid].transport.as_ref().unwrap(),
             &lan_existing
         ));
-        // The link's DELEGATED ceiling comes from the authenticated device's
-        // current store record, not from the empty default that denied every
-        // transfer at the capability gate.
+        // Both paths give the pair link's principal and trust, resolved from
+        // the record exactly as a pair link is, not the empty delegated
+        // ceiling that refused the forward a granted pair carries.
         for owned in [pid, existing_pid] {
+            let link = &conn.links[owned];
+            assert!(link.trusted, "LAN adoption of {owned} was not the pair");
+            assert_eq!(link.verified_name.as_deref(), Some("dev"));
             assert!(
-                matches!(
-                    &conn.links[owned].principal_kind,
-                    PrincipalKind::Delegated { caps } if caps == &vec!["transfer".to_string()]
-                ),
-                "LAN adoption did not apply the stored transfer ceiling to {owned}"
+                matches!(&link.principal_kind, PrincipalKind::OwnerDevice),
+                "LAN adoption of {owned} did not carry the pair principal"
             );
         }
 
@@ -12875,6 +14840,8 @@ mod warm_identity_tests {
             conn.adopt_direct(fleet_pid, fleet_lan, filament_transport::lan::ROUTE_LAN),
             DirectAdoption::Adopted { tkey: None, .. }
         ));
+        assert!(!conn.links[fleet_pid].trusted, "a fleet LAN reservation was trusted");
+        assert!(conn.links[fleet_pid].verified_name.is_none());
         let fleet_binding = conn.links[fleet_pid].lan_binding.as_ref().unwrap();
         assert_eq!(fleet_binding.name, "fleet");
         assert!(fleet_binding.device.is_none());
@@ -12892,8 +14859,8 @@ mod warm_identity_tests {
         assert!(auth.transport_key().is_none());
     }
 
-    /// A live LAN link is deduped by its authenticated reservation even though
-    /// it is deliberately untrusted and unnamed. Its exact device binding drives
+    /// A live LAN link is deduped by its authenticated reservation. Its exact
+    /// device binding drives
     /// revocation, while a dead LAN link no longer dedups and unrelated device
     /// or fleet links survive the LAN link's removal.
     #[tokio::test]
@@ -12918,8 +14885,8 @@ mod warm_identity_tests {
             conn.adopt_direct(pid, t.clone(), filament_transport::lan::ROUTE_LAN),
             DirectAdoption::Adopted { .. }
         ));
-        assert!(!conn.links[pid].trusted);
-        assert!(conn.links[pid].verified_name.is_none());
+        assert!(conn.links[pid].trusted);
+        assert_eq!(conn.links[pid].verified_name.as_deref(), Some("dev"));
         assert!(conn.links[pid].expected_secret.is_none());
         assert_eq!(
             conn.links[pid].lan_binding.as_ref().and_then(|b| b.device.clone()),
@@ -12990,6 +14957,48 @@ mod warm_identity_tests {
         ));
         assert!(fresh.is_dead());
         assert!(!conn.links.contains_key(fresh_pid));
+    }
+
+    /// A FULL retirement drain refuses new direct attempts, but not the relay
+    /// recovery or the no-op returns, which consume no drain capacity. With
+    /// the check first, a relay-committed peer with no link was refused its
+    /// relay re-establish whenever the drain was full, and stayed disconnected.
+    #[tokio::test]
+    async fn a_full_drain_still_re_establishes_a_relay_committed_peer() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let log = Arc::new(crate::host::VecLog::new());
+        conn.log = log.clone() as Arc<dyn LogSink>;
+        // Live producers: the backstop cannot reap any of them.
+        for _ in 0..MAX_RETIRED_ATTEMPTS {
+            conn.retired_attempts
+                .insert(net::AttemptId::next(), RetiredAttempt::new("sid-other"));
+        }
+        let pid = "sid-relay";
+        conn.resil.relay_committed.insert(pid.into());
+        conn.start_direct(pid, "peer", "pair-secret").await;
+        assert!(
+            conn.links.contains_key(pid),
+            "the relay re-establish was refused by a full drain"
+        );
+        assert!(!conn.direct_pending.contains_key(pid), "a direct attempt was armed");
+        let lines = log.take();
+        assert!(
+            !lines.iter().any(|(_, l)| l.contains("retirement drain capacity full")),
+            "the relay recovery was counted as a refused direct attempt: {lines:?}"
+        );
+
+        // A peer that is NOT relay-committed is still refused, before any
+        // pending exists: the drain bound itself is unchanged.
+        let other = "sid-direct";
+        conn.start_direct(other, "peer2", "pair-secret-2").await;
+        assert!(!conn.direct_pending.contains_key(other), "a full drain armed a direct attempt");
+        assert!(
+            log.take().iter().any(|(_, l)| l.contains(&format!(
+                "direct attempt for {other} refused: retirement drain capacity full"
+            ))),
+            "the full drain did not refuse the direct attempt"
+        );
     }
 
     /// The capacity backstop reaps a tombstone by age only once its producer
@@ -13275,6 +15284,203 @@ mod warm_identity_tests {
         assert!(conn
             .stage_event(Ev::LocalControl(pid.into(), json!({ "type": "x" })))
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn chunk_attribution_fences_pairing_and_worker_dispatch() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "pairing-peer";
+        let primary = Rec::new("primary", &log);
+        let source = primary.source_id().unwrap();
+        let worker = Rec::new("worker", &log);
+        let worker_source = worker.source_id().unwrap();
+        let retired = net::SourceId::next();
+        let mut link = relay_link(pid, "peer", "peer", primary);
+        link.source = source;
+        link.worker_sources.insert(worker_source);
+        conn.links.insert(pid.into(), link);
+        let chunk = |s, envelope: &str, inner: &str| Ev::Sourced {
+            pid: envelope.into(), source: s,
+            inner: Box::new(Ev::Chunk(inner.into(), 42, Some(0), bytes::Bytes::from_static(b"pair"))),
+        };
+        assert!(matches!(conn.stage_event(chunk(source, pid, pid)), Some((Ev::Chunk(..), Some(s))) if s == source));
+        assert!(matches!(conn.stage_event(chunk(worker_source, pid, pid)), Some((Ev::Chunk(..), Some(s))) if s == worker_source));
+        assert!(conn.stage_event(chunk(retired, pid, pid)).is_none());
+        assert!(conn.stage_event(chunk(source, pid, "other")).is_none());
+        assert!(conn.stage_event(Ev::Chunk(pid.into(), 42, Some(0), bytes::Bytes::new())).is_none());
+
+        // A registered standby may read before adoption. Replay stays tagged,
+        // and replacement between flush and dispatch must still fence it.
+        let standby = Rec::new("standby", &log);
+        let standby_source = standby.source_id().unwrap();
+        conn.pending_sources.insert(standby_source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::new(), bytes: 0,
+        });
+        assert!(conn.stage_event(chunk(standby_source, pid, pid)).is_none());
+        assert_eq!(conn.pending_sources[&standby_source].events.len(), 1);
+        assert_eq!(conn.pending_sources[&standby_source].bytes, 4);
+        conn.links.get_mut(pid).unwrap().source = standby_source;
+        conn.flush_pending_source(standby_source);
+        assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(..), Some(s))) if s == standby_source));
+
+        conn.links.get_mut(pid).unwrap().source = source;
+        conn.pending_sources.insert(standby_source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::new(), bytes: 0,
+        });
+        assert!(conn.stage_event(chunk(standby_source, pid, pid)).is_none());
+        conn.links.get_mut(pid).unwrap().source = standby_source;
+        conn.flush_pending_source(standby_source);
+        conn.links.get_mut(pid).unwrap().source = source;
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
+        conn.links.get_mut(pid).unwrap().worker_sources.clear();
+        assert!(conn.stage_event(chunk(worker_source, pid, pid)).is_none());
+    }
+
+    #[tokio::test]
+    async fn buffered_standby_chunks_cannot_be_overtaken_at_adoption() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "ordered-standby";
+        let old = Rec::new("old", &log);
+        let old_source = old.source_id().unwrap();
+        let standby = Rec::new("standby", &log);
+        let source = standby.source_id().unwrap();
+        let mut link = relay_link(pid, "peer", "peer", old);
+        link.source = old_source;
+        conn.links.insert(pid.into(), link);
+        conn.pending_sources.insert(source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::new(), bytes: 0,
+        });
+        let chunk = |offset, data: &'static [u8]| Ev::Sourced {
+            pid: pid.into(), source,
+            inner: Box::new(Ev::Chunk(pid.into(), 42, Some(offset), bytes::Bytes::from_static(data))),
+        };
+        assert!(conn.stage_event(chunk(0, b"old")).is_none());
+        // This event is already in the normal queue when adoption happens.
+        conn.tx.send(chunk(3, b"new")).unwrap();
+        conn.links.get_mut(pid).unwrap().source = source;
+        conn.flush_pending_source(source);
+        let first = conn.stage_event(rx.try_recv().unwrap()).unwrap().0;
+        let second = conn.stage_event(rx.try_recv().unwrap()).unwrap().0;
+        assert!(matches!(first, Ev::Chunk(_, 42, Some(0), ref data) if data.as_ref() == b"old"));
+        assert!(matches!(second, Ev::Chunk(_, 42, Some(3), ref data) if data.as_ref() == b"new"));
+        assert!(conn.replaying_sources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_precedes_real_departure_paths_and_fences_replacement() {
+        for sourced_barrier in [false, true] {
+            let (mut conn, _far, mut rx) = test_conn().await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "replay-departure";
+            let transport = Rec::new("current", &log);
+            let source = transport.source_id().unwrap();
+            conn.links.insert(pid.into(), delegated_link(pid, transport));
+            if sourced_barrier {
+                let (_tx, queued) = tokio::sync::mpsc::unbounded_channel();
+                conn.link_events.insert(pid.into(), LinkEvents {
+                    generation: 7, rx: std::sync::Mutex::new(queued),
+                    departure_ready: None, departure_pending: Some(source),
+                });
+            }
+            conn.pending_sources.insert(source, PendingSource {
+                pid: pid.into(), attempt: None, at: Instant::now(),
+                events: std::collections::VecDeque::from([Ev::Chunk(
+                    pid.into(), 42, Some(0), bytes::Bytes::from_static(b"before-left"),
+                )]), bytes: 11,
+            });
+            let payload = json!({"id": pid});
+            let departure = if sourced_barrier {
+                Ev::Sourced { pid: pid.into(), source, inner: Box::new(Ev::PeerLeft(payload.clone())) }
+            } else { Ev::PeerLeft(payload.clone()) };
+            conn.tx.send(departure).unwrap();
+            conn.flush_pending_source(source);
+            if let Some((Ev::PeerLeft(v), _)) = conn.stage_event(rx.try_recv().unwrap()) {
+                assert!(!conn.on_peer_left(&v));
+            } else {
+                assert!(sourced_barrier, "ordinary room departure was not dispatched");
+            }
+            assert!(conn.links.contains_key(pid), "departure overtook buffered data");
+            assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(_, 42, Some(0), ref b), Some(s))) if s == source && b.as_ref() == b"before-left"));
+            let (Ev::PeerLeft(v), seen) = conn.stage_event(rx.try_recv().unwrap()).expect("deferred departure") else { panic!("expected departure") };
+            assert_eq!(seen, Some(source));
+            conn.on_peer_left(&v);
+            assert!(!conn.links.contains_key(pid), "departure did not finalize");
+        }
+
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "replay-replacement";
+        let old = Rec::new("old", &log);
+        let source = old.source_id().unwrap();
+        conn.links.insert(pid.into(), delegated_link(pid, old));
+        conn.pending_sources.insert(source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"x"))]), bytes: 1,
+        });
+        conn.flush_pending_source(source);
+        assert!(!conn.on_peer_left(&json!({"id": pid})));
+        let successor = Rec::new("successor", &log);
+        conn.links.insert(pid.into(), delegated_link(pid, successor));
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
+        assert!(conn.stage_event(rx.try_recv().unwrap()).is_none());
+        assert!(conn.links.contains_key(pid), "stale deferred departure dropped replacement");
+
+        // A replacement after the deferred event passes staging but before its
+        // caller invokes on_peer_left must also survive.
+        let current = conn.links[pid].source;
+        conn.replaying_sources.insert(current, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"y"))]), bytes: 1,
+        });
+        conn.tx.send(Ev::ReplaySource(current)).unwrap();
+        assert!(!conn.on_peer_left(&json!({"id": pid})));
+        assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(..), _))));
+        let (Ev::PeerLeft(deferred), _) = conn.stage_event(rx.try_recv().unwrap()).unwrap() else { panic!("expected staged departure") };
+        conn.drop_link(pid);
+        let newer = Rec::new("newer", &log);
+        conn.links.insert(pid.into(), delegated_link(pid, newer));
+        assert!(!conn.on_peer_left(&deferred));
+        assert!(conn.links.contains_key(pid), "staged departure dropped a newer link");
+    }
+
+    /// The replay swap path closes the CURRENT, already adopted transport when
+    /// the replay would exceed the event budget. That is a behaviour change on
+    /// a live link, so it is pinned here rather than left implicit: the
+    /// standby's replay is dropped, the adopted link's transport is closed,
+    /// and the daemon keeps running.
+    #[tokio::test]
+    async fn a_replay_overflow_closes_the_adopted_link_not_the_standby() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid = "replay-overflow";
+        let adopted = Rec::new("adopted", &log);
+        let source = adopted.source_id().unwrap();
+        conn.links
+            .insert(pid.into(), delegated_link(pid, adopted.clone()));
+        // A replay already in flight for this source, with one buffered event.
+        conn.replaying_sources.insert(source, PendingSource {
+            pid: pid.into(), attempt: None, at: Instant::now(),
+            events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"old"))]), bytes: 3,
+        });
+        // A new event over the budget: the swap overflows and must close the
+        // adopted transport.
+        // The comparison is strict (`>`), so exactly the limit is allowed.
+        // One byte above it must take the overflow path.
+        let big = vec![0u8; MAX_BUILD_EVENT_BYTES + 1];
+        let ev = Ev::Sourced {
+            pid: pid.into(),
+            source,
+            inner: Box::new(Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from(big))),
+        };
+        assert!(conn.stage_event(ev).is_none(), "the overflowing event must not be dispatched");
+        assert!(!conn.replaying_sources.contains_key(&source), "the replay entry must be dropped");
+        assert!(conn.links.contains_key(pid), "the daemon must survive the overflow");
+        assert!(adopted.is_dead(), "overflow must close the adopted transport");
     }
 
     /// A registered standby source buffers until adoption, replays with its tag,
@@ -14556,6 +16762,414 @@ mod warm_identity_tests {
             .expect("prepare");
         assert!(plan.is_some(), "a changed authorized binding could not replace");
         assert!(!conn.builds.contains_key(other), "the revoked-bound candidate survived");
+    }
+
+    /// A transport for the revoked-link closer: it records each control it
+    /// writes and each close, carries a real source (so an ack can be bound
+    /// to it), and can be told to never complete a write (a frozen peer) or
+    /// to fail every write (a transport already gone).
+    struct RefusalT {
+        source: net::SourceId,
+        sent: std::sync::Mutex<Vec<Value>>,
+        closes: AtomicUsize,
+        hang: bool,
+        fail: bool,
+        dead: AtomicBool,
+    }
+    fn refusal_t(hang: bool) -> Arc<RefusalT> {
+        Arc::new(RefusalT {
+            source: net::SourceId::next(),
+            sent: std::sync::Mutex::new(Vec::new()),
+            closes: AtomicUsize::new(0),
+            hang,
+            fail: false,
+            dead: AtomicBool::new(false),
+        })
+    }
+    fn failing_refusal_t() -> Arc<RefusalT> {
+        Arc::new(RefusalT {
+            source: net::SourceId::next(),
+            sent: std::sync::Mutex::new(Vec::new()),
+            closes: AtomicUsize::new(0),
+            hang: false,
+            fail: true,
+            dead: AtomicBool::new(false),
+        })
+    }
+    #[async_trait::async_trait]
+    impl Transport for RefusalT {
+        async fn send_control(&self, msg: &Value) -> Result<()> {
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            if self.fail {
+                anyhow::bail!("channel closed");
+            }
+            self.sent.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+        fn force_close(&self) {
+            self.closes.fetch_add(1, Ordering::Relaxed);
+        }
+        fn is_dead(&self) -> bool {
+            self.dead.load(Ordering::Relaxed)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn source_id(&self) -> Option<net::SourceId> {
+            Some(self.source)
+        }
+    }
+
+    fn refusal() -> Value {
+        json!({ "type": "link-revoked", "reason": "forgotten" })
+    }
+
+    /// The nonce of the `link-revoked` the closer task wrote, once it has.
+    async fn written_refusal_nonce(t: &RefusalT) -> String {
+        for _ in 0..100 {
+            if let Some(v) = t.sent.lock().unwrap().first() {
+                assert_eq!(v["type"], "link-revoked", "the refusal is the first frame");
+                assert_eq!(v["reason"], "forgotten", "the refusal keeps its reason");
+                return v["nonce"].as_str().expect("the refusal carries a nonce").to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the closer never wrote the refusal");
+    }
+
+    fn revoked_ack(pid: &str, source: net::SourceId, nonce: &str) -> Ev {
+        Ev::Sourced {
+            pid: pid.to_string(),
+            source,
+            inner: Box::new(Ev::Control(
+                pid.to_string(),
+                json!({ "type": "link-revoked-ack", "nonce": nonce }),
+            )),
+        }
+    }
+
+    async fn closed_within(t: &RefusalT, bound: Duration) -> bool {
+        let until = Instant::now() + bound;
+        while Instant::now() < until {
+            if t.closes.load(Ordering::Relaxed) > 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        t.closes.load(Ordering::Relaxed) > 0
+    }
+
+    /// An installed WebRTC link's event stream, as `apply_built_peer` leaves it.
+    fn own_stream(conn: &mut Conn, pid: &str, generation: u32) -> mpsc::UnboundedSender<Ev> {
+        let (etx, erx) = mpsc::unbounded_channel();
+        conn.link_events.insert(
+            pid.to_string(),
+            LinkEvents {
+                generation,
+                rx: std::sync::Mutex::new(erx),
+                departure_ready: None,
+                departure_pending: None,
+            },
+        );
+        etx
+    }
+
+    /// F1 (daemon-path gate): a write returning Ok is not delivery, and the
+    /// close discards what is still queued. The revoked link leaves routing at
+    /// once, but its transport closes only on the peer's ack for THIS cut,
+    /// bound by NONCE only (pid plus nonce): a stale nonce, or the right nonce
+    /// for another pid, does nothing, while the right nonce for this pid counts
+    /// from any source. This is the main-queue path (a link with no candidate
+    /// stream).
+    #[tokio::test]
+    async fn a_revoked_link_closes_on_the_peers_ack_and_not_before() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-r".into(), direct_link("sid-r", "b", "user@b", t.clone()));
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-r", refusal()));
+        assert!(!conn.links.contains_key("sid-r"), "the cut link stayed routable");
+        let nonce = written_refusal_nonce(&t).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0, "closed before the peer acked");
+        assert!(conn.stage_event(revoked_ack("sid-r", t.source, "not-this-cut")).is_none());
+        assert!(conn.stage_event(revoked_ack("sid-x", t.source, &nonce)).is_none());
+        assert_eq!(conn.closing.len(), 1, "a stale nonce or another pid completed the cut");
+        assert!(!closed_within(&t, Duration::from_millis(100)).await, "closed on a stale ack");
+        // The peer may answer on another path of the same session (its primary
+        // after a promotion, a worker): the nonce binds it, not the source.
+        assert!(
+            conn.stage_event(revoked_ack("sid-r", net::SourceId::next(), &nonce)).is_none(),
+            "the ack authorizes nothing and is never dispatched"
+        );
+        assert!(conn.closing.is_empty(), "the matching ack did not complete the cut");
+        assert!(closed_within(&t, Duration::from_millis(500)).await, "not closed after the ack");
+        assert!(
+            start.elapsed() < REFUSAL_ACK_BUDGET,
+            "closed by the budget, not by the ack ({:?})",
+            start.elapsed()
+        );
+    }
+
+    /// The path the first version missed: a link built by `apply_built_peer`
+    /// (a WebRTC DataChannel link) delivers ONLY on its own candidate stream,
+    /// which the loop drains once per turn (up to 2 s on an idle daemon). The
+    /// closer reads that stream itself, so the ack closes the link with no
+    /// loop turn at all: nothing here calls `pump_builds` or `stage_event`.
+    /// Nothing else read from the cut link is forwarded.
+    #[tokio::test]
+    async fn a_cut_links_own_stream_ack_needs_no_loop_turn() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-e".into(), direct_link("sid-e", "b", "user@b", t.clone()));
+        let etx = own_stream(&mut conn, "sid-e", 7);
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-e", refusal()));
+        assert_eq!(conn.closing.len(), 1, "the main-queue path is watched as well");
+        let nonce = written_refusal_nonce(&t).await;
+        let _ = etx.send(Ev::Sourced {
+            pid: "sid-e".into(),
+            source: t.source,
+            inner: Box::new(Ev::Control("sid-e".into(), json!({ "type": "exec-close", "sid": 1 }))),
+        });
+        let _ = etx.send(revoked_ack("sid-e", t.source, "not-this-cut"));
+        let _ = etx.send(revoked_ack("sid-x", t.source, &nonce));
+        assert!(!closed_within(&t, Duration::from_millis(150)).await, "closed on a stale ack");
+        let _ = etx.send(revoked_ack("sid-e", t.source, &nonce));
+        assert!(closed_within(&t, Duration::from_millis(300)).await, "not closed after the ack");
+        assert!(start.elapsed() < REFUSAL_ACK_BUDGET, "closed by the budget, not by the ack");
+        while let Ok(ev) = rx.try_recv() {
+            if let Ev::Sourced { pid, .. } = &ev {
+                assert_ne!(pid, "sid-e", "an event from the cut link was forwarded");
+            }
+        }
+    }
+
+    /// The cut link's reader ended (its stream's sender dropped) on a dead
+    /// transport: no ack can arrive on any path, so the closer closes at once,
+    /// not at the budget.
+    #[tokio::test]
+    async fn a_cut_link_whose_reader_ended_closes_at_once() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-d".into(), direct_link("sid-d", "b", "user@b", t.clone()));
+        let etx = own_stream(&mut conn, "sid-d", 7);
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-d", refusal()));
+        let _ = written_refusal_nonce(&t).await;
+        t.dead.store(true, Ordering::Relaxed);
+        drop(etx);
+        assert!(closed_within(&t, Duration::from_millis(500)).await, "left open after the reader ended");
+        assert!(start.elapsed() < REFUSAL_ACK_BUDGET, "waited out the budget for a dead reader");
+    }
+
+    /// The branch the two-link fix relies on: a cut link with its OWN stream
+    /// whose reader ends while the transport is still alive (the peer answers
+    /// on another path of the same session). The closer must keep waiting,
+    /// and the ack for the SAME nonce from a DIFFERENT source, delivered
+    /// through the main queue, completes the cut. Fails if the stream's end
+    /// stopped the wait unconditionally, or if the main-queue signal were not
+    /// registered alongside the stream.
+    #[tokio::test]
+    async fn an_ack_on_another_path_completes_a_cut_whose_own_stream_ended() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-s".into(), direct_link("sid-s", "b", "user@b", t.clone()));
+        let etx = own_stream(&mut conn, "sid-s", 7);
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-s", refusal()));
+        let nonce = written_refusal_nonce(&t).await;
+        drop(etx);
+        assert!(
+            !closed_within(&t, Duration::from_millis(300)).await,
+            "the stream's end on a live transport stopped the wait"
+        );
+        assert!(
+            conn.stage_event(revoked_ack("sid-s", net::SourceId::next(), &nonce)).is_none(),
+            "the ack was dispatched"
+        );
+        assert!(
+            closed_within(&t, REFUSAL_ACK_BUDGET.saturating_sub(start.elapsed())).await,
+            "the ack on another path did not complete the cut"
+        );
+        assert!(start.elapsed() < REFUSAL_ACK_BUDGET, "closed by the budget, not by the ack");
+    }
+
+    /// A candidate stream left from an EARLIER generation of the pid (a
+    /// replacement such as a direct upgrade) is not where this transport
+    /// delivers, and must not be watched: an event on it is not this link's.
+    /// The cut still waits on the main-queue signal for its ack.
+    #[tokio::test]
+    async fn a_stale_generation_stream_is_not_taken_for_the_ack() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-g".into(), direct_link("sid-g", "b", "user@b", t.clone()));
+        let stale = own_stream(&mut conn, "sid-g", 6);
+        assert!(conn.drop_link_after_refusal("sid-g", refusal()));
+        assert_eq!(conn.closing.len(), 1, "a stale stream was taken instead of the signal path");
+        let nonce = written_refusal_nonce(&t).await;
+        let _ = stale.send(revoked_ack("sid-g", t.source, &nonce));
+        assert!(
+            !closed_within(&t, Duration::from_millis(300)).await,
+            "the stale stream was watched"
+        );
+        assert!(conn.stage_event(revoked_ack("sid-g", t.source, &nonce)).is_none());
+        assert!(closed_within(&t, Duration::from_millis(500)).await, "not closed after the ack");
+    }
+
+    /// A peer that never acks (dead, or an older build) costs the budget and
+    /// no more: the transport is closed then, and the entry is forgotten. An
+    /// ack arriving after that is consumed, never dispatched, and closes
+    /// nothing twice.
+    #[tokio::test]
+    async fn a_revoked_link_with_no_ack_closes_at_the_budget() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        conn.links.insert("sid-n".into(), direct_link("sid-n", "b", "user@b", t.clone()));
+        assert!(conn.drop_link_after_refusal("sid-n", refusal()));
+        let nonce = written_refusal_nonce(&t).await;
+        tokio::time::sleep(REFUSAL_ACK_BUDGET - Duration::from_millis(500)).await;
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0, "closed before the budget");
+        assert!(closed_within(&t, Duration::from_millis(1500)).await, "left open past the budget");
+        assert!(
+            conn.stage_event(revoked_ack("sid-n", t.source, &nonce)).is_none(),
+            "a late ack was dispatched"
+        );
+        conn.pump_builds();
+        assert!(conn.closing.is_empty(), "a finished cut stayed registered");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(t.closes.load(Ordering::Relaxed), 1, "a late ack closed the link again");
+    }
+
+    /// A frozen peer whose write never completes: the drop returns at once (it
+    /// is synchronous; the wait is on a task), and the transport is still
+    /// closed at the budget.
+    #[tokio::test]
+    async fn a_revoked_link_to_a_frozen_peer_never_holds_the_caller() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(true);
+        conn.links.insert("sid-f".into(), direct_link("sid-f", "b", "user@b", t.clone()));
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-f", refusal()));
+        assert!(start.elapsed() < Duration::from_millis(200), "the drop waited on the peer");
+        assert!(
+            closed_within(&t, REFUSAL_ACK_BUDGET + Duration::from_millis(1500)).await,
+            "a frozen peer kept the cut transport open"
+        );
+    }
+
+    /// A write that fails (the transport is already gone) closes at once.
+    #[tokio::test]
+    async fn a_revoked_link_whose_write_fails_closes_at_once() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = failing_refusal_t();
+        conn.links.insert("sid-w".into(), direct_link("sid-w", "b", "user@b", t.clone()));
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-w", refusal()));
+        assert!(closed_within(&t, Duration::from_millis(500)).await, "left open after a failed write");
+        assert!(start.elapsed() < REFUSAL_ACK_BUDGET);
+    }
+
+    /// No transport (a WebRTC link that never reached ChannelReady): nothing
+    /// is attempted, the link is still dropped, and nothing is registered.
+    #[tokio::test]
+    async fn a_revoked_link_with_no_transport_is_a_plain_drop() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let log = Arc::new(crate::host::VecLog::new());
+        conn.log = log.clone() as Arc<dyn LogSink>;
+        let t = refusal_t(false);
+        let mut l = direct_link("sid-t", "b", "user@b", t.clone());
+        l.transport = None;
+        conn.links.insert("sid-t".into(), l);
+        assert!(!conn.drop_link_after_refusal("sid-t", refusal()));
+        assert!(!conn.links.contains_key("sid-t"), "the link survived");
+        assert!(conn.closing.is_empty());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(t.sent.lock().unwrap().is_empty(), "a refusal went out with no transport");
+        let lines = log.take();
+        assert!(
+            lines.iter().any(|(_, l)| l.contains("link-revoked to sid-t: dropped_no_transport")),
+            "the skipped refusal was not logged: {lines:?}"
+        );
+    }
+
+    /// An unassigned source cannot carry a source-tagged ack: the refusal is
+    /// still written, nothing is awaited or registered, and the link closes
+    /// at once.
+    #[tokio::test]
+    async fn a_revoked_link_with_an_unassigned_source_awaits_no_ack() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = refusal_t(false);
+        let mut l = direct_link("sid-u", "b", "user@b", t.clone());
+        l.source = net::SourceId::UNASSIGNED;
+        conn.links.insert("sid-u".into(), l);
+        let start = Instant::now();
+        assert!(conn.drop_link_after_refusal("sid-u", refusal()));
+        assert!(conn.closing.is_empty(), "an unbindable cut was registered");
+        let _ = written_refusal_nonce(&t).await;
+        assert!(closed_within(&t, Duration::from_millis(500)).await);
+        assert!(start.elapsed() < REFUSAL_ACK_BUDGET, "waited for an ack that cannot come");
+    }
+
+    /// F1a's shape: a forget dooms TWO links to one peer together (here a
+    /// stale one whose transport is already gone, and the live one). Each cut
+    /// has its own nonce and waits for its own ack: the dead one closes at once
+    /// on its failed write, the live one only on ITS nonce. An ack with the
+    /// other cut's nonce, or for the other pid, cannot complete it.
+    #[tokio::test]
+    async fn two_links_of_one_peer_cut_together_each_wait_for_their_own_ack() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let gone = failing_refusal_t();
+        let live = refusal_t(false);
+        conn.links.insert("sid-old".into(), direct_link("sid-old", "b", "user@b", gone.clone()));
+        conn.links.insert("sid-new".into(), direct_link("sid-new", "b", "user@b", live.clone()));
+        assert!(conn.drop_link_after_refusal("sid-old", refusal()));
+        assert!(conn.drop_link_after_refusal("sid-new", refusal()));
+        assert!(closed_within(&gone, Duration::from_millis(500)).await, "the dead link stayed open");
+        let n_live = written_refusal_nonce(&live).await;
+        let n_other = conn
+            .closing
+            .iter()
+            .find(|(n, e)| e.pid == "sid-old" && **n != n_live)
+            .map(|(n, _)| n.clone())
+            .expect("the dead cut keeps its own entry until the next prune");
+        assert!(conn.stage_event(revoked_ack("sid-new", live.source, &n_other)).is_none());
+        assert!(conn.stage_event(revoked_ack("sid-old", live.source, &n_live)).is_none());
+        assert!(!closed_within(&live, Duration::from_millis(150)).await, "closed on another cut's ack");
+        assert!(conn.stage_event(revoked_ack("sid-new", live.source, &n_live)).is_none());
+        assert!(closed_within(&live, Duration::from_millis(500)).await, "not closed after its ack");
+    }
+
+    /// An ack that comes back on a CURRENT link of the same pid (the peer
+    /// answered on a path this side re-established) still completes the cut,
+    /// and is consumed, never dispatched.
+    #[tokio::test]
+    async fn an_ack_on_a_current_link_of_the_same_pid_completes_the_cut() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let cut = refusal_t(false);
+        conn.links.insert("sid-c".into(), direct_link("sid-c", "b", "user@b", cut.clone()));
+        assert!(conn.drop_link_after_refusal("sid-c", refusal()));
+        let nonce = written_refusal_nonce(&cut).await;
+        let again = refusal_t(false);
+        conn.links.insert("sid-c".into(), direct_link("sid-c", "b", "user@b", again.clone()));
+        assert!(
+            conn.stage_event(revoked_ack("sid-c", again.source, &nonce)).is_none(),
+            "an ack on a current link was dispatched"
+        );
+        assert!(conn.closing.is_empty());
+        assert!(closed_within(&cut, Duration::from_millis(500)).await, "not closed after the ack");
+        assert_eq!(again.closes.load(Ordering::Relaxed), 0, "the current link was closed");
     }
 }
 

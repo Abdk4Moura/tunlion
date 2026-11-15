@@ -83,7 +83,8 @@ EXIT CODES
        (status: the daemon runs but did not answer)
   7    can't reach the tunlion server (no internet or DNS)
   8    partial: some files moved and some did not
-  9    this device has no identity yet (init, or join an invitation)
+  9    this device has no identity yet (init, or join an invitation),
+       or this device's own key could not be read
   10   up: a daemon is already running with different settings (not applied)
   11   status: no daemon is running for this config directory
   12   a resource on this machine ran out (disk full, quota, open files, memory)

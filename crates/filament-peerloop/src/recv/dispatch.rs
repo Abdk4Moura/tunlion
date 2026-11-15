@@ -13,7 +13,9 @@
 //! through the narrow traits in [`crate::recv::ports`].
 
 use crate::adoption::AdoptSource;
-use crate::conn::{Conn, DigestSurface, Presence, Promotion, Rung};
+use crate::conn::{
+    CodeAuthorityCache, CodeContinuation, Conn, DigestSurface, Presence, Promotion, Rung,
+};
 use crate::consent::REQUEST_WITHDRAWN;
 use crate::control::{Req, ReqKind};
 use crate::daemon_ctl::sshd_listening;
@@ -28,6 +30,7 @@ use crate::mesh::{
 };
 use crate::present::{Ask, Presentation};
 use crate::recv::ceremony::{Ceremony, Inbound as PakeInbound};
+use crate::recv::fleet_bind;
 use crate::recv::ports::{RecvDaemon, RecvPorts, RecvServers};
 use crate::recv::report::{RecvReport, RefusalClass};
 use crate::recv::signaling_health;
@@ -244,19 +247,35 @@ pub enum LinkedFleetOffer {
 /// offer names a meeting place (`ch`) that is exactly this fleet's channel,
 /// and the link is fleet-shaped (`recv::fleet::shaped_link`). A `ch`-less
 /// unicast offer and an offer for any other channel keep the old behavior.
+///
+/// A peer we saw ON THE FLEET CHANNEL counts as fleet-shaped here even when
+/// its link still carries a pair expectation. The two ends can file the same
+/// peer under different relationships: the peer still holds us as a paired
+/// device while we forgot it, so its link keeps the pair expectation, the
+/// link was never fleet-shaped, the fleet direct was never armed on either
+/// end, and the peer sat with no transport at all until the silence watchdog
+/// tore the link down. The fleet relationship is the certificate-proven one,
+/// so it wins here.
+///
+/// Arming grants NO authority: the link stays fleet-pending until the fleet
+/// hello verifies, and that verification is where a revoked or forgotten
+/// device is refused. A peer that was never seen on the fleet channel is not
+/// fleet-pending, so a pair-only peer keeps the old behaviour, and a pending
+/// still wins earlier, because a pending is fed, not armed.
 pub fn linked_fleet_offer_action(
     has_link: bool,
     has_pending: bool,
     offer_ch: Option<&str>,
     fleet_ch: Option<&str>,
     link_is_fleet_shaped: bool,
+    peer_is_fleet_pending: bool,
     my_id: &str,
     pid: &str,
 ) -> LinkedFleetOffer {
     if has_pending {
         return LinkedFleetOffer::Feed;
     }
-    if !has_link || !link_is_fleet_shaped {
+    if !has_link || !(link_is_fleet_shaped || peer_is_fleet_pending) {
         return LinkedFleetOffer::Buffer;
     }
     let on_fleet_channel = match (offer_ch, fleet_ch) {
@@ -326,6 +345,149 @@ async fn refuse_unrecognized_dial(sio: &filament_signal::Client, pid: &str, log:
     log.debug(&format!(
         "refused a dial from {pid}: a device forgotten here"
     ));
+}
+
+/// The honest "not recognized" answer for a peer that dials on a meeting place
+/// we forgot or revoked.
+///
+/// The peer is waiting for this answer, and the truth does not change because
+/// we still hold a link to it: a stale link used to suppress the answer, so
+/// the forgotten device appeared, never connected, and said nothing about the
+/// owner. Only a live direct pending suppresses the answer: that means we are
+/// dialing this peer right now on the same credential, so its offer is part
+/// of our own race rather than a claim to be admitted.
+///
+/// The answer is a refusal over signaling: it builds no link and grants no
+/// authority, so a peer that gets it cannot use it as a second path.
+///
+/// `_has_link` is deliberately NOT consulted: a stale link must not swallow
+/// the answer. It stays in the signature so the rule is stated in one place
+/// and the tests can say "a link exists" out loud.
+pub fn refuse_forgotten_dial(
+    has_direct_pending: bool,
+    _has_link: bool,
+    offer_channel_forgotten: bool,
+) -> bool {
+    offer_channel_forgotten && !has_direct_pending
+}
+
+/// One fleet arm per peer per window.
+///
+/// The fleet arm sites are driven by repeated events: the server re-pushes the
+/// roster on every sync tick, and a sibling re-offers its transport every
+/// ~1.2 s. Each arm starts a direct attempt, and a retired attempt leaves a
+/// tombstone in the retirement drain, which is bounded (16). Armed without a
+/// bound, a handful of peers fill that drain in seconds and then EVERY direct
+/// attempt fails closed ("retirement drain capacity full"), which reads as
+/// "can't reach the tunlion server" on the whole fleet.
+pub fn fleet_arm_allowed(last_armed_at: Option<Instant>, now: Instant, cooldown: Duration) -> bool {
+    match last_armed_at {
+        Some(at) => now.duration_since(at) >= cooldown,
+        None => true,
+    }
+}
+
+/// A fleet arm must not take over a LEGITIMATE PAIR link.
+///
+/// `expected_secret` is the secret the link is bound to (a pair secret, or the
+/// fleet rendezvous secret, which is never a store entry), `secret_is_held`
+/// says whether that secret is still in our device store, and `trusted` is the
+/// link's own standing.
+///
+/// - A link whose secret we STILL hold is a live pair relationship. Arming a
+///   fleet direct on it replaces the transport and strips its standing, which
+///   breaks the pair path for a device we still know.
+/// - A link whose secret we NO LONGER hold is stale: the peer was forgotten or
+///   revoked here, so the fleet relationship is exactly what may take it over.
+///   This is the restart case the fix is for.
+/// - A trusted link with NO secret has unknown standing (a code ceremony, an
+///   ephemeral link), so it is left alone.
+pub fn fleet_arm_skips_pair_link(
+    trusted: bool,
+    expected_secret: Option<&str>,
+    secret_is_held: bool,
+) -> bool {
+    match expected_secret {
+        Some(_) => secret_is_held,
+        None => trusted,
+    }
+}
+
+/// Does a live PAIR link to `pid` block a fleet arm? The one place every
+/// fleet arm site (the roster push, the one-shot dialer's offer, the linked
+/// sibling's offer) reads the link and the store for
+/// `fleet_arm_skips_pair_link`, so no site can arm over a pair link another
+/// site would have left alone. `devices` is the device store as the caller
+/// holds it now.
+///
+/// Residual race, not closed here: the rule reads the link as it is when the
+/// fleet event arrives. If the fleet KnownPeer for a device arrives BEFORE its
+/// pair KnownPeer, there is no pair link yet to protect, so the fleet arm
+/// proceeds and the pair establish that follows meets a fleet-pending link.
+pub fn fleet_arm_blocked_by_pair_link(conn: &Conn, pid: &str, devices: &[(String, String)]) -> bool {
+    let link = conn.link(pid);
+    let trusted = link.map(|l| l.trusted).unwrap_or(false);
+    let expected = link.and_then(|l| l.expected_secret.as_ref().map(|(_, s)| s.as_str()));
+    let held = expected.is_some_and(|s| devices.iter().any(|(_, d)| d == s));
+    fleet_arm_skips_pair_link(trusted, expected, held)
+}
+
+/// What a binding epoch rotation does to the fleet standing.
+///
+/// The binding moved to `installed`, so what an OLDER binding proved is
+/// stale. A fleet sibling verified on an older epoch must verify again on the
+/// new one: its verdict is dropped and the hello is queued again, otherwise it
+/// stays a non-sibling forever (the reset to Delegated would never be undone).
+/// A verdict already earned on `installed` is kept: the peer can rotate first
+/// and greet us on the new binding before our own rotation is processed, and
+/// it will not greet us again (`fleet_bind::Standing`).
+pub fn fleet_standing_after_rotation(
+    standing: &mut fleet_bind::Standing,
+    verified: &mut std::collections::HashSet<String>,
+    pending: &mut std::collections::HashSet<String>,
+    pid: &str,
+    installed: fleet_bind::Epoch,
+) -> bool {
+    if standing.rotated(pid, installed) && verified.remove(pid) {
+        pending.insert(pid.to_string());
+        true
+    } else {
+        false
+    }
+}
+
+/// The binding epoch of the link installed for `pid` now.
+pub fn link_epoch(conn: &Conn, pid: &str) -> Option<fleet_bind::Epoch> {
+    conn.link(pid).map(|l| fleet_bind::Epoch {
+        generation: l.generation,
+        source: l.source,
+    })
+}
+
+/// Record a verified fleet hello: the verdict, stamped with the binding epoch
+/// it was earned on, and the link's sibling standing. `verified_name` is
+/// resolved by the caller from the PROVEN certificate key, never from a name
+/// the peer sent. Returns whether the verdict is new for this pid.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_verified_fleet_hello(
+    conn: &mut Conn,
+    standing: &mut fleet_bind::Standing,
+    verified: &mut std::collections::HashSet<String>,
+    pid: &str,
+    verified_name: Option<String>,
+    owner_pub: [u8; 32],
+    device_pub: [u8; 32],
+    cert_expires: u64,
+) -> bool {
+    let fresh = verified.insert(pid.to_string());
+    if let Some(e) = link_epoch(conn, pid) {
+        standing.verified(pid, e);
+    }
+    if let Some(l) = conn.link_mut(pid) {
+        l.verified_name = verified_name;
+        l.admit_fleet(owner_pub, device_pub, cert_expires);
+    }
+    fresh
 }
 
 /// The outcome of ONE peer's step (adopt, answer, a control reply) inside the
@@ -544,6 +706,85 @@ pub fn offer_has_consent(
     } else {
         yes || consented || link_trusted || resuming_partial || code_consent
     }
+}
+
+/// The `file-offer` transfer gate, exactly as the receive loop composes it:
+/// the signed-store outcome under the trust floor, the fleet inputs, the
+/// FleetSibling mapping, the pair mapping, then the injected policy site.
+/// `landing_in_bounds` is the caller's verified drop-dir bound. Returns
+/// `(allowed, cap_reason, decision)`. A function (not an inline block) so the
+/// composition the loop runs is the one its tests drive.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn file_offer_transfer_gate(
+    conn: &mut Conn,
+    pid: &str,
+    sibling: &crate::shell_gate::SiblingFacts,
+    legacy_ok: bool,
+    link_trusted: bool,
+    authoritative: bool,
+    landing_in_bounds: bool,
+    sender_name: &str,
+    log: &dyn LogSink,
+) -> (bool, Option<String>, cap::GateDecision) {
+    let host = conn.host.clone();
+    let az = crate::shell_gate::peer_authz(conn, pid);
+    let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
+    let store = host.cap_store();
+    let now = host.now_secs();
+    let outcome = cap::authorize_in(&store, "self", cap::CAP_TRANSFER, idev, iusr, ak_caps, now);
+    // Trust floor: under authoritative, an untrusted link
+    // must never authorize transfer (pair-proof vs device-key).
+    let outcome = cap::cap_trust_floor(&outcome, link_trusted, binding, authoritative);
+    let (own_user, has_grant) =
+        cap::fleet_inputs_in(&store, "self", cap::CAP_TRANSFER, idev, iusr, ak_caps, now);
+    // FleetSibling: the kind implies transfer into the drop
+    // dir and nothing else; grants from either source count.
+    let (scoped_in_bounds, has_grant) = crate::shell_gate::sibling_gate_inputs(
+        sibling,
+        cap::CAP_TRANSFER,
+        landing_in_bounds,
+        has_grant,
+    );
+    // Pair: this device's own record transfer grant counts as
+    // an explicit grant in authoritative mode too. A deny
+    // recorded for transfer keeps it from counting.
+    let (outcome, has_grant) = crate::shell_gate::pair_facts(conn, pid, cap::CAP_TRANSFER, ak_caps)
+        .apply(outcome, has_grant);
+    // No deny list is consulted on the transfer path today;
+    // false preserves that exactly.
+    let d = host.cap_gate_effective(CapGate {
+        legacy_allowed: legacy_ok,
+        outcome: &outcome,
+        action: cap::CAP_TRANSFER,
+        resource: "self",
+        device_pub: idev,
+        user_pub: iusr,
+        binding,
+        cert_expires: expires,
+        auth_key_caps: ak_caps,
+        own_user_pub: own_user.as_ref(),
+        scoped_in_bounds,
+        has_explicit_grant: has_grant,
+        cert_revoked,
+        identity_state: conn.identity_state_of(pid),
+        // A sibling's local deny wins over its kind default and grants;
+        // no deny list is consulted for anyone else on this path.
+        denied: sibling.denied,
+        ceiling_authorizes: false,
+    });
+    let reason = if let cap::GateDecision::Deny { cap_reason } = &d {
+        cap_reason.clone()
+    } else {
+        None
+    };
+    log.debug(&format!(
+        "transfer-gate: from={sender_name} allowed={} legacy_ok={legacy_ok} trusted={link_trusted} binding={binding:?} own_user={} has_grant={has_grant} in_bounds={scoped_in_bounds} revoked={cert_revoked} authoritative={} reason={:?}",
+        d.allowed(),
+        own_user.is_some(),
+        authoritative,
+        reason
+    ));
+    (d.allowed(), reason, d)
 }
 
 /// Why a code receive ended with no sender authenticated. "Older version" was
@@ -1035,6 +1276,33 @@ impl SyncTasks {
         }
     }
 
+    /// [`Self::cancel_sync_for_pid`] for a whole set of peers under ONE shared
+    /// deadline: every task is cancelled first, then all are joined against
+    /// the same [`crate::sync::SYNC_JOIN_BOUND`]. N revoked peers therefore
+    /// hold the loop for at most one bound, not one bound each.
+    async fn cancel_sync_for_pids(&self, pids: &[&str], log: &dyn LogSink) {
+        let keys: Vec<_> = self
+            .0
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(task_pid, _)| pids.contains(&task_pid.as_str()))
+            .cloned()
+            .collect();
+        let mut joining = Vec::with_capacity(keys.len());
+        for key in keys {
+            let removed = self.0.lock().unwrap().remove(&key);
+            if let Some(task) = removed {
+                task.cancel();
+                joining.push((key, task));
+            }
+        }
+        let deadline = sync_join_deadline();
+        for ((task_pid, sid), task) in joining {
+            report_sync_join(log, &task_pid, sid, task.join(deadline).await);
+        }
+    }
+
     async fn stop_sync_tasks(&self, log: &dyn LogSink) {
         let mut joining = std::mem::take(&mut *self.0.lock().unwrap())
             .into_iter()
@@ -1137,9 +1405,11 @@ pub fn report_sync_join(log: &dyn LogSink, pid: &str, sid: u32, result: Result<(
 
 /// Is this the peer a transfer's explicit consent names, for identity
 /// settling purposes? A pair-trusted link is consent by construction (its MAC
-/// proved the paired device); a code send names its ceremony peer; a room send
-/// is consented by -y or a daemon, which accepts every offer it receives.
-fn consented_identity_peer(
+/// proved the paired device); a code send names its ceremony peer, on the
+/// exact session and transport the ceremony confirmed
+/// (`Conn::holds_code_authority`); a room send is consented by -y or a daemon,
+/// which accepts every offer it receives.
+pub(crate) async fn consented_identity_peer(
     conn: &Conn,
     pid: &str,
     recv_code_path: bool,
@@ -1151,13 +1421,138 @@ fn consented_identity_peer(
         return true;
     }
     if recv_code_path {
-        recv_pake_done && conn.is_bound_active_peer(pid)
+        recv_pake_done && conn.holds_code_authority(pid).await
     } else {
         // A room with -y / a daemon accepts every offer it consents to, so
         // each such link settles its own identity; no single active slot is
         // required to decide which peer the consent names.
         yes || daemon
     }
+}
+
+/// A code receive's transfer events are bound to the code-authorized link. Pure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeStreamAction {
+    Continue,
+    Ignore,
+    /// End the transfer: release the peer's in-flight streams.
+    Retire,
+}
+
+/// The transfer event a code receive is deciding for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeStreamEvent {
+    Ready,
+    Chunk,
+    FileEnd,
+    Completion,
+    Cancel,
+}
+
+impl CodeStreamEvent {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "a ready channel",
+            Self::Chunk => "a chunk",
+            Self::FileEnd => "file-end",
+            Self::Completion => "a completion",
+            Self::Cancel => "file-cancel",
+        }
+    }
+}
+
+fn code_stream_action(
+    recv_code_path: bool,
+    recv_pake_done: bool,
+    code_peer: bool,
+    continuation: Option<CodeContinuation>,
+    event: CodeStreamEvent,
+) -> CodeStreamAction {
+    if !recv_code_path {
+        return CodeStreamAction::Continue;
+    }
+    if !recv_pake_done {
+        return CodeStreamAction::Ignore;
+    }
+    match continuation {
+        Some(CodeContinuation::Holds) => CodeStreamAction::Continue,
+        Some(CodeContinuation::Lost) if code_peer => CodeStreamAction::Retire,
+        // A completion finishes bytes already written; it needs no link.
+        Some(CodeContinuation::NoLink) if code_peer && event == CodeStreamEvent::Completion => {
+            CodeStreamAction::Continue
+        }
+        _ => CodeStreamAction::Ignore,
+    }
+}
+
+/// Remove and return `pid`'s in-flight streams.
+fn take_streams_of<V>(by_sid: &mut HashMap<(String, u32), V>, pid: &str) -> Vec<V> {
+    let keys: Vec<(String, u32)> = by_sid.keys().filter(|(p, _)| p == pid).cloned().collect();
+    keys.into_iter().filter_map(|k| by_sid.remove(&k)).collect()
+}
+
+const CODE_LINK_REBUILT_RECV: &str = "transfer stopped: the connection to the sender was rebuilt after the code was confirmed, so nothing more is accepted on this code. Any partial file is kept; ask for a FRESH code.";
+
+/// `Ok(true)`: act on the event. `Ok(false)`: ignore it. `Err`: the transfer
+/// ends; `pid`'s streams are flushed to their `.part` (kept) and released.
+async fn apply_code_stream_action(
+    action: CodeStreamAction,
+    by_sid: &mut HashMap<(String, u32), IncomingFile>,
+    pid: &str,
+    log: &dyn LogSink,
+    event: CodeStreamEvent,
+) -> Result<bool> {
+    match action {
+        CodeStreamAction::Continue => Ok(true),
+        CodeStreamAction::Ignore => {
+            log.debug(&format!(
+                "recv: ignoring {} from {pid}: not on the code's confirmed link",
+                event.label()
+            ));
+            Ok(false)
+        }
+        CodeStreamAction::Retire => {
+            for inc in take_streams_of(by_sid, pid) {
+                let f = inc.file.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = f.sync_all();
+                })
+                .await;
+                log.debug(&format!(
+                    "{}: kept at {}",
+                    inc.name,
+                    crate::present::human(inc.received.load(Ordering::Relaxed))
+                ));
+            }
+            log.critical(&log.paint(Tone::Warn, CODE_LINK_REBUILT_RECV));
+            Err(anyhow!(CODE_LINK_REBUILT_RECV))
+        }
+    }
+}
+
+/// Code path: decide and apply [`code_stream_action`] for `pid`'s current link.
+#[allow(clippy::too_many_arguments)]
+async fn admit_code_stream_event(
+    conn: &Conn,
+    cache: &mut CodeAuthorityCache,
+    recv_code_path: bool,
+    recv_pake_done: bool,
+    pid: &str,
+    by_sid: &mut HashMap<(String, u32), IncomingFile>,
+    log: &dyn LogSink,
+    event: CodeStreamEvent,
+) -> Result<bool> {
+    if !recv_code_path {
+        return Ok(true);
+    }
+    let code_peer = conn.code_session.as_ref().is_some_and(|s| s.sid() == pid);
+    let continuation = if recv_pake_done {
+        Some(conn.code_continuation(pid, cache).await)
+    } else {
+        None
+    };
+    let action = code_stream_action(recv_code_path, recv_pake_done, code_peer, continuation, event);
+    apply_code_stream_action(action, by_sid, pid, log, event).await
 }
 
 async fn recv_run(
@@ -1402,8 +1797,9 @@ async fn recv_run(
         // Fleet auto-mesh: one more meeting point, where devices certified by the
         // SAME owner key find each other with no pairwise pairing. Presence there
         // authorizes NOTHING; admission runs on the certificate. See cli/src/fleet.rs
-        // and docs/design-fleet-automesh.md. It leads the list so the server's
-        // channel cap can never truncate it away (`subscription_order`).
+        // and docs/design-fleet-automesh.md. `subscription_order` keeps it inside
+        // the server's channel cap at any device count, after the device channels
+        // that fit, so a paired device is announced on its own channel first.
         let fleet = if cfg!(feature = "fleet") {
             ports.identity.fleet_channel()
         } else {
@@ -1466,6 +1862,11 @@ async fn recv_run(
     // challenge's entry does not expire and let a re-issue clobber the nonce.
     const RECV_IDENTITY_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
     let mut recv_pake_done = code.is_none(); // only the code path runs the PAKE
+    // Said once: the confirmed sender's link was rebuilt, so this code covers
+    // nothing on it any more (see `Conn::holds_code_authority`).
+    let mut recv_code_rebuilt_said = false;
+    // See `Conn::code_continuation`.
+    let mut code_authority_cache = CodeAuthorityCache::default();
     let recv_pake_budget = ports.env.pair_grace;
     // Overall bound: once we are matched into the sender's room, SOMEONE must
     // authenticate within this window or the whole `recv` fails loudly. Per-peer
@@ -2103,7 +2504,23 @@ async fn recv_run(
     // transport can reuse the same peer id; nonces from the previous transport
     // must not be carried across (see the reset in `ChannelReady`).
     let mut bind_source: HashMap<String, net::SourceId> = HashMap::new();
+    // How many times a transport-source change cleared each pid's nonce maps.
+    // Diagnostic only: reported with every fleet-hello verdict (`fhello`).
+    let mut bind_resets: HashMap<String, u32> = HashMap::new();
+    // The challenge epoch (installed link generation + source), our outstanding
+    // challenge with its bounded retry, and superseded nonces kept verify-only
+    // for a short TTL (recv/fleet_bind.rs). `bind_ours` stays the current nonce.
+    let mut bind_epoch: HashMap<String, fleet_bind::Epoch> = HashMap::new();
+    let mut bind_challenge: HashMap<String, fleet_bind::Challenge> = HashMap::new();
+    let mut bind_retired: HashMap<String, fleet_bind::Retired> = HashMap::new();
+    let fleet_trace = ports.env.fleet_hello_trace.clone();
+    // Links already reported by the unverified watchdog, by (pid, generation).
+    let mut fleet_unverified_said: HashSet<(String, u32)> = HashSet::new();
     let mut fleet_pending: std::collections::HashSet<String> = Default::default();
+    // When we last armed a fleet direct for a peer, so the arm sites (the
+    // roster push and the sibling's repeated transport-offer) cannot start an
+    // unbounded number of direct attempts and fill the retirement drain.
+    let mut fleet_arm_at: std::collections::HashMap<String, Instant> = Default::default();
     let mut fleet_verified: std::collections::HashSet<String> = Default::default();
     // Offers that arrived while this link's `fleet-hello` was still in flight.
     // Verification is MUTUAL and the two directions are not synchronized: the
@@ -2158,7 +2575,10 @@ async fn recv_run(
     // anyway. Bounded on purpose: waiting forever for a hello that never comes
     // would turn a clean decline into the 45s timeout it replaced.
     let fleet_offer_grace = ports.env.fleet_offer_grace;
-    let mut fleet_greeted: std::collections::HashSet<String> = Default::default();
+    // Which binding epoch each verdict and each hello we sent belongs to
+    // (`fleet_bind::Standing`), so a rotation drops only what an older
+    // binding earned and a hello sent on an older binding is sent again.
+    let mut fleet_standing = fleet_bind::Standing::default();
 
     // Daemon-managed mount state: the daemon holds the sshfs child processes and
     // monitors their health centrally instead of spawning per-mount threads.
@@ -2238,6 +2658,9 @@ async fn recv_run(
     // observation revived them). State-only; the gate already denies past the
     // deadline, the sweep is what makes LAPSED visible in `devices`.
     let mut last_sweep = Instant::now();
+    // Whether the delisted-sibling store problem was already said (once per
+    // episode, not every sweep).
+    let mut delisted_problem_said = false;
     let mut last_renewal_check = Instant::now();
     let mut last_route_reconcile = Instant::now();
     let mut last_wg_check = Instant::now();
@@ -2756,7 +3179,11 @@ async fn recv_run(
                 // between "authenticating..." and "authenticated" (two such
                 // waits, measured 4.0 to 4.1s in 4 of 5 runs). The ceremony
                 // is budgeted, so the fast tick is too.
-                if parked_opens.is_empty() && !ceremony_live {
+                // And while a warm exec runs as initiator: a refusal for it
+                // rides a link stream that is drained once per loop turn, and
+                // the cutting side holds that link open only for a short
+                // budget waiting for the acknowledgement.
+                if parked_opens.is_empty() && !ceremony_live && !l2::mux::warm_exec_live() {
                     Duration::from_secs(2)
                 } else {
                     Duration::from_millis(100)
@@ -3508,6 +3935,14 @@ async fn recv_run(
                     log.paint(Tone::Warn, log.glyph_warn())
                 ));
             }
+            match ports.store.delisted_siblings_problem() {
+                Some(why) if !delisted_problem_said => {
+                    delisted_problem_said = true;
+                    log.critical(&format!("fleet: delisted-sibling store: {why}"));
+                }
+                Some(_) => {}
+                None => delisted_problem_said = false,
+            }
         }
 
         // WIREGUARD RECONCILE. On a timer, and deliberately NOT on an event.
@@ -3728,6 +4163,7 @@ async fn recv_run(
                     // still visible mid-write (see `link_cut_reason`).
                     let mut cut_as_revoked: std::collections::HashSet<String> = Default::default();
                     let mut unrouted: Vec<String> = Vec::new();
+                    let held_pairs = host.devices_load();
                     for (pid, l) in &conn.links {
                         let facts = crate::recv::revocation::LinkFacts {
                             // LAN device reservations are bindings too; a LAN
@@ -3753,7 +4189,26 @@ async fn recv_run(
                             identity::now_secs(),
                             &|p: &[u8; 32]| ports.identity.device_cert_revoked(p),
                         );
+                        let held_pair_for_device = l.device_secret().is_some_and(|secret| {
+                            held_pairs.iter().any(|(name, held)| {
+                                !held.is_empty()
+                                    && held == secret
+                                    && host.device_cert_for(name).is_some_and(|cert| {
+                                        Some(cert.device_pub) == l.identity_device_pub
+                                    })
+                            })
+                        });
+                        let revoked_identity_cut =
+                            crate::recv::revocation::revoked_identity_must_close(
+                                l.identity_device_pub.as_ref(),
+                                held_pair_for_device,
+                                &|p: &[u8; 32]| {
+                                    ports.identity.device_cert_revoked(p)
+                                        || ports.identity.device_tombstoned(p)
+                                },
+                            );
                         let close = sibling_cut
+                            || revoked_identity_cut
                             || crate::recv::revocation::link_must_close(
                                 &facts,
                                 &revoked_secrets,
@@ -3788,36 +4243,38 @@ async fn recv_run(
                     });
                     // Tell each doomed peer WHY before the link goes: a peer
                     // mid-exec or mid-send otherwise sees only a dead link and
-                    // reports "link died" (exit 6) for what is a refusal.
-                    // drop_link closes the transport only after a grace, so
-                    // this frame leaves first.
-                    for (pid, _) in &doomed {
-                        if let Some(t) = conn.transport_of(pid) {
-                            let code = if cut_as_revoked.contains(pid) {
-                                crate::refusal::Code::CertRevoked
-                            } else {
-                                crate::refusal::Code::Unrecognized
-                            };
-                            let refusal = crate::refusal::Refusal::new(code, None);
-                            let mut f = json!({ "type": "link-revoked", "reason": refusal.reason });
-                            refusal.annotate(&mut f);
-                            let _ = t.send_control(&f).await;
-                        }
-                    }
+                    // reports "link died" (exit 6) for what is a refusal. The
+                    // link leaves routing now; its transport stays open only
+                    // until the peer acks the refusal or a bounded budget runs
+                    // out, on a task, never in this loop (a write returning Ok
+                    // is not delivery: the close would discard it).
                     for (pid, label) in &doomed {
-                        // Drop first: its close releases a sync task parked in a write.
-                        conn.drop_link(pid);
-                        sync_tasks.cancel_sync_for_pid(pid, log.as_ref()).await;
+                        let code = if cut_as_revoked.contains(pid) {
+                            crate::refusal::Code::CertRevoked
+                        } else {
+                            crate::refusal::Code::Unrecognized
+                        };
+                        let refusal = crate::refusal::Refusal::new(code, None);
+                        let mut f = json!({ "type": "link-revoked", "reason": refusal.reason });
+                        refusal.annotate(&mut f);
+                        conn.drop_link_after_refusal(pid, f);
                         l2_muxes.remove(pid);
                         fleet_pending.remove(pid);
                         fleet_verified.remove(pid);
-                        fleet_greeted.remove(pid);
+                        fleet_standing.forget(pid);
                         fleet_deferred_offers.retain(|(p, _, _)| p != pid);
                         unrouted.push(pid.clone());
                         log.say(&format!(
                             "closed the link to '{label}': it was forgotten or revoked here"
                         ));
                     }
+                    // Their served sync tasks, all at once under ONE join bound
+                    // (SYNC_JOIN_BOUND, 5 s) for the whole doomed set: that is
+                    // the longest this revocation can hold the loop. A task
+                    // parked in a write on a cut transport is released by the
+                    // closer's close at REFUSAL_ACK_BUDGET (2 s), inside it.
+                    let doomed_pids: Vec<&str> = doomed.iter().map(|(p, _)| p.as_str()).collect();
+                    sync_tasks.cancel_sync_for_pids(&doomed_pids, log.as_ref()).await;
                     // An overlay route is the one thing a revoked device keeps
                     // without opening anything, so it goes with the revocation
                     // (this is the explicit forget path `remove_by_pid` is for).
@@ -4009,7 +4466,7 @@ async fn recv_run(
         }
 
         // G-k completion sweep (top-of-loop): see sweep_completed_streams.
-        crate::recv::files::sweep_completed_streams(
+        let mut swept_senders = crate::recv::files::sweep_completed_streams(
             host.as_ref(),
             log.as_ref(),
             &mut st.by_sid,
@@ -4034,15 +4491,12 @@ async fn recv_run(
             protocol::recv_transfer_done(st.completed, keep_open, st.by_sid.is_empty());
         // WARM-HOLD: when a transfer completes, mark the peer as warm so we
         // proactively reconnect if the link drops.
-        if st.completed > 0 {
-            let warm_peers: Vec<String> = st
-                .by_sid
-                .keys()
-                .filter_map(|(pid, _)| conn.links.get(pid)?.verified_name.clone())
-                .collect();
-            for name in &warm_peers {
-                conn.note_warm_use(name);
-            }
+        // Each completion records its own sender (`note_completed_transfer`),
+        // and the sweep above returns the senders it finalized. Reading the
+        // streams still in flight named nobody for a single transfer (the
+        // finished stream was already gone) and the wrong peer with two.
+        for name in swept_senders.drain(..) {
+            conn.note_warm_use(&name);
         }
         if st.completed > 0 || !st.by_sid.is_empty() {
             st.ever_received = true; // a channel was up; Bug-5 wedge hint no longer applies
@@ -4244,6 +4698,61 @@ async fn recv_run(
             last_quiet = None;
         }
 
+        // Bounded challenge retry (recv/fleet_bind.rs): while a fleet link's
+        // peer is not verified, re-send OUR nonce, the same value, on the
+        // backoff. The peer answers every nonce with a hello, so one lost nonce
+        // or one lost answer costs a backoff step, not the link's life. Runs on
+        // ticks as well as events.
+        if let Some(rv) = ports.identity.fleet_rv() {
+            if !bind_challenge.is_empty() {
+                let now = Instant::now();
+                let due: Vec<String> = bind_challenge
+                    .iter()
+                    .filter(|(p, c)| {
+                        let installed = conn.link(p.as_str()).map(|l| fleet_bind::Epoch {
+                            generation: l.generation,
+                            source: l.source,
+                        });
+                        fleet_bind::retry_allowed(c, installed, fleet_verified.contains(p.as_str()), now)
+                            && (fleet_pending.contains(p.as_str())
+                                || crate::recv::fleet::shaped_link(&conn, p.as_str(), Some(rv.as_str())))
+                    })
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                for p in due {
+                    let Some(t) = conn.transport_of(&p) else { continue };
+                    if t.channel_binding().is_some() {
+                        continue;
+                    }
+                    let Some(c) = bind_challenge.get_mut(&p) else { continue };
+                    let n = c.note_retry(now);
+                    let nonce = c.nonce.clone();
+                    let sent = t
+                        .send_control(&json!({
+                            "type": "l3-nonce",
+                            "nonce": base64::engine::general_purpose::STANDARD.encode(&nonce),
+                        }))
+                        .await
+                        .is_ok();
+                    fleet_step(
+                        log.as_ref(),
+                        daemon,
+                        fleet_trace.as_deref(),
+                        &conn,
+                        &p,
+                        "sent-nonce",
+                        &format!(
+                            "{}-{n} nonce={}",
+                            if sent { "retry" } else { "retry-send-failed" },
+                            nonce_prefix(&nonce)
+                        ),
+                        "dtls",
+                        "none",
+                    );
+                }
+            }
+        }
+
         let Some((ev, event_source)) = ev else { continue };
 
         // A fleet verdict, a hello marker and a nonce all belong to the
@@ -4256,10 +4765,71 @@ async fn recv_run(
         // path, including future ones, starts the replacement unverified.
         fleet_pending.retain(|p| conn.links.contains_key(p));
         fleet_verified.retain(|p| conn.links.contains_key(p));
-        fleet_greeted.retain(|p| conn.links.contains_key(p));
+        fleet_standing.retain(|p| conn.links.contains_key(p));
         bind_ours.retain(|p, _| conn.links.contains_key(p));
         bind_theirs.retain(|p, _| conn.links.contains_key(p));
         bind_source.retain(|p, _| conn.links.contains_key(p));
+        bind_resets.retain(|p, _| conn.links.contains_key(p));
+        bind_epoch.retain(|p, _| conn.links.contains_key(p));
+        bind_challenge.retain(|p, _| conn.links.contains_key(p));
+        bind_retired.retain(|p, _| conn.links.contains_key(p));
+        fleet_unverified_said.retain(|(p, _)| conn.links.contains_key(p));
+        // Unverified watchdog, once per link: a fleet-shaped link that has been
+        // up this long without a verified hello says what it is still waiting
+        // on. Diagnostic only; it changes no state the handshake reads.
+        if let Some(rv) = ports.identity.fleet_rv() {
+            let stale: Vec<(String, u32, u64)> = conn
+                .links
+                .iter()
+                .filter(|(p, _)| !fleet_verified.contains(*p))
+                .filter_map(|(p, l)| {
+                    let age = l.established_at?.elapsed().as_secs();
+                    (age >= FLEET_UNVERIFIED_SAY_SECS
+                        && !fleet_unverified_said.contains(&(p.clone(), l.generation)))
+                    .then(|| (p.clone(), l.generation, age))
+                })
+                .collect();
+            for (p, generation, age) in stale {
+                if !crate::recv::fleet::shaped_link(&conn, &p, Some(rv.as_str())) {
+                    continue;
+                }
+                fleet_unverified_said.insert((p.clone(), generation));
+                let t = conn.transport_of(&p);
+                let exporter = t.as_ref().is_some_and(|t| t.channel_binding().is_some());
+                let dc = t
+                    .as_ref()
+                    .is_some_and(|t| t.as_any().is::<net::DataChannelTransport>());
+                let fps = if dc && !exporter {
+                    link_fingerprints(&conn, &p).await.is_some()
+                } else {
+                    true
+                };
+                let waiting = if t.is_none() {
+                    "transport"
+                } else if !exporter && !bind_theirs.contains_key(&p) {
+                    "theirs"
+                } else if !fps {
+                    "fps"
+                } else if !exporter && !bind_ours.contains_key(&p) {
+                    "exporter"
+                } else {
+                    "peer-hello"
+                };
+                let src = conn
+                    .link(&p)
+                    .map(|l| format!("{:?}", l.source))
+                    .unwrap_or_else(|| "none".into());
+                let line = format!(
+                    "fleet unverified for {age}s: waiting on {waiting} pid={p} gen={generation} src={src}"
+                );
+                if daemon {
+                    log.say(&line);
+                } else {
+                    log.debug(&line);
+                }
+                fleet_trace_append(fleet_trace.as_deref(), &line);
+            }
+        }
         fleet_deferred_offers.retain(|(p, _, _)| conn.links.contains_key(p));
 
         // C23: questions from links that died (supersede/peer-left) are
@@ -4335,7 +4905,7 @@ async fn recv_run(
                     // binding exists to prevent.
                     fleet_pending.remove(&pid);
                     fleet_verified.remove(&pid);
-                    fleet_greeted.remove(&pid);
+                    fleet_standing.forget(&pid);
                     // Deferred offers die with the link that carried them. A new
                     // link must re-prove on a NEW binding, so replaying an offer
                     // buffered under the old one is precisely the stale-trust bug
@@ -4348,6 +4918,9 @@ async fn recv_run(
                     bind_ours.remove(&pid);
                     bind_theirs.remove(&pid);
                     bind_source.remove(&pid);
+                    bind_epoch.remove(&pid);
+                    bind_challenge.remove(&pid);
+                    bind_retired.remove(&pid);
                 }
             }
             Ev::PairMatched(v) => {
@@ -4759,8 +5332,13 @@ async fn recv_run(
                 }) {
                     // A device forgotten here, dialing the meeting place it still
                     // finds us on: tell it, rather than leave it waiting.
+                    //
+                    // A stale link for that peer must NOT swallow the answer:
+                    // the peer is waiting for it, and the truth does not change
+                    // because we still hold a link to it.
                     if let Some(pid) = v["id"].as_str().filter(|p| !p.is_empty()) {
-                        if !conn.links.contains_key(pid) {
+                        let has_link = conn.links.contains_key(pid);
+                        if refuse_forgotten_dial(false, has_link, true) {
                             refuse_unrecognized_dial(&sio, pid, log.as_ref()).await;
                         }
                     }
@@ -4833,7 +5411,27 @@ async fn recv_run(
                     // so exactly one dials and the other accepts.
                     if conn.my_id < pid {
                         if let Some(rv) = ports.identity.fleet_rv() {
-                            conn.start_direct_fleet(&pid, &rv).await;
+                            // Bounded: one arm per peer per window. The roster
+                            // is re-pushed on every sync tick, and each arm
+                            // starts a direct attempt that can be retired into
+                            // the bounded retirement drain.
+                            let now = Instant::now();
+                            if fleet_arm_blocked_by_pair_link(&conn, &pid, &devices) {
+                                log.debug(&format!(
+                                    "fleet: arm for {pid} skipped, it is a live pair link"
+                                ));
+                            } else if fleet_arm_allowed(
+                                fleet_arm_at.get(&pid).copied(),
+                                now,
+                                FLEET_ARM_COOLDOWN,
+                            ) {
+                                fleet_arm_at.insert(pid.clone(), now);
+                                conn.start_direct_fleet(&pid, &rv).await;
+                            } else {
+                                log.debug(&format!(
+                                    "fleet: arm for {pid} skipped, armed recently"
+                                ));
+                            }
                         }
                     }
                     let r = conn.maybe_adopt(&v, true).await;
@@ -4908,13 +5506,21 @@ async fn recv_run(
                     }
                     // A dial on the meeting place of a device forgotten here: it
                     // can never be matched, so refuse it now, by name.
-                    if !conn.direct_pending.contains_key(&from)
-                        && !conn.links.contains_key(&from)
-                        && data["ch"].as_str().is_some_and(|c| {
+                    //
+                    // The answer is owed REGARDLESS of the link we still hold
+                    // for that peer: a stale link used to suppress it, so the
+                    // peer waited out its whole window for an answer that was
+                    // already true. Only a live direct pending suppresses it:
+                    // that means we are dialing this peer right now, on the same
+                    // credential, so the offer is part of our own race.
+                    if refuse_forgotten_dial(
+                        conn.direct_pending.contains_key(&from),
+                        conn.links.contains_key(&from),
+                        data["ch"].as_str().is_some_and(|c| {
                             forgotten_channels.contains(c)
                                 || revoked_secrets.iter().any(|s| host.channel_of(s) == c)
-                        })
-                    {
+                        }),
+                    ) {
                         refuse_unrecognized_dial(&sio, &from, log.as_ref()).await;
                         continue;
                     }
@@ -4939,7 +5545,21 @@ async fn recv_run(
                             conn.links.get(&from).map(|l| l.name == *n).unwrap_or(false)
                         });
                         if let Some((name, secret)) = known {
-                            conn.start_direct(&from, &name, &secret).await;
+                            // Bounded like the fleet arms: this offer site
+                            // fires on every transport-offer the peer sends.
+                            let now = Instant::now();
+                            if fleet_arm_allowed(
+                                fleet_arm_at.get(&from).copied(),
+                                now,
+                                FLEET_ARM_COOLDOWN,
+                            ) {
+                                fleet_arm_at.insert(from.clone(), now);
+                                conn.start_direct(&from, &name, &secret).await;
+                            } else {
+                                log.debug(&format!(
+                                    "fleet: re-arm for {from} skipped, armed recently"
+                                ));
+                            }
                         }
                         // A one-shot dialer on our FLEET channel (`tunlion
                         // shell/exec/reach <sibling>` from a device with no daemon
@@ -4959,10 +5579,28 @@ async fn recv_run(
                             && data["ch"].is_null()
                         {
                             if let Some(rv) = ports.identity.fleet_rv() {
-                                log.debug(&format!(
-                                    "fleet: answering a one-shot dialer's transport-offer from {from}"
-                                ));
-                                conn.start_direct_fleet(&from, &rv).await;
+                                // Bounded like the other arms, and it must not
+                                // take over a live pair link.
+                                let now = Instant::now();
+                                if fleet_arm_blocked_by_pair_link(&conn, &from, &host.devices_load()) {
+                                    log.debug(&format!(
+                                        "fleet: answer for {from} skipped, it is a live pair link"
+                                    ));
+                                } else if fleet_arm_allowed(
+                                    fleet_arm_at.get(&from).copied(),
+                                    now,
+                                    FLEET_ARM_COOLDOWN,
+                                ) {
+                                    fleet_arm_at.insert(from.clone(), now);
+                                    log.debug(&format!(
+                                        "fleet: answering a one-shot dialer's transport-offer from {from}"
+                                    ));
+                                    conn.start_direct_fleet(&from, &rv).await;
+                                } else {
+                                    log.debug(&format!(
+                                        "fleet: answer for {from} skipped, armed recently"
+                                    ));
+                                }
                             }
                         }
                         // A daemon sibling re-dialing on our FLEET channel while
@@ -4977,12 +5615,21 @@ async fn recv_run(
                         if !conn.direct_pending.contains_key(&from) && cfg!(feature = "fleet") {
                             if let Some(rv) = ports.identity.fleet_rv() {
                                 let fleet_ch = host.channel_of(&rv);
+                                // `fleet_pending` is the evidence: this peer was
+                                // seen on the fleet channel, which is derived
+                                // from the fleet secret, so the offer below can
+                                // only be the fleet relationship. Arming the
+                                // direct grants nothing: the link stays
+                                // fleet-pending until the certificate hello
+                                // verifies, and that is where a revoked peer is
+                                // refused.
                                 let action = linked_fleet_offer_action(
                                     conn.links.contains_key(&from),
                                     conn.direct_pending.contains_key(&from),
                                     data["ch"].as_str(),
                                     Some(fleet_ch.as_str()),
                                     crate::recv::fleet::shaped_link(&conn, &from, Some(rv.as_str())),
+                                    fleet_pending.contains(&from),
                                     conn.my_id.as_str(),
                                     from.as_str(),
                                 );
@@ -4990,15 +5637,39 @@ async fn recv_run(
                                     action,
                                     LinkedFleetOffer::ArmDial | LinkedFleetOffer::ArmAnswer
                                 ) {
-                                    log.debug(&format!(
-                                        "fleet: arming direct for linked sibling {from}'s transport-offer ({})",
-                                        if action == LinkedFleetOffer::ArmDial {
-                                            "dialer"
-                                        } else {
-                                            "answer"
-                                        }
-                                    ));
-                                    conn.start_direct_fleet(&from, &rv).await;
+                                    // Bounded: one arm per peer per window. The
+                                    // sibling re-offers every ~1.2 s, and each
+                                    // arm starts a direct attempt that can be
+                                    // retired into the bounded retirement
+                                    // drain, which then refuses EVERY direct
+                                    // attempt for the whole session. A live
+                                    // pair link is left alone: the fleet
+                                    // relationship must not replace it.
+                                    let now = Instant::now();
+                                    if fleet_arm_blocked_by_pair_link(&conn, &from, &host.devices_load()) {
+                                        log.debug(&format!(
+                                            "fleet: arm for {from} skipped, it is a live pair link"
+                                        ));
+                                    } else if fleet_arm_allowed(
+                                        fleet_arm_at.get(&from).copied(),
+                                        now,
+                                        FLEET_ARM_COOLDOWN,
+                                    ) {
+                                        fleet_arm_at.insert(from.clone(), now);
+                                        log.debug(&format!(
+                                            "fleet: arming direct for linked sibling {from}'s transport-offer ({})",
+                                            if action == LinkedFleetOffer::ArmDial {
+                                                "dialer"
+                                            } else {
+                                                "answer"
+                                            }
+                                        ));
+                                        conn.start_direct_fleet(&from, &rv).await;
+                                    } else {
+                                        log.debug(&format!(
+                                            "fleet: arm for {from} skipped, armed recently"
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -5148,6 +5819,14 @@ async fn recv_run(
                         recv_pake_done = true;
                         st.recv_cers.retain(|pid, _| pid == &from);
                         st.recv_deadlines.clear();
+                        // The confirmed session: this exact sid and the DTLS
+                        // fingerprint pair the confirmation MAC bound. Every
+                        // code-receive decision is checked against it.
+                        let confirmed_fps = st
+                            .recv_cers
+                            .get(&from)
+                            .and_then(|c| c.confirmed_fingerprints())
+                            .map(|(mine, theirs)| (mine.to_string(), theirs.to_string()));
                         // The progression block stops once a sender is settled, and
                         // its confirmation can verify here before ours went out.
                         if let Some((my_fp, their_fp)) = fp_ref {
@@ -5179,6 +5858,14 @@ async fn recv_run(
                             crate::conn::Promotion::Retained
                         };
                         conn.bind_active(&from);
+                        match &confirmed_fps {
+                            Some((mine, theirs)) => {
+                                conn.bind_code_session(&from, (mine.as_str(), theirs.as_str()), &sec)
+                            }
+                            None => log.debug(
+                                "recv: confirmed ceremony carries no fingerprint pair; no code authority",
+                            ),
+                        }
                         // A retained link is unannounced here too, and this loop's
                         // ChannelReady arm sends `caps` and the signed L3 announce,
                         // which a peer on a retained link would otherwise never get.
@@ -5254,11 +5941,9 @@ async fn recv_run(
                 if peer_step(daemon, &from, "responder", r, log.as_ref())?.is_none() {
                     continue;
                 }
-                if conn.build_pending(&from) {
-                    conn.stage_signal(&v);
-                    continue;
-                }
-                conn.apply_signal(&from, data).await;
+                // Stage into a pending build, hold during a pending direct
+                // attempt (the offer is sent once per connection), else apply.
+                conn.deliver_sdp_signal(&v).await;
             }
             // rung-1: authenticated direct-QUIC won the race, adopt as a
             // pre-trusted Link, then funnel into the normal ChannelReady handler.
@@ -5343,7 +6028,7 @@ async fn recv_run(
                     recv_pake_done,
                     yes,
                     daemon,
-                );
+                ).await;
                 let needs_challenge = if host.cap_authoritative() {
                     (idev_known && !proven) || (!idev_known && consent_identity)
                 } else {
@@ -5410,6 +6095,23 @@ async fn recv_run(
                 conn.stash_upgrade_standby(&pid, t, route);
             }
             Ev::ChannelReady(pid, t) => {
+                // Continuation is bound to the code-authorized link.
+                if recv_code_path
+                    && recv_pake_done
+                    && conn.code_session.as_ref().is_some_and(|s| s.sid() == pid.as_str())
+                {
+                    admit_code_stream_event(
+                        &conn,
+                        &mut code_authority_cache,
+                        recv_code_path,
+                        recv_pake_done,
+                        &pid,
+                        &mut st.by_sid,
+                        log.as_ref(),
+                        CodeStreamEvent::Ready,
+                    )
+                    .await?;
+                }
                 // #39 (fleet-trust): the WebRTC/relay path's possession challenge is
                 // NOT issued here. At ChannelReady on the WebRTC path, verified_name is
                 // not set yet (the pair-proof round-trip sets it AFTER the channel opens),
@@ -5451,7 +6153,7 @@ async fn recv_run(
                     recv_pake_done,
                     yes,
                     daemon,
-                );
+                ).await;
                 if consent_identity {
                     if let Some(l) = conn.link_mut(&pid) {
                         crate::identity::resolve_peer_identity(l);
@@ -5509,20 +6211,71 @@ async fn recv_run(
                 // receive it, while we accepted the peer's hello. That showed up
                 // as a link that stays fleet-unverified on one side only.
                 let t = conn.transport_of(&pid).unwrap_or(t);
-                // A nonce belongs to the TRANSPORT it was exchanged on. A
-                // re-established transport can reuse the same peer id (warm
-                // re-dial after a zombie drop), so carrying the previous
-                // transport's nonce forward makes each side sign a value the
-                // other no longer expects: both fleet hellos fail verification
-                // and the link stays unverified forever. Drop both directions
-                // when the transport source changes; a genuinely same-transport
-                // re-announce keeps its nonce.
-                if let Some(source) = event_source {
-                    if bind_source.get(&pid).copied() != Some(source) {
-                        bind_source.insert(pid.clone(), source);
-                        bind_ours.remove(&pid);
-                        bind_theirs.remove(&pid);
+                // A challenge belongs to the INSTALLED transport: its epoch is
+                // the link's (generation, source), not the source of this event
+                // (recv/fleet_bind.rs). A re-established transport can reuse the
+                // same peer id (warm re-dial after a zombie drop); on that
+                // rotation our nonce is retired (verify-only, short TTL, never
+                // signed with), a fresh one is minted, and the peer's nonce is
+                // dropped because it was chosen for the previous transport. An
+                // event delivered by a transport that is NOT installed (a racing
+                // loser) changes nothing.
+                let installed = conn.link(&pid).map(|l| fleet_bind::Epoch {
+                    generation: l.generation,
+                    source: l.source,
+                });
+                let held_epoch = bind_epoch.get(&pid).copied();
+                if fleet_bind::epoch_change(held_epoch, installed) == fleet_bind::EpochChange::Rotated {
+                    let now = Instant::now();
+                    // The binding moved: what the OLD binding proved is stale.
+                    // A fleet sibling verified on it must verify again on the
+                    // new one, or it stays a non-sibling forever.
+                    if let Some(e) = installed {
+                        fleet_standing_after_rotation(
+                            &mut fleet_standing,
+                            &mut fleet_verified,
+                            &mut fleet_pending,
+                            &pid,
+                            e,
+                        );
                     }
+                    let cleared_ours = match bind_ours.remove(&pid) {
+                        Some(old) => {
+                            bind_retired.entry(pid.clone()).or_default().retire(old, now);
+                            true
+                        }
+                        None => false,
+                    };
+                    let cleared_theirs = bind_theirs.remove(&pid).is_some();
+                    bind_challenge.remove(&pid);
+                    if ports.identity.fleet_rv().is_some() {
+                        fleet_step(
+                            log.as_ref(),
+                            daemon,
+                            fleet_trace.as_deref(),
+                            &conn,
+                            &pid,
+                            "rechallenged",
+                            &format!(
+                                "epoch-rotated retired_ours={cleared_ours} cleared_theirs={cleared_theirs}"
+                            ),
+                            "none",
+                            "none",
+                        );
+                        let n = bind_resets.entry(pid.clone()).or_insert(0);
+                        *n = n.saturating_add(1);
+                        fleet_hello_note(
+                            log.as_ref(),
+                            fleet_trace.as_deref(),
+                            &format!(
+                                "fhello-bind pid={pid} event=epoch-rotated from={held_epoch:?} to={installed:?} event_source={event_source:?} retired_ours={cleared_ours} cleared_theirs={cleared_theirs} resets={n}"
+                            ),
+                        );
+                    }
+                }
+                if let Some(e) = installed {
+                    bind_epoch.insert(pid.clone(), e);
+                    bind_source.insert(pid.clone(), e.source);
                 }
                 // No exporter on this transport: open the challenge. Our nonce
                 // goes out now; anything we SEND waits until theirs arrives.
@@ -5535,16 +6288,55 @@ async fn recv_run(
                     // dropped with the link, so a genuinely new link still gets a
                     // new one. Re-send the stored value every time, so a peer
                     // that missed the first copy still gets it.
+                    let minted = !bind_ours.contains_key(&pid);
                     let nonce = bind_ours
                         .entry(pid.clone())
                         .or_insert_with(link_nonce)
                         .clone();
-                    let _ = t
+                    if let Some(e) = installed {
+                        let now = Instant::now();
+                        bind_challenge
+                            .entry(pid.clone())
+                            .and_modify(|c| c.note_sent(now))
+                            .or_insert_with(|| fleet_bind::Challenge::new(e, nonce.clone(), now));
+                    }
+                    let sent = t
                         .send_control(&json!({
                             "type": "l3-nonce",
                             "nonce": base64::engine::general_purpose::STANDARD.encode(&nonce),
                         }))
-                        .await;
+                        .await
+                        .is_ok();
+                    if ports.identity.fleet_rv().is_some() {
+                        let prefix = nonce_prefix(&nonce);
+                        if minted {
+                            fleet_step(
+                                log.as_ref(),
+                                daemon,
+                                fleet_trace.as_deref(),
+                                &conn,
+                                &pid,
+                                "minted",
+                                &format!("channel-ready nonce={prefix}"),
+                                "dtls",
+                                "none",
+                            );
+                        }
+                        fleet_step(
+                            log.as_ref(),
+                            daemon,
+                            fleet_trace.as_deref(),
+                            &conn,
+                            &pid,
+                            "sent-nonce",
+                            &format!(
+                                "{} nonce={prefix}",
+                                if sent { "channel-ready" } else { "send-failed" }
+                            ),
+                            "dtls",
+                            "none",
+                        );
+                    }
                 }
                 // Only for a node that is actually IN a fleet: this fires on every
                 // ChannelReady, and a user with no fleet has nothing to diagnose
@@ -5563,8 +6355,11 @@ async fn recv_run(
                 }
                 // H1: a DataChannel's binding folds in its DTLS fingerprints.
                 let link_fps = link_fingerprints(&conn, &pid).await;
+                // Also when the peer is verified but we have not greeted it on
+                // THIS binding: its hello for the new binding can be verified
+                // before our rotation is processed, and the peer needs ours.
                 if cfg!(feature = "fleet")
-                    && !fleet_verified.contains(&pid)
+                    && (!fleet_verified.contains(&pid) || fleet_standing.hello_owed(&pid, installed))
                     && ports.identity.fleet_rv().is_some()
                     && (fleet_pending.contains(&pid)
                         || crate::recv::fleet::shaped_link(
@@ -5578,14 +6373,30 @@ async fn recv_run(
                     if cfg!(feature = "fleet") {
                         fleet_pending.insert(pid.clone());
                     }
-                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
+                    if let Some(sign_cb) = signing_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
                         match ports
                             .identity
-                            .make_fleet_hello(&cb, &ports.env.display_name)
+                            .make_fleet_hello(&sign_cb, &ports.env.display_name)
                         {
                             Ok(hello) => {
-                                fleet_greeted.insert(pid.clone());
-                                let _ = t.send_control(&hello).await;
+                                let sent = t.send_control(&hello).await.is_ok();
+                                // Stamped only once it went out, so a failed
+                                // send stays owed and the next ChannelReady
+                                // retries it.
+                                if let (true, Some(e)) = (sent, installed) {
+                                    fleet_standing.greeted(&pid, e);
+                                }
+                                fleet_step(
+                                    log.as_ref(),
+                                    daemon,
+                                    fleet_trace.as_deref(),
+                                    &conn,
+                                    &pid,
+                                    "sent-hello",
+                                    if sent { "channel-ready" } else { "send-failed" },
+                                    cb_kind(&t),
+                                    "none",
+                                );
                             }
                             Err(e) => log.debug(&format!("fleet-hello not sent to {pid}: {e}")),
                         }
@@ -5593,8 +6404,8 @@ async fn recv_run(
                 }
                 #[cfg(feature = "mesh")]
                 if let Some(l3) = l3.as_ref() {
-                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
-                        if let Some(ann) = l3.make_announce(&cb) {
+                    if let Some(sign_cb) = signing_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
+                        if let Some(ann) = l3.make_announce(&sign_cb) {
                             let _ = t.send_control(&ann.to_json()).await;
                         }
                     }
@@ -5607,7 +6418,25 @@ async fn recv_run(
                                 // channel binding and possession; none of those
                                 // stop a genuine announce being replayed onto
                                 // the SAME channel later.
-                                if !crate::recv::fleet::route_ok(
+                                if fleet_bind::is_own_device(&pending.pubkey, host.overlay_pubkey().ok()) {
+                                    // Our own overlay key, from a peer: never a
+                                    // route to install.
+                                    log.debug(&format!(
+                                        "  l3-announce from {pid} ignored: {}",
+                                        fleet_bind::OWN_DEVICE_KEY
+                                    ));
+                                    fleet_step(
+                                        log.as_ref(),
+                                        daemon,
+                                        fleet_trace.as_deref(),
+                                        &conn,
+                                        &pid,
+                                        "ignored",
+                                        concat!("announce-", "own-device-key"),
+                                        "none",
+                                        "none",
+                                    );
+                                } else if !crate::recv::fleet::route_ok(
                                     &conn,
                                     &pid,
                                     pending.relay_datagrams,
@@ -5833,16 +6662,61 @@ async fn recv_run(
                 #[cfg(feature = "mesh")]
                 Some("l3-nonce") => {
                     match v["nonce"].as_str().map(unb64) {
+                        // A challenge is answered only when the peer chose it:
+                        // one equal to a nonce we issued is refused and nothing
+                        // is bound or signed from it (recv/fleet_bind.rs).
+                        Some(Ok(nonce))
+                            if nonce.len() >= 16
+                                && fleet_bind::accept_peer_nonce(
+                                    &nonce,
+                                    bind_ours.values().map(|n| n.as_slice()),
+                                    bind_retired.values(),
+                                )
+                                .is_err() =>
+                        {
+                            fleet_step(
+                                log.as_ref(),
+                                daemon,
+                                fleet_trace.as_deref(),
+                                &conn,
+                                &pid,
+                                "ignored",
+                                fleet_bind::REFLECTED_CHALLENGE,
+                                "none",
+                                "none",
+                            );
+                            fleet_hello_note(
+                                log.as_ref(),
+                                fleet_trace.as_deref(),
+                                &format!(
+                                    "fhello-bind pid={pid} event=challenge-refused why={}",
+                                    fleet_bind::REFLECTED_CHALLENGE
+                                ),
+                            );
+                        }
                         Some(Ok(nonce)) if nonce.len() >= 16 => {
+                            if ports.identity.fleet_rv().is_some() {
+                                fleet_step(
+                                    log.as_ref(),
+                                    daemon,
+                                    fleet_trace.as_deref(),
+                                    &conn,
+                                    &pid,
+                                    "recv-nonce",
+                                    &format!("ok nonce={}", nonce_prefix(&nonce)),
+                                    "dtls",
+                                    "none",
+                                );
+                            }
                             bind_theirs.insert(pid.clone(), nonce);
                             if let Some(t) = conn.transport_of(&pid) {
                                 let link_fps = link_fingerprints(&conn, &pid).await;
-                                if let Some(cb) =
-                                    out_binding(&t, &pid, &bind_theirs, link_fps.as_ref())
+                                if let Some(sign_cb) =
+                                    signing_binding(&t, &pid, &bind_theirs, link_fps.as_ref())
                                 {
                                     #[cfg(feature = "mesh")]
                                     if let Some(l3) = l3.as_ref() {
-                                        if let Some(ann) = l3.make_announce(&cb) {
+                                        if let Some(ann) = l3.make_announce(&sign_cb) {
                                             let _ = t.send_control(&ann.to_json()).await;
                                         }
                                     }
@@ -5851,15 +6725,32 @@ async fn recv_run(
                                     // means the peer could not verify what we sent
                                     // (its challenge had not reached us when we
                                     // signed) and is asking again. Honouring
-                                    // `fleet_greeted` here would leave it waiting
+                                    // the hello marker here would leave it waiting
                                     // forever for a proof we refuse to re-send.
-                                    if cfg!(feature = "fleet") && !fleet_verified.contains(&pid) {
+                                    // Not gated on our own verdict of the peer: the
+                                    // peer re-sends its nonce (bounded) exactly when
+                                    // it has not verified US, and only a hello
+                                    // answers that.
+                                    if cfg!(feature = "fleet") {
                                         if let Ok(hello) = ports
                                             .identity
-                                            .make_fleet_hello(&cb, &ports.env.display_name)
+                                            .make_fleet_hello(&sign_cb, &ports.env.display_name)
                                         {
-                                            fleet_greeted.insert(pid.clone());
-                                            let _ = t.send_control(&hello).await;
+                                            let sent = t.send_control(&hello).await.is_ok();
+                                            if let (true, Some(e)) = (sent, link_epoch(&conn, &pid)) {
+                                                fleet_standing.greeted(&pid, e);
+                                            }
+                                            fleet_step(
+                                                log.as_ref(),
+                                                daemon,
+                                                fleet_trace.as_deref(),
+                                                &conn,
+                                                &pid,
+                                                "sent-hello",
+                                                if sent { "nonce-answer" } else { "send-failed" },
+                                                cb_kind(&t),
+                                                "none",
+                                            );
                                         }
                                     }
                                 }
@@ -5868,9 +6759,24 @@ async fn recv_run(
                         // A short or malformed nonce is refused rather than used:
                         // a peer that picks a weak challenge would weaken OUR
                         // replay protection, not theirs.
-                        _ => log.debug(&format!(
-                            "l3-nonce from {pid} ignored: missing or too short"
-                        )),
+                        _ => {
+                            log.debug(&format!(
+                                "l3-nonce from {pid} ignored: missing or too short"
+                            ));
+                            if ports.identity.fleet_rv().is_some() {
+                                fleet_step(
+                                    log.as_ref(),
+                                    daemon,
+                                    fleet_trace.as_deref(),
+                                    &conn,
+                                    &pid,
+                                    "recv-nonce",
+                                    "missing-or-short",
+                                    "none",
+                                    "none",
+                                );
+                            }
+                        }
                     }
                 }
                 // Fleet auto-mesh: a same-owner device is presenting its
@@ -5881,10 +6787,48 @@ async fn recv_run(
                 #[cfg(feature = "fleet")]
                 Some(fleet::HELLO) => {
                     let link_fps = link_fingerprints(&conn, &pid).await;
-                    let cb = conn
-                        .transport_of(&pid)
-                        .and_then(|t| in_binding(&t, &pid, &bind_ours, link_fps.as_ref()));
+                    let hello_t = conn.transport_of(&pid);
+                    // Every binding this hello may verify against: the exporter,
+                    // or our current nonce then any retired nonce still inside
+                    // its TTL, each over THIS link's DTLS fingerprint pair.
+                    let hello_cbs: Vec<Vec<u8>> = match hello_t.as_ref() {
+                        None => Vec::new(),
+                        Some(t) => match t.channel_binding() {
+                            Some(x) => vec![x],
+                            None => fleet_bind::verify_candidates(
+                                bind_ours.get(&pid).map(|n| n.as_slice()),
+                                bind_retired.get(&pid),
+                                Instant::now(),
+                                |n| nonce_binding(t, link_fps.as_ref(), n),
+                            ),
+                        },
+                    };
+                    let cb = hello_cbs.first().cloned();
                     let owner = ports.identity.fleet_owner_pub();
+                    // What this hello's binding decision rested on, for the
+                    // `fhello-verdict` line every arm below emits exactly once.
+                    let fhello_ctx = fleet_hello_context(
+                        &pid,
+                        hello_t.as_ref(),
+                        cb.is_some(),
+                        bind_ours.contains_key(&pid),
+                        bind_theirs.contains_key(&pid),
+                        link_fps.as_ref(),
+                        bind_source.get(&pid).copied(),
+                        bind_resets.get(&pid).copied().unwrap_or(0),
+                        &v,
+                    );
+                    // Release this extra handle now: the arms below may drop the
+                    // link, and its close must not wait on a clone held here.
+                    let hello_had_transport = hello_t.is_some();
+                    let hello_cb = match &hello_t {
+                        Some(t) if cb.is_some() => cb_kind(t),
+                        _ => "none",
+                    };
+                    let claimed_dev: String = identity::DeviceCert::from_json(&v["cert"])
+                        .map(|c| hex::encode(c.device_pub).chars().take(16).collect())
+                        .unwrap_or_else(|| "none".into());
+                    drop(hello_t);
                     // A sibling link (met on the fleet channel, no pair secret):
                     // the only kind the owner's roster governs. A paired link
                     // carries its own, pairwise, authorization and is unchanged.
@@ -5895,7 +6839,58 @@ async fn recv_run(
                     );
                     match (cb, owner) {
                         (Some(cb), Some(owner)) => {
-                            match fleet::verify_hello(&v, &cb, &owner, identity::now_secs()) {
+                            let now_s = identity::now_secs();
+                            let mut verdict = fleet::verify_hello(&v, &cb, &owner, now_s);
+                            for (i, alt) in hello_cbs.iter().enumerate().skip(1) {
+                                if verdict.is_ok() {
+                                    break;
+                                }
+                                verdict = fleet::verify_hello(&v, alt, &owner, now_s);
+                                if verdict.is_ok() {
+                                    log.debug(&format!(
+                                        "fleet-hello from {pid} verified with retired nonce #{i}"
+                                    ));
+                                }
+                            }
+                            #[cfg(feature = "mesh")]
+                            let own_device_pub: Option<[u8; 32]> = host.overlay_pubkey().ok();
+                            #[cfg(not(feature = "mesh"))]
+                            let own_device_pub: Option<[u8; 32]> = None;
+                            match verdict {
+                                // A verified hello carrying this device's own key
+                                // is never admitted as a peer.
+                                Ok(ok) if fleet_bind::is_own_device(&ok.device_pub, own_device_pub) => {
+                                    fleet_unlisted_hellos.remove(&pid);
+                                    log.debug(&format!(
+                                        "fleet-hello from {pid} refused: {}",
+                                        fleet_bind::OWN_DEVICE_KEY
+                                    ));
+                                    fleet_hello_note(
+                                        log.as_ref(),
+                                        fleet_trace.as_deref(),
+                                        &format!(
+                                            "fhello-verdict {fhello_ctx} outcome=refused why={} dev={}",
+                                            fleet_bind::OWN_DEVICE_KEY,
+                                            hex::encode(ok.device_pub)
+                                        ),
+                                    );
+                                    fleet_step(
+                                        log.as_ref(),
+                                        daemon,
+                                        fleet_trace.as_deref(),
+                                        &conn,
+                                        &pid,
+                                        "refused",
+                                        fleet_bind::OWN_DEVICE_KEY,
+                                        hello_cb,
+                                        &hex::encode(ok.device_pub)[..16],
+                                    );
+                                    fleet_pending.remove(&pid);
+                                    fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
+                                    // Drop first: its close releases a sync task parked in a write.
+                                    conn.drop_link(&pid);
+                                    sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
+                                }
                                 Ok(ok)
                                     if sibling_link
                                         && !ports.identity.device_cert_revoked(&ok.device_pub)
@@ -5907,6 +6902,25 @@ async fn recv_run(
                                     log.debug(&format!(
                                         "fleet-hello from {pid} held: not listed in the owner's roster"
                                     ));
+                                    fleet_hello_note(
+                                        log.as_ref(),
+                                        fleet_trace.as_deref(),
+                                        &format!(
+                                            "fhello-verdict {fhello_ctx} outcome=held why=not-in-owner-roster dev={}",
+                                            hex::encode(ok.device_pub)
+                                        ),
+                                    );
+                                    fleet_step(
+                                        log.as_ref(),
+                                        daemon,
+                                        fleet_trace.as_deref(),
+                                        &conn,
+                                        &pid,
+                                        "held",
+                                        "not-in-owner-roster",
+                                        hello_cb,
+                                        &hex::encode(ok.device_pub)[..16],
+                                    );
                                     fleet_unlisted_hellos.insert(
                                         pid.clone(),
                                         DeferredControl {
@@ -5918,8 +6932,28 @@ async fn recv_run(
                                 Ok(ok) if ports.identity.device_cert_revoked(&ok.device_pub) => {
                                     fleet_unlisted_hellos.remove(&pid);
                                     log.debug(&format!(
-                                        "fleet-hello from {pid} refused: device revoked"
+                                        "fleet-hello from {pid} refused: device revoked (device {})",
+                                        hex::encode(ok.device_pub)
                                     ));
+                                    fleet_hello_note(
+                                        log.as_ref(),
+                                        fleet_trace.as_deref(),
+                                        &format!(
+                                            "fhello-verdict {fhello_ctx} outcome=refused why=device-revoked dev={}",
+                                            hex::encode(ok.device_pub)
+                                        ),
+                                    );
+                                    fleet_step(
+                                        log.as_ref(),
+                                        daemon,
+                                        fleet_trace.as_deref(),
+                                        &conn,
+                                        &pid,
+                                        "refused",
+                                        "device-revoked",
+                                        hello_cb,
+                                        &hex::encode(ok.device_pub)[..16],
+                                    );
                                     fleet_pending.remove(&pid);
                                     fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
                                     // Drop first: its close releases a sync task parked in a write.
@@ -5928,7 +6962,37 @@ async fn recv_run(
                                 }
                                 Ok(ok) => {
                                     fleet_unlisted_hellos.remove(&pid);
-                                    let fresh = fleet_verified.insert(pid.clone());
+                                    // verified_name is the CAP-STORE KEY, so it is
+                                    // resolved from the PROVEN certificate key, never
+                                    // from the name the peer sent. A peer that could
+                                    // name itself could name itself after a device
+                                    // that holds grants.
+                                    let proven_name =
+                                        ports.identity.device_name_for_pub(&ok.device_pub);
+                                    // The verdict, stamped with the binding epoch it
+                                    // was earned on, and the link's sibling standing.
+                                    // The ceiling comes from the RECORD, which is
+                                    // what `tunlion grant` edits. Hardcoding it
+                                    // empty made auto-mesh peers ungrantable: the
+                                    // grant landed in devices.json and the live
+                                    // link kept refusing, so `grant` silently did
+                                    // nothing for exactly the devices this feature
+                                    // adds. A sibling we hold no record for still
+                                    // gets nothing, which is the intended
+                                    // reachability-without-capability default.
+                                    let fresh = admit_verified_fleet_hello(
+                                        &mut conn,
+                                        &mut fleet_standing,
+                                        &mut fleet_verified,
+                                        &pid,
+                                        proven_name.clone(),
+                                        ok.owner_pub,
+                                        ok.device_pub,
+                                        ok.cert_expires,
+                                    );
+                                    // Overwritten below by the fresh-hello decision.
+                                    let mut fhello_outcome =
+                                        String::from("outcome=admitted why=repeat-hello-on-verified-link");
                                     // Identity has settled: replay whatever arrived
                                     // while it had not. This belongs HERE, beside
                                     // the insert, not in the `fresh` branch below:
@@ -5951,35 +7015,43 @@ async fn recv_run(
                                     // Reachability, NOT capability: an empty
                                     // ceiling. The link forms, warm-hold keeps it
                                     // and L3 routes to it, while transfer, shell
-                                    // and mount still need their own grant.
-                                    // verified_name is the CAP-STORE KEY, so it is
-                                    // resolved from the PROVEN certificate key, never
-                                    // from the name the peer sent. A peer that could
-                                    // name itself could name itself after a device
-                                    // that holds grants.
-                                    let proven_name =
-                                        ports.identity.device_name_for_pub(&ok.device_pub);
-                                    // The ceiling comes from the RECORD, which is
-                                    // what `tunlion grant` edits. Hardcoding it
-                                    // empty made auto-mesh peers ungrantable: the
-                                    // grant landed in devices.json and the live
-                                    // link kept refusing, so `grant` silently did
-                                    // nothing for exactly the devices this feature
-                                    // adds. A sibling we hold no record for still
-                                    // gets nothing, which is the intended
-                                    // reachability-without-capability default.
-                                    if let Some(l) = conn.link_mut(&pid) {
-                                        l.verified_name = proven_name.clone();
-                                        l.admit_fleet(ok.owner_pub, ok.device_pub, ok.cert_expires);
-                                    }
+                                    // and mount still need their own grant. The
+                                    // link was admitted above, with the verdict.
                                     // Answer once, so a mutual hello terminates.
-                                    if fleet_greeted.insert(pid.clone()) {
+                                    // Signed like every outgoing hello: over the
+                                    // binding the PEER verifies with (its nonce,
+                                    // `signing_binding`), never over ours. With no
+                                    // peer nonce yet there is nothing to sign; the
+                                    // peer's own challenge retry delivers one and
+                                    // the `l3-nonce` arm answers it. "Once" is per
+                                    // binding epoch: a hello we sent on an older
+                                    // binding was signed over one the peer no
+                                    // longer verifies with, so it is owed again.
+                                    if fleet_standing.hello_owed(&pid, link_epoch(&conn, &pid)) {
                                         if let Some(t) = conn.transport_of(&pid) {
-                                            if let Ok(hello) = ports
-                                                .identity
-                                                .make_fleet_hello(&cb, &ports.env.display_name)
+                                            if let Some(sign_cb) =
+                                                signing_binding(&t, &pid, &bind_theirs, link_fps.as_ref())
                                             {
-                                                let _ = t.send_control(&hello).await;
+                                                if let Ok(hello) = ports
+                                                    .identity
+                                                    .make_fleet_hello(&sign_cb, &ports.env.display_name)
+                                                {
+                                                    let sent = t.send_control(&hello).await.is_ok();
+                                                    if let (true, Some(e)) = (sent, link_epoch(&conn, &pid)) {
+                                                        fleet_standing.greeted(&pid, e);
+                                                    }
+                                                    fleet_step(
+                                                        log.as_ref(),
+                                                        daemon,
+                                                        fleet_trace.as_deref(),
+                                                        &conn,
+                                                        &pid,
+                                                        "sent-hello",
+                                                        if sent { "answer-once" } else { "send-failed" },
+                                                        cb_kind(&t),
+                                                        "none",
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -5990,8 +7062,15 @@ async fn recv_run(
                                     #[cfg(feature = "mesh")]
                                     if let Some(l3) = l3.as_ref() {
                                         if let Some(t) = conn.transport_of(&pid) {
-                                            if let Some(ann) = l3.make_announce(&cb) {
-                                                let _ = t.send_control(&ann.to_json()).await;
+                                            if let Some(sign_cb) = signing_binding(
+                                                &t,
+                                                &pid,
+                                                &bind_theirs,
+                                                link_fps.as_ref(),
+                                            ) {
+                                                if let Some(ann) = l3.make_announce(&sign_cb) {
+                                                    let _ = t.send_control(&ann.to_json()).await;
+                                                }
                                             }
                                         }
                                     }
@@ -6026,6 +7105,10 @@ async fn recv_run(
                                         // channel subscription or a dial target. It is
                                         // an INDEX ENTRY, not an authorization, and the
                                         // empty ceiling it carries matches the link's.
+                                        fhello_outcome = format!(
+                                            "outcome=admitted why=proven-name name={:?}",
+                                            shown
+                                        );
                                         if proven_name.is_none() {
                                             // Transplant refusal: compare the SANITIZED
                                             // name -- the store keys on the sanitized
@@ -6060,7 +7143,18 @@ async fn recv_run(
                                                         })
                                                     })
                                                     .unwrap_or(false);
+                                            fhello_outcome = format!(
+                                                "outcome=admitted why=unindexed-no-cert name={:?}",
+                                                shown
+                                            );
                                             if name_taken {
+                                                // The link stays verified; only the
+                                                // name is not adopted. Never logged as
+                                                // `refused`, which means not admitted.
+                                                fhello_outcome = format!(
+                                                    "outcome=admitted why=name-refused-existing-record name={:?}",
+                                                    shown
+                                                );
                                                 // A REFUSAL, not chatter: a peer tried to
                                                 // take over another device's identity. Emitted
                                                 // at Critical so `-q` cannot hide it, with a
@@ -6101,13 +7195,24 @@ async fn recv_run(
                                                         if let Some(l) = conn.link_mut(&pid) {
                                                             l.verified_name = Some(stored.clone());
                                                         }
+                                                        fhello_outcome = format!(
+                                                            "outcome=admitted why=indexed-new-record name={:?}",
+                                                            stored
+                                                        );
                                                         log.debug(&format!(
                                                             "fleet peer indexed as '{stored}'"
                                                         ));
                                                     }
-                                                    Err(e) => log.debug(&format!(
-                                                        "fleet peer not indexed: {e}"
-                                                    )),
+                                                    Err(e) => {
+                                                        fhello_outcome = format!(
+                                                            "outcome=admitted why=index-write-failed name={:?} err={:?}",
+                                                            shown,
+                                                            e.to_string()
+                                                        );
+                                                        log.debug(&format!(
+                                                            "fleet peer not indexed: {e}"
+                                                        ))
+                                                    }
                                                 }
                                             }
                                         }
@@ -6134,9 +7239,61 @@ async fn recv_run(
                                             .maybe_request_cert_renewal(&conn, &pid)
                                             .await;
                                     }
+                                    fleet_hello_note(
+                                        log.as_ref(),
+                                        fleet_trace.as_deref(),
+                                        &format!(
+                                            "fhello-verdict {fhello_ctx} {fhello_outcome} fresh={fresh} dev={}",
+                                            hex::encode(ok.device_pub)
+                                        ),
+                                    );
+                                    let fhello_why = fhello_outcome
+                                        .split_whitespace()
+                                        .find_map(|w| w.strip_prefix("why="))
+                                        .unwrap_or("unknown");
+                                    // `refused` is reserved for a hello that was
+                                    // NOT admitted. A name collision admits the
+                                    // link under its proven key and only refuses
+                                    // the name, so it is `admitted`.
+                                    let (fhello_step, fhello_reason) =
+                                        if fhello_why == "name-refused-existing-record" {
+                                            ("admitted", "name-refused")
+                                        } else {
+                                            ("verified", fhello_why)
+                                        };
+                                    fleet_step(
+                                        log.as_ref(),
+                                        daemon,
+                                        fleet_trace.as_deref(),
+                                        &conn,
+                                        &pid,
+                                        fhello_step,
+                                        fhello_reason,
+                                        hello_cb,
+                                        &hex::encode(ok.device_pub)[..16],
+                                    );
                                 }
                                 Err(e) => {
                                     log.debug(&format!("fleet-hello from {pid} rejected: {e}"));
+                                    fleet_hello_note(
+                                        log.as_ref(),
+                                        fleet_trace.as_deref(),
+                                        &format!(
+                                            "fhello-verdict {fhello_ctx} outcome=rejected why={:?}",
+                                            e.to_string()
+                                        ),
+                                    );
+                                    fleet_step(
+                                        log.as_ref(),
+                                        daemon,
+                                        fleet_trace.as_deref(),
+                                        &conn,
+                                        &pid,
+                                        "dropped",
+                                        "verify-failed",
+                                        hello_cb,
+                                        &claimed_dev,
+                                    );
                                     fleet_pending.remove(&pid);
                                     fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
                                     // Drop first: its close releases a sync task parked in a write.
@@ -6145,9 +7302,38 @@ async fn recv_run(
                                 }
                             }
                         }
-                        _ => log.debug(&format!(
-                            "fleet-hello from {pid} ignored: no channel binding or no owner key"
-                        )),
+                        (cb, owner) => {
+                            log.debug(&format!(
+                                "fleet-hello from {pid} ignored: no channel binding or no owner key"
+                            ));
+                            let why = if owner.is_none() {
+                                "no-owner-key"
+                            } else if !hello_had_transport {
+                                "no-transport"
+                            } else if cb.is_none() && !bind_ours.contains_key(&pid) {
+                                "no-exporter-and-no-own-l3-nonce"
+                            } else if cb.is_none() && link_fps.is_none() {
+                                "no-exporter-and-no-dtls-fingerprints"
+                            } else {
+                                "no-binding"
+                            };
+                            fleet_hello_note(
+                                log.as_ref(),
+                                fleet_trace.as_deref(),
+                                &format!("fhello-verdict {fhello_ctx} outcome=ignored why={why}"),
+                            );
+                            fleet_step(
+                                log.as_ref(),
+                                daemon,
+                                fleet_trace.as_deref(),
+                                &conn,
+                                &pid,
+                                "ignored",
+                                why,
+                                hello_cb,
+                                &claimed_dev,
+                            );
+                        }
                     }
                 }
                 // A sibling's daemon brokered a private meeting place for one of
@@ -6179,6 +7365,21 @@ async fn recv_run(
                                 None => log.debug(&format!(
                                     "fleet-rendezvous from {pid} ignored: no proven identity on the link"
                                 )),
+                                // A meeting place is only as good as the sibling
+                                // that brokered it: none from a revoked one. The
+                                // link stops counting as verified, so this check
+                                // (and its store read) runs once per link, and
+                                // the sweep it requests closes it.
+                                Some(broker)
+                                    if ports.identity.device_cert_revoked(&broker.device_pub) =>
+                                {
+                                    fleet_verified.remove(&pid);
+                                    fleet_standing.forget(&pid);
+                                    revocation_sweep_now = true;
+                                    log.debug(&format!(
+                                        "fleet-rendezvous from {pid} refused: device revoked"
+                                    ));
+                                }
                                 Some(broker) if !sess.channels.contains(&ch) => {
                                     sess.channels.push(ch.clone());
                                     let _ = sio
@@ -6225,6 +7426,29 @@ async fn recv_run(
                                 }) {
                                     Some((t, cb)) => match ann.verify(&cb) {
                                         Ok(ip) => {
+                                            // Our own overlay key, from a peer: never
+                                            // a route to install.
+                                            if fleet_bind::is_own_device(
+                                                &ann.pubkey,
+                                                host.overlay_pubkey().ok(),
+                                            ) {
+                                                log.debug(&format!(
+                                                    "  l3-announce from {pid} ignored: {}",
+                                                    fleet_bind::OWN_DEVICE_KEY
+                                                ));
+                                                fleet_step(
+                                                    log.as_ref(),
+                                                    daemon,
+                                                    fleet_trace.as_deref(),
+                                                    &conn,
+                                                    &pid,
+                                                    "ignored",
+                                                    concat!("announce-", "own-device-key"),
+                                                    "none",
+                                                    "none",
+                                                );
+                                                continue;
+                                            }
                                             // The overlay key IS the device key: a
                                             // revoked or forgotten device gets no route.
                                             if overlay_key_refused(
@@ -6557,7 +7781,7 @@ async fn recv_run(
                         recv_pake_done,
                         yes,
                         daemon,
-                    );
+                    ).await;
                     if consented_peer {
                         // A certificate is the only identity fact this answer can
                         // settle. It is the PEER's own link saying it cannot
@@ -7325,9 +8549,19 @@ async fn recv_run(
                 // status that will never arrive. Other consumers (send, a served
                 // session) keep their existing handling.
                 Some("link-revoked") => {
-                    if let Some(mux) = l2_muxes.get(&pid) {
-                        mux.on_link_revoked(v.clone()).await;
-                    }
+                    // Recorded where every warm exec on this link reads it, and
+                    // only then acknowledged (see `answer_link_revoked`).
+                    let answer = l2::mux::answer_link_revoked(
+                        l2_muxes.get(&pid),
+                        conn.reply_transports(&pid, event_source),
+                        &v,
+                    )
+                    .await;
+                    log.debug(&format!(
+                        "link-revoked from {pid}: {} (nonce {})",
+                        answer.describe(),
+                        v["nonce"].as_str().unwrap_or("none")
+                    ));
                     continue;
                 }
                 // Remote command execution: parse, shell-gate, direct-spawn
@@ -7558,8 +8792,9 @@ async fn recv_run(
                         // the signaling server chose) is refused. And the secret
                         // always lands in a NEW record: a peer can never re-key
                         // an existing device by naming it.
-                        let ceremony_peer =
-                            recv_code_path && recv_pake_done && conn.is_bound_active_peer(&pid);
+                        let ceremony_peer = recv_code_path
+                            && recv_pake_done
+                            && conn.holds_code_authority(&pid).await;
                         let kept = match (&remember, ceremony_peer) {
                             (Some(name), true) => match ports.store.devices_store_remembered(name, &sec) {
                                 Ok(stored) => {
@@ -7992,7 +9227,9 @@ async fn recv_run(
                     // offer past while we were still authenticating; now it cannot.)
                     // If no peer has authenticated yet, the overall watchdog still
                     // fails loudly should the real sender never confirm.
-                    if recv_code_path && (!recv_pake_done || !conn.is_bound_active_peer(&pid)) {
+                    if recv_code_path
+                        && (!recv_pake_done || !conn.holds_code_authority(&pid).await)
+                    {
                         // A pre-auth offer from a peer we are STILL authenticating
                         // (it has a live ceremony) is buffered, not lost: the offer
                         // and the sender's confirm crossed on the wire. If that peer
@@ -8011,6 +9248,20 @@ async fn recv_run(
                             log.debug(
                                 "ignoring file-offer from a peer that has not authenticated via ephemeral PAKE",
                             );
+                            // The ceremony's own sid on a link the confirmation
+                            // does not cover: that connection was rebuilt.
+                            let rebuilt = recv_pake_done
+                                && conn
+                                    .code_session
+                                    .as_ref()
+                                    .is_some_and(|session| session.sid() == pid.as_str());
+                            if rebuilt && !recv_code_rebuilt_said {
+                                recv_code_rebuilt_said = true;
+                                log.critical(&log.paint(
+                                    Tone::Warn,
+                                    "the connection to the sender was rebuilt after the code was confirmed; nothing more is accepted on this code. Ask for a FRESH code.",
+                                ));
+                            }
                         }
                         continue;
                     }
@@ -8239,7 +9490,7 @@ async fn recv_run(
                             recv_pake_done,
                             yes,
                             daemon,
-                        );
+                        ).await;
                         let identity_hold = consented_peer
                             && identity_state == cap::IdentityState::Pending;
                         let expired = if identity_hold && link_ready {
@@ -8363,8 +9614,9 @@ async fn recv_run(
                     // --help` promises ("`receive <code>` never asks"). It
                     // asked `accept? [y/N]` anyway at a terminal. Only the
                     // ceremony peer carries that consent, never a bystander.
-                    let code_consent =
-                        recv_code_path && recv_pake_done && conn.is_bound_active_peer(&pid);
+                    let code_consent = recv_code_path
+                        && recv_pake_done
+                        && conn.holds_code_authority(&pid).await;
                     let legacy_ok = offer_has_consent(
                         daemon,
                         yes,
@@ -8382,93 +9634,33 @@ async fn recv_run(
                     // before peer_authz resolves anything (see below).
                     let sibling =
                         crate::shell_gate::sibling_facts(&conn, &pid, cap::CAP_TRANSFER);
-                    let (ok, xfer_deny_reason, xfer_gate) = {
-                        let az = crate::shell_gate::peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-                        let store = host.cap_store();
-                        let now = host.now_secs();
-                        let outcome = cap::authorize_in(
-                            &store,
-                            "self",
-                            cap::CAP_TRANSFER,
-                            idev,
-                            iusr,
-                            ak_caps,
-                            now,
-                        );
-                        // Trust floor: under authoritative, an untrusted link
-                        // must never authorize transfer (pair-proof vs device-key).
-                        let outcome =
-                            cap::cap_trust_floor(&outcome, link_trusted, binding, authoritative);
-                        // Fleet transfer scope, enforced by construction and VERIFIED
-                        // here (not hardcoded `true`, which asserted a bound nothing
-                        // checked). The offered name is basename-only (see ~14095:
-                        // `Path::new(raw).file_name()`, "never trust a remote name with
-                        // path separators") and lands in the receiver's OWN drop dir
-                        // `dir`, which the sender cannot redirect. Assert the landing
-                        // path is within `dir` so a future regression in the sanitizer
-                        // or in how `dir` is derived TRIPS the gate (fails closed to
-                        // grant-only) instead of silently widening scope. NOTE: this is
-                        // a LEXICAL check; a symlink planted at the final `.part` create
-                        // could still redirect the write — closed separately by the
-                        // plain-file-only (O_NOFOLLOW/O_EXCL) write hardening tracked as
-                        // a fleet-trust follow-up.
-                        let landing = dir.join(&name);
-                        let scoped_in_bounds =
-                            filament_transfer::path_bounds::path_within(&dir, &landing);
-                        let (own_user, has_grant) = cap::fleet_inputs_in(
-                            &store,
-                            "self",
-                            cap::CAP_TRANSFER,
-                            idev,
-                            iusr,
-                            ak_caps,
-                            now,
-                        );
-                        // FleetSibling: the kind implies transfer into the drop
-                        // dir and nothing else; grants from either source count.
-                        let (scoped_in_bounds, has_grant) = crate::shell_gate::sibling_gate_inputs(
-                            &sibling,
-                            cap::CAP_TRANSFER,
-                            scoped_in_bounds,
-                            has_grant,
-                        );
-                        // No deny list is consulted on the transfer path today;
-                        // false preserves that exactly.
-                        let d = host.cap_gate_effective(CapGate {
-                            legacy_allowed: legacy_ok,
-                            outcome: &outcome,
-                            action: cap::CAP_TRANSFER,
-                            resource: "self",
-                            device_pub: idev,
-                            user_pub: iusr,
-                            binding,
-                            cert_expires: expires,
-                            auth_key_caps: ak_caps,
-                            own_user_pub: own_user.as_ref(),
-                            scoped_in_bounds,
-                            has_explicit_grant: has_grant,
-                            cert_revoked,
-                            identity_state: conn.identity_state_of(&pid),
-                            // A sibling's local deny wins over its kind default and grants;
-                            // no deny list is consulted for anyone else on this path.
-                            denied: sibling.denied,
-                            ceiling_authorizes: false,
-                        });
-                        let reason = if let cap::GateDecision::Deny { cap_reason } = &d {
-                            cap_reason.clone()
-                        } else {
-                            None
-                        };
-                        log.debug(&format!(
-                            "transfer-gate: from={sender_name} allowed={} legacy_ok={legacy_ok} trusted={link_trusted} binding={binding:?} own_user={} has_grant={has_grant} in_bounds={scoped_in_bounds} revoked={cert_revoked} authoritative={} reason={:?}",
-                            d.allowed(),
-                            own_user.is_some(),
-                            authoritative,
-                            reason
-                        ));
-                        (d.allowed(), reason, d)
-                    };
+                    // Fleet transfer scope, enforced by construction and VERIFIED
+                    // here (not hardcoded `true`, which asserted a bound nothing
+                    // checked). The offered name is basename-only (see ~14095:
+                    // `Path::new(raw).file_name()`, "never trust a remote name with
+                    // path separators") and lands in the receiver's OWN drop dir
+                    // `dir`, which the sender cannot redirect. Assert the landing
+                    // path is within `dir` so a future regression in the sanitizer
+                    // or in how `dir` is derived TRIPS the gate (fails closed to
+                    // grant-only) instead of silently widening scope. NOTE: this is
+                    // a LEXICAL check; a symlink planted at the final `.part` create
+                    // could still redirect the write; that is closed separately by the
+                    // plain-file-only (O_NOFOLLOW/O_EXCL) write hardening tracked as
+                    // a fleet-trust follow-up.
+                    let landing = dir.join(&name);
+                    let landing_in_bounds =
+                        filament_transfer::path_bounds::path_within(&dir, &landing);
+                    let (ok, xfer_deny_reason, xfer_gate) = file_offer_transfer_gate(
+                        &mut conn,
+                        &pid,
+                        &sibling,
+                        legacy_ok,
+                        link_trusted,
+                        authoritative,
+                        landing_in_bounds,
+                        &sender_name,
+                        log.as_ref(),
+                    );
                     // Under authoritative, a capability Deny hard-declines
                     // immediately: no prompt, skip the accept path entirely.
                     if let Some(reason) = cap::transfer_gate_decision(&xfer_gate, authoritative) {
@@ -8669,6 +9861,7 @@ async fn recv_run(
                                     bar: conn.present.progress("(stdout)", size),
                                     write_err: Arc::new(std::sync::Mutex::new(None)),
                                     stdout: Some(sink),
+                                    sender: conn.link(&pid).and_then(|l| l.verified_name.clone()),
                                 },
                             );
                             // Ask for ONE in-order stream: split across parallel
@@ -8886,6 +10079,7 @@ async fn recv_run(
                             bar,
                             write_err: Arc::new(std::sync::Mutex::new(None)),
                             stdout: None,
+                            sender: conn.link(&pid).and_then(|l| l.verified_name.clone()),
                         },
                     );
                     // The accept could not be sent (the link died under us): drop
@@ -8901,6 +10095,20 @@ async fn recv_run(
                 // never kept as junk (`unread`, `unread.part`, `unread.part.meta`
                 // were left behind before this message existed).
                 Some("file-cancel") => {
+                    if !admit_code_stream_event(
+                        &conn,
+                        &mut code_authority_cache,
+                        recv_code_path,
+                        recv_pake_done,
+                        &pid,
+                        &mut st.by_sid,
+                        log.as_ref(),
+                        CodeStreamEvent::Cancel,
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
                     let id = v["id"].as_str().unwrap_or_default().to_string();
                     let reason: String = v["reason"]
                         .as_str()
@@ -8959,6 +10167,20 @@ async fn recv_run(
                     if test_hooks::drop_file_end() {
                         continue;
                     }
+                    if !admit_code_stream_event(
+                        &conn,
+                        &mut code_authority_cache,
+                        recv_code_path,
+                        recv_pake_done,
+                        &pid,
+                        &mut st.by_sid,
+                        log.as_ref(),
+                        CodeStreamEvent::FileEnd,
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
                     // Exactly-once completion: the gate records end_seen and
                     // then checks inflight under SeqCst. If a writer drained
@@ -8982,6 +10204,7 @@ async fn recv_run(
                         Some(i) => i,
                         None => continue,
                     };
+                    let sender = inc.sender.clone();
                     let f = inc.file.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         let _ = f.sync_all();
@@ -8990,6 +10213,7 @@ async fn recv_run(
                     if to_stdout {
                         stdout_delivered(&inc, &conn, &pid, sid, &report).await?;
                         st.completed += 1;
+                        conn.note_completed_transfer(&pid, sender.as_deref());
                         continue;
                     }
                     let id = inc.id.clone();
@@ -9043,6 +10267,7 @@ async fn recv_run(
                                 .await?
                                 {
                                     st.completed += 1;
+                                    conn.note_completed_transfer(&pid, sender.as_deref());
                                     // BUG-ACKLOSS reproducer: tear the link DOWN at the
                                     // instant the ack is due, so the sender never sees it and
                                     // its transport observes ApplicationClosed(0,""). In
@@ -9192,6 +10417,7 @@ async fn recv_run(
                         .await?
                         {
                             st.completed += 1;
+                            conn.note_completed_transfer(&pid, sender.as_deref());
                         }
                     }
                 }
@@ -9200,6 +10426,22 @@ async fn recv_run(
             Ev::MaybeComplete(pid, sid) => {
                 // A background writer task finished and was the last inflight,
                 // and end_seen was already set. Finalize (verify + delv ack).
+                // Continuation is bound to the code-authorized link; a
+                // completion with no link finishes bytes already written.
+                if !admit_code_stream_event(
+                    &conn,
+                    &mut code_authority_cache,
+                    recv_code_path,
+                    recv_pake_done,
+                    &pid,
+                    &mut st.by_sid,
+                    log.as_ref(),
+                    CodeStreamEvent::Completion,
+                )
+                .await?
+                {
+                    continue;
+                }
                 let ack_sid = {
                     st.by_sid
                         .get(&(pid.clone(), sid))
@@ -9207,9 +10449,11 @@ async fn recv_run(
                         .unwrap_or(0)
                 };
                 if let Some(mut inc) = st.by_sid.remove(&(pid.clone(), sid)) {
+                    let sender = inc.sender.clone();
                     if to_stdout {
                         stdout_delivered(&inc, &conn, &pid, ack_sid, &report).await?;
                         st.completed += 1;
+                        conn.note_completed_transfer(&pid, sender.as_deref());
                         continue;
                     }
                     let id = inc.id.clone();
@@ -9263,6 +10507,7 @@ async fn recv_run(
                                 .await?
                                 {
                                     st.completed += 1;
+                                    conn.note_completed_transfer(&pid, sender.as_deref());
                                     // BUG-ACKLOSS reproducer: tear the link DOWN at the
                                     // instant the ack is due, so the sender never sees it and
                                     // its transport observes ApplicationClosed(0,""). In
@@ -9399,11 +10644,28 @@ async fn recv_run(
                         .await?
                         {
                             st.completed += 1;
+                            conn.note_completed_transfer(&pid, sender.as_deref());
                         }
                     }
                 }
             }
             Ev::Chunk(pid, sid, offset, data) => {
+                // Continuation is bound to the code-authorized link.
+                if !l2::is_l2_sid(sid)
+                    && !admit_code_stream_event(
+                        &conn,
+                        &mut code_authority_cache,
+                        recv_code_path,
+                        recv_pake_done,
+                        &pid,
+                        &mut st.by_sid,
+                        log.as_ref(),
+                        CodeStreamEvent::Chunk,
+                    )
+                    .await?
+                {
+                    continue;
+                }
                 // L2 streams live in the HIGH half of the sid space, route them
                 // to the tunnel mux, never the file-transfer table (the pure
                 // high-bit prefix check keeps file send/recv byte-identical).
@@ -9827,7 +11089,7 @@ async fn recv_run(
                 {
                     // G-k: the dropped link may have delivered every byte but
                     // lost its file-end, finalize before deciding it's fatal.
-                    crate::recv::files::sweep_completed_streams(
+                    let swept = crate::recv::files::sweep_completed_streams(
                         host.as_ref(),
                         log.as_ref(),
                         &mut st.by_sid,
@@ -9841,6 +11103,9 @@ async fn recv_run(
                         &ports.env.delivery,
                     )
                     .await?;
+                    for name in swept {
+                        conn.note_warm_use(&name);
+                    }
                     if st.completed == 0 {
                         bail!(crate::recv::transfer_truth::sender_gone_message(
                             &format!(
@@ -9865,7 +11130,7 @@ async fn recv_run(
                     _ => false,
                 };
                 if exhausted && paired && !keep_open {
-                    crate::recv::files::sweep_completed_streams(
+                    let swept = crate::recv::files::sweep_completed_streams(
                         host.as_ref(),
                         log.as_ref(),
                         &mut st.by_sid,
@@ -9879,6 +11144,9 @@ async fn recv_run(
                         &ports.env.delivery,
                     )
                     .await?;
+                    for name in swept {
+                        conn.note_warm_use(&name);
+                    }
                     if st.completed == 0 {
                         bail!(crate::recv::transfer_truth::sender_gone_message(
                             &format!(
@@ -10083,7 +11351,13 @@ fn nonce_binding(
     }
 }
 
-fn out_binding(
+/// The binding an OUTGOING `fleet-hello` or `l3-announce` is signed over: the
+/// exporter, or the nonce held in the peer-nonce map for this link (CONTRACT.md:
+/// the signer uses the peer's challenge, the verifier its own). That map only
+/// receives nonces `fleet_bind::accept_peer_nonce` kept, never one we issued.
+/// Every signing call site takes its binding from here, bound to a variable
+/// named `sign_cb`; the `signing_call_sites` tests hold the call sites to that.
+fn signing_binding(
     t: &Arc<dyn Transport>,
     pid: &str,
     theirs: &HashMap<String, Vec<u8>>,
@@ -10091,6 +11365,134 @@ fn out_binding(
 ) -> Option<Vec<u8>> {
     t.channel_binding()
         .or_else(|| theirs.get(pid).and_then(|n| nonce_binding(t, fps, n)))
+}
+
+/// How often the unverified watchdog may speak: once per link, after this long.
+const FLEET_UNVERIFIED_SAY_SECS: u64 = 20;
+/// How long one fleet direct arm per peer is allowed to stand before the next
+/// arm site may start another attempt for that peer.
+const FLEET_ARM_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// The first 8 hex characters of a binding nonce. Nonces travel in the clear,
+/// so a prefix is safe to log; it lets two daemons' lines be matched up.
+fn nonce_prefix(nonce: &[u8]) -> String {
+    hex::encode(nonce).chars().take(8).collect()
+}
+
+/// What a hello on this transport is bound to: the transport's own exporter,
+/// or (a DataChannel) the DTLS fingerprint pair plus a nonce.
+fn cb_kind(t: &Arc<dyn Transport>) -> &'static str {
+    if t.channel_binding().is_some() {
+        "exporter"
+    } else {
+        "dtls"
+    }
+}
+
+/// The trace file stops growing at this size, after one final marker line.
+const FLEET_TRACE_CAP: u64 = 4 * 1024 * 1024;
+
+fn fleet_trace_append(sink: Option<&Path>, line: &str) {
+    use std::io::Write as _;
+    let Some(path) = sink else { return };
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if len >= FLEET_TRACE_CAP {
+        return;
+    }
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut record = format!("t_ms={ms} {line}\n");
+    if len + record.len() as u64 >= FLEET_TRACE_CAP {
+        record = format!("t_ms={ms} trace truncated at {FLEET_TRACE_CAP} bytes\n");
+    }
+    // One append-mode write per record, so concurrent writers cannot interleave
+    // within a line.
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(record.as_bytes());
+    }
+}
+
+/// One fleet establishment transition, with stable tokens:
+/// `fleet pid=<pid> gen=<n> src=<id> step=<step> reason=<..> cb=<..> dev=<..>`.
+/// INFO on a daemon (where the gates and an operator read it), debug for a
+/// one-shot. `dev` is a device-key prefix (16 hex), `none` when unknown.
+#[allow(clippy::too_many_arguments)]
+fn fleet_step(
+    log: &dyn LogSink,
+    info: bool,
+    sink: Option<&Path>,
+    conn: &Conn,
+    pid: &str,
+    step: &str,
+    reason: &str,
+    cb: &str,
+    dev: &str,
+) {
+    let (generation, src) = conn
+        .link(pid)
+        .map(|l| (l.generation.to_string(), format!("{:?}", l.source)))
+        .unwrap_or_else(|| ("none".into(), "none".into()));
+    let line = format!(
+        "fleet pid={pid} gen={generation} src={src} step={step} reason={reason} cb={cb} dev={dev}"
+    );
+    if info {
+        log.say(&line);
+    } else {
+        log.debug(&line);
+    }
+    fleet_trace_append(sink, &line);
+}
+
+/// One fleet-hello binding record (`fhello-bind`) or verdict (`fhello-verdict`).
+/// Always at debug; also appended, with a wall-clock millisecond stamp, to the
+/// file named by `TUNLION_FLEET_HELLO_TRACE` when set, so a gate can print the
+/// owner's decisions on failure without raising the whole daemon's verbosity.
+/// Best effort: a write that fails is dropped, never surfaced as an error.
+fn fleet_hello_note(log: &dyn LogSink, sink: Option<&Path>, line: &str) {
+    log.debug(line);
+    fleet_trace_append(sink, line);
+}
+
+/// The inputs a fleet-hello verdict rested on, in one line: whether the
+/// transport supplied an exporter binding, whether our own l3 nonce (the only
+/// other source `in_binding` reads) was present, the DTLS fingerprint pair it
+/// was combined with, the transport source and how many source changes have
+/// cleared this pid's nonce maps, and the name and device key the hello CLAIMS
+/// (unverified until the verdict says otherwise).
+#[cfg(feature = "fleet")]
+#[allow(clippy::too_many_arguments)]
+fn fleet_hello_context(
+    pid: &str,
+    t: Option<&Arc<dyn Transport>>,
+    cb: bool,
+    ours_nonce: bool,
+    theirs_nonce: bool,
+    fps: Option<&(String, String)>,
+    source: Option<net::SourceId>,
+    resets: u32,
+    v: &Value,
+) -> String {
+    let exporter = t.is_some_and(|t| t.channel_binding().is_some());
+    let dc = t.is_some_and(|t| t.as_any().is::<net::DataChannelTransport>());
+    let cb_from = match (cb, exporter) {
+        (false, _) => "none",
+        (true, true) => "exporter",
+        (true, false) => "ours-l3-nonce",
+    };
+    let short = |s: &str| s.chars().take(23).collect::<String>();
+    let fps = fps
+        .map(|(mine, theirs)| format!("{}/{}", short(mine), short(theirs)))
+        .unwrap_or_else(|| "none".into());
+    let claimed: String = v["name"].as_str().unwrap_or("").chars().take(64).collect();
+    let claimed_dev = identity::DeviceCert::from_json(&v["cert"])
+        .map(|c| hex::encode(c.device_pub))
+        .unwrap_or_else(|| "none".into());
+    format!(
+        "pid={pid} transport={} cb={cb_from} dc={dc} ours_nonce={ours_nonce} theirs_nonce={theirs_nonce} fps={fps} source={source:?} resets={resets} claimed={claimed:?} claimed_dev={claimed_dev}",
+        t.is_some()
+    )
 }
 
 fn in_binding(
@@ -11087,6 +12489,44 @@ mod lifecycle_tests {
             "shutdown cancels, joins, and drains owners"
         );
     }
+
+    /// A revocation that dooms several peers cancels all their served syncs
+    /// first and joins them under ONE shared deadline, so the loop is held
+    /// for at most one SYNC_JOIN_BOUND for the whole set (not one per peer),
+    /// and a peer outside the set keeps its stream.
+    #[cfg(feature = "mount-server")]
+    #[tokio::test]
+    async fn a_doomed_set_cancels_its_syncs_under_one_shared_deadline() {
+        let cleanup = RecvCleanup::default();
+        let sync_tasks = cleanup.sync_tasks.clone();
+        let mut keep = Vec::new();
+        for (i, pid) in ["doomed-a", "doomed-b", "doomed-c", "survivor"].iter().enumerate() {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            keep.push(tx);
+            sync_tasks
+                .track_sync_task(
+                    (*pid).into(),
+                    0x8000_0200 + i as u32,
+                    SyncTask(sync_server(rx)),
+                    &NoLog,
+                )
+                .await;
+        }
+        let start = std::time::Instant::now();
+        sync_tasks
+            .cancel_sync_for_pids(&["doomed-a", "doomed-b", "doomed-c"], &NoLog)
+            .await;
+        assert!(
+            start.elapsed() < crate::sync::SYNC_JOIN_BOUND,
+            "the set was joined one bound per peer ({:?})",
+            start.elapsed()
+        );
+        let left: Vec<String> =
+            sync_tasks.0.lock().unwrap().keys().map(|(p, _)| p.clone()).collect();
+        assert_eq!(left, vec!["survivor".to_string()], "the doomed set was not fully cancelled");
+        sync_tasks.stop_sync_tasks(&NoLog).await;
+        drop(keep);
+    }
 }
 
 #[cfg(test)]
@@ -11343,7 +12783,11 @@ mod expiry_redrive_tests {
 /// buffered with "no pending yet", so the direct path never armed.
 #[cfg(test)]
 mod linked_fleet_offer_tests {
-    use super::{linked_fleet_offer_action as decide, LinkedFleetOffer};
+    use super::{
+        fleet_arm_allowed, fleet_arm_skips_pair_link, fleet_standing_after_rotation,
+        linked_fleet_offer_action as decide, refuse_forgotten_dial, LinkedFleetOffer,
+    };
+    use std::time::{Duration, Instant};
 
     const FLEET: &str = "chan-fleet";
     const LOW: &str = "sid-aaa";
@@ -11357,12 +12801,12 @@ mod linked_fleet_offer_tests {
     fn a_fleet_offer_on_a_shaped_link_with_no_pending_arms_one() {
         // We are the higher sid: the peer is the elected dialer, we answer.
         assert_eq!(
-            decide(true, false, Some(FLEET), Some(FLEET), true, HIGH, LOW),
+            decide(true, false, Some(FLEET), Some(FLEET), true, false, HIGH, LOW),
             LinkedFleetOffer::ArmAnswer
         );
         // We are the lower sid: we are the elected dialer.
         assert_eq!(
-            decide(true, false, Some(FLEET), Some(FLEET), true, LOW, HIGH),
+            decide(true, false, Some(FLEET), Some(FLEET), true, false, LOW, HIGH),
             LinkedFleetOffer::ArmDial
         );
     }
@@ -11377,7 +12821,7 @@ mod linked_fleet_offer_tests {
                 for shaped in [false, true] {
                     for ch in [None, Some(FLEET), Some("chan-pair")] {
                         assert_eq!(
-                            decide(has_link, true, ch, Some(FLEET), shaped, me, peer),
+                            decide(has_link, true, ch, Some(FLEET), shaped, false, me, peer),
                             LinkedFleetOffer::Feed,
                             "a pending peer was re-armed (link={has_link} shaped={shaped} ch={ch:?})"
                         );
@@ -11396,45 +12840,102 @@ mod linked_fleet_offer_tests {
         for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
             // ch-less unicast offer on a shaped link.
             assert_eq!(
-                decide(true, false, None, Some(FLEET), true, me, peer),
+                decide(true, false, None, Some(FLEET), true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // Another meeting place (a pair channel) on a shaped link.
             assert_eq!(
-                decide(true, false, Some("chan-pair"), Some(FLEET), true, me, peer),
+                decide(true, false, Some("chan-pair"), Some(FLEET), true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // An empty `ch` never matches, even against an empty fleet channel.
             assert_eq!(
-                decide(true, false, Some(""), Some(""), true, me, peer),
+                decide(true, false, Some(""), Some(""), true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // We are in no fleet.
             assert_eq!(
-                decide(true, false, Some(FLEET), None, true, me, peer),
+                decide(true, false, Some(FLEET), None, true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // No link to the peer: not this case (the one-shot and
             // known-device arms own it).
             assert_eq!(
-                decide(false, false, Some(FLEET), Some(FLEET), true, me, peer),
+                decide(false, false, Some(FLEET), Some(FLEET), true, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             assert_eq!(
-                decide(false, false, Some(FLEET), Some(FLEET), false, me, peer),
+                decide(false, false, Some(FLEET), Some(FLEET), false, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
             // A link that is not fleet-shaped.
             assert_eq!(
-                decide(true, false, Some(FLEET), Some(FLEET), false, me, peer),
+                decide(true, false, Some(FLEET), Some(FLEET), false, false, me, peer),
                 LinkedFleetOffer::Buffer
             );
         }
     }
 
+    /// A peer we saw on the FLEET CHANNEL is fleet-shaped for this decision
+    /// even when its link still carries a pair expectation. The two ends can
+    /// file the same peer under different relationships (the peer still holds
+    /// us as a paired device while we forgot it): the pair expectation kept
+    /// the link out of the fleet shape, so the fleet direct was never armed on
+    /// either end, the peer sat with no transport at all, and nothing was ever
+    /// refused or admitted. The fleet relationship is the certificate-proven
+    /// one and it wins here.
+    #[test]
+    fn a_fleet_pending_peer_arms_the_fleet_direct_despite_a_pair_expectation() {
+        for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
+            let want = if me < peer {
+                LinkedFleetOffer::ArmDial
+            } else {
+                LinkedFleetOffer::ArmAnswer
+            };
+            assert_eq!(
+                decide(true, false, Some(FLEET), Some(FLEET), false, true, me, peer),
+                want,
+                "a fleet-pending peer on a pair-shaped link was not armed (me={me})"
+            );
+        }
+    }
+
+    /// The fleet-pending escape does not reach past the other rules: a pending
+    /// is still fed, and an offer that does not name our fleet channel is
+    /// still buffered.
+    #[test]
+    fn the_fleet_pending_escape_respects_the_other_rules() {
+        // A pending peer is fed, never re-armed.
+        assert_eq!(
+            decide(true, true, Some(FLEET), Some(FLEET), false, true, HIGH, LOW),
+            LinkedFleetOffer::Feed
+        );
+        // Another meeting place (a pair channel) is still not the fleet one.
+        assert_eq!(
+            decide(true, false, Some("chan-pair"), Some(FLEET), false, true, HIGH, LOW),
+            LinkedFleetOffer::Buffer
+        );
+        // A ch-less unicast offer is still not the fleet one.
+        assert_eq!(
+            decide(true, false, None, Some(FLEET), false, true, HIGH, LOW),
+            LinkedFleetOffer::Buffer
+        );
+        // No link to the peer at all: not this case.
+        assert_eq!(
+            decide(false, false, Some(FLEET), Some(FLEET), false, true, HIGH, LOW),
+            LinkedFleetOffer::Buffer
+        );
+        // We are in no fleet, so there is no fleet channel to match.
+        assert_eq!(
+            decide(true, false, Some(FLEET), None, false, true, HIGH, LOW),
+            LinkedFleetOffer::Buffer
+        );
+    }
+
     /// The whole input space, so no combination slips between the rules:
-    /// arm iff link && !pending && ch == fleet channel (non-empty) && shaped,
-    /// feed iff pending, buffer otherwise; the arm's role is the sid order.
+    /// arm iff link && !pending && ch == fleet channel (non-empty) && (shaped
+    /// || the peer is fleet-pending), feed iff pending, buffer otherwise; the
+    /// arm's role is the sid order.
     #[test]
     fn the_decision_is_exhaustive() {
         let chans = [None, Some(""), Some(FLEET), Some("chan-pair")];
@@ -11443,31 +12944,213 @@ mod linked_fleet_offer_tests {
             for has_link in [false, true] {
                 for has_pending in [false, true] {
                     for shaped in [false, true] {
-                        for ch in chans {
-                            for fleet in fleets {
-                                let got = decide(has_link, has_pending, ch, fleet, shaped, me, peer);
-                                let on_fleet = ch.is_some_and(|c| !c.is_empty()) && ch == fleet;
-                                let want = if has_pending {
-                                    LinkedFleetOffer::Feed
-                                } else if has_link && shaped && on_fleet {
-                                    if me < peer {
-                                        LinkedFleetOffer::ArmDial
+                        for pending_fleet in [false, true] {
+                            for ch in chans {
+                                for fleet in fleets {
+                                    let got = decide(
+                                        has_link,
+                                        has_pending,
+                                        ch,
+                                        fleet,
+                                        shaped,
+                                        pending_fleet,
+                                        me,
+                                        peer,
+                                    );
+                                    let on_fleet =
+                                        ch.is_some_and(|c| !c.is_empty()) && ch == fleet;
+                                    let want = if has_pending {
+                                        LinkedFleetOffer::Feed
+                                    } else if has_link
+                                        && (shaped || pending_fleet)
+                                        && on_fleet
+                                    {
+                                        if me < peer {
+                                            LinkedFleetOffer::ArmDial
+                                        } else {
+                                            LinkedFleetOffer::ArmAnswer
+                                        }
                                     } else {
-                                        LinkedFleetOffer::ArmAnswer
-                                    }
-                                } else {
-                                    LinkedFleetOffer::Buffer
-                                };
-                                assert_eq!(
-                                    got, want,
-                                    "link={has_link} pending={has_pending} shaped={shaped} ch={ch:?} fleet={fleet:?} me={me}"
-                                );
+                                        LinkedFleetOffer::Buffer
+                                    };
+                                    assert_eq!(
+                                        got, want,
+                                        "link={has_link} pending={has_pending} shaped={shaped} fleet_pending={pending_fleet} ch={ch:?} fleet={fleet:?} me={me}"
+                                    );
+                                }
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    /// The honest "not recognized" answer is owed to a forgotten peer EVEN
+    /// WHILE we still hold a stale link to it. The link used to suppress the
+    /// answer, so the forgotten device appeared, never connected, and said
+    /// nothing about the owner: it waited out its whole window for a reply
+    /// that was already true.
+    #[test]
+    fn a_forgotten_peer_is_refused_despite_a_stale_link() {
+        assert!(
+            refuse_forgotten_dial(false, true, true),
+            "a stale link suppressed the honest refusal"
+        );
+    }
+    /// The refusal still does not fire for a peer that is not forgotten, and
+    /// a live direct pending (we are dialing that peer right now, on the same
+    /// credential) keeps the offer in our own race.
+    #[test]
+    fn the_refusal_fires_only_for_a_forgotten_channel() {
+        // Not forgotten: nothing to refuse.
+        assert!(!refuse_forgotten_dial(false, false, false));
+        assert!(!refuse_forgotten_dial(false, true, false));
+        // We are dialing this peer right now: its offer is part of our race.
+        assert!(!refuse_forgotten_dial(true, false, true));
+        assert!(!refuse_forgotten_dial(true, true, true));
+        // Forgotten, no pending, no link: the plain case still refuses.
+        assert!(refuse_forgotten_dial(false, false, true));
+    }
+
+    /// The fleet arm is bounded: one per peer per window. The arm sites are
+    /// event-driven (a roster push on every sync tick, a sibling re-offer
+    /// every ~1.2 s) and each arm starts a direct attempt, so an unbounded arm
+    /// fills the bounded retirement drain and then EVERY direct attempt fails
+    /// closed for the whole session.
+    #[test]
+    fn the_fleet_arm_is_bounded_per_peer() {
+        let start = Instant::now();
+        let cooldown = Duration::from_secs(5);
+        // A peer we never armed: allowed.
+        assert!(fleet_arm_allowed(None, start, cooldown));
+        // Armed just now: refused.
+        assert!(!fleet_arm_allowed(Some(start), start, cooldown));
+        // Still inside the window: refused.
+        assert!(!fleet_arm_allowed(
+            Some(start),
+            start + Duration::from_secs(4),
+            cooldown
+        ));
+        // The window has passed: allowed again.
+        assert!(fleet_arm_allowed(
+            Some(start),
+            start + Duration::from_secs(5),
+            cooldown
+        ));
+    }
+
+    /// A fleet arm must not take over a live PAIR link, and must still arm
+    /// for a forgotten one (the secret we no longer hold).
+    #[test]
+    fn a_fleet_arm_skips_a_live_pair_link_and_keeps_the_forgotten_one() {
+        // A pair secret we still hold: a live pair relationship, skipped.
+        assert!(fleet_arm_skips_pair_link(true, Some("pair-secret"), true));
+        assert!(fleet_arm_skips_pair_link(false, Some("pair-secret"), true));
+        // The same secret, but we no longer hold it: the peer was forgotten or
+        // revoked here, so the fleet relationship may take the link over.
+        assert!(!fleet_arm_skips_pair_link(true, Some("pair-secret"), false));
+        assert!(!fleet_arm_skips_pair_link(false, Some("pair-secret"), false));
+        // The fleet rendezvous secret is never a store entry: a fleet link
+        // keeps arming.
+        assert!(!fleet_arm_skips_pair_link(false, Some("fleet-rv"), false));
+        // A trusted link with no secret at all has unknown standing (a code
+        // ceremony, an ephemeral link): left alone.
+        assert!(fleet_arm_skips_pair_link(true, None, false));
+        // An untrusted link with no secret is the secretless fleet shape.
+        assert!(!fleet_arm_skips_pair_link(false, None, false));
+    }
+
+    fn epoch(generation: u32) -> super::fleet_bind::Epoch {
+        super::fleet_bind::Epoch {
+            generation,
+            source: filament_transport::net::SourceId::next(),
+        }
+    }
+
+    /// A binding epoch rotation drops a fleet verdict earned on an OLDER
+    /// binding, so the hello runs again on the new one. Without this, a
+    /// sibling verified on the old binding stays a non-sibling forever.
+    #[test]
+    fn a_rotated_binding_re_earns_the_fleet_standing() {
+        let (old, new) = (epoch(7), epoch(8));
+        let mut standing = super::fleet_bind::Standing::default();
+        let mut verified = std::collections::HashSet::new();
+        let mut pending = std::collections::HashSet::new();
+        verified.insert("sib".to_string());
+        standing.verified("sib", old);
+        standing.greeted("sib", old);
+        assert!(
+            fleet_standing_after_rotation(&mut standing, &mut verified, &mut pending, "sib", new),
+            "the rotation did not drop the standing"
+        );
+        assert!(!verified.contains("sib"), "the stale standing survived");
+        assert!(standing.hello_owed("sib", Some(new)), "the stale greeting still counts");
+        assert!(pending.contains("sib"), "the hello was not queued again");
+        // A peer that was not verified keeps its pending state, and the
+        // rotation reports that nothing was standing.
+        let mut pending2 = std::collections::HashSet::new();
+        pending2.insert("other".to_string());
+        assert!(!fleet_standing_after_rotation(
+            &mut standing,
+            &mut verified,
+            &mut pending2,
+            "other",
+            new
+        ));
+        assert!(pending2.contains("other"), "the pending state was changed");
+    }
+
+    /// The ordering race: the peer rotates first and greets us on the NEW
+    /// binding, and we verify that hello before our own rotation is
+    /// processed. The rotation must keep that verdict (the peer has already
+    /// greeted us on this binding and will not again), and it must still
+    /// leave our hello OWED on the new binding (ours was sent on the old one),
+    /// so the peer gets it and verifies us too. Either half missing is a link
+    /// that stays unverified on one side for good.
+    #[test]
+    fn a_peer_that_rotates_and_greets_first_keeps_its_verdict_and_gets_our_hello() {
+        let (old, new) = (epoch(7), epoch(8));
+        let mut standing = super::fleet_bind::Standing::default();
+        let mut verified = std::collections::HashSet::new();
+        let mut pending = std::collections::HashSet::new();
+        // Steady state on the old binding: mutual hellos done.
+        verified.insert("sib".to_string());
+        standing.verified("sib", old);
+        standing.greeted("sib", old);
+        // The new link is installed and the peer's hello for it verifies
+        // BEFORE our rotation runs. "Already greeted" on the old binding does
+        // not count here, so the answer-once arm answers it.
+        assert!(standing.hello_owed("sib", Some(new)), "a hello from the old binding counted");
+        assert!(standing.verified("sib", new), "a verdict on a new binding read as a repeat");
+        // Then our rotation is processed.
+        assert!(
+            !fleet_standing_after_rotation(&mut standing, &mut verified, &mut pending, "sib", new),
+            "a verdict earned on the installed binding was dropped as stale"
+        );
+        assert!(verified.contains("sib"), "the current verdict was removed");
+        assert!(!pending.contains("sib"), "a hello was queued for a verified peer");
+        assert!(
+            standing.hello_owed("sib", Some(new)),
+            "our hello is not owed on the new binding, so the peer never verifies us"
+        );
+        // Once we greet on the new binding, it is no longer owed: the mutual
+        // hello still terminates.
+        standing.greeted("sib", new);
+        assert!(!standing.hello_owed("sib", Some(new)));
+        assert!(
+            !fleet_standing_after_rotation(&mut standing, &mut verified, &mut pending, "sib", new),
+            "a repeat rotation event to the same binding changed the standing"
+        );
+        assert!(!standing.hello_owed("sib", Some(new)));
+    }
+
+    /// No installed link: nothing is owed and nothing is greeted.
+    #[test]
+    fn no_installed_link_owes_no_hello() {
+        let standing = super::fleet_bind::Standing::default();
+        assert!(!standing.hello_owed("sib", None));
+        assert!(standing.hello_owed("sib", Some(epoch(1))));
     }
 }
 
@@ -11635,4 +13318,385 @@ async fn lan_ownership(
         None => Vec::new(),
     };
     crate::lan_glue::Ownership::build(stored, live)
+}
+
+#[cfg(test)]
+mod pair_grant_tests {
+    use crate::host::NoLog;
+    use crate::shell_gate::SiblingFacts;
+    use crate::shell_gate::pair_fixture::{PID, PairHost, pair_conn};
+    use std::sync::Arc;
+
+    /// Pairwise-first, through the real `file-offer` transfer gate the receive
+    /// loop calls: under authoritative, a transfer grant this device gave its
+    /// pair (the pairing default) admits the offer with no owner-signed grant,
+    /// and with no record grant, or a local transfer deny, it is refused. Pins
+    /// the `pair_facts(...).apply` line in `file_offer_transfer_gate`.
+    #[tokio::test]
+    async fn a_pair_record_transfer_grant_admits_a_file_offer_under_authoritative() {
+        let host = Arc::new(PairHost::default());
+        let (mut conn, _far) = pair_conn(host.clone()).await;
+        let offer = |conn: &mut crate::conn::Conn| {
+            super::file_offer_transfer_gate(
+                conn,
+                PID,
+                &SiblingFacts::default(),
+                false,
+                true,
+                true,
+                true,
+                "phone",
+                &NoLog,
+            )
+            .0
+        };
+        assert!(!offer(&mut conn), "no record grant: the empty signed store refuses");
+        host.grant("transfer");
+        assert!(offer(&mut conn), "a pair transfer grant must admit under authoritative");
+        host.denies.lock().unwrap().insert("transfer".into());
+        assert!(!offer(&mut conn), "a local transfer deny outranks the grant");
+    }
+}
+
+#[cfg(test)]
+mod code_stream_tests {
+    use super::{
+        apply_code_stream_action, code_stream_action, take_streams_of, CodeStreamAction,
+        CodeStreamEvent,
+    };
+    use crate::recv::IncomingFile;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
+    use std::sync::Arc;
+
+    const EVENTS: [CodeStreamEvent; 5] = [
+        CodeStreamEvent::Ready,
+        CodeStreamEvent::Chunk,
+        CodeStreamEvent::FileEnd,
+        CodeStreamEvent::Completion,
+        CodeStreamEvent::Cancel,
+    ];
+
+    #[test]
+    fn a_code_transfer_event_acts_only_on_the_covered_link() {
+        use crate::conn::CodeContinuation::{Holds, Lost, NoLink};
+        for e in EVENTS {
+            assert_eq!(code_stream_action(true, true, true, Some(Holds), e), CodeStreamAction::Continue, "{e:?}");
+            assert_eq!(code_stream_action(true, true, true, Some(Lost), e), CodeStreamAction::Retire, "{e:?}");
+            assert_eq!(code_stream_action(true, true, false, Some(Lost), e), CodeStreamAction::Ignore, "{e:?}");
+            assert_eq!(code_stream_action(true, true, false, Some(NoLink), e), CodeStreamAction::Ignore, "{e:?}");
+            assert_eq!(code_stream_action(true, false, true, None, e), CodeStreamAction::Ignore, "{e:?}");
+            assert_eq!(code_stream_action(false, false, false, None, e), CodeStreamAction::Continue, "{e:?}");
+            assert_eq!(code_stream_action(false, true, false, Some(Lost), e), CodeStreamAction::Continue, "{e:?}");
+            let no_link = code_stream_action(true, true, true, Some(NoLink), e);
+            if e == CodeStreamEvent::Completion {
+                assert_eq!(no_link, CodeStreamAction::Continue);
+            } else {
+                assert_eq!(no_link, CodeStreamAction::Ignore, "{e:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn retiring_takes_only_that_peers_streams() {
+        let mut by_sid: HashMap<(String, u32), &str> = HashMap::new();
+        by_sid.insert(("sid-s1".into(), 1), "s1-a");
+        by_sid.insert(("sid-s1".into(), 3), "s1-b");
+        by_sid.insert(("sid-other".into(), 1), "other");
+        let mut taken = take_streams_of(&mut by_sid, "sid-s1");
+        taken.sort();
+        assert_eq!(taken, vec!["s1-a", "s1-b"]);
+        assert!(!by_sid.keys().any(|(p, _)| p == "sid-s1"));
+        assert_eq!(by_sid.len(), 1);
+        assert!(take_streams_of(&mut by_sid, "sid-s1").is_empty());
+    }
+
+    /// An in-flight stream with `bytes` already written to its `.part`.
+    fn incoming(part_path: &PathBuf, bytes: &[u8]) -> IncomingFile {
+        std::fs::write(part_path, bytes).expect("write fixture part");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(part_path)
+            .expect("open fixture part");
+        IncomingFile {
+            id: "id-1".into(),
+            name: "f.bin".into(),
+            size: bytes.len() as u64 * 2,
+            received: Arc::new(AtomicU64::new(bytes.len() as u64)),
+            ranges: Arc::new(std::sync::Mutex::new(vec![(0, bytes.len() as u64)])),
+            file: Arc::new(file),
+            part_path: part_path.clone(),
+            full: None,
+            inflight: Arc::new(AtomicI64::new(0)),
+            end_seen: Arc::new(AtomicBool::new(false)),
+            completion: Arc::new(crate::recv::CompletionGate::default()),
+            ack_sid: 0,
+            last_tick: 0,
+            bar: Box::new(crate::present::NoBar),
+            write_err: Arc::new(std::sync::Mutex::new(None)),
+            stdout: None,
+            sender: None,
+        }
+    }
+
+    fn part_in_temp(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("code-stream-{tag}-{}-{nanos}.part", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn applying_the_action_keeps_or_retires_the_stream() {
+        use crate::conn::CodeContinuation::{Holds, Lost, NoLink};
+        let log = crate::host::NoLog;
+        let mine = part_in_temp("mine");
+        let other = part_in_temp("other");
+        let mut by_sid: HashMap<(String, u32), IncomingFile> = HashMap::new();
+        by_sid.insert(("sid-s1".into(), 1), incoming(&mine, b"abcd"));
+        by_sid.insert(("sid-x".into(), 1), incoming(&other, b"wxyz"));
+
+        // Holds: every event acts; the stream stays.
+        for e in EVENTS {
+            let action = code_stream_action(true, true, true, Some(Holds), e);
+            assert!(apply_code_stream_action(action, &mut by_sid, "sid-s1", &log, e).await.unwrap());
+        }
+        assert!(by_sid.contains_key(&("sid-s1".to_string(), 1)));
+
+        // NoLink: a completion finishes; chunk and file-end are not acted on.
+        let action = code_stream_action(true, true, true, Some(NoLink), CodeStreamEvent::Completion);
+        assert!(apply_code_stream_action(action, &mut by_sid, "sid-s1", &log, CodeStreamEvent::Completion)
+            .await
+            .unwrap());
+        for e in [CodeStreamEvent::Chunk, CodeStreamEvent::FileEnd] {
+            let action = code_stream_action(true, true, true, Some(NoLink), e);
+            assert!(!apply_code_stream_action(action, &mut by_sid, "sid-s1", &log, e).await.unwrap());
+        }
+        assert!(by_sid.contains_key(&("sid-s1".to_string(), 1)));
+
+        // Lost on a file-cancel: the transfer ends before the cancel runs; the
+        // stream is released and its `.part` is kept with its bytes.
+        let action = code_stream_action(true, true, true, Some(Lost), CodeStreamEvent::Cancel);
+        assert!(apply_code_stream_action(action, &mut by_sid, "sid-s1", &log, CodeStreamEvent::Cancel)
+            .await
+            .is_err());
+        assert!(!by_sid.contains_key(&("sid-s1".to_string(), 1)));
+        assert_eq!(std::fs::read(&mine).expect("the .part is kept"), b"abcd");
+        assert!(by_sid.contains_key(&("sid-x".to_string(), 1)));
+
+        let _ = std::fs::remove_file(&mine);
+        let _ = std::fs::remove_file(&other);
+    }
+}
+
+/// The signer rule, held at the call sites themselves (CONTRACT.md, "Link
+/// channel binding": the signer uses the PEER's nonce, the verifier its own).
+/// A hello or announce signed over OUR nonce verifies here and fails at the
+/// peer, whose Err arm then drops the link. This reads this file's source, so
+/// it fails if any signing site, including the answering hello in the verified
+/// arm and the re-announce after it, takes its binding from anywhere but
+/// `signing_binding` over the peer's nonce map. The needles are built with
+/// `concat!` so this module never matches itself.
+#[cfg(test)]
+mod signing_call_sites {
+    /// This file, cut just before this module, so the scans below cannot
+    /// match their own needles, test names or messages.
+    const FULL: &str = include_str!("dispatch.rs");
+    fn src() -> &'static str {
+        let end = FULL.find(concat!("mod signing", "_call_sites")).expect("this module");
+        &FULL[..end]
+    }
+    const HELLO: &str = concat!("make_fleet", "_hello(");
+    const ANNOUNCE: &str = concat!("make", "_announce(");
+    const SIGN_VAR: &str = concat!("&sign", "_cb");
+    const BOUND: &str = concat!("Some(sign", "_cb)");
+    const SIGNING_CALL: &str = concat!("signing", "_binding(");
+    const SIGNING_FN: &str = concat!("fn signing", "_binding(");
+    const THEIRS: &str = concat!("&bind", "_theirs");
+    const OURS: &str = concat!("bind", "_ours");
+    const NONCE_ARM: &str = concat!("Some(\"l3", "-nonce\") =>");
+    const ACCEPT: &str = concat!("accept_peer", "_nonce(");
+    const STORE_THEIRS: &str = concat!("bind_theirs", ".insert(");
+    const HELLO_ARM: &str = concat!("Some(fleet::", "HELLO) =>");
+    const OWN_GUARD: &str = concat!("is_own", "_device(");
+    // Admission in the hello arm goes through `admit_verified_fleet_hello`,
+    // which is the only caller of `admit_fleet` in this file.
+    const ADMIT: &str = concat!("admit_verified", "_fleet_hello(");
+    const ADMIT_FLEET: &str = concat!("admit", "_fleet(");
+    const ADMIT_FN: &str = concat!("fn admit_verified", "_fleet_hello(");
+    const ANN_VERIFIES: [&str; 2] = [concat!("pending.verify", "(&cb)"), concat!("ann.verify", "(&cb)")];
+    const ACCEPT_SEQ: &str = concat!("accept", "_seq(");
+
+    fn squash(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The argument list of the call whose `(` ends at `open`.
+    fn call_args(src: &str, open: usize) -> &str {
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open + 1..open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        &src[open..]
+    }
+
+    #[test]
+    fn every_signing_site_signs_over_the_peer_binding() {
+        let mut sites = 0;
+        for needle in [HELLO, ANNOUNCE] {
+            for (at, _) in src().match_indices(needle) {
+                let args = squash(call_args(src(), at + needle.len() - 1));
+                assert!(
+                    args.starts_with(SIGN_VAR),
+                    "a signing call signs over `{args}`, not the peer-nonce binding (`sign_cb`)"
+                );
+                sites += 1;
+            }
+        }
+        // Non-vacuous: the known sites are the ChannelReady hello and announce,
+        // the l3-nonce answer's hello and announce, the verified arm's
+        // answering hello and its re-announce.
+        assert!(sites >= 6, "found only {sites} signing sites");
+    }
+
+    #[test]
+    fn every_sign_cb_comes_from_signing_binding_over_the_peer_nonce_map() {
+        let flat = squash(src());
+        let mut bound = 0;
+        for (at, _) in flat.match_indices(BOUND) {
+            let rest = &flat[at + BOUND.len()..];
+            let rest = rest.strip_prefix('=').unwrap_or("");
+            assert!(
+                rest.starts_with(SIGNING_CALL),
+                "a `sign_cb` is bound from something other than signing_binding: {}",
+                rest.chars().take(80).collect::<String>()
+            );
+            bound += 1;
+        }
+        assert!(bound >= 5, "found only {bound} sign_cb bindings");
+        for (at, _) in src().match_indices(SIGNING_CALL) {
+            if src()[..at].ends_with("fn ") {
+                continue;
+            }
+            let args = call_args(src(), at + SIGNING_CALL.len() - 1);
+            assert!(args.contains(THEIRS), "signing_binding called without the peer-nonce map: {args}");
+            assert!(!args.contains(OURS), "signing_binding called with OUR nonce map: {args}");
+        }
+    }
+
+    /// The l3-nonce arm refuses a challenge we issued BEFORE it can store it
+    /// as the peer's, and logs the stable reason.
+    #[test]
+    fn a_reflected_challenge_is_refused_before_it_is_stored() {
+        let arm = src().find(NONCE_ARM).expect("l3-nonce arm");
+        let guard = arm + src()[arm..].find(ACCEPT).expect("reflection guard in the l3-nonce arm");
+        let store = arm + src()[arm..].find(STORE_THEIRS).expect("peer nonce stored");
+        assert!(guard < store, "the reflection guard must run before the nonce is stored");
+        let logged = &src()[guard..store];
+        assert!(logged.contains("REFLECTED_CHALLENGE"), "the refusal is logged with its stable reason");
+    }
+
+    /// The fleet-hello arm refuses a hello carrying our own key BEFORE any
+    /// admission.
+    #[test]
+    fn our_own_key_is_refused_before_admission() {
+        let arm = src().find(HELLO_ARM).expect("fleet-hello arm");
+        let guard = arm + src()[arm..].find(OWN_GUARD).expect("own-key guard in the fleet-hello arm");
+        let admit = arm + src()[arm..].find(ADMIT).expect("admission in the fleet-hello arm");
+        assert!(guard < admit, "the own-key guard must precede admission");
+        // And nothing in this file admits a link any other way: the one
+        // `admit_fleet` call is inside the admission function.
+        let f = src().find(ADMIT_FN).expect("the admission function");
+        let body = &src()[f..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        let calls: Vec<usize> = src().match_indices(ADMIT_FLEET).map(|(i, _)| i).collect();
+        assert_eq!(calls.len(), 1, "admission happens outside the admission function");
+        assert!(body.contains(ADMIT_FLEET), "the admission function does not admit");
+        assert!(calls[0] > f && calls[0] < f + body.len());
+    }
+
+    /// Every verified announce is checked against our own overlay key before
+    /// its sequence is accepted and a route can be installed.
+    #[test]
+    fn an_announce_carrying_our_own_key_is_dropped_before_routing() {
+        let mut sites = 0;
+        for needle in ANN_VERIFIES {
+            for (at, _) in src().match_indices(needle) {
+                let seq = at + src()[at..].find(ACCEPT_SEQ).expect("sequence check after verify");
+                assert!(
+                    src()[at..seq].contains(OWN_GUARD),
+                    "an announce verified at byte {at} reaches accept_seq without the own-key refusal"
+                );
+                sites += 1;
+            }
+        }
+        assert_eq!(sites, 2, "both announce verification sites are covered");
+    }
+
+    #[test]
+    fn signing_binding_reads_the_peer_nonce_map() {
+        let at = src().find(SIGNING_FN).expect("signing_binding exists");
+        let body = &src()[at..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        assert!(body.contains("theirs.get(pid)"));
+        assert!(!body.contains("ours"));
+    }
+}
+
+/// Every fleet direct arm in the serving loop goes through the pair-link
+/// rule. Checking the rule alone proved nothing about the call sites: a site
+/// that computed its own inputs (or skipped the check) could arm a fleet
+/// direct over a live pair link while the unit tests stayed green.
+#[cfg(test)]
+mod fleet_arm_wiring_tests {
+    const FULL: &str = include_str!("dispatch.rs");
+
+    /// The production source: everything before this module, so no needle
+    /// can match this module's own text.
+    fn src() -> &'static str {
+        let end = FULL.find(concat!("mod fleet_arm_", "wiring_tests")).expect("this module");
+        &FULL[..end]
+    }
+
+    #[test]
+    fn every_fleet_arm_checks_the_pair_link_first() {
+        let arm = concat!(".start_direct", "_fleet(");
+        let guard = concat!("fleet_arm_blocked_by", "_pair_link(&conn, ");
+        let src = src();
+        let sites: Vec<usize> = src.match_indices(arm).map(|(i, _)| i).collect();
+        assert_eq!(sites.len(), 3, "the fleet arm sites changed; re-check this rule");
+        for at in sites {
+            // Back up to a char boundary: the source is not all ASCII.
+            let mut lo = at.saturating_sub(2500);
+            while !src.is_char_boundary(lo) {
+                lo += 1;
+            }
+            let before = &src[lo..at];
+            let g = before.rfind(guard).unwrap_or_else(|| {
+                panic!("a fleet arm at byte {at} is not behind the pair-link rule")
+            });
+            assert!(
+                !before[g..].contains(arm),
+                "a fleet arm at byte {at} borrows another site's pair-link check"
+            );
+        }
+        // The rule's inputs are read in exactly one place: the helper.
+        assert_eq!(
+            src.matches(concat!("fleet_arm_skips", "_pair_link(trusted")).count(),
+            1,
+            "a site reads the link for the pair-link rule on its own"
+        );
+    }
 }

@@ -394,9 +394,13 @@ pub enum Ev {
     /// source) so a stale ready from a replaced primary cannot authorize old
     /// worker sources on the new link.
     DirectWorkersReady(String, Vec<Arc<dyn Transport>>, SourceId),
+    /// Loop-owned token to drain one buffered event after source adoption.
+    ReplaySource(SourceId),
+    /// Loop-owned, source-bound room departure deferred behind replay.
+    ReplayDeparture(String, SourceId, Value),
     Control(String, Value),
     /// A transport-origin event with immutable provenance. `pid` must match the
-    /// inner Control/PcState/ChannelReady pid; nested Sourced is invalid. The
+    /// inner Control/PcState/ChannelReady/Chunk pid; nested Sourced is invalid. The
     /// handler gate checks `source` against the current link immediately before
     /// dispatch.
     Sourced {
@@ -1766,6 +1770,26 @@ pub struct Peer {
     /// TURN over TCP/TLS bridges for this connection (`turn_bridge`); `None`
     /// when the config had no TCP or TLS TURN URL.
     turn_bridges: Option<Arc<crate::turn_bridge::TurnBridges>>,
+    /// This connection's generation, sent as `pc` on every description and
+    /// candidate so the far end can tell a rebuilt connection on the same sid
+    /// from a renegotiation of this one.
+    generation: u32,
+}
+
+/// The remote DTLS fingerprint a live connection may record next. A
+/// connection's DTLS certificate is fixed for its life (an ICE restart keeps
+/// it, a rebuild is a new connection), so once one is recorded, a description
+/// that names a different one, or none, is refused.
+fn next_remote_fingerprint(recorded: Option<&str>, offered: Option<String>) -> Result<Option<String>> {
+    match (recorded, offered.as_deref()) {
+        (Some(old), Some(new)) if old != new => Err(anyhow!(
+            "remote DTLS fingerprint changed on a live connection; description refused"
+        )),
+        (Some(_), None) => Err(anyhow!(
+            "remote description names no DTLS fingerprint on a live connection; description refused"
+        )),
+        _ => Ok(offered),
+    }
 }
 
 /// Extract `a=fingerprint:...` from an SDP (normalized uppercase hex).
@@ -1778,6 +1802,9 @@ fn sdp_fingerprint(sdp: &str) -> Option<String> {
 struct PeerSignalState {
     pending_candidates: Vec<RTCIceCandidateInit>,
     has_remote: bool,
+    /// The `pc` tag of the remote description applied last (the sender's
+    /// peer-connection generation), `None` from a sender that does not tag.
+    remote_pc: Option<u64>,
 }
 
 /// What `handle_signal` did with a relayed signal.
@@ -1802,9 +1829,10 @@ impl Peer {
         ice_servers: Vec<RTCIceServer>,
         relay_only: bool,
         sio: Client,
-        tx: mpsc::UnboundedSender<Ev>,
+        tx: impl Into<EvSink>,
         generation: u32,
     ) -> Result<Arc<Peer>> {
+        let tx: EvSink = tx.into();
         let source = SourceId::next();
         crate::hooks::debug(&format!(
             "tunlion: ICE-CONFIG peer={peer_id} servers={} urls={:?}",
@@ -1897,7 +1925,7 @@ impl Peer {
                             let _ = sio
                                 .emit(
                                     "signal",
-                                    json!({ "to": to, "data": { "type": "candidate", "uid": uid.clone(), "candidate": init } }),
+                                    json!({ "to": to, "data": { "type": "candidate", "uid": uid.clone(), "pc": generation, "candidate": init } }),
                                 )
                                 .await;
                         }
@@ -1936,7 +1964,7 @@ impl Peer {
                 .ok_or_else(|| anyhow!("no local description"))?;
             sio.emit(
                 "signal",
-                json!({ "to": peer_id, "data": { "type": "description", "uid": my_uid.clone(), "description": advertise_max_message_size(&ld) } }),
+                json!({ "to": peer_id, "data": { "type": "description", "uid": my_uid.clone(), "pc": generation, "description": advertise_max_message_size(&ld) } }),
             )
             .await
             .ok();
@@ -1989,11 +2017,13 @@ impl Peer {
             state: Mutex::new(PeerSignalState {
                 pending_candidates: Vec::new(),
                 has_remote: false,
+                remote_pc: None,
             }),
             sio,
             closed,
             fps: Mutex::new((None, None)),
             turn_bridges,
+            generation,
         });
         // local fingerprint from whatever description we already sent (offer
         // path emits before Peer exists; capture lazily on first access too)
@@ -2029,6 +2059,20 @@ impl Peer {
         is_live_state(self.pc.connection_state())
     }
 
+    /// The far end's peer-connection tag from the remote description applied
+    /// last; `None` before one is applied or from a sender that does not tag.
+    pub async fn remote_pc(&self) -> Option<u64> {
+        self.state.lock().await.remote_pc
+    }
+
+    /// Has this establish heard back from the far end: a remote description
+    /// applied, or ICE checking or connected? An establish timer should leave
+    /// such a connection to the C3 watchdog rather than abandon it.
+    pub async fn establishing_progress(&self) -> bool {
+        let has_remote = self.state.lock().await.has_remote;
+        has_remote || ice_progressing(self.pc.ice_connection_state())
+    }
+
     /// C4: nudge ICE recovery after a transient 'disconnected' (impolite side
     /// only, mirroring the browser).
     pub async fn restart_ice(&self) {
@@ -2042,7 +2086,7 @@ impl Peer {
                         .sio
                         .emit(
                             "signal",
-                            json!({ "to": self.id, "data": { "type": "description", "description": advertise_max_message_size(&ld) } }),
+                            json!({ "to": self.id, "data": { "type": "description", "pc": self.generation, "description": advertise_max_message_size(&ld) } }),
                         )
                         .await;
                 }
@@ -2098,11 +2142,17 @@ impl Peer {
                     // Stale answer (e.g. to an offer this side abandoned).
                     return Ok(SignalOutcome::Handled);
                 }
-                self.fps.lock().await.1 = sdp_fingerprint(&desc.sdp);
+                let remote_fp = {
+                    let fps = self.fps.lock().await;
+                    next_remote_fingerprint(fps.1.as_deref(), sdp_fingerprint(&desc.sdp))?
+                };
                 self.pc.set_remote_description(desc).await?;
+                // Recorded only once the description is in force.
+                self.fps.lock().await.1 = remote_fp;
                 let pending = {
                     let mut st = self.state.lock().await;
                     st.has_remote = true;
+                    st.remote_pc = data["pc"].as_u64();
                     std::mem::take(&mut st.pending_candidates)
                 };
                 for c in pending {
@@ -2122,7 +2172,7 @@ impl Peer {
                     self.sio
                         .emit(
                             "signal",
-                            json!({ "to": self.id, "data": { "type": "description", "description": advertise_max_message_size(&ld) } }),
+                            json!({ "to": self.id, "data": { "type": "description", "pc": self.generation, "description": advertise_max_message_size(&ld) } }),
                         )
                         .await
                         .ok();
@@ -2196,8 +2246,17 @@ impl Peer {
         if same_host {
             return Some("direct over lo".into());
         }
-        // Resolve the LOCAL address to a real interface name
-        let iface = resolve_iface_name(&pair.local.address);
+        // Resolve the LOCAL address to a real interface name. A reflexive
+        // local candidate names the NAT mapping, so use its base, or failing
+        // that the source address the OS routes to the remote from.
+        let iface_addr = selected_local_iface_addr(
+            pair.local.typ,
+            &pair.local.address,
+            &pair.local.related_address,
+            &pair.remote.address,
+            pair.remote.port,
+        );
+        let iface = resolve_iface_name(&iface_addr);
         if is_tailscale_addr(&pair.local.address) || is_tailscale_addr(&pair.remote.address) {
             return Some(format!("direct over {iface}"));
         }
@@ -2296,6 +2355,56 @@ pub fn is_live_state(state: RTCPeerConnectionState) -> bool {
             | RTCPeerConnectionState::Connecting
             | RTCPeerConnectionState::Connected
     )
+}
+
+/// ICE states that mean the far end has answered and pairs are being checked
+/// or have succeeded: the state-only part of `Peer::establishing_progress`.
+pub fn ice_progressing(state: RTCIceConnectionState) -> bool {
+    matches!(
+        state,
+        RTCIceConnectionState::Checking
+            | RTCIceConnectionState::Connected
+            | RTCIceConnectionState::Completed
+    )
+}
+
+/// The address whose interface carries a selected local candidate. A server-
+/// or peer-reflexive candidate's own address is the NAT's public mapping,
+/// which no local interface owns (that read "direct over ?"); its base, the
+/// related address, is the local socket it was learned from. Falls back to
+/// the candidate's own address when the base is absent or unspecified.
+pub fn local_iface_addr(typ: RTCIceCandidateType, address: &str, related: &str) -> String {
+    let reflexive = matches!(typ, RTCIceCandidateType::Srflx | RTCIceCandidateType::Prflx);
+    let base_usable = related
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| !ip.is_unspecified());
+    if reflexive && base_usable {
+        related.to_string()
+    } else {
+        address.to_string()
+    }
+}
+
+/// `local_iface_addr`, plus the last resort for a reflexive candidate with no
+/// usable base: the source address the OS routes to the remote from.
+pub fn selected_local_iface_addr(
+    typ: RTCIceCandidateType,
+    address: &str,
+    related: &str,
+    remote_address: &str,
+    remote_port: u16,
+) -> String {
+    let addr = local_iface_addr(typ, address, related);
+    let reflexive = matches!(typ, RTCIceCandidateType::Srflx | RTCIceCandidateType::Prflx);
+    if !reflexive || addr != address {
+        return addr;
+    }
+    remote_address
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .and_then(|ip| source_ip_for(std::net::SocketAddr::new(ip, remote_port)))
+        .map(|ip| ip.to_string())
+        .unwrap_or(addr)
 }
 
 /// The concrete endpoints of a selected ICE candidate pair, for path display.
@@ -2499,10 +2608,56 @@ fn resolve_iface_name(addr: &str) -> String {
     crate::hooks::resolve_iface_name(addr)
 }
 
+/// Where a WebRTC peer's events go. A plain sink is the bare channel. A waking
+/// sink also wakes the consumer's loop once per batch: it queues one
+/// `Ev::BuildWake` on `wake` when `pending` was clear, and the consumer clears
+/// `pending` before it drains. The event itself goes straight onto `tx`, with
+/// no intermediate queue or task, so whatever drains `tx` on departure or
+/// replacement sees every event that was sent.
+///
+/// The peerloop needs the waking form: an installed link's events land on a
+/// candidate-local channel that only `pump_builds` drains, once per loop turn,
+/// and without a wake they waited for an unrelated event (the 1200 ms
+/// DIRECT-OFFER re-emit, in practice).
+#[derive(Clone)]
+pub struct EvSink {
+    tx: mpsc::UnboundedSender<Ev>,
+    wake: Option<(mpsc::UnboundedSender<Ev>, Arc<std::sync::atomic::AtomicBool>)>,
+}
+
+impl EvSink {
+    pub fn waking(
+        tx: mpsc::UnboundedSender<Ev>,
+        wake: mpsc::UnboundedSender<Ev>,
+        pending: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        EvSink { tx, wake: Some((wake, pending)) }
+    }
+
+    /// Queue `ev`, then wake the consumer unless a wake is already pending. A
+    /// closed receiver (the link was dropped or replaced) gets nothing and
+    /// wakes nothing.
+    pub fn send(&self, ev: Ev) -> Result<(), mpsc::error::SendError<Ev>> {
+        self.tx.send(ev)?;
+        if let Some((wake, pending)) = &self.wake {
+            if !pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = wake.send(Ev::BuildWake);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl From<mpsc::UnboundedSender<Ev>> for EvSink {
+    fn from(tx: mpsc::UnboundedSender<Ev>) -> Self {
+        EvSink { tx, wake: None }
+    }
+}
+
 async fn wire_channel(
     peer_id: String,
     dc: Arc<RTCDataChannel>,
-    tx: mpsc::UnboundedSender<Ev>,
+    tx: EvSink,
     closed: Arc<std::sync::atomic::AtomicBool>,
     polite: bool,
     source: SourceId,
@@ -2615,12 +2770,14 @@ async fn wire_channel(
                                         buf[4], buf[5], buf[6], buf[7],
                                         buf[8], buf[9], buf[10], buf[11],
                                     ]);
-                                    let _ = tx.send(Ev::Chunk(
-                                        peer_id.clone(),
-                                        sid,
-                                        Some(offset),
-                                        Bytes::copy_from_slice(&buf[12..n]),
-                                    ));
+                                    let _ = tx.send(Ev::Sourced {
+                                        pid: peer_id.clone(),
+                                        source,
+                                        inner: Box::new(Ev::Chunk(
+                                            peer_id.clone(), sid, Some(offset),
+                                            Bytes::copy_from_slice(&buf[12..n]),
+                                        )),
+                                    });
                                 }
                             }
                         }
@@ -2728,7 +2885,7 @@ async fn wire_channel(
 /// stream until the reader takes them. `ready` is None when the link was
 /// closed while opening; the reader still runs so the channel is drained and
 /// marked dead, and it forwards nothing for a closed link.
-fn announce_then_read<F>(tx: &mpsc::UnboundedSender<Ev>, ready: Option<Ev>, reader: F)
+fn announce_then_read<F>(tx: &EvSink, ready: Option<Ev>, reader: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -2741,6 +2898,62 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A waking sink puts the event straight on the channel (no task, so it
+    /// is there when `send` returns), wakes once until the consumer clears
+    /// `pending`, and on a closed channel neither queues nor wakes.
+    #[test]
+    fn a_waking_sink_queues_directly_and_wakes_once_per_clear() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+        let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<Ev>();
+        let pending = Arc::new(AtomicBool::new(false));
+        let sink = EvSink::waking(tx, wake_tx, pending.clone());
+        for i in 0..3 {
+            sink.send(Ev::Control("p".into(), json!({ "i": i }))).unwrap();
+        }
+        for i in 0..3 {
+            match rx.try_recv() {
+                Ok(Ev::Control(_, v)) => assert_eq!(v["i"], i),
+                _ => panic!("event {i} was not queued synchronously"),
+            }
+        }
+        assert!(matches!(wake_rx.try_recv(), Ok(Ev::BuildWake)));
+        assert!(wake_rx.try_recv().is_err(), "more than one wake before a clear");
+
+        pending.store(false, Ordering::SeqCst);
+        sink.send(Ev::Control("p".into(), json!({}))).unwrap();
+        assert!(matches!(wake_rx.try_recv(), Ok(Ev::BuildWake)), "the clear must re-arm");
+
+        pending.store(false, Ordering::SeqCst);
+        drop(rx);
+        assert!(sink.send(Ev::Control("p".into(), json!({}))).is_err());
+        assert!(wake_rx.try_recv().is_err(), "a closed channel woke the consumer");
+    }
+
+    /// A plain sink is the bare channel: no wake channel, nothing else sent.
+    #[test]
+    fn a_plain_sink_only_queues() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+        let sink: EvSink = tx.into();
+        sink.send(Ev::BuildWake).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Ev::BuildWake)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_live_connection_keeps_its_remote_dtls_fingerprint() {
+        // First description records it.
+        assert_eq!(next_remote_fingerprint(None, Some("AA".into())).unwrap().as_deref(), Some("AA"));
+        // A renegotiation naming the same certificate is accepted.
+        assert_eq!(next_remote_fingerprint(Some("AA"), Some("AA".into())).unwrap().as_deref(), Some("AA"));
+        // Once recorded, a description without one is refused.
+        assert!(next_remote_fingerprint(Some("AA"), None).is_err());
+        // Before anything is recorded, a missing one records nothing.
+        assert_eq!(next_remote_fingerprint(None, None).unwrap(), None);
+        // A different certificate on the same connection is refused.
+        assert!(next_remote_fingerprint(Some("AA"), Some("BB".into())).is_err());
+    }
 
     struct StubTransport;
 
@@ -3023,7 +3236,7 @@ mod tests {
             };
             let transport: Arc<dyn Transport> = Arc::new(StubTransport);
             announce_then_read(
-                &tx,
+                &tx.clone().into(),
                 Some(Ev::ChannelReady("peer".into(), transport)),
                 reader,
             );
@@ -3238,7 +3451,7 @@ mod tests {
     async fn a_closed_channel_announces_nothing_but_still_reads() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
         let (ran_tx, ran_rx) = tokio::sync::oneshot::channel::<()>();
-        announce_then_read(&tx, None, async move {
+        announce_then_read(&tx.clone().into(), None, async move {
             let _ = ran_tx.send(());
         });
         tokio::time::timeout(Duration::from_secs(5), ran_rx)
@@ -3266,6 +3479,75 @@ mod tests {
             RTCPeerConnectionState::Connecting,
             RTCIceConnectionState::Checking,
         ));
+    }
+
+    /// The establish timer keeps a connection whose ICE has heard the far end
+    /// and abandons one that has not.
+    #[test]
+    fn ice_progressing_is_checking_or_connected_only() {
+        for s in [
+            RTCIceConnectionState::Checking,
+            RTCIceConnectionState::Connected,
+            RTCIceConnectionState::Completed,
+        ] {
+            assert!(ice_progressing(s), "{s} is progress");
+        }
+        for s in [
+            RTCIceConnectionState::New,
+            RTCIceConnectionState::Disconnected,
+            RTCIceConnectionState::Failed,
+            RTCIceConnectionState::Closed,
+        ] {
+            assert!(!ice_progressing(s), "{s} is not progress");
+        }
+    }
+
+    /// A reflexive local candidate resolves its interface from its base, not
+    /// from the public mapping no interface owns ("direct over ?").
+    #[test]
+    fn reflexive_local_candidate_resolves_by_its_base() {
+        assert_eq!(
+            local_iface_addr(RTCIceCandidateType::Srflx, "74.152.64.39", "10.0.0.4"),
+            "10.0.0.4"
+        );
+        assert_eq!(
+            local_iface_addr(RTCIceCandidateType::Prflx, "74.152.64.39", "10.0.0.4"),
+            "10.0.0.4"
+        );
+        assert_eq!(
+            local_iface_addr(RTCIceCandidateType::Srflx, "74.152.64.39", "0.0.0.0"),
+            "74.152.64.39",
+            "an unspecified base is not an interface"
+        );
+        assert_eq!(
+            local_iface_addr(RTCIceCandidateType::Srflx, "74.152.64.39", ""),
+            "74.152.64.39"
+        );
+        assert_eq!(
+            local_iface_addr(RTCIceCandidateType::Host, "10.0.0.4", "1.2.3.4"),
+            "10.0.0.4",
+            "a host candidate is its own interface address"
+        );
+    }
+
+    /// With no usable base, a reflexive candidate falls back to the source the
+    /// OS routes to the remote from (loopback here, so no network is needed).
+    /// A host candidate never takes the fallback.
+    #[test]
+    fn reflexive_candidate_without_base_uses_the_routed_source() {
+        assert_eq!(
+            selected_local_iface_addr(RTCIceCandidateType::Srflx, "74.152.64.39", "", "127.0.0.1", 9),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            selected_local_iface_addr(RTCIceCandidateType::Srflx, "74.152.64.39", "10.0.0.4", "127.0.0.1", 9),
+            "10.0.0.4",
+            "a usable base wins over the routed source"
+        );
+        assert_eq!(
+            selected_local_iface_addr(RTCIceCandidateType::Host, "10.0.0.4", "", "127.0.0.1", 9),
+            "10.0.0.4"
+        );
     }
 
     #[test]

@@ -13,6 +13,10 @@ release build failed and nothing was published under it.
 
 ## [Unreleased]
 
+- A one-time code now covers exactly the connection its handshake confirmed,
+  on both the sending and the receiving side. If that connection is rebuilt
+  after the code was confirmed, nothing more is sent or accepted on the code;
+  run the transfer again with a fresh code.
 - Browser transfer admission through the shared policy core is prepared in
   #675/#677 and is not part of 0.9.4. The browser remains pairwise-only.
 - Invitations through one shared core policy are prepared in #662 and are not

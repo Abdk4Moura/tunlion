@@ -55,8 +55,8 @@ impl Ownership {
 
 impl Conn {
     /// Record that `pid` is a LAN link authenticated with `secret` for `name`.
-    /// The reservation carries the exact attempt and device binding, but it
-    /// never makes the link trusted, verified, Proven, or worker-keyed.
+    /// The reservation carries the exact attempt and device binding. It mints
+    /// no worker key; adoption makes a live device binding the pair.
     pub fn seed_lan(&mut self, pid: &str, name: &str, secret: &str, fleet: bool, attempt: AttemptId) {
         self.roster.insert(pid.to_string(), json!({ "id": pid, "name": name, "via": lan::ROUTE_LAN }));
         self.next_gen += 1;
@@ -90,9 +90,9 @@ impl Conn {
 
     /// Is there a usable link to `name` already (any route)?
     ///
-    /// A LAN link is deliberately neither trusted nor `verified_name`d, so the
-    /// warm/Proven matcher cannot see it. Match it by its own authenticated
-    /// reservation instead: a live `ROUTE_LAN` transport whose reservation name
+    /// A LAN link whose binding no longer resolves is neither trusted nor
+    /// `verified_name`d, so the warm/Proven matcher cannot see it. Match it by
+    /// its own authenticated reservation instead: a live `ROUTE_LAN` transport whose reservation name
     /// is this device. This is identity for DEDUP only and grants no capability.
     pub fn has_link_to(&self, name: &str) -> bool {
         crate::conn::warm_link_for(self, name).is_some()

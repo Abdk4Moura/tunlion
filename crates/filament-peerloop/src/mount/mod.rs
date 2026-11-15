@@ -105,6 +105,10 @@ pub async fn handle_mount_open(
         let sib = crate::shell_gate::sibling_facts(conn, pid, cap::CAP_MOUNT);
         let record_grants = record_grants || (sib.is_sibling && sib.owner_grant);
         let has_grant = has_grant || (sib.is_sibling && sib.owner_grant);
+        // Pair: this device's own record mount grant counts as an explicit grant
+        // in authoritative mode too; the deny read above still outranks it.
+        let (outcome, has_grant) = crate::shell_gate::pair_facts(conn, pid, cap::CAP_MOUNT, ak_caps)
+            .apply(outcome, has_grant);
         // A proven sibling's identity answers "is this the device the grant
         // names" as strongly as a pair MAC does (same rule as the shell fold).
         let trusted_for_grant = trusted || conn.link(pid).is_some_and(|l| l.fleet_proven());
@@ -247,6 +251,9 @@ mod tests {
     struct TestHost {
         authoritative: bool,
         grant: bool,
+        /// THIS device's own record lists `mount` for the peer (a pair grant),
+        /// read through `device_record_grants` and `device_allows`.
+        record_grant: bool,
         refusal: Option<&'static str>,
         calls: AtomicU64,
         enqueued: Mutex<Vec<(String, String)>>,
@@ -257,6 +264,7 @@ mod tests {
             Arc::new(Self {
                 authoritative,
                 grant,
+                record_grant: false,
                 refusal: None,
                 calls: AtomicU64::new(0),
                 enqueued: Mutex::new(Vec::new()),
@@ -265,6 +273,12 @@ mod tests {
 
         fn enqueued(&self) -> Vec<(String, String)> {
             self.enqueued.lock().unwrap().clone()
+        }
+
+        /// Either grant source: the owner-signed store or this device's own
+        /// record grant to its pair.
+        fn granted(&self) -> bool {
+            self.grant || self.record_grant
         }
     }
 
@@ -308,13 +322,19 @@ mod tests {
                 .unwrap()
                 .push((peer.to_string(), capability.to_string()));
         }
+        fn device_allows(&self, _name: &str, capability: &str) -> bool {
+            self.record_grant && capability == "mount"
+        }
+        fn device_record_grants(&self, _name: &str, capability: &str) -> bool {
+            self.record_grant && capability == "mount"
+        }
         fn cap_gate_effective(&self, gate: CapGate<'_>) -> cap::GateDecision {
             self.calls.fetch_add(1, Ordering::Relaxed);
             assert_eq!(gate.action, "mount");
             assert_eq!(gate.resource, "self");
             assert_eq!(gate.device_pub, Some(&DEVICE));
-            assert_eq!(gate.has_explicit_grant, self.grant);
-            assert_eq!(gate.legacy_allowed, self.grant);
+            assert_eq!(gate.has_explicit_grant, self.granted());
+            assert_eq!(gate.legacy_allowed, self.granted());
             assert!(!gate.scoped_in_bounds, "mount scoped default remains held out");
             assert!(!gate.ceiling_authorizes);
             assert!(!gate.denied);
@@ -322,7 +342,7 @@ mod tests {
             if let Some(reason) = self.refusal {
                 return cap::GateDecision::Deny { cap_reason: Some(reason.into()) };
             }
-            if self.grant {
+            if self.granted() {
                 assert!(matches!(gate.outcome, cap::CapOutcome::Authorized));
                 cap::GateDecision::Allow
             } else {
@@ -445,6 +465,45 @@ mod tests {
         assert!(muxes.is_empty());
     }
 
+    /// Pairwise-first, through the real mount gate: under authoritative, a
+    /// mount grant this device gave its pair (no owner-signed mount grant; the
+    /// signed store holds transfer only) admits the open, and without the
+    /// record grant the same open is refused. Pins the `pair_facts(...).apply`
+    /// line in `handle_mount_open`: without it `has_explicit_grant` and the
+    /// outcome stay at the signed store's answer and the host's checks fail.
+    #[tokio::test]
+    async fn a_pair_record_mount_grant_is_admitted_under_authoritative() {
+        let share = Share::new();
+        for record_grant in [true, false] {
+            let host = Arc::new(TestHost {
+                authoritative: true,
+                grant: false,
+                record_grant,
+                refusal: None,
+                calls: AtomicU64::new(0),
+                enqueued: Mutex::new(Vec::new()),
+            });
+            let t = Arc::new(CaptureTransport::default());
+            let (mut conn, _far) = connection(host.clone(), t.clone()).await;
+            conn.links.get_mut(PID).unwrap().verified_name = Some("phone".into());
+            let mut muxes = HashMap::new();
+            let handle =
+                handle_mount_open(&mut conn, PID, &open(Path::new(".")), &mut muxes, &share.0)
+                    .await;
+            assert_eq!(host.calls.load(Ordering::Relaxed), 1);
+            if record_grant {
+                assert!(handle.is_some(), "a pair mount grant must admit under authoritative");
+                assert_eq!(t.controls.lock().unwrap()[0]["type"], "mount-open-ack");
+                if let Some(h) = handle {
+                    h.abort();
+                }
+            } else {
+                assert!(handle.is_none(), "no grant is still refused");
+                assert_close(&t, "not authorized: mount capability required");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn invalid_sid_and_missing_transport_never_reach_the_gate() {
         let share = Share::new();
@@ -479,6 +538,7 @@ mod tests {
                 let host = Arc::new(TestHost {
                     authoritative,
                     grant: true,
+                    record_grant: false,
                     refusal: Some(reason),
                     calls: AtomicU64::new(0),
                     enqueued: Mutex::new(Vec::new()),

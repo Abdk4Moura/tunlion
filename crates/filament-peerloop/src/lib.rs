@@ -111,7 +111,8 @@ pub(crate) mod test_hooks;
 mod warm;
 
 pub use adoption::{
-    AdoptSource, active_binding_matches, match_adoption_source, peer_targetable,
+    AdoptSource, CodeAuthorityRefusal, CodeSession, CodeTransport, active_binding_matches,
+    code_authority_check, match_adoption_source, peer_targetable,
 };
 pub use liveness::{RevokeRecheck, direct_permitted, ice_fallback_allowed, link_dead_for, link_has_live_for};
 pub use petname::{LinkPetname, link_petname};
