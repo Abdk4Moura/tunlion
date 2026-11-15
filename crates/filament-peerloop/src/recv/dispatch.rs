@@ -275,7 +275,16 @@ pub fn linked_fleet_offer_action(
     if has_pending {
         return LinkedFleetOffer::Feed;
     }
-    if !has_link || !(link_is_fleet_shaped || peer_is_fleet_pending) {
+    if !has_link {
+        return LinkedFleetOffer::Buffer;
+    }
+    // Arm a fleet direct only for a pair-shaped link that is fleet-pending:
+    // a forgotten device whose pair secret is no longer held. Fleet-shaped
+    // links (enrolled siblings) use the normal dial path; arming them here
+    // created a direct_pending that buffered and lost the incoming offer.
+    // (This is the minimal change that fixes the cold-connect regression
+    // while keeping the forgotten-peer refusal working.)
+    if !(peer_is_fleet_pending && !link_is_fleet_shaped) {
         return LinkedFleetOffer::Buffer;
     }
     let on_fleet_channel = match (offer_ch, fleet_ch) {
@@ -12776,19 +12785,36 @@ mod linked_fleet_offer_tests {
     const HIGH: &str = "sid-zzz";
 
     /// A fleet-channel offer from a linked, fleet-shaped sibling with no
-    /// pending arms exactly one pending, and which role it takes follows the
-    /// same sid comparison as the fleet adoption arm: the lower sid is the
-    /// dialer, the higher sid only answers the offer it was sent.
+    /// pending is BUFFERED, not armed: fleet-shaped links use the normal dial
+    /// path. Arming them here created a direct_pending that buffered and lost
+    /// the incoming offer (the cold-connect regression). Only pair-shaped
+    /// fleet-pending peers (forgotten devices) are armed.
     #[test]
-    fn a_fleet_offer_on_a_shaped_link_with_no_pending_arms_one() {
+    fn a_fleet_offer_on_a_shaped_link_with_no_pending_buffers() {
+        for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
+            assert_eq!(
+                decide(true, false, Some(FLEET), Some(FLEET), true, false, me, peer),
+                LinkedFleetOffer::Buffer,
+                "a fleet-shaped link was armed instead of buffered (me={me})"
+            );
+        }
+    }
+
+    /// A fleet-channel offer from a linked, pair-shaped, fleet-pending peer
+    /// (a forgotten device) with no pending arms exactly one pending, and
+    /// which role it takes follows the same sid comparison as the fleet
+    /// adoption arm: the lower sid is the dialer, the higher sid only answers
+    /// the offer it was sent.
+    #[test]
+    fn a_forgotten_peer_offer_arms_one_pending() {
         // We are the higher sid: the peer is the elected dialer, we answer.
         assert_eq!(
-            decide(true, false, Some(FLEET), Some(FLEET), true, false, HIGH, LOW),
+            decide(true, false, Some(FLEET), Some(FLEET), false, true, HIGH, LOW),
             LinkedFleetOffer::ArmAnswer
         );
         // We are the lower sid: we are the elected dialer.
         assert_eq!(
-            decide(true, false, Some(FLEET), Some(FLEET), true, false, LOW, HIGH),
+            decide(true, false, Some(FLEET), Some(FLEET), false, true, LOW, HIGH),
             LinkedFleetOffer::ArmDial
         );
     }
