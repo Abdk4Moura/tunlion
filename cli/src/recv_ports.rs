@@ -336,6 +336,9 @@ impl RecvIdentity for CliRecv {
     fn device_cert_revoked(&self, device_pub: &[u8; 32]) -> bool {
         self.identity().device_cert_revoked(device_pub)
     }
+    fn device_tombstoned(&self, device_pub: &[u8; 32]) -> bool {
+        self.identity().device_tombstoned(device_pub)
+    }
     fn sibling_admissible(&self, device_pub: &[u8; 32]) -> bool {
         self.identity.store().sibling_admissible(device_pub)
     }

@@ -4163,6 +4163,7 @@ async fn recv_run(
                     // still visible mid-write (see `link_cut_reason`).
                     let mut cut_as_revoked: std::collections::HashSet<String> = Default::default();
                     let mut unrouted: Vec<String> = Vec::new();
+                    let held_pairs = host.devices_load();
                     for (pid, l) in &conn.links {
                         let facts = crate::recv::revocation::LinkFacts {
                             // LAN device reservations are bindings too; a LAN
@@ -4188,7 +4189,26 @@ async fn recv_run(
                             identity::now_secs(),
                             &|p: &[u8; 32]| ports.identity.device_cert_revoked(p),
                         );
+                        let held_pair_for_device = l.device_secret().is_some_and(|secret| {
+                            held_pairs.iter().any(|(name, held)| {
+                                !held.is_empty()
+                                    && held == secret
+                                    && host.device_cert_for(name).is_some_and(|cert| {
+                                        Some(cert.device_pub) == l.identity_device_pub
+                                    })
+                            })
+                        });
+                        let revoked_identity_cut =
+                            crate::recv::revocation::revoked_identity_must_close(
+                                l.identity_device_pub.as_ref(),
+                                held_pair_for_device,
+                                &|p: &[u8; 32]| {
+                                    ports.identity.device_cert_revoked(p)
+                                        || ports.identity.device_tombstoned(p)
+                                },
+                            );
                         let close = sibling_cut
+                            || revoked_identity_cut
                             || crate::recv::revocation::link_must_close(
                                 &facts,
                                 &revoked_secrets,

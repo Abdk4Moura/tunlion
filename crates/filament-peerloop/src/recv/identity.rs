@@ -661,6 +661,10 @@ impl IdentityService {
         self.store.device_cert_revoked(device_pub)
     }
 
+    pub fn device_tombstoned(&self, device_pub: &[u8; 32]) -> bool {
+        self.store.delisted_sibling_tombstoned(device_pub)
+    }
+
     pub fn owner_pub_for_resources(&self) -> Option<[u8; 32]> {
         let local = self.overlay.public_key_bytes().ok();
         self.store.owner_pub_for_resources(local.as_ref())

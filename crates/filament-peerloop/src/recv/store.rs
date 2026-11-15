@@ -1260,7 +1260,7 @@ impl DeviceStore {
     /// roster. Fail-closed like the record read: absent is nothing, unreadable
     /// or unparseable refuses (and is reported, see
     /// [`DeviceStore::delisted_siblings_problem`]).
-    fn delisted_sibling_tombstoned(&self, device_pub: &[u8; 32]) -> bool {
+    pub fn delisted_sibling_tombstoned(&self, device_pub: &[u8; 32]) -> bool {
         if self.owner_pub_from_keystore().is_some() {
             return false;
         }
@@ -4727,6 +4727,25 @@ mod sibling_roster_revocation {
             serde_json::to_string(entries).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn tombstone_is_visible_for_known_paired_key_without_changing_global_pair_policy() {
+        let j = joined("tomb-known-pair");
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32]]);
+        let mut records = j.store.devices_records();
+        records[0]["secret"] = json!("held-pair-secret");
+        std::fs::write(j.store.devices_path(), serde_json::to_string(&records).unwrap()).unwrap();
+        write_delisted(&j, &json!([{
+            "devicePub": hex::encode(j.sib),
+            "ownerPub": hex::encode(j.owner.public_key_bytes()),
+            "certExpires": now_secs() + 3600,
+        }]));
+        assert!(j.store.delisted_sibling_tombstoned(&j.sib));
+        assert!(!j.store.device_cert_revoked(&j.sib), "global pair policy changed");
+        write_roster(&j, j.owner.public_key_bytes(), &[[1u8; 32], j.sib]);
+        assert!(!j.store.delisted_sibling_tombstoned(&j.sib));
+        let _ = std::fs::remove_dir_all(&j.root);
     }
 
     #[test]

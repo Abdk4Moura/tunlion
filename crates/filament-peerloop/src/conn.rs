@@ -6344,7 +6344,18 @@ impl Conn {
         // have a fleet secret at all, is treated as a fleet link and stays
         // untrusted until `fleet-hello` names it.
         let fleet = match pend.as_ref() {
-            Some(p) => p.fleet,
+            Some(p) => {
+                let stale_device_binding = p.auth.domain == DirectAuthDomain::Device
+                    && self.host.fleet_rv_present()
+                    && !p.auth.device_binding.as_ref().is_some_and(|(name, secret)| {
+                        !secret.is_empty()
+                            && !self.host.device_record_revoked(name)
+                            && self.host.devices_load().iter().any(|(n, held)| {
+                                n.eq_ignore_ascii_case(name) && held == secret
+                            })
+                    });
+                p.fleet || stale_device_binding
+            }
             None => {
                 let claimed = self
                     .roster
@@ -6352,9 +6363,10 @@ impl Conn {
                     .and_then(|v| v["name"].as_str().map(str::to_string))
                     .unwrap_or_default();
                 let paired = !claimed.is_empty()
+                    && !self.host.device_record_revoked(&claimed)
                     && self.host.devices_load()
                         .iter()
-                        .any(|(n, _)| n.eq_ignore_ascii_case(&claimed));
+                        .any(|(n, secret)| !secret.is_empty() && n.eq_ignore_ascii_case(&claimed));
                 self.host.fleet_rv_present() && !paired
             }
         };
@@ -9706,6 +9718,7 @@ mod warm_identity_tests {
     #[derive(Default)]
     struct TestHost {
         devices: Vec<(String, String)>,
+        fleet_rv: bool,
         /// Records the store still carries with their pair secret but which are
         /// REVOKED (`certRevoked` / terminal `principalState`).
         revoked_records: Vec<String>,
@@ -9773,7 +9786,7 @@ mod warm_identity_tests {
             None
         }
         fn fleet_rv_present(&self) -> bool {
-            false
+            self.fleet_rv
         }
         fn now_secs(&self) -> u64 {
             filament_id::now_secs()
@@ -11903,6 +11916,32 @@ mod warm_identity_tests {
             Some("fleet-rv"),
             "the fleet binding did not replace the pair one"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_adoption_does_not_grant_pair_standing_for_stale_or_revoked_binding() {
+        for (held, revoked, expect_trusted) in [
+            (None, false, false),
+            (Some("different"), false, false),
+            (Some("pair-secret"), true, false),
+            (Some("pair-secret"), false, true),
+        ] {
+            let host = Arc::new(TestHost {
+                fleet_rv: true,
+                devices: held.map(|s| vec![("peer".into(), s.into())]).unwrap_or_default(),
+                revoked_records: if revoked { vec!["peer".into()] } else { vec![] },
+                ..TestHost::default()
+            });
+            let (mut conn, _far, _rx) = test_conn_with_host(host).await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pid = "sid-pair";
+            conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", Rec::new("webrtc", &log)));
+            let attempt = net::AttemptId::next();
+            conn.direct_pending.insert(pid.into(), direct_pending_with(attempt, ("peer", "pair-secret")));
+            let quic: Arc<dyn Transport> = Rec::with_attempt("quic", &log, attempt);
+            assert!(matches!(conn.adopt_direct(pid, quic, "direct-quic"), DirectAdoption::Adopted { .. }));
+            assert_eq!(conn.link(pid).unwrap().trusted, expect_trusted, "held={held:?}, revoked={revoked}");
+        }
     }
 
     /// The whole fleet standing cycle on a real Link, through the same
