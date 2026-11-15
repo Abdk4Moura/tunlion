@@ -5554,105 +5554,16 @@ async fn recv_run(
                         // place, conn.rs start_direct_inner). The link it gets is
                         // fleet-pending and authorizes nothing until fleet-hello
                         // verifies, exactly like a daemon's.
-                        if !conn.direct_pending.contains_key(&from)
-                            && fleet_pending.contains(&from)
-                            && data["ch"].is_null()
-                        {
-                            if let Some(rv) = ports.identity.fleet_rv() {
-                                // Bounded like the other arms, and it must not
-                                // take over a live pair link.
-                                let now = Instant::now();
-                                if fleet_arm_blocked_by_pair_link(&conn, &from, &host.devices_load()) {
-                                    log.debug(&format!(
-                                        "fleet: answer for {from} skipped, it is a live pair link"
-                                    ));
-                                } else if fleet_arm_allowed(
-                                    fleet_arm_at.get(&from).copied(),
-                                    now,
-                                    FLEET_ARM_COOLDOWN,
-                                ) {
-                                    fleet_arm_at.insert(from.clone(), now);
-                                    log.debug(&format!(
-                                        "fleet: answering a one-shot dialer's transport-offer from {from}"
-                                    ));
-                                    conn.start_direct_fleet(&from, &rv).await;
-                                } else {
-                                    log.debug(&format!(
-                                        "fleet: answer for {from} skipped, armed recently"
-                                    ));
-                                }
-                            }
-                        }
-                        // A daemon sibling re-dialing on our FLEET channel while
-                        // we already hold a link to it (the WebRTC fallback).
-                        // Neither branch above matches it (its offer names the
-                        // fleet channel and the link carries no pair secret), so
-                        // its offers were buffered forever and the direct path
-                        // never armed. Arm exactly one fleet pending for this
-                        // offer when the link is fleet-shaped; the offer is fed
-                        // into it just below. A repeat offer then finds the
-                        // pending and feeds it instead of arming another.
-                        if !conn.direct_pending.contains_key(&from) && cfg!(feature = "fleet") {
-                            if let Some(rv) = ports.identity.fleet_rv() {
-                                let fleet_ch = host.channel_of(&rv);
-                                // `fleet_pending` is the evidence: this peer was
-                                // seen on the fleet channel, which is derived
-                                // from the fleet secret, so the offer below can
-                                // only be the fleet relationship. Arming the
-                                // direct grants nothing: the link stays
-                                // fleet-pending until the certificate hello
-                                // verifies, and that is where a revoked peer is
-                                // refused.
-                                let action = linked_fleet_offer_action(
-                                    conn.links.contains_key(&from),
-                                    conn.direct_pending.contains_key(&from),
-                                    data["ch"].as_str(),
-                                    Some(fleet_ch.as_str()),
-                                    crate::recv::fleet::shaped_link(&conn, &from, Some(rv.as_str())),
-                                    fleet_pending.contains(&from),
-                                    conn.my_id.as_str(),
-                                    from.as_str(),
-                                );
-                                if matches!(
-                                    action,
-                                    LinkedFleetOffer::ArmDial | LinkedFleetOffer::ArmAnswer
-                                ) {
-                                    // Bounded: one arm per peer per window. The
-                                    // sibling re-offers every ~1.2 s, and each
-                                    // arm starts a direct attempt that can be
-                                    // retired into the bounded retirement
-                                    // drain, which then refuses EVERY direct
-                                    // attempt for the whole session. A live
-                                    // pair link is left alone: the fleet
-                                    // relationship must not replace it.
-                                    let now = Instant::now();
-                                    if fleet_arm_blocked_by_pair_link(&conn, &from, &host.devices_load()) {
-                                        log.debug(&format!(
-                                            "fleet: arm for {from} skipped, it is a live pair link"
-                                        ));
-                                    } else if fleet_arm_allowed(
-                                        fleet_arm_at.get(&from).copied(),
-                                        now,
-                                        FLEET_ARM_COOLDOWN,
-                                    ) {
-                                        fleet_arm_at.insert(from.clone(), now);
-                                        log.debug(&format!(
-                                            "fleet: arming direct for linked sibling {from}'s transport-offer ({})",
-                                            if action == LinkedFleetOffer::ArmDial {
-                                                "dialer"
-                                            } else {
-                                                "answer"
-                                            }
-                                        ));
-                                        conn.start_direct_fleet(&from, &rv).await;
-                                    } else {
-                                        log.debug(&format!(
-                                            "fleet: arm for {from} skipped, armed recently"
-                                        ));
-                                    }
-                                }
-                            }
-                        }
+                        // WebRTC path handles this offer. The fleet arm used to
+                        // fire here, but arming a direct created a direct_pending
+                        // that buffered and lost the incoming offer, breaking
+                        // link establishment (W2). The fleet presence path
+                        // (above) still arms the direct for forgotten peers.
+                        // WebRTC path handles this offer. The fleet arm used to
+                        // fire here, but arming a direct created a direct_pending
+                        // that buffered and lost the incoming offer, breaking
+                        // link establishment (W2). The fleet presence path
+                        // (above) still arms the direct for forgotten peers.
                         if conn.direct_pending.contains_key(&from) {
                             // Re-arm succeeded — process the offer now.
                             conn.on_transport_offer(
