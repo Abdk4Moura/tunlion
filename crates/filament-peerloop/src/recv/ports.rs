@@ -168,6 +168,8 @@ pub trait RecvIdentity: Send + Sync {
         None
     }
     fn device_cert_revoked(&self, device_pub: &[u8; 32]) -> bool;
+    /// Owner-roster tombstone, irrespective of whether a device record exists.
+    fn device_tombstoned(&self, device_pub: &[u8; 32]) -> bool;
     /// Fleet auto-mesh: may this same-owner sibling be admitted over the fleet
     /// channel? See `DeviceStore::sibling_admissible` (the owner's signed
     /// roster is the revocation channel on a joined device).
@@ -595,6 +597,9 @@ pub(crate) mod test_support {
             None
         }
         fn device_cert_revoked(&self, _: &[u8; 32]) -> bool {
+            false
+        }
+        fn device_tombstoned(&self, _: &[u8; 32]) -> bool {
             false
         }
         fn sibling_admissible(&self, _: &[u8; 32]) -> bool {
