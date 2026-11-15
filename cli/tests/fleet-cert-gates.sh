@@ -342,10 +342,13 @@ fi
 
 # ===================================================================== GATE E ==
 # The refusal reason is deliberately generic on the wire so a denied peer
-# cannot oracle which check failed; the REASON goes to the owner's log only,
-# so assert there. Asserting the issuance count is the other half: it is what
-# turns "the flow stopped" into "no certificate for a revoked device exists",
-# and A3 is what makes that absence meaningful.
+# cannot oracle which check failed; the reason goes to the owner's log only.
+# The revocation sweep may close the old link before this request, leaving the
+# replacement's identity unproven, so that local refusal is accepted as well.
+# The unchanged issuance count proves no new certificate was signed; gate A3
+# proves signing worked before revocation, gate D checks the revocation reason
+# for shell, and gate F checks that nothing was installed in authorized_keys.
+# An identity-not-proven refusal alone does not prove why identity was absent.
 say "E: the revoked spoke's shell --ssh is refused, and nothing is signed"
 E_OWNER_START=$(( $(wc -l < "$WORK/up.log") + 1 ))
 timeout 60 "${SSH_ENV[@]}" TUNLION_CONFIG_DIR="$DS" "$BIN" --server "$SERVER" \
