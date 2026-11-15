@@ -128,6 +128,19 @@ for i in $(seq 1 "$W_REPS"); do
 done
 show_sock
 
+# Diagnostics only, on failure: what each daemon did with the fleet-channel
+# dials. Asserts nothing.
+if [ "$FAIL" != 0 ]; then
+  for t in B W1 W2 W3 W4 G GW1 GW2 GW3 GW4; do
+    [ -f "$WORK/$t.secs" ] && echo "## $t: $(cat "$WORK/$t.secs")s"
+  done
+  for n in charlie bravo; do
+    echo "-- up-$n.log (fleet/direct/offer/drain, last 150) --"
+    grep -E "fleet|direct|offer|arm|drain|retir|capacity|pending|refus|one-shot|establish" \
+      "$WORK/up-$n.log" | tail -150
+  done
+fi
+
 declare_known_red_summary
 echo
 echo "sibling-shell-refusal: $PASS passed, $FAIL failed${FAILED:+ ($FAILED )}"
