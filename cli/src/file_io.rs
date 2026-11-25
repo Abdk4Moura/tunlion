@@ -60,6 +60,20 @@ pub(crate) fn remove_pidfile() {
     let _ = std::fs::remove_file(ready_marker());
 }
 
+/// `remove_pidfile`, but only when `up.pid` still names THIS process. For an
+/// exit that skips the normal return path (the loop-stall exit): the instance
+/// lock is released by the OS either way, and this keeps a stale pidfile from
+/// pointing `status`/`down` at a pid that may be reused.
+pub(crate) fn remove_pidfile_if_ours() {
+    let ours = std::fs::read_to_string(pidfile())
+        .ok()
+        .and_then(|raw| parse_pidfile(&raw))
+        .is_some_and(|(pid, _)| pid == std::process::id());
+    if ours {
+        remove_pidfile();
+    }
+}
+
 /// The daemon is serving. Best-effort: a missing marker only makes
 /// `up --detach` report "not ready yet", never a false success.
 pub(crate) fn mark_daemon_ready() {

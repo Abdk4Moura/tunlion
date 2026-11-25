@@ -382,6 +382,17 @@
       ]
     },
     {
+      "path": "cli/tests/loop-stall-exit-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/loop-stall-exit-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/forward-refusal-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/forward-refusal-gates.sh",
@@ -555,6 +566,7 @@
         "cli/tests/invite-expiry-gates.sh",
         "cli/tests/invite-withdraw-gates.sh",
         "cli/tests/l2-revoke-gates.sh",
+        "cli/tests/loop-stall-exit-gates.sh",
         "cli/tests/mount-revoke-gates.sh",
         "cli/tests/net-blockers-gates.sh",
         "cli/tests/pty-resume-gates.sh",

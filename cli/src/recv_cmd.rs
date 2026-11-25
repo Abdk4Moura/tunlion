@@ -23,6 +23,30 @@ pub(crate) use crate::recv_ports::cli_park_on_deny as park_on_deny;
 /// `exec_recv`/`sync_cmd`/`ssh_ca` modules) share the one parked-open type.
 pub(crate) use filament_peerloop::recv::dispatch::{settle_timeout_reason, ParkKind, ParkedOpen};
 
+/// The daemon's way out of a loop that stalled past its hard limit
+/// (`LOOP_STALL_EXIT_SECS`, 120 s; `TUNLION_LOOP_STALL_EXIT_SECS` overrides it,
+/// `0` disables the exit). The library has already logged the critical line;
+/// this drops the pidfile if it is ours and exits with
+/// [`exit_codes::DAEMON_LOOP_STALLED`], so a supervisor restarts the daemon and
+/// a plain `tunlion up` starts a fresh one (the OS releases the instance lock).
+fn stall_exit() -> filament_peerloop::recv::lifecycle::StallExit {
+    let after_secs = std::env::var("TUNLION_LOOP_STALL_EXIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(filament_peerloop::recv::lifecycle::LOOP_STALL_EXIT_SECS);
+    filament_peerloop::recv::lifecycle::StallExit {
+        after_secs,
+        on_stall: Arc::new(|secs| {
+            eprintln!(
+                "tunlion: daemon exiting with code {} after a {secs}s event-loop stall",
+                exit_codes::DAEMON_LOOP_STALLED
+            );
+            crate::file_io::remove_pidfile_if_ours();
+            std::process::exit(exit_codes::DAEMON_LOOP_STALLED);
+        }),
+    }
+}
+
 /// CLI process adapter. Returns only after the library dispatch and its owned
 /// cleanup have completed; cancellation is translated into the CLI exit policy.
 #[allow(clippy::too_many_arguments)]
@@ -88,6 +112,7 @@ pub(crate) async fn recv_cmd(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(20),
+        stall_exit: daemon.then(stall_exit),
         remember_stored: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         delivery: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
