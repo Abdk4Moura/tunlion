@@ -1108,7 +1108,11 @@ def main() -> int:
             rc = cmd_canary(w, a.out)
             if rc or a.command == "canary":
                 return rc
-        corpus = a.files or sorted((HERE / "corpus").glob("*.json"))
+        corpus = []
+        for f in a.files or [HERE / "corpus"]:
+            corpus += sorted(f.glob("*.json")) if f.is_dir() else [f]
+        if not corpus:
+            raise Refused("no schedules to run")
         if a.command == "replay":
             return cmd_replay(w, a.out, corpus)
         return cmd_explore(w, a.out, a.budget_min * 60, a.seed, corpus)

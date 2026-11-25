@@ -32,7 +32,8 @@ git -C "$ROOT" archive --format=tar HEAD -o "$TAR"
 echo "== ship $SHA ($(du -h "$TAR" | cut -f1)) to $WORKER"
 tunlion send "$TAR" --to "$WORKER" --timeout 240 --json >/dev/null
 
-printf -v ARGS '%q ' "$@"
+ARGS=""
+[ "$#" -gt 0 ] && printf -v ARGS '%q ' "$@"
 REMOTE=$(cat <<EOF
 set -euo pipefail
 source /home/runner/work/_temp/tunlion-work/worker.env
