@@ -441,9 +441,7 @@ async fn exec_once(
     };
     let ack: std::result::Result<Value, String> = ack_wait
     .map_err(|_| {
-        anyhow::anyhow!(
-            "no answer from '{peer}' - it may be unresponsive or running a build without exec"
-        )
+        anyhow::anyhow!(filament_peerloop::l2::warm_exec::no_answer_message(peer))
     })?;
     let ack = match ack {
         Ok(v) => v,
