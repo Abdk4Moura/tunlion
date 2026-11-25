@@ -4563,7 +4563,10 @@ async fn recv_run(
             let all_pids: Vec<String> = conn.links.keys().cloned().collect();
             for pid in all_pids {
                 let in_flight = st.by_sid.keys().any(|(p, _)| *p == pid);
-                if let Some(idle) = conn.detect_stall(&pid, in_flight) {
+                // A dead channel is NOT a stall here: the sender owns
+                // re-establishing it and this side answers its re-dial
+                // (see `Conn::detect_stall`).
+                if let Some(idle) = conn.detect_stall(&pid, in_flight, false) {
                     let transport_dead = conn
                         .transport_of(&pid)
                         .map(|t| t.is_dead())

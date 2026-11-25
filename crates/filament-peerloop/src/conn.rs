@@ -7260,7 +7260,15 @@ impl Conn {
     /// `note_progress`, so a slow-but-MOVING link (which keeps advancing
     /// idle_ms's baseline) never trips, the threshold is on time-since-last-byte,
     /// never on throughput.
-    pub fn detect_stall(&mut self, pid: &str, in_flight: bool) -> Option<u64> {
+    ///
+    /// `dead_is_stall`: whether a transport that latched dead counts as a stall.
+    /// The SENDER passes true: it owns the offer, so it owns re-establishing a
+    /// link whose channel died, and nothing else does while the peer connection
+    /// still reads connected. The receiver passes false: it answers the
+    /// sender's re-dial, and parking its partials plus dropping the link on its
+    /// own would let a one-shot receive with one file done and one mid-transfer
+    /// quiet-exit as "done".
+    pub fn detect_stall(&mut self, pid: &str, in_flight: bool, dead_is_stall: bool) -> Option<u64> {
         let in_episode = self
             .resil
             .stall_repairs
@@ -7281,6 +7289,13 @@ impl Conn {
         let workers: Vec<Arc<dyn Transport>> = link.map(|l| l.workers.clone()).unwrap_or_default();
         let (transport_up, flowed, idle_ms) =
             Self::stall_observation(transport.map(|t| t.as_ref()), &workers);
+        // A primary that latched dead with no live worker beside it: the link
+        // had a transport and lost it. The send loop already routes a dead
+        // transport to the ladder (`transport_dead || link_alive`); without
+        // this the classifier read it as an establishment and never got there.
+        let transport_dead = dead_is_stall
+            && transport.is_some_and(|t| t.is_dead())
+            && workers.iter().all(|w| w.is_dead());
         // The stall clock starts when THIS transfer did. A link's idle time
         // counts from when it opened (or last moved bytes), so a link that sat
         // idle before a transfer was offered on it read as stalled the moment
@@ -7312,6 +7327,7 @@ impl Conn {
         let obs = resilience::LiveObs {
             in_flight,
             transport_up,
+            transport_dead,
             flowed,
             idle_ms,
             grace_ms: net::establish_grace_ms(),
@@ -7585,10 +7601,18 @@ impl Conn {
     ///   in the new transport → ChannelReady re-offers the unfinished transfers.
     /// - WebRTC link: `restart_ice()`, keeps the RTCPeerConnection + DTLS keys;
     ///   only ICE re-gathers, so transfers resume on the same channel once ICE
-    ///   re-converges (no re-key, the preferred repair when available).
+    ///   re-converges (no re-key, the preferred repair when available). Not for
+    ///   a channel that already latched dead: that one is rebuilt like a direct
+    ///   link, since no ICE restart revives it.
     async fn repair_link_in_place(&mut self, pid: &str) {
         let Some(l) = self.links.get(pid) else { return };
-        if l.direct {
+        // An ICE restart renews the PATH under a data channel; it cannot revive
+        // a channel that already latched dead (a write or flush the association
+        // never acknowledged). That transport stays dead whatever ICE does, so
+        // a dead WebRTC link is rebuilt the way a wedged direct one is.
+        let dead = l.transport.as_ref().is_some_and(|t| t.is_dead())
+            && l.workers.iter().all(|w| w.is_dead());
+        if l.direct || dead {
             // Fresh QUIC dial of the known device. Pull the (name,secret) the
             // link was born with so the re-dial re-authenticates to the SAME pair
             // secret (session identity is stable across the swap; only the wire
@@ -11131,6 +11155,55 @@ mod warm_identity_tests {
         ));
         assert!(conn.links.contains_key("sid-old"));
         assert_eq!(t.closes.load(Ordering::Relaxed), 0);
+    }
+
+    /// A send whose WebRTC data channel latched dead under loss (a write the
+    /// association never acknowledged) while its peer connection stayed
+    /// connected: the chaos fuzzer's send-stuck-reconnecting-after-heal. The
+    /// stall watchdog read the dead transport as "establishing" and never fired,
+    /// the establishment watchdog keys on the peer connection and never fired
+    /// either, so the send printed "the link is down, trying to reconnect"
+    /// until its rejoin window ran out, long after the network healed.
+    #[tokio::test]
+    async fn a_dead_webrtc_transport_reaches_the_stall_ladder() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-dc";
+        conn.links
+            .insert(pid.into(), relay_link(pid, "bravo", "bravo", FakeQuic::dead()));
+        assert!(conn.detect_stall(pid, true, true).is_some(), "a dead channel mid-transfer is a stall");
+        assert!(conn.detect_stall(pid, false, true).is_none(), "nothing in flight, nothing to repair");
+        // The receiver leaves a dead channel to the sender's re-dial.
+        assert!(conn.detect_stall(pid, true, false).is_none());
+        // A link that has no transport yet is still the establishment
+        // watchdog's, never the stall ladder's.
+        let mut fresh = relay_link("sid-new", "bravo", "bravo", FakeQuic::live());
+        fresh.transport = None;
+        conn.links.insert("sid-new".into(), fresh);
+        assert!(conn.detect_stall("sid-new", true, true).is_none());
+    }
+
+    /// The ladder's repair rung for that link must rebuild it: an ICE restart
+    /// keeps the same data channel, which stays dead whatever ICE does. The
+    /// dead link goes, a fresh dial of the known device is armed, and the
+    /// transfer target stays pointed at the peer so the new link's
+    /// ChannelReady re-offers with resume.
+    #[tokio::test]
+    async fn the_repair_rung_rebuilds_a_dead_webrtc_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        let pid = "sid-dc";
+        conn.links
+            .insert(pid.into(), relay_link(pid, "bravo", "bravo", FakeQuic::dead()));
+        conn.active = Some(pid.to_string());
+        assert_eq!(conn.correct_stall(pid).await, Rung::Repaired);
+        assert!(
+            conn.links.get(pid).is_none_or(|l| l.transport.as_ref().is_none_or(|t| !t.is_dead())),
+            "the dead channel is still the link's transport"
+        );
+        assert!(conn.direct_pending.contains_key(pid), "no fresh dial was armed");
+        assert_eq!(conn.active.as_deref(), Some(pid));
+        // While that dial converges the ladder holds instead of re-firing.
+        assert!(conn.detect_stall(pid, true, true).is_none());
     }
 
     /// The other side of the contract: a dead transport is a departure. The

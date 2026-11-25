@@ -1250,7 +1250,8 @@ pub(crate) async fn send_cmd(
                 let out = outgoing.lock().await;
                 out.iter().any(|o| o.accepted_once && !o.sent)
             };
-            if let Some(idle) = conn.detect_stall(&active, in_flight) {
+            // A dead channel is a stall here: the sender owns re-establishing it.
+            if let Some(idle) = conn.detect_stall(&active, in_flight, true) {
                 let transport_dead = conn
                     .transport_of(&active)
                     .map(|t| t.is_dead())
