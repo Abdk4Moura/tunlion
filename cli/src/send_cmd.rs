@@ -430,6 +430,8 @@ pub(crate) async fn send_cmd(
     // What "nobody connected" means depends on who we were waiting for. Only a
     // code can be opened in a browser; a device name is another tunlion.
     let peer_hint = no_peer_hint(to.as_deref(), use_code, room.as_deref());
+    // `to` moves into the connection below; the timeout message still names it.
+    let to_name = to.clone();
     let transport_context = crate::transport_context::for_root(&crate::settings::config_dir())?;
     // One log/presentation pair for this send, shared by the link loop and the
     // library streamer. The CLI's CliLog/CliScreen delegate to `ui`, so output
@@ -1015,13 +1017,7 @@ pub(crate) async fn send_cmd(
             // With --relay the only path is the TURN relay. A peer that showed
             // up on the tunlion server and still never connected points at
             // the relay, not at the peer.
-            let hint = if relay && !saw_known_peer.is_empty() {
-                "the peer is on the tunlion server, but no relayed path came up: the TURN relay \
-                 may be unreachable from here (--relay forces it; drop --relay to try a direct path)"
-                    .to_string()
-            } else {
-                peer_hint.clone()
-            };
+            let hint = establish_timeout_hint(relay, to_name.as_deref(), !saw_known_peer.is_empty(), &peer_hint);
             return Err(exit_codes::err(
                 ExitKind::Unreachable,
                 format!(
@@ -3477,6 +3473,33 @@ pub(crate) fn pake_expiry(partner_latched: bool, any_pake_heard: bool) -> PakeEx
         (true, _) => PakeExpiry::Unfinished,
         (false, false) => PakeExpiry::OlderPeer,
         (false, true) => PakeExpiry::KeepWaiting,
+    }
+}
+
+/// What to say when no link came up before the deadline. A peer that showed
+/// up on the tunlion server and still never connected points at the path
+/// between the two machines first: the chaos fuzzer found the old "is it
+/// online, with `tunlion up` running there?" while the peer was up and only
+/// UDP between the two was blocked. Presence is not proof of life (a frozen
+/// or killed daemon stays listed for a while), so the peer going away stays
+/// in the sentence, second. Pure.
+pub(crate) fn establish_timeout_hint(relay: bool, to: Option<&str>, seen_on_server: bool, peer_hint: &str) -> String {
+    match (relay, seen_on_server) {
+        (true, true) => "the peer is on the tunlion server, but no relayed path came up: the TURN relay \
+             may be unreachable from here (--relay forces it; drop --relay to try a direct path)"
+            .to_string(),
+        (false, true) => {
+            let (who, doctor) = match to {
+                Some(d) => (format!("'{d}'"), format!("`tunlion doctor {}`", crate::refusal::word(d))),
+                None => ("the peer".to_string(), "`tunlion doctor`".to_string()),
+            };
+            format!(
+                "{who} is listed on the tunlion server, but no connection to it came up: a firewall may \
+                 block every path between you (direct UDP, and the relay), or it went offline just now. \
+                 {doctor} shows which paths were tried"
+            )
+        }
+        _ => peer_hint.to_string(),
     }
 }
 
