@@ -1052,10 +1052,14 @@
     },
     {
       "path": "cli/tests/reach-until-direct-gates.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/tunlion/issues/316",
-      "owner": "claude-advisor",
-      "expires": "2026-11-18"
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/reach-until-direct-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     },
     {
       "path": "cli/tests/durability_soak.py",
