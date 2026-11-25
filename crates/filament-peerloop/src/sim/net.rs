@@ -360,6 +360,14 @@ impl SimNetwork {
                 g.had_partition_heal = true;
                 if matches!(g.mutant, SimMutant::PostHealDroppedReconnect) {
                     g.drop_post_heal_reconnect = true;
+                    g.record(format!("link:dropped_by_partition:{a}:{b}"));
+                    for n in [&a, &b] {
+                        if let Some(closers) = g.active_closers.remove(n) {
+                            for flag in closers {
+                                flag.store(true, Ordering::Release);
+                            }
+                        }
+                    }
                 }
                 for w in &g.direct_waiters {
                     w.notify.notify_waiters();

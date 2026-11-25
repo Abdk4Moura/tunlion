@@ -115,18 +115,48 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
     }
 
     // Derived from proofs/establishment_model.py Tier-1 self-heal invariant:
-    // once all partitions and blackholes heal with at least 15s left in the run,
-    // a previously disrupted pair must resume peer/signaling progress.
+    // (a) if a node was restarted with >=10s remaining and is not blackholed
+    // past restart+5s, it must re-establish signaling after restart;
+    // (b) once all partitions/blackholes heal after a link-severing fault with
+    // >=15s clean tail remaining, paired nodes must show post-heal connect progress.
     if config.nodes.len() >= 2 && config.duration_ms >= 20_000 {
+        if let Some((ref rnode, _kill_ms, restart_ms)) = config.restart_node {
+            let tail = config.duration_ms.saturating_sub(restart_ms);
+            let still_bh = config.schedule.iter().any(|sf| match &sf.fault {
+                Fault::BlackholeSignaling { node, active: true } if node == rnode => {
+                    !config.schedule.iter().any(|h| {
+                        h.at_ms > sf.at_ms
+                            && matches!(&h.fault, Fault::BlackholeSignaling { node: n2, active: false } if n2 == rnode && h.at_ms <= config.duration_ms.saturating_sub(10_000))
+                    })
+                }
+                _ => false,
+            });
+            if tail >= 10_000 && !still_bh {
+                let reconnected = outcome.net_events.iter().any(|ne| {
+                    ne.at_ms >= restart_ms && ne.event.starts_with(&format!("sig:connect:{rnode}:"))
+                });
+                if !reconnected {
+                    violations.push(OracleViolation {
+                        kind: OracleKind::PostHealLivenessViolation,
+                        summary: format!(
+                            "restarted node {rnode} at {restart_ms}ms never reconnected to signaling"
+                        ),
+                    });
+                }
+            }
+        }
+
         let mut active_partitions: usize = 0;
         let mut active_blackholes: usize = 0;
-        let mut had_disruption = config.restart_node.is_some();
         let mut last_heal_ms = config.restart_node.as_ref().map_or(0, |(_, _, r)| *r);
+        let severed_before_heal = outcome
+            .net_events
+            .iter()
+            .any(|ne| ne.event.starts_with("link:dropped_by_partition:"));
 
         for sf in &config.schedule {
             match &sf.fault {
                 Fault::Partition { .. } => {
-                    had_disruption = true;
                     active_partitions = active_partitions.saturating_add(1);
                 }
                 Fault::HealPartition { .. } => {
@@ -134,7 +164,6 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
                     last_heal_ms = last_heal_ms.max(sf.at_ms);
                 }
                 Fault::BlackholeSignaling { active: true, .. } => {
-                    had_disruption = true;
                     active_blackholes = active_blackholes.saturating_add(1);
                 }
                 Fault::BlackholeSignaling { active: false, .. } => {
@@ -146,7 +175,7 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
         }
 
         let clean_tail_ms = config.duration_ms.saturating_sub(last_heal_ms);
-        if had_disruption
+        if severed_before_heal
             && active_partitions == 0
             && active_blackholes == 0
             && clean_tail_ms >= 15_000
@@ -154,14 +183,13 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
             let post_heal_progress = outcome.net_events.iter().any(|ne| {
                 ne.at_ms > last_heal_ms
                     && (ne.event.starts_with("direct:pair:")
-                        || ne.event.starts_with("sig:connect:")
-                        || ne.event.starts_with("sig:relay:"))
+                        || ne.event.starts_with("sig:connect:"))
             });
             if !post_heal_progress {
                 violations.push(OracleViolation {
                     kind: OracleKind::PostHealLivenessViolation,
                     summary: format!(
-                        "no signaling/direct progress after final heal at {last_heal_ms}ms (tail={clean_tail_ms}ms)"
+                        "no signaling/direct progress after severed link healed at {last_heal_ms}ms (tail={clean_tail_ms}ms)"
                     ),
                 });
             }

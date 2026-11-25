@@ -555,6 +555,32 @@ fn select_parent_idx(
     0
 }
 
+/// Purely non-oracle continuous guidance signal computed strictly from
+/// telemetry (loop busy time capped below 1000 ms, control-status latency
+/// capped below 1000 ms, phase/event variety, and optional target-phase hit).
+/// Never reads `OracleViolation` or any pass/fail oracle threshold.
+fn non_oracle_guidance_score(outcome: &SimOutcome, target_phase: Option<&str>) -> u64 {
+    let busy_slope = outcome.telemetry.max_iter_busy_ms.min(999).saturating_mul(10);
+    let status_slope = outcome
+        .cap_status_results
+        .iter()
+        .map(|s| s.latency_ms.min(999))
+        .max()
+        .unwrap_or(0)
+        .saturating_mul(4);
+    let phase_div = (outcome.telemetry.phases_hit.len() as u64).saturating_mul(25);
+    let event_div = (outcome.telemetry.events_hit.len() as u64).saturating_mul(10);
+    let target_bonus = target_phase
+        .and_then(|p| outcome.telemetry.phase_first_seen_ms.get(p))
+        .map(|first_ms| 2_000u64.saturating_sub((*first_ms / 40).min(1_500)))
+        .unwrap_or(0);
+    busy_slope
+        .saturating_add(status_slope)
+        .saturating_add(phase_div)
+        .saturating_add(event_div)
+        .saturating_add(target_bonus)
+}
+
 pub struct Fuzzer;
 
 impl Fuzzer {
@@ -566,6 +592,8 @@ impl Fuzzer {
         let mut corpus: Vec<CorpusEntry> = Vec::new();
         let mut max_iter_busy_ms_seen = 0u64;
         let mut max_cap_status_latency_ms_seen = 0u64;
+        let mut best_hill_score = 0u64;
+        let mut best_busy_slope = 0u64;
         let mut runs_executed = 0usize;
 
         let corpus_active = campaign.flags.sometimes || campaign.flags.hill_climb;
@@ -603,14 +631,27 @@ impl Fuzzer {
                 max_cap_status_latency_ms_seen = max_cap_status_latency_ms_seen.max(st.latency_ms);
             }
 
-            if campaign.flags.sometimes && hit_rare_milestone {
+            let hill_score = if campaign.flags.hill_climb {
+                non_oracle_guidance_score(&outcome, campaign.flags.target_phase.as_deref())
+            } else {
+                0
+            };
+            let busy_slope = outcome.telemetry.max_iter_busy_ms.min(999);
+            let improved_hill = campaign.flags.hill_climb
+                && (hill_score > best_hill_score || busy_slope > best_busy_slope);
+            if improved_hill {
+                best_hill_score = best_hill_score.max(hill_score);
+                best_busy_slope = best_busy_slope.max(busy_slope);
+            }
+
+            if (campaign.flags.sometimes && hit_rare_milestone) || improved_hill {
                 if corpus.len() >= 64 {
                     corpus.remove(0);
                 }
                 corpus.push(CorpusEntry {
                     sched: sched.clone(),
                     milestones: hit_set,
-                    score: 0,
+                    score: hill_score,
                 });
             }
 
