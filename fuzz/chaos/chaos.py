@@ -314,7 +314,34 @@ class World:
             raise Refused(f"binary changed under the run: {self.bin_sha[:12]} -> {now[:12]}")
 
     # -- network ------------------------------------------------------------
+    def reap_stale(self) -> None:
+        """Kill what a previous campaign left behind: daemons running from an
+        older /tmp/chz.* work dir and anything on our port (a stale backend
+        would answer health checks with another campaign's state)."""
+        mine = str(self.work)
+        victims = set()
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit() or int(p.name) == os.getpid():
+                continue
+            try:
+                cmd = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except OSError:
+                continue
+            if "/tmp/chz." in cmd and mine not in cmd and "chaos.py" not in cmd:
+                victims.add(int(p.name))
+        r = sh(["ss", "-ltnpH", f"sport = :{PORT}"], check=False)
+        victims |= {int(x) for x in re.findall(r"pid=(\d+)", r.stdout)}
+        for pid in victims:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if victims:
+            log(f"reaped {len(victims)} process(es) left by an earlier campaign")
+            time.sleep(1)
+
     def net_up(self) -> None:
+        self.reap_stale()
         self.net_down()
         sh(["sysctl", "-qw", "net.ipv4.ip_forward=1"])
         for d in DEVICES:
