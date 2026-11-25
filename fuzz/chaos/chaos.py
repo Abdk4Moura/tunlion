@@ -68,7 +68,7 @@ DOCUMENTED_RC = set(range(0, 14)) | {126, 127, 130, 141, 143}
 # Per-operation wall-clock deadlines. The CLI gives up on a link after 45 s
 # and says so; a command still running well past that is a hang, which is a
 # finding even while faults are active.
-OP_DEADLINE = {"exec": 75.0, "send": 90.0, "reach": 75.0}
+OP_DEADLINE = {"exec": 75.0, "send": 90.0, "reach": 75.0, "status": 15.0, "doctor": 90.0}
 
 SETTLE_SIGNALING = 90.0     # after heal: every daemon must report signaling connected
 STORM_WINDOW = 30.0         # quiet window in which reconnects are counted
@@ -77,7 +77,7 @@ LOOP_STALL_GRACE = 150.0    # a logged stall must be followed by recovery or exi
 
 FAULTS = ["net.impair", "net.partition", "sig.blackhole", "sig.reset",
           "proc.freeze", "proc.kill", "server.down"]
-OPS = ["exec", "send", "reach"]
+OPS = ["exec", "send", "reach", "status", "doctor"]
 
 # Env hooks (test-hooks builds) that add INTERNAL faults with a designed
 # recovery. The fuzzer may switch them on per daemon. Hooks that disable a
@@ -164,6 +164,13 @@ def random_op(rng: random.Random) -> dict:
     if kind == "send":
         return {"op": "send", "at": at, "src": OWNER, "dst": rng.choice(DELEGATES),
                 "kib": rng.choice([4, 256, 4096])}
+    if kind == "status":
+        # Asking your own machine must answer fast, even with its daemon frozen.
+        d = rng.choice(DEVICES)
+        return {"op": "status", "at": at, "src": d, "dst": d}
+    if kind == "doctor":
+        src = rng.choice(DEVICES)
+        return {"op": "doctor", "at": at, "src": src, "dst": rng.choice([x for x in DEVICES if x != src])}
     return {"op": "reach", "at": at, "src": OWNER, "dst": rng.choice(DELEGATES)}
 
 
@@ -747,6 +754,12 @@ def run_op(w: World, st: dict, phase: str) -> dict:
         res.update(rc=rc, elapsed=round(el, 2), ok=(rc == 0 and intact))
         # rc 0 with the file absent or different is the worst UX outcome there is.
         res["lie"] = rc == 0 and not intact
+    elif kind == "status":
+        rc, out, err, el = w.cli(src, ["status"], deadline)
+        res.update(rc=rc, elapsed=round(el, 2), ok=rc == 0, lie=False)
+    elif kind == "doctor":
+        rc, out, err, el = w.cli(src, ["doctor", dst], deadline)
+        res.update(rc=rc, elapsed=round(el, 2), ok=rc == 0, lie=False)
     else:
         rc, out, err, el = w.cli(src, ["reach", dst], deadline)
         res.update(rc=rc, elapsed=round(el, 2), ok=rc == 0, lie=False)
