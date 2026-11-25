@@ -877,7 +877,9 @@ def sig_state(w: World, d: str) -> tuple[str, object]:
     if rep is None:
         return "noanswer", None
     sig = rep.get("signaling")
-    if not sig:
+    # The test-hooks no-self-heal path answers {"connected": false,
+    # "state": "unknown"} while connected: it does not track the link.
+    if not sig or sig.get("state") in (None, "unknown"):
         return "unreported", sig
     return ("connected" if sig.get("state") == "connected" else "down"), sig
 
