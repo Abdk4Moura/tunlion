@@ -2,7 +2,9 @@
 
 use std::time::Instant;
 
-use filament_peerloop::sim::{Fault, NodeSpec, Proto, ScheduledFault, SimConfig, SimWorld};
+use filament_peerloop::sim::{
+    Fault, NodeSpec, Proto, ScheduledFault, SimConfig, SimMutant, SimWorld,
+};
 
 fn two_node_config(seed: u64, duration_ms: u64) -> SimConfig {
     let secret = "sim-shared-secret-alpha-bravo".to_string();
@@ -25,6 +27,7 @@ fn two_node_config(seed: u64, duration_ms: u64) -> SimConfig {
         restart_node: None,
         cap_status_queries: vec![("alpha".to_string(), 6_000)],
         inline_stall_injection: None,
+        mutant: SimMutant::None,
     }
 }
 
@@ -189,6 +192,7 @@ fn test_replay_status_stall_blackhole_plus_peer_restart() {
         restart_node: Some(("bravo".to_string(), 18_500, 21_800)),
         cap_status_queries: vec![("charlie".to_string(), 39_100)],
         inline_stall_injection: None,
+        mutant: SimMutant::None,
     };
 
     let outcome = SimWorld::run(cfg);

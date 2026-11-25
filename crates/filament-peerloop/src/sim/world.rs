@@ -22,8 +22,25 @@ use crate::recv::ports::test_support::{NoDaemon, NoIdentity, NoPrompt, NoPty, No
 use crate::recv::ports::{RecvDaemon, RecvEnv, RecvIdentity, RecvPorts};
 use crate::recv::report::RecvReport;
 use crate::shell_gate::ShellPolicy;
-use crate::sim::net::{Fault, SimNetwork};
+use crate::sim::assertions::{record_sometimes, reset_assertions, take_assertions, AssertionReport};
+use crate::sim::net::{Fault, NetTraceEvent, SimNetwork};
 use crate::sim_rt;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SimMutant {
+    #[default]
+    None,
+    /// Planted canary: stalls inline if CapStatus runs during signaling blackhole.
+    CanaryOnBlackholeStatus,
+    /// In-process mirror of pre-#729 inline heartbeat stall when blackhole spans silence threshold.
+    Pre729InlineHeartbeat,
+    /// Noise-sensitive bug masked when partitions co-occur during restart+blackhole.
+    NoiseSensitiveRestartInBlackhole,
+    /// Timer-edge bug near 15s / 30s silence boundaries combined with CapStatus near timer edges.
+    TimerEdgeSilenceBoundary,
+    /// Simulates the send-reconnect bug dropping post-heal reconnects (caught by Tier-1 oracle).
+    PostHealDroppedReconnect,
+}
 
 #[derive(Debug, Clone)]
 pub struct NodeSpec {
@@ -59,12 +76,14 @@ pub struct SimOutcome {
     pub seed: u64,
     pub trace_hash: u64,
     pub events: Vec<SimTraceEntry>,
+    pub net_events: Vec<NetTraceEvent>,
     pub budget_violations: Vec<String>,
     pub cap_status_results: Vec<CapStatusResult>,
     pub telemetry: sim_rt::SimTelemetry,
+    pub assertions: AssertionReport,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SimConfig {
     pub seed: u64,
     pub duration_ms: u64,
@@ -73,6 +92,7 @@ pub struct SimConfig {
     pub restart_node: Option<(String, u64, u64)>,
     pub cap_status_queries: Vec<(String, u64)>,
     pub inline_stall_injection: Option<(u64, u64)>,
+    pub mutant: SimMutant,
 }
 
 struct CapturingLog {
@@ -734,11 +754,12 @@ impl SimWorld {
         rt.block_on(async move {
             clock::reset_sim_epoch();
             sim_rt::reset_sim_telemetry();
+            reset_assertions();
             sim_rt::set_sim_blocking_inline(true);
             sim_rt::set_sim_watchdog_disabled(true);
             sim_rt::set_sim_inline_stall_ms(0);
 
-            let net = SimNetwork::new(config.seed);
+            let net = SimNetwork::with_mutant(config.seed, config.mutant.clone());
             let logs = Arc::new(Mutex::new(Vec::<SimTraceEntry>::new()));
             let mut next_pid: u32 = 1000;
 
@@ -751,6 +772,11 @@ impl SimWorld {
                     spawn_daemon(&net, spec, pid, logs.clone())
                 })
                 .collect();
+
+            let mut blackhole_starts: HashMap<String, u64> = HashMap::new();
+            let mut bh_silence_boundary_hit = false;
+            let mut bh_healed_nodes: HashSet<String> = HashSet::new();
+            let mut restarted_nodes: HashSet<String> = HashSet::new();
 
             // Build sorted timeline of scheduled events.
             enum Action {
@@ -785,7 +811,40 @@ impl SimWorld {
                     cursor_ms = at_ms;
                 }
                 match action {
-                    Action::Fault(f) => net.apply_fault(f),
+                    Action::Fault(f) => {
+                        match &f {
+                            Fault::BlackholeSignaling { node, active: true } => {
+                                blackhole_starts.insert(node.clone(), at_ms);
+                            }
+                            Fault::BlackholeSignaling { node, active: false } => {
+                                if let Some(s) = blackhole_starts.remove(node) {
+                                    let dur = at_ms.saturating_sub(s);
+                                    if (25_000..=35_000).contains(&dur) {
+                                        record_sometimes("blackhole_boundary_silence");
+                                    }
+                                    if dur.abs_diff(15_000) <= 800 || dur.abs_diff(30_000) <= 800 {
+                                        bh_silence_boundary_hit = true;
+                                    }
+                                    if matches!(config.mutant, SimMutant::Pre729InlineHeartbeat)
+                                        && dur >= 18_000
+                                    {
+                                        sim_rt::set_sim_inline_stall_ms(2_000);
+                                    }
+                                }
+                                bh_healed_nodes.insert(node.clone());
+                            }
+                            Fault::Impair { .. } | Fault::Partition { .. } => {
+                                if net.any_blackholed() || net.has_impair() || net.partition_count() > 0 {
+                                    record_sometimes("multi_fault_overlap");
+                                }
+                            }
+                            _ => {}
+                        }
+                        net.apply_fault(f);
+                        if net.has_impair() && net.partition_count() > 0 {
+                            record_sometimes("impair_under_partition");
+                        }
+                    }
                     Action::KillNode(name) => {
                         net.disconnect_node(&name);
                         if let Some(node) = running.iter_mut().find(|n| n.spec.name == name) {
@@ -796,6 +855,17 @@ impl SimWorld {
                         }
                     }
                     Action::RestartNode(name) => {
+                        restarted_nodes.insert(name.clone());
+                        if net.any_blackholed() {
+                            record_sometimes("peer_restarted_during_blackhole");
+                            if net.partition_count() == 0 {
+                                record_sometimes("clean_restart_no_partition");
+                                if matches!(config.mutant, SimMutant::NoiseSensitiveRestartInBlackhole)
+                                {
+                                    sim_rt::set_sim_inline_stall_ms(1_200);
+                                }
+                            }
+                        }
                         if let Some(pos) = running.iter().position(|n| n.spec.name == name) {
                             let spec = running[pos].spec.clone();
                             let pid = next_pid;
@@ -804,6 +874,20 @@ impl SimWorld {
                         }
                     }
                     Action::QueryCapStatus(name) => {
+                        if net.any_blackholed() {
+                            record_sometimes("cap_status_during_blackhole");
+                            if matches!(config.mutant, SimMutant::CanaryOnBlackholeStatus) {
+                                sim_rt::set_sim_inline_stall_ms(1_500);
+                            }
+                        }
+                        if matches!(config.mutant, SimMutant::TimerEdgeSilenceBoundary) {
+                            let status_near_edge = [15_000u64, 20_000, 30_000]
+                                .iter()
+                                .any(|t| at_ms.abs_diff(*t) <= 800);
+                            if bh_silence_boundary_hit && status_near_edge {
+                                sim_rt::set_sim_inline_stall_ms(1_200);
+                            }
+                        }
                         if let Some(node) = running.iter().find(|n| n.spec.name == name) {
                             let slot = node.ctl_slot.clone();
                             if let Some(res) = send_cap_status(&name, &slot).await {
@@ -820,6 +904,14 @@ impl SimWorld {
 
             if config.duration_ms > cursor_ms {
                 tokio::time::sleep(Duration::from_millis(config.duration_ms - cursor_ms)).await;
+            }
+
+            for (_n, start_ms) in blackhole_starts {
+                if config.duration_ms.saturating_sub(start_ms) >= 18_000
+                    && matches!(config.mutant, SimMutant::Pre729InlineHeartbeat)
+                {
+                    sim_rt::set_sim_inline_stall_ms(2_000);
+                }
             }
 
             for mut node in running {
@@ -843,6 +935,19 @@ impl SimWorld {
             sim_rt::set_sim_blocking_inline(false);
             let events = logs.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let net_events = net.trace_events();
+            if !bh_healed_nodes.is_empty()
+                && net_events
+                    .iter()
+                    .any(|e| e.event.starts_with("sig:connect:") || e.event.starts_with("direct:pair:"))
+            {
+                record_sometimes("signaling_healed_after_blackhole");
+            }
+            if !restarted_nodes.is_empty()
+                && net_events.iter().any(|e| e.event.starts_with("sig:connect:"))
+            {
+                record_sometimes("reconnect_after_peer_restart");
+            }
+
             let budget_violations: Vec<String> = events
                 .iter()
                 .filter(|e| e.message.contains("LOOP-BUDGET-EXCEEDED"))
@@ -850,14 +955,17 @@ impl SimWorld {
                 .collect();
             let trace_hash = fnv1a64(&events, &net_events);
             let telemetry = sim_rt::take_sim_telemetry();
+            let assertions = take_assertions();
 
             SimOutcome {
                 seed: config.seed,
                 trace_hash,
                 events,
+                net_events,
                 budget_violations,
                 cap_status_results,
                 telemetry,
+                assertions,
             }
         })
     }

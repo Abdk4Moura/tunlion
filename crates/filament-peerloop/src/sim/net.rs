@@ -18,6 +18,9 @@ use filament_transport::{HttpBackend, SignalingConnector, TransportContext};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
+use crate::sim::assertions::record_sometimes;
+use crate::sim::world::SimMutant;
+
 /// Deterministic SplitMix64 PRNG so every simulation run with the same seed
 /// makes identical loss, jitter, and timing choices.
 #[derive(Debug, Clone)]
@@ -161,6 +164,9 @@ pub struct NetTraceEvent {
 
 struct NetInner {
     rng: SimRng,
+    mutant: SimMutant,
+    drop_post_heal_reconnect: bool,
+    had_partition_heal: bool,
     next_node_idx: u16,
     next_port_offset: u16,
     next_sid: u64,
@@ -249,9 +255,16 @@ pub struct SimNetwork {
 
 impl SimNetwork {
     pub fn new(seed: u64) -> Arc<Self> {
+        Self::with_mutant(seed, SimMutant::None)
+    }
+
+    pub fn with_mutant(seed: u64, mutant: SimMutant) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(NetInner {
                 rng: SimRng::new(seed),
+                mutant,
+                drop_post_heal_reconnect: false,
+                had_partition_heal: false,
                 next_node_idx: 1,
                 next_port_offset: 10_000,
                 next_sid: 0,
@@ -344,6 +357,10 @@ impl SimNetwork {
             Fault::HealPartition { a, b } => {
                 g.record(format!("fault:heal:{a}:{b}"));
                 g.partitions.remove(&NetInner::pair_key(&a, &b));
+                g.had_partition_heal = true;
+                if matches!(g.mutant, SimMutant::PostHealDroppedReconnect) {
+                    g.drop_post_heal_reconnect = true;
+                }
                 for w in &g.direct_waiters {
                     w.notify.notify_waiters();
                 }
@@ -408,6 +425,45 @@ impl SimNetwork {
             .clone()
     }
 
+    pub fn is_blackholed(&self, node: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .blackholed
+            .contains(node)
+    }
+
+    pub fn any_blackholed(&self) -> bool {
+        !self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .blackholed
+            .is_empty()
+    }
+
+    pub fn partition_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .partitions
+            .len()
+    }
+
+    pub fn has_impair(&self) -> bool {
+        !self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .impair
+            .is_empty()
+    }
+
+    pub fn is_partitioned(&self, a: &str, b: &str) -> bool {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.is_partitioned(a, b, true)
+    }
+
     pub fn connected_sig_nodes(&self) -> Vec<String> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.sig_clients.values().map(|c| c.node.clone()).collect()
@@ -448,6 +504,7 @@ impl SignalingConnector for SimSignalingConnector {
                 let mut g = self.net.inner.lock().unwrap_or_else(|e| e.into_inner());
                 g.next_sid += 1;
                 let sid = format!("sim-sid-{}", g.next_sid);
+                let suppress_heal = g.drop_post_heal_reconnect;
                 g.sig_clients.insert(
                     conn_id,
                     SigClientState {
@@ -461,9 +518,12 @@ impl SignalingConnector for SimSignalingConnector {
                     },
                 );
                 g.sid_to_node.insert(sid.clone(), self.node.to_string());
-                g.record(format!("sig:connect:{}:{sid}", self.node));
+                if !suppress_heal {
+                    g.record(format!("sig:connect:{}:{sid}", self.node));
+                }
                 sid
             };
+            record_sometimes("sig_connected");
             let _ = tx.send(Incoming::Event {
                 name: "welcome".to_string(),
                 data: json!({ "id": sid, "peers": [] }),
@@ -598,6 +658,9 @@ impl SimSigBackend {
             "signal" => {
                 let to = data["to"].as_str().unwrap_or_default();
                 let inner = data["data"].clone();
+                if g.drop_post_heal_reconnect {
+                    return;
+                }
                 let found = g
                     .sig_clients
                     .iter()
@@ -662,6 +725,9 @@ impl SignalingBackend for SimSigBackend {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
             }
             if blackholed {
+                if event == "sync" {
+                    record_sometimes("heartbeat_fired_under_blackhole");
+                }
                 tokio::time::sleep(timeout).await;
                 return Ok(None);
             }
@@ -732,12 +798,16 @@ struct SimDirectBackend {
 #[async_trait]
 impl DirectBackend for SimDirectBackend {
     async fn gather_candidates(&self, _server: &str, port: u16) -> (Vec<String>, Option<String>) {
-        let (hang_ms, ip) = {
+        let (hang_ms, ip, blackholed) = {
             let mut g = self.net.inner.lock().unwrap_or_else(|e| e.into_inner());
             let hang = g.take_hang(&self.node, HangSite::GatherCandidates);
             let ip = g.node_ip(&self.node);
-            (hang, ip)
+            let bh = g.blackholed.contains(self.node.as_ref());
+            (hang, ip, bh)
         };
+        if blackholed {
+            record_sometimes("gather_during_blackhole");
+        }
         if let Some(ms) = hang_ms {
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
@@ -773,12 +843,19 @@ impl DirectBackend for SimDirectBackend {
             });
             if let Some(idx) = found_idx {
                 let peer_waiter = g.direct_waiters.swap_remove(idx);
+                if g.drop_post_heal_reconnect {
+                    return None;
+                }
                 let (a_tx, a_rx) = mpsc::unbounded_channel();
                 let (b_tx, b_rx) = mpsc::unbounded_channel();
                 g.record(format!(
                     "direct:pair:{}:{}<->{}",
                     req.route, self.node, peer_waiter.node
                 ));
+                record_sometimes("direct_paired");
+                if g.had_partition_heal {
+                    record_sometimes("direct_after_partition_heal");
+                }
                 *peer_waiter
                     .matched
                     .lock()
@@ -1045,6 +1122,7 @@ struct SimPeerFactory {
 #[async_trait]
 impl PeerFactory for SimPeerFactory {
     async fn connect(&self, req: SimPeerConnectReq) -> Result<Arc<dyn PeerBackend>> {
+        record_sometimes("webrtc_fallback_attempted");
         let hang_ms = {
             let mut g = self.net.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.record(format!("webrtc:connect:{}:{}", self.node, req.peer_id));
