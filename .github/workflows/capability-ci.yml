@@ -172,6 +172,32 @@ jobs:
         if: runner.os == 'macOS'
         run: codesign --force --sign - target/release/tunlion
 
+      # BUG-ACKLOSS fault-injection reproducer (#294). The binary this job
+      # already builds carries the test hook (stripped from release builds), so
+      # this is the only place in CI where the reproducer can produce a verdict.
+      # It asserts PROMPTNESS: with the receiver vanishing at the ack, a sender
+      # that detects the dead connection gives up once and never re-probes.
+      - name: Ack-loss reproducer (fault injection)
+        if: runner.os == 'Linux'
+        env:
+          TUNLION_SKIP_BUILD: "1"
+          TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
+          TUNLION_TEST_SERVER: http://127.0.0.1:8077
+        run: |
+          set -euo pipefail
+          ( cd backend && PORT=8077 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
+              FIL_CLAIM_LIMIT=1000000 FIL_PING_TIMEOUT=120 FIL_PING_INTERVAL=25 \
+              python3 app.py > /tmp/ackloss-backend.log 2>&1 & echo $! > /tmp/ackloss-backend.pid )
+          trap 'kill "$(cat /tmp/ackloss-backend.pid 2>/dev/null)" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:8077/api/health >/dev/null 2>&1 && break; sleep 0.5; done
+          curl -fsS http://127.0.0.1:8077/api/health >/dev/null
+          set +e
+          out=$(bash cli/tests/ack-loss-repro.sh 2>&1); code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 0 ]; then echo "::error::ack-loss reproducer exited $code"; exit 1; fi
+          grep -q '\[PROMPT:' <<<"$out" || { echo "::error::no PROMPT verdict in the output"; exit 1; }
+
       # Windows installer logic (scripts/install.ps1).
       #
       # COVERED HERE:

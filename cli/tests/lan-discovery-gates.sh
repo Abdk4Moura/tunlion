@@ -130,11 +130,24 @@ topo_wg() {
     # Key FILES: sudo closes inherited descriptors, so <(...) would hand wg
     # an unreadable path and leave the tunnel keyless (and silent).
     (umask 077; wg genkey > "$WORK/wg-a.key"; wg genkey > "$WORK/wg-b.key")
-    nsx lanA wg set wg0 listen-port 51820 private-key "$WORK/wg-a.key" peer "$(wg pubkey < "$WORK/wg-b.key")" endpoint 10.88.2.1:51820 allowed-ips 10.99.0.0/24 persistent-keepalive 5 \
-      || refuse "wg set failed on A"
-    nsx lanB wg set wg0 listen-port 51820 private-key "$WORK/wg-b.key" peer "$(wg pubkey < "$WORK/wg-a.key")" endpoint 10.88.1.1:51820 allowed-ips 10.99.0.0/24 persistent-keepalive 5 \
-      || refuse "wg set failed on B"
-    forward_udp 51820
+    # The wg ARM IS OPTIONAL, the instrument is not. Some hosts expose the
+    # wireguard netlink interface but not a wg tool that can read a key file
+    # (a confined wrapper answers "fopen: Permission denied"), and the ipip
+    # arm below is an equally valid underlay: the gates assert discovery, not
+    # the tunnel type. Fall back loudly instead of refusing the whole script,
+    # so a broken wg install cannot masquerade as a LAN-discovery failure.
+    if wg_err=$( { nsx lanA wg set wg0 listen-port 51820 private-key "$WORK/wg-a.key" peer "$(wg pubkey < "$WORK/wg-b.key")" endpoint 10.88.2.1:51820 allowed-ips 10.99.0.0/24 persistent-keepalive 5 \
+        && nsx lanB wg set wg0 listen-port 51820 private-key "$WORK/wg-b.key" peer "$(wg pubkey < "$WORK/wg-a.key")" endpoint 10.88.1.1:51820 allowed-ips 10.99.0.0/24 persistent-keepalive 5; } 2>&1 ); then
+      forward_udp 51820
+    else
+      echo "wireguard arm unavailable here ($wg_err); falling back to ipip"
+      nsx lanA ip link del wg0 2>/dev/null
+      nsx lanB ip link del wg0 2>/dev/null
+      TUNNEL=ipip
+      nsx lanA ip tunnel add wg0 mode ipip local 10.88.1.1 remote 10.88.2.1
+      nsx lanB ip tunnel add wg0 mode ipip local 10.88.2.1 remote 10.88.1.1
+      forward_udp 51820 4
+    fi
   else
     nsx lanA ip link del wg0 2>/dev/null
     TUNNEL=ipip

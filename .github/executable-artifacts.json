@@ -24,10 +24,14 @@
     },
     {
       "path": "cli/tests/ack-loss-repro.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/tunlion/issues/294",
-      "owner": "chief-ux",
-      "expires": "2026-11-15"
+      "disposition": "required",
+      "entrypoint": "TUNLION_SKIP_BUILD=1 TUNLION_BIN=target/release/tunlion TUNLION_TEST_SERVER=http://127.0.0.1:8077 bash cli/tests/ack-loss-repro.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     },
     {
       "path": "cli/tests/cap-verbs-gates.sh",
