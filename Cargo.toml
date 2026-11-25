@@ -26,6 +26,31 @@ lto = false
 debug = 0
 incremental = true
 
+# Fast rebuilds for the chaos fuzzer and other real-binary test loops
+# (fuzz/chaos/run-on-lease.sh). Not release evidence, same caveat as `measure`.
+#
+# Release takes minutes after ANY edit because fat LTO with one codegen unit
+# redoes whole-program optimisation every time. Here the workspace crates are
+# incremental with many codegen units and no LTO, so an edit recompiles only
+# what changed. Third-party crates do not change between iterations, so they
+# are compiled once at full optimisation and the hot dependency paths (tokio,
+# quinn, rustls, webrtc) run as fast as in release. Workspace code stays at
+# opt-level 2, not 1: the fuzzer injects timing faults, and an -O1 daemon is
+# slow enough in its own loops to shift the races it is meant to find.
+# Line tables keep backtraces and gdb thread dumps readable.
+[profile.fuzz]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 256
+incremental = true
+debug = "line-tables-only"
+strip = false
+
+[profile.fuzz.package."*"]
+opt-level = 3
+codegen-units = 16
+
 # SIZE: optimise the COLD crates for size, the hot ones for speed.
 #
 # opt-level "z" costs throughput, so it is applied only where throughput is not
