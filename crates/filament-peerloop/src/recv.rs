@@ -78,6 +78,9 @@ pub mod identity;
 pub mod join;
 #[cfg(feature = "dispatch")]
 pub mod lifecycle;
+// Ungated: `test_hooks::LoopBudget` names it in every test-hooks build, and
+// its unit tests run in the default `cargo test`.
+pub mod loop_budget;
 #[cfg(feature = "dispatch")]
 pub mod membership;
 #[cfg(not(feature = "mesh"))]

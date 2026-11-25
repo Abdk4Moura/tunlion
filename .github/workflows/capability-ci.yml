@@ -172,6 +172,32 @@ jobs:
         if: runner.os == 'macOS'
         run: codesign --force --sign - target/release/tunlion
 
+      # Loop budget (crates/filament-peerloop/src/recv/loop_budget.rs): every
+      # test-hooks daemon this job starts judges each event-loop iteration's
+      # busy time against one second. A healthy handler takes milliseconds; an
+      # iteration past a second is an await parked in the loop. Fatal here
+      # (the daemon panics), and recorded to a file the verdict step below
+      # checks, so a trip fails the job even where a harness swallows the
+      # daemon's output. Gates that hold the loop on purpose unset both.
+      #
+      # KNOWN RED (Windows only): the `file-end` handler, after sending the
+      # delivery ack, awaits `t.flush()` inline in the loop, bounded by
+      # ACK_FLUSH_BUDGET (2 s, recv/dispatch.rs). A peer that does not
+      # acknowledge holds the loop for the whole 2 s: 2028 ms on the Windows
+      # runner in revoked_device_direct_blocked_gets_no_fallback_access (PR
+      # #731's first run), and 2007 ms on Linux under the chaos schedule
+      # send-stuck-reconnecting-after-heal. Until that flush leaves the loop,
+      # Windows daemons record without panicking and the verdict tolerates
+      # exactly that label there; any other label, or that one on Linux or
+      # macOS, still fails the job.
+      - name: Arm the loop budget
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            echo "TUNLION_TEST_LOOP_BUDGET_PANIC=1" >> "$GITHUB_ENV"
+          fi
+          echo "TUNLION_TEST_LOOP_BUDGET_RECORD=$RUNNER_TEMP/loop-budget.record" >> "$GITHUB_ENV"
+
       # BUG-ACKLOSS fault-injection reproducer (#294). The binary this job
       # already builds carries the test hook (stripped from release builds), so
       # this is the only place in CI where the reproducer can produce a verdict.
@@ -613,6 +639,27 @@ jobs:
         env:
           TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
         timeout-minutes: 6
+
+      - name: Loop budget verdict
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          # cygpath: on Windows RUNNER_TEMP is a D:\ path the daemons wrote to.
+          rec="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/loop-budget.record"
+          [ -f "$rec" ] || : >"$rec"
+          known=""
+          [ "$RUNNER_OS" = "Windows" ] && known=" handler/Control:file-end "
+          if [ -n "$known" ] && grep -qF "$known" "$rec"; then
+            echo "::warning::known red: the file-end handler ran past the 1 s loop budget on Windows:"
+            grep -F "$known" "$rec"
+          fi
+          if [ -n "$known" ]; then rest=$(grep -vF "$known" "$rec" || true); else rest=$(cat "$rec"); fi
+          if [ -n "$rest" ]; then
+            echo "::error::a daemon event-loop iteration was busy past its 1 s budget (an await parked in the loop):"
+            echo "$rest"
+            exit 1
+          fi
+          echo "no daemon loop iteration over budget (known red excepted)"
 
       - name: Upload harness log (macOS)
         if: runner.os == 'macOS' && always()

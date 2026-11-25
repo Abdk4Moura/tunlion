@@ -141,6 +141,40 @@ pub enum ReqKind {
     Depart,
 }
 
+impl ReqKind {
+    /// The request's name, for labelling which control request the daemon
+    /// loop is handling (the test-hooks loop budget). Exhaustive on purpose.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ReqKind::Open { .. } => "Open",
+            ReqKind::Dial { .. } => "Dial",
+            ReqKind::Pty { .. } => "Pty",
+            ReqKind::Resize { .. } => "Resize",
+            ReqKind::WarmPtyReason { .. } => "WarmPtyReason",
+            ReqKind::Exec { .. } => "Exec",
+            ReqKind::Bootstrap { .. } => "Bootstrap",
+            ReqKind::Ping { .. } => "Ping",
+            ReqKind::Reconfigure { .. } => "Reconfigure",
+            ReqKind::ReloadExpose => "ReloadExpose",
+            ReqKind::L3State => "L3State",
+            ReqKind::Wake => "Wake",
+            ReqKind::RevocationSync => "RevocationSync",
+            ReqKind::Reload => "Reload",
+            ReqKind::Mount { .. } => "Mount",
+            ReqKind::Unmount { .. } => "Unmount",
+            ReqKind::ListMounts => "ListMounts",
+            ReqKind::MountHealth { .. } => "MountHealth",
+            ReqKind::CapStatus => "CapStatus",
+            ReqKind::ListWarm => "ListWarm",
+            ReqKind::FleetRendezvous { .. } => "FleetRendezvous",
+            ReqKind::ListPending => "ListPending",
+            ReqKind::ApproveRequest { .. } => "ApproveRequest",
+            ReqKind::DenyRequest { .. } => "DenyRequest",
+            ReqKind::Depart => "Depart",
+        }
+    }
+}
+
 /// A parsed request handed to the daemon's event loop, which owns the link
 /// table and the per-peer muxes. The loop dispatches on `kind` and then
 /// `accept()`s (bridging `sock`) or `reject()`s.
