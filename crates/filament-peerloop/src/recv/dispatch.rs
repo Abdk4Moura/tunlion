@@ -1082,9 +1082,11 @@ impl WriterTasks {
         #[cfg(not(feature = "sim"))]
         let handle = tokio::task::spawn_blocking(write);
         #[cfg(feature = "sim")]
-        let handle = {
+        let handle = if crate::sim_rt::is_sim_blocking_inline() {
             write();
             tokio::spawn(std::future::ready(()))
+        } else {
+            tokio::task::spawn_blocking(write)
         };
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.tasks
@@ -2857,6 +2859,14 @@ async fn recv_run(
         }
         if daemon {
             cleanup.watchdog.tick(log.clone());
+            #[cfg(feature = "sim")]
+            {
+                let sim_hold = crate::sim_rt::take_sim_inline_stall_ms();
+                if sim_hold > 0 {
+                    sim_budget.set_phase("sim-stall-hold", "none");
+                    tokio::time::sleep(Duration::from_millis(sim_hold)).await;
+                }
+            }
             // Loop-stall exit gate: hold this loop once, as a wedged await
             // would, so the gate can prove a short stall recovers and a long
             // one exits. Zero (and every production build) is a no-op.
@@ -2866,6 +2876,15 @@ async fn recv_run(
                 loop_budget.enter("test-stall-hold");
                 tokio::time::sleep(Duration::from_millis(hold)).await;
                 loop_budget.enter("prelude");
+            }
+            #[cfg(feature = "sim")]
+            {
+                let sim_hold = crate::sim_rt::take_sim_inline_stall_ms();
+                if sim_hold > 0 {
+                    loop_budget.enter("sim-stall-hold");
+                    tokio::time::sleep(Duration::from_millis(sim_hold)).await;
+                    loop_budget.enter("prelude");
+                }
             }
         }
         cleanup.tasks.reap(log.as_ref()).await;

@@ -2003,6 +2003,18 @@ impl UnreadTransport {
         }
     }
 
+    /// Wrap an in-memory transport along with a reader future spawned on `announce`.
+    #[cfg(feature = "sim")]
+    pub fn from_sim_with_reader(
+        transport: Arc<dyn Transport>,
+        reader: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        Self {
+            transport,
+            reader: std::sync::Mutex::new(Some(Box::pin(reader))),
+        }
+    }
+
     /// The transport, for callers that must inspect it before announcing.
     pub fn transport(&self) -> &Arc<dyn Transport> {
         &self.transport
