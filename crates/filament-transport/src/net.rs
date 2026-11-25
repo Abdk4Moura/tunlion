@@ -2255,6 +2255,17 @@ impl Peer {
         }
     }
 
+    /// The selected ICE pair, read under the same bound as every other
+    /// webrtc-rs call made from the event loop (see [`PC_OP_INLINE_BUDGET`]):
+    /// a reading that cannot be had at once is reported as unknown.
+    async fn selected_pair(&self) -> Option<webrtc::ice_transport::ice_candidate_pair::RTCIceCandidatePair> {
+        let ice = self.pc.sctp().transport().ice_transport();
+        tokio::time::timeout(PC_OP_INLINE_BUDGET, ice.get_selected_candidate_pair())
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// Which physical path did ICE pick? Same taxonomy as the browser badge.
     /// C2 fix: read the agent's actual selected pair, and classify
     /// local-vs-direct by ADDRESS rather than candidate type, the answering
@@ -2262,13 +2273,7 @@ impl Peer {
     /// badge promises is "bytes never leave your network", which is an
     /// address property.
     pub async fn route(&self) -> Option<String> {
-        let pair = self
-            .pc
-            .sctp()
-            .transport()
-            .ice_transport()
-            .get_selected_candidate_pair()
-            .await?;
+        let pair = self.selected_pair().await?;
         if pair.local.typ == RTCIceCandidateType::Relay
             || pair.remote.typ == RTCIceCandidateType::Relay
         {
@@ -2304,13 +2309,7 @@ impl Peer {
     /// or "tls". `None` when the selected pair's local candidate is not a relay
     /// (a direct path, or only the peer relays).
     pub async fn local_relay_transport(&self) -> Option<&'static str> {
-        let pair = self
-            .pc
-            .sctp()
-            .transport()
-            .ice_transport()
-            .get_selected_candidate_pair()
-            .await?;
+        let pair = self.selected_pair().await?;
         if pair.local.typ != RTCIceCandidateType::Relay {
             return None;
         }
@@ -2342,13 +2341,7 @@ impl Peer {
     /// network?"); this hands back the raw 5-tuple so the UI can name the
     /// interface and show the addresses instead of guessing.
     pub async fn path_detail(&self) -> Option<PathPair> {
-        let pair = self
-            .pc
-            .sctp()
-            .transport()
-            .ice_transport()
-            .get_selected_candidate_pair()
-            .await?;
+        let pair = self.selected_pair().await?;
         let typ = |t: RTCIceCandidateType| {
             match t {
                 RTCIceCandidateType::Host => "host",
