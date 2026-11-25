@@ -1,0 +1,8 @@
+{"version": 1, "seed": 9,
+ "origin": "production 2026-11-25: pop-os and dgmfa dropped off every network at once; do-vm kept a 'live' link to pop-os for 90 minutes ('missing from channel digest, link still live; deferring drop') and exec rode it into a 15 s timeout",
+ "hooks": {},
+ "steps": [{"at": 1.0, "op": "exec", "src": "bravo", "dst": "alpha"},
+           {"at": 5.0, "fault": "net.isolate", "target": "bravo", "dur": 120.0},
+           {"at": 40.0, "op": "send", "src": "alpha", "dst": "bravo", "kib": 64},
+           {"at": 100.0, "op": "reach", "src": "alpha", "dst": "bravo"},
+           {"at": 100.0, "op": "status", "src": "alpha", "dst": "alpha"}]}

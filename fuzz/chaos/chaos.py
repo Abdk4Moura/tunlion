@@ -73,9 +73,14 @@ OP_DEADLINE = {"exec": 75.0, "send": 90.0, "reach": 75.0, "status": 15.0, "docto
 SETTLE_SIGNALING = 90.0     # after heal: every daemon must report signaling connected
 STORM_WINDOW = 30.0         # quiet window in which reconnects are counted
 STORM_MAX_CONNECTS = 8      # per device per window; the 2026 storm made ~75
-LOOP_STALL_GRACE = 150.0    # a logged stall must be followed by recovery or exit
+LOOP_STALL_GRACE = 150.0
+STALE_LINK_AFTER = 90.0     # O10: a peer silent this long should not still look warm    # a logged stall must be followed by recovery or exit
 
-FAULTS = ["net.impair", "net.partition", "sig.blackhole", "sig.reset",
+# CHAOS: device to device (FORWARD). CHAOS_IN: device to the backend (INPUT).
+# CHAOS_OUT: the backend's replies to a device (OUTPUT), needed to isolate it.
+CHAINS = [("CHAOS", "FORWARD"), ("CHAOS_IN", "INPUT"), ("CHAOS_OUT", "OUTPUT")]
+
+FAULTS = ["net.impair", "net.partition", "net.isolate", "sig.blackhole", "sig.reset",
           "proc.freeze", "proc.kill", "server.down"]
 OPS = ["exec", "send", "reach", "status", "doctor"]
 
@@ -366,7 +371,7 @@ class World:
         # runners with docker default FORWARD to DROP). CHAOS_IN: device to
         # backend; a counting rule per device (SYNs = connection attempts,
         # measured OUTSIDE the daemon) precedes the fault rules.
-        for chain, hook in [("CHAOS", "FORWARD"), ("CHAOS_IN", "INPUT")]:
+        for chain, hook in CHAINS:
             sh(["iptables", "-N", chain])
             sh(["iptables", "-I", hook, "1", "-j", chain])
         sh(["iptables", "-A", "CHAOS", "-s", SUBNET, "-d", SUBNET, "-j", "ACCEPT"])
@@ -382,7 +387,7 @@ class World:
             log(f"netem unavailable ({r.stderr.strip()[:120]}); net.impair is DISABLED for this run")
 
     def net_down(self) -> None:
-        for chain, hook in [("CHAOS", "FORWARD"), ("CHAOS_IN", "INPUT")]:
+        for chain, hook in CHAINS:
             sh(["iptables", "-D", hook, "-j", chain], check=False)
             sh(["iptables", "-F", chain], check=False)
             sh(["iptables", "-X", chain], check=False)
@@ -653,6 +658,23 @@ def apply_fault(w: World, st: dict, uid: str) -> Applied | None:
         return Applied(st, heal, lambda: _ipt_counter("CHAOS", tag) >= 0,
                        lambda: _ipt_counter("CHAOS", tag) > 0)
 
+    if k == "net.isolate":
+        # The machine drops off every network at once (lid closed, Wi-Fi
+        # gone): nothing in or out, to peers or to the server, no close sent.
+        ip = dev_ip(st["target"])
+        rules = [("CHAOS", ["-s", ip]), ("CHAOS", ["-d", ip]), ("CHAOS_IN", ["-s", ip]), ("CHAOS_OUT", ["-d", ip])]
+        for chain, r in rules:
+            sh(["iptables", "-I", chain, "1", *r, "-m", "comment", "--comment", tag, "-j", "DROP"])
+
+        def heal():
+            for chain, r in rules:
+                sh(["iptables", "-D", chain, *r, "-m", "comment", "--comment", tag, "-j", "DROP"], check=False)
+
+        def present():
+            return all(_ipt_counter(c, tag) >= 0 for c in ("CHAOS", "CHAOS_IN", "CHAOS_OUT"))
+        return Applied(st, heal, present,
+                       lambda: sum(max(0, _ipt_counter(c, tag)) for c in ("CHAOS", "CHAOS_IN", "CHAOS_OUT")) > 0)
+
     if k in ("sig.blackhole", "sig.reset"):
         d = st["target"]
         target = ["-j", "DROP"] if k == "sig.blackhole" else ["-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset"]
@@ -802,7 +824,7 @@ _BLAMES_PEER = re.compile(r"\boffline\b|is '?[\w-]+'? online|`tunlion up` (is no
 _NAMES_PATH = re.compile(r"firewall|\bpath\b|relay|\bUDP\b|network between", re.I)
 # Faults that really can make the peer look offline. A partition between two
 # devices or a degraded link cannot: the peer is still up and announced.
-_PEER_DOWN_FAULTS = {"proc.freeze", "proc.kill", "sig.blackhole", "sig.reset"}
+_PEER_DOWN_FAULTS = {"proc.freeze", "proc.kill", "sig.blackhole", "sig.reset", "net.isolate"}
 
 
 def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
@@ -891,6 +913,8 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
             if end <= now:
                 present = ap.present()
                 bit = ap.bit()
+                if ap.step["fault"] == "net.isolate" and ap.step["dur"] >= STALE_LINK_AFTER:
+                    verdict["findings"].extend(stale_links(w, ap.step["target"], ap.step["dur"]))
                 ap.heal()
                 active.remove(item)
                 for tl in timeline:
@@ -1006,6 +1030,23 @@ def sig_state(w: World, d: str) -> tuple[str, object]:
     if not sig or sig.get("state") in (None, "unknown"):
         return "unreported", sig
     return ("connected" if sig.get("state") == "connected" else "down"), sig
+
+
+def stale_links(w: World, gone: str, secs: float) -> list[dict]:
+    """O10 (soft until tunlion documents a detection bound): after `gone` has
+    been silent on every network for `secs`, a peer that still reports a warm
+    link to it routes commands into a dead link (seen in production on
+    2026-11-25: 'link still live; deferring drop' for 90 minutes)."""
+    out = []
+    for d in DEVICES:
+        if d == gone:
+            continue
+        rep = w.cap_status(d) or {}
+        for l in rep.get("links") or []:
+            if l.get("name") == gone and l.get("warm"):
+                out.append({"oracle": "O10-stale-link", "hard": False,
+                            "what": f"{d} still reports a warm link to {gone} after {secs:.0f}s of total silence: {l}"})
+    return out
 
 
 def wait_signaling(w: World, devs: list[str], limit: float, allow_unreported: bool = False) -> dict:
