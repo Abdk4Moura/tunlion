@@ -1114,19 +1114,31 @@ def cmd_canary(w: World, out: Path) -> int:
     return 0
 
 
-def cmd_replay(w: World, out: Path, files: list[Path]) -> int:
+def cmd_replay(w: World, out: Path, files: list[Path], repeat: int = 1) -> int:
+    """Run each schedule `repeat` times. With repeat 1 a failure is confirmed
+    once more; with repeat > 1 the failure RATE is the result (an
+    intermittent bug and its fix are both measured as rates), and every
+    failing repetition keeps its own evidence."""
     hard = 0
+    rates = {}
     for f in files:
         sched = json.loads(f.read_text())
-        log(f"replay {f.name}")
-        v = run_schedule(w, sched, f.name)
-        if v["hard"]:
-            repro = confirm(w, sched, v, tries=1)
+        fails = 0
+        for i in range(repeat):
+            log(f"replay {f.name}" + (f" ({i + 1}/{repeat})" if repeat > 1 else ""))
+            v = run_schedule(w, sched, f.stem + (f"-r{i + 1}" if repeat > 1 else ""))
+            if not v["hard"]:
+                log("  clean")
+                continue
+            fails += 1
+            repro = confirm(w, sched, v, tries=1) if repeat == 1 else f"repetition {i + 1}/{repeat}"
             d = save_finding(out, v, w, repro)
-            log(f"  FINDING ({repro}) -> {d}: {[x['what'] for x in v['hard']]}")
-            hard += 1
-        else:
-            log("  clean")
+            log(f"  FINDING ({repro}) -> {d}: {[x['what'][:200] for x in v['hard']]}")
+        rates[f.name] = f"{fails}/{repeat}"
+        if repeat > 1:
+            log(f"  {f.name}: failed {fails} of {repeat}")
+        hard += 1 if fails else 0
+    (out / "replay-rates.json").write_text(json.dumps(rates, indent=2))
     return 1 if hard else 0
 
 
@@ -1244,6 +1256,7 @@ def main() -> int:
     ap.add_argument("--python", default=os.environ.get("TUNLION_TEST_VENV", sys.executable))
     ap.add_argument("--budget-min", type=float, default=30.0)
     ap.add_argument("--seed", type=int, default=int(time.time()))
+    ap.add_argument("--repeat", type=int, default=1, help="replay: run each schedule N times and report the rate")
     ap.add_argument("--skip-canary", action="store_true", help="local debugging only; CI never passes this")
     a = ap.parse_args()
     if a.command == "selftest":
@@ -1268,7 +1281,7 @@ def main() -> int:
         if not corpus:
             raise Refused("no schedules to run")
         if a.command == "replay":
-            return cmd_replay(w, a.out, corpus)
+            return cmd_replay(w, a.out, corpus, a.repeat)
         return cmd_explore(w, a.out, a.budget_min * 60, a.seed, corpus)
     except Refused as e:
         log(f"REFUSED: {e}")
