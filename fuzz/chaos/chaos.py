@@ -783,6 +783,9 @@ def judge_op(r: dict) -> list[dict]:
 # conditions in judge_diagnosis carry the precision.
 _BLAMES_PEER = re.compile(r"\boffline\b|is '?[\w-]+'? online|`tunlion up` (is not )?running|"
                           r"did not appear on the tunlion server|did not answer within", re.I)
+# A hint that names the path between the machines as a possible cause is not
+# a misdiagnosis, even when it also allows that the peer went away.
+_NAMES_PATH = re.compile(r"firewall|\bpath\b|relay|\bUDP\b|network between", re.I)
 # Faults that really can make the peer look offline. A partition between two
 # devices or a degraded link cannot: the peer is still up and announced.
 _PEER_DOWN_FAULTS = {"proc.freeze", "proc.kill", "sig.blackhole", "sig.reset"}
@@ -795,7 +798,8 @@ def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
     was connected to the server right after the failure."""
     if r.get("ok") or r.get("rc") in (None, 0) or "t_start" not in r:
         return []
-    if not _BLAMES_PEER.search(r.get("stderr_tail") or ""):
+    err = r.get("stderr_tail") or ""
+    if not _BLAMES_PEER.search(err) or _NAMES_PATH.search(err):
         return []
     dst = r["dst"]
     lo, hi = r["t_start"] - 15.0, r["t_end"]
@@ -1193,6 +1197,10 @@ def cmd_selftest() -> int:
     old = [{"step": {"fault": "proc.kill", "target": "bravo"}, "start": 0.0, "end": 1.0}]
     assert judge_diagnosis(dict(blamed, t_start=10.0, t_end=40.0), old) == [], "slack: presence may lag a heal"
     assert judge_diagnosis(dict(blamed, t_start=70.0, t_end=80.0), old)[0]["oracle"] == "O9-misdiagnosis"
+    fixed = dict(blamed, stderr_tail="no peer connected within 60s: 'bravo' is listed on the tunlion server, but no "
+                 "connection to it came up: a firewall may block every path between you (direct UDP, and the relay), "
+                 "or it went offline just now.")
+    assert judge_diagnosis(fixed, part) == [], "naming the path is the correct diagnosis"
     for p in sorted((HERE / "corpus").glob("*.json")):
         s = json.loads(p.read_text())
         assert s.get("version") == 1 and s["steps"], p
