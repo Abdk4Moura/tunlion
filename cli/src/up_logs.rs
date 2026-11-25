@@ -443,6 +443,26 @@ pub(crate) async fn up_cmd(
         // the rest used to pass as "same settings" whenever the shell posture
         // matched, and were silently not applied.
         let verdict = already_up_verdict(&shell_policy, &launch, running.as_ref());
+        // No settings back is not "different settings": a daemon whose loop is
+        // wedged cannot answer at all, and calling that a conflict sent a
+        // tester after flags instead of the stall. Ask once more whether it
+        // answers ANYTHING; a silent one is reported as not responding.
+        let responding = if running.is_some() {
+            Some(true)
+        } else {
+            crate::ctl::daemon_responds(UP_RESPONSE_WAIT).await
+        };
+        if !headless && responding == Some(false) {
+            let mut restart_flags = vec!["--detach".to_string()];
+            restart_flags.extend(daemon_argv.iter().skip(1).cloned());
+            let restart = restart_command(&restart_flags);
+            ui::problem(
+                &format!("a daemon is running (pid {pid}) but is not responding"),
+                &not_responding_detail(&verdict),
+                &[format!("stop it and start a fresh one:  {restart}")],
+            );
+            std::process::exit(crate::exit_codes::DAEMON_NOT_RESPONDING);
+        }
         // The detached child of a racing `up --detach` lost the election to a
         // daemon that may not be answering yet, so its settings are unknown and
         // the verdict would read as a conflict (exit 10, reported by the parent
@@ -734,6 +754,27 @@ fn log_line_out(line: &str) -> bool {
     writeln!(out, "{line}").and_then(|()| out.flush()).is_ok()
 }
 
+/// How long `up` waits for a running daemon that did not report its settings
+/// to answer anything at all before calling it not responding. On top of the
+/// settings query's own wait, so a slow but live daemon is not misjudged.
+const UP_RESPONSE_WAIT: Duration = Duration::from_secs(3);
+
+/// The explanation for a daemon that holds the lock but does not answer its
+/// control socket. `tunlion down` stops it even then: it escalates to a forced
+/// kill after a bounded wait (`daemon_stop::await_exit`).
+pub(crate) fn not_responding_detail(verdict: &AlreadyUp) -> String {
+    let flags = if *verdict == AlreadyUp::Same {
+        String::new()
+    } else {
+        " Your flags were NOT applied.".to_string()
+    };
+    format!(
+        "it did not answer its control socket, so it may be stalled (an event loop that \
+         stopped turning) and is probably serving nothing; peers will see this device \
+         offline. `tunlion down` stops it, forcing it after a bounded wait.{flags}"
+    )
+}
+
 /// What `up` should do about a daemon that is already running.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AlreadyUp {
@@ -997,6 +1038,18 @@ mod already_up_tests {
         assert_eq!(already_up_verdict(&asked, &none, Some(&only)), AlreadyUp::Same);
         let other = ShellPolicy::Only(["a".to_string()].into_iter().collect());
         assert_eq!(already_up_verdict(&other, &none, Some(&only)), AlreadyUp::Differs);
+    }
+
+    /// A daemon that does not answer is reported as not responding, never as
+    /// a settings conflict; the flags line appears only when flags were given.
+    #[test]
+    fn a_silent_daemon_is_not_called_a_settings_conflict() {
+        let same = not_responding_detail(&AlreadyUp::Same);
+        assert!(same.contains("may be stalled") && same.contains("`tunlion down`"), "{same}");
+        assert!(!same.contains("different settings") && !same.contains("NOT applied"), "{same}");
+        let unknown = not_responding_detail(&AlreadyUp::Unknown);
+        assert!(unknown.contains("NOT applied"), "{unknown}");
+        assert_ne!(crate::exit_codes::DAEMON_NOT_RESPONDING, ALREADY_UP_DIFFERENT_EXIT);
     }
 
     #[test]

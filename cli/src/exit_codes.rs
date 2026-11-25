@@ -14,6 +14,8 @@
 //!  14  loop stalled        the daemon (`up`) exited because its event loop
 //!                          stalled past the hard limit ([`DAEMON_LOOP_STALLED`],
 //!                          loop-stall-exit-gates.sh)
+//!  15  not responding      `up` found a running daemon that does not answer its
+//!                          control socket ([`DAEMON_NOT_RESPONDING`])
 //!
 //! `1` stays the catch-all, so the change is additive: a script that only tests
 //! `!= 0` is unaffected.
@@ -53,6 +55,12 @@ pub(crate) const STATUS_NOT_RUNNING: i32 = 11;
 /// lock, so a plain `tunlion up` starts a fresh daemon. Not an [`ExitKind`]:
 /// no command's own work failed, the process gave itself up.
 pub(crate) const DAEMON_LOOP_STALLED: i32 = 14;
+
+/// `up` found a daemon holding this config dir that does not answer its
+/// control socket at all: likely stalled. Distinct from [`DAEMON_CONFLICT`]
+/// (10), which is a daemon that answered with other settings; a frozen daemon
+/// used to be reported as that conflict. Nothing was started or applied.
+pub(crate) const DAEMON_NOT_RESPONDING: i32 = 15;
 
 /// What kind of failure a command ended in. `code()` is the process exit code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,7 +418,7 @@ const REACH_CODES: &[i32] = &[0, 1, 2, 3, 5, 6, 7, 9, 13, 130, 143];
 const STATUS_CODES: &[i32] = &[0, 1, 2, 6, 9, 11, 130, 143];
 const DEVICES_CODES: &[i32] = &[0, 1, 2, 3, 9, 12];
 const DOCTOR_CODES: &[i32] = &[0, 1, 2, 3, 6, 7, 9, 13, 130, 143];
-const UP_CODES: &[i32] = &[0, 1, 2, 4, 7, 9, 10, 12, 13, 14, 130, 143];
+const UP_CODES: &[i32] = &[0, 1, 2, 4, 7, 9, 10, 12, 13, 14, 15, 130, 143];
 const LOGS_CODES: &[i32] = &[0, 1, 2, 130, 143];
 const DOWN_CODES: &[i32] = &[0, 1, 2, 6];
 const PAIRING_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 9, 12, 13, 130, 143];
@@ -470,6 +478,7 @@ fn code_meaning(verb: &str, code: i32) -> &'static str {
         (_, 11) => "no daemon is running for this config directory",
         (_, 12) => "a resource on this machine ran out (disk full, quota, open files, memory)",
         (_, 14) => "the daemon exited because its event loop stalled past the limit (restart it, or let a service manager do so)",
+        (_, 15) => "a daemon is running but does not respond (it may be stalled; `tunlion down` stops it)",
         (_, 13) => "the tunlion server's TLS certificate was not trusted (a TLS-inspecting proxy, or a missing CA: set SSL_CERT_FILE)",
         (_, EXEC_CANNOT_RUN) => "the remote command was found but cannot be executed there",
         (_, EXEC_NOT_FOUND) => "the remote command is not on the remote daemon's PATH",
@@ -1122,5 +1131,16 @@ mod tests {
             "DAEMON_LOOP_STALLED must not reuse another code"
         );
         assert!(verb_exit_codes("up").contains(&DAEMON_LOOP_STALLED), "up is the daemon");
+        assert!(
+            footer.lines().any(|l| l.trim_start().starts_with(&format!("{DAEMON_NOT_RESPONDING} "))),
+            "DAEMON_NOT_RESPONDING (exit {DAEMON_NOT_RESPONDING}) is missing from the EXIT CODES help section"
+        );
+        assert!(
+            !kinds.contains(&DAEMON_NOT_RESPONDING)
+                && ![DAEMON_CONFLICT, STATUS_NOT_RUNNING, DAEMON_LOOP_STALLED]
+                    .contains(&DAEMON_NOT_RESPONDING),
+            "DAEMON_NOT_RESPONDING must not reuse another code"
+        );
+        assert!(verb_exit_codes("up").contains(&DAEMON_NOT_RESPONDING));
     }
 }
