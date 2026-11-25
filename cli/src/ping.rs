@@ -481,7 +481,7 @@ async fn print_cold(server: &str, peer: &str, relay: bool, timeout: Option<u64>)
             } else {
                 ui::say(&format!(
                     "  {}",
-                    ui::paint(Tone::Dim, &format!("─ {peer} may be offline, or not running `tunlion up` / `--shell`"))
+                    ui::paint(Tone::Dim, &format!("─ {}", unreachable_hint(peer, o.failed_phase)))
                 ));
             }
             Some(kind)
@@ -625,9 +625,40 @@ pub(crate) fn reach_json_cold(
     v
 }
 
+/// What a failed reach says about the cause. Failing at `establishing` or
+/// later means the peer already appeared on the tunlion server, so "may be
+/// offline, or not running `tunlion up`" pointed the user at a machine that
+/// was up: the chaos fuzzer found it with only UDP blocked between the two.
+/// Before that (or unknown) the peer really may be offline. Pure.
+pub(crate) fn unreachable_hint(peer: &str, failed_phase: Option<crate::diag::Phase>) -> String {
+    use crate::diag::Phase;
+    match failed_phase {
+        Some(Phase::Establishing | Phase::Ready | Phase::L2Open | Phase::Up) => format!(
+            "{peer} is listed on the tunlion server, but no connection to it came up: a firewall may block \
+             every path between you (direct UDP, and the relay), or it went offline just now. \
+             `tunlion doctor {}` shows which paths were tried",
+            crate::refusal::word(peer)
+        ),
+        _ => format!("{peer} may be offline, or not running `tunlion up` / `--shell`"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reach_that_found_the_peer_blames_the_path_not_the_peer() {
+        use crate::diag::Phase;
+        let path = unreachable_hint("bravo", Some(Phase::Establishing));
+        assert!(path.contains("listed on the tunlion server") && path.contains("firewall"), "{path}");
+        assert!(!path.contains("not running"), "{path}");
+        assert!(path.contains("`tunlion doctor bravo`"), "{path}");
+        for early in [Some(Phase::Presence), Some(Phase::Signaling), None] {
+            let h = unreachable_hint("bravo", early);
+            assert!(h.contains("may be offline"), "{early:?}: {h}");
+        }
+    }
 
     /// E3: `reach` told a device with no shell grant on beta that "ssh/pty to
     /// beta will be instant". It cannot know the grant, so it says the
