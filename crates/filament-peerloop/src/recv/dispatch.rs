@@ -10363,17 +10363,22 @@ async fn recv_run(
                                                 &ports.env.delivery,
                                             ))
                                             .await;
-                                        // BOUNDED: this runs inline in the event
-                                        // loop. The ack is already queued and goes
-                                        // out on its own; the flush only waits for
-                                        // the peer to acknowledge it, and a sender
-                                        // that reads the ack and exits never does.
-                                        // Unbounded, that parked the whole loop, so
-                                        // the receiver never saw the peer-left that
-                                        // ends it and held the finished file until
-                                        // its timeout (gate 11c, G-k).
-                                        let _ =
-                                            tokio::time::timeout(ACK_FLUSH_BUDGET, t.flush()).await;
+                                        // OFF THE LOOP. The ack is already queued and
+                                        // goes out on its own; the flush only waits
+                                        // for the peer to acknowledge it, and a
+                                        // sender that reads the ack and exits never
+                                        // does. Unbounded inline, that parked the
+                                        // whole loop (gate 11c, G-k); bounded inline
+                                        // it still held the loop for up to
+                                        // ACK_FLUSH_BUDGET on every file whose sender
+                                        // left, which the loop budget (#731) reported
+                                        // as `handler/Control:file-end` 2007 ms. Nothing
+                                        // after this point depends on the flush, so it
+                                        // runs on its own task with the same bound.
+                                        let flush_t = t.clone();
+                                        tokio::spawn(async move {
+                                            let _ = tokio::time::timeout(ACK_FLUSH_BUDGET, flush_t.flush()).await;
+                                        });
                                         log.say(&log.paint(
                                             Tone::Dim,
                                             &format!(
