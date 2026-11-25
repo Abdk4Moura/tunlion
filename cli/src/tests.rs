@@ -5174,6 +5174,20 @@ fn a_full_disk_is_named_with_both_sizes_never_called_corruption() {
 }
 
 #[test]
+fn a_send_that_saw_the_peer_blames_the_path_not_the_peer() {
+    use crate::send_cmd::{establish_timeout_hint, no_peer_hint};
+    let fallback = no_peer_hint(Some("bravo"), false, None);
+    let seen = establish_timeout_hint(false, Some("bravo"), true, &fallback);
+    assert!(seen.contains("'bravo' is listed on the tunlion server") && seen.contains("firewall"), "{seen}");
+    assert!(!seen.contains("`tunlion up` running"), "{seen}");
+    assert!(seen.contains("`tunlion doctor bravo`"), "{seen}");
+    // Never seen: the peer itself is the likely cause, keep the old question.
+    assert_eq!(establish_timeout_hint(false, Some("bravo"), false, &fallback), fallback);
+    // --relay keeps its own sentence.
+    assert!(establish_timeout_hint(true, Some("bravo"), true, &fallback).contains("TURN relay"));
+}
+
+#[test]
 fn the_no_peer_hint_names_who_we_were_waiting_for() {
     use crate::send_cmd::no_peer_hint;
     // CLI to CLI: a device is another tunlion, never "the page".

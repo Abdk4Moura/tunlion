@@ -423,7 +423,12 @@ try {
         foreach ($d in @(Get-RunningDaemons $exe)) {
             if ($AllUsers) { $stuck += $d; continue }
             Say "stopping the running daemon (pid $($d.Id)) to replace its binary ..."
-            & $exe down --yes 2>&1 | Out-Null
+            # Under $ErrorActionPreference = 'Stop', Windows PowerShell 5.1
+            # turns a native command's redirected stderr into a terminating
+            # error, so a `down` that fails (0.9.1 prints "program not found")
+            # aborted the whole install before the binary was replaced. A
+            # failed `down` is expected here; Stop-Process below covers it.
+            try { & $exe down --yes 2>&1 | Out-Null } catch { }
             if (Get-Process -Id $d.Id -ErrorAction SilentlyContinue) {
                 # Releases whose `down` cannot stop a Windows daemon exist
                 # (it shelled out to `kill`). End it the way Task Manager

@@ -269,6 +269,7 @@ test holds to the help text.
 | 12 | `local_resource` | a resource on THIS machine ran out: its disk or quota is full, it has no file descriptors or memory left (a full stdin spool, `add --out` onto a full disk). A receiver's full disk is 4 for the sender, the peer refusing, with `error.reason: "no_space"`, and 12 for `receive` itself |
 | 13 | `tls_certificate` | the tunlion server answered, but its TLS certificate was not trusted here: a proxy that inspects TLS and re-signs with its own CA, or a missing CA. Set `SSL_CERT_FILE` (or `SSL_CERT_DIR`) to your CA bundle. Also a set `SSL_CERT_FILE` / `SSL_CERT_DIR` that loads no certificate |
 | 14 | | the daemon (`up`) exited on its own because its event loop stalled for `LOOP_STALL_EXIT_SECS` (120 s): a wedged await it could not recover from. A service manager restarts it; otherwise `tunlion up` starts a fresh one (`DAEMON_LOOP_STALLED`) |
+| 15 | | `up`: a daemon holds this config directory but does not answer its control socket, so it may be stalled; nothing was started or applied. `tunlion down` stops it (it forces the stop after a bounded wait). Distinct from 10, a daemon that answered with other settings (`DAEMON_NOT_RESPONDING`) |
 | 126 | | `exec`: the remote command was found but cannot be executed there |
 | 127 | | `exec`: the remote command is not on the remote daemon's PATH |
 | 130 | `interrupted` | interrupted (SIGINT) |
