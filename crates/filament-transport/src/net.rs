@@ -1940,14 +1940,48 @@ pub fn polite_role_legacy(my_uid: &str, peer_uid: Option<&str>, my_id: &str, pee
 }
 
 
-pub struct Peer {
-    pub id: String,
+#[cfg(feature = "sim")]
+#[derive(Clone)]
+pub struct SimPeerConnectReq {
+    pub peer_id: String,
+    pub my_uid: String,
     pub polite: bool,
-    pub pc: Arc<RTCPeerConnection>,
-    /// Immutable source identity captured before any callback is enqueued.
-    source: SourceId,
+    pub relay_only: bool,
+    pub sio: Client,
+    pub tx: EvSink,
+    pub generation: u32,
+    pub source: SourceId,
+}
+
+#[cfg(feature = "sim")]
+#[async_trait]
+pub trait PeerBackend: Send + Sync {
+    fn is_connected(&self) -> bool;
+    fn is_live(&self) -> bool;
+    async fn remote_pc(&self) -> Option<u64>;
+    async fn establishing_progress(&self) -> bool;
+    fn restart_ice(&self);
+    fn negotiation_backlog(&self) -> usize;
+    fn mark_closed(&self);
+    async fn close(&self);
+    async fn handle_signal(&self, data: Value) -> Result<SignalOutcome>;
+    async fn fingerprints(&self) -> Option<(String, String)>;
+    async fn route(&self) -> Option<String>;
+    async fn local_relay_transport(&self) -> Option<&'static str>;
+    async fn route_shown(&self, route: &str) -> String;
+    async fn path_detail(&self) -> Option<PathPair>;
+}
+
+#[cfg(feature = "sim")]
+#[async_trait]
+pub trait PeerFactory: Send + Sync {
+    async fn connect(&self, req: SimPeerConnectReq) -> Result<Arc<dyn PeerBackend>>;
+}
+
+struct RealPeer {
+    id: String,
+    pc: Arc<RTCPeerConnection>,
     state: Arc<Mutex<PeerSignalState>>,
-    sio: Client,
     closed: Arc<std::sync::atomic::AtomicBool>,
     /// C20: DTLS cert fingerprints (ours, theirs) parsed from the SDP we
     /// exchange, pair-proofs are bound to them so a MITM'd channel (even by
@@ -1961,14 +1995,29 @@ pub struct Peer {
     /// TURN over TCP/TLS bridges for this connection (`turn_bridge`); `None`
     /// when the config had no TCP or TLS TURN URL.
     turn_bridges: Option<Arc<crate::turn_bridge::TurnBridges>>,
-    /// This connection's generation, sent as `pc` on every description and
-    /// candidate so the far end can tell a rebuilt connection on the same sid
-    /// from a renegotiation of this one.
-    generation: u32,
     /// Test seam: while held, the negotiation task cannot start an operation,
     /// standing in for a webrtc-rs lock held across an SCTP handshake.
     #[cfg(test)]
     hold: Arc<Mutex<()>>,
+}
+
+#[cfg(feature = "sim")]
+enum PeerInner {
+    Real(Box<RealPeer>),
+    Sim(Arc<dyn PeerBackend>),
+}
+
+pub struct Peer {
+    pub id: String,
+    pub polite: bool,
+    #[cfg(not(feature = "sim"))]
+    pub pc: Arc<RTCPeerConnection>,
+    /// Immutable source identity captured before any callback is enqueued.
+    source: SourceId,
+    #[cfg(not(feature = "sim"))]
+    real: Box<RealPeer>,
+    #[cfg(feature = "sim")]
+    inner: PeerInner,
 }
 
 /// The remote DTLS fingerprint a live connection may record next. A
@@ -2059,6 +2108,76 @@ pub enum SignalOutcome {
 }
 
 impl Peer {
+    #[inline]
+    fn as_real(&self) -> Option<&RealPeer> {
+        #[cfg(not(feature = "sim"))]
+        {
+            Some(&self.real)
+        }
+        #[cfg(feature = "sim")]
+        match &self.inner {
+            PeerInner::Real(r) => Some(r),
+            PeerInner::Sim(_) => None,
+        }
+    }
+
+    #[cfg(feature = "sim")]
+    #[inline]
+    fn as_sim(&self) -> Option<&Arc<dyn PeerBackend>> {
+        match &self.inner {
+            PeerInner::Sim(s) => Some(s),
+            PeerInner::Real(_) => None,
+        }
+    }
+
+    /// Underlying `RTCPeerConnection` for unit tests. Panics on a sim peer.
+    #[doc(hidden)]
+    pub fn raw_pc(&self) -> &Arc<RTCPeerConnection> {
+        &self.as_real().expect("raw_pc called on sim Peer").pc
+    }
+
+    /// Context-aware constructor: delegates to `context.peer_factory()` under
+    /// `--features sim` when configured, otherwise falls through to `Peer::connect`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_context(
+        context: &crate::TransportContext,
+        peer_id: String,
+        my_uid: String,
+        polite: bool,
+        ice_servers: Vec<RTCIceServer>,
+        relay_only: bool,
+        sio: Client,
+        tx: impl Into<EvSink>,
+        generation: u32,
+    ) -> Result<Arc<Peer>> {
+        #[cfg(feature = "sim")]
+        if let Some(factory) = context.peer_factory() {
+            let tx: EvSink = tx.into();
+            let source = SourceId::next();
+            let backend = factory
+                .connect(SimPeerConnectReq {
+                    peer_id: peer_id.clone(),
+                    my_uid,
+                    polite,
+                    relay_only,
+                    sio,
+                    tx,
+                    generation,
+                    source,
+                })
+                .await?;
+            return Ok(Arc::new(Peer {
+                id: peer_id,
+                polite,
+                source,
+                inner: PeerInner::Sim(backend),
+            }));
+        }
+        #[cfg(not(feature = "sim"))]
+        let _ = context;
+        Self::connect(peer_id, my_uid, polite, ice_servers, relay_only, sio, tx, generation).await
+    }
+
     /// Build the RTCPeerConnection, wire callbacks into `tx`, and (if impolite)
     /// create the data channel + offer, exactly the browser's PeerLink dance.
     /// `generation` tags watchdog events so stale timers from torn-down attempts are
@@ -2271,32 +2390,47 @@ impl Peer {
         };
         let ops_busy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let ops = worker.clone().spawn(ops_busy.clone());
-        let peer = Arc::new(Peer {
-            id: peer_id,
-            polite,
-            pc,
-            source,
+        let real = Box::new(RealPeer {
+            id: peer_id.clone(),
+            pc: pc.clone(),
             state,
-            sio,
             closed,
             fps,
             ops,
             ops_busy,
             turn_bridges,
-            generation,
             #[cfg(test)]
             hold: worker.hold,
         });
         // local fingerprint from whatever description we already sent (offer
         // path emits before Peer exists; capture lazily on first access too)
-        if let Some(ld) = peer.pc.local_description().await {
-            peer.fps.lock().await.0 = sdp_fingerprint(&ld.sdp);
+        if let Some(ld) = real.pc.local_description().await {
+            real.fps.lock().await.0 = sdp_fingerprint(&ld.sdp);
         }
+        #[cfg(not(feature = "sim"))]
+        let peer = Arc::new(Peer {
+            id: peer_id,
+            polite,
+            pc,
+            source,
+            real,
+        });
+        #[cfg(feature = "sim")]
+        let peer = Arc::new(Peer {
+            id: peer_id,
+            polite,
+            source,
+            inner: PeerInner::Real(real),
+        });
         Ok(peer)
     }
 
     pub fn is_connected(&self) -> bool {
-        self.pc.connection_state() == RTCPeerConnectionState::Connected
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            return sim.is_connected();
+        }
+        self.as_real().expect("real peer").pc.connection_state() == RTCPeerConnectionState::Connected
     }
 
     /// Immutable identity assigned before any event was enqueued.
@@ -2318,21 +2452,34 @@ impl Peer {
     /// New/Connecting remain bounded by the C3 establishment watchdog
     /// (`WATCHDOG_SECS`, 15s, sent Ev::Stuck when the pc is not Connected).
     pub fn is_live(&self) -> bool {
-        is_live_state(self.pc.connection_state())
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            return sim.is_live();
+        }
+        is_live_state(self.as_real().expect("real peer").pc.connection_state())
     }
 
     /// The far end's peer-connection tag from the remote description applied
     /// last; `None` before one is applied or from a sender that does not tag.
     pub async fn remote_pc(&self) -> Option<u64> {
-        self.state.lock().await.remote_pc
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            return sim.remote_pc().await;
+        }
+        self.as_real().expect("real peer").state.lock().await.remote_pc
     }
 
     /// Has this establish heard back from the far end: a remote description
     /// applied, or ICE checking or connected? An establish timer should leave
     /// such a connection to the C3 watchdog rather than abandon it.
     pub async fn establishing_progress(&self) -> bool {
-        let has_remote = self.state.lock().await.has_remote;
-        has_remote || ice_progressing(self.pc.ice_connection_state())
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            return sim.establishing_progress().await;
+        }
+        let real = self.as_real().expect("real peer");
+        let has_remote = real.state.lock().await.has_remote;
+        has_remote || ice_progressing(real.pc.ice_connection_state())
     }
 
     /// C4: nudge ICE recovery after a transient 'disconnected' (impolite side
@@ -2344,6 +2491,11 @@ impl Peer {
     /// [`PC_OP_INLINE_BUDGET`], it parked the daemon loop for that whole budget
     /// in the `disconnected` PcState handler (chaos finding d6e0cd7c93).
     pub fn restart_ice(&self) {
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            sim.restart_ice();
+            return;
+        }
         let _ = self.enqueue(PcOp::RestartIce);
     }
 
@@ -2353,9 +2505,10 @@ impl Peer {
     /// out the budget again, one budget per signal, so the caller does not.
     fn enqueue(&self, op: PcOp) -> bool {
         use std::sync::atomic::Ordering;
-        let idle = self.ops_busy.fetch_add(1, Ordering::SeqCst) == 0;
-        if self.ops.send(op).is_err() {
-            self.ops_busy.fetch_sub(1, Ordering::SeqCst);
+        let real = self.as_real().expect("real peer");
+        let idle = real.ops_busy.fetch_add(1, Ordering::SeqCst) == 0;
+        if real.ops.send(op).is_err() {
+            real.ops_busy.fetch_sub(1, Ordering::SeqCst);
             return false;
         }
         idle
@@ -2363,23 +2516,44 @@ impl Peer {
 
     /// Operations queued or running on this peer's negotiation task.
     pub fn negotiation_backlog(&self) -> usize {
-        self.ops_busy.load(std::sync::atomic::Ordering::SeqCst)
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            return sim.negotiation_backlog();
+        }
+        self.as_real()
+            .expect("real peer")
+            .ops_busy
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Silence callbacks immediately (synchronous, atomic) so a dying pc
     /// can't spam the event loop (browser fix #3, the CLI flavor).
     pub fn mark_closed(&self) {
-        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            sim.mark_closed();
+            return;
+        }
+        self.as_real()
+            .expect("real peer")
+            .closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Tear down. May block on network teardown against an unreachable peer,
     /// callers in the event loop must mark_closed() and spawn this, never
     /// await it inline (gate 11 deadlock).
     pub async fn close(&self) {
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            sim.close().await;
+            return;
+        }
         self.mark_closed();
-        let _ = self.pc.close().await;
+        let real = self.as_real().expect("real peer");
+        let _ = real.pc.close().await;
         // After pc.close(): its TURN deallocations travel through the bridges.
-        if let Some(b) = &self.turn_bridges {
+        if let Some(b) = &real.turn_bridges {
             b.shutdown();
         }
     }
@@ -2401,6 +2575,11 @@ impl Peer {
     /// in order, once webrtc-rs lets go. A glare found that late cannot be
     /// handed back, so it is logged and the C3 watchdog rebuilds the link.
     pub async fn handle_signal(&self, data: Value) -> Result<SignalOutcome> {
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            return sim.handle_signal(data).await;
+        }
+        let real = self.as_real().expect("real peer");
         let (done, wait) = tokio::sync::oneshot::channel();
         if !self.enqueue(PcOp::Signal(data, Some(done))) {
             return Ok(SignalOutcome::Handled);
@@ -2411,7 +2590,7 @@ impl Peer {
             Err(_) => {
                 crate::hooks::debug(&format!(
                     "tunlion: signal for {} still applying after {PC_OP_INLINE_BUDGET:?}; it continues off the event loop",
-                    self.id
+                    real.id
                 ));
                 Ok(SignalOutcome::Handled)
             }
@@ -2425,10 +2604,15 @@ impl Peer {
     /// held across an SCTP handshake (see [`PC_OP_INLINE_BUDGET`]), so it is
     /// bounded and never holds `fps` while it waits.
     pub async fn fingerprints(&self) -> Option<(String, String)> {
-        let (mine, theirs) = self.fps.lock().await.clone();
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            return sim.fingerprints().await;
+        }
+        let real = self.as_real().expect("real peer");
+        let (mine, theirs) = real.fps.lock().await.clone();
         let mine = match mine {
             Some(fp) => Some(fp),
-            None => tokio::time::timeout(PC_OP_INLINE_BUDGET, self.pc.local_description())
+            None => tokio::time::timeout(PC_OP_INLINE_BUDGET, real.pc.local_description())
                 .await
                 .ok()
                 .flatten()
@@ -2436,13 +2620,13 @@ impl Peer {
         };
         let theirs = match theirs {
             Some(fp) => Some(fp),
-            None => tokio::time::timeout(PC_OP_INLINE_BUDGET, self.pc.remote_description())
+            None => tokio::time::timeout(PC_OP_INLINE_BUDGET, real.pc.remote_description())
                 .await
                 .ok()
                 .flatten()
                 .and_then(|rd| sdp_fingerprint(&rd.sdp)),
         };
-        let mut f = self.fps.lock().await;
+        let mut f = real.fps.lock().await;
         if f.0.is_none() {
             f.0 = mine;
         }
@@ -2459,7 +2643,8 @@ impl Peer {
     /// webrtc-rs call made from the event loop (see [`PC_OP_INLINE_BUDGET`]):
     /// a reading that cannot be had at once is reported as unknown.
     async fn selected_pair(&self) -> Option<webrtc::ice_transport::ice_candidate_pair::RTCIceCandidatePair> {
-        let sctp = self.pc.sctp();
+        let real = self.as_real()?;
+        let sctp = real.pc.sctp();
         let dtls = sctp.transport();
         let ice = dtls.ice_transport();
         tokio::time::timeout(PC_OP_INLINE_BUDGET, ice.get_selected_candidate_pair())
@@ -2475,6 +2660,10 @@ impl Peer {
     /// badge promises is "bytes never leave your network", which is an
     /// address property.
     pub async fn route(&self) -> Option<String> {
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            return sim.route().await;
+        }
         let pair = self.selected_pair().await?;
         if pair.local.typ == RTCIceCandidateType::Relay
             || pair.remote.typ == RTCIceCandidateType::Relay
@@ -2511,12 +2700,17 @@ impl Peer {
     /// or "tls". `None` when the selected pair's local candidate is not a relay
     /// (a direct path, or only the peer relays).
     pub async fn local_relay_transport(&self) -> Option<&'static str> {
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            return sim.local_relay_transport().await;
+        }
+        let real = self.as_real()?;
         let pair = self.selected_pair().await?;
         if pair.local.typ != RTCIceCandidateType::Relay {
             return None;
         }
         Some(
-            self.turn_bridges
+            real.turn_bridges
                 .as_ref()
                 .and_then(|b| b.kind_for_port(pair.local.related_port))
                 .map(|k| k.label())
@@ -2528,6 +2722,10 @@ impl Peer {
     /// "relay (TURN over tcp)", so a UDP-blocked network is visible. Callers
     /// that compare against [`ROUTE_RELAY`] keep using `route()`.
     pub async fn route_shown(&self, route: &str) -> String {
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            return sim.route_shown(route).await;
+        }
         if route != ROUTE_RELAY {
             return route.to_string();
         }
@@ -2543,6 +2741,10 @@ impl Peer {
     /// network?"); this hands back the raw 5-tuple so the UI can name the
     /// interface and show the addresses instead of guessing.
     pub async fn path_detail(&self) -> Option<PathPair> {
+        #[cfg(feature = "sim")]
+        if let Some(sim) = self.as_sim() {
+            return sim.path_detail().await;
+        }
         let pair = self.selected_pair().await?;
         let typ = |t: RTCIceCandidateType| {
             match t {
@@ -4380,7 +4582,7 @@ mod negotiation_off_loop_tests {
     #[tokio::test]
     async fn an_ice_restart_never_waits_for_a_wedged_negotiation() {
         let p = peer(false).await;
-        let guard = p.hold.lock().await;
+        let guard = p.as_real().unwrap().hold.lock().await;
         assert_eq!(p.negotiation_backlog(), 0, "the queue starts idle");
         let started = std::time::Instant::now();
         p.restart_ice();
@@ -4409,7 +4611,7 @@ mod negotiation_off_loop_tests {
         // case for one handler is two wedged operations on idle queues (two
         // descriptions read, or a signal applied to two connections).
         let (p, q) = (peer(true).await, peer(true).await);
-        let (guard_p, guard_q) = (p.hold.lock().await, q.hold.lock().await);
+        let (guard_p, guard_q) = (p.as_real().unwrap().hold.lock().await, q.as_real().unwrap().hold.lock().await);
         let started = std::time::Instant::now();
         assert!(matches!(p.handle_signal(candidate(1)).await, Ok(SignalOutcome::Handled)));
         assert!(matches!(q.handle_signal(candidate(2)).await, Ok(SignalOutcome::Handled)));
@@ -4424,7 +4626,7 @@ mod negotiation_off_loop_tests {
     #[tokio::test]
     async fn a_wedged_negotiation_does_not_park_the_caller() {
         let p = peer(true).await;
-        let guard = p.hold.lock().await;
+        let guard = p.as_real().unwrap().hold.lock().await;
         let started = crate::clock::Instant::now();
         assert!(matches!(p.handle_signal(candidate(1)).await, Ok(SignalOutcome::Handled)));
         let first = started.elapsed();
@@ -4456,7 +4658,7 @@ mod negotiation_off_loop_tests {
         })
         .await
         .expect("the queue drains once released");
-        let st = p.state.lock().await;
+        let st = p.as_real().unwrap().state.lock().await;
         let order: Vec<String> = st
             .pending_candidates
             .iter()
@@ -4471,12 +4673,12 @@ mod negotiation_off_loop_tests {
     async fn a_healthy_negotiation_still_answers_before_the_caller_returns() {
         let offerer = peer(false).await;
         let answerer = peer(true).await;
-        let offer = offerer.pc.local_description().await.expect("offer");
+        let offer = offerer.raw_pc().local_description().await.expect("offer");
         let signal = json!({ "type": "description", "pc": 1, "description": offer });
         assert!(matches!(answerer.handle_signal(signal).await, Ok(SignalOutcome::Handled)));
         // Synchronous to the caller on the happy path: the answer is in force
         // when handle_signal returns, as it was when it ran inline.
-        let local = answerer.pc.local_description().await.expect("answer applied");
+        let local = answerer.raw_pc().local_description().await.expect("answer applied");
         assert_eq!(local.sdp_type, RTCSdpType::Answer);
         assert!(answerer.fingerprints().await.is_some());
         assert_eq!(answerer.negotiation_backlog(), 0);
@@ -4487,11 +4689,11 @@ mod negotiation_off_loop_tests {
         // A polite peer holding its own local offer must hand a colliding
         // offer back to its owner, who rebuilds it as a responder.
         let other = peer(false).await;
-        let offer = other.pc.local_description().await.expect("offer");
+        let offer = other.raw_pc().local_description().await.expect("offer");
         let signal = json!({ "type": "description", "pc": 1, "description": offer });
         let p = peer(true).await;
-        let own = p.pc.create_offer(None).await.expect("own offer");
-        p.pc.set_local_description(own).await.expect("have-local-offer");
+        let own = p.raw_pc().create_offer(None).await.expect("own offer");
+        p.raw_pc().set_local_description(own).await.expect("have-local-offer");
         assert!(matches!(p.handle_signal(signal).await, Ok(SignalOutcome::Glare(_))));
     }
 }
