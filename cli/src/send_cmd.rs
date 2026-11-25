@@ -1033,6 +1033,13 @@ pub(crate) async fn send_cmd(
                 // A reset device runs `up` as a NEW key the old record can
                 // never find, so "is up running there?" alone was useless. Say
                 // so, and if it already re-paired under a suffixed name, name it.
+                // This machine never reached the server (it fell back to the
+                // local network), so nothing is known about the peer's
+                // presence: the failure is ours. The chaos fuzzer found the old
+                // text telling an offline laptop to forget a healthy device.
+                if lan_offline {
+                    return Err(exit_codes::err(ExitKind::Network, unreachable_from_here_message(n)));
+                }
                 let names: Vec<String> = devices_load().into_iter().map(|(name, _)| name).collect();
                 let successor =
                     crate::reset_hints::successor_of(n, names.iter().map(String::as_str));
@@ -1052,7 +1059,13 @@ pub(crate) async fn send_cmd(
             {
                 offline_hinted = true;
                 ui::clear_sticky();
-                ui::say(&crate::conn::offline_hint(n));
+                if lan_offline {
+                    ui::say(&format!(
+                        "still looking for '{n}' on the local network (the tunlion server is unreachable from here)"
+                    ));
+                } else {
+                    ui::say(&crate::conn::offline_hint(n));
+                }
             }
         }
         // The receiver left and did not come back within the window this send
@@ -3330,6 +3343,18 @@ pub(crate) fn offline_window(establish: Duration, env: Option<&str>) -> Option<D
         .filter(|n| *n > 0)
         .unwrap_or(10);
     Some(Duration::from_secs(secs).min(establish))
+}
+
+/// The answer when THIS machine could not reach the tunlion server and the
+/// peer was not found on the local network either. Nothing is known about
+/// the peer, so the sentence is about this machine's connection; it never
+/// suggests forgetting or re-pairing the device. Pure.
+pub(crate) fn unreachable_from_here_message(peer: &str) -> String {
+    format!(
+        "can't reach the tunlion server from this machine, and '{peer}' was not found on the local \
+         network either: check this machine's network connection (`tunlion doctor` checks it). \
+         Nothing was sent."
+    )
 }
 
 /// The answer for a known device that never appeared. Pure.
