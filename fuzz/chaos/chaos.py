@@ -692,10 +692,13 @@ def apply_fault(w: World, st: dict, uid: str) -> Applied | None:
 def run_op(w: World, st: dict, phase: str) -> dict:
     kind = st["op"]
     src, dst = st["src"], st["dst"]
-    res = {"op": kind, "src": src, "dst": dst, "phase": phase, "at": st.get("at")}
+    res = {"op": kind, "src": src, "dst": dst, "phase": phase, "at": st.get("at"),
+           "deadline": st.get("deadline", OP_DEADLINE[kind])}
+    deadline = st.get("deadline", OP_DEADLINE[kind])
     if kind == "exec":
         token = f"CHZ{random.randrange(1 << 40):x}"
-        rc, out, err, el = w.cli(src, ["exec", dst, "--", "/bin/echo", token], OP_DEADLINE["exec"])
+        cmd = st.get("cmd") or ["/bin/echo", token]
+        rc, out, err, el = w.cli(src, ["exec", dst, "--", *cmd], deadline)
         res.update(rc=rc, elapsed=round(el, 2), ok=(rc == 0 and token in out))
         res["lie"] = rc == 0 and token not in out
     elif kind == "send":
@@ -704,7 +707,7 @@ def run_op(w: World, st: dict, phase: str) -> dict:
         data = os.urandom(st.get("kib", 4) * 1024)
         f.write_bytes(data)
         os.chown(f, w.uid, w.gid)
-        rc, out, err, el = w.cli(src, ["send", str(f), "--to", dst], OP_DEADLINE["send"])
+        rc, out, err, el = w.cli(src, ["send", str(f), "--to", dst], deadline)
         got = None
         if rc == 0:
             for _ in range(20):
@@ -718,7 +721,7 @@ def run_op(w: World, st: dict, phase: str) -> dict:
         # rc 0 with the file absent or different is the worst UX outcome there is.
         res["lie"] = rc == 0 and not intact
     else:
-        rc, out, err, el = w.cli(src, ["reach", dst], OP_DEADLINE["reach"])
+        rc, out, err, el = w.cli(src, ["reach", dst], deadline)
         res.update(rc=rc, elapsed=round(el, 2), ok=rc == 0, lie=False)
     res["stderr_tail"] = (err or "").strip()[-400:]
     res["stdout_tail"] = (out or "").strip()[-200:]
@@ -731,7 +734,7 @@ def judge_op(r: dict) -> list[dict]:
     who = f"{r['op']} {r['src']}->{r['dst']}"
     if r["rc"] is None:
         f.append({"oracle": "O2-hang", "hard": True,
-                  "what": f"{who} still running after {OP_DEADLINE[r['op']]:.0f}s ({r['phase']})"})
+                  "what": f"{who} still running after {r.get('deadline', OP_DEADLINE[r['op']]):.0f}s ({r['phase']})"})
         return f
     if r["rc"] == 101:
         f.append({"oracle": "O4-panic", "hard": True, "what": f"{who} panicked: {r['stderr_tail'][-200:]}"})
@@ -994,7 +997,15 @@ def cmd_canary(w: World, out: Path) -> int:
     if not caught:
         log(f"CANARY MISSED: a daemon with signaling self-heal disabled was not flagged: {b['findings']}")
         return 4
-    log("canary: healthy arm clean, broken arm flagged. The instrument works.")
+    # Hang arm: a command that really outlives its deadline must be killed and
+    # classified as O2-hang. Proves deadline, kill and judgement end to end.
+    hung = run_op(w, {"op": "exec", "src": "bravo", "dst": OWNER, "cmd": ["/bin/sleep", "20"], "deadline": 5.0},
+                  "canary-hang")
+    hang_found = [f["oracle"] for f in judge_op(hung)]
+    if hung["rc"] is not None or "O2-hang" not in hang_found or hung["elapsed"] > 15:
+        log(f"CANARY MISSED: the hang rule did not fire on a 20 s command with a 5 s deadline: {hung}")
+        return 4
+    log("canary: healthy arm clean, broken arm flagged, hang arm flagged. The instrument works.")
     return 0
 
 
