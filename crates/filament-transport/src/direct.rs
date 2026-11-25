@@ -518,14 +518,38 @@ async fn public_ip(context: &crate::TransportContext, server: &str) -> Option<Ip
     }
     let cache = context.public_ip_cache();
     // Read the cache under a short-held lock (NEVER across the await below).
-    {
+    let stale = {
         let guard = cache.lock().await;
-        if let Some(e) = guard.as_ref() {
-            if pubip_fresh(&e.server, e.at.elapsed(), server, PUBIP_TTL) {
-                return Some(e.ip);
-            }
+        match guard.as_ref() {
+            Some(e) if pubip_fresh(&e.server, e.at.elapsed(), server, PUBIP_TTL) => return Some(e.ip),
+            Some(e) if e.server == server => Some(e.ip),
+            _ => None,
         }
+    };
+    // An expired answer for this server is still the best guess (a box's
+    // public IP rarely moves). Use it now and refresh off the caller: this runs
+    // inside a fleet arm in the daemon event loop, and a whoami against a
+    // server that stopped answering held the loop for its whole timeout on
+    // every arm. Only a cold cache (first connect) waits for the round trip.
+    if let Some(ip) = stale {
+        if !PUBIP_REFRESHING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let (context, server) = (context.clone(), server.to_string());
+            tokio::spawn(async move {
+                let _ = fetch_public_ip(&context, &server).await;
+                PUBIP_REFRESHING.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        return Some(ip);
     }
+    fetch_public_ip(context, server).await
+}
+
+/// At most one background whoami refresh at a time.
+static PUBIP_REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The `/api/whoami` round trip, recording the answer in the cache.
+async fn fetch_public_ip(context: &crate::TransportContext, server: &str) -> Option<IpAddr> {
+    let cache = context.public_ip_cache();
     let url = format!("{server}/api/whoami");
     let client = crate::http::client_builder()
         .ok()?
