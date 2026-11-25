@@ -826,13 +826,35 @@ def judge_op(r: dict) -> list[dict]:
 # running `tunlion up`, never appeared. Matched loosely on purpose; the other
 # conditions in judge_diagnosis carry the precision.
 _BLAMES_PEER = re.compile(r"\boffline\b|is '?[\w-]+'? online|`tunlion up` (is not )?running|"
-                          r"did not appear on the tunlion server|did not answer within", re.I)
+                          r"did not appear on the tunlion server|did not answer within|"
+                          r"may be unresponsive|running a build without", re.I)
 # A hint that names the path between the machines as a possible cause is not
 # a misdiagnosis, even when it also allows that the peer went away.
 _NAMES_PATH = re.compile(r"firewall|\bpath\b|relay|\bUDP\b|network between", re.I)
 # Faults that really can make the peer look offline. A partition between two
 # devices or a degraded link cannot: the peer is still up and announced.
 _PEER_DOWN_FAULTS = {"proc.freeze", "proc.kill", "sig.blackhole", "sig.reset", "net.isolate"}
+
+
+def judge_local_status(r: dict, fault_windows: list[dict]) -> list[dict]:
+    """O3b: a daemon keeps answering its OWN machine while only its network is
+    faulted. `status` on a device whose daemon was not frozen or killed must
+    not say "not responding": that is the event loop parked on network I/O,
+    and the advice it prints (restart it) is wrong."""
+    if r.get("op") != "status" or r.get("rc") != 6 or "t_start" not in r:
+        return []
+    if "not responding" not in (r.get("stderr_tail") or ""):
+        return []
+    lo, hi = r["t_start"], r["t_end"]
+    for f in fault_windows:
+        st = f["step"]
+        end = f["end"] if f["end"] is not None else float("inf")
+        if st["fault"] in ("proc.freeze", "proc.kill") and st.get("target") == r["src"] and f["start"] < hi and end > lo - 5:
+            return []
+    faults = sorted({f["step"]["fault"] for f in fault_windows})
+    return [{"oracle": "O3b-unresponsive-during-network-fault", "hard": True,
+             "what": f"status on {r['src']} said its daemon was not responding while only network faults "
+                     f"were active ({', '.join(faults)}): {r['stderr_tail'][:200]}"}]
 
 
 def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
@@ -942,6 +964,7 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
     for r in results:
         verdict["findings"].extend(judge_op(r))
         verdict["findings"].extend(judge_diagnosis(r, fault_windows))
+        verdict["findings"].extend(judge_local_status(r, fault_windows))
 
     # After heal: every daemon reconnects, every path works, nobody storms.
     alive = [d for d in DEVICES if w.daemons[d] and w.daemons[d].poll() is None]
@@ -1319,6 +1342,15 @@ def cmd_selftest() -> int:
                  "connection to it came up: a firewall may block every path between you (direct UDP, and the relay), "
                  "or it went offline just now.")
     assert judge_diagnosis(fixed, part) == [], "naming the path is the correct diagnosis"
+    st_r = {"op": "status", "src": "charlie", "dst": "charlie", "rc": 6, "t_start": 39.2, "t_end": 40.8,
+            "stderr_tail": "x running but not responding (pid 1): it did not answer on its control socket"}
+    bh = [{"step": {"fault": "sig.blackhole", "target": "charlie"}, "start": 4.9, "end": 54.6}]
+    assert judge_local_status(st_r, bh)[0]["oracle"] == "O3b-unresponsive-during-network-fault"
+    fr = bh + [{"step": {"fault": "proc.freeze", "target": "charlie"}, "start": 10.7, "end": 72.9}]
+    assert judge_local_status(st_r, fr) == [], "a frozen daemon is allowed to not respond"
+    ex = dict(blamed, op="exec", src="bravo", dst="alpha", stderr_tail="Error: no answer from 'alpha' - it may be "
+              "unresponsive or running a build without exec", dst_signaling_after="connected")
+    assert judge_diagnosis(dict(ex, dst="bravo"), part)[0]["oracle"] == "O9-misdiagnosis"
     for p in sorted((HERE / "corpus").glob("*.json")):
         s = json.loads(p.read_text())
         assert s.get("version") == 1 and s["steps"], p
