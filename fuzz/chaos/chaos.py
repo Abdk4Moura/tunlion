@@ -864,7 +864,25 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
                                         "what": f"{d} logged an event-loop stall and never recovered or exited"})
     verdict["kinds"] = sorted(set().union(*(kinds_of(t) for t in logs.values())))
     verdict["hard"] = [f for f in verdict["findings"] if f["hard"]]
+    verdict["elapsed_s"] = round(time.monotonic() - t0, 1)
+    record_run(w, verdict)
     return verdict
+
+
+def record_run(w: "World", verdict: dict) -> None:
+    """Every run leaves a record, clean or not: what was applied, whether it
+    bit, every operation's exit code and latency, which rules fired. A clean
+    record is the evidence of what was exercised."""
+    if not getattr(w, "out", None):
+        return
+    runs = w.out / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    n = len(list(runs.glob("*.json")))
+    rec = {k: verdict.get(k) for k in ("label", "schedule", "faults", "ops", "findings", "elapsed_s",
+                                       "unreported_signaling")}
+    rec["kinds_count"] = len(verdict.get("kinds", []))
+    safe = re.sub(r"[^\w.-]", "_", verdict["label"])[:60]
+    (runs / f"{n:04d}-{safe}.json").write_text(json.dumps(rec, indent=1, sort_keys=True))
 
 
 def sig_state(w: World, d: str) -> tuple[str, object]:
@@ -961,7 +979,9 @@ def cmd_canary(w: World, out: Path) -> int:
     sb = copy.deepcopy(CANARY_SCHEDULE)
     sb["hooks"] = {"bravo": {"TUNLION_TEST_NO_SIGNALING_RECONNECT": "1"}}
     b = run_schedule(w, sb, "canary-broken")
-    (out / "canary.json").write_text(json.dumps({"healthy": a["findings"], "broken": b["findings"]}, indent=2))
+    (out / "canary.json").write_text(json.dumps(
+        {arm: {k: v[k] for k in ("findings", "ops", "faults")} for arm, v in (("healthy", a), ("broken", b))},
+        indent=2))
     caught = any(f["oracle"].startswith("O1") and "bravo" in f["what"] for f in b["hard"])
     bit = all(x.get("bit") for x in b["faults"])
     if a["hard"]:
@@ -1099,6 +1119,7 @@ def main() -> int:
     a.out.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="chz.", dir="/tmp"))
     w = World(a.bin.resolve(), work, a.python)
+    w.out = a.out
     try:
         w.preconditions()
         log(f"binary {w.bin} sha256 {w.bin_sha[:16]} (asserted unchanged before every run)")
