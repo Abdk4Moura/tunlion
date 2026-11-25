@@ -25,6 +25,7 @@ if [ -n "$(git -C "$ROOT" status --porcelain -- fuzz cli crates backend)" ]; the
   echo "uncommitted changes under fuzz/ cli/ crates/ backend/: commit first, the run must name a SHA" >&2
   exit 2
 fi
+TREE=$(git -C "$ROOT" rev-parse HEAD:cli HEAD:crates HEAD:Cargo.lock | sha256sum | cut -c1-16)
 JOB="chaos-$SHA-$MODE-$(date +%s)"
 TAR=$(mktemp -d)/"$JOB.tar"
 git -C "$ROOT" archive --format=tar HEAD -o "$TAR"
@@ -42,8 +43,17 @@ job="\$root/jobs/$JOB"; mkdir -p "\$job"; tar -xf "\$inbox" -C "\$job"
 find "\$job" -type f -exec touch {} +
 cd "\$job/cli"
 export CARGO_TARGET_DIR="\${CARGO_TARGET_DIR:-\$root/cargo-target}"
-flock --close "\$root/build.lock" cargo build --features test-hooks --release 2>&1 | tail -3
-cp "\$CARGO_TARGET_DIR/release/tunlion" "\$job/tunlion-under-test"
+# The binary depends only on cli/, crates/ and Cargo.lock: a fuzz-only change
+# reuses the binary built for the same product tree.
+cached="\$root/chaos-bins/$TREE/tunlion"
+if [ -x "\$cached" ]; then
+  echo "== reusing binary built for product tree $TREE"
+else
+  flock --close "\$root/build.lock" cargo build --features test-hooks --release 2>&1 | tail -3
+  mkdir -p "\$root/chaos-bins/$TREE"
+  cp "\$CARGO_TARGET_DIR/release/tunlion" "\$cached"
+fi
+cp "\$cached" "\$job/tunlion-under-test"
 sha256sum "\$job/tunlion-under-test"
 python3 -m venv "\$root/chaos-venv" 2>/dev/null || true
 "\$root/chaos-venv/bin/pip" -q install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
@@ -67,7 +77,7 @@ OUT=$(grep -oP '^CHAOS_OUT=\K.*' "$LOG" | tail -1)
 RC=$(grep -oP '^CHAOS_RC=\K\d+' "$LOG" | tail -1)
 if [ -n "$OUT" ]; then
   DEST="$ROOT/chaos-results/$JOB"; mkdir -p "$DEST"
-  tunlion exec "$WORKER" -- base64 -w0 "$OUT" | base64 -d | tar -xz -C "$DEST"
+  tunlion exec "$WORKER" -- base64 -w0 "$OUT" | base64 -d | tar --no-same-owner -xz -C "$DEST"
   echo "== results in $DEST"
 fi
 exit "${RC:-3}"

@@ -19,6 +19,7 @@ Exit codes (same convention as scripts/flake-check.sh):
   3  refused: a precondition is unmet, so no result was produced
   4  the canary was NOT detected: the instrument is broken, every other
      result of this job is meaningless
+  5  the harness itself crashed: a bug in this file, not in tunlion
 
 Subcommands:
   canary    two-arm self-check: a known-broken daemon must be flagged and the
@@ -90,6 +91,11 @@ RECOVERABLE_HOOKS = {
     "TUNLION_TEST_DROP_PEER_LEFT": ["1"],
     "TUNLION_TEST_CORRUPT_ONCE": ["1"],
 }
+
+
+# Files a daemon creates while it runs. They are state of THAT process, not of
+# the enrolled device, and a socket cannot be copied at all.
+RUNTIME_FILES = shutil.ignore_patterns("*.sock", "up.pid", "up.exe", "up.ready", "up.inbox", "up.lock", "*.lock")
 
 
 def log(msg: str) -> None:
@@ -507,7 +513,7 @@ class World:
         if self.snapshot.exists():
             shutil.rmtree(self.snapshot)
         for d in DEVICES:
-            shutil.copytree(self.cfg(d) / "cfg", self.snapshot / d, symlinks=True)
+            shutil.copytree(self.cfg(d) / "cfg", self.snapshot / d, symlinks=True, ignore=RUNTIME_FILES)
 
     def reset_for_run(self, hooks: dict) -> None:
         """Every run starts from the same enrolled state with fresh daemons."""
@@ -1086,6 +1092,13 @@ def main() -> int:
     except Refused as e:
         log(f"REFUSED: {e}")
         return 3
+    except Exception:
+        # Exit 1 means "tunlion has a bug". A crash in this file must never
+        # be read that way.
+        import traceback
+        traceback.print_exc()
+        log("HARNESS ERROR: chaos.py itself failed; this is not a tunlion finding")
+        return 5
     finally:
         try:
             shutil.copytree(work / "dev", a.out / "last-run-dev", dirs_exist_ok=True,
