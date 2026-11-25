@@ -20,6 +20,16 @@ pub trait SignalingConnector: Send + Sync {
     >;
 }
 
+#[cfg(feature = "sim")]
+pub trait HttpBackend: Send + Sync {
+    fn get_json<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send + 'a>,
+    >;
+}
+
 struct Inner {
     dns_cache_path: Option<PathBuf>,
     settings: Arc<Settings>,
@@ -28,6 +38,8 @@ struct Inner {
     observed_ip: Mutex<Option<IpAddr>>,
     #[cfg(feature = "sim")]
     signaling_connector: Option<Arc<dyn SignalingConnector>>,
+    #[cfg(feature = "sim")]
+    http_backend: Option<Arc<dyn HttpBackend>>,
 }
 
 impl Default for TransportContext {
@@ -60,6 +72,8 @@ impl TransportContext {
             observed_ip: Mutex::new(None),
             #[cfg(feature = "sim")]
             signaling_connector: None,
+            #[cfg(feature = "sim")]
+            http_backend: None,
         }))
     }
 
@@ -78,11 +92,30 @@ impl TransportContext {
             public_ip: Mutex::new(None),
             observed_ip: Mutex::new(None),
             signaling_connector: Some(connector),
+            http_backend: self.0.http_backend.clone(),
         }))
     }
 
     #[cfg(feature = "sim")]
     pub fn signaling_connector(&self) -> Option<&Arc<dyn SignalingConnector>> {
         self.0.signaling_connector.as_ref()
+    }
+
+    #[cfg(feature = "sim")]
+    pub fn with_http_backend(&self, backend: Arc<dyn HttpBackend>) -> Self {
+        Self(Arc::new(Inner {
+            dns_cache_path: self.0.dns_cache_path.clone(),
+            settings: Arc::clone(&self.0.settings),
+            membership: Arc::clone(&self.0.membership),
+            public_ip: Mutex::new(None),
+            observed_ip: Mutex::new(None),
+            signaling_connector: self.0.signaling_connector.clone(),
+            http_backend: Some(backend),
+        }))
+    }
+
+    #[cfg(feature = "sim")]
+    pub fn http_backend(&self) -> Option<&Arc<dyn HttpBackend>> {
+        self.0.http_backend.as_ref()
     }
 }
