@@ -1760,13 +1760,18 @@ pub struct Peer {
     pub pc: Arc<RTCPeerConnection>,
     /// Immutable source identity captured before any callback is enqueued.
     source: SourceId,
-    state: Mutex<PeerSignalState>,
+    state: Arc<Mutex<PeerSignalState>>,
     sio: Client,
     closed: Arc<std::sync::atomic::AtomicBool>,
     /// C20: DTLS cert fingerprints (ours, theirs) parsed from the SDP we
     /// exchange, pair-proofs are bound to them so a MITM'd channel (even by
     /// the signaling server) fails verification.
-    fps: Mutex<(Option<String>, Option<String>)>,
+    fps: Arc<Mutex<(Option<String>, Option<String>)>>,
+    /// Negotiation operations (signals, ICE restarts) run in order on this
+    /// peer's own task, never on the caller's: see [`PcOp`].
+    ops: mpsc::UnboundedSender<PcOp>,
+    /// Operations queued or running on that task.
+    ops_busy: Arc<std::sync::atomic::AtomicUsize>,
     /// TURN over TCP/TLS bridges for this connection (`turn_bridge`); `None`
     /// when the config had no TCP or TLS TURN URL.
     turn_bridges: Option<Arc<crate::turn_bridge::TurnBridges>>,
@@ -1774,6 +1779,10 @@ pub struct Peer {
     /// candidate so the far end can tell a rebuilt connection on the same sid
     /// from a renegotiation of this one.
     generation: u32,
+    /// Test seam: while held, the negotiation task cannot start an operation,
+    /// standing in for a webrtc-rs lock held across an SCTP handshake.
+    #[cfg(test)]
+    hold: Arc<Mutex<()>>,
 }
 
 /// The remote DTLS fingerprint a live connection may record next. A
@@ -1805,6 +1814,42 @@ struct PeerSignalState {
     /// The `pc` tag of the remote description applied last (the sender's
     /// peer-connection generation), `None` from a sender that does not tag.
     remote_pc: Option<u64>,
+}
+
+/// How long a caller (the daemon event loop) waits for a negotiation
+/// operation before leaving it to finish on the peer's task.
+///
+/// webrtc-rs holds internal locks across network waits: `start_sctp` holds the
+/// local-description lock while the SCTP association handshake runs, and under
+/// loss or a partition that handshake takes tens of seconds. `create_offer`,
+/// `set_remote_description` and friends wait on the same locks. Awaited from
+/// the event loop, one such call parked the whole daemon (48 s, then 120 s and
+/// the stall exit) while every other peer went unserved. A healthy operation
+/// finishes in milliseconds, so the caller still sees its result; a wedged one
+/// keeps its place in the peer's queue and the loop moves on.
+pub const PC_OP_INLINE_BUDGET: Duration = Duration::from_secs(1);
+
+/// One negotiation operation on a peer connection, run by the peer's own
+/// task in arrival order. Order matters: a description must land before the
+/// candidates that follow it, and an answer must follow its offer.
+enum PcOp {
+    Signal(Value, Option<tokio::sync::oneshot::Sender<Result<SignalOutcome>>>),
+    RestartIce(Option<tokio::sync::oneshot::Sender<()>>),
+}
+
+/// What the peer's negotiation task needs: shared handles only, so no
+/// operation borrows the `Peer` and none runs on its caller's task.
+#[derive(Clone)]
+struct PcWorker {
+    id: String,
+    polite: bool,
+    pc: Arc<RTCPeerConnection>,
+    state: Arc<Mutex<PeerSignalState>>,
+    fps: Arc<Mutex<(Option<String>, Option<String>)>>,
+    sio: Client,
+    generation: u32,
+    #[cfg(test)]
+    hold: Arc<Mutex<()>>,
 }
 
 /// What `handle_signal` did with a relayed signal.
@@ -2009,21 +2054,40 @@ impl Peer {
             });
         }
 
+        let state = Arc::new(Mutex::new(PeerSignalState {
+            pending_candidates: Vec::new(),
+            has_remote: false,
+            remote_pc: None,
+        }));
+        let fps = Arc::new(Mutex::new((None, None)));
+        let worker = PcWorker {
+            id: peer_id.clone(),
+            polite,
+            pc: pc.clone(),
+            state: state.clone(),
+            fps: fps.clone(),
+            sio: sio.clone(),
+            generation,
+            #[cfg(test)]
+            hold: Arc::new(Mutex::new(())),
+        };
+        let ops_busy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ops = worker.clone().spawn(ops_busy.clone());
         let peer = Arc::new(Peer {
             id: peer_id,
             polite,
             pc,
             source,
-            state: Mutex::new(PeerSignalState {
-                pending_candidates: Vec::new(),
-                has_remote: false,
-                remote_pc: None,
-            }),
+            state,
             sio,
             closed,
-            fps: Mutex::new((None, None)),
+            fps,
+            ops,
+            ops_busy,
             turn_bridges,
             generation,
+            #[cfg(test)]
+            hold: worker.hold,
         });
         // local fingerprint from whatever description we already sent (offer
         // path emits before Peer exists; capture lazily on first access too)
@@ -2074,24 +2138,32 @@ impl Peer {
     }
 
     /// C4: nudge ICE recovery after a transient 'disconnected' (impolite side
-    /// only, mirroring the browser).
+    /// only, mirroring the browser). Runs on the peer's negotiation task; the
+    /// caller waits at most [`PC_OP_INLINE_BUDGET`] (see there for why).
     pub async fn restart_ice(&self) {
-        let _ = self.pc.restart_ice().await;
-        // restart_ice marks negotiation needed; drive the new offer ourselves
-        // (webrtc-rs has no negotiationneeded auto-loop in this setup).
-        if let Ok(offer) = self.pc.create_offer(None).await {
-            if self.pc.set_local_description(offer).await.is_ok() {
-                if let Some(ld) = self.pc.local_description().await {
-                    let _ = self
-                        .sio
-                        .emit(
-                            "signal",
-                            json!({ "to": self.id, "data": { "type": "description", "pc": self.generation, "description": advertise_max_message_size(&ld) } }),
-                        )
-                        .await;
-                }
-            }
+        let (done, wait) = tokio::sync::oneshot::channel();
+        if self.enqueue(PcOp::RestartIce(Some(done))) {
+            let _ = tokio::time::timeout(PC_OP_INLINE_BUDGET, wait).await;
         }
+    }
+
+    /// Queue one negotiation operation. True when the caller should wait for
+    /// it: the queue was idle, so this operation is next and a healthy one
+    /// answers at once. Behind a queued or wedged operation it would only wait
+    /// out the budget again, one budget per signal, so the caller does not.
+    fn enqueue(&self, op: PcOp) -> bool {
+        use std::sync::atomic::Ordering;
+        let idle = self.ops_busy.fetch_add(1, Ordering::SeqCst) == 0;
+        if self.ops.send(op).is_err() {
+            self.ops_busy.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+        idle
+    }
+
+    /// Operations queued or running on this peer's negotiation task.
+    pub fn negotiation_backlog(&self) -> usize {
+        self.ops_busy.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Silence callbacks immediately (synchronous, atomic) so a dying pc
@@ -2122,104 +2194,65 @@ impl Peer {
     /// arm for it), so the polite side can't recover in-place, it returns
     /// `Glare(offer)` and the OWNER of this Peer must rebuild the link as a
     /// pure responder and re-apply that offer.
+    ///
+    /// The operation runs on the peer's negotiation task, in arrival order. The
+    /// caller gets its outcome when it finishes within [`PC_OP_INLINE_BUDGET`]
+    /// (every healthy case); otherwise `Handled`, and the signal still applies,
+    /// in order, once webrtc-rs lets go. A glare found that late cannot be
+    /// handed back, so it is logged and the C3 watchdog rebuilds the link.
     pub async fn handle_signal(&self, data: Value) -> Result<SignalOutcome> {
-        match data["type"].as_str() {
-            Some("description") => {
-                let desc: RTCSessionDescription =
-                    serde_json::from_value(data["description"].clone())
-                        .context("parse remote description")?;
-                let is_offer = desc.sdp_type.to_string() == "offer";
-                let state = self.pc.signaling_state();
-                if desc.sdp_type == RTCSdpType::Offer && state != RTCSignalingState::Stable {
-                    if !self.polite {
-                        return Ok(SignalOutcome::Handled); // their polite side yields
-                    }
-                    return Ok(SignalOutcome::Glare(data));
-                }
-                if desc.sdp_type == RTCSdpType::Answer
-                    && state != RTCSignalingState::HaveLocalOffer
-                {
-                    // Stale answer (e.g. to an offer this side abandoned).
-                    return Ok(SignalOutcome::Handled);
-                }
-                let remote_fp = {
-                    let fps = self.fps.lock().await;
-                    next_remote_fingerprint(fps.1.as_deref(), sdp_fingerprint(&desc.sdp))?
-                };
-                self.pc.set_remote_description(desc).await?;
-                // Recorded only once the description is in force.
-                self.fps.lock().await.1 = remote_fp;
-                let pending = {
-                    let mut st = self.state.lock().await;
-                    st.has_remote = true;
-                    st.remote_pc = data["pc"].as_u64();
-                    std::mem::take(&mut st.pending_candidates)
-                };
-                for c in pending {
-                    if let Err(e) = self.pc.add_ice_candidate(c).await {
-                        crate::hooks::trace(&format!("tunlion: queued candidate failed: {e}"));
-                    }
-                }
-                if is_offer {
-                    let answer = self.pc.create_answer(None).await?;
-                    self.pc.set_local_description(answer).await?;
-                    let ld = self
-                        .pc
-                        .local_description()
-                        .await
-                        .ok_or_else(|| anyhow!("no local description"))?;
-                    self.fps.lock().await.0 = sdp_fingerprint(&ld.sdp);
-                    self.sio
-                        .emit(
-                            "signal",
-                            json!({ "to": self.id, "data": { "type": "description", "pc": self.generation, "description": advertise_max_message_size(&ld) } }),
-                        )
-                        .await
-                        .ok();
-                }
-            }
-            Some("candidate") => {
-                let init: RTCIceCandidateInit =
-                    serde_json::from_value(data["candidate"].clone()).context("parse candidate")?;
-                let buffered = {
-                    let mut st = self.state.lock().await;
-                    if st.has_remote {
-                        false
-                    } else {
-                        st.pending_candidates.push(init.clone());
-                        true
-                    }
-                };
-                if !buffered {
-                    if let Err(e) = self.pc.add_ice_candidate(init).await {
-                        crate::hooks::trace(&format!("tunlion: addIceCandidate failed: {e}"));
-                    }
-                }
-            }
-            _ => {}
+        let (done, wait) = tokio::sync::oneshot::channel();
+        if !self.enqueue(PcOp::Signal(data, Some(done))) {
+            return Ok(SignalOutcome::Handled);
         }
-        Ok(SignalOutcome::Handled)
+        match tokio::time::timeout(PC_OP_INLINE_BUDGET, wait).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Ok(SignalOutcome::Handled),
+            Err(_) => {
+                crate::hooks::debug(&format!(
+                    "tunlion: signal for {} still applying after {PC_OP_INLINE_BUDGET:?}; it continues off the event loop",
+                    self.id
+                ));
+                Ok(SignalOutcome::Handled)
+            }
+        }
     }
 
     /// C20: (our fp, their fp) once the handshake exchanged descriptions.
+    ///
+    /// Both are normally recorded by the negotiation already. The fallback
+    /// reads the descriptions from webrtc-rs, whose description locks can be
+    /// held across an SCTP handshake (see [`PC_OP_INLINE_BUDGET`]), so it is
+    /// bounded and never holds `fps` while it waits.
     pub async fn fingerprints(&self) -> Option<(String, String)> {
-        {
-            let mut f = self.fps.lock().await;
-            if f.0.is_none() {
-                if let Some(ld) = self.pc.local_description().await {
-                    f.0 = sdp_fingerprint(&ld.sdp);
-                }
-            }
-            if f.1.is_none() {
-                if let Some(rd) = self.pc.remote_description().await {
-                    f.1 = sdp_fingerprint(&rd.sdp);
-                }
-            }
-            if let (Some(a), Some(b)) = (&f.0, &f.1) {
-                return Some((a.clone(), b.clone()));
-            }
+        let (mine, theirs) = self.fps.lock().await.clone();
+        let mine = match mine {
+            Some(fp) => Some(fp),
+            None => tokio::time::timeout(PC_OP_INLINE_BUDGET, self.pc.local_description())
+                .await
+                .ok()
+                .flatten()
+                .and_then(|ld| sdp_fingerprint(&ld.sdp)),
+        };
+        let theirs = match theirs {
+            Some(fp) => Some(fp),
+            None => tokio::time::timeout(PC_OP_INLINE_BUDGET, self.pc.remote_description())
+                .await
+                .ok()
+                .flatten()
+                .and_then(|rd| sdp_fingerprint(&rd.sdp)),
+        };
+        let mut f = self.fps.lock().await;
+        if f.0.is_none() {
+            f.0 = mine;
         }
-        None
+        if f.1.is_none() {
+            f.1 = theirs;
+        }
+        match (&f.0, &f.1) {
+            (Some(a), Some(b)) => Some((a.clone(), b.clone())),
+            _ => None,
+        }
     }
 
     /// Which physical path did ICE pick? Same taxonomy as the browser badge.
@@ -2335,6 +2368,147 @@ impl Peer {
             relayed: pair.local.typ == RTCIceCandidateType::Relay
                 || pair.remote.typ == RTCIceCandidateType::Relay,
         })
+    }
+}
+
+impl PcWorker {
+    /// Start the negotiation task. It ends when the `Peer` (the only sender)
+    /// is dropped and the queue is drained.
+    fn spawn(self, busy: Arc<std::sync::atomic::AtomicUsize>) -> mpsc::UnboundedSender<PcOp> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<PcOp>();
+        tokio::spawn(async move {
+            while let Some(op) = rx.recv().await {
+                #[cfg(test)]
+                drop(self.hold.lock().await);
+                match op {
+                    PcOp::Signal(data, reply) => {
+                        let outcome = self.handle_signal(data).await;
+                        let unheard = match reply {
+                            Some(reply) => reply.send(outcome).err(),
+                            None => Some(outcome),
+                        };
+                        // The caller moved on: say what it did not hear.
+                        match unheard {
+                            Some(Err(e)) => crate::hooks::trace(&format!(
+                                "tunlion: late signal for {} failed to apply: {e} (recovering)",
+                                self.id
+                            )),
+                            Some(Ok(SignalOutcome::Glare(_))) => crate::hooks::debug(&format!(
+                                "tunlion: late offer for {} collided with ours; left to the watchdog rebuild",
+                                self.id
+                            )),
+                            _ => {}
+                        }
+                    }
+                    PcOp::RestartIce(reply) => {
+                        self.restart_ice().await;
+                        if let Some(reply) = reply {
+                            let _ = reply.send(());
+                        }
+                    }
+                }
+                busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        tx
+    }
+
+    async fn restart_ice(&self) {
+        let _ = self.pc.restart_ice().await;
+        // restart_ice marks negotiation needed; drive the new offer ourselves
+        // (webrtc-rs has no negotiationneeded auto-loop in this setup).
+        if let Ok(offer) = self.pc.create_offer(None).await {
+            if self.pc.set_local_description(offer).await.is_ok() {
+                if let Some(ld) = self.pc.local_description().await {
+                    let _ = self
+                        .sio
+                        .emit(
+                            "signal",
+                            json!({ "to": self.id, "data": { "type": "description", "pc": self.generation, "description": advertise_max_message_size(&ld) } }),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
+    async fn handle_signal(&self, data: Value) -> Result<SignalOutcome> {
+        match data["type"].as_str() {
+            Some("description") => {
+                let desc: RTCSessionDescription =
+                    serde_json::from_value(data["description"].clone())
+                        .context("parse remote description")?;
+                let is_offer = desc.sdp_type.to_string() == "offer";
+                let state = self.pc.signaling_state();
+                if desc.sdp_type == RTCSdpType::Offer && state != RTCSignalingState::Stable {
+                    if !self.polite {
+                        return Ok(SignalOutcome::Handled); // their polite side yields
+                    }
+                    return Ok(SignalOutcome::Glare(data));
+                }
+                if desc.sdp_type == RTCSdpType::Answer
+                    && state != RTCSignalingState::HaveLocalOffer
+                {
+                    // Stale answer (e.g. to an offer this side abandoned).
+                    return Ok(SignalOutcome::Handled);
+                }
+                let remote_fp = {
+                    let fps = self.fps.lock().await;
+                    next_remote_fingerprint(fps.1.as_deref(), sdp_fingerprint(&desc.sdp))?
+                };
+                self.pc.set_remote_description(desc).await?;
+                // Recorded only once the description is in force.
+                self.fps.lock().await.1 = remote_fp;
+                let pending = {
+                    let mut st = self.state.lock().await;
+                    st.has_remote = true;
+                    st.remote_pc = data["pc"].as_u64();
+                    std::mem::take(&mut st.pending_candidates)
+                };
+                for c in pending {
+                    if let Err(e) = self.pc.add_ice_candidate(c).await {
+                        crate::hooks::trace(&format!("tunlion: queued candidate failed: {e}"));
+                    }
+                }
+                if is_offer {
+                    let answer = self.pc.create_answer(None).await?;
+                    self.pc.set_local_description(answer).await?;
+                    let ld = self
+                        .pc
+                        .local_description()
+                        .await
+                        .ok_or_else(|| anyhow!("no local description"))?;
+                    self.fps.lock().await.0 = sdp_fingerprint(&ld.sdp);
+                    self.sio
+                        .emit(
+                            "signal",
+                            json!({ "to": self.id, "data": { "type": "description", "pc": self.generation, "description": advertise_max_message_size(&ld) } }),
+                        )
+                        .await
+                        .ok();
+                }
+            }
+            Some("candidate") => {
+                let init: RTCIceCandidateInit =
+                    serde_json::from_value(data["candidate"].clone()).context("parse candidate")?;
+                let buffered = {
+                    let mut st = self.state.lock().await;
+                    if st.has_remote {
+                        false
+                    } else {
+                        st.pending_candidates.push(init.clone());
+                        true
+                    }
+                };
+                if !buffered {
+                    if let Err(e) = self.pc.add_ice_candidate(init).await {
+                        crate::hooks::trace(&format!("tunlion: addIceCandidate failed: {e}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(SignalOutcome::Handled)
     }
 }
 
@@ -3853,5 +4027,101 @@ mod direct_route_label_tests {
     fn a_same_host_direct_link_is_direct_over_lo() {
         assert_eq!(direct_route_label("127.0.0.1:52986".parse().unwrap()), "direct over lo");
         assert_eq!(direct_route_label("[::1]:4000".parse().unwrap()), "direct over lo");
+    }
+}
+
+/// Negotiation on a WebRTC peer must never park its caller. The daemon event
+/// loop calls `handle_signal` and `restart_ice` inline; webrtc-rs holds its
+/// description lock across the SCTP handshake, which under loss took 48 s and
+/// then 120 s (the stall exit). `hold` stands in for that lock.
+#[cfg(test)]
+mod negotiation_off_loop_tests {
+    use super::*;
+
+    async fn peer(polite: bool) -> Arc<Peer> {
+        let sio = Client::offline().await.expect("offline signaling client");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Peer::connect("sid-far".into(), "uid-far".into(), polite, Vec::new(), false, sio, tx, 1)
+            .await
+            .expect("peer")
+    }
+
+    fn candidate(n: u8) -> Value {
+        json!({ "type": "candidate", "candidate": {
+            "candidate": format!("candidate:{n} 1 udp 1 10.0.0.{n} 9 typ host") } })
+    }
+
+    #[tokio::test]
+    async fn a_wedged_negotiation_does_not_park_the_caller() {
+        let p = peer(true).await;
+        let guard = p.hold.lock().await;
+        let started = std::time::Instant::now();
+        assert!(matches!(p.handle_signal(candidate(1)).await, Ok(SignalOutcome::Handled)));
+        let first = started.elapsed();
+        assert!(
+            first < PC_OP_INLINE_BUDGET + Duration::from_millis(500),
+            "the first signal behind a wedged negotiation waited {first:?}"
+        );
+        // Behind a wedged operation every later caller returns at once: one
+        // budget per wedge, not one per signal.
+        let started = std::time::Instant::now();
+        for n in 2..=20 {
+            p.handle_signal(candidate(n)).await.expect("queued");
+        }
+        p.restart_ice().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "queued negotiation operations waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(p.negotiation_backlog(), 21);
+        // Nothing was applied out of order or dropped: released, the queue
+        // drains in arrival order (no remote description yet, so the
+        // candidates buffer).
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while p.negotiation_backlog() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the queue drains once released");
+        let st = p.state.lock().await;
+        let order: Vec<String> = st
+            .pending_candidates
+            .iter()
+            .map(|c| c.candidate.clone())
+            .collect();
+        let want: Vec<String> =
+            (1..=20).map(|n| format!("candidate:{n} 1 udp 1 10.0.0.{n} 9 typ host")).collect();
+        assert_eq!(order, want);
+    }
+
+    #[tokio::test]
+    async fn a_healthy_negotiation_still_answers_before_the_caller_returns() {
+        let offerer = peer(false).await;
+        let answerer = peer(true).await;
+        let offer = offerer.pc.local_description().await.expect("offer");
+        let signal = json!({ "type": "description", "pc": 1, "description": offer });
+        assert!(matches!(answerer.handle_signal(signal).await, Ok(SignalOutcome::Handled)));
+        // Synchronous to the caller on the happy path: the answer is in force
+        // when handle_signal returns, as it was when it ran inline.
+        let local = answerer.pc.local_description().await.expect("answer applied");
+        assert_eq!(local.sdp_type, RTCSdpType::Answer);
+        assert!(answerer.fingerprints().await.is_some());
+        assert_eq!(answerer.negotiation_backlog(), 0);
+    }
+
+    #[tokio::test]
+    async fn glare_is_still_reported_to_the_caller() {
+        // A polite peer holding its own local offer must hand a colliding
+        // offer back to its owner, who rebuilds it as a responder.
+        let other = peer(false).await;
+        let offer = other.pc.local_description().await.expect("offer");
+        let signal = json!({ "type": "description", "pc": 1, "description": offer });
+        let p = peer(true).await;
+        let own = p.pc.create_offer(None).await.expect("own offer");
+        p.pc.set_local_description(own).await.expect("have-local-offer");
+        assert!(matches!(p.handle_signal(signal).await, Ok(SignalOutcome::Glare(_))));
     }
 }

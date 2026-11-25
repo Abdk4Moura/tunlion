@@ -236,13 +236,13 @@ impl LoopWatchdog {
             .name("loop-watchdog".into())
             .spawn(move || {
                 #[cfg(feature = "taskdump")]
-                let on_first_stall = |log: &dyn LogSink| {
+                let dump_on_stall = |log: &dyn LogSink| {
                     if let Some(handle) = dump.as_ref() {
                         dump_tasks(handle, log);
                     }
                 };
                 #[cfg(not(feature = "taskdump"))]
-                let on_first_stall = |_: &dyn LogSink| {};
+                let dump_on_stall = |_: &dyn LogSink| {};
                 observe(
                     last_tick_ms,
                     stopped,
@@ -250,7 +250,7 @@ impl LoopWatchdog {
                     threshold_secs,
                     exit,
                     log,
-                    on_first_stall,
+                    dump_on_stall,
                 );
             });
         if let Ok(thread) = spawned {
@@ -329,10 +329,9 @@ fn observe(
     threshold_secs: u64,
     exit: Option<StallExit>,
     log: Arc<dyn LogSink>,
-    on_first_stall: impl Fn(&dyn LogSink),
+    dump_on_stall: impl Fn(&dyn LogSink),
 ) {
     let mut reported = false;
-    let mut dumped = false;
     let mut woke_ms = now_ms();
     let mut resumed_ms = 0u64;
     loop {
@@ -367,12 +366,9 @@ fn observe(
                 "event loop stalled: no iteration for {stalled}s (an await inside the daemon loop never completed); the daemon is not serving until it recovers{limit}"
             ));
             reported = true;
-            if !dumped {
-                // Once per observer: a dump is large, and the first stall is
-                // the one whose await chain names the culprit.
-                dumped = true;
-                on_first_stall(&*log);
-            }
+            // Once per stall episode: each one may be parked on a different
+            // await.
+            dump_on_stall(&*log);
         } else if stalled < threshold_secs && reported {
             log.critical("event loop recovered");
             reported = false;

@@ -3684,8 +3684,19 @@ async fn recv_run(
                             // reconnected every ~30 s, churning presence. The server
                             // acks `sync` unconditionally; the ack wakes the loop as
                             // Ev::SignalingAlive, which resets the gap below.
+                            //
+                            // Spawned, not awaited: the ack wait is up to 5 s
+                            // and the ack already arrives as an event. Awaited
+                            // here, a server that stopped answering (a
+                            // blackholed route) parked this loop for 5 s per
+                            // probe, so the daemon stopped answering its own
+                            // control socket while signaling was down.
                             probed_silence = Some(Instant::now());
-                            net::heartbeat(&sio, sess.heartbeat_payload(), tx.clone()).await;
+                            {
+                                let (sio, payload, tx) =
+                                    (sio.clone(), sess.heartbeat_payload(), tx.clone());
+                                tokio::spawn(async move { net::heartbeat(&sio, payload, tx).await });
+                            }
                         }
                         Some(sent)
                             if silent_ms >= silence.saturating_mul(2)
