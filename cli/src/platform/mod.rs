@@ -1854,12 +1854,50 @@ pub(crate) fn systemd_exec_start(exe: &Path, argv: &[String]) -> String {
     line
 }
 
+/// Service lines every tunlion systemd unit carries, user and system alike.
+///
+/// Remote shells (`tunlion shell`, `exec`) run as children of the daemon, so
+/// they live in its cgroup. With the default `KillMode=control-group` every
+/// restart (the 45 s watchdog, an upgrade, `down`) killed every session that
+/// had been opened through tunlion, including the one doing the upgrade.
+/// `KillMode=process` stops only the daemon, as sshd.service does for the same
+/// reason. `OOMPolicy=continue`: the default (`stop`) stops the whole service
+/// when the kernel OOM-kills any one process in it, so one runaway shell
+/// command would take the daemon down with it.
+pub(crate) const SYSTEMD_SESSION_LINES: &str = "KillMode=process\nOOMPolicy=continue\n";
+
 /// The per-user systemd unit `up --install` writes on Linux.
 #[allow(dead_code)] // Linux only
 pub(crate) fn systemd_user_unit(exe: &Path, argv: &[String]) -> String {
     format!(
-        "[Unit]\nDescription=Tunlion drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Tunlion drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n{SYSTEMD_SESSION_LINES}\n[Install]\nWantedBy=default.target\n",
         systemd_exec_start(exe, argv)
+    )
+}
+
+/// The machine-wide unit `up --install --system` writes
+/// (`/etc/systemd/system/tunlion.service`).
+#[allow(dead_code)] // Linux only
+pub(crate) fn systemd_system_unit(user: &str, home: &str, exec_start: &str) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Tunlion drop target (trusted devices only)\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\n\
+         [Service]\n\
+         Type=notify\n\
+         User={user}\n\
+         Environment=HOME={home}\n\
+         Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
+         ExecStart={exec_start}\n\
+         AmbientCapabilities=CAP_NET_ADMIN\n\
+         CapabilityBoundingSet=CAP_NET_ADMIN\n\
+         Restart=always\n\
+         RestartSec=2\n\
+         WatchdogSec=45\n\
+         {SYSTEMD_SESSION_LINES}\n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
     )
 }
 
@@ -2110,6 +2148,29 @@ mod service_argv_encoding {
         );
         let unit = systemd_user_unit(Path::new("/usr/local/bin/tunlion"), &argv(&["up", "--shell"]));
         assert!(unit.contains("\nExecStart=/usr/local/bin/tunlion up --shell\n"), "{unit}");
+    }
+
+    /// A restart must not kill the shells tunlion opened, and one OOM-killed
+    /// child must not stop the service: both units say so, inside [Service].
+    #[test]
+    fn systemd_units_keep_sessions_across_restarts() {
+        let user = systemd_user_unit(Path::new("/usr/local/bin/tunlion"), &argv(&["up"]));
+        let system = systemd_system_unit("u", "/home/u", "/usr/local/bin/tunlion up");
+        for unit in [&user, &system] {
+            let service = unit
+                .split("[Service]\n")
+                .nth(1)
+                .and_then(|rest| rest.split("\n[Install]").next())
+                .unwrap_or_else(|| panic!("no [Service] section:\n{unit}"));
+            let lines: Vec<&str> = service.lines().collect();
+            assert!(lines.contains(&"KillMode=process"), "{unit}");
+            assert!(lines.contains(&"OOMPolicy=continue"), "{unit}");
+            assert!(lines.contains(&"Restart=always"), "{unit}");
+            assert!(lines.contains(&"WatchdogSec=45"), "{unit}");
+        }
+        assert!(system.contains("\nUser=u\n") && system.contains("\nExecStart=/usr/local/bin/tunlion up\n"));
+        assert!(system.contains("\n\n[Install]\nWantedBy=multi-user.target\n"), "{system}");
+        assert!(user.contains("\n\n[Install]\nWantedBy=default.target\n"), "{user}");
     }
 
     #[test]

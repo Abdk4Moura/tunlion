@@ -39,25 +39,7 @@ pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
 
     let exec_start = crate::platform::systemd_exec_start(&exe_path, argv);
 
-    let unit = format!(
-        "[Unit]\n\
-         Description=Tunlion drop target (trusted devices only)\n\
-         After=network-online.target\n\
-         Wants=network-online.target\n\n\
-         [Service]\n\
-         Type=notify\n\
-         User={user}\n\
-         Environment=HOME={home}\n\
-         Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
-         ExecStart={exec_start}\n\
-         AmbientCapabilities=CAP_NET_ADMIN\n\
-         CapabilityBoundingSet=CAP_NET_ADMIN\n\
-         Restart=always\n\
-         RestartSec=2\n\
-         WatchdogSec=45\n\n\
-         [Install]\n\
-         WantedBy=multi-user.target\n"
-    );
+    let unit = crate::platform::systemd_system_unit(&user, &home, &exec_start);
     // The unit file, and every systemctl/journalctl/sudoers reference below,
     // name crate::platform::SYSTEMD_UNIT (`tunlion`).
     let unit_path = "/etc/systemd/system/tunlion.service";
