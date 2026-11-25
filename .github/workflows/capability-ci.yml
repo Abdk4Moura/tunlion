@@ -193,9 +193,7 @@ jobs:
       - name: Arm the loop budget
         shell: bash
         run: |
-          if [ "$RUNNER_OS" != "Windows" ]; then
-            echo "TUNLION_TEST_LOOP_BUDGET_PANIC=1" >> "$GITHUB_ENV"
-          fi
+          echo "TUNLION_TEST_LOOP_BUDGET_PANIC=1" >> "$GITHUB_ENV"
           echo "TUNLION_TEST_LOOP_BUDGET_RECORD=$RUNNER_TEMP/loop-budget.record" >> "$GITHUB_ENV"
 
       # BUG-ACKLOSS fault-injection reproducer (#294). The binary this job
@@ -647,19 +645,12 @@ jobs:
           # cygpath: on Windows RUNNER_TEMP is a D:\ path the daemons wrote to.
           rec="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/loop-budget.record"
           [ -f "$rec" ] || : >"$rec"
-          known=""
-          [ "$RUNNER_OS" = "Windows" ] && known=" handler/Control:file-end "
-          if [ -n "$known" ] && grep -qF "$known" "$rec"; then
-            echo "::warning::known red: the file-end handler ran past the 1 s loop budget on Windows:"
-            grep -F "$known" "$rec"
-          fi
-          if [ -n "$known" ]; then rest=$(grep -vF "$known" "$rec" || true); else rest=$(cat "$rec"); fi
-          if [ -n "$rest" ]; then
+          if [ -s "$rec" ]; then
             echo "::error::a daemon event-loop iteration was busy past its 1 s budget (an await parked in the loop):"
-            echo "$rest"
+            cat "$rec"
             exit 1
           fi
-          echo "no daemon loop iteration over budget (known red excepted)"
+          echo "no daemon loop iteration over budget"
 
       - name: Upload harness log (macOS)
         if: runner.os == 'macOS' && always()
