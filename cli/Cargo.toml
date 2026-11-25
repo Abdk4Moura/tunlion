@@ -74,6 +74,9 @@ fleet = ["filament-peerloop/fleet"]
 # there: a feature is per-crate, so the freeze/unblock/flaky hooks the P1 and P5
 # gates inject with were compiled out even when the gates asked for them.
 test-hooks = ["filament-transport/test-hooks", "filament-peerloop/test-hooks"]
+# Loop-stall task dump (diagnostic, Linux): see filament-peerloop's `taskdump`.
+# Build with RUSTFLAGS="--cfg tokio_unstable".
+taskdump = ["test-hooks", "filament-peerloop/taskdump"]
 # Dev-debug logging (TRACE / STALL / worker-ports internals). Stripped from
 # default release builds so no debug strings reach the shipped binary.
 debug-logs = ["filament-transport/debug-logs", "filament-peerloop/debug-logs"]

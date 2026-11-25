@@ -88,6 +88,11 @@ ssh-bootstrap = ["dep:authkeys-managed"]
 # Fault-injection hooks the peer-loop paths read. The CLI forwards its own
 # `test-hooks` feature here, so a gate build injects into the moved code too.
 test-hooks = []
+# Diagnostic only: on the first loop stall, dump every tokio task's async
+# backtrace to the log. Needs `RUSTFLAGS="--cfg tokio_unstable"` (tokio refuses
+# its `taskdump` feature without it), so it is a separate feature, never on in
+# a normal or a gate build.
+taskdump = ["test-hooks", "tokio/taskdump"]
 debug-logs = []
 
 [dependencies]

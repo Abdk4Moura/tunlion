@@ -230,10 +230,28 @@ impl LoopWatchdog {
         let observe_every = self.observe_every;
         let threshold_secs = self.threshold_secs;
         let exit = self.exit.clone();
+        #[cfg(feature = "taskdump")]
+        let dump = tokio::runtime::Handle::try_current().ok();
         let spawned = std::thread::Builder::new()
             .name("loop-watchdog".into())
             .spawn(move || {
-                observe(last_tick_ms, stopped, observe_every, threshold_secs, exit, log);
+                #[cfg(feature = "taskdump")]
+                let on_first_stall = |log: &dyn LogSink| {
+                    if let Some(handle) = dump.as_ref() {
+                        dump_tasks(handle, log);
+                    }
+                };
+                #[cfg(not(feature = "taskdump"))]
+                let on_first_stall = |_: &dyn LogSink| {};
+                observe(
+                    last_tick_ms,
+                    stopped,
+                    observe_every,
+                    threshold_secs,
+                    exit,
+                    log,
+                    on_first_stall,
+                );
             });
         if let Ok(thread) = spawned {
             self.stop = Some(stop);
@@ -311,8 +329,10 @@ fn observe(
     threshold_secs: u64,
     exit: Option<StallExit>,
     log: Arc<dyn LogSink>,
+    on_first_stall: impl Fn(&dyn LogSink),
 ) {
     let mut reported = false;
+    let mut dumped = false;
     let mut woke_ms = now_ms();
     let mut resumed_ms = 0u64;
     loop {
@@ -347,11 +367,40 @@ fn observe(
                 "event loop stalled: no iteration for {stalled}s (an await inside the daemon loop never completed); the daemon is not serving until it recovers{limit}"
             ));
             reported = true;
+            if !dumped {
+                // Once per observer: a dump is large, and the first stall is
+                // the one whose await chain names the culprit.
+                dumped = true;
+                on_first_stall(&*log);
+            }
         } else if stalled < threshold_secs && reported {
             log.critical("event loop recovered");
             reported = false;
         }
     }
+}
+
+/// Diagnostic build only (`--features taskdump`, `RUSTFLAGS="--cfg
+/// tokio_unstable"`, Linux): print every runtime task's async backtrace, so a
+/// stalled loop names the await it is parked on. The workers are idle while the
+/// loop task waits on a pending future, so they can answer the trace request;
+/// the bound covers a worker that is itself blocked.
+#[cfg(feature = "taskdump")]
+fn dump_tasks(handle: &tokio::runtime::Handle, log: &dyn LogSink) {
+    let dumped = handle.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle.dump()).await
+    });
+    let Ok(dump) = dumped else {
+        log.critical("taskdump: the runtime did not answer the trace request within 10s");
+        return;
+    };
+    let tasks = dump.tasks();
+    let count = tasks.iter().count();
+    log.critical(&format!("taskdump: {count} tasks"));
+    for (i, task) in tasks.iter().enumerate() {
+        log.critical(&format!("taskdump: task {i} id={}:\n{}", task.id(), task.trace()));
+    }
+    log.critical("taskdump: end");
 }
 
 /// Did the observer itself oversleep by more than scheduling jitter? Then the
