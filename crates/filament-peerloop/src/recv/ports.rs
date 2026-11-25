@@ -71,6 +71,10 @@ pub struct RecvEnv {
     pub supervised: bool,
     /// Loop-stall threshold for the watchdog.
     pub loop_stall_secs: u64,
+    /// What a daemon does when a stall reaches its hard limit
+    /// (`lifecycle::LOOP_STALL_EXIT_SECS` in production). None keeps the
+    /// warning-only behavior; the CLI daemon sets it so a wedged loop exits.
+    pub stall_exit: Option<crate::recv::lifecycle::StallExit>,
     /// `--remember` stored a record this invocation.
     pub remember_stored: Arc<std::sync::atomic::AtomicBool>,
     /// Transfer id -> what this invocation stored for it. Kept after the ack
@@ -109,6 +113,7 @@ impl Default for RecvEnv {
             fleet_hello_trace: None,
             supervised: false,
             loop_stall_secs: 20,
+            stall_exit: None,
             remember_stored: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             delivery: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }

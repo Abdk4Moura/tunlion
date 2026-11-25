@@ -606,6 +606,14 @@ jobs:
           TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
         timeout-minutes: 6
 
+      - name: Loop-stall exit gate (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash cli/tests/loop-stall-exit-gates.sh
+        env:
+          TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
+        timeout-minutes: 6
+
       - name: Upload harness log (macOS)
         if: runner.os == 'macOS' && always()
         uses: actions/upload-artifact@v4
