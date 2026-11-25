@@ -392,6 +392,8 @@ pub async fn connect(
     };
 
     // rung-1's race, UNCHANGED but for the route label.
+    #[cfg(feature = "sim")]
+    let endpoint = direct::BoundEndpoint::Real(endpoint);
     direct::race_connect_labeled(
         context,
         endpoint,

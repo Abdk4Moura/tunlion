@@ -455,6 +455,50 @@ pub(crate) fn local_ips() -> Vec<IpAddr> {
 /// wifi<->cellular handoff, default-route move) is the strongest portable "a new
 /// direct path may exist NOW" signal, and triggers an immediate re-probe. Cheap
 /// (two UDP `connect`s, no packets) and dependency-free, no platform netlink.
+#[cfg(not(feature = "sim"))]
+pub type BoundEndpoint = Endpoint;
+
+#[cfg(feature = "sim")]
+#[derive(Clone)]
+pub enum BoundEndpoint {
+    Real(Endpoint),
+    Sim { port: u16 },
+}
+
+#[cfg(feature = "sim")]
+#[derive(Clone)]
+pub struct SimDirectRaceReq {
+    pub local_port: u16,
+    pub peer_cands: Vec<String>,
+    pub secret: String,
+    pub peer_id: String,
+    pub attempt: AttemptId,
+    pub my_uid: String,
+    pub peer_uid: String,
+    pub my_id: String,
+    pub tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+    pub route: String,
+}
+
+#[cfg(feature = "sim")]
+#[async_trait]
+pub trait DirectBackend: Send + Sync {
+    async fn gather_candidates(&self, server: &str, port: u16) -> (Vec<String>, Option<String>);
+    fn bind_port(&self) -> Result<u16>;
+    async fn race_connect(&self, req: SimDirectRaceReq) -> Option<UnreadTransport>;
+    fn local_ip_snapshot(&self) -> Vec<String>;
+}
+
+pub fn local_ip_snapshot_with_context(context: &crate::TransportContext) -> Vec<String> {
+    #[cfg(feature = "sim")]
+    if let Some(backend) = context.direct_backend() {
+        return backend.local_ip_snapshot();
+    }
+    #[cfg(not(feature = "sim"))]
+    let _ = context;
+    local_ip_snapshot()
+}
+
 pub fn local_ip_snapshot() -> Vec<String> {
     let mut v: Vec<String> = local_ips()
         .into_iter()
@@ -659,6 +703,10 @@ fn dials_claimed(claimed: Option<SocketAddr>, cand: &str) -> bool {
 /// attribution can never name an address the candidate set did not contain.
 /// `peer` is optional — when provided, per-peer avoid/prefer overrides are read.
 pub async fn gather_candidates(context: &crate::TransportContext, server: &str, port: u16) -> (Vec<String>, Option<String>) {
+    #[cfg(feature = "sim")]
+    if let Some(backend) = context.direct_backend() {
+        return backend.gather_candidates(server, port).await;
+    }
     let peer: Option<&str> = None; // per-peer filter not yet wired from callers
     if loopback_only() {
         let lo: IpAddr = "127.0.0.1".parse().unwrap();
@@ -908,6 +956,24 @@ pub(crate) fn pair_client_config() -> Result<quinn::ClientConfig> {
 /// the test module below. An unbounded await in a test does not fail, it HANGS,
 /// and a hang has no verdict at all: no failing test name, no count, just a job
 /// that times out and reads as infrastructure.
+pub fn bind_endpoint_with_context(context: &crate::TransportContext) -> Result<(BoundEndpoint, u16)> {
+    #[cfg(feature = "sim")]
+    if let Some(backend) = context.direct_backend() {
+        let port = backend.bind_port()?;
+        return Ok((BoundEndpoint::Sim { port }, port));
+    }
+    #[cfg(not(feature = "sim"))]
+    {
+        let _ = context;
+        bind_endpoint()
+    }
+    #[cfg(feature = "sim")]
+    {
+        let (ep, port) = bind_endpoint()?;
+        Ok((BoundEndpoint::Real(ep), port))
+    }
+}
+
 pub fn bind_endpoint() -> Result<(Endpoint, u16)> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
@@ -1928,6 +1994,27 @@ pub struct UnreadTransport {
 }
 
 impl UnreadTransport {
+    /// Wrap an in-memory transport produced by a `DirectBackend` sim race.
+    #[cfg(feature = "sim")]
+    pub fn from_sim(transport: Arc<dyn Transport>) -> Self {
+        Self {
+            transport,
+            reader: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Wrap an in-memory transport along with a reader future spawned on `announce`.
+    #[cfg(feature = "sim")]
+    pub fn from_sim_with_reader(
+        transport: Arc<dyn Transport>,
+        reader: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        Self {
+            transport,
+            reader: std::sync::Mutex::new(Some(Box::pin(reader))),
+        }
+    }
+
     /// The transport, for callers that must inspect it before announcing.
     pub fn transport(&self) -> &Arc<dyn Transport> {
         &self.transport
@@ -2301,7 +2388,7 @@ where
 /// `ip:port` strings. `secret` is the pair secret (known-device only, rung 1).
 pub async fn race_connect(
     context: &crate::TransportContext,
-    endpoint: Endpoint,
+    endpoint: BoundEndpoint,
     peer_cands: Vec<String>,
     secret: &str,
     peer_id: String,
@@ -2335,7 +2422,7 @@ pub async fn race_connect(
 /// on the wire.
 pub async fn race_connect_labeled(
     context: &crate::TransportContext,
-    endpoint: Endpoint,
+    endpoint: BoundEndpoint,
     peer_cands: Vec<String>,
     secret: &str,
     peer_id: String,
@@ -2349,6 +2436,47 @@ pub async fn race_connect_labeled(
     peer_claimed: Option<SocketAddr>,
     server_public_dialed: Arc<AtomicBool>,
 ) -> Option<UnreadTransport> {
+    #[cfg(feature = "sim")]
+    let endpoint = match endpoint {
+        BoundEndpoint::Real(ep) => {
+            if let Some(backend) = context.direct_backend() {
+                return backend
+                    .race_connect(SimDirectRaceReq {
+                        local_port: ep.local_addr().map(|a| a.port()).unwrap_or(0),
+                        peer_cands,
+                        secret: secret.to_string(),
+                        peer_id,
+                        attempt,
+                        my_uid,
+                        peer_uid,
+                        my_id,
+                        tx,
+                        route: route.to_string(),
+                    })
+                    .await;
+            }
+            ep
+        }
+        BoundEndpoint::Sim { port } => {
+            if let Some(backend) = context.direct_backend() {
+                return backend
+                    .race_connect(SimDirectRaceReq {
+                        local_port: port,
+                        peer_cands,
+                        secret: secret.to_string(),
+                        peer_id,
+                        attempt,
+                        my_uid,
+                        peer_uid,
+                        my_id,
+                        tx,
+                        route: route.to_string(),
+                    })
+                    .await;
+            }
+            return None;
+        }
+    };
     let answerer = match answerer_for(&my_uid, &peer_uid, &my_id, &peer_id) {
         Ok(value) => value,
         Err(error) => {

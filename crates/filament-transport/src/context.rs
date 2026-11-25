@@ -42,6 +42,8 @@ struct Inner {
     http_backend: Option<Arc<dyn HttpBackend>>,
     #[cfg(feature = "sim")]
     peer_factory: Option<Arc<dyn crate::net::PeerFactory>>,
+    #[cfg(feature = "sim")]
+    direct_backend: Option<Arc<dyn crate::direct::DirectBackend>>,
 }
 
 impl Default for TransportContext {
@@ -78,6 +80,8 @@ impl TransportContext {
             http_backend: None,
             #[cfg(feature = "sim")]
             peer_factory: None,
+            #[cfg(feature = "sim")]
+            direct_backend: None,
         }))
     }
 
@@ -98,6 +102,7 @@ impl TransportContext {
             signaling_connector: Some(connector),
             http_backend: self.0.http_backend.clone(),
             peer_factory: self.0.peer_factory.clone(),
+            direct_backend: self.0.direct_backend.clone(),
         }))
     }
 
@@ -117,6 +122,7 @@ impl TransportContext {
             signaling_connector: self.0.signaling_connector.clone(),
             http_backend: Some(backend),
             peer_factory: self.0.peer_factory.clone(),
+            direct_backend: self.0.direct_backend.clone(),
         }))
     }
 
@@ -136,11 +142,32 @@ impl TransportContext {
             signaling_connector: self.0.signaling_connector.clone(),
             http_backend: self.0.http_backend.clone(),
             peer_factory: Some(factory),
+            direct_backend: self.0.direct_backend.clone(),
         }))
     }
 
     #[cfg(feature = "sim")]
     pub fn peer_factory(&self) -> Option<&Arc<dyn crate::net::PeerFactory>> {
         self.0.peer_factory.as_ref()
+    }
+
+    #[cfg(feature = "sim")]
+    pub fn with_direct_backend(&self, backend: Arc<dyn crate::direct::DirectBackend>) -> Self {
+        Self(Arc::new(Inner {
+            dns_cache_path: self.0.dns_cache_path.clone(),
+            settings: Arc::clone(&self.0.settings),
+            membership: Arc::clone(&self.0.membership),
+            public_ip: Mutex::new(None),
+            observed_ip: Mutex::new(None),
+            signaling_connector: self.0.signaling_connector.clone(),
+            http_backend: self.0.http_backend.clone(),
+            peer_factory: self.0.peer_factory.clone(),
+            direct_backend: Some(backend),
+        }))
+    }
+
+    #[cfg(feature = "sim")]
+    pub fn direct_backend(&self) -> Option<&Arc<dyn crate::direct::DirectBackend>> {
+        self.0.direct_backend.as_ref()
     }
 }
