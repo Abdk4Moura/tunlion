@@ -172,6 +172,19 @@ jobs:
         if: runner.os == 'macOS'
         run: codesign --force --sign - target/release/tunlion
 
+      # Loop budget (crates/filament-peerloop/src/recv/loop_budget.rs): every
+      # test-hooks daemon this job starts judges each event-loop iteration's
+      # busy time against one second. A healthy handler takes milliseconds; an
+      # iteration past a second is an await parked in the loop. Fatal here
+      # (the daemon panics), and recorded to a file the verdict step below
+      # checks, so a trip fails the job even where a harness swallows the
+      # daemon's output. Gates that hold the loop on purpose unset both.
+      - name: Arm the loop budget
+        shell: bash
+        run: |
+          echo "TUNLION_TEST_LOOP_BUDGET_PANIC=1" >> "$GITHUB_ENV"
+          echo "TUNLION_TEST_LOOP_BUDGET_RECORD=$RUNNER_TEMP/loop-budget.record" >> "$GITHUB_ENV"
+
       # BUG-ACKLOSS fault-injection reproducer (#294). The binary this job
       # already builds carries the test hook (stripped from release builds), so
       # this is the only place in CI where the reproducer can produce a verdict.
@@ -613,6 +626,19 @@ jobs:
         env:
           TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
         timeout-minutes: 6
+
+      - name: Loop budget verdict
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          # cygpath: on Windows RUNNER_TEMP is a D:\ path the daemons wrote to.
+          rec="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/loop-budget.record"
+          if [ -s "$rec" ]; then
+            echo "::error::a daemon event-loop iteration was busy past its 1 s budget (an await parked in the loop):"
+            cat "$rec"
+            exit 1
+          fi
+          echo "no daemon loop iteration over budget"
 
       - name: Upload harness log (macOS)
         if: runner.os == 'macOS' && always()

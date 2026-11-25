@@ -50,6 +50,11 @@ pub const BUDGET: Duration = Duration::from_secs(1);
 /// Env var that turns a report into a panic (test-hooks builds only).
 pub const PANIC_ENV: &str = "TUNLION_TEST_LOOP_BUDGET_PANIC";
 
+/// Env var naming a file every report is also appended to, with the pid. CI
+/// sets one per job and fails the job if it is not empty at the end, so a trip
+/// counts even where a harness swallows the daemon's output or its panic.
+pub const RECORD_ENV: &str = "TUNLION_TEST_LOOP_BUDGET_RECORD";
+
 /// One over-budget iteration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exceeded {
@@ -167,6 +172,7 @@ impl PauseClock {
 pub struct IterationBudget {
     budget: Duration,
     panic: bool,
+    record: Option<std::path::PathBuf>,
     open: Option<(Instant, &'static str, u64)>,
     clock: Option<Arc<PauseClock>>,
     /// The iteration overlapped a whole-process pause: not judged.
@@ -183,6 +189,7 @@ impl IterationBudget {
         Self {
             budget,
             panic,
+            record: None,
             open: None,
             clock,
             paused: false,
@@ -196,11 +203,21 @@ impl IterationBudget {
 
     /// The daemon's budget: [`BUDGET`], fatal when [`PANIC_ENV`] is `1`.
     pub fn from_env() -> Self {
-        Self::new(
+        let mut b = Self::new(
             BUDGET,
             std::env::var(PANIC_ENV).as_deref() == Ok("1"),
             PauseClock::global(),
-        )
+        );
+        b.record = std::env::var_os(RECORD_ENV)
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from);
+        b
+    }
+
+    /// Also append every report to `path` (see [`RECORD_ENV`]).
+    pub fn recording_to(mut self, path: std::path::PathBuf) -> Self {
+        self.record = Some(path);
+        self
     }
 
     /// Start a busy stretch labelled `phase`, closing the current one.
@@ -267,6 +284,17 @@ impl IterationBudget {
         let verdict = self.finish()?;
         let line = verdict.line();
         log.critical(&line);
+        if let Some(path) = &self.record {
+            use std::io::Write;
+            let appended = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut f| writeln!(f, "{line} pid={}", std::process::id()));
+            if let Err(e) = appended {
+                log.critical(&format!("{MARKER}: could not record to {}: {e}", path.display()));
+            }
+        }
         if self.panic {
             panic!("{line} ({PANIC_ENV}=1): an await parked the daemon event loop");
         }
@@ -328,6 +356,26 @@ mod tests {
                 && lines[0].contains(" handler/PcState slowest_ms="),
             "{}",
             lines[0]
+        );
+    }
+
+    #[test]
+    fn a_report_is_appended_to_the_record_file() {
+        let dir = std::env::temp_dir().join(format!("loop-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record.log");
+        let _ = std::fs::remove_file(&path);
+        let mut b = IterationBudget::new(Duration::ZERO, false, None).recording_to(path.clone());
+        b.event("PcState");
+        b.enter("handler");
+        b.finish_and_report(&crate::host::NoLog);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            text.starts_with("LOOP-BUDGET-EXCEEDED ")
+                && text.contains(" handler/PcState ")
+                && text.contains(&format!(" pid={}", std::process::id())),
+            "{text}"
         );
     }
 

@@ -18,6 +18,14 @@
 #   S4  `up` over a daemon whose loop is held (exit disabled) says "not
 #       responding" with DAEMON_NOT_RESPONDING (15), never the settings
 #       conflict (10); `down -y` then stops it
+#   S5  the per-iteration loop budget (recv::loop_budget) sees the hold: S1's
+#       daemon logged LOOP-BUDGET-EXCEEDED naming the held phase, and with
+#       TUNLION_TEST_LOOP_BUDGET_PANIC=1 a short hold ends the daemon with a
+#       panic that carries the same line. This proves the instrument CI relies
+#       on is present, so its silence elsewhere means something.
+#
+# The holds here are deliberate, so every daemon this gate stalls runs with the
+# budget's CI env (panic, record file) removed; S5 sets its own.
 #
 # Standalone, hermetic, fixture port 8199 ONLY. Needs a test-hooks binary.
 
@@ -48,7 +56,7 @@ as_dir() { # as_dir DIR -- run the CLI against that config dir
 
 stop_all() {
   local d p
-  for d in "$WORK"/s1 "$WORK"/s2 "$WORK"/s4; do
+  for d in "$WORK"/s1 "$WORK"/s2 "$WORK"/s4 "$WORK"/s5; do
     [ -d "$d" ] || continue
     timeout 20 env TUNLION_CONFIG_DIR="$d" "$BIN" --server "$SERVER" down -y >/dev/null 2>&1 || true
     p=$(head -1 "$d/up.pid" 2>/dev/null)
@@ -59,7 +67,8 @@ stop_all() {
 start_daemon() { # start_daemon DIR HOLD_MS [LIMIT] -- foreground `up`, rc recorded
   local d="$1" hold="$2" limit="${3:-$LIMIT_SECS}"
   mkdir -p "$d-drop"
-  ( env TUNLION_CONFIG_DIR="$d" \
+  ( env -u TUNLION_TEST_LOOP_BUDGET_PANIC -u TUNLION_TEST_LOOP_BUDGET_RECORD \
+      TUNLION_CONFIG_DIR="$d" \
       TUNLION_LOOP_STALL_SECS="$WARN_SECS" \
       TUNLION_LOOP_STALL_EXIT_SECS="$limit" \
       TUNLION_TEST_STALL_LOOP_MS="$hold" \
@@ -106,6 +115,15 @@ timeout 20 env TUNLION_CONFIG_DIR="$S1" "$BIN" --server "$SERVER" status >"$WORK
 rc=$?
 [ "$rc" = 0 ] && ok "S1: status answers (exit 0)" || bad "S1: status exit $rc after recovery: $(tail -3 "$WORK/s1-status.out")"
 timeout 20 env TUNLION_CONFIG_DIR="$S1" "$BIN" --server "$SERVER" down -y >/dev/null 2>&1 || true
+# S5 (first half): the budget saw S1's hold and named it. The hold is the only
+# deliberately slow iteration, so its line must be there, about SHORT_MS long.
+budget_line=$(grep -aoE "LOOP-BUDGET-EXCEEDED [0-9]+ test-stall-hold/[^ ]*" "$S1.log" | head -1)
+budget_ms=$(echo "$budget_line" | awk '{print $2}')
+if [ -n "$budget_line" ] && [ "${budget_ms:-0}" -ge $((SHORT_MS - 500)) ]; then
+  ok "S5: the loop budget reported the hold ($budget_line)"
+else
+  bad "S5: no LOOP-BUDGET-EXCEEDED line naming test-stall-hold for the ${SHORT_MS}ms hold: $(grep -a LOOP-BUDGET "$S1.log" | head -3)"
+fi
 
 # ---------------------------------------------------------------- S2
 say "S2: a stall past the limit exits with $STALLED_EXIT"
@@ -169,6 +187,33 @@ rc=$?
 timeout 20 env TUNLION_CONFIG_DIR="$S4" "$BIN" --server "$SERVER" status >/dev/null 2>&1
 rc=$?
 [ "$rc" = 11 ] && ok "S4: status says not running after down" || bad "S4: status exit $rc after down"
+
+# ---------------------------------------------------------------- S5
+say "S5: with the budget fatal, a held iteration ends the daemon with a panic"
+S5="$WORK/s5"
+init_owner "$S5"
+mkdir -p "$S5-drop"
+( env -u TUNLION_TEST_LOOP_BUDGET_RECORD \
+    TUNLION_TEST_LOOP_BUDGET_PANIC=1 \
+    TUNLION_CONFIG_DIR="$S5" \
+    TUNLION_LOOP_STALL_EXIT_SECS=0 \
+    TUNLION_TEST_STALL_LOOP_MS=1500 \
+    "$BIN" --server "$SERVER" up --dir "$S5-drop" </dev/null >"$S5.log" 2>&1
+  echo $? >"$S5.rc" ) &
+FIX_PIDS+=($!)
+wait_for_line "$S5.log" "LOOP-STALL-HOLD" 40 || fixture_die "S5: the hold hook never fired"
+for _ in $(seq 1 80); do [ -f "$S5.rc" ] && break; sleep 0.25; done
+if [ -f "$S5.rc" ]; then
+  rc=$(cat "$S5.rc")
+  [ "$rc" != 0 ] && ok "S5: the daemon ended (rc=$rc) after a held iteration" \
+    || bad "S5: the daemon exited 0 after a held iteration under the fatal budget"
+else
+  bad "S5: the daemon is still running 20s after a held iteration under the fatal budget"
+  timeout 20 env TUNLION_CONFIG_DIR="$S5" "$BIN" --server "$SERVER" down -y >/dev/null 2>&1 || true
+fi
+grep -aq "panicked" "$S5.log" && grep -aqE "LOOP-BUDGET-EXCEEDED [0-9]+ test-stall-hold/" "$S5.log" \
+  && ok "S5: the panic carries the budget line" \
+  || bad "S5: no panic with the budget line: $(grep -aE 'LOOP-BUDGET|panicked' "$S5.log" | head -3)"
 
 declare_known_red_summary
 [ "$FAIL" -eq 0 ]
