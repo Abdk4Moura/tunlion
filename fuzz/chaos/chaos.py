@@ -764,6 +764,7 @@ def run_op(w: World, st: dict, phase: str) -> dict:
         rc, out, err, el = w.cli(src, ["reach", dst], deadline)
         res.update(rc=rc, elapsed=round(el, 2), ok=rc == 0, lie=False)
     res["stderr_tail"] = (err or "").strip()[-400:]
+    res["stderr_full"] = (err or "").strip()[-20000:]
     res["stdout_tail"] = (out or "").strip()[-200:]
     return res
 
@@ -963,6 +964,13 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
     verdict["kinds"] = sorted(set().union(*(kinds_of(t) for t in logs.values())))
     verdict["hard"] = [f for f in verdict["findings"] if f["hard"]]
     verdict["elapsed_s"] = round(time.monotonic() - t0, 1)
+    if verdict["hard"]:
+        # Confirm and minimize replay the schedule and overwrite the daemon
+        # logs. Keep the logs of THIS run, the one that failed.
+        verdict["evidence_logs"] = {f"{d}-daemon.log": t for d, t in logs.items()}
+        bl = w.work / "backend.log"
+        if bl.exists():
+            verdict["evidence_logs"]["backend.log"] = bl.read_text(errors="replace")[-400000:]
     record_run(w, verdict)
     return verdict
 
@@ -976,7 +984,7 @@ def record_run(w: "World", verdict: dict) -> None:
     runs = w.out / "runs"
     runs.mkdir(parents=True, exist_ok=True)
     n = len(list(runs.glob("*.json")))
-    rec = {k: verdict.get(k) for k in ("label", "schedule", "faults", "ops", "findings", "elapsed_s",
+    rec = {k: verdict.get(k) for k in ("label", "schedule", "faults", "fault_windows", "ops", "findings", "elapsed_s",
                                        "unreported_signaling")}
     rec["kinds_count"] = len(verdict.get("kinds", []))
     safe = re.sub(r"[^\w.-]", "_", re.sub(r"\.json$", "", verdict["label"]))[:60]
@@ -1028,11 +1036,13 @@ def save_finding(out: Path, verdict: dict, w: World, repro: str) -> Path:
     (d / "verdict.json").write_text(json.dumps(v, indent=2, sort_keys=True))
     logs = d / "logs"
     logs.mkdir(exist_ok=True)
-    for dev in DEVICES:
-        for f in w.cfg(dev).glob("daemon.*.log"):
-            shutil.copy(f, logs / f"{dev}-{f.name}")
-    if (w.work / "backend.log").exists():
-        shutil.copy(w.work / "backend.log", logs / "backend.log")
+    # The failing run's own logs, captured when it was judged (confirm and
+    # minimize runs since then have replaced the files on disk).
+    for name, text in (verdict.get("evidence_logs") or {}).items():
+        (logs / name).write_text(text)
+    for i, o in enumerate(verdict.get("ops", [])):
+        if not o.get("ok") and o.get("stderr_full"):
+            (logs / f"op{i:02d}-{o['op']}-{o['src']}-{o['dst']}.stderr").write_text(o["stderr_full"])
     return d
 
 
