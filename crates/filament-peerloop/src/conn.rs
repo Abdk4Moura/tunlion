@@ -585,10 +585,10 @@ pub struct LanBinding {
 ///
 /// Returns the store's casing of the name. This is a ROUTING name: it grants no
 /// capability and never marks the link trusted or Proven.
-pub fn authenticated_lan_device_name<'a>(
+pub fn authenticated_lan_device_name<'a, S: std::hash::BuildHasher>(
     binding: Option<&LanBinding>,
     devices: &'a [(String, String)],
-    revoked: &HashSet<String>,
+    revoked: &HashSet<String, S>,
     record_revoked: &dyn Fn(&str) -> bool,
 ) -> Option<&'a str> {
     let (bound_name, secret) = binding?.device.as_ref()?;
@@ -845,10 +845,10 @@ impl Link {
     /// fleet-reserved link resolves
     /// nothing: the store lookup is exact on `(name, secret)` and the secret
     /// must not be in `revoked`.
-    pub fn authenticated_device_name<'a>(
+    pub fn authenticated_device_name<'a, S: std::hash::BuildHasher>(
         &self,
         devices: &'a [(String, String)],
-        revoked: &HashSet<String>,
+        revoked: &HashSet<String, S>,
         record_revoked: &dyn Fn(&str) -> bool,
     ) -> Option<&'a str> {
         authenticated_lan_device_name(self.lan_binding.as_ref(), devices, revoked, record_revoked)

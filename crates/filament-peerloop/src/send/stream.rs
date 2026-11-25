@@ -17,7 +17,6 @@ use filament_transfer::Outgoing;
 use serde_json::json;
 use std::io::SeekFrom;
 use std::sync::Arc;
-use filament_transport::clock::Instant;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -53,7 +52,7 @@ pub async fn stream_one(
     {
         let mut out = outgoing.lock().await;
         if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-            o.stream_started = Some(Instant::now());
+            o.stream_started = Some(std::time::Instant::now());
             o.stream_bytes = size.saturating_sub(offset);
         }
     }

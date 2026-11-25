@@ -1080,7 +1080,7 @@ impl WriterTasks {
         F: FnOnce() + Send + 'static,
     {
         #[cfg(not(feature = "sim"))]
-        let handle = crate::sim_rt::run_blocking(write);
+        let handle = tokio::task::spawn_blocking(write);
         #[cfg(feature = "sim")]
         let handle = {
             write();
