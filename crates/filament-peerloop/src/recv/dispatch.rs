@@ -1597,7 +1597,8 @@ async fn recv_run(
     readiness: &crate::driver::Readiness,
     cleanup: &mut RecvCleanup,
 ) -> Result<()> {
-    cleanup.watchdog = crate::recv::lifecycle::LoopWatchdog::with_stall(ports.env.loop_stall_secs);
+    cleanup.watchdog = crate::recv::lifecycle::LoopWatchdog::with_stall(ports.env.loop_stall_secs)
+        .with_exit(ports.env.stall_exit.clone());
     validate_expect_sha256(expect_sha256.as_deref())?;
     let opened_flow = !daemon
         && ports.env.interactive_allowed
@@ -2835,6 +2836,14 @@ async fn recv_run(
         }
         if daemon {
             cleanup.watchdog.tick(log.clone());
+            // Loop-stall exit gate: hold this loop once, as a wedged await
+            // would, so the gate can prove a short stall recovers and a long
+            // one exits. Zero (and every production build) is a no-op.
+            let hold = test_hooks::stall_loop_once_ms();
+            if hold > 0 {
+                log.critical(&format!("LOOP-STALL-HOLD ms={hold}"));
+                tokio::time::sleep(Duration::from_millis(hold)).await;
+            }
         }
         cleanup.tasks.reap(log.as_ref()).await;
         // Read before the select: a code ceremony is in flight (see the

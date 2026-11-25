@@ -78,6 +78,38 @@ const WATCHDOG_OBSERVE_EVERY: std::time::Duration = std::time::Duration::from_se
 /// already inside a blocking `LogSink` call.
 const WATCHDOG_STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long the daemon loop may go without an iteration before the process
+/// gives up and exits. The warning threshold (`RecvEnv::loop_stall_secs`, 20 s)
+/// only logs; a loop that is still wedged here is not coming back on its own
+/// (a Windows peer stayed "alive" for ~33 h serving nothing, so peers saw it
+/// offline and `up` attached to it). Exiting hands the restart to whatever
+/// supervises the daemon, and frees the instance lock for the next `up`.
+pub const LOOP_STALL_EXIT_SECS: u64 = 120;
+
+/// A whole-process pause (laptop sleep, SIGSTOP, a VM freeze) stops the
+/// observer thread too. When its own wake-up comes this much later than
+/// scheduled, the gap is a pause, not a loop stall, and the stall window
+/// restarts from the resume. Without this a laptop would exit on every wake.
+const PAUSE_SLACK_MS: u64 = 5_000;
+
+/// What the daemon does once a stall reaches its hard limit.
+///
+/// The library only decides WHEN; the adapter decides HOW to leave (it owns the
+/// pidfile and the exit-code taxonomy). `on_stall` receives the stall length in
+/// seconds and is expected not to return; if it does, the observer stops.
+#[derive(Clone)]
+pub struct StallExit {
+    /// Hard limit in seconds; `0` disables the exit (warnings only).
+    pub after_secs: u64,
+    pub on_stall: Arc<dyn Fn(u64) + Send + Sync>,
+}
+
+impl std::fmt::Debug for StallExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StallExit").field("after_secs", &self.after_secs).finish_non_exhaustive()
+    }
+}
+
 /// What happened when an owner asked the observer to stop.
 ///
 /// `Detached` is a real outcome, not success: the observer thread and the
@@ -120,6 +152,7 @@ pub struct LoopWatchdog {
     observe_every: std::time::Duration,
     threshold_secs: u64,
     join_bound: std::time::Duration,
+    exit: Option<StallExit>,
     #[cfg(test)]
     join_waiters: Arc<AtomicUsize>,
 }
@@ -157,9 +190,17 @@ impl LoopWatchdog {
             observe_every,
             threshold_secs,
             join_bound,
+            exit: None,
             #[cfg(test)]
             join_waiters: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Exit (through `exit.on_stall`) once a stall reaches `exit.after_secs`.
+    /// Must be set before the first `tick` starts the observer.
+    pub fn with_exit(mut self, exit: Option<StallExit>) -> Self {
+        self.exit = exit.filter(|e| e.after_secs > 0);
+        self
     }
 
     /// A generous join bound for cleanup-order tests, where the point is that
@@ -188,10 +229,11 @@ impl LoopWatchdog {
         let last_tick_ms = Arc::clone(&self.last_tick_ms);
         let observe_every = self.observe_every;
         let threshold_secs = self.threshold_secs;
+        let exit = self.exit.clone();
         let spawned = std::thread::Builder::new()
             .name("loop-watchdog".into())
             .spawn(move || {
-                observe(last_tick_ms, stopped, observe_every, threshold_secs, log);
+                observe(last_tick_ms, stopped, observe_every, threshold_secs, exit, log);
             });
         if let Ok(thread) = spawned {
             self.stop = Some(stop);
@@ -267,19 +309,42 @@ fn observe(
     stopped: mpsc::Receiver<()>,
     observe_every: std::time::Duration,
     threshold_secs: u64,
+    exit: Option<StallExit>,
     log: Arc<dyn LogSink>,
 ) {
     let mut reported = false;
+    let mut woke_ms = now_ms();
+    let mut resumed_ms = 0u64;
     loop {
         match stopped.recv_timeout(observe_every) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
-        let last = last_tick_ms.load(Ordering::Relaxed);
-        let stalled = now_ms().saturating_sub(last) / 1000;
-        if stalled >= threshold_secs && !reported {
+        let now = now_ms();
+        if paused(woke_ms, now, observe_every) {
+            // The whole process was paused (this thread overslept by far more
+            // than scheduling jitter). The loop never had a chance to run, so
+            // the window restarts here.
+            resumed_ms = now;
+        }
+        woke_ms = now;
+        let last = last_tick_ms.load(Ordering::Relaxed).max(resumed_ms);
+        let stalled = now.saturating_sub(last) / 1000;
+        if let Some(exit) = exit.as_ref().filter(|e| stalled >= e.after_secs) {
             log.critical(&format!(
-                "event loop stalled: no iteration for {stalled}s (an await inside the daemon loop never completed); the daemon is not serving until it recovers"
+                "event loop stalled for {stalled}s, past the {}s limit: the daemon is exiting so it can be restarted",
+                exit.after_secs
+            ));
+            (exit.on_stall)(stalled);
+            return;
+        }
+        if stalled >= threshold_secs && !reported {
+            let limit = exit
+                .as_ref()
+                .map(|e| format!("; it exits if this lasts {}s", e.after_secs))
+                .unwrap_or_default();
+            log.critical(&format!(
+                "event loop stalled: no iteration for {stalled}s (an await inside the daemon loop never completed); the daemon is not serving until it recovers{limit}"
             ));
             reported = true;
         } else if stalled < threshold_secs && reported {
@@ -287,6 +352,13 @@ fn observe(
             reported = false;
         }
     }
+}
+
+/// Did the observer itself oversleep by more than scheduling jitter? Then the
+/// process, not the loop, was paused.
+fn paused(woke_ms: u64, now_ms: u64, observe_every: std::time::Duration) -> bool {
+    let scheduled = observe_every.as_millis() as u64;
+    now_ms.saturating_sub(woke_ms) > scheduled.saturating_add(PAUSE_SLACK_MS)
 }
 
 fn now_ms() -> u64 {
@@ -527,5 +599,70 @@ mod tests {
         wait_until_sink_dropped(weak).await;
         assert_eq!(watchdog.stop().await, WatchdogStop::Detached);
         assert_eq!(watchdog.join_waiters(), 1);
+    }
+
+    fn exit_probe(after_secs: u64) -> (StallExit, std::sync::mpsc::Receiver<u64>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        let exit = StallExit {
+            after_secs,
+            on_stall: Arc::new(move |secs| {
+                let _ = tx.lock().unwrap().send(secs);
+            }),
+        };
+        (exit, rx)
+    }
+
+    #[tokio::test]
+    async fn a_stall_past_the_hard_limit_calls_the_exit() {
+        let (exit, fired) = exit_probe(1);
+        let mut watchdog =
+            LoopWatchdog::with_limits(Duration::from_millis(20), 20, Duration::from_secs(1))
+                .with_exit(Some(exit));
+        watchdog.tick(Arc::new(crate::host::NoLog));
+        // No further tick: the loop is wedged.
+        let secs = tokio::task::spawn_blocking(move || fired.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .expect("the hard limit never fired");
+        assert!(secs >= 1, "fired early, at {secs}s");
+        let _ = watchdog.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_loop_that_keeps_ticking_never_exits() {
+        let (exit, fired) = exit_probe(1);
+        let mut watchdog =
+            LoopWatchdog::with_limits(Duration::from_millis(20), 0, Duration::from_secs(1))
+                .with_exit(Some(exit));
+        let log: Arc<dyn LogSink> = Arc::new(crate::host::NoLog);
+        for _ in 0..50 {
+            watchdog.tick(log.clone());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(watchdog.stop().await, WatchdogStop::Joined);
+        assert!(fired.try_recv().is_err(), "exited although the loop kept ticking");
+    }
+
+    #[test]
+    fn a_zero_limit_disables_the_exit() {
+        let (exit, _fired) = exit_probe(0);
+        let watchdog = LoopWatchdog::new().with_exit(Some(exit));
+        assert!(watchdog.exit.is_none());
+    }
+
+    #[test]
+    fn an_oversleeping_observer_means_the_process_was_paused() {
+        let every = Duration::from_secs(1);
+        assert!(!paused(10_000, 11_000, every));
+        assert!(!paused(10_000, 10_000 + 1_000 + PAUSE_SLACK_MS, every));
+        assert!(paused(10_000, 10_000 + 1_001 + PAUSE_SLACK_MS, every));
+        // A clock stepped backwards is not a pause.
+        assert!(!paused(10_000, 5_000, every));
+    }
+
+    #[test]
+    fn the_hard_limit_is_well_past_the_warning() {
+        assert!(LOOP_STALL_EXIT_SECS >= 6 * threshold_secs());
     }
 }

@@ -162,6 +162,20 @@ mod on {
             .unwrap_or(0)
     }
 
+    /// Loop-stall exit gate: hold the daemon loop ONCE for this many
+    /// milliseconds, after the daemon is serving (TUNLION_TEST_STALL_LOOP_MS).
+    pub fn stall_loop_once_ms() -> u64 {
+        static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let ms: u64 = std::env::var("TUNLION_TEST_STALL_LOOP_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if ms == 0 || FIRED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return 0;
+        }
+        ms
+    }
+
     /// Raw offer-first gate: suppress the automatic KnownPeer adoption that
     /// normally races ahead of the browser's SDP, so the gate can prove the
     /// responder path from a bare offer. Test-only; release builds never read it.
@@ -271,6 +285,11 @@ mod off {
     #[inline]
     pub fn suppress_known_peer() -> bool {
         false
+    }
+
+    #[inline]
+    pub fn stall_loop_once_ms() -> u64 {
+        0
     }
 }
 

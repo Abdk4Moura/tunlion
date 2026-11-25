@@ -11,6 +11,9 @@
 //!   5  still on a relay    `reach --until-direct` (its --help says so)
 //!  10  daemon conflict     `up` over a running daemon with other settings
 //!                          ([`DAEMON_CONFLICT`], shell-gates.sh gates F/F3)
+//!  14  loop stalled        the daemon (`up`) exited because its event loop
+//!                          stalled past the hard limit ([`DAEMON_LOOP_STALLED`],
+//!                          loop-stall-exit-gates.sh)
 //!
 //! `1` stays the catch-all, so the change is additive: a script that only tests
 //! `!= 0` is unaffected.
@@ -42,6 +45,14 @@ pub(crate) const DAEMON_CONFLICT: i32 = 10;
 /// ([`ExitKind::Unreachable`]: "did not answer in time"). `--json` keeps exit
 /// 0 and reports both in its `running`/`responding` fields.
 pub(crate) const STATUS_NOT_RUNNING: i32 = 11;
+
+/// The daemon (`up`, foreground or detached) exited on its own because its
+/// event loop made no iteration for `LOOP_STALL_EXIT_SECS` (120 s): a wedged
+/// await it could not recover from. Nonzero so a supervisor restarts it
+/// (systemd `Restart=always`, launchd `KeepAlive`); the OS frees the instance
+/// lock, so a plain `tunlion up` starts a fresh daemon. Not an [`ExitKind`]:
+/// no command's own work failed, the process gave itself up.
+pub(crate) const DAEMON_LOOP_STALLED: i32 = 14;
 
 /// What kind of failure a command ended in. `code()` is the process exit code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -399,7 +410,7 @@ const REACH_CODES: &[i32] = &[0, 1, 2, 3, 5, 6, 7, 9, 13, 130, 143];
 const STATUS_CODES: &[i32] = &[0, 1, 2, 6, 9, 11, 130, 143];
 const DEVICES_CODES: &[i32] = &[0, 1, 2, 3, 9, 12];
 const DOCTOR_CODES: &[i32] = &[0, 1, 2, 3, 6, 7, 9, 13, 130, 143];
-const UP_CODES: &[i32] = &[0, 1, 2, 4, 7, 9, 10, 12, 13, 130, 143];
+const UP_CODES: &[i32] = &[0, 1, 2, 4, 7, 9, 10, 12, 13, 14, 130, 143];
 const LOGS_CODES: &[i32] = &[0, 1, 2, 130, 143];
 const DOWN_CODES: &[i32] = &[0, 1, 2, 6];
 const PAIRING_CODES: &[i32] = &[0, 1, 2, 3, 4, 6, 7, 9, 12, 13, 130, 143];
@@ -458,6 +469,7 @@ fn code_meaning(verb: &str, code: i32) -> &'static str {
         (_, 10) => "a daemon is already running with different settings (not applied)",
         (_, 11) => "no daemon is running for this config directory",
         (_, 12) => "a resource on this machine ran out (disk full, quota, open files, memory)",
+        (_, 14) => "the daemon exited because its event loop stalled past the limit (restart it, or let a service manager do so)",
         (_, 13) => "the tunlion server's TLS certificate was not trusted (a TLS-inspecting proxy, or a missing CA: set SSL_CERT_FILE)",
         (_, EXEC_CANNOT_RUN) => "the remote command was found but cannot be executed there",
         (_, EXEC_NOT_FOUND) => "the remote command is not on the remote daemon's PATH",
@@ -1100,5 +1112,15 @@ mod tests {
             !kinds.contains(&STATUS_NOT_RUNNING) && STATUS_NOT_RUNNING != DAEMON_CONFLICT,
             "STATUS_NOT_RUNNING must not reuse another code"
         );
+        assert!(
+            footer.lines().any(|l| l.trim_start().starts_with(&format!("{DAEMON_LOOP_STALLED} "))),
+            "DAEMON_LOOP_STALLED (exit {DAEMON_LOOP_STALLED}) is missing from the EXIT CODES help section"
+        );
+        assert!(
+            !kinds.contains(&DAEMON_LOOP_STALLED)
+                && ![DAEMON_CONFLICT, STATUS_NOT_RUNNING].contains(&DAEMON_LOOP_STALLED),
+            "DAEMON_LOOP_STALLED must not reuse another code"
+        );
+        assert!(verb_exit_codes("up").contains(&DAEMON_LOOP_STALLED), "up is the daemon");
     }
 }
