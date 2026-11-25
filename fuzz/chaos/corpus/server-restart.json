@@ -1,0 +1,1 @@
+{"version":1,"seed":5,"origin":"signaling ops incident: the backend restarts and loses every room; all daemons must re-announce","hooks":{},"steps":[{"at":2.0,"fault":"server.down","dur":20.0},{"at":5.0,"op":"reach","src":"alpha","dst":"charlie"}]}

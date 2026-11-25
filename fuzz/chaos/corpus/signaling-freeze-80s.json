@@ -1,0 +1,1 @@
+{"version":1,"seed":1,"origin":"cli/tests/signaling-freeze-gates.sh: SIGSTOP 80s with the server keeping the socket (ping timeout 120s); the 2026 reconnect storm","hooks":{},"steps":[{"at":2.0,"fault":"proc.freeze","target":"bravo","dur":80.0},{"at":90.0,"op":"send","src":"alpha","dst":"bravo","kib":256}]}

@@ -60,3 +60,4 @@ frontend/tests/.browser-ui-bundle.js
 frontend/tests/.browser-ui-bundle.css
 frontend/tests/.browser-ui-shots/
 frontend/tests/filament_pake_bg-*.wasm
+chaos-results/

@@ -1,0 +1,1 @@
+{"version":1,"seed":4,"origin":"warm-hold / zombie warm link: the peer daemon dies hard mid-session and comes back with the same identity","hooks":{},"steps":[{"at":1.0,"op":"exec","src":"charlie","dst":"alpha"},{"at":4.0,"fault":"proc.kill","target":"alpha","dur":10.0},{"at":6.0,"op":"exec","src":"charlie","dst":"alpha"}]}

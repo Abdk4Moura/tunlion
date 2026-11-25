@@ -1,0 +1,1 @@
+{"version":1,"seed":6,"origin":"silence-watchdog flap root cause: the server link goes silent without a close","hooks":{},"steps":[{"at":1.0,"fault":"sig.blackhole","target":"charlie","dur":45.0},{"at":3.0,"op":"send","src":"alpha","dst":"charlie","kib":64}]}
