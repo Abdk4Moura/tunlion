@@ -12,7 +12,15 @@ From the owner box, against a leased test machine (never on the owner box):
     fuzz/chaos/run-on-lease.sh <worker> replay           # every schedule in corpus/
     fuzz/chaos/run-on-lease.sh <worker> explore --budget-min 60
 
-`replay` and `explore` run the canary first and stop if it fails.
+`replay` and `explore` run the canary once, on world 0, while the other
+worlds already work; if it fails the whole job exits 4.
+
+One job runs several independent worlds at once (`--worlds N`; default 2 per
+core, at most one per GiB available, at most 16). Each world has its own
+slot: namespaces `chz<k>_*`, subnet `10.(90+k).0.0/16`, backend port
+`8155+k`, chains `CHZ<k>*`, lock `/run/tunlion-chaos.slot<k>.lock`, so two
+jobs can share a machine as long as slots are free. `throughput.json` in the
+results records runs per hour and the machine's load.
 
 Exit codes: 0 clean, 1 hard finding, 3 refused (a precondition is unmet, so
 there is no result), 4 the canary was not detected (the instrument is broken).
