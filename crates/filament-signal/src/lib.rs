@@ -97,10 +97,21 @@ async fn send_writer_message(
             },
         ) => match result {
             Ok(result) => result,
-            Err(_) => bail!(
-                "signaling write stalled for {}s; the socket is no longer usable",
-                SIGNALING_WRITE_STALL.as_secs()
-            ),
+            Err(_) => {
+                // Make "no longer usable" true for the next caller too. The
+                // sink stays in place otherwise, and every later emit on the
+                // same stuck socket waited out its own full stall budget, in
+                // sequence, inside the daemon event loop. Closed, they fail at
+                // once and the silence watchdog redials. A writer still holding
+                // the sink is itself bounded by this same budget.
+                if let Ok(mut sink) = writer.try_lock() {
+                    sink.take();
+                }
+                bail!(
+                    "signaling write stalled for {}s; the socket is no longer usable",
+                    SIGNALING_WRITE_STALL.as_secs()
+                )
+            }
         },
     }
 }
@@ -774,5 +785,39 @@ mod tests {
         assert_eq!(split_packet("42[\"a\"]"), Some(('4', "2[\"a\"]")));
         assert_eq!(split_packet("2"), Some(('2', "")));
         assert_eq!(split_packet(""), None);
+    }
+}
+
+/// A stalled signaling write must close the socket for every later emit, not
+/// just fail the one that stalled: the daemon event loop emits inline, and a
+/// fresh full stall budget per emit parked it for many budgets in a row.
+#[cfg(test)]
+mod write_stall_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn after_one_stalled_write_later_emits_fail_at_once() {
+        // The far end never reads, so the socket buffers fill and a write stalls.
+        let (client, _far) = Client::loopback().await.expect("loopback client");
+        let big = "x".repeat(1 << 20);
+        let started = std::time::Instant::now();
+        let mut stalled = false;
+        for _ in 0..256 {
+            if client.emit("fill", serde_json::json!(big)).await.is_err() {
+                stalled = true;
+                break;
+            }
+        }
+        assert!(stalled, "the buffers never filled");
+        assert!(started.elapsed() < SIGNALING_WRITE_STALL * 3, "filling took {:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            assert!(client.emit("small", serde_json::json!({})).await.is_err(), "a stalled socket accepted a write");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "five emits on a stalled socket took {:?}",
+            started.elapsed()
+        );
     }
 }
