@@ -40,6 +40,12 @@ if [ "${CHAOS_SYMBOLS:-0}" = 1 ]; then
   TREE="$TREE-syms"
   SYMS="CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only"
 fi
+# CHAOS_RUSTFLAGS, e.g. "--cfg tokio_unstable" for async task dumps. Part of
+# the cache key: flags change the binary.
+if [ -n "${CHAOS_RUSTFLAGS:-}" ]; then
+  TREE="$TREE-$(printf '%s' "$CHAOS_RUSTFLAGS" | sha256sum | cut -c1-8)"
+  SYMS="$SYMS RUSTFLAGS=$(printf '%q' "$CHAOS_RUSTFLAGS")"
+fi
 JOB="chaos-$SHA-$MODE-$(date +%s)"
 TAR=$(mktemp -d)/"$JOB.tar"
 git -C "$ROOT" archive --format=tar HEAD -o "$TAR"

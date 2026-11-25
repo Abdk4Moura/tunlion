@@ -1,0 +1,25 @@
+name: Chaos fuzzer selftest
+# The chaos fuzzer itself (fuzz/chaos) runs on a leased test machine, not
+# here: it needs root, network namespaces and minutes per run. This job only
+# checks its pure parts (schedule generation and mutation, log-kind
+# normalization, every oracle's judgement, every corpus schedule's shape),
+# so a change to the fuzzer cannot silently break its rules.
+on:
+  pull_request:
+    paths: ["fuzz/**", ".github/workflows/chaos-selftest.yml"]
+  push:
+    branches: [main]
+    paths: ["fuzz/**", ".github/workflows/chaos-selftest.yml"]
+permissions:
+  contents: read
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -I fuzz/chaos/chaos.py selftest
+      - run: bash -n fuzz/chaos/run-on-lease.sh
