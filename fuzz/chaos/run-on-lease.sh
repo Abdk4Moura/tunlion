@@ -10,7 +10,9 @@
 # the ci-dogfood workflow in worker mode). It is driven with `tunlion exec`;
 # nothing heavy runs on the owner box. Steps:
 #   1. ship the COMMITTED source (git archive HEAD, so the run is tied to a SHA)
-#   2. build the test-hooks release binary in the worker's warm cargo target
+#   2. build the test-hooks binary with the `fuzz` profile (Cargo.toml) in one
+#      STABLE source dir and one target dir on the worker, so a small edit
+#      rebuilds in seconds, not the minutes a fat-LTO release build takes
 #   3. copy that binary into the job dir and record its sha256: the shared
 #      target can be rebuilt by another job mid-run, and chaos.py asserts the
 #      hash before every schedule
@@ -32,19 +34,37 @@ if [ -n "$(git -C "$ROOT" status --porcelain -- fuzz cli crates backend)" ]; the
   echo "uncommitted changes under fuzz/ cli/ crates/ backend/: commit first, the run must name a SHA" >&2
   exit 2
 fi
-TREE=$(git -C "$ROOT" rev-parse HEAD:cli HEAD:crates HEAD:Cargo.lock | sha256sum | cut -c1-16)
+# The binary depends only on cli/, crates/, Cargo.lock and the root Cargo.toml
+# (which holds the profiles), so a fuzz-only change reuses the cached binary.
+TREE=$(git -C "$ROOT" rev-parse HEAD:cli HEAD:crates HEAD:Cargo.lock HEAD:Cargo.toml | sha256sum | cut -c1-16)
+# CHAOS_PROFILE: `fuzz` (default) rebuilds incrementally in seconds; `release`
+# is the shipped fat-LTO build, for confirming a finding against it.
+PROFILE=${CHAOS_PROFILE:-fuzz}
+case "$PROFILE" in *[!a-z0-9_-]*|"") echo "bad CHAOS_PROFILE: $PROFILE" >&2; exit 2;; esac
+TREE="$TREE-$PROFILE"
+PUP=$(printf '%s' "$PROFILE" | tr a-z- A-Z_)
 # CHAOS_SYMBOLS=1: keep line tables and skip strip, so a wedged daemon's
-# thread dump names functions. A different binary, so a different cache key.
+# thread dump names functions. The fuzz profile already does both, so there it
+# changes nothing; for release it is a different binary, so a different key.
 SYMS=""
-if [ "${CHAOS_SYMBOLS:-0}" = 1 ]; then
+if [ "${CHAOS_SYMBOLS:-0}" = 1 ] && [ "$PROFILE" != fuzz ]; then
   TREE="$TREE-syms"
-  SYMS="CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only"
+  SYMS="CARGO_PROFILE_${PUP}_STRIP=false CARGO_PROFILE_${PUP}_DEBUG=line-tables-only"
+fi
+# CHAOS_FEATURES: extra cargo features on top of test-hooks. Part of the key.
+FEATURES="test-hooks"
+if [ -n "${CHAOS_FEATURES:-}" ]; then
+  case "$CHAOS_FEATURES" in *[!a-zA-Z0-9_,\ /-]*) echo "bad CHAOS_FEATURES: $CHAOS_FEATURES" >&2; exit 2;; esac
+  FEATURES="test-hooks ${CHAOS_FEATURES//,/ }"
+  TREE="$TREE-f$(printf '%s' "$FEATURES" | tr ' ' '\n' | sort -u | sha256sum | cut -c1-8)"
 fi
 # CHAOS_RUSTFLAGS, e.g. "--cfg tokio_unstable" for async task dumps. Part of
-# the cache key: flags change the binary.
+# the key, and it gets its own target dir: RUSTFLAGS changes every unit, so
+# sharing one dir with the plain build would rebuild everything on each switch.
+RFKEY=""
 if [ -n "${CHAOS_RUSTFLAGS:-}" ]; then
-  TREE="$TREE-$(printf '%s' "$CHAOS_RUSTFLAGS" | sha256sum | cut -c1-8)"
-  SYMS="$SYMS RUSTFLAGS=$(printf '%q' "$CHAOS_RUSTFLAGS")"
+  RFKEY=$(printf '%s' "$CHAOS_RUSTFLAGS" | sha256sum | cut -c1-8)
+  TREE="$TREE-$RFKEY"
 fi
 JOB="chaos-$SHA-$MODE-$(date +%s)"
 TAR=$(mktemp -d)/"$JOB.tar"
@@ -61,18 +81,35 @@ root="\$TUNLION_WORKER_ROOT"
 inbox="\$root/$JOB.tar"
 [ -f "\$inbox" ] || { echo "shipped tarball not found at \$inbox" >&2; exit 2; }
 job="\$root/jobs/$JOB"; mkdir -p "\$job"; tar -xf "\$inbox" -C "\$job"
-find "\$job" -type f -exec touch {} +
-cd "\$job/cli"
-export CARGO_TARGET_DIR="\${CARGO_TARGET_DIR:-\$root/cargo-target}"
-# The binary depends only on cli/, crates/ and Cargo.lock: a fuzz-only change
-# reuses the binary built for the same product tree.
 cached="\$root/chaos-bins/$TREE/tunlion"
 if [ -x "\$cached" ]; then
   echo "== reusing binary built for product tree $TREE"
 else
-  flock --close "\$root/build.lock" env $SYMS cargo build --features test-hooks --release 2>&1 | tail -3
-  mkdir -p "\$root/chaos-bins/$TREE"
-  cp "\$CARGO_TARGET_DIR/release/tunlion" "\$cached"
+  # ONE source dir and ONE target dir for every run on this worker. rsync
+  # --checksum without --times rewrites only files whose CONTENT changed (they
+  # get a fresh mtime) and leaves every other file, and its old mtime, alone,
+  # so cargo recompiles exactly the crates this commit touched. Never copy the
+  # archive's mtimes in: they are the commit time, which can be older than the
+  # last build, and cargo would then keep a stale binary.
+  src="\$root/src-stable"
+  tgt="\${CARGO_TARGET_DIR:-\$root/cargo-target}"
+  [ -z "$RFKEY" ] || tgt="\$tgt-rf-$RFKEY"
+  # No linker override: rustc already links x86_64 Linux with its bundled
+  # rust-lld, and mold measured no faster on this binary (21.7 s vs 21.9 s).
+  rf=${CHAOS_RUSTFLAGS:+$(printf '%q' "$CHAOS_RUSTFLAGS")}
+  (
+    flock 9
+    mkdir -p "\$src"
+    rsync -rlc --delete "\$job/" "\$src/"
+    cd "\$src/cli"
+    t0=\$(date +%s)
+    [ -z "\$rf" ] || export RUSTFLAGS="\$rf"
+    env CARGO_TARGET_DIR="\$tgt" CARGO_BUILD_JOBS="\$(nproc)" $SYMS \
+      cargo build --features "$FEATURES" --profile $PROFILE 2>&1 | tail -3
+    echo "== built $PROFILE in \$(( \$(date +%s) - t0 ))s (target \$tgt)"
+    mkdir -p "\$root/chaos-bins/$TREE"
+    cp "\$tgt/$PROFILE/tunlion" "\$cached.tmp" && mv "\$cached.tmp" "\$cached"
+  ) 9>"\$root/build.lock"
 fi
 cp "\$cached" "\$job/tunlion-under-test"
 sha256sum "\$job/tunlion-under-test"

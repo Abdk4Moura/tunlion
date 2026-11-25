@@ -22,6 +22,26 @@ slot: namespaces `chz<k>_*`, subnet `10.(90+k).0.0/16`, backend port
 jobs can share a machine as long as slots are free. `throughput.json` in the
 results records runs per hour and the machine's load.
 
+### Build
+
+The script builds the daemon with the `fuzz` profile (root `Cargo.toml`): no
+LTO, incremental, workspace code at -O2 and dependencies at -O3, line tables
+kept. On a 4-core lease, after the first build, a one-line change rebuilds in
+about 22 s (in `cli/`) or 7 s (in `crates/filament-peerloop`), against 280 to
+320 s for `--release`. To keep it that fast, the worker keeps ONE source dir
+(`src-stable`, updated with `rsync --checksum` so unchanged files keep their
+mtimes) and ONE target dir, and you should keep using the same worker: a new
+lease starts cold (about 400 s), or, when the worker workflow restored
+`cargo-target` from the Actions cache, rebuilds only the workspace crates
+(about 190 s when the dependencies are already built).
+
+Knobs, each part of the binary cache key:
+
+    CHAOS_PROFILE=release   the shipped fat-LTO build (minutes per rebuild)
+    CHAOS_FEATURES="a b"    extra cargo features on top of test-hooks
+    CHAOS_RUSTFLAGS=...     e.g. "--cfg tokio_unstable"; gets its own target dir
+    CHAOS_SYMBOLS=1         line tables and no strip (already so for `fuzz`)
+
 Exit codes: 0 clean, 1 hard finding, 3 refused (a precondition is unmet, so
 there is no result), 4 the canary was not detected (the instrument is broken).
 
