@@ -6,12 +6,14 @@
 use std::process::Command;
 
 /// Get the path to the tunlion binary built with test-hooks feature.
+///
+/// Cargo hands integration tests the exact path of the package binary it just
+/// built (CARGO_BIN_EXE_<name>). Deriving it from `current_exe` instead assumed
+/// a `target/debug/tunlion` that only exists when some earlier step happened to
+/// build it, so the test failed with "No such file or directory" whenever the
+/// test step ran without that earlier build.
 fn filament_bin() -> std::path::PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // remove test binary name
-    path.pop(); // remove deps/
-    path.push("tunlion");
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_tunlion"))
 }
 
 /// Test that `tunlion devices` shows the authoritative capability note.
