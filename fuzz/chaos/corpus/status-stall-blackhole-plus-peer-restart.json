@@ -1,0 +1,57 @@
+{
+  "hooks": {
+    "charlie": {
+      "TUNLION_LOG": "debug"
+    }
+  },
+  "origin": "exact schedule of exploration run explore-14 (2026-11-25): charlie server link blackholed, bravo killed and restarted at 18.5 s; status on charlie at 39 s said its daemon was not responding (O3b). Suspected mechanism: bravo re-offers a direct link, charlie arms it inline and its candidate gathering does HTTP to the blackholed server (up to about 31 s)",
+  "seed": 950782088,
+  "steps": [
+    {
+      "a": "alpha",
+      "at": 0.9,
+      "b": "charlie",
+      "dur": 7.8,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 1.7,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "alpha"
+    },
+    {
+      "at": 4.9,
+      "dur": 49.7,
+      "fault": "sig.blackhole",
+      "target": "charlie"
+    },
+    {
+      "at": 18.5,
+      "dur": 3.3,
+      "fault": "proc.kill",
+      "target": "bravo"
+    },
+    {
+      "at": 18.8,
+      "dst": "charlie",
+      "kib": 256,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 33.6,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "bravo"
+    },
+    {
+      "at": 39.1,
+      "dst": "charlie",
+      "op": "status",
+      "src": "charlie"
+    }
+  ],
+  "version": 1
+}
