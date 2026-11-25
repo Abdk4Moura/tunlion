@@ -1,0 +1,39 @@
+{
+  "hooks": {},
+  "seed": 585688596,
+  "steps": [
+    {
+      "a": "alpha",
+      "at": 6.4,
+      "b": "bravo",
+      "dur": 32.3,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "at": 6.7,
+      "dur": 25.8,
+      "fault": "sig.blackhole",
+      "target": "charlie"
+    },
+    {
+      "at": 6.8,
+      "dur": 11.2,
+      "fault": "sig.reset",
+      "target": "charlie"
+    },
+    {
+      "at": 24.2,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "at": 39.3,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

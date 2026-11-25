@@ -1,0 +1,49 @@
+{
+  "hooks": {
+    "bravo": {
+      "TUNLION_TEST_CORRUPT_ONCE": "1"
+    }
+  },
+  "seed": 55287047,
+  "steps": [
+    {
+      "at": 3.2,
+      "dur": 14.0,
+      "fault": "server.down"
+    },
+    {
+      "at": 17.4,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "a": "charlie",
+      "at": 18.7,
+      "b": "bravo",
+      "dur": 97.3,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "at": 23.2,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 30.6,
+      "dst": "bravo",
+      "op": "status",
+      "src": "bravo"
+    },
+    {
+      "at": 31.1,
+      "dst": "bravo",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

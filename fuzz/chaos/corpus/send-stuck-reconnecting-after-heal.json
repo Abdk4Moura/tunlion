@@ -1,0 +1,36 @@
+{
+  "hooks": {},
+  "origin": "found by exploration 2026-11-25 (seed 2026112503), reproduced 1/3: 30% loss on bravo for 45 s plus a 2 s full alpha-bravo partition during a 4 MiB send; at 90 s, 45 s after the network healed, send still printed 'the link is down, trying to reconnect' (O2 hang)",
+  "seed": 391743414,
+  "steps": [
+    {
+      "args": {
+        "delay_ms": 80,
+        "dup": 0,
+        "jitter_ms": 50,
+        "loss": 30,
+        "reorder": 0
+      },
+      "at": 0.0,
+      "dur": 45.0,
+      "fault": "net.impair",
+      "target": "bravo"
+    },
+    {
+      "at": 3.0,
+      "dst": "bravo",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "a": "alpha",
+      "at": 5.4,
+      "b": "bravo",
+      "dur": 2.1,
+      "fault": "net.partition",
+      "proto": "all"
+    }
+  ],
+  "version": 1
+}

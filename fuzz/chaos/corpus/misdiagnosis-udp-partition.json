@@ -1,0 +1,7 @@
+{"version": 1, "seed": 8,
+ "origin": "found by exploration 2026-11-25 (explore-2): with UDP blocked between alpha and bravo, alpha's send told the user to check whether bravo was online and running `tunlion up`, while bravo was up and a concurrent reach to it succeeded",
+ "hooks": {},
+ "steps": [{"at": 0.0, "fault": "net.partition", "a": "alpha", "b": "bravo", "proto": "udp", "dur": 75.0},
+           {"at": 3.0, "op": "send", "src": "alpha", "dst": "bravo", "kib": 64},
+           {"at": 5.0, "op": "exec", "src": "bravo", "dst": "alpha"},
+           {"at": 8.0, "op": "reach", "src": "alpha", "dst": "bravo"}]}

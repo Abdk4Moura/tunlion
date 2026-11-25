@@ -1,0 +1,31 @@
+{
+  "hooks": {},
+  "seed": 422569782,
+  "steps": [
+    {
+      "at": 7.7,
+      "dst": "charlie",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 17.7,
+      "dur": 40.0,
+      "fault": "server.down"
+    },
+    {
+      "at": 18.6,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "at": 25.2,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

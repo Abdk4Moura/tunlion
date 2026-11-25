@@ -1,0 +1,53 @@
+{
+  "hooks": {},
+  "seed": 500493151,
+  "steps": [
+    {
+      "a": "alpha",
+      "at": 0.9,
+      "b": "charlie",
+      "dur": 7.8,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 1.7,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "alpha"
+    },
+    {
+      "at": 15.9,
+      "dst": "charlie",
+      "kib": 256,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 18.5,
+      "dur": 1.6,
+      "fault": "proc.kill",
+      "target": "bravo"
+    },
+    {
+      "at": 18.8,
+      "dst": "charlie",
+      "kib": 256,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 33.6,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "bravo"
+    },
+    {
+      "at": 39.1,
+      "dst": "charlie",
+      "op": "status",
+      "src": "charlie"
+    }
+  ],
+  "version": 1
+}

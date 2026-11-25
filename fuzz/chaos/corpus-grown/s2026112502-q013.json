@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "bravo": {
+      "TUNLION_TEST_DROP_PEER_LEFT": "1"
+    }
+  },
+  "seed": 793837078,
+  "steps": [
+    {
+      "at": 3.0,
+      "dst": "charlie",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 14.5,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 15.0,
+      "dur": 30.7,
+      "fault": "sig.reset",
+      "target": "alpha"
+    },
+    {
+      "at": 17.5,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 19.7,
+      "dur": 3.0,
+      "fault": "proc.kill",
+      "target": "charlie"
+    }
+  ],
+  "version": 1
+}

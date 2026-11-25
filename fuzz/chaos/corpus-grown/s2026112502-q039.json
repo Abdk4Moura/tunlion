@@ -1,0 +1,20 @@
+{
+  "hooks": {},
+  "seed": 563706410,
+  "steps": [
+    {
+      "at": 12.1,
+      "dur": 50.8,
+      "fault": "sig.blackhole",
+      "target": "alpha"
+    },
+    {
+      "at": 18.3,
+      "dst": "bravo",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,1 @@
+{"version":1,"seed":3,"origin":"cli/tests/ack-loss-repro.sh: heavy loss on one side during a transfer","hooks":{},"steps":[{"at":0.0,"fault":"net.impair","target":"bravo","dur":45.0,"args":{"loss":30,"delay_ms":80,"jitter_ms":50,"dup":0,"reorder":0}},{"at":2.0,"op":"send","src":"alpha","dst":"bravo","kib":4096}]}

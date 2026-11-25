@@ -1,0 +1,58 @@
+{
+  "hooks": {},
+  "seed": 181088975,
+  "steps": [
+    {
+      "a": "alpha",
+      "at": 0.9,
+      "b": "charlie",
+      "dur": 7.8,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 1.7,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "alpha"
+    },
+    {
+      "at": 4.9,
+      "dur": 99.4,
+      "fault": "sig.blackhole",
+      "target": "charlie"
+    },
+    {
+      "at": 10.5,
+      "dur": 113.9,
+      "fault": "sig.reset",
+      "target": "alpha"
+    },
+    {
+      "at": 18.5,
+      "dur": 3.3,
+      "fault": "proc.kill",
+      "target": "bravo"
+    },
+    {
+      "at": 18.8,
+      "dst": "charlie",
+      "kib": 256,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 33.6,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "bravo"
+    },
+    {
+      "at": 39.1,
+      "dst": "charlie",
+      "op": "status",
+      "src": "charlie"
+    }
+  ],
+  "version": 1
+}

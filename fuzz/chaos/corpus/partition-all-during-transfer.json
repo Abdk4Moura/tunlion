@@ -1,0 +1,1 @@
+{"version":1,"seed":7,"origin":"unbounded SCTP await: the peer vanishes from the network mid-transfer, the sender must not hang","hooks":{},"steps":[{"at":2.0,"op":"send","src":"alpha","dst":"bravo","kib":4096},{"at":4.0,"fault":"net.partition","a":"alpha","b":"bravo","proto":"all","dur":40.0}]}

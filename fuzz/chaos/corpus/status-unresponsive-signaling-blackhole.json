@@ -1,0 +1,8 @@
+{"version": 1, "seed": 10,
+ "origin": "found by reading exploration records 2026-11-25 (explore-14, explore-27): with only charlie's server link blackholed, `status` on charlie said its daemon was not responding on its control socket (no freeze, no kill), and advised a restart",
+ "hooks": {},
+ "steps": [{"at": 5.0, "fault": "sig.blackhole", "target": "charlie", "dur": 60.0},
+           {"at": 20.0, "op": "status", "src": "charlie", "dst": "charlie"},
+           {"at": 35.0, "op": "status", "src": "charlie", "dst": "charlie"},
+           {"at": 40.0, "op": "exec", "src": "charlie", "dst": "alpha"},
+           {"at": 50.0, "op": "status", "src": "charlie", "dst": "charlie"}]}
