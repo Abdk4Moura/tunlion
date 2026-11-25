@@ -979,7 +979,7 @@ def record_run(w: "World", verdict: dict) -> None:
     rec = {k: verdict.get(k) for k in ("label", "schedule", "faults", "ops", "findings", "elapsed_s",
                                        "unreported_signaling")}
     rec["kinds_count"] = len(verdict.get("kinds", []))
-    safe = re.sub(r"[^\w.-]", "_", verdict["label"])[:60]
+    safe = re.sub(r"[^\w.-]", "_", re.sub(r"\.json$", "", verdict["label"]))[:60]
     (runs / f"{n:04d}-{safe}.json").write_text(json.dumps(rec, indent=1, sort_keys=True))
 
 
