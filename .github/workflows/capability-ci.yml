@@ -180,14 +180,16 @@ jobs:
       # checks, so a trip fails the job even where a harness swallows the
       # daemon's output. Gates that hold the loop on purpose unset both.
       #
-      # KNOWN RED (Windows only): the `file-end` handler finishes a received
-      # file inline in the loop (fsync via an awaited spawn_blocking, the
-      # whole-file SHA-256 verify, the rename and the delivery ack). On the
-      # Windows runner that iteration took 2028 ms in
-      # revoked_device_direct_blocked_gets_no_fallback_access (PR #731's first
-      # run). Until it moves off the loop, Windows daemons record without
-      # panicking, and the verdict tolerates exactly that label there; any
-      # other label, or that one on Linux or macOS, still fails the job.
+      # KNOWN RED (Windows only): the `file-end` handler, after sending the
+      # delivery ack, awaits `t.flush()` inline in the loop, bounded by
+      # ACK_FLUSH_BUDGET (2 s, recv/dispatch.rs). A peer that does not
+      # acknowledge holds the loop for the whole 2 s: 2028 ms on the Windows
+      # runner in revoked_device_direct_blocked_gets_no_fallback_access (PR
+      # #731's first run), and 2007 ms on Linux under the chaos schedule
+      # send-stuck-reconnecting-after-heal. Until that flush leaves the loop,
+      # Windows daemons record without panicking and the verdict tolerates
+      # exactly that label there; any other label, or that one on Linux or
+      # macOS, still fails the job.
       - name: Arm the loop budget
         shell: bash
         run: |
