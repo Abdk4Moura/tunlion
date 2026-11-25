@@ -7,11 +7,10 @@ use std::process::Command;
 
 /// Get the path to the tunlion binary built with test-hooks feature.
 fn filament_bin() -> std::path::PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // remove test binary name
-    path.pop(); // remove deps/
-    path.push("tunlion");
-    path
+    // Cargo hands integration tests the exact path of the package binary it
+    // built. Deriving it from `current_exe` assumed a `target/debug/tunlion`
+    // that only exists when some earlier step happened to build it.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_tunlion"))
 }
 
 /// Test that `tunlion man` piped produces valid roff with ".TH" header.
