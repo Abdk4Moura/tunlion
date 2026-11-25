@@ -15,6 +15,9 @@
 // Failure-mode ledger: ../docs/cli-resilience.md, every resilience behavior
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
+#[cfg(test)]
+#[path = "../build_profile.rs"]
+mod build_profile;
 mod codeentry;
 mod armed;
 mod authkey;

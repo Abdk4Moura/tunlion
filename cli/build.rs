@@ -24,18 +24,15 @@ fn watch_if_exists(path: &str) {
     }
 }
 
-/// Cargo does not expose the custom profile name as a stable dedicated variable.
-/// OUT_DIR is always `<target>/<profile>/build/<package>/out`, including for
-/// cross-target builds, so its third ancestor is the profile directory.
+#[path = "build_profile.rs"]
+mod build_profile_path;
+
+/// Profile name for `--version` and the capability harness. Path-derived first
+/// (see build_profile.rs for the layouts), then cargo's coarse PROFILE
+/// (`debug`/`release`), then "unknown".
 fn build_profile() -> String {
     std::env::var_os("OUT_DIR")
-        .and_then(|out| {
-            Path::new(&out)
-                .ancestors()
-                .nth(3)
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-        })
+        .and_then(|out| build_profile_path::profile_from_out_dir(Path::new(&out)))
         .or_else(|| std::env::var("PROFILE").ok())
         .unwrap_or_else(|| "unknown".into())
 }
