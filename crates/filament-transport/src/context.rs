@@ -9,12 +9,25 @@ type Membership = dyn Fn(Option<&str>) -> String + Send + Sync;
 #[derive(Clone)]
 pub struct TransportContext(Arc<Inner>);
 
+#[cfg(feature = "sim")]
+pub trait SignalingConnector: Send + Sync {
+    fn connect<'a>(
+        &'a self,
+        server: &'a str,
+        tx: tokio::sync::mpsc::UnboundedSender<filament_signal::Incoming>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<filament_signal::Client>> + Send + 'a>,
+    >;
+}
+
 struct Inner {
     dns_cache_path: Option<PathBuf>,
     settings: Arc<Settings>,
     membership: Arc<Membership>,
     public_ip: Mutex<Option<crate::direct::PubIpEntry>>,
     observed_ip: Mutex<Option<IpAddr>>,
+    #[cfg(feature = "sim")]
+    signaling_connector: Option<Arc<dyn SignalingConnector>>,
 }
 
 impl Default for TransportContext {
@@ -45,6 +58,8 @@ impl TransportContext {
             membership,
             public_ip: Mutex::new(None),
             observed_ip: Mutex::new(None),
+            #[cfg(feature = "sim")]
+            signaling_connector: None,
         }))
     }
 
@@ -53,4 +68,21 @@ impl TransportContext {
     pub fn membership(&self, peer: Option<&str>) -> String { (self.0.membership)(peer) }
     pub(crate) fn public_ip_cache(&self) -> &Mutex<Option<crate::direct::PubIpEntry>> { &self.0.public_ip }
     pub(crate) fn observed_ip(&self) -> &Mutex<Option<IpAddr>> { &self.0.observed_ip }
+
+    #[cfg(feature = "sim")]
+    pub fn with_signaling_connector(&self, connector: Arc<dyn SignalingConnector>) -> Self {
+        Self(Arc::new(Inner {
+            dns_cache_path: self.0.dns_cache_path.clone(),
+            settings: Arc::clone(&self.0.settings),
+            membership: Arc::clone(&self.0.membership),
+            public_ip: Mutex::new(None),
+            observed_ip: Mutex::new(None),
+            signaling_connector: Some(connector),
+        }))
+    }
+
+    #[cfg(feature = "sim")]
+    pub fn signaling_connector(&self) -> Option<&Arc<dyn SignalingConnector>> {
+        self.0.signaling_connector.as_ref()
+    }
 }

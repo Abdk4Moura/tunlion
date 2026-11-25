@@ -1732,6 +1732,13 @@ async fn recv_run(
                 ));
                 log.debug(&format!("  signaling connect failed at start: {why}"));
                 start_offline = true;
+                #[cfg(feature = "sim")]
+                if transport_context.signaling_connector().is_some() {
+                    filament_signal::Client::offline_sim()
+                } else {
+                    filament_signal::Client::offline().await?
+                }
+                #[cfg(not(feature = "sim"))]
                 filament_signal::Client::offline().await?
             }
         }

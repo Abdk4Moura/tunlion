@@ -1618,6 +1618,29 @@ impl Drop for Signaling {
 /// Connect signaling and return the OWNING handle: the client plus the task that
 /// forwards its events, which [`Signaling::shutdown`] cancels and awaits.
 pub async fn connect_signaling_owned(context: &crate::TransportContext, server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Signaling> {
+    #[cfg(feature = "sim")]
+    if let Some(connector) = context.signaling_connector() {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<filament_signal::Incoming>();
+        let forwarder = spawn_signal_forwarder(raw_rx, tx, stop.clone());
+        let sio = match connector.connect(server, raw_tx).await {
+            Ok(sio) => sio,
+            Err(e) => {
+                stop.store(true, std::sync::atomic::Ordering::Release);
+                forwarder.abort();
+                let _ = forwarder.await;
+                return Err(e).with_context(|| format!("signaling connect to {server}"));
+            }
+        };
+        return Ok(Signaling {
+            client: sio,
+            stop,
+            task: std::sync::Mutex::new(Some(forwarder)),
+            shutdown_gate: Mutex::new(()),
+            owns_task: std::sync::atomic::AtomicBool::new(true),
+        });
+    }
+
     // Warm the OS resolver cache before rust_socketio resolves the host itself.
     // rust_socketio's builder takes only a URL string (no DNS-override or custom
     // client hook), so we cannot steer its connect at a cached IP the way the
