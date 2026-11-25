@@ -1109,6 +1109,10 @@ def cmd_explore(w: World, out: Path, budget_s: float, seed: int, corpus: list[Pa
         if new:
             seen |= new
             queue.append(sched)
+            # Saved as it grows: a campaign stopped early keeps what it learned.
+            grown = out / "corpus-grown"
+            grown.mkdir(exist_ok=True)
+            (grown / f"q{len(queue) - 1:03d}.json").write_text(json.dumps(sched, indent=2, sort_keys=True))
             log(f"  run {runs}: +{len(new)} new behaviours (total {len(seen)}), kept")
         if v["hard"]:
             key = "|".join(sorted({finding_key(f) for f in v["hard"]}))
@@ -1122,9 +1126,6 @@ def cmd_explore(w: World, out: Path, budget_s: float, seed: int, corpus: list[Pa
     summary = {"runs": runs, "behaviours": len(seen), "faults_bit": bites,
                "findings": [str(p) for p in found.values()], "seed": seed}
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
-    (out / "corpus-grown").mkdir(exist_ok=True)
-    for i, s in enumerate(queue):
-        (out / "corpus-grown" / f"q{i:03d}.json").write_text(json.dumps(s, indent=2, sort_keys=True))
     if runs and bites == 0:
         log("no fault bit in the whole campaign: the fault layer is not reaching the daemons")
         return 4
