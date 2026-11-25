@@ -489,6 +489,54 @@ impl std::fmt::Debug for dyn Transport {
 // --------------------------------------------------------------- transport --
 
 impl Ev {
+    /// The variant's name, for labelling which handler the daemon loop is
+    /// running (the test-hooks loop budget). A `Sourced` event is named by
+    /// what it carries, which is what the handler dispatches on. Exhaustive on
+    /// purpose: a new variant must name itself.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Ev::Lan(..) => "Lan",
+            Ev::Welcome(..) => "Welcome",
+            Ev::PeerJoined(..) => "PeerJoined",
+            Ev::PeerLeft(..) => "PeerLeft",
+            Ev::Signal(..) => "Signal",
+            Ev::PairCode(..) => "PairCode",
+            Ev::PairOk(..) => "PairOk",
+            Ev::PairMatched(..) => "PairMatched",
+            Ev::PairUsed(..) => "PairUsed",
+            Ev::PairError(..) => "PairError",
+            Ev::KnownPeer(..) => "KnownPeer",
+            Ev::KnownPeerLeft(..) => "KnownPeerLeft",
+            Ev::Synced(..) => "Synced",
+            Ev::SignalingAlive => "SignalingAlive",
+            Ev::BuildWake => "BuildWake",
+            Ev::ChannelReady(..) => "ChannelReady",
+            Ev::DirectReady(..) => "DirectReady",
+            Ev::DirectUpgradeReady(..) => "DirectUpgradeReady",
+            Ev::DirectWorkersReady(..) => "DirectWorkersReady",
+            Ev::ReplaySource(..) => "ReplaySource",
+            Ev::ReplayDeparture(..) => "ReplayDeparture",
+            Ev::Control(..) => "Control",
+            Ev::Sourced { inner, .. } => inner.kind(),
+            Ev::LocalControl(..) => "LocalControl",
+            Ev::LocalPcState(..) => "LocalPcState",
+            Ev::Chunk(..) => "Chunk",
+            Ev::PcState(..) => "PcState",
+            Ev::TransferDone(..) => "TransferDone",
+            Ev::TransferFailed { .. } => "TransferFailed",
+            Ev::MaybeComplete(..) => "MaybeComplete",
+            Ev::Stuck(..) => "Stuck",
+            Ev::TransferStalled(..) => "TransferStalled",
+            Ev::GraceExpired(..) => "GraceExpired",
+            Ev::RetryLink(..) => "RetryLink",
+            Ev::SignalingDown(..) => "SignalingDown",
+            Ev::DropLink(..) => "DropLink",
+            Ev::Interrupted => "Interrupted",
+            Ev::StdinLine(..) => "StdinLine",
+            Ev::AttemptDrained(..) => "AttemptDrained",
+        }
+    }
+
     /// Build a ChannelReady event that carries the transport's immutable
     /// source. A transport without one produces an untagged readiness event,
     /// which the handler gate rejects (fail closed).

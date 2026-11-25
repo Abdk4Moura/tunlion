@@ -2707,12 +2707,19 @@ async fn recv_run(
     // The deadline starts when the loop starts, not when the process did: the
     // caller asked "wait N seconds for a sender", not "be ready in N seconds".
     let receive_started = Instant::now();
+    // Test-hooks builds: judge every daemon iteration's busy time (idle wait
+    // in the select excluded) against a one-second budget, so ANY test that
+    // happens to park an await in this loop reports it with the handler's
+    // name (recv::loop_budget). Empty and free in a production build.
+    let mut loop_budget = test_hooks::LoopBudget::new(daemon);
 
     loop {
         // Real-loop latency gate: a test-only line per iteration, so the worker
         // gate can measure the maximum gap between iterations. No call in a
         // production build (test_hooks::loop_beat is empty there).
         test_hooks::loop_beat();
+        loop_budget.finish(log.as_ref());
+        loop_budget.enter("prelude");
         conn.pump_builds();
         sync_tasks.reap_sync_tasks(log.as_ref()).await;
         // Reap completed blocking writers every iteration: the handles are
@@ -2842,13 +2849,16 @@ async fn recv_run(
             let hold = test_hooks::stall_loop_once_ms();
             if hold > 0 {
                 log.critical(&format!("LOOP-STALL-HOLD ms={hold}"));
+                loop_budget.enter("test-stall-hold");
                 tokio::time::sleep(Duration::from_millis(hold)).await;
+                loop_budget.enter("prelude");
             }
         }
         cleanup.tasks.reap(log.as_ref()).await;
         // Read before the select: a code ceremony is in flight (see the
         // event wait below for why that shortens the wait).
         let ceremony_live = recv_code_path && !recv_pake_done && !st.recv_cers.is_empty();
+        loop_budget.idle();
         let ev = tokio::select! {
             biased;
             // Warm-link reuse request from a sibling process. Handle it inline
@@ -2856,6 +2866,9 @@ async fn recv_run(
             // a non-daemon this branch pends forever (ctl_tx held, serve unspawned).
             req = ctl_rx.recv() => {
                 if let Some(req) = req {
+                    loop_budget.enter("ctl");
+                    #[cfg(unix)]
+                    loop_budget.event(req.kind.kind());
                     // Bootstrap defers its reply (awaits the peer's ack via this
                     // loop), so it can't go through the inline handle_warm_req; it
                     // stashes the socket in pending_bootstrap instead.
@@ -3216,10 +3229,15 @@ async fn recv_run(
             },
         };
 
+        loop_budget.enter("periodic");
         let ev = match ev {
             Some(ev) => conn.stage_event(ev),
             None => None,
         };
+        if let Some((e, _)) = &ev {
+            loop_budget.event(e.kind());
+            loop_budget.detail(|| control_type(e));
+        }
 
         // Settle sweep: re-drive parked shell-class opens whose link proved
         // since parking (same link AND same device key, else the proof is
@@ -3229,6 +3247,7 @@ async fn recv_run(
         // the hold therefore denies. Never blocks: releases and denies are
         // ordinary handler calls in this loop's turn, not spawned tasks
         // awaiting anything (the loop must stay live; see serve_exec).
+        loop_budget.enter("parked-opens");
         if !parked_opens.is_empty() {
             let now = Instant::now();
             let mut fire = Vec::new();
@@ -3523,6 +3542,7 @@ async fn recv_run(
         }
 
         // C30: converge session state (no-op unless diverged/stale/unconfirmed).
+        loop_budget.enter("session-tick");
         sess.tick(&sio).await;
 
         // L1-a ephemeral PAKE progression (recv code path), PER CANDIDATE PEER.
@@ -3608,6 +3628,7 @@ async fn recv_run(
         // P2 (GAP-2): the OUTER RECONNECT / RE-ANNOUNCE loop for the long-lived
         // acceptor. Runs only in the daemon path; the one-shot recv/send paths
         // re-invoke fresh on failure and so never need it.
+        loop_budget.enter("signaling-heal");
         if signaling_self_heal {
             // (1) Liveness accounting. Any inbound signaling event proves the
             // socket is alive; a successful `sync` ack (Ev::Synced) is the
@@ -3873,6 +3894,7 @@ async fn recv_run(
         // add_peer swaps the fresh transport under the same overlay IP. We do NOT
         // re-dial here on purpose (single-driver = the model's proven, churn-free
         // recovery; a both-ends timer re-dial storms).
+        loop_budget.enter("link-health");
         if daemon && last_link_health.elapsed() >= Duration::from_secs(8) {
             last_link_health = Instant::now();
             let dead: Vec<String> = conn
@@ -4124,6 +4146,7 @@ async fn recv_run(
         // them into `devices` so the KnownPeer handler recognizes them. We never
         // re-subscribe existing channels or touch live links. Daemon-only: a
         // one-shot `recv`/`send` has a fixed roster for its short lifetime.
+        loop_budget.enter("devices-scan");
         if daemon && (revocation_sweep_now || last_devices_scan.elapsed() >= Duration::from_secs(2))
         {
             last_devices_scan = Instant::now();
@@ -4380,6 +4403,7 @@ async fn recv_run(
             }
         }
         // #28: discharge any deferred peer-left whose channel has gone idle/dead.
+        loop_budget.enter("reap");
         conn.reap_deferred();
         // Grace expired: decide these offers normally rather than hold them.
         // Re-injected with `__fleet_waited` so the deferral above does not catch
@@ -4557,6 +4581,7 @@ async fn recv_run(
         // acceptor is the canonical long-lived session, so the prober defaults ON
         // here. Probe for a direct path while serving on relay; verify-before-
         // upgrade cuts over only on a confirmed-stable direct standby.
+        loop_budget.enter("upgrade-prober");
         conn.tick_upgrade_prober().await;
 
         // Gate-18 Mode B DETERMINISTIC repro hook: simulate the post-completion
@@ -4570,6 +4595,7 @@ async fn recv_run(
         // links empties → no link to churn next tick → quiet-exit fires. Driven
         // at LOOP level (not inside on_stuck) so the A/B tests the fix, not
         // itself.
+        loop_budget.enter("exit-checks");
         if conn.recv_done && test_hooks::churn_after_complete() {
             let churn: Vec<(String, u32)> = conn
                 .links
@@ -4774,6 +4800,7 @@ async fn recv_run(
         }
 
         let Some((ev, event_source)) = ev else { continue };
+        loop_budget.enter("fleet-gates");
 
         // A fleet verdict, a hello marker and a nonce all belong to the
         // TRANSPORT they were earned on. Links are dropped from several places
@@ -4881,6 +4908,7 @@ async fn recv_run(
             }
         }
 
+        loop_budget.enter("handler");
         match ev {
             // A sid left a channel we watch: forget it from the roster so
             // warm-hold never dials a departed instance (see on_known_peer_left).
@@ -13718,5 +13746,18 @@ mod fleet_arm_wiring_tests {
             1,
             "a site reads the link for the pair-link rule on its own"
         );
+    }
+}
+
+/// A control message's `type`, the finer label for the loop budget's report.
+/// Called only by a test-hooks build (`LoopBudget::detail` never runs it in
+/// production).
+fn control_type(ev: &Ev) -> Option<String> {
+    match ev {
+        Ev::Control(_, v) | Ev::LocalControl(_, v) => {
+            v.get("type").and_then(|t| t.as_str()).map(str::to_owned)
+        }
+        Ev::Sourced { inner, .. } => control_type(inner),
+        _ => None,
     }
 }
