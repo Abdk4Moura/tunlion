@@ -5188,6 +5188,15 @@ fn a_send_that_saw_the_peer_blames_the_path_not_the_peer() {
 }
 
 #[test]
+fn a_send_that_never_reached_the_server_blames_this_machine() {
+    let m = crate::send_cmd::unreachable_from_here_message("bravo");
+    assert!(m.contains("can't reach the tunlion server from this machine"), "{m}");
+    assert!(m.contains("network connection") && m.contains("`tunlion doctor`"), "{m}");
+    // Never the reset advice: the device may be perfectly healthy.
+    assert!(!m.contains("forget") && !m.contains("pair it again") && !m.contains("is offline"), "{m}");
+}
+
+#[test]
 fn the_no_peer_hint_names_who_we_were_waiting_for() {
     use crate::send_cmd::no_peer_hint;
     // CLI to CLI: a device is another tunlion, never "the page".
