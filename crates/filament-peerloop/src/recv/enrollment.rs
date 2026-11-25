@@ -163,7 +163,7 @@ impl EnrollmentService {
 
         let nonce = match self
             .runtime
-            .generate_nonce_at(&pid, std::time::Instant::now())
+            .generate_nonce_at(&pid, filament_transport::clock::Instant::now())
         {
             Ok(n) => n,
             Err(e) => {
@@ -213,7 +213,7 @@ impl EnrollmentService {
         // Structural nonce consumption: never trust a nonce echoed by the peer.
         let nonce = match self
             .runtime
-            .consume_latest_nonce_at(&pid, std::time::Instant::now())
+            .consume_latest_nonce_at(&pid, filament_transport::clock::Instant::now())
         {
             Ok(n) => n,
             Err(e) => {

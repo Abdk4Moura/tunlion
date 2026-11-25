@@ -65,7 +65,8 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -1078,7 +1079,13 @@ impl WriterTasks {
     where
         F: FnOnce() + Send + 'static,
     {
-        let handle = tokio::task::spawn_blocking(write);
+        #[cfg(not(feature = "sim"))]
+        let handle = crate::sim_rt::run_blocking(write);
+        #[cfg(feature = "sim")]
+        let handle = {
+            write();
+            tokio::spawn(std::future::ready(()))
+        };
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.tasks
             .lock()
@@ -1514,7 +1521,7 @@ async fn apply_code_stream_action(
         CodeStreamAction::Retire => {
             for inc in take_streams_of(by_sid, pid) {
                 let f = inc.file.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                let _ = crate::sim_rt::run_blocking(move || {
                     let _ = f.sync_all();
                 })
                 .await;
@@ -1846,13 +1853,13 @@ async fn recv_run(
     // unresolved. The offer is held (re-injected) while identity resolution is
     // pending, bounded by RECV_IDENTITY_HOLD_DEADLINE from first sight so a
     // ceremony that never resolves cannot wedge the transfer.
-    let mut recv_identity_hold: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut recv_identity_hold: HashMap<String, filament_transport::clock::Instant> = HashMap::new();
     // Last time the held identity challenge was re-sent. The first copy can
     // race the peer's control channel becoming ready (measured on a room
     // transfer: the challenge was issued at ChannelReady but the sender had not
     // installed the link yet), and a lost challenge must not turn into a
     // fail-closed refusal. Re-sending the SAME nonce is idempotent.
-    let mut recv_identity_resent: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut recv_identity_resent: HashMap<String, filament_transport::clock::Instant> = HashMap::new();
     // #161: how long the offer waits for identity to resolve before deciding.
     // Identity resolution normally settles in well under a second on a working
     // link; the window exists so a revoked device's cert (which resolves via
@@ -2966,7 +2973,7 @@ async fn recv_run(
                                             // BOUNDED. A port the peer did not expose can
                                             // black-hole the SYN, and an unbounded dial held
                                             // the proxy's client with no reply at all.
-                                            let t0 = std::time::Instant::now();
+                                            let t0 = filament_transport::clock::Instant::now();
                                             match tokio::time::timeout(OVERLAY_DIAL_BOUND, m.dial(addr, port)).await {
                                                 Ok(Ok(mut stream)) => {
                                                     // An exposed port's overlay listener completes
@@ -3955,7 +3962,7 @@ async fn recv_run(
                 let store = ports.store.clone();
                 let who_owned = who.to_string();
                 tokio::spawn(async move {
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let _ = crate::sim_rt::run_blocking(move || {
                         store.devices_touch(&who_owned, None, None);
                     })
                     .await;
@@ -6512,7 +6519,7 @@ async fn recv_run(
                                     let store = ports.store.clone();
                                     let who_owned = who.to_string();
                                     tokio::spawn(async move {
-                                        let _ = tokio::task::spawn_blocking(move || {
+                                        let _ = crate::sim_rt::run_blocking(move || {
                                             store.devices_touch(&who_owned, Some(ip), Some(v4));
                                         })
                                         .await;
@@ -7622,7 +7629,7 @@ async fn recv_run(
                                             let store = ports.store.clone();
                                             let who_owned = who.to_string();
                                             tokio::spawn(async move {
-                                                let _ = tokio::task::spawn_blocking(move || {
+                                                let _ = crate::sim_rt::run_blocking(move || {
                                                     store.devices_touch(&who_owned, Some(ip), Some(v4));
                                                 })
                                                 .await;
@@ -9544,7 +9551,7 @@ async fn recv_run(
                         let expired = if identity_hold && link_ready {
                             recv_identity_hold
                                 .entry(pid.clone())
-                                .or_insert_with(std::time::Instant::now)
+                                .or_insert_with(filament_transport::clock::Instant::now)
                                 .elapsed()
                                 >= RECV_IDENTITY_HOLD_DEADLINE
                         } else {
@@ -9855,7 +9862,7 @@ async fn recv_run(
                             for k in dup_keys {
                                 if let Some(inc) = st.by_sid.remove(&k) {
                                     let f = inc.file.clone();
-                                    let _ = tokio::task::spawn_blocking(move || {
+                                    let _ = crate::sim_rt::run_blocking(move || {
                                         let _ = f.sync_all();
                                     })
                                     .await;
@@ -10254,7 +10261,7 @@ async fn recv_run(
                     };
                     let sender = inc.sender.clone();
                     let f = inc.file.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let _ = crate::sim_rt::run_blocking(move || {
                         let _ = f.sync_all();
                     })
                     .await;
@@ -10423,7 +10430,7 @@ async fn recv_run(
                                     ));
                                 }
                                 let f = inc.file.clone();
-                                let _ = tokio::task::spawn_blocking(move || {
+                                let _ = crate::sim_rt::run_blocking(move || {
                                     let _ = f.sync_all();
                                 })
                                 .await;
@@ -10657,7 +10664,7 @@ async fn recv_run(
                                     ));
                                 }
                                 let f = inc.file.clone();
-                                let _ = tokio::task::spawn_blocking(move || {
+                                let _ = crate::sim_rt::run_blocking(move || {
                                     let _ = f.sync_all();
                                 })
                                 .await;
@@ -10763,7 +10770,7 @@ async fn recv_run(
                     // --- TRACE recv path ---
                     let trace = cfg!(feature = "debug-logs") && ports.env.trace_throughput;
                     let t_recv_start = if trace {
-                        Some(std::time::Instant::now())
+                        Some(filament_transport::clock::Instant::now())
                     } else {
                         None
                     };
@@ -10821,7 +10828,7 @@ async fn recv_run(
                             sid,
                         };
                         let t_pwrite = if trace_inner {
-                            Some(std::time::Instant::now())
+                            Some(filament_transport::clock::Instant::now())
                         } else {
                             None
                         };
@@ -11091,7 +11098,7 @@ async fn recv_run(
                 for key in stale {
                     if let Some(inc) = st.by_sid.remove(&key) {
                         let f = inc.file.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let _ = crate::sim_rt::run_blocking(move || {
                             let _ = f.sync_all();
                         })
                         .await;
@@ -12560,7 +12567,7 @@ mod lifecycle_tests {
                 )
                 .await;
         }
-        let start = std::time::Instant::now();
+        let start = filament_transport::clock::Instant::now();
         sync_tasks
             .cancel_sync_for_pids(&["doomed-a", "doomed-b", "doomed-c"], &NoLog)
             .await;
@@ -12835,7 +12842,8 @@ mod linked_fleet_offer_tests {
         fleet_arm_allowed, fleet_arm_skips_pair_link, fleet_standing_after_rotation,
         linked_fleet_offer_action as decide, refuse_forgotten_dial, LinkedFleetOffer,
     };
-    use std::time::{Duration, Instant};
+    use filament_transport::clock::Instant;
+use std::time::Duration;
 
     const FLEET: &str = "chan-fleet";
     const LOW: &str = "sid-aaa";

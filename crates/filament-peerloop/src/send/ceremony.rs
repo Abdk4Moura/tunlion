@@ -33,7 +33,7 @@
 
 use filament_pair::PakeState;
 use serde_json::{json, Value};
-use std::time::Instant;
+use filament_transport::clock::Instant;
 
 use crate::retry::Resend;
 
@@ -1156,7 +1156,7 @@ mod tests {
         fate: impl Fn(char, &str, usize) -> Fate,
         bound: std::time::Duration,
     ) -> (std::time::Duration, Vec<Value>, Vec<Value>) {
-        let started = std::time::Instant::now();
+        let started = filament_transport::clock::Instant::now();
         let mut wire: (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
         let mut counts = std::collections::HashMap::<(char, String), usize>::new();
         let mut queue: std::collections::VecDeque<(char, Value)> = Default::default();

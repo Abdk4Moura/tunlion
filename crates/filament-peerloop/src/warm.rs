@@ -16,7 +16,8 @@
 //! decision in one tested place is how it stays fixed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 
 /// WARM-HOLD state: keeps connections alive to recently-used and explicitly
 /// configured peers so `tunlion reach`/`ssh` is instant.

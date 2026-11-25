@@ -19,6 +19,7 @@
 //! reliability rests on, and a half-verified transport is worse than a coupled
 //! one.
 
+pub mod clock;
 pub mod direct;
 pub mod control_limits;
 mod context;

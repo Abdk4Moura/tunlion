@@ -13,7 +13,8 @@
 //! [`HostServices::revoke_recheck_interval`], so the CLI's env knob and its
 //! revocation store stay the single source.
 
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 
 use crate::host::{HostServices, LiveCut};
 

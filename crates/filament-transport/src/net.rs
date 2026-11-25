@@ -745,14 +745,7 @@ const READ_BUF: usize = 1 << 20;
 /// it lets `maybe_adopt`/`on_peer_left` tell an actively-transferring link from
 /// a frozen-alive one (gate 11's SIGSTOP'd receiver vs #28's live reconnect).
 /// Monotonic on purpose, an NTP wall-clock step must not flip a recency check.
-fn now_ms() -> u64 {
-    use std::sync::OnceLock;
-    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-    EPOCH
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis() as u64
-}
+use crate::clock::now_ms;
 
 /// Sid reserved for L3 IP packets on a relay/DataChannel link.
 ///
@@ -924,7 +917,7 @@ impl Transport for DataChannelTransport {
 
     async fn send_frame(&self, sid: u32, offset: u64, payload: &[u8]) -> Result<()> {
         let trace = cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
-        let t_frame = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_frame = if trace { Some(crate::clock::Instant::now()) } else { None };
         let mut framed = Vec::with_capacity(4 + 8 + payload.len());
         framed.extend_from_slice(&sid.to_be_bytes());
         framed.extend_from_slice(&offset.to_be_bytes());
@@ -939,7 +932,7 @@ impl Transport for DataChannelTransport {
         // acknowledged byte): a peer that died without closing the association
         // never drains the buffer and never notifies, and an unbounded park
         // here is a sender that never learns its receiver is gone.
-        let t_bp = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_bp = if trace { Some(crate::clock::Instant::now()) } else { None };
         let waited = self.raw.buffered_amount() > HIGH_WATER;
         let _ = &waited; // read only by the trace line below
         if waited {
@@ -961,7 +954,7 @@ impl Transport for DataChannelTransport {
             .await?;
         }
         let bp_us = t_bp.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-        let t_write = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_write = if trace { Some(crate::clock::Instant::now()) } else { None };
         let framed = Bytes::from(framed);
         self.bounded(
             "write",
@@ -3411,7 +3404,7 @@ mod tests {
         };
         held_rx.await.expect("holder took the gate");
 
-        let started = std::time::Instant::now();
+        let started = crate::clock::Instant::now();
         let stalled = write_within(
             &gate,
             std::time::Duration::from_millis(100),
@@ -4098,7 +4091,7 @@ mod negotiation_off_loop_tests {
     async fn a_wedged_negotiation_does_not_park_the_caller() {
         let p = peer(true).await;
         let guard = p.hold.lock().await;
-        let started = std::time::Instant::now();
+        let started = crate::clock::Instant::now();
         assert!(matches!(p.handle_signal(candidate(1)).await, Ok(SignalOutcome::Handled)));
         let first = started.elapsed();
         assert!(
@@ -4107,7 +4100,7 @@ mod negotiation_off_loop_tests {
         );
         // Behind a wedged operation every later caller returns at once: one
         // budget per wedge, not one per signal.
-        let started = std::time::Instant::now();
+        let started = crate::clock::Instant::now();
         for n in 2..=20 {
             p.handle_signal(candidate(n)).await.expect("queued");
         }

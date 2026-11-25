@@ -15,6 +15,9 @@ description = "Minimal Engine.IO v4 / Socket.IO v5 websocket client for tunlion'
 [lib]
 name = "filament_signal"
 
+[features]
+sim = []
+
 [dependencies]
 anyhow = "1.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

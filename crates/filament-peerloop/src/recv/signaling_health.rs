@@ -28,7 +28,8 @@
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 
 /// A connection that stayed up this long has earned a fresh backoff ladder.
 /// Anything shorter counts as part of the same outage, so a link that drops

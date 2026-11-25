@@ -25,7 +25,8 @@
 //! Pure over its inputs (time is passed in), so the loss cases are tested
 //! without a network.
 
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 
 use serde_json::Value;
 

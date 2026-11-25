@@ -42,6 +42,7 @@ name = "filament_transport"
 # taken with the faults never injected.
 test-hooks = []
 debug-logs = []
+sim = ["filament-signal/sim"]
 # Fully static builds (musl): compile OpenSSL from source instead of linking the
 # system one. (Historic: rust_socketio hard-depended on native-tls; a rustls-only
 # tree is not possible without forking it upstream (ledger C16).
