@@ -55,11 +55,21 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 
-DEVICES = ["alpha", "bravo", "charlie"]          # index i -> subnet 10.89.(i+1).0/24
+DEVICES = ["alpha", "bravo", "charlie"]          # index i -> subnet 10.<net>.(i+1).0/24
 OWNER = "alpha"
 DELEGATES = ["bravo", "charlie"]
-PORT = 8155
-SUBNET = "10.89.0.0/16"
+
+# Several independent WORLDS run on one machine at once (the daemons are idle
+# most of a run, so one world leaves the machine mostly idle). Everything
+# global to a world is derived from its slot k: namespaces chz<k>_<dev>,
+# veths chz<k>r<i>/chz<k>n<i>, subnet 10.(90+k).0.0/16, backend port
+# 8155+k, iptables chains CHZ<k>/CHZ<k>_IN/CHZ<k>_OUT, the slot lock
+# /run/tunlion-chaos.slot<k>.lock and the work dir /tmp/chz.w<k>.*. A world
+# only ever reaps and tears down its own slot. 10.89 is skipped: the
+# single-world version used it, and a crashed old campaign may have left
+# rules for it.
+BASE_PORT = 8155
+MAX_SLOTS = 16
 
 # The CLI's own documented exit codes (cli/src/cli_def.rs, EXIT CODES). A code
 # outside this set, a panic (101) or death by a signal we did not send is a
@@ -74,11 +84,20 @@ OP_DEADLINE = {"exec": 75.0, "send": 90.0, "reach": 75.0, "status": 15.0, "docto
 SETTLE_SIGNALING = 90.0     # after heal: every daemon must report signaling connected
 STORM_WINDOW = 30.0         # quiet window in which reconnects are counted
 STORM_MAX_CONNECTS = 8      # per device per window; the 2026 storm made ~75
-LOOP_STALL_GRACE = 150.0
-STALE_LINK_AFTER = 90.0     # O10: a peer silent this long should not still look warm    # a logged stall must be followed by recovery or exit
+# The quiet window ends early when, STORM_QUIET_EXIT seconds in, no device has
+# opened a single server connection. To be missed, a storm must stay silent
+# for those first seconds and then fit 9+ connects into the rest: any storm
+# steady enough to make 9 connects in 30 s (a gap under 3.4 s) shows up in
+# the first 10 s. A device that connects at all gets the full 30 s window and
+# the unchanged threshold. And a window already over the threshold is a
+# finding at once (the counters only grow).
+STORM_QUIET_EXIT = 10.0
+LOOP_STALL_GRACE = 150.0    # a logged stall must be followed by recovery or exit
+STALE_LINK_AFTER = 90.0     # O10: a peer silent this long should not still look warm
 
 # CHAOS: device to device (FORWARD). CHAOS_IN: device to the backend (INPUT).
 # CHAOS_OUT: the backend's replies to a device (OUTPUT), needed to isolate it.
+# These are ROLE names; World.chain() maps a role to the world's own chain.
 CHAINS = [("CHAOS", "FORWARD"), ("CHAOS_IN", "INPUT"), ("CHAOS_OUT", "OUTPUT")]
 
 FAULTS = ["net.impair", "net.partition", "net.isolate", "sig.blackhole", "sig.reset",
@@ -107,8 +126,29 @@ RECOVERABLE_HOOKS = {
 RUNTIME_FILES = shutil.ignore_patterns("*.sock", "up.pid", "up.exe", "up.ready", "up.inbox", "up.lock", "*.lock")
 
 
+_ctx = threading.local()
+_print_lock = threading.Lock()
+
+
 def log(msg: str) -> None:
-    print(f"[chaos {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    w = getattr(_ctx, "world", None)
+    tag = f" w{w}" if w is not None else ""
+    with _print_lock:
+        print(f"[chaos {time.strftime('%H:%M:%S')}{tag}] {msg}", flush=True)
+
+
+class Aborted(Exception):
+    """Another world stopped the campaign (canary failed, harness error)."""
+
+
+# iptables from several worlds at once: -w waits for the xtables lock, and
+# one in-process lock keeps nft transactions from racing each other.
+_ipt_lock = threading.Lock()
+
+
+def ipt(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    with _ipt_lock:
+        return sh(["iptables", "-w", "10", *args], check=check, timeout=60)
 
 
 class Refused(Exception):
@@ -124,18 +164,6 @@ def sh(cmd: list[str], check: bool = True, timeout: float = 30.0) -> subprocess.
 
 def dev_index(name: str) -> int:
     return DEVICES.index(name) + 1
-
-
-def dev_ip(name: str) -> str:
-    return f"10.89.{dev_index(name)}.1"
-
-
-def gw_ip(name: str) -> str:
-    return f"10.89.{dev_index(name)}.254"
-
-
-def ns(name: str) -> str:
-    return f"chz_{name}"
 
 
 # ----------------------------------------------------------------- schedule --
@@ -277,10 +305,16 @@ def kinds_of(text: str) -> set[str]:
 class World:
     """The fixture: namespaces, firewall chains, backend, three daemons."""
 
-    def __init__(self, binary: Path, work: Path, py: str):
+    def __init__(self, binary: Path, work: Path, py: str, slot: int = 0, lock=None):
         self.bin = binary
         self.work = work
         self.py = py
+        self.k = slot
+        self._lock = lock            # the slot lock, held for the world's life
+        self.port = BASE_PORT + slot
+        self.net = 90 + slot
+        self.subnet = f"10.{self.net}.0.0/16"
+        self.stop: threading.Event = threading.Event()
         self.uid, self.gid = self._pick_user()
         self.backend: subprocess.Popen | None = None
         self.daemons: dict[str, subprocess.Popen | None] = {d: None for d in DEVICES}
@@ -307,17 +341,35 @@ class World:
                 h.update(chunk)
         return h.hexdigest()
 
+    # -- names of this world's slot ----------------------------------------
+    def dev_ip(self, d: str) -> str:
+        return f"10.{self.net}.{dev_index(d)}.1"
+
+    def gw_ip(self, d: str) -> str:
+        return f"10.{self.net}.{dev_index(d)}.254"
+
+    def ns(self, d: str) -> str:
+        return f"chz{self.k}_{d}"
+
+    def veth_root(self, d: str) -> str:
+        return f"chz{self.k}r{dev_index(d)}"
+
+    def veth_dev(self, d: str) -> str:
+        return f"chz{self.k}n{dev_index(d)}"
+
+    def chain(self, role: str) -> str:
+        return {"CHAOS": f"CHZ{self.k}", "CHAOS_IN": f"CHZ{self.k}_IN", "CHAOS_OUT": f"CHZ{self.k}_OUT"}[role]
+
     def preconditions(self) -> None:
         if os.geteuid() != 0:
             raise Refused("must run as root (network namespaces, tc, iptables)")
-        # One campaign per machine: two would share namespace names, firewall
-        # chains and the backend port, and each would reap the other's daemons.
-        import fcntl
-        self._lock = open("/run/tunlion-chaos.lock", "w")
-        try:
-            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise Refused("another chaos campaign is running on this machine (/run/tunlion-chaos.lock)")
+        if self._lock is None:
+            raise Refused("world started without its slot lock")
+        # The world's /16 must not be in use on this machine.
+        r = sh(["ip", "-4", "-o", "addr", "show"], check=False)
+        for ln in r.stdout.splitlines():
+            if f" 10.{self.net}." in ln and "chz" not in ln:
+                raise Refused(f"10.{self.net}.0.0/16 already in use here: {ln.strip()[:120]}")
         for tool in ["ip", "iptables", "tc", "setpriv", "ss"]:
             if not shutil.which(tool):
                 raise Refused(f"missing tool: {tool}")
@@ -339,11 +391,18 @@ class World:
 
     # -- network ------------------------------------------------------------
     def reap_stale(self) -> None:
-        """Kill what a previous campaign left behind: daemons running from an
-        older /tmp/chz.* work dir and anything on our port (a stale backend
-        would answer health checks with another campaign's state)."""
+        """Kill what a previous campaign left behind IN THIS SLOT (we hold its
+        lock, so whatever uses it is dead weight): processes inside the
+        slot's namespaces, processes naming an older /tmp/chz.w<k>.* work dir
+        or this slot's server URL, and anything on the slot's port (a stale
+        backend would answer health checks with another campaign's state).
+        Other slots are never touched: another campaign may own them."""
         mine = str(self.work)
         victims = set()
+        for d in DEVICES:
+            r = sh(["ip", "netns", "pids", self.ns(d)], check=False)
+            victims |= {int(x) for x in r.stdout.split() if x.isdigit()}
+        marks = [f"/tmp/chz.w{self.k}.", f"http://10.{self.net}."]
         for p in Path("/proc").iterdir():
             if not p.name.isdigit() or int(p.name) == os.getpid():
                 continue
@@ -351,9 +410,10 @@ class World:
                 cmd = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
             except OSError:
                 continue
-            if "/tmp/chz." in cmd and mine not in cmd and "chaos.py" not in cmd:
+            if any(m in cmd for m in marks) and mine not in cmd and "chaos.py" not in cmd:
                 victims.add(int(p.name))
-        r = sh(["ss", "-ltnpH", f"sport = :{PORT}"], check=False)
+        victims.discard(os.getpid())
+        r = sh(["ss", "-ltnpH", f"sport = :{self.port}"], check=False)
         victims |= {int(x) for x in re.findall(r"pid=(\d+)", r.stdout)}
         for pid in victims:
             try:
@@ -369,54 +429,63 @@ class World:
         self.net_down()
         sh(["sysctl", "-qw", "net.ipv4.ip_forward=1"])
         for d in DEVICES:
-            i = dev_index(d)
-            sh(["ip", "netns", "add", ns(d)])
-            sh(["ip", "-n", ns(d), "link", "set", "lo", "up"])
-            sh(["ip", "link", "add", f"chzr{i}", "type", "veth", "peer", "name", f"chzn{i}"])
-            sh(["ip", "link", "set", f"chzn{i}", "netns", ns(d)])
-            sh(["ip", "addr", "add", f"{gw_ip(d)}/24", "dev", f"chzr{i}"])
-            sh(["ip", "link", "set", f"chzr{i}", "up"])
-            sh(["ip", "-n", ns(d), "addr", "add", f"{dev_ip(d)}/24", "dev", f"chzn{i}"])
-            sh(["ip", "-n", ns(d), "link", "set", f"chzn{i}", "up"])
-            sh(["ip", "-n", ns(d), "route", "add", "default", "via", gw_ip(d)])
+            n, r, v = self.ns(d), self.veth_root(d), self.veth_dev(d)
+            sh(["ip", "netns", "add", n])
+            sh(["ip", "-n", n, "link", "set", "lo", "up"])
+            sh(["ip", "link", "add", r, "type", "veth", "peer", "name", v])
+            sh(["ip", "link", "set", v, "netns", n])
+            sh(["ip", "addr", "add", f"{self.gw_ip(d)}/24", "dev", r])
+            sh(["ip", "link", "set", r, "up"])
+            sh(["ip", "-n", n, "addr", "add", f"{self.dev_ip(d)}/24", "dev", v])
+            sh(["ip", "-n", n, "link", "set", v, "up"])
+            sh(["ip", "-n", n, "route", "add", "default", "via", self.gw_ip(d)])
         # CHAOS: device-to-device forwarding (partitions go first, then accept;
         # runners with docker default FORWARD to DROP). CHAOS_IN: device to
         # backend; a counting rule per device (SYNs = connection attempts,
         # measured OUTSIDE the daemon) precedes the fault rules.
-        for chain, hook in CHAINS:
-            sh(["iptables", "-N", chain])
-            sh(["iptables", "-I", hook, "1", "-j", chain])
-        sh(["iptables", "-A", "CHAOS", "-s", SUBNET, "-d", SUBNET, "-j", "ACCEPT"])
+        for role, hook in CHAINS:
+            ipt(["-N", self.chain(role)])
+            ipt(["-I", hook, "1", "-j", self.chain(role)])
+        ipt(["-A", self.chain("CHAOS"), "-s", self.subnet, "-d", self.subnet, "-j", "ACCEPT"])
         for d in DEVICES:
-            sh(["iptables", "-A", "CHAOS_IN", "-s", dev_ip(d), "-p", "tcp", "--dport", str(PORT),
-                "--syn", "-m", "comment", "--comment", f"syn-{d}"])
+            ipt(["-A", self.chain("CHAOS_IN"), "-s", self.dev_ip(d), "-p", "tcp", "--dport", str(self.port),
+                 "--syn", "-m", "comment", "--comment", f"syn-{d}"])
         # Prove netem exists before any schedule relies on it.
-        r = sh(["tc", "qdisc", "add", "dev", "chzr1", "root", "netem", "delay", "1ms"], check=False)
+        probe = self.veth_root(DEVICES[0])
+        r = sh(["tc", "qdisc", "add", "dev", probe, "root", "netem", "delay", "1ms"], check=False)
         self.can_netem = r.returncode == 0
         if self.can_netem:
-            sh(["tc", "qdisc", "del", "dev", "chzr1", "root"], check=False)
+            sh(["tc", "qdisc", "del", "dev", probe, "root"], check=False)
         else:
             log(f"netem unavailable ({r.stderr.strip()[:120]}); net.impair is DISABLED for this run")
 
     def net_down(self) -> None:
-        for chain, hook in CHAINS:
-            sh(["iptables", "-D", hook, "-j", chain], check=False)
-            sh(["iptables", "-F", chain], check=False)
-            sh(["iptables", "-X", chain], check=False)
+        for role, hook in CHAINS:
+            c = self.chain(role)
+            while ipt(["-D", hook, "-j", c], check=False).returncode == 0:
+                pass
+            ipt(["-F", c], check=False)
+            ipt(["-X", c], check=False)
         for d in DEVICES:
-            sh(["ip", "netns", "del", ns(d)], check=False)
-            sh(["ip", "link", "del", f"chzr{dev_index(d)}"], check=False)
+            sh(["ip", "netns", "del", self.ns(d)], check=False)
+            sh(["ip", "link", "del", self.veth_root(d)], check=False)
 
-    def syn_count(self, d: str) -> int:
-        out = sh(["iptables", "-nvxL", "CHAOS_IN"]).stdout
-        for ln in out.splitlines():
-            if f"syn-{d} " in ln + " ":
-                return int(ln.split()[0])
-        raise RuntimeError(f"counting rule for {d} missing")
+    def syn_counts(self) -> dict[str, int]:
+        """Every device's SYN counter, from one listing."""
+        out = ipt(["-nvxL", self.chain("CHAOS_IN")]).stdout
+        got = {}
+        for d in DEVICES:
+            for ln in out.splitlines():
+                if f"syn-{d} " in ln + " ":
+                    got[d] = int(ln.split()[0])
+                    break
+            else:
+                raise RuntimeError(f"counting rule for {d} missing")
+        return got
 
     # -- backend ------------------------------------------------------------
     def backend_start(self) -> None:
-        env = dict(os.environ, PORT=str(PORT), FIL_ASYNC_MODE="eventlet", FIL_SELF_MONKEYPATCH="1",
+        env = dict(os.environ, PORT=str(self.port), FIL_ASYNC_MODE="eventlet", FIL_SELF_MONKEYPATCH="1",
                    FIL_CLAIM_LIMIT="1000000", FIL_PING_TIMEOUT="120", FIL_PING_INTERVAL="25")
         f = open(self.work / "backend.log", "ab")
         self.backend = subprocess.Popen([self.py, "app.py"], cwd=REPO / "backend", env=env,
@@ -429,7 +498,7 @@ class World:
 
     def backend_healthy(self) -> bool:
         try:
-            with socket.create_connection(("127.0.0.1", PORT), timeout=1) as s:
+            with socket.create_connection(("127.0.0.1", self.port), timeout=1) as s:
                 s.sendall(b"GET /api/health HTTP/1.0\r\nHost: x\r\n\r\n")
                 return b" 200 " in s.recv(200)
         except OSError:
@@ -450,7 +519,7 @@ class World:
         return self.work / "dev" / d
 
     def server(self, d: str) -> str:
-        return f"http://{gw_ip(d)}:{PORT}"
+        return f"http://{self.gw_ip(d)}:{self.port}"
 
     def env_for(self, d: str, extra: dict | None = None) -> dict:
         c = self.cfg(d)
@@ -462,7 +531,7 @@ class World:
         return env
 
     def as_dev(self, d: str, args: list[str]) -> list[str]:
-        return ["ip", "netns", "exec", ns(d), "setpriv", f"--reuid={self.uid}", f"--regid={self.gid}",
+        return ["ip", "netns", "exec", self.ns(d), "setpriv", f"--reuid={self.uid}", f"--regid={self.gid}",
                 "--clear-groups", "--", str(self.bin), "--server", self.server(d)] + args
 
     def cli(self, d: str, args: list[str], timeout: float) -> tuple[int | None, str, str, float]:
@@ -608,7 +677,7 @@ class Applied:
 
 
 def _ipt_counter(chain: str, comment: str) -> int:
-    out = sh(["iptables", "-nvxL", chain]).stdout
+    out = ipt(["-nvxL", chain]).stdout
     total = 0
     found = False
     for ln in out.splitlines():
@@ -621,6 +690,7 @@ def _ipt_counter(chain: str, comment: str) -> int:
 def apply_fault(w: World, st: dict, uid: str) -> Applied | None:
     k = st["fault"]
     tag = f"chz-{uid}"
+    C, C_IN, C_OUT = w.chain("CHAOS"), w.chain("CHAOS_IN"), w.chain("CHAOS_OUT")
     if k == "net.impair":
         if not w.can_netem:
             return None
@@ -636,8 +706,7 @@ def apply_fault(w: World, st: dict, uid: str) -> Applied | None:
             spec += ["reorder", f"{a['reorder']}%"]
         if not spec:
             spec = ["loss", "10%"]
-        i = dev_index(st["target"])
-        devs = [(None, f"chzr{i}"), (ns(st["target"]), f"chzn{i}")]
+        devs = [(None, w.veth_root(st["target"])), (w.ns(st["target"]), w.veth_dev(st["target"]))]
 
         def tc(n, *args):
             return sh((["ip", "netns", "exec", n] if n else []) + ["tc", *args], check=False)
@@ -660,53 +729,53 @@ def apply_fault(w: World, st: dict, uid: str) -> Applied | None:
     if k == "net.partition":
         a, b = st["a"], st["b"]
         proto = [] if st.get("proto") == "all" else ["-p", "udp"]
-        rules = [["-s", dev_ip(a), "-d", dev_ip(b)] + proto, ["-s", dev_ip(b), "-d", dev_ip(a)] + proto]
+        rules = [["-s", w.dev_ip(a), "-d", w.dev_ip(b)] + proto, ["-s", w.dev_ip(b), "-d", w.dev_ip(a)] + proto]
         for r in rules:
-            sh(["iptables", "-I", "CHAOS", "1", *r, "-m", "comment", "--comment", tag, "-j", "DROP"])
+            ipt(["-I", C, "1", *r, "-m", "comment", "--comment", tag, "-j", "DROP"])
 
         def heal():
             for r in rules:
-                sh(["iptables", "-D", "CHAOS", *r, "-m", "comment", "--comment", tag, "-j", "DROP"], check=False)
-        return Applied(st, heal, lambda: _ipt_counter("CHAOS", tag) >= 0,
-                       lambda: _ipt_counter("CHAOS", tag) > 0)
+                ipt(["-D", C, *r, "-m", "comment", "--comment", tag, "-j", "DROP"], check=False)
+        return Applied(st, heal, lambda: _ipt_counter(C, tag) >= 0,
+                       lambda: _ipt_counter(C, tag) > 0)
 
     if k == "net.isolate":
         # The machine drops off every network at once (lid closed, Wi-Fi
         # gone): nothing in or out, to peers or to the server, no close sent.
-        ip = dev_ip(st["target"])
-        rules = [("CHAOS", ["-s", ip]), ("CHAOS", ["-d", ip]), ("CHAOS_IN", ["-s", ip]), ("CHAOS_OUT", ["-d", ip])]
+        ip = w.dev_ip(st["target"])
+        rules = [(C, ["-s", ip]), (C, ["-d", ip]), (C_IN, ["-s", ip]), (C_OUT, ["-d", ip])]
         for chain, r in rules:
-            sh(["iptables", "-I", chain, "1", *r, "-m", "comment", "--comment", tag, "-j", "DROP"])
+            ipt(["-I", chain, "1", *r, "-m", "comment", "--comment", tag, "-j", "DROP"])
 
         def heal():
             for chain, r in rules:
-                sh(["iptables", "-D", chain, *r, "-m", "comment", "--comment", tag, "-j", "DROP"], check=False)
+                ipt(["-D", chain, *r, "-m", "comment", "--comment", tag, "-j", "DROP"], check=False)
 
         def present():
-            return all(_ipt_counter(c, tag) >= 0 for c in ("CHAOS", "CHAOS_IN", "CHAOS_OUT"))
+            return all(_ipt_counter(c, tag) >= 0 for c in (C, C_IN, C_OUT))
         return Applied(st, heal, present,
-                       lambda: sum(max(0, _ipt_counter(c, tag)) for c in ("CHAOS", "CHAOS_IN", "CHAOS_OUT")) > 0)
+                       lambda: sum(max(0, _ipt_counter(c, tag)) for c in (C, C_IN, C_OUT)) > 0)
 
     if k in ("sig.blackhole", "sig.reset"):
         d = st["target"]
         target = ["-j", "DROP"] if k == "sig.blackhole" else ["-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset"]
-        rule = ["-s", dev_ip(d), "-p", "tcp", "--dport", str(PORT), "-m", "comment", "--comment", tag]
+        rule = ["-s", w.dev_ip(d), "-p", "tcp", "--dport", str(w.port), "-m", "comment", "--comment", tag]
         full = rule + (target[2:] if k == "sig.reset" else target)
         # Insert after the counting rules (1..3), so attempts are still counted.
-        sh(["iptables", "-I", "CHAOS_IN", str(len(DEVICES) + 1), *full])
+        ipt(["-I", C_IN, str(len(DEVICES) + 1), *full])
         killed = 0
         if k == "sig.reset":
             # A rule only bites when a packet crosses it, and an idle signaling
             # socket can be silent for a whole ping interval (25 s). Abort the
             # live connections from the server side too (tcp_abort sends RST),
             # so the reset happens now and is provable.
-            r = sh(["ss", "-K", "-tn", "dst", dev_ip(d), "sport", "=", f":{PORT}"], check=False)
-            killed = max(0, len([ln for ln in r.stdout.splitlines() if "ESTAB" in ln or dev_ip(d) in ln]))
+            r = sh(["ss", "-K", "-tn", "dst", w.dev_ip(d), "sport", "=", f":{w.port}"], check=False)
+            killed = max(0, len([ln for ln in r.stdout.splitlines() if "ESTAB" in ln or w.dev_ip(d) in ln]))
 
         def heal():
-            sh(["iptables", "-D", "CHAOS_IN", *full], check=False)
-        return Applied(st, heal, lambda: _ipt_counter("CHAOS_IN", tag) >= 0,
-                       lambda: killed > 0 or _ipt_counter("CHAOS_IN", tag) > 0)
+            ipt(["-D", C_IN, *full], check=False)
+        return Applied(st, heal, lambda: _ipt_counter(C_IN, tag) >= 0,
+                       lambda: killed > 0 or _ipt_counter(C_IN, tag) > 0)
 
     if k == "proc.freeze":
         d = st["target"]
@@ -895,6 +964,7 @@ def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
 def run_schedule(w: World, sched: dict, label: str) -> dict:
     """Execute one schedule end to end. Returns the verdict (never raises for
     product misbehaviour; raises Refused for fixture problems)."""
+    t_wall = time.monotonic()
     w.assert_binary_unchanged()
     w.reset_for_run(sched.get("hooks", {}))
     verdict: dict = {"label": label, "schedule": sched, "findings": [], "ops": [], "faults": []}
@@ -958,6 +1028,8 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
                 log(f"  t={now:5.1f} heal  {ap.step['fault']} present={present} bit={bit}")
                 if not present:
                     raise Refused(f"instrument: fault mechanism absent at heal time: {ap.step}")
+        if w.stop.is_set():
+            raise Aborted()
         time.sleep(0.2)
     for th in threads:
         th.join(max(OP_DEADLINE.values()) + 30)
@@ -1006,10 +1078,8 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
         verdict["findings"].extend(judge_op(r))
     # Quiet window, started AFTER the checks above so the CLI's own server
     # connections are not counted: only the daemons talk to the server now.
-    syn0 = {d: w.syn_count(d) for d in DEVICES}
-    time.sleep(STORM_WINDOW)
-    for d in DEVICES:
-        c = w.syn_count(d) - syn0[d]
+    verdict["storm"] = storm_window(w)
+    for d, c in verdict["storm"]["syns"].items():
         if c > STORM_MAX_CONNECTS:
             verdict["findings"].append({"oracle": "O5-reconnect-storm", "hard": True,
                                         "what": f"{d} opened {c} server connections in the post-heal window"})
@@ -1026,6 +1096,7 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
     verdict["kinds"] = sorted(set().union(*(kinds_of(t) for t in logs.values())))
     verdict["hard"] = [f for f in verdict["findings"] if f["hard"]]
     verdict["elapsed_s"] = round(time.monotonic() - t0, 1)
+    verdict["wall_s"] = round(time.monotonic() - t_wall, 1)
     if verdict["hard"]:
         # Confirm and minimize replay the schedule and overwrite the daemon
         # logs. Keep the logs of THIS run, the one that failed.
@@ -1039,6 +1110,34 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
     return verdict
 
 
+def storm_window(w: World, window: float = STORM_WINDOW, quiet_exit: float = STORM_QUIET_EXIT,
+                 poll: float = 1.0, clock=time.monotonic, sleep=time.sleep, counts=None) -> dict:
+    """Count each device's server connection attempts for up to `window`
+    seconds. Ends early on a device over STORM_MAX_CONNECTS (counters only
+    grow: the full window could not clear it) or, after `quiet_exit`
+    seconds, when NO device has made a single attempt (see STORM_QUIET_EXIT
+    for what that can miss). Returns the counts and the time it watched."""
+    counts = counts or w.syn_counts
+    base = counts()
+    t0 = clock()
+    c = {d: 0 for d in base}
+    while True:
+        sleep(poll)
+        el = clock() - t0
+        now = counts()
+        c = {d: now[d] - base[d] for d in base}
+        if any(v > STORM_MAX_CONNECTS for v in c.values()):
+            why = "over"
+            break
+        if el >= window:
+            why = "full"
+            break
+        if el >= quiet_exit and not any(c.values()):
+            why = "quiet"
+            break
+    return {"syns": c, "watched_s": round(clock() - t0, 1), "ended": why}
+
+
 def record_run(w: "World", verdict: dict) -> None:
     """Every run leaves a record, clean or not: what was applied, whether it
     bit, every operation's exit code and latency, which rules fired. A clean
@@ -1047,12 +1146,15 @@ def record_run(w: "World", verdict: dict) -> None:
         return
     runs = w.out / "runs"
     runs.mkdir(parents=True, exist_ok=True)
-    n = len(list(runs.glob("*.json")))
+    with _out_lock:
+        _run_seq[0] += 1
+        n = _run_seq[0] - 1
     rec = {k: verdict.get(k) for k in ("label", "schedule", "faults", "fault_windows", "ops", "findings", "elapsed_s",
-                                       "unreported_signaling")}
+                                       "unreported_signaling", "storm", "wall_s")}
+    rec["world"] = w.k
     rec["kinds_count"] = len(verdict.get("kinds", []))
     safe = re.sub(r"[^\w.-]", "_", re.sub(r"\.json$", "", verdict["label"]))[:60]
-    (runs / f"{n:04d}-{safe}.json").write_text(json.dumps(rec, indent=1, sort_keys=True))
+    (runs / f"{n:04d}-w{w.k}-{safe}.json").write_text(json.dumps(rec, indent=1, sort_keys=True))
 
 
 def sig_state(w: World, d: str) -> tuple[str, object]:
@@ -1131,12 +1233,21 @@ def wait_signaling(w: World, devs: list[str], limit: float, allow_unreported: bo
         time.sleep(1)
 
 
+_out_lock = threading.Lock()
+_run_seq = [0]
+
+
 def finding_key(f: dict) -> str:
     """One bug, one report: oracle plus the device and op words, no numbers."""
     return f["oracle"] + "|" + re.sub(r"[\d.]+", "N", f["what"])[:80]
 
 
 def save_finding(out: Path, verdict: dict, w: World, repro: str) -> Path:
+    with _out_lock:
+        return _save_finding(out, verdict, w, repro)
+
+
+def _save_finding(out: Path, verdict: dict, w: World, repro: str) -> Path:
     key = hashlib.sha1("\n".join(sorted(finding_key(f) for f in verdict["hard"])).encode()).hexdigest()[:10]
     d = out / "findings" / key
     d.mkdir(parents=True, exist_ok=True)
@@ -1189,6 +1300,39 @@ CANARY_SCHEDULE = {"version": 1, "seed": 0, "hooks": {},
                    "steps": [{"at": 2.0, "fault": "sig.reset", "target": "bravo", "dur": 10.0}]}
 
 
+def run_worlds(worlds: list[World], job, first=None) -> None:
+    """Run job(w) in one thread per world. `first`, if given, runs on world 0
+    before its job (the canary: once per machine, while the other worlds
+    already work; a failed canary stops them and voids the campaign). The
+    first exception in any world stops every world and is re-raised here."""
+    errors: list[tuple[int, BaseException, str]] = []
+
+    def body(w: World) -> None:
+        _ctx.world = w.k
+        try:
+            if first is not None and w is worlds[0]:
+                first(w)
+            if not w.stop.is_set():
+                job(w)
+        except Aborted:
+            pass
+        except BaseException as e:
+            import traceback
+            errors.append((w.k, e, traceback.format_exc()))
+            for x in worlds:
+                x.stop.set()
+    threads = [threading.Thread(target=body, args=(w,), name=f"world{w.k}", daemon=True) for w in worlds]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        k, e, tb = errors[0]
+        if not isinstance(e, Refused):
+            log(f"world {k} crashed:\n{tb}")
+        raise e
+
+
 def cmd_canary(w: World, out: Path) -> int:
     """Arm A (healthy): must produce no hard finding. Arm B (self-heal
     disabled with TUNLION_TEST_NO_SIGNALING_RECONNECT on bravo): must produce
@@ -1198,7 +1342,7 @@ def cmd_canary(w: World, out: Path) -> int:
     sb["hooks"] = {"bravo": {"TUNLION_TEST_NO_SIGNALING_RECONNECT": "1"}}
     b = run_schedule(w, sb, "canary-broken")
     (out / "canary.json").write_text(json.dumps(
-        {arm: {k: v[k] for k in ("findings", "ops", "faults")} for arm, v in (("healthy", a), ("broken", b))},
+        {arm: {k: v[k] for k in ("findings", "ops", "faults", "storm")} for arm, v in (("healthy", a), ("broken", b))},
         indent=2))
     caught = any(f["oracle"].startswith("O1") and "bravo" in f["what"] for f in b["hard"])
     bit = all(x.get("bit") for x in b["faults"])
@@ -1224,110 +1368,144 @@ def cmd_canary(w: World, out: Path) -> int:
     return 0
 
 
-def cmd_replay(w: World, out: Path, files: list[Path], repeat: int = 1) -> int:
-    """Run each schedule `repeat` times. With repeat 1 a failure is confirmed
-    once more; with repeat > 1 the failure RATE is the result (an
-    intermittent bug and its fix are both measured as rates), and every
-    failing repetition keeps its own evidence."""
-    hard = 0
-    rates = {}
-    for f in files:
-        sched = json.loads(f.read_text())
-        fails = 0
-        for i in range(repeat):
+def cmd_replay(worlds: list[World], out: Path, files: list[Path], repeat: int = 1, first=None) -> int:
+    """Run each schedule `repeat` times, spread over the worlds. With repeat
+    1 a failure is confirmed once more (on the same world); with repeat > 1
+    the failure RATE is the result (an intermittent bug and its fix are both
+    measured as rates), and every failing repetition keeps its own evidence."""
+    lock = threading.Lock()
+    scheds = {f: json.loads(f.read_text()) for f in files}
+    items = [(f, i) for f in files for i in range(repeat)]
+    fails = {f.name: 0 for f in files}
+
+    def job(w: World) -> None:
+        while not w.stop.is_set():
+            with lock:
+                if not items:
+                    return
+                f, i = items.pop(0)
+            sched = scheds[f]
             log(f"replay {f.name}" + (f" ({i + 1}/{repeat})" if repeat > 1 else ""))
             v = run_schedule(w, sched, f.stem + (f"-r{i + 1}" if repeat > 1 else ""))
             if not v["hard"]:
-                log("  clean")
+                log(f"  clean ({f.name})")
                 continue
-            fails += 1
+            with lock:
+                fails[f.name] += 1
             repro = confirm(w, sched, v, tries=1) if repeat == 1 else f"repetition {i + 1}/{repeat}"
             d = save_finding(out, v, w, repro)
-            log(f"  FINDING ({repro}) -> {d}: {[x['what'][:200] for x in v['hard']]}")
-        rates[f.name] = f"{fails}/{repeat}"
-        if repeat > 1:
-            log(f"  {f.name}: failed {fails} of {repeat}")
-        hard += 1 if fails else 0
+            log(f"  FINDING {f.name} ({repro}) -> {d}: {[x['what'][:200] for x in v['hard']]}")
+    run_worlds(worlds, job, first)
+    rates = {name: f"{n}/{repeat}" for name, n in fails.items()}
+    if repeat > 1:
+        for name, r in rates.items():
+            log(f"  {name}: failed {r}")
     (out / "replay-rates.json").write_text(json.dumps(rates, indent=2))
-    return 1 if hard else 0
+    return 1 if any(fails.values()) else 0
 
 
-def cmd_explore(w: World, out: Path, budget_s: float, seed: int, corpus: list[Path]) -> int:
-    rng = random.Random(seed)
+def cmd_explore(worlds: list[World], out: Path, budget_s: float, seed: int, corpus: list[Path], first=None) -> int:
+    """Every world mutates from ONE shared queue and feeds ONE shared set of
+    seen behaviours, so a schedule kept by one world is mutated by all."""
+    lock = threading.Lock()
     queue = [json.loads(p.read_text()) for p in corpus]
     seen: set[str] = set()
-    found: dict[str, Path] = {}
-    runs = bites = refusals = 0
+    found: dict[str, Path | None] = {}
+    tally = {"runs": 0, "bites": 0}
+    per_world = {w.k: 0 for w in worlds}
     t_end = time.monotonic() + budget_s
-    while time.monotonic() < t_end:
-        if queue and rng.random() < 0.8:
-            sched = mutate(rng.choice(queue[-16:]), rng)
-        else:
-            sched = random_schedule(rng)
-        if window_end(sched) + 200 > t_end - time.monotonic():
-            break
-        runs += 1
-        try:
-            v = run_schedule(w, sched, f"explore-{runs}")
-            refusals = 0
-        except Refused as e:
-            # A baseline that fails proves nothing about the schedule; skip
-            # it, but three in a row means the fixture itself is broken.
-            if str(e).startswith("instrument"):
-                raise
-            refusals += 1
-            log(f"  run {runs} refused: {e}")
-            if refusals >= 3:
-                raise
-            continue
-        bites += sum(1 for x in v["faults"] if x.get("bit"))
-        new = set(v["kinds"]) - seen
-        if new:
-            seen |= new
-            queue.append(sched)
-            # Saved as it grows: a campaign stopped early keeps what it learned.
-            grown = out / "corpus-grown"
-            grown.mkdir(exist_ok=True)
-            (grown / f"q{len(queue) - 1:03d}.json").write_text(json.dumps(sched, indent=2, sort_keys=True))
-            log(f"  run {runs}: +{len(new)} new behaviours (total {len(seen)}), kept")
-        if v["hard"]:
-            key = "|".join(sorted({finding_key(f) for f in v["hard"]}))
-            if key in found:
+    grown = out / "corpus-grown"
+
+    def job(w: World) -> None:
+        rng = random.Random(seed + 7919 * w.k)
+        refusals = 0
+        while time.monotonic() < t_end and not w.stop.is_set():
+            with lock:
+                parent = rng.choice(queue[-16:]) if queue and rng.random() < 0.8 else None
+            sched = mutate(parent, rng) if parent is not None else random_schedule(rng)
+            if window_end(sched) + 200 > t_end - time.monotonic():
+                return
+            with lock:
+                tally["runs"] += 1
+                n = tally["runs"]
+            per_world[w.k] += 1
+            try:
+                v = run_schedule(w, sched, f"explore-{n}")
+                refusals = 0
+            except Refused as e:
+                # A baseline that fails proves nothing about the schedule; skip
+                # it, but three in a row means the fixture itself is broken.
+                if str(e).startswith("instrument"):
+                    raise
+                refusals += 1
+                log(f"  run {n} refused: {e}")
+                if refusals >= 3:
+                    raise
+                continue
+            key = None
+            with lock:
+                tally["bites"] += sum(1 for x in v["faults"] if x.get("bit"))
+                new = set(v["kinds"]) - seen
+                if new:
+                    seen.update(new)
+                    queue.append(sched)
+                    # Saved as it grows: a campaign stopped early keeps what it learned.
+                    grown.mkdir(exist_ok=True)
+                    (grown / f"q{len(queue) - 1:03d}.json").write_text(json.dumps(sched, indent=2, sort_keys=True))
+                    log(f"  run {n}: +{len(new)} new behaviours (total {len(seen)}), kept")
+                if v["hard"]:
+                    key = "|".join(sorted({finding_key(f) for f in v["hard"]}))
+                    if key in found:
+                        key = None
+                    else:
+                        found[key] = None      # claimed: no other world confirms it too
+            if key is None:
                 continue
             repro = confirm(w, sched, v)
             small = minimize(w, sched, {f["oracle"] for f in v["hard"]})
             v["schedule"] = small
-            found[key] = save_finding(out, v, w, repro)
-            log(f"  FINDING ({repro}) -> {found[key]}")
-    summary = {"runs": runs, "behaviours": len(seen), "faults_bit": bites,
-               "findings": [str(p) for p in found.values()], "seed": seed}
+            d = save_finding(out, v, w, repro)
+            with lock:
+                found[key] = d
+            log(f"  FINDING ({repro}) -> {d}")
+    run_worlds(worlds, job, first)
+    summary = {"runs": tally["runs"], "runs_per_world": per_world, "behaviours": len(seen),
+               "faults_bit": tally["bites"], "findings": [str(p) for p in found.values() if p], "seed": seed}
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
-    if runs and bites == 0:
+    if tally["runs"] and tally["bites"] == 0:
         log("no fault bit in the whole campaign: the fault layer is not reaching the daemons")
         return 4
     return 1 if found else 0
 
 
-def cmd_hookcheck(w: World, out: Path, repeat: int = 3) -> int:
+def cmd_hookcheck(worlds: list[World], out: Path, repeat: int = 3, first=None) -> int:
     """Validate RECOVERABLE_HOOKS empirically: each hook alone, on the daemon
     that receives and serves, with a send and an exec and a negligible fault
     (a schedule needs one), must be clean every time. A hook that fails here
     is not a recoverable fault and would make the fuzzer report false bugs."""
-    bad = {}
-    for hook, values in sorted(RECOVERABLE_HOOKS.items()):
-        for val in values:
+    lock = threading.Lock()
+    items = [(hook, val, i) for hook, values in sorted(RECOVERABLE_HOOKS.items()) for val in values
+             for i in range(repeat)]
+    fails: dict[str, int] = {}
+
+    def job(w: World) -> None:
+        while not w.stop.is_set():
+            with lock:
+                if not items:
+                    return
+                hook, val, i = items.pop(0)
             sched = {"version": 1, "seed": 0, "hooks": {"bravo": {hook: val}},
                      "steps": [{"at": 1.0, "fault": "net.impair", "target": "charlie", "dur": 2.0,
                                 "args": {"delay_ms": 10, "dup": 0, "jitter_ms": 0, "loss": 0, "reorder": 0}},
                                {"at": 3.0, "op": "send", "src": OWNER, "dst": "bravo", "kib": 256},
                                {"at": 20.0, "op": "exec", "src": "bravo", "dst": OWNER}]}
-            fails = 0
-            for i in range(repeat):
-                v = run_schedule(w, sched, f"hookcheck-{hook}={val}-{i + 1}")
-                fails += 1 if v["hard"] else 0
-            log(f"hookcheck {hook}={val}: {fails}/{repeat} failed")
-            if fails:
-                bad[f"{hook}={val}"] = f"{fails}/{repeat}"
+            v = run_schedule(w, sched, f"hookcheck-{hook}={val}-{i + 1}")
+            with lock:
+                fails[f"{hook}={val}"] = fails.get(f"{hook}={val}", 0) + (1 if v["hard"] else 0)
+    run_worlds(worlds, job, first)
+    for k, n in sorted(fails.items()):
+        log(f"hookcheck {k}: {n}/{repeat} failed")
+    bad = {k: f"{n}/{repeat}" for k, n in fails.items() if n}
     (out / "hookcheck.json").write_text(json.dumps(bad, indent=2))
     if bad:
         log(f"HOOKS MISCLASSIFIED (remove them from RECOVERABLE_HOOKS): {bad}")
@@ -1382,6 +1560,39 @@ def cmd_selftest() -> int:
     ex = dict(blamed, op="exec", src="bravo", dst="alpha", stderr_tail="Error: no answer from 'alpha' - it may be "
               "unresponsive or running a build without exec", dst_signaling_after="connected")
     assert judge_diagnosis(dict(ex, dst="bravo"), part)[0]["oracle"] == "O9-misdiagnosis"
+    # The adaptive quiet window, on a fake clock and fake counters.
+    def storm(series: list[dict]) -> dict:
+        t = [0.0]
+        it = iter(series)
+        last = [None]
+
+        def counts():
+            try:
+                last[0] = next(it)
+            except StopIteration:
+                pass
+            return last[0]
+        return storm_window(None, poll=1.0, clock=lambda: t[0],
+                           sleep=lambda s: t.__setitem__(0, t[0] + s), counts=counts)
+    z = {"alpha": 0, "bravo": 0, "charlie": 0}
+    r = storm([z] * 40)
+    assert r["ended"] == "quiet" and r["watched_s"] == STORM_QUIET_EXIT, r
+    one = [z] * 5 + [dict(z, bravo=1)] * 40          # any attempt: the full window
+    r = storm(one)
+    assert r["ended"] == "full" and r["watched_s"] == STORM_WINDOW and r["syns"]["bravo"] == 1, r
+    steady = [dict(z, charlie=i) for i in range(40)]  # 1 per second: over the line at 9
+    r = storm(steady)
+    assert r["ended"] == "over" and r["syns"]["charlie"] == STORM_MAX_CONNECTS + 1, r
+    late = [z] * 12 + [dict(z, alpha=20)] * 30       # silent 10 s, then a burst: the documented blind spot
+    assert storm(late)["ended"] == "quiet"
+    # Worlds never share a name, address, port or chain.
+    ws = [World.__new__(World) for _ in range(3)]
+    for k, x in enumerate(ws):
+        x.k, x.net, x.port = k, 90 + k, BASE_PORT + k
+    names = [(x.ns(d), x.veth_root(d), x.veth_dev(d), x.dev_ip(d), x.gw_ip(d)) for x in ws for d in DEVICES]
+    flat = [n for t in names for n in t]
+    assert len(flat) == len(set(flat)) and all(len(n) <= 15 for t in names for n in t[:3]), names
+    assert len({x.chain(r) for x in ws for r, _ in CHAINS}) == 3 * len(CHAINS)
     for p in sorted((HERE / "corpus").glob("*.json")) + sorted((HERE / "corpus-grown").glob("*.json")):
         s = json.loads(p.read_text())
         assert s.get("version") == 1 and s["steps"], p
@@ -1391,6 +1602,80 @@ def cmd_selftest() -> int:
                 assert st["fault"] in FAULTS, (p, st)
     print("selftest ok")
     return 0
+
+
+def mem_available_mib() -> int:
+    for ln in Path("/proc/meminfo").read_text().splitlines():
+        if ln.startswith("MemAvailable:"):
+            return int(ln.split()[1]) // 1024
+    return 0
+
+
+def default_worlds() -> int:
+    """Measured on the 4-core / 16 GB lease runner (see the throughput
+    commit): about 2 worlds per core keeps the machine far from saturated,
+    and a world needs well under 1 GiB."""
+    cpus = os.cpu_count() or 1
+    return max(1, min(MAX_SLOTS, 2 * cpus, mem_available_mib() // 1024))
+
+
+class Sampler:
+    """Machine load while the campaign runs: the evidence for the world
+    count, and a warning sign if timing oracles start firing under load."""
+
+    def __init__(self, every: float = 5.0):
+        self.every, self.samples = every, []
+        self.done = threading.Event()
+        self.t = threading.Thread(target=self._run, daemon=True)
+
+    @staticmethod
+    def _cpu() -> tuple[int, int]:
+        f = [int(x) for x in Path("/proc/stat").read_text().splitlines()[0].split()[1:]]
+        idle = f[3] + (f[4] if len(f) > 4 else 0)
+        return sum(f), idle
+
+    def _run(self) -> None:
+        last = self._cpu()
+        while not self.done.wait(self.every):
+            now = self._cpu()
+            tot, idle = now[0] - last[0], now[1] - last[1]
+            last = now
+            self.samples.append({"busy": round(100 * (1 - idle / tot), 1) if tot else 0.0,
+                                 "load1": float(Path("/proc/loadavg").read_text().split()[0]),
+                                 "mem_avail_mib": mem_available_mib()})
+
+    def summary(self) -> dict:
+        s = self.samples
+        if not s:
+            return {}
+        busy = sorted(x["busy"] for x in s)
+        return {"samples": len(s), "cpu_busy_mean": round(sum(busy) / len(busy), 1),
+                "cpu_busy_p95": busy[int(0.95 * (len(busy) - 1))], "cpu_busy_max": busy[-1],
+                "load1_max": max(x["load1"] for x in s), "mem_avail_min_mib": min(x["mem_avail_mib"] for x in s),
+                "cpus": os.cpu_count()}
+
+
+def acquire_slots(n: int) -> list[tuple[int, object]]:
+    """Up to n free world slots. Holds the old single-world lock SHARED, so a
+    campaign of the old version (which took it exclusively and reaped every
+    /tmp/chz.* daemon) cannot run beside this one."""
+    import fcntl
+    legacy = open("/run/tunlion-chaos.lock", "w")
+    try:
+        fcntl.flock(legacy, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Refused("a single-world chaos campaign holds /run/tunlion-chaos.lock")
+    got = [(-1, legacy)]
+    for k in range(MAX_SLOTS):
+        if len(got) > n:
+            break
+        f = open(f"/run/tunlion-chaos.slot{k}.lock", "w")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            got.append((k, f))
+        except BlockingIOError:
+            f.close()
+    return got
 
 
 def main() -> int:
@@ -1403,24 +1688,54 @@ def main() -> int:
     ap.add_argument("--budget-min", type=float, default=30.0)
     ap.add_argument("--seed", type=int, default=int(time.time()))
     ap.add_argument("--repeat", type=int, default=1, help="replay: run each schedule N times and report the rate")
+    ap.add_argument("--worlds", type=int, default=0,
+                    help="independent worlds run at once (0: by machine size, see default_worlds)")
     ap.add_argument("--skip-canary", action="store_true", help="local debugging only; CI never passes this")
     a = ap.parse_args()
     if a.command == "selftest":
         return cmd_selftest()
 
     a.out.mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix="chz.", dir="/tmp"))
-    w = World(a.bin.resolve(), work, a.python)
-    w.out = a.out
+    worlds: list[World] = []
+    sampler = Sampler()
+    t_start = time.monotonic()
+    canary_rc = [0]
     try:
-        w.preconditions()
-        log(f"binary {w.bin} sha256 {w.bin_sha[:16]} (asserted unchanged before every run)")
-        w.net_up()
-        w.setup()
-        if a.command == "canary" or not a.skip_canary:
+        if os.geteuid() != 0:
+            raise Refused("must run as root (network namespaces, tc, iptables)")
+        want = 1 if a.command == "canary" else (a.worlds or default_worlds())
+        slots = acquire_slots(want)
+        if len(slots) == 1:
+            raise Refused(f"no free world slot (all {MAX_SLOTS} /run/tunlion-chaos.slot*.lock held)")
+        if len(slots) - 1 < want:
+            log(f"only {len(slots) - 1} of {want} world slots free; running with those")
+        bin_path = a.bin.resolve()
+        for k, lockf in slots[1:]:
+            work = Path(tempfile.mkdtemp(prefix=f"chz.w{k}.", dir="/tmp"))
+            w = World(bin_path, work, a.python, k, lockf)
+            w.out = a.out
+            worlds.append(w)
+        w0 = worlds[0]
+        log(f"binary {w0.bin} sha256 {w0.bin_sha[:16]} (asserted unchanged before every run); "
+            f"{len(worlds)} world(s): slots {[w.k for w in worlds]}; {os.cpu_count()} cpus, "
+            f"{mem_available_mib()} MiB available")
+        sampler.t.start()
+
+        def bring_up(w: World) -> None:
+            w.preconditions()
+            w.net_up()
+            w.setup()
+        run_worlds(worlds, bring_up)
+        if a.command == "canary":
+            return cmd_canary(w0, a.out)
+
+        def canary(w: World) -> None:
             rc = cmd_canary(w, a.out)
-            if rc or a.command == "canary":
-                return rc
+            if rc:
+                canary_rc[0] = rc
+                for x in worlds:
+                    x.stop.set()
+        first = None if a.skip_canary else canary
         corpus = []
         # replay: the curated regression set. explore: also the queue grown by
         # earlier campaigns, so each campaign starts where the last one stopped.
@@ -1430,13 +1745,16 @@ def main() -> int:
         if not corpus:
             raise Refused("no schedules to run")
         if a.command == "replay":
-            return cmd_replay(w, a.out, corpus, a.repeat)
-        if a.command == "hookcheck":
-            return cmd_hookcheck(w, a.out, a.repeat if a.repeat > 1 else 3)
-        return cmd_explore(w, a.out, a.budget_min * 60, a.seed, corpus)
+            rc = cmd_replay(worlds, a.out, corpus, a.repeat, first)
+        elif a.command == "hookcheck":
+            rc = cmd_hookcheck(worlds, a.out, a.repeat if a.repeat > 1 else 3, first)
+        else:
+            rc = cmd_explore(worlds, a.out, a.budget_min * 60, a.seed, corpus, first)
+        # The canary ran beside the work: a broken instrument voids it all.
+        return canary_rc[0] or rc
     except Refused as e:
         log(f"REFUSED: {e}")
-        return 3
+        return canary_rc[0] or 3
     except Exception:
         # Exit 1 means "tunlion has a bug". A crash in this file must never
         # be read that way.
@@ -1445,12 +1763,23 @@ def main() -> int:
         log("HARNESS ERROR: chaos.py itself failed; this is not a tunlion finding")
         return 5
     finally:
+        sampler.done.set()
+        wall = time.monotonic() - t_start
         try:
-            shutil.copytree(work / "dev", a.out / "last-run-dev", dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns("*.sock", "home", "snapshot"))
+            (a.out / "throughput.json").write_text(json.dumps({
+                "command": a.command, "worlds": len(worlds), "slots": [w.k for w in worlds],
+                "wall_s": round(wall, 1), "schedule_runs": _run_seq[0],
+                "runs_per_hour": round(3600 * _run_seq[0] / wall, 1) if wall > 0 else None,
+                "resources": sampler.summary()}, indent=2))
         except Exception:
             pass
-        w.teardown()
+        for w in worlds:
+            try:
+                shutil.copytree(w.work / "dev", a.out / "last-run-dev" / f"w{w.k}", dirs_exist_ok=True,
+                                ignore=shutil.ignore_patterns("*.sock", "home", "snapshot"))
+            except Exception:
+                pass
+            w.teardown()
 
 
 if __name__ == "__main__":
