@@ -92,6 +92,8 @@ EXIT CODES
        proxy, or a missing CA: set SSL_CERT_FILE to your CA bundle)
   14   up: the daemon exited because its event loop stalled past the limit
        (a service manager restarts it; otherwise run `tunlion up` again)
+  15   up: a daemon is running but does not respond (it may be stalled;
+       `tunlion down` stops it)
   130  interrupted (SIGINT); 143 terminated (SIGTERM)
   exec passes the remote command's own exit status through; 127 when the
   command is not on the remote PATH, 126 when it cannot be executed there,

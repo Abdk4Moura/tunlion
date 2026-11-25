@@ -15,6 +15,9 @@
 #       DAEMON_LOOP_STALLED (14) within the bound
 #   S3  after that exit the pidfile is gone, `status` says not running (11),
 #       and a plain `up --detach` starts a fresh daemon that answers
+#   S4  `up` over a daemon whose loop is held (exit disabled) says "not
+#       responding" with DAEMON_NOT_RESPONDING (15), never the settings
+#       conflict (10); `down -y` then stops it
 #
 # Standalone, hermetic, fixture port 8199 ONLY. Needs a test-hooks binary.
 
@@ -45,7 +48,7 @@ as_dir() { # as_dir DIR -- run the CLI against that config dir
 
 stop_all() {
   local d p
-  for d in "$WORK"/s1 "$WORK"/s2; do
+  for d in "$WORK"/s1 "$WORK"/s2 "$WORK"/s4; do
     [ -d "$d" ] || continue
     timeout 20 env TUNLION_CONFIG_DIR="$d" "$BIN" --server "$SERVER" down -y >/dev/null 2>&1 || true
     p=$(head -1 "$d/up.pid" 2>/dev/null)
@@ -53,12 +56,12 @@ stop_all() {
   done
 }
 
-start_daemon() { # start_daemon DIR HOLD_MS -- foreground `up`, rc recorded
-  local d="$1" hold="$2"
+start_daemon() { # start_daemon DIR HOLD_MS [LIMIT] -- foreground `up`, rc recorded
+  local d="$1" hold="$2" limit="${3:-$LIMIT_SECS}"
   mkdir -p "$d-drop"
   ( env TUNLION_CONFIG_DIR="$d" \
       TUNLION_LOOP_STALL_SECS="$WARN_SECS" \
-      TUNLION_LOOP_STALL_EXIT_SECS="$LIMIT_SECS" \
+      TUNLION_LOOP_STALL_EXIT_SECS="$limit" \
       TUNLION_TEST_STALL_LOOP_MS="$hold" \
       "$BIN" --server "$SERVER" up --dir "$d-drop" </dev/null >"$d.log" 2>&1
     echo $? >"$d.rc" ) &
@@ -141,6 +144,31 @@ rc=$?
 timeout 20 env TUNLION_CONFIG_DIR="$S2" "$BIN" --server "$SERVER" status >/dev/null 2>&1
 rc=$?
 [ "$rc" = 0 ] && ok "S3: the fresh daemon answers" || bad "S3: status exit $rc for the fresh daemon"
+
+# ---------------------------------------------------------------- S4
+say "S4: up over a silent daemon says not responding, not a settings conflict"
+S4="$WORK/s4"
+init_owner "$S4"
+start_daemon "$S4" 600000 0
+wait_for_line "$S4.log" "LOOP-STALL-HOLD" 40 || fixture_die "S4: the hold hook never fired"
+timeout 60 env TUNLION_CONFIG_DIR="$S4" "$BIN" --server "$SERVER" up --dir "$S4-drop" \
+  </dev/null >"$WORK/s4-up.out" 2>&1
+rc=$?
+[ "$rc" = 15 ] && ok "S4: up exited 15 (not responding)" \
+  || bad "S4: up exited $rc over a silent daemon, wanted 15: $(tail -5 "$WORK/s4-up.out")"
+grep -q "not responding" "$WORK/s4-up.out" && ok "S4: the message says not responding" \
+  || bad "S4: no 'not responding' in: $(tail -5 "$WORK/s4-up.out")"
+grep -q "different settings" "$WORK/s4-up.out" && bad "S4: still called a settings conflict" \
+  || ok "S4: not called a settings conflict"
+grep -q "tunlion down" "$WORK/s4-up.out" && ok "S4: points at tunlion down" \
+  || bad "S4: no tunlion down hint"
+timeout 60 env TUNLION_CONFIG_DIR="$S4" "$BIN" --server "$SERVER" down -y >"$WORK/s4-down.out" 2>&1
+rc=$?
+[ "$rc" = 0 ] && ok "S4: down -y stopped the silent daemon" \
+  || bad "S4: down -y exit $rc: $(tail -5 "$WORK/s4-down.out")"
+timeout 20 env TUNLION_CONFIG_DIR="$S4" "$BIN" --server "$SERVER" status >/dev/null 2>&1
+rc=$?
+[ "$rc" = 11 ] && ok "S4: status says not running after down" || bad "S4: status exit $rc after down"
 
 declare_known_red_summary
 [ "$FAIL" -eq 0 ]
