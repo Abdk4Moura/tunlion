@@ -758,8 +758,11 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
     verdict: dict = {"label": label, "schedule": sched, "findings": [], "ops": [], "faults": []}
 
     # Baseline: the fixture must work before any fault, or the run proves nothing.
-    if not wait_signaling(w, DEVICES, 60):
-        raise Refused("baseline: daemons never reported signaling connected")
+    seen = wait_signaling(w, DEVICES, 60, allow_unreported=True)
+    bad = {d: v for d, v in seen.items() if v[0] not in ("connected", "unreported")}
+    if bad:
+        raise Refused(f"baseline: signaling not ready after 60s: {bad}")
+    verdict["unreported_signaling"] = sorted(d for d, v in seen.items() if v[0] == "unreported")
     base = run_op(w, {"op": "exec", "src": "bravo", "dst": OWNER}, "baseline")
     if not base["ok"]:
         raise Refused(f"baseline exec bravo->alpha failed rc={base['rc']}: {base['stderr_tail'][-200:]}")
@@ -816,12 +819,11 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
             rc = w.daemons[d].returncode if w.daemons[d] else None
             verdict["findings"].append({"oracle": "O3-daemon-died", "hard": True,
                                         "what": f"{d} daemon exited (rc {rc}) without being killed by the schedule"})
-    if not wait_signaling(w, alive, SETTLE_SIGNALING):
-        for d in alive:
-            st = (w.cap_status(d) or {}).get("signaling")
-            if not st or st.get("state") != "connected":
-                verdict["findings"].append({"oracle": "O1-no-recovery", "hard": True,
-                                            "what": f"{d} signaling not connected {SETTLE_SIGNALING:.0f}s after heal: {st}"})
+    seen = wait_signaling(w, alive, SETTLE_SIGNALING, allow_unreported=True)
+    for d, (st, raw) in seen.items():
+        if st == "down":
+            verdict["findings"].append({"oracle": "O1-no-recovery", "hard": True,
+                                        "what": f"{d} signaling not connected {SETTLE_SIGNALING:.0f}s after heal: {raw}"})
     for d in alive:
         if w.cap_status(d) is None:
             verdict["findings"].append({"oracle": "O3-unresponsive", "hard": True,
@@ -865,13 +867,32 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
     return verdict
 
 
-def wait_signaling(w: World, devs: list[str], limit: float) -> bool:
+def sig_state(w: World, d: str) -> tuple[str, object]:
+    """('connected' | 'down' | 'unreported' | 'noanswer', raw signaling object).
+
+    'unreported' means the daemon answered cap-status without a signaling
+    object (some code paths, such as the no-self-heal baseline a canary
+    selects, do not track it). It is never counted as recovered."""
+    rep = w.cap_status(d)
+    if rep is None:
+        return "noanswer", None
+    sig = rep.get("signaling")
+    if not sig:
+        return "unreported", sig
+    return ("connected" if sig.get("state") == "connected" else "down"), sig
+
+
+def wait_signaling(w: World, devs: list[str], limit: float, allow_unreported: bool = False) -> dict:
+    """Wait until every device is connected (or unreported, when allowed).
+    Returns {device: (state, raw)} as last seen, for the caller to judge."""
+    ok = {"connected", "unreported"} if allow_unreported else {"connected"}
     t0 = time.monotonic()
-    while time.monotonic() - t0 < limit:
-        if all(((w.cap_status(d) or {}).get("signaling") or {}).get("state") == "connected" for d in devs):
-            return True
+    seen = {}
+    while True:
+        seen = {d: sig_state(w, d) for d in devs}
+        if all(st in ok for st, _ in seen.values()) or time.monotonic() - t0 >= limit:
+            return seen
         time.sleep(1)
-    return False
 
 
 def finding_key(f: dict) -> str:
