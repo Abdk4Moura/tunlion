@@ -127,20 +127,30 @@ pub const TIMER_CONSTANTS_MS: &[u64] = &[
     1_000, 2_000, 3_000, 5_000, 6_000, 8_000, 10_000, 15_000, 20_000, 30_000, 45_000, 60_000,
 ];
 
+const TIMER_WINDOW_CONSTANTS_MS: &[u64] = &[3_000, 5_000, 6_000, 10_000, 15_000, 20_000, 30_000];
+
 fn pick_boundary_value(rng: &mut SimRng, min: u64, max: u64) -> u64 {
+    pick_from_constants(rng, min, max, TIMER_CONSTANTS_MS)
+}
+
+fn pick_window_boundary(rng: &mut SimRng, min: u64, max: u64) -> u64 {
+    pick_from_constants(rng, min, max, TIMER_WINDOW_CONSTANTS_MS)
+}
+
+fn pick_from_constants(rng: &mut SimRng, min: u64, max: u64, table: &[u64]) -> u64 {
     if min >= max {
         return min;
     }
-    let candidates: Vec<u64> = TIMER_CONSTANTS_MS
+    let candidates: Vec<u64> = table
         .iter()
         .copied()
         .filter(|t| *t >= min && *t <= max)
         .collect();
-    if candidates.is_empty() || !rng.chance_pct(80) {
+    if candidates.is_empty() || !rng.chance_pct(50) {
         return min + rng.gen_range_u64(max - min + 1);
     }
     let base = candidates[rng.gen_range_u64(candidates.len() as u64) as usize];
-    let deltas = [0u64, 50, 150, 300, 500, 750];
+    let deltas = [0u64, 50, 150, 300, 500, 700];
     let delta = deltas[rng.gen_range_u64(deltas.len() as u64) as usize];
     if rng.chance_pct(50) {
         base.saturating_add(delta).min(max)
@@ -298,40 +308,29 @@ impl SwarmMask {
     }
 
     fn sample(rng: &mut SimRng) -> Self {
-        // Focus tightly on 1 to 2 fault axes ~40% of runs so bugs masked by
-        // background partition/impair noise get clean signal; otherwise coin-flip.
-        if rng.chance_pct(40) {
-            let mut m = Self {
+        // 35% of runs silence interfering background transport noise (partition/impair)
+        // so clean blackhole/restart/hang interactions surface without masking.
+        if rng.chance_pct(35) {
+            return Self {
                 impair: false,
                 partition: false,
-                blackhole: false,
-                hang: false,
-                restart: false,
-                status_query: rng.chance_pct(65),
+                blackhole: rng.chance_pct(80),
+                hang: rng.chance_pct(75),
+                restart: rng.chance_pct(80),
+                status_query: rng.chance_pct(85),
             };
-            let first = rng.gen_range_u64(5);
-            let second = rng.gen_range_u64(5);
-            for slot in [first, second] {
-                match slot {
-                    0 => m.impair = true,
-                    1 => m.partition = true,
-                    2 => m.blackhole = true,
-                    3 => m.hang = true,
-                    _ => m.restart = true,
-                }
-            }
-            return m;
         }
         let mut m = Self {
-            impair: rng.chance_pct(50),
-            partition: rng.chance_pct(45),
-            blackhole: rng.chance_pct(55),
-            hang: rng.chance_pct(45),
-            restart: rng.chance_pct(55),
-            status_query: rng.chance_pct(70),
+            impair: rng.chance_pct(55),
+            partition: rng.chance_pct(50),
+            blackhole: rng.chance_pct(70),
+            hang: rng.chance_pct(65),
+            restart: rng.chance_pct(70),
+            status_query: rng.chance_pct(85),
         };
         if !(m.impair || m.partition || m.blackhole || m.hang || m.restart) {
             m.blackhole = true;
+            m.restart = true;
         }
         m
     }
@@ -349,14 +348,14 @@ fn generate_schedule(
         SwarmMask::all_default()
     };
 
-    let pick_window = |rng: &mut SimRng, min_dur: u64, max_dur: u64| -> (u64, u64) {
-        let start = if flags.timer_edges && rng.chance_pct(60) {
+    let pick_window = |rng: &mut SimRng, min_dur: u64, max_dur: u64, snap_dur: bool| -> (u64, u64) {
+        let start = if snap_dur && flags.timer_edges && rng.chance_pct(35) {
             pick_boundary_value(rng, 500, 32_500)
         } else {
             500 + rng.gen_range_u64(32_000)
         };
-        let dur = if flags.timer_edges {
-            pick_boundary_value(rng, min_dur, max_dur)
+        let dur = if snap_dur && flags.timer_edges {
+            pick_window_boundary(rng, min_dur, max_dur)
         } else {
             min_dur + rng.gen_range_u64(max_dur - min_dur + 1)
         };
@@ -364,69 +363,57 @@ fn generate_schedule(
         (start, end.max(start + 500))
     };
 
-    let impair_prob = if flags.swarm { 90 } else { 55 };
-    let part_prob = if flags.swarm { 90 } else { 65 };
-    let bh_prob = if flags.swarm { 90 } else { 65 };
-    let hang_prob = if flags.swarm { 90 } else { 50 };
-    let restart_prob = if flags.swarm { 90 } else { 60 };
+    let impair_prob = if flags.swarm { 95 } else { 55 };
+    let part_prob = if flags.swarm { 95 } else { 65 };
+    let bh_prob = if flags.swarm { 95 } else { 65 };
+    let hang_prob = if flags.swarm { 95 } else { 50 };
+    let restart_prob = if flags.swarm { 95 } else { 60 };
     let status_prob = if flags.swarm { 95 } else { 75 };
 
     let impair_range = (mask.impair && rng.chance_pct(impair_prob)).then(|| {
-        let (s, e) = pick_window(rng, 2_000, 30_000);
+        let (s, e) = pick_window(rng, 2_000, 30_000, false);
         (rng.gen_range_u64(3) as usize, s, e)
     });
     let partition = (mask.partition && rng.chance_pct(part_prob)).then(|| {
-        let (s, e) = pick_window(rng, 1_500, 18_000);
+        let (s, e) = pick_window(rng, 1_500, 18_000, true);
         let a = rng.gen_range_u64(3) as usize;
         let b = rng.gen_range_u64(2) as usize;
         (a, b, rng.chance_pct(60), s, e)
     });
     let blackhole = (mask.blackhole && rng.chance_pct(bh_prob)).then(|| {
-        let (s, e) = pick_window(rng, 3_000, 40_000);
+        let (s, e) = pick_window(rng, 3_000, 40_000, true);
         (rng.gen_range_u64(3) as usize, s, e)
     });
     let hang = (mask.hang && rng.chance_pct(hang_prob)).then(|| {
-        let site = if allow_gather_hang && rng.chance_pct(if flags.swarm { 50 } else { 35 }) {
+        let site = if allow_gather_hang && rng.chance_pct(35) {
             HangSite::GatherCandidates
+        } else if rng.chance_pct(50) {
+            HangSite::HttpGetJson
         } else {
-            match rng.gen_range_u64(3) {
-                0 => HangSite::HttpGetJson,
-                1 => HangSite::SignalingEmit,
-                _ => HangSite::DirectRace,
-            }
+            HangSite::DirectRace
         };
-        let at_ms = if flags.timer_edges {
-            pick_boundary_value(rng, 500, 42_500)
-        } else {
-            500 + rng.gen_range_u64(42_000)
-        };
-        let dur = if flags.timer_edges {
-            pick_boundary_value(rng, 1_100, 3_500)
-        } else {
-            1_100 + rng.gen_range_u64(2_400)
-        };
+        let at_ms = 500 + rng.gen_range_u64(42_000);
+        let dur = 1_100 + rng.gen_range_u64(2_400);
         (rng.gen_range_u64(3) as usize, site, at_ms, dur)
     });
     let restart = (mask.restart && rng.chance_pct(restart_prob)).then(|| {
-        let k = if flags.timer_edges {
-            pick_boundary_value(rng, 2_000, 37_000)
-        } else {
-            2_000 + rng.gen_range_u64(35_000)
-        };
-        let gap = if flags.timer_edges {
-            pick_boundary_value(rng, 1_000, 7_000)
-        } else {
-            1_000 + rng.gen_range_u64(6_000)
-        };
+        let k = 2_000 + rng.gen_range_u64(35_000);
+        let gap = 1_000 + rng.gen_range_u64(6_000);
         (rng.gen_range_u64(3) as usize, k, (k + gap).min(duration_ms - 5_000))
     });
     let status_query = (mask.status_query && rng.chance_pct(status_prob)).then(|| {
-        let at = if flags.timer_edges {
+        let node = rng.gen_range_u64(3) as usize;
+        let mut at = if flags.timer_edges {
             pick_boundary_value(rng, 4_000, 52_000)
         } else {
             4_000 + rng.gen_range_u64(48_000)
         };
-        (rng.gen_range_u64(3) as usize, at)
+        if let Some((rn, k, r)) = restart {
+            if rn == node && at >= k.saturating_sub(200) && at <= r.saturating_add(500) {
+                at = (r + 1_000).min(duration_ms - 2_000);
+            }
+        }
+        (node, at)
     });
 
     FuzzSchedule {
@@ -461,57 +448,64 @@ fn mutate_schedule(
     s.sim_seed = rng.next_u64();
     let fresh = generate_schedule(rng, flags, allow_gather_hang);
 
-    // Pick 1 to 2 structural/timing mutations while preserving interesting fault combos.
-    let mutations = 1 + rng.gen_range_u64(2);
-    for _ in 0..mutations {
-        match rng.gen_range_u64(6) {
-            0 => s.impair_range = fresh.impair_range,
-            1 => {
-                if flags.swarm && rng.chance_pct(40) {
-                    s.partition = None;
-                } else {
-                    s.partition = fresh.partition;
-                }
+    // Perform 1 targeted structural/timing mutation per child.
+    match rng.gen_range_u64(6) {
+        0 => s.impair_range = fresh.impair_range,
+        1 => {
+            if flags.swarm && rng.chance_pct(45) {
+                s.partition = None;
+            } else {
+                s.partition = fresh.partition;
             }
-            2 => {
-                if let Some((node, start, end)) = s.blackhole {
-                    let dur = if flags.timer_edges {
-                        pick_boundary_value(rng, 3_000, 40_000)
-                    } else {
-                        end.saturating_sub(start)
-                            .saturating_add(rng.gen_range_u64(6_000))
-                            .saturating_sub(3_000)
-                            .clamp(3_000, 40_000)
-                    };
-                    let new_end = (start + dur).min(s.duration_ms - 5_000);
-                    s.blackhole = Some((node, start, new_end.max(start + 500)));
+        }
+        2 => {
+            if let Some((node, start, end)) = s.blackhole {
+                let dur = if flags.timer_edges {
+                    pick_window_boundary(rng, 3_000, 40_000)
                 } else {
-                    s.blackhole = fresh.blackhole;
-                }
-            }
-            3 => s.hang = fresh.hang,
-            4 => {
-                if let Some((_n, k, r)) = s.restart {
-                    let node = rng.gen_range_u64(3) as usize;
-                    let shift = rng.gen_range_u64(4_000) as i64 - 2_000;
-                    let nk = (k as i64 + shift).clamp(1_500, 45_000) as u64;
-                    let gap = r.saturating_sub(k).clamp(1_000, 8_000);
-                    s.restart = Some((node, nk, (nk + gap).min(s.duration_ms - 5_000)));
-                } else {
-                    s.restart = fresh.restart;
-                }
-            }
-            _ => {
-                let at = if flags.timer_edges {
-                    pick_boundary_value(rng, 4_000, 52_000)
-                } else {
-                    4_000 + rng.gen_range_u64(48_000)
+                    end.saturating_sub(start)
+                        .saturating_add(rng.gen_range_u64(6_000))
+                        .saturating_sub(3_000)
+                        .clamp(3_000, 40_000)
                 };
-                s.status_query = Some((rng.gen_range_u64(3) as usize, at));
+                let new_end = (start + dur).min(s.duration_ms - 5_000);
+                s.blackhole = Some((node, start, new_end.max(start + 500)));
+            } else {
+                s.blackhole = fresh.blackhole;
             }
+        }
+        3 => s.hang = fresh.hang,
+        4 => {
+            if let Some((_n, k, r)) = s.restart {
+                let node = rng.gen_range_u64(3) as usize;
+                let shift = rng.gen_range_u64(4_000) as i64 - 2_000;
+                let nk = (k as i64 + shift).clamp(1_500, 45_000) as u64;
+                let gap = r.saturating_sub(k).clamp(1_000, 8_000);
+                s.restart = Some((node, nk, (nk + gap).min(s.duration_ms - 5_000)));
+            } else {
+                s.restart = fresh.restart;
+            }
+        }
+        _ => {
+            let node = rng.gen_range_u64(3) as usize;
+            let mut at = if flags.timer_edges {
+                pick_boundary_value(rng, 4_000, 52_000)
+            } else {
+                4_000 + rng.gen_range_u64(48_000)
+            };
+            if let Some((rn, k, r)) = s.restart {
+                if rn == node && at >= k.saturating_sub(200) && at <= r.saturating_add(500) {
+                    at = (r + 1_000).min(s.duration_ms - 2_000);
+                }
+            }
+            s.status_query = Some((node, at));
         }
     }
     s
+}
+
+fn is_trivial_startup_milestone(name: &str) -> bool {
+    matches!(name, "sig_connected" | "direct_paired")
 }
 
 fn select_parent_idx(
@@ -531,6 +525,7 @@ fn select_parent_idx(
                 let rarity: u64 = entry
                     .milestones
                     .iter()
+                    .filter(|m| !is_trivial_startup_milestone(m))
                     .map(|m| {
                         let c = milestone_counts.get(m).copied().unwrap_or(1).max(1) as u64;
                         10_000 / c.saturating_mul(c).max(1)
@@ -600,7 +595,7 @@ impl Fuzzer {
 
         for run_idx in 0..campaign.max_runs {
             runs_executed = run_idx + 1;
-            let sched = if corpus_active && !corpus.is_empty() && rng.chance_pct(65) {
+            let sched = if corpus_active && !corpus.is_empty() && rng.chance_pct(40) {
                 let idx = select_parent_idx(&corpus, &milestone_counts, &mut rng, &campaign.flags);
                 mutate_schedule(
                     &corpus[idx].sched,
@@ -620,7 +615,7 @@ impl Fuzzer {
                 if *v > 0 {
                     hit_set.insert(k.clone());
                     let prev = milestone_counts.get(k).copied().unwrap_or(0);
-                    if prev < 3 {
+                    if !is_trivial_startup_milestone(k) && prev < 2 {
                         hit_rare_milestone = true;
                     }
                     *milestone_counts.entry(k.clone()).or_insert(0) += 1;
@@ -664,6 +659,29 @@ impl Fuzzer {
                     && !replay_violations.is_empty();
                 let finding_kinds: BTreeSet<_> =
                     violations.iter().map(|v| format!("{:?}", v.kind)).collect();
+                if !replay_verified {
+                    eprintln!(
+                        "REPLAY_DIFF: orig_ev={} replay_ev={} orig_net={} replay_net={}",
+                        outcome.events.len(),
+                        replay.events.len(),
+                        outcome.net_events.len(),
+                        replay.net_events.len()
+                    );
+                    for i in 0..outcome.events.len().min(replay.events.len()) {
+                        if outcome.events[i] != replay.events[i] {
+                            eprintln!("FIRST_EV_DIFF[{i}]: orig={:?} replay={:?}", outcome.events[i], replay.events[i]);
+                            break;
+                        }
+                    }
+                    for i in 0..outcome.net_events.len().min(replay.net_events.len()) {
+                        if outcome.net_events[i].at_ms != replay.net_events[i].at_ms
+                            || outcome.net_events[i].event != replay.net_events[i].event
+                        {
+                            eprintln!("FIRST_NET_DIFF[{i}]: orig={:?} replay={:?}", outcome.net_events[i], replay.net_events[i]);
+                            break;
+                        }
+                    }
+                }
                 assert!(
                     replay_verified,
                     "DST finding failed bit-exact replay! seed={} orig_hash={:#x} replay_hash={:#x} kinds={:?}",
