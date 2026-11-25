@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -170,17 +170,17 @@ struct NetInner {
     next_node_idx: u16,
     next_port_offset: u16,
     next_sid: u64,
-    node_idx: HashMap<String, u16>,
-    node_uid_map: HashMap<String, String>,
-    uid_node_map: HashMap<String, String>,
+    node_idx: BTreeMap<String, u16>,
+    node_uid_map: BTreeMap<String, String>,
+    uid_node_map: BTreeMap<String, String>,
     sig_clients: BTreeMap<u64, SigClientState>,
-    sid_to_node: HashMap<String, String>,
-    blackholed: HashSet<String>,
-    impair: HashMap<String, ImpairConfig>,
+    sid_to_node: BTreeMap<String, String>,
+    blackholed: BTreeSet<String>,
+    impair: BTreeMap<String, ImpairConfig>,
     partitions: BTreeMap<(String, String), Proto>,
-    hangs: HashMap<(String, HangSite), u64>,
+    hangs: BTreeMap<(String, HangSite), u64>,
     direct_waiters: Vec<DirectWaiter>,
-    active_closers: HashMap<String, Vec<Arc<AtomicBool>>>,
+    active_closers: BTreeMap<String, Vec<Arc<AtomicBool>>>,
     trace: Vec<NetTraceEvent>,
 }
 
@@ -268,17 +268,17 @@ impl SimNetwork {
                 next_node_idx: 1,
                 next_port_offset: 10_000,
                 next_sid: 0,
-                node_idx: HashMap::new(),
-                node_uid_map: HashMap::new(),
-                uid_node_map: HashMap::new(),
+                node_idx: BTreeMap::new(),
+                node_uid_map: BTreeMap::new(),
+                uid_node_map: BTreeMap::new(),
                 sig_clients: BTreeMap::new(),
-                sid_to_node: HashMap::new(),
-                blackholed: HashSet::new(),
-                impair: HashMap::new(),
+                sid_to_node: BTreeMap::new(),
+                blackholed: BTreeSet::new(),
+                impair: BTreeMap::new(),
                 partitions: BTreeMap::new(),
-                hangs: HashMap::new(),
+                hangs: BTreeMap::new(),
                 direct_waiters: Vec::new(),
-                active_closers: HashMap::new(),
+                active_closers: BTreeMap::new(),
                 trace: Vec::new(),
             }),
         })

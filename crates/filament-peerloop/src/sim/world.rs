@@ -683,7 +683,9 @@ async fn send_cap_status(node_name: &str, ctl_slot: &Arc<Mutex<Option<mpsc::Unbo
     if tx.send(req).is_err() {
         return None;
     }
-    tokio::task::yield_now().await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
     let mut reader = BufReader::new(client);
     let mut line = String::new();
     let read_res = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line)).await;
@@ -753,6 +755,7 @@ impl SimWorld {
 
         rt.block_on(async move {
             clock::reset_sim_epoch();
+            sim_rt::reset_sim_rng(config.seed);
             sim_rt::reset_sim_telemetry();
             reset_assertions();
             sim_rt::set_sim_blocking_inline(true);

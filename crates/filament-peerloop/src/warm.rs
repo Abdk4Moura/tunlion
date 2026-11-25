@@ -15,7 +15,8 @@
 //! ~95s re-dial cycle that never settled. The names are the bug; keeping the
 //! decision in one tested place is how it stays fixed.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use crate::sim_rt::{SimHashMap as HashMap, SimHashSet as HashSet};
 use filament_transport::clock::Instant;
 use std::time::Duration;
 

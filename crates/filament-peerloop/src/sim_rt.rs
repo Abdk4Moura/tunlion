@@ -193,3 +193,26 @@ pub(crate) fn record_iter_busy(
 pub fn take_sim_telemetry() -> SimTelemetry {
     SIM_TELEMETRY.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
+
+#[cfg(feature = "sim")]
+thread_local! {
+    static SIM_PRNG_STATE: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0x9E37_79B9_7F4A_7C15) };
+}
+
+#[cfg(feature = "sim")]
+pub fn reset_sim_rng(seed: u64) {
+    SIM_PRNG_STATE.with(|cell| cell.set(seed ^ 0x9E37_79B9_7F4A_7C15));
+}
+
+#[cfg(feature = "sim")]
+pub fn next_sim_u64() -> u64 {
+    SIM_PRNG_STATE.with(|cell| {
+        let state = cell.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+        cell.set(state);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    })
+}
