@@ -689,7 +689,7 @@ async fn await_ack(
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
-                return Ack::Failed(no_answer_message(peer));
+                return Ack::Failed(super::no_answer_message(peer));
             }
         }
     }
@@ -721,30 +721,8 @@ fn is_warm_error(v: &Value) -> bool {
     v["type"].as_str() == Some("warm-error")
 }
 
-/// What an exec says when the link is up but the peer never acknowledged the
-/// open. The link existed, so the peer had been reachable; the likely causes
-/// are a path that stopped carrying traffic (a partition, a network change, a
-/// firewall) or a daemon there that has stopped serving. The old text ended
-/// with "or running a build without exec", which the chaos fuzzer found
-/// pointing users at the peer's version during a plain network partition
-/// (every build has exec). Shared with the CLI's one-shot path. Pure.
-pub fn no_answer_message(peer: &str) -> String {
-    format!(
-        "no answer from '{peer}' over the link: the connection may have stopped carrying traffic \
-         (a network change or a firewall between you), or tunlion on '{peer}' is not responding. \
-         `tunlion reach {peer}` checks the link"
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn no_answer_points_at_the_link_not_the_peers_version() {
-        let m = super::no_answer_message("alpha");
-        assert!(m.contains("stopped carrying traffic") && m.contains("`tunlion reach alpha`"), "{m}");
-        assert!(!m.contains("build without exec"), "{m}");
-    }
-
     use super::*;
 
     /// A fast command can drain stdout before the select ever polls the
