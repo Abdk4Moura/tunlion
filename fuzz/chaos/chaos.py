@@ -439,6 +439,17 @@ class World:
             sh(["ip", "-n", n, "addr", "add", f"{self.dev_ip(d)}/24", "dev", v])
             sh(["ip", "-n", n, "link", "set", v, "up"])
             sh(["ip", "-n", n, "route", "add", "default", "via", self.gw_ip(d)])
+            # DNS inside a world fails at once, as on a machine with no
+            # network. Without this the host's resolv.conf applies, and on
+            # runners that list a forwarded resolver (Azure's 168.63.129.16)
+            # every lookup is silently dropped: each daemon start then blocked
+            # 24 s (measured), every run paid it, and a daemon restarted by
+            # proc.kill came back 24 s late, so the same schedule meant a
+            # different thing on different machines. `ip netns exec` binds
+            # this file over /etc/resolv.conf.
+            etc = Path("/etc/netns") / n
+            etc.mkdir(parents=True, exist_ok=True)
+            (etc / "resolv.conf").write_text("nameserver 127.0.0.1\noptions timeout:1 attempts:1\n")
         # CHAOS: device-to-device forwarding (partitions go first, then accept;
         # runners with docker default FORWARD to DROP). CHAOS_IN: device to
         # backend; a counting rule per device (SYNs = connection attempts,
@@ -469,6 +480,7 @@ class World:
         for d in DEVICES:
             sh(["ip", "netns", "del", self.ns(d)], check=False)
             sh(["ip", "link", "del", self.veth_root(d)], check=False)
+            shutil.rmtree(Path("/etc/netns") / self.ns(d), ignore_errors=True)
 
     def syn_counts(self) -> dict[str, int]:
         """Every device's SYN counter, from one listing."""
@@ -1461,9 +1473,17 @@ def cmd_explore(worlds: list[World], out: Path, budget_s: float, seed: int, corp
                         found[key] = None      # claimed: no other world confirms it too
             if key is None:
                 continue
-            repro = confirm(w, sched, v)
-            small = minimize(w, sched, {f["oracle"] for f in v["hard"]})
-            v["schedule"] = small
+            # A refused baseline inside confirm or minimize says nothing about
+            # the finding: keep it, marked unconfirmed, instead of ending the
+            # campaign (an instrument refusal still ends it).
+            try:
+                repro = confirm(w, sched, v)
+                v["schedule"] = minimize(w, sched, {f["oracle"] for f in v["hard"]})
+            except Refused as e:
+                if str(e).startswith("instrument"):
+                    raise
+                repro = f"unconfirmed (a confirm or minimize run was refused: {e})"
+                log(f"  {repro}")
             d = save_finding(out, v, w, repro)
             with lock:
                 found[key] = d
