@@ -306,6 +306,14 @@ class World:
     def preconditions(self) -> None:
         if os.geteuid() != 0:
             raise Refused("must run as root (network namespaces, tc, iptables)")
+        # One campaign per machine: two would share namespace names, firewall
+        # chains and the backend port, and each would reap the other's daemons.
+        import fcntl
+        self._lock = open("/run/tunlion-chaos.lock", "w")
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused("another chaos campaign is running on this machine (/run/tunlion-chaos.lock)")
         for tool in ["ip", "iptables", "tc", "setpriv", "ss"]:
             if not shutil.which(tool):
                 raise Refused(f"missing tool: {tool}")
