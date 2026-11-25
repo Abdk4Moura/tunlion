@@ -751,6 +751,44 @@ def judge_op(r: dict) -> list[dict]:
     return f
 
 
+# A failure message that tells the user the PEER is the problem: offline, not
+# running `tunlion up`, never appeared. Matched loosely on purpose; the other
+# conditions in judge_diagnosis carry the precision.
+_BLAMES_PEER = re.compile(r"\boffline\b|is '?[\w-]+'? online|`tunlion up` (is not )?running|"
+                          r"did not appear on the tunlion server|did not answer within", re.I)
+# Faults that really can make the peer look offline. A partition between two
+# devices or a degraded link cannot: the peer is still up and announced.
+_PEER_DOWN_FAULTS = {"proc.freeze", "proc.kill", "sig.blackhole", "sig.reset"}
+
+
+def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
+    """O9: the command blamed the peer (offline, not running) while the peer
+    was up: no fault that could take it offline overlapped the command (15 s
+    of slack before it, for presence to settle), and the peer's daemon said it
+    was connected to the server right after the failure."""
+    if r.get("ok") or r.get("rc") in (None, 0) or "t_start" not in r:
+        return []
+    if not _BLAMES_PEER.search(r.get("stderr_tail") or ""):
+        return []
+    dst = r["dst"]
+    lo, hi = r["t_start"] - 15.0, r["t_end"]
+    for f in fault_windows:
+        st = f["step"]
+        end = f["end"] if f["end"] is not None else float("inf")
+        if not (f["start"] < hi and end > lo):
+            continue
+        if st["fault"] == "server.down":
+            return []
+        if st["fault"] in _PEER_DOWN_FAULTS and st.get("target") == dst:
+            return []
+    if r.get("dst_signaling_after") != "connected":
+        return []
+    return [{"oracle": "O9-misdiagnosis", "hard": True,
+             "what": f"{r['op']} {r['src']}->{dst} told the user the peer was offline or not running "
+                     f"(rc {r['rc']}), but {dst} was up and connected; real cause was elsewhere: "
+                     f"{r['stderr_tail'][-180:]}"}]
+
+
 # ------------------------------------------------------------- one run ---
 
 def run_schedule(w: World, sched: dict, label: str) -> dict:
@@ -772,6 +810,7 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
 
     t0 = time.monotonic()
     active: list[tuple[float, Applied]] = []
+    timeline: list[dict] = []
     threads: list[threading.Thread] = []
     results: list[dict] = []
     lock = threading.Lock()
@@ -786,12 +825,17 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
                 ap = apply_fault(w, st, f"{os.getpid()}-{n}")
                 if ap:
                     active.append((st["at"] + st["dur"], ap))
+                    timeline.append({"step": st, "start": now, "end": None, "ap": ap})
                     log(f"  t={now:5.1f} apply {json.dumps(st, sort_keys=True)}")
                 else:
                     verdict["faults"].append({"step": st, "skipped": True})
             else:
                 def go(st=st):
+                    t_s = time.monotonic() - t0
                     r = run_op(w, st, "fault-window")
+                    r["t_start"], r["t_end"] = round(t_s, 1), round(time.monotonic() - t0, 1)
+                    if not r["ok"]:
+                        r["dst_signaling_after"] = sig_state(w, st["dst"])[0]
                     with lock:
                         results.append(r)
                 th = threading.Thread(target=go, daemon=True)
@@ -804,6 +848,9 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
                 bit = ap.bit()
                 ap.heal()
                 active.remove(item)
+                for tl in timeline:
+                    if tl["ap"] is ap:
+                        tl["end"] = now
                 verdict["faults"].append({"step": ap.step, "present": present, "bit": bit})
                 log(f"  t={now:5.1f} heal  {ap.step['fault']} present={present} bit={bit}")
                 if not present:
@@ -812,8 +859,12 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
     for th in threads:
         th.join(max(OP_DEADLINE.values()) + 30)
     verdict["ops"].extend(results)
+    fault_windows = [{"step": tl["step"], "start": tl["start"], "end": tl["end"]} for tl in timeline]
+    verdict["fault_windows"] = [{"fault": f["step"]["fault"], "start": round(f["start"], 1),
+                                 "end": None if f["end"] is None else round(f["end"], 1)} for f in fault_windows]
     for r in results:
         verdict["findings"].extend(judge_op(r))
+        verdict["findings"].extend(judge_diagnosis(r, fault_windows))
 
     # After heal: every daemon reconnects, every path works, nobody storms.
     alive = [d for d in DEVICES if w.daemons[d] and w.daemons[d].poll() is None]
@@ -1102,6 +1153,18 @@ def cmd_selftest() -> int:
     assert judge_op({"op": "send", "src": "a", "dst": "b", "phase": "x", "rc": 0, "lie": True, "stderr_tail": ""})[0]["oracle"] == "O7-false-success"
     assert judge_op({"op": "exec", "src": "b", "dst": "a", "phase": "x", "rc": 6, "stderr_tail": ""})[0]["oracle"] == "O8-silent-failure"
     assert judge_op({"op": "exec", "src": "b", "dst": "a", "phase": "x", "rc": 6, "stderr_tail": "offline"}) == []
+    blamed = {"op": "send", "src": "alpha", "dst": "bravo", "ok": False, "rc": 6, "t_start": 3.0, "t_end": 63.0,
+              "dst_signaling_after": "connected",
+              "stderr_tail": "Error: no peer connected within 60s: is 'bravo' online, with `tunlion up` running there?"}
+    part = [{"step": {"fault": "net.partition", "a": "alpha", "b": "bravo"}, "start": 0.0, "end": 60.0}]
+    assert judge_diagnosis(blamed, part)[0]["oracle"] == "O9-misdiagnosis"
+    frozen = [{"step": {"fault": "proc.freeze", "target": "bravo"}, "start": 0.0, "end": 60.0}]
+    assert judge_diagnosis(blamed, frozen) == []
+    assert judge_diagnosis(dict(blamed, dst_signaling_after="down"), part) == []
+    assert judge_diagnosis(dict(blamed, stderr_tail="connect timeout: couldn't reach 'bravo' in 45s"), part) == []
+    old = [{"step": {"fault": "proc.kill", "target": "bravo"}, "start": 0.0, "end": 1.0}]
+    assert judge_diagnosis(dict(blamed, t_start=10.0, t_end=40.0), old) == [], "slack: presence may lag a heal"
+    assert judge_diagnosis(dict(blamed, t_start=70.0, t_end=80.0), old)[0]["oracle"] == "O9-misdiagnosis"
     for p in sorted((HERE / "corpus").glob("*.json")):
         s = json.loads(p.read_text())
         assert s.get("version") == 1 and s["steps"], p
