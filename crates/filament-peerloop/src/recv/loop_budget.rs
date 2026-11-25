@@ -34,7 +34,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use filament_transport::clock::Instant;
 
 use crate::host::LogSink;
 
@@ -104,7 +106,7 @@ pub const PAUSE_SLACK: Duration = Duration::from_millis(300);
 /// up the time by which its beats came late beyond [`PAUSE_SLACK`].
 #[derive(Debug)]
 pub struct PauseClock {
-    base: Instant,
+    base: std::time::Instant,
     last_beat_ms: AtomicU64,
     paused_ms: AtomicU64,
 }
@@ -113,7 +115,7 @@ impl PauseClock {
     /// A clock with no thread; `beat` drives it (tests).
     pub fn manual() -> Arc<Self> {
         Arc::new(Self {
-            base: Instant::now(),
+            base: std::time::Instant::now(),
             last_beat_ms: AtomicU64::new(0),
             paused_ms: AtomicU64::new(0),
         })
@@ -210,10 +212,15 @@ impl IterationBudget {
 
     /// The daemon's budget: [`BUDGET`], fatal when [`PANIC_ENV`] is `1`.
     pub fn from_env() -> Self {
+        let clock = if crate::sim_rt::is_sim_watchdog_disabled() {
+            None
+        } else {
+            PauseClock::global()
+        };
         let mut b = Self::new(
             BUDGET,
             std::env::var(PANIC_ENV).as_deref() == Ok("1"),
-            PauseClock::global(),
+            clock,
         );
         b.record = std::env::var_os(RECORD_ENV)
             .filter(|p| !p.is_empty())
@@ -231,7 +238,7 @@ impl IterationBudget {
     pub fn enter(&mut self, phase: &'static str) {
         self.close_stretch();
         let paused_before = self.clock.as_ref().map_or(0, |c| c.paused_ms());
-        self.open = Some((Instant::now(), phase, paused_before));
+        self.open = Some((filament_transport::clock::now(), phase, paused_before));
     }
 
     /// The loop is about to wait for its next event: stop counting.
@@ -251,7 +258,7 @@ impl IterationBudget {
 
     fn close_stretch(&mut self) {
         if let Some((at, phase, paused_before)) = self.open.take() {
-            let took = at.elapsed();
+            let took = filament_transport::clock::now().saturating_duration_since(at);
             if let Some(c) = &self.clock {
                 if c.paused_ms() != paused_before || (took > PAUSE_SLACK && c.stale()) {
                     self.paused = true;
@@ -270,6 +277,13 @@ impl IterationBudget {
     /// Close the iteration: the verdict if it was over budget, then reset.
     pub fn finish(&mut self) -> Option<Exceeded> {
         self.close_stretch();
+        #[cfg(feature = "sim")]
+        crate::sim_rt::record_iter_busy(
+            self.busy.as_millis() as u64,
+            self.slowest.as_millis() as u64,
+            self.slowest_phase,
+            self.slowest_event,
+        );
         let judged = !std::mem::take(&mut self.paused);
         let verdict = (judged && self.busy >= self.budget).then(|| Exceeded {
             busy: self.busy,

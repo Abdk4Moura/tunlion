@@ -182,44 +182,6 @@ mod on {
     pub fn suppress_known_peer() -> bool {
         std::env::var("TUNLION_TEST_SUPPRESS_KNOWN_PEER").as_deref() == Ok("1")
     }
-
-    /// Per-iteration busy budget of the daemon loop (`recv::loop_budget`):
-    /// reports an iteration busy for a second or more, fatal under
-    /// TUNLION_TEST_LOOP_BUDGET_PANIC=1. Always measuring in a test-hooks build.
-    /// `None` for a loop that is not the daemon's (a one-shot receive).
-    pub struct LoopBudget(Option<crate::recv::loop_budget::IterationBudget>);
-
-    impl LoopBudget {
-        pub fn new(daemon: bool) -> Self {
-            Self(daemon.then(crate::recv::loop_budget::IterationBudget::from_env))
-        }
-        pub fn enter(&mut self, phase: &'static str) {
-            if let Some(b) = self.0.as_mut() {
-                b.enter(phase);
-            }
-        }
-        pub fn idle(&mut self) {
-            if let Some(b) = self.0.as_mut() {
-                b.idle();
-            }
-        }
-        pub fn event(&mut self, event: &'static str) {
-            if let Some(b) = self.0.as_mut() {
-                b.event(event);
-            }
-        }
-        /// `detail` runs only in a measuring build.
-        pub fn detail(&mut self, detail: impl FnOnce() -> Option<String>) {
-            if let Some(b) = self.0.as_mut() {
-                b.detail(detail());
-            }
-        }
-        pub fn finish(&mut self, log: &dyn crate::host::LogSink) {
-            if let Some(b) = self.0.as_mut() {
-                b.finish_and_report(log);
-            }
-        }
-    }
 }
 
 #[cfg(not(feature = "test-hooks"))]
@@ -329,7 +291,50 @@ mod off {
     pub fn stall_loop_once_ms() -> u64 {
         0
     }
+}
 
+#[cfg(any(feature = "test-hooks", feature = "sim"))]
+mod budget_on {
+    /// Per-iteration busy budget of the daemon loop (`recv::loop_budget`):
+    /// reports an iteration busy for a second or more, fatal under
+    /// TUNLION_TEST_LOOP_BUDGET_PANIC=1. Active in test-hooks and sim builds.
+    pub struct LoopBudget(Option<crate::recv::loop_budget::IterationBudget>);
+
+    impl LoopBudget {
+        pub fn new(daemon: bool) -> Self {
+            Self(daemon.then(crate::recv::loop_budget::IterationBudget::from_env))
+        }
+        pub fn enter(&mut self, phase: &'static str) {
+            if let Some(b) = self.0.as_mut() {
+                b.enter(phase);
+            }
+        }
+        pub fn idle(&mut self) {
+            if let Some(b) = self.0.as_mut() {
+                b.idle();
+            }
+        }
+        pub fn event(&mut self, event: &'static str) {
+            if let Some(b) = self.0.as_mut() {
+                b.event(event);
+            }
+        }
+        /// `detail` runs only in a measuring build.
+        pub fn detail(&mut self, detail: impl FnOnce() -> Option<String>) {
+            if let Some(b) = self.0.as_mut() {
+                b.detail(detail());
+            }
+        }
+        pub fn finish(&mut self, log: &dyn crate::host::LogSink) {
+            if let Some(b) = self.0.as_mut() {
+                b.finish_and_report(log);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(feature = "test-hooks", feature = "sim")))]
+mod budget_off {
     /// The production twin of the loop budget: no state, no clock, no call.
     pub struct LoopBudget;
 
@@ -355,3 +360,7 @@ mod off {
 pub(crate) use off::*;
 #[cfg(feature = "test-hooks")]
 pub(crate) use on::*;
+#[cfg(not(any(feature = "test-hooks", feature = "sim")))]
+pub(crate) use budget_off::LoopBudget;
+#[cfg(any(feature = "test-hooks", feature = "sim"))]
+pub(crate) use budget_on::LoopBudget;

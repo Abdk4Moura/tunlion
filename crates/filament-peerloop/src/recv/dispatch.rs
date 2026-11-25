@@ -2859,14 +2859,6 @@ async fn recv_run(
         }
         if daemon {
             cleanup.watchdog.tick(log.clone());
-            #[cfg(feature = "sim")]
-            {
-                let sim_hold = crate::sim_rt::take_sim_inline_stall_ms();
-                if sim_hold > 0 {
-                    sim_budget.set_phase("sim-stall-hold", "none");
-                    tokio::time::sleep(Duration::from_millis(sim_hold)).await;
-                }
-            }
             // Loop-stall exit gate: hold this loop once, as a wedged await
             // would, so the gate can prove a short stall recovers and a long
             // one exits. Zero (and every production build) is a no-op.

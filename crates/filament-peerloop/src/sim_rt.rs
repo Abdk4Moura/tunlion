@@ -137,124 +137,59 @@ pub(crate) fn take_sim_inline_stall_ms() -> u64 {
     SIM_INLINE_STALL_MS.with(|cell| cell.replace(0))
 }
 
-/// Virtual-time per-iteration loop budget oracle aligned with PR #731's
-/// `LOOP-BUDGET-EXCEEDED` marker and 1 s busy threshold.
+/// Read-only per-run loop-budget telemetry collected for search guidance.
+/// Guidance uses continuous metrics here (`max_iter_busy_ms`, phase histogram)
+/// and never alters `recv::loop_budget::BUDGET` or any oracle threshold.
 #[cfg(feature = "sim")]
-pub struct SimLoopBudget {
-    enabled: bool,
-    iter_start: Option<filament_transport::clock::Instant>,
-    idle_start: Option<filament_transport::clock::Instant>,
-    idle_total: std::time::Duration,
+#[derive(Debug, Clone, Default)]
+pub struct SimTelemetry {
+    pub iterations: u64,
+    pub max_iter_busy_ms: u64,
+    pub max_slowest_ms: u64,
+    pub max_phase: String,
+    pub max_event: String,
+    pub phases_hit: std::collections::BTreeMap<String, u64>,
+    pub events_hit: std::collections::BTreeMap<String, u64>,
+    pub phase_first_seen_ms: std::collections::BTreeMap<String, u64>,
+}
+
+#[cfg(feature = "sim")]
+thread_local! {
+    static SIM_TELEMETRY: std::cell::RefCell<SimTelemetry> =
+        std::cell::RefCell::new(SimTelemetry::default());
+}
+
+#[cfg(feature = "sim")]
+pub fn reset_sim_telemetry() {
+    SIM_TELEMETRY.with(|cell| *cell.borrow_mut() = SimTelemetry::default());
+}
+
+#[cfg(feature = "sim")]
+pub(crate) fn record_iter_busy(
+    busy_ms: u64,
+    slowest_ms: u64,
     phase: &'static str,
     event: &'static str,
+) {
+    let now = filament_transport::clock::now_ms();
+    SIM_TELEMETRY.with(|cell| {
+        let mut t = cell.borrow_mut();
+        t.iterations = t.iterations.saturating_add(1);
+        if busy_ms >= t.max_iter_busy_ms {
+            t.max_iter_busy_ms = busy_ms;
+            t.max_phase = phase.to_string();
+            t.max_event = event.to_string();
+        }
+        if slowest_ms > t.max_slowest_ms {
+            t.max_slowest_ms = slowest_ms;
+        }
+        *t.phases_hit.entry(phase.to_string()).or_insert(0) += 1;
+        *t.events_hit.entry(event.to_string()).or_insert(0) += 1;
+        t.phase_first_seen_ms.entry(phase.to_string()).or_insert(now);
+    });
 }
 
 #[cfg(feature = "sim")]
-impl SimLoopBudget {
-    pub const BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
-
-    pub fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            iter_start: None,
-            idle_start: None,
-            idle_total: std::time::Duration::ZERO,
-            phase: "prelude",
-            event: "none",
-        }
-    }
-
-    pub fn finish_and_start(&mut self, log: &dyn crate::host::LogSink) {
-        if !self.enabled {
-            return;
-        }
-        let now = filament_transport::clock::now();
-        if let Some(start) = self.iter_start {
-            let total = now.saturating_duration_since(start);
-            let busy = total.saturating_sub(self.idle_total);
-            if busy >= Self::BUDGET {
-                log.critical(&format!(
-                    "LOOP-BUDGET-EXCEEDED {} {}/{} slowest_ms={} budget_ms={}",
-                    busy.as_millis(),
-                    self.phase,
-                    self.event,
-                    busy.as_millis(),
-                    Self::BUDGET.as_millis()
-                ));
-            }
-        }
-        self.iter_start = Some(now);
-        self.idle_start = None;
-        self.idle_total = std::time::Duration::ZERO;
-        self.phase = "prelude";
-        self.event = "none";
-    }
-
-    pub fn begin_idle(&mut self) {
-        if self.enabled {
-            self.idle_start = Some(filament_transport::clock::now());
-        }
-    }
-
-    pub fn end_idle(&mut self) {
-        if self.enabled {
-            if let Some(idle_start) = self.idle_start.take() {
-                let elapsed = filament_transport::clock::now().saturating_duration_since(idle_start);
-                self.idle_total = self.idle_total.saturating_add(elapsed);
-            }
-        }
-    }
-
-    pub fn set_phase(&mut self, phase: &'static str, event: &'static str) {
-        if self.enabled {
-            self.phase = phase;
-            self.event = event;
-        }
-    }
-}
-
-#[cfg(feature = "sim")]
-pub(crate) fn sim_ev_kind(ev: &filament_transport::net::Ev) -> &'static str {
-    use filament_transport::net::Ev;
-    match ev {
-        Ev::Lan(_) => "lan",
-        Ev::Welcome(_) => "welcome",
-        Ev::PeerJoined(_) => "peer-joined",
-        Ev::PeerLeft(_) => "peer-left",
-        Ev::Signal(_) => "signal",
-        Ev::PairCode(_) => "pair-code",
-        Ev::PairOk(_) => "pair-ok",
-        Ev::PairMatched(_) => "pair-matched",
-        Ev::PairUsed(_) => "pair-used",
-        Ev::PairError(_) => "pair-error",
-        Ev::KnownPeer(_) => "known-peer",
-        Ev::KnownPeerLeft(_) => "known-peer-left",
-        Ev::Synced(_) => "synced",
-        Ev::SignalingAlive => "signaling-alive",
-        Ev::BuildWake => "build-wake",
-        Ev::ChannelReady(..) => "channel-ready",
-        Ev::DirectReady(..) => "direct-ready",
-        Ev::DirectUpgradeReady(..) => "direct-upgrade-ready",
-        Ev::DirectWorkersReady(..) => "direct-workers-ready",
-        Ev::ReplaySource(_) => "replay-source",
-        Ev::ReplayDeparture(..) => "replay-departure",
-        Ev::Control(..) => "control",
-        Ev::Sourced { inner, .. } => sim_ev_kind(inner),
-        Ev::LocalControl(..) => "local-control",
-        Ev::LocalPcState(..) => "local-pc-state",
-        Ev::Chunk(..) => "chunk",
-        Ev::PcState(..) => "pc-state",
-        Ev::TransferDone(_) => "transfer-done",
-        Ev::TransferFailed { .. } => "transfer-failed",
-        Ev::MaybeComplete(..) => "maybe-complete",
-        Ev::Stuck(..) => "stuck",
-        Ev::TransferStalled(..) => "transfer-stalled",
-        Ev::GraceExpired(..) => "grace-expired",
-        Ev::RetryLink(..) => "retry-link",
-        Ev::SignalingDown(..) => "signaling-down",
-        Ev::DropLink(_) => "drop-link",
-        Ev::Interrupted => "interrupted",
-        Ev::StdinLine(_) => "stdin-line",
-        Ev::AttemptDrained(_) => "attempt-drained",
-    }
+pub fn take_sim_telemetry() -> SimTelemetry {
+    SIM_TELEMETRY.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }

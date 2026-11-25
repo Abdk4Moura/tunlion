@@ -61,6 +61,7 @@ pub struct SimOutcome {
     pub events: Vec<SimTraceEntry>,
     pub budget_violations: Vec<String>,
     pub cap_status_results: Vec<CapStatusResult>,
+    pub telemetry: sim_rt::SimTelemetry,
 }
 
 #[derive(Clone)]
@@ -732,6 +733,7 @@ impl SimWorld {
 
         rt.block_on(async move {
             clock::reset_sim_epoch();
+            sim_rt::reset_sim_telemetry();
             sim_rt::set_sim_blocking_inline(true);
             sim_rt::set_sim_watchdog_disabled(true);
             sim_rt::set_sim_inline_stall_ms(0);
@@ -847,6 +849,7 @@ impl SimWorld {
                 .map(|e| format!("{}@{}ms: {}", e.node, e.at_ms, e.message))
                 .collect();
             let trace_hash = fnv1a64(&events, &net_events);
+            let telemetry = sim_rt::take_sim_telemetry();
 
             SimOutcome {
                 seed: config.seed,
@@ -854,6 +857,7 @@ impl SimWorld {
                 events,
                 budget_violations,
                 cap_status_results,
+                telemetry,
             }
         })
     }
