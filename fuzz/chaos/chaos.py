@@ -317,6 +317,7 @@ class World:
         self.stop: threading.Event = threading.Event()
         self.uid, self.gid = self._pick_user()
         self.backend: subprocess.Popen | None = None
+        self.server_down = 0          # overlapping server.down faults now active
         self.daemons: dict[str, subprocess.Popen | None] = {d: None for d in DEVICES}
         self.hooks: dict[str, dict] = {}
         self.incarnation: dict[str, int] = {d: 0 for d in DEVICES}
@@ -497,6 +498,8 @@ class World:
 
     # -- backend ------------------------------------------------------------
     def backend_start(self) -> None:
+        if self.backend and self.backend.poll() is None:
+            raise RuntimeError("backend_start with a backend already running (it would be orphaned)")
         env = dict(os.environ, PORT=str(self.port), FIL_ASYNC_MODE="eventlet", FIL_SELF_MONKEYPATCH="1",
                    FIL_CLAIM_LIMIT="1000000", FIL_PING_TIMEOUT="120", FIL_PING_INTERVAL="25")
         f = open(self.work / "backend.log", "ab")
@@ -651,9 +654,16 @@ class World:
         """Every run starts from the same enrolled state with fresh daemons."""
         for d in DEVICES:
             self.daemon_stop(d, signal.SIGKILL)
+        self.server_down = 0
         if not self.backend_healthy():
             self.backend_stop()
             self.backend_start()
+        # Exactly one server per world: an extra listener on the port (the
+        # backend uses SO_REUSEPORT) would take part of the connections.
+        r = sh(["ss", "-ltnpH", f"sport = :{self.port}"], check=False)
+        extra = {int(x) for x in re.findall(r"pid=(\d+)", r.stdout)} - {self.backend.pid}
+        if extra:
+            raise Refused(f"instrument: {len(extra)} extra server(s) on port {self.port}: {sorted(extra)}")
         for d in DEVICES:
             c = self.cfg(d)
             shutil.rmtree(c / "cfg", ignore_errors=True)
@@ -828,10 +838,19 @@ def apply_fault(w: World, st: dict, uid: str) -> Applied | None:
         return Applied(st, heal, lambda: True, lambda: True)
 
     if k == "server.down":
+        # Overlapping server.down steps: the server stays down until the LAST
+        # one heals. Starting one backend per heal used to orphan the first
+        # (the attribute was overwritten); the backend binds with
+        # SO_REUSEPORT, so the orphan kept serving half the connections and
+        # the world's daemons split across two servers that never see each
+        # other (false refusals, and false findings of any kind).
+        w.server_down += 1
         w.backend_stop()
 
         def heal():
-            w.backend_start()
+            w.server_down -= 1
+            if w.server_down == 0:
+                w.backend_start()
         return Applied(st, heal, lambda: not w.backend_healthy() or True, lambda: True)
     raise ValueError(k)
 
@@ -1605,6 +1624,19 @@ def cmd_selftest() -> int:
     assert r["ended"] == "over" and r["syns"]["charlie"] == STORM_MAX_CONNECTS + 1, r
     late = [z] * 12 + [dict(z, alpha=20)] * 30       # silent 10 s, then a burst: the documented blind spot
     assert storm(late)["ended"] == "quiet"
+    # Overlapping server.down: one stop, ONE start, after the last heal.
+    calls = []
+    fw = World.__new__(World)
+    fw.server_down, fw.k = 0, 0
+    fw.backend_stop = lambda: calls.append("stop")
+    fw.backend_start = lambda: calls.append("start")
+    fw.backend_healthy = lambda: False
+    a1 = apply_fault(fw, {"fault": "server.down", "at": 0, "dur": 9}, "t1")
+    a2 = apply_fault(fw, {"fault": "server.down", "at": 1, "dur": 2}, "t2")
+    a2.heal()
+    assert calls.count("start") == 0, calls
+    a1.heal()
+    assert calls.count("start") == 1 and fw.server_down == 0, calls
     # Worlds never share a name, address, port or chain.
     ws = [World.__new__(World) for _ in range(3)]
     for k, x in enumerate(ws):
