@@ -22,6 +22,23 @@ pub mod warm_exec;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// What an exec says when the link is up but the peer never acknowledged the
+/// open. The link existed, so the peer had been reachable; the likely causes
+/// are a path that stopped carrying traffic (a partition, a network change, a
+/// firewall) or a daemon there that has stopped serving. The old text ended
+/// with "or running a build without exec", which the chaos fuzzer found
+/// pointing users at the peer's version during a plain network partition
+/// (every build has exec). Lives here, not in the unix-only `warm_exec`, because the CLI's one-shot
+/// path (every platform) says the same thing. Pure.
+pub fn no_answer_message(peer: &str) -> String {
+    format!(
+        "no answer from '{peer}' over the link: the connection may have stopped carrying traffic \
+         (a network change or a firewall between you), or tunlion on '{peer}' is not responding. \
+         `tunlion reach {peer}` checks the link"
+    )
+}
+
+
 /// The per-peer mux table the receive driver owns. Every L2 sector (mount,
 /// forward, pty, exec, sync) receives THIS map: one SID namespace and one
 /// close/ack path per link, never a private mux.
@@ -42,3 +59,13 @@ pub use warm::{
 pub const MAX_PTYS_GLOBAL: usize = 32;
 /// Close reason for a resume with no live session.
 pub const NO_SUCH_SESSION: &str = "no such session";
+
+#[cfg(test)]
+mod no_answer_tests {
+    #[test]
+    fn no_answer_points_at_the_link_not_the_peers_version() {
+        let m = super::no_answer_message("alpha");
+        assert!(m.contains("stopped carrying traffic") && m.contains("`tunlion reach alpha`"), "{m}");
+        assert!(!m.contains("build without exec"), "{m}");
+    }
+}

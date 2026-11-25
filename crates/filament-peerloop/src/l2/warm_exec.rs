@@ -689,9 +689,7 @@ async fn await_ack(
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
-                return Ack::Failed(format!(
-                    "no answer from '{peer}' - it may be unresponsive or running a build without exec"
-                ));
+                return Ack::Failed(super::no_answer_message(peer));
             }
         }
     }
