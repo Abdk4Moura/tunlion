@@ -1,0 +1,44 @@
+{
+  "hooks": {},
+  "seed": 641119195,
+  "steps": [
+    {
+      "at": 4.9,
+      "dst": "alpha",
+      "op": "status",
+      "src": "alpha"
+    },
+    {
+      "at": 5.4,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "charlie"
+    },
+    {
+      "args": {
+        "delay_ms": 1500,
+        "dup": 0,
+        "jitter_ms": 300,
+        "loss": 50,
+        "reorder": 0
+      },
+      "at": 5.8,
+      "dur": 38.6,
+      "fault": "net.impair",
+      "target": "charlie"
+    },
+    {
+      "at": 7.3,
+      "dst": "charlie",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 24.8,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "bravo"
+    }
+  ],
+  "version": 1
+}

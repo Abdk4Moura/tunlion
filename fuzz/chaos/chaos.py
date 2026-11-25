@@ -1351,7 +1351,7 @@ def cmd_selftest() -> int:
     ex = dict(blamed, op="exec", src="bravo", dst="alpha", stderr_tail="Error: no answer from 'alpha' - it may be "
               "unresponsive or running a build without exec", dst_signaling_after="connected")
     assert judge_diagnosis(dict(ex, dst="bravo"), part)[0]["oracle"] == "O9-misdiagnosis"
-    for p in sorted((HERE / "corpus").glob("*.json")):
+    for p in sorted((HERE / "corpus").glob("*.json")) + sorted((HERE / "corpus-grown").glob("*.json")):
         s = json.loads(p.read_text())
         assert s.get("version") == 1 and s["steps"], p
         for st in s["steps"]:
@@ -1391,7 +1391,10 @@ def main() -> int:
             if rc or a.command == "canary":
                 return rc
         corpus = []
-        for f in a.files or [HERE / "corpus"]:
+        # replay: the curated regression set. explore: also the queue grown by
+        # earlier campaigns, so each campaign starts where the last one stopped.
+        default = [HERE / "corpus"] + ([HERE / "corpus-grown"] if a.command == "explore" else [])
+        for f in a.files or default:
             corpus += sorted(f.glob("*.json")) if f.is_dir() else [f]
         if not corpus:
             raise Refused("no schedules to run")

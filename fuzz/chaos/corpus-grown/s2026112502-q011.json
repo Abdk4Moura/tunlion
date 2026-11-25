@@ -1,0 +1,25 @@
+{
+  "hooks": {},
+  "origin": "signaling ops incident: the backend restarts and loses every room; all daemons must re-announce",
+  "seed": 1032516770,
+  "steps": [
+    {
+      "at": 2.0,
+      "dur": 20.0,
+      "fault": "server.down"
+    },
+    {
+      "at": 5.0,
+      "dst": "charlie",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 12.1,
+      "dur": 22.1,
+      "fault": "sig.blackhole",
+      "target": "charlie"
+    }
+  ],
+  "version": 1
+}

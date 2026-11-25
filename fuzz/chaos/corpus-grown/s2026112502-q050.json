@@ -1,0 +1,27 @@
+{
+  "hooks": {},
+  "seed": 767525049,
+  "steps": [
+    {
+      "at": 0.9,
+      "dur": 48.9,
+      "fault": "proc.kill",
+      "target": "charlie"
+    },
+    {
+      "a": "charlie",
+      "at": 12.3,
+      "b": "alpha",
+      "dur": 3.7,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "at": 33.1,
+      "dst": "bravo",
+      "op": "status",
+      "src": "bravo"
+    }
+  ],
+  "version": 1
+}

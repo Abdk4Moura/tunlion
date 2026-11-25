@@ -1,0 +1,43 @@
+{
+  "hooks": {},
+  "seed": 176038753,
+  "steps": [
+    {
+      "at": 5.0,
+      "dur": 51.1,
+      "fault": "sig.blackhole",
+      "target": "charlie"
+    },
+    {
+      "at": 7.4,
+      "dur": 7.8,
+      "fault": "proc.freeze",
+      "target": "charlie"
+    },
+    {
+      "at": 8.5,
+      "dur": 8.3,
+      "fault": "proc.freeze",
+      "target": "charlie"
+    },
+    {
+      "at": 13.3,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 35.8,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 36.7,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "charlie"
+    }
+  ],
+  "version": 1
+}
