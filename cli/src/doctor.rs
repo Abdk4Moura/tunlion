@@ -467,7 +467,24 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     // independent network round-trips; run them CONCURRENTLY so the preflight's
     // wall-clock is the slower of the two, not their sum (on a slow link that is
     // ~2.7s + ~0.9s sequential -> ~2.7s).
-    let (sig, ice) = tokio::join!(check_signaling(&context, server), check_stun(&context, server));
+    // Both probes are network GETs, and `http_get_json` retries three times
+    // with a 10 s connect timeout each; against a host that DROPS the packets
+    // (firewall, captive portal, blocked port) the preflight therefore took
+    // 31.5 s before it could report anything, which reads as a hang and is
+    // longer than the bound callers put around it (the lan-discovery gate
+    // allows 30 s and saw rc=124). A preflight is a status report, not a
+    // transfer: give it one shared deadline and say plainly that it passed.
+    const NET_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+    let probes = async {
+        tokio::join!(check_signaling(&context, server), check_stun(&context, server))
+    };
+    let (sig, ice) = match tokio::time::timeout(NET_DEADLINE, probes).await {
+        Ok(pair) => pair,
+        Err(_) => (
+            Err(format!("no answer within {}s (the server may be blocked, not refusing)", NET_DEADLINE.as_secs())),
+            IceResult::Failed(format!("no answer within {}s", NET_DEADLINE.as_secs())),
+        ),
+    };
     let ifaces = list_interfaces();
     let history = diag::summarize(HISTORY_LIMIT);
     // Local file read (fast, no IO worth joining): sshd CA trust presence.
