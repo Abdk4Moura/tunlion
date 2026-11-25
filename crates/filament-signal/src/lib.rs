@@ -121,6 +121,52 @@ async fn send_writer_message(
 /// Acks the server owes us, by id.
 type Pending = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Vec<Value>>>>>;
 
+/// Pinned future type for `SignalingBackend` without adding an `async-trait` dep.
+#[cfg(feature = "sim")]
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// In-memory / simulated signaling transport backend for `--features sim`.
+#[cfg(feature = "sim")]
+pub trait SignalingBackend: Send + Sync {
+    fn emit<'a>(&'a self, event: &'a str, data: Value) -> BoxFuture<'a, Result<()>>;
+    fn emit_with_ack<'a>(
+        &'a self,
+        event: &'a str,
+        data: Value,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'a, Result<Option<Vec<Value>>>>;
+    fn disconnect<'a>(&'a self) -> BoxFuture<'a, Result<()>>;
+}
+
+#[cfg(feature = "sim")]
+pub fn alloc_conn_id() -> u64 {
+    next_conn_id()
+}
+
+#[cfg(feature = "sim")]
+struct OfflineSimBackend;
+
+#[cfg(feature = "sim")]
+impl SignalingBackend for OfflineSimBackend {
+    fn emit<'a>(&'a self, _event: &'a str, _data: Value) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn emit_with_ack<'a>(
+        &'a self,
+        _event: &'a str,
+        _data: Value,
+        _timeout: std::time::Duration,
+    ) -> BoxFuture<'a, Result<Option<Vec<Value>>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn disconnect<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[cfg(not(feature = "sim"))]
 #[derive(Clone)]
 pub struct Client {
     /// Which connection this handle writes to. Clones share it; every
@@ -140,6 +186,29 @@ pub struct Client {
     unacked_bound: Option<std::time::Duration>,
 }
 
+#[cfg(feature = "sim")]
+#[derive(Clone)]
+enum ClientInner {
+    Ws {
+        writer: Writer,
+        next_ack: Arc<AtomicU64>,
+        pending: Pending,
+        reader_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+        stopping: Arc<Mutex<bool>>,
+        stop_tx: watch::Sender<bool>,
+        unacked_bound: Option<std::time::Duration>,
+    },
+    Sim(Arc<dyn SignalingBackend>),
+}
+
+#[cfg(feature = "sim")]
+#[derive(Clone)]
+pub struct Client {
+    id: u64,
+    inner: ClientInner,
+}
+
+#[cfg(not(feature = "sim"))]
 impl Client {
     /// How long this connection's unacknowledged writes may wait before the
     /// kernel aborts it, read back from the socket. `None` on platforms without
@@ -319,6 +388,168 @@ impl Client {
         }
         *reader_task = None;
         Ok(())
+    }
+}
+
+#[cfg(feature = "sim")]
+impl Client {
+    pub fn from_sim_backend(id: u64, backend: Arc<dyn SignalingBackend>) -> Self {
+        Client {
+            id,
+            inner: ClientInner::Sim(backend),
+        }
+    }
+
+    pub fn offline_sim() -> Self {
+        Client {
+            id: next_conn_id(),
+            inner: ClientInner::Sim(Arc::new(OfflineSimBackend)),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn unacked_bound(&self) -> Option<std::time::Duration> {
+        match &self.inner {
+            ClientInner::Ws { unacked_bound, .. } => *unacked_bound,
+            ClientInner::Sim(_) => None,
+        }
+    }
+
+    pub async fn emit(&self, event: &str, data: Value) -> Result<()> {
+        match &self.inner {
+            ClientInner::Ws {
+                writer, stop_tx, ..
+            } => {
+                let frame =
+                    format!("42{}", Value::Array(vec![Value::String(event.into()), data]));
+                send_writer_message(writer, stop_tx.subscribe(), Message::Text(frame.into()))
+                    .await
+                    .with_context(|| format!("emit '{event}'"))
+            }
+            ClientInner::Sim(backend) => backend.emit(event, data).await,
+        }
+    }
+
+    pub async fn emit_with_ack(
+        &self,
+        event: &str,
+        data: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Vec<Value>>> {
+        match &self.inner {
+            ClientInner::Ws {
+                writer,
+                next_ack,
+                pending,
+                stop_tx,
+                ..
+            } => {
+                let id = next_ack.fetch_add(1, Ordering::Relaxed);
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                pending.lock().await.insert(id, done_tx);
+                let frame =
+                    format!("42{id}{}", Value::Array(vec![Value::String(event.into()), data]));
+                if let Err(e) =
+                    send_writer_message(writer, stop_tx.subscribe(), Message::Text(frame.into()))
+                        .await
+                {
+                    pending.lock().await.remove(&id);
+                    return Err(e).with_context(|| format!("emit '{event}' with ack"));
+                }
+                match tokio::time::timeout(timeout, done_rx).await {
+                    Ok(Ok(args)) => Ok(Some(args)),
+                    Ok(Err(_)) => Ok(None),
+                    Err(_) => {
+                        pending.lock().await.remove(&id);
+                        Ok(None)
+                    }
+                }
+            }
+            ClientInner::Sim(backend) => backend.emit_with_ack(event, data, timeout).await,
+        }
+    }
+
+    #[doc(hidden)]
+    pub async fn loopback() -> Result<(Client, tokio::net::TcpStream)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (dial, accept) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let dial = dial?;
+        let (far, _) = accept?;
+        let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            tokio_tungstenite::MaybeTlsStream::Plain(dial),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let (writer, _reader) = ws.split();
+        Ok((
+            Client {
+                id: next_conn_id(),
+                inner: ClientInner::Ws {
+                    writer: Arc::new(Mutex::new(Some(writer))),
+                    next_ack: Arc::new(AtomicU64::new(1)),
+                    pending: Arc::new(Mutex::new(HashMap::new())),
+                    reader_task: Arc::new(Mutex::new(None)),
+                    stopping: Arc::new(Mutex::new(false)),
+                    stop_tx: watch::channel(false).0,
+                    unacked_bound: None,
+                },
+            },
+            far,
+        ))
+    }
+
+    pub async fn offline() -> Result<Client> {
+        let (client, mut far) = Client::loopback().await?;
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut far, &mut tokio::io::sink()).await;
+        });
+        Ok(client)
+    }
+
+    pub async fn disconnect(&self) -> Result<()> {
+        match &self.inner {
+            ClientInner::Ws {
+                writer,
+                reader_task,
+                stopping,
+                stop_tx,
+                ..
+            } => {
+                *stopping.lock().await = true;
+                stop_tx.send_replace(true);
+                let mut reader_task = reader_task.lock().await;
+                let graceful = tokio::time::timeout(DISCONNECT_GRACE, async {
+                    let mut w_guard = writer.lock().await;
+                    if let Some(w) = w_guard.as_mut() {
+                        let _ = w.send(Message::Text("41".into())).await;
+                        let _ = w.close().await;
+                    }
+                    drop(w_guard);
+                    if let Some(task) = reader_task.as_mut() {
+                        let _ = task.await;
+                    }
+                })
+                .await;
+                if graceful.is_err() {
+                    if let Some(task) = reader_task.as_mut() {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                    let _ = tokio::time::timeout(DISCONNECT_GRACE, async {
+                        writer.lock().await.take();
+                    })
+                    .await;
+                }
+                *reader_task = None;
+                Ok(())
+            }
+            ClientInner::Sim(backend) => backend.disconnect().await,
+        }
     }
 }
 
@@ -537,6 +768,7 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
     let id = next_conn_id();
     let reader_task = Arc::new(Mutex::new(None));
     let stopping = Arc::new(Mutex::new(false));
+    #[cfg(not(feature = "sim"))]
     let client = Client {
         id,
         writer: writer.clone(),
@@ -546,6 +778,19 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
         stopping: stopping.clone(),
         stop_tx,
         unacked_bound,
+    };
+    #[cfg(feature = "sim")]
+    let client = Client {
+        id,
+        inner: ClientInner::Ws {
+            writer: writer.clone(),
+            next_ack: Arc::new(AtomicU64::new(1)),
+            pending: pending.clone(),
+            reader_task: reader_task.clone(),
+            stopping: stopping.clone(),
+            stop_tx,
+            unacked_bound,
+        },
     };
     *reader_task.lock().await = Some(tokio::spawn(read_loop(
         id, reader, writer, tx, pending, stopping, stop_rx,
