@@ -18,8 +18,15 @@
 #      the unprivileged runner user
 #   5. bring the results back as a tarball under ./chaos-results/<sha>-<mode>/
 set -euo pipefail
+# Bash reads a script while it runs it, so editing this file during a campaign
+# breaks the running copy (it did, on 2026-11-25). Run from a private copy.
+if [ -z "${CHAOS_SELF_COPY:-}" ]; then
+  self=$(mktemp)
+  cp "$0" "$self"
+  CHAOS_SELF_COPY=1 CHAOS_ORIG="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" exec bash "$self" "$@"
+fi
 WORKER=${1:?worker device name}; MODE=${2:?canary|replay|explore}; shift 2
-ROOT=$(git rev-parse --show-toplevel)
+ROOT=$(git -C "$(dirname "${CHAOS_ORIG:-$0}")" rev-parse --show-toplevel)
 SHA=$(git -C "$ROOT" rev-parse --short=12 HEAD)
 if [ -n "$(git -C "$ROOT" status --porcelain -- fuzz cli crates backend)" ]; then
   echo "uncommitted changes under fuzz/ cli/ crates/ backend/: commit first, the run must name a SHA" >&2
