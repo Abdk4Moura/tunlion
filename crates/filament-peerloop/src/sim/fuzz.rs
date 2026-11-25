@@ -120,6 +120,35 @@ struct FuzzSchedule {
 
 const NODE_NAMES: [&str; 3] = ["alpha", "bravo", "charlie"];
 
+/// Protocol timer constants harvested from recv/loop_budget.rs, recv/dispatch.rs,
+/// conn.rs, and transport/net.rs (budget, scan, gather, heartbeat, grace, health,
+/// rejoin, silence/watchdog, and session bounds).
+pub const TIMER_CONSTANTS_MS: &[u64] = &[
+    1_000, 2_000, 3_000, 5_000, 6_000, 8_000, 10_000, 15_000, 20_000, 30_000, 45_000, 60_000,
+];
+
+fn pick_boundary_value(rng: &mut SimRng, min: u64, max: u64) -> u64 {
+    if min >= max {
+        return min;
+    }
+    let candidates: Vec<u64> = TIMER_CONSTANTS_MS
+        .iter()
+        .copied()
+        .filter(|t| *t >= min && *t <= max)
+        .collect();
+    if candidates.is_empty() || !rng.chance_pct(80) {
+        return min + rng.gen_range_u64(max - min + 1);
+    }
+    let base = candidates[rng.gen_range_u64(candidates.len() as u64) as usize];
+    let deltas = [0u64, 50, 150, 300, 500, 750];
+    let delta = deltas[rng.gen_range_u64(deltas.len() as u64) as usize];
+    if rng.chance_pct(50) {
+        base.saturating_add(delta).min(max)
+    } else {
+        base.saturating_sub(delta).max(min)
+    }
+}
+
 impl FuzzSchedule {
     fn to_sim_config(&self, mutant: SimMutant) -> SimConfig {
         let sec_ab = "fuzz-sec-ab".to_string();
@@ -321,8 +350,16 @@ fn generate_schedule(
     };
 
     let pick_window = |rng: &mut SimRng, min_dur: u64, max_dur: u64| -> (u64, u64) {
-        let start = 500 + rng.gen_range_u64(32_000);
-        let dur = min_dur + rng.gen_range_u64(max_dur - min_dur + 1);
+        let start = if flags.timer_edges && rng.chance_pct(60) {
+            pick_boundary_value(rng, 500, 32_500)
+        } else {
+            500 + rng.gen_range_u64(32_000)
+        };
+        let dur = if flags.timer_edges {
+            pick_boundary_value(rng, min_dur, max_dur)
+        } else {
+            min_dur + rng.gen_range_u64(max_dur - min_dur + 1)
+        };
         let end = (start + dur).min(duration_ms - 5_000);
         (start, end.max(start + 500))
     };
@@ -358,17 +395,37 @@ fn generate_schedule(
                 _ => HangSite::DirectRace,
             }
         };
-        let at_ms = 500 + rng.gen_range_u64(42_000);
-        let dur = 1_100 + rng.gen_range_u64(2_400);
+        let at_ms = if flags.timer_edges {
+            pick_boundary_value(rng, 500, 42_500)
+        } else {
+            500 + rng.gen_range_u64(42_000)
+        };
+        let dur = if flags.timer_edges {
+            pick_boundary_value(rng, 1_100, 3_500)
+        } else {
+            1_100 + rng.gen_range_u64(2_400)
+        };
         (rng.gen_range_u64(3) as usize, site, at_ms, dur)
     });
     let restart = (mask.restart && rng.chance_pct(restart_prob)).then(|| {
-        let k = 2_000 + rng.gen_range_u64(35_000);
-        let r = k + 1_000 + rng.gen_range_u64(6_000);
-        (rng.gen_range_u64(3) as usize, k, r.min(duration_ms - 5_000))
+        let k = if flags.timer_edges {
+            pick_boundary_value(rng, 2_000, 37_000)
+        } else {
+            2_000 + rng.gen_range_u64(35_000)
+        };
+        let gap = if flags.timer_edges {
+            pick_boundary_value(rng, 1_000, 7_000)
+        } else {
+            1_000 + rng.gen_range_u64(6_000)
+        };
+        (rng.gen_range_u64(3) as usize, k, (k + gap).min(duration_ms - 5_000))
     });
     let status_query = (mask.status_query && rng.chance_pct(status_prob)).then(|| {
-        let at = 4_000 + rng.gen_range_u64(48_000);
+        let at = if flags.timer_edges {
+            pick_boundary_value(rng, 4_000, 52_000)
+        } else {
+            4_000 + rng.gen_range_u64(48_000)
+        };
         (rng.gen_range_u64(3) as usize, at)
     });
 
