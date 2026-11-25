@@ -22,6 +22,7 @@ Exit codes (same convention as scripts/flake-check.sh):
   5  the harness itself crashed: a bug in this file, not in tunlion
 
 Subcommands:
+  hookcheck each test-hook "fault" alone must be clean (validates the list)
   canary    two-arm self-check: a known-broken daemon must be flagged and the
             same schedule on a healthy daemon must pass
   replay    run checked-in schedules (the PR gate)
@@ -85,14 +86,17 @@ FAULTS = ["net.impair", "net.partition", "net.isolate", "sig.blackhole", "sig.re
 OPS = ["exec", "send", "reach", "status", "doctor"]
 
 # Env hooks (test-hooks builds) that add INTERNAL faults with a designed
-# recovery. The fuzzer may switch them on per daemon. Hooks that disable a
+# recovery. Every entry must pass `chaos.py hookcheck` (the hook alone, no
+# network fault, must be clean). TUNLION_TEST_DROP_FILE_END was here and
+# produced a false finding: its recovery (the completion sweep) only runs once
+# the sender's link is gone, and a confirmed send keeps the link up, so with
+# the hook on every send fails by construction. The fuzzer may switch them on per daemon. Hooks that disable a
 # recovery (NO_SIGNALING_RECONNECT, NO_DIRECT...) are not here: those are
 # canaries, not faults.
 RECOVERABLE_HOOKS = {
     "TUNLION_TEST_DIRECT_FLAKY": ["1"],
     "TUNLION_TEST_DIRECT_DELAY_MS": ["500", "3000"],
     "TUNLION_TEST_ESTABLISH_DELAY_MS": ["500", "4000"],
-    "TUNLION_TEST_DROP_FILE_END": ["1"],
     "TUNLION_TEST_DROP_PEER_LEFT": ["1"],
     "TUNLION_TEST_CORRUPT_ONCE": ["1"],
 }
@@ -1304,6 +1308,33 @@ def cmd_explore(w: World, out: Path, budget_s: float, seed: int, corpus: list[Pa
     return 1 if found else 0
 
 
+def cmd_hookcheck(w: World, out: Path, repeat: int = 3) -> int:
+    """Validate RECOVERABLE_HOOKS empirically: each hook alone, on the daemon
+    that receives and serves, with a send and an exec and a negligible fault
+    (a schedule needs one), must be clean every time. A hook that fails here
+    is not a recoverable fault and would make the fuzzer report false bugs."""
+    bad = {}
+    for hook, values in sorted(RECOVERABLE_HOOKS.items()):
+        for val in values:
+            sched = {"version": 1, "seed": 0, "hooks": {"bravo": {hook: val}},
+                     "steps": [{"at": 1.0, "fault": "net.impair", "target": "charlie", "dur": 2.0,
+                                "args": {"delay_ms": 10, "dup": 0, "jitter_ms": 0, "loss": 0, "reorder": 0}},
+                               {"at": 3.0, "op": "send", "src": OWNER, "dst": "bravo", "kib": 256},
+                               {"at": 20.0, "op": "exec", "src": "bravo", "dst": OWNER}]}
+            fails = 0
+            for i in range(repeat):
+                v = run_schedule(w, sched, f"hookcheck-{hook}={val}-{i + 1}")
+                fails += 1 if v["hard"] else 0
+            log(f"hookcheck {hook}={val}: {fails}/{repeat} failed")
+            if fails:
+                bad[f"{hook}={val}"] = f"{fails}/{repeat}"
+    (out / "hookcheck.json").write_text(json.dumps(bad, indent=2))
+    if bad:
+        log(f"HOOKS MISCLASSIFIED (remove them from RECOVERABLE_HOOKS): {bad}")
+        return 4
+    return 0
+
+
 def cmd_selftest() -> int:
     rng = random.Random(1)
     for _ in range(500):
@@ -1364,7 +1395,7 @@ def cmd_selftest() -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["canary", "replay", "explore", "selftest"])
+    ap.add_argument("command", choices=["canary", "replay", "explore", "hookcheck", "selftest"])
     ap.add_argument("files", nargs="*", type=Path)
     ap.add_argument("--bin", type=Path, default=REPO / "target" / "release" / "tunlion")
     ap.add_argument("--out", type=Path, default=Path("chaos-out"))
@@ -1400,6 +1431,8 @@ def main() -> int:
             raise Refused("no schedules to run")
         if a.command == "replay":
             return cmd_replay(w, a.out, corpus, a.repeat)
+        if a.command == "hookcheck":
+            return cmd_hookcheck(w, a.out, a.repeat if a.repeat > 1 else 3)
         return cmd_explore(w, a.out, a.budget_min * 60, a.seed, corpus)
     except Refused as e:
         log(f"REFUSED: {e}")
