@@ -1,0 +1,39 @@
+{
+  "hooks": {
+    "bravo": {
+      "TUNLION_TEST_DROP_FILE_END": "1"
+    }
+  },
+  "origin": "found by exploration 2026-11-25 (seed 2026112502, finding d1f3186458, 3/3): UDP blocked between alpha and bravo for 75 s while bravo drops file-end frames (test hook with a designed completion sweep); after the heal, alpha's send to bravo failed twice with 'delivery not confirmed ... acknowledged none'",
+  "seed": 701341564,
+  "steps": [
+    {
+      "a": "alpha",
+      "at": 0.0,
+      "b": "bravo",
+      "dur": 75.0,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 0.0,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 8.0,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 10.8,
+      "dst": "bravo",
+      "kib": 64,
+      "op": "send",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,6 @@
+{"version": 1, "seed": 11,
+ "origin": "control for finding d1f3186458 (2026-11-25): bravo drops every file-end frame (test hook with a designed recovery, the completion sweep), plain sends with no network fault. If this fails, the sweep is broken in general",
+ "hooks": {"bravo": {"TUNLION_TEST_DROP_FILE_END": "1"}},
+ "steps": [{"at": 2.0, "fault": "net.impair", "target": "charlie", "dur": 3.0, "args": {"delay_ms": 20, "dup": 0, "jitter_ms": 0, "loss": 0, "reorder": 0}},
+           {"at": 3.0, "op": "send", "src": "alpha", "dst": "bravo", "kib": 64},
+           {"at": 20.0, "op": "send", "src": "alpha", "dst": "bravo", "kib": 4}]}
