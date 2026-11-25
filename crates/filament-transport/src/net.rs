@@ -1531,6 +1531,11 @@ pub async fn fetch_auto_room(context: &crate::TransportContext, server: &str) ->
 }
 
 pub async fn http_get_json(context: &crate::TransportContext, url: &str) -> Result<Value> {
+    #[cfg(feature = "sim")]
+    if let Some(http) = context.http_backend() {
+        return http.get_json(url).await;
+    }
+
     // rust_socketio already pulls in reqwest; reuse it instead of adding a dep.
     // 3 quick attempts: establish() refetches config per connection attempt
     // (C5), and one blip of the API mustn't kill a transfer in progress.
