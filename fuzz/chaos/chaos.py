@@ -1120,6 +1120,12 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
         if "panicked at" in text:
             line = next(ln for ln in text.splitlines() if "panicked at" in ln)
             verdict["findings"].append({"oracle": "O4-daemon-panic", "hard": True, "what": f"{d}: {line[-240:]}"})
+        # O11: the daemon's own per-iteration budget (PR #731, test-hooks
+        # builds). One busy pass over 1 s is an await parked on the event
+        # loop: the #729 bug class, caught even when it recovers.
+        for m in re.finditer(r"LOOP-BUDGET-EXCEEDED (\d+) (\S+)", text):
+            verdict["findings"].append({"oracle": "O11-loop-budget", "hard": True,
+                                        "what": f"{d} event loop busy {m.group(1)} ms in one pass ({m.group(2)})"})
         stalls = [m.start() for m in re.finditer(r"event loop stalled", text)]
         if stalls and "event loop recovered" not in text[stalls[-1]:] and d in alive:
             verdict["findings"].append({"oracle": "O3-stalled-loop", "hard": True,
@@ -1645,6 +1651,8 @@ def cmd_selftest() -> int:
     flat = [n for t in names for n in t]
     assert len(flat) == len(set(flat)) and all(len(n) <= 15 for t in names for n in t[:3]), names
     assert len({x.chain(r) for x in ws for r, _ in CHAINS}) == 3 * len(CHAINS)
+    assert re.search(r"LOOP-BUDGET-EXCEEDED (\d+) (\S+)",
+                     "2026-11-25T23:01:02Z LOOP-BUDGET-EXCEEDED 2007 handler/Control:file-end slowest_ms=2007 budget_ms=1000").groups() == ("2007", "handler/Control:file-end")
     for p in sorted((HERE / "corpus").glob("*.json")) + sorted((HERE / "corpus-grown").glob("*.json")):
         s = json.loads(p.read_text())
         assert s.get("version") == 1 and s["steps"], p

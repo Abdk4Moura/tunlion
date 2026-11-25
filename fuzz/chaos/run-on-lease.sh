@@ -71,6 +71,7 @@ TAR=$(mktemp -d)/"$JOB.tar"
 git -C "$ROOT" archive --format=tar HEAD -o "$TAR"
 echo "== ship $SHA ($(du -h "$TAR" | cut -f1)) to $WORKER"
 tunlion send "$TAR" --to "$WORKER" --timeout 240 --json >/dev/null
+rm -f "$TAR"; rmdir "$(dirname "$TAR")" 2>/dev/null || true   # 43 MB per run; they filled /tmp
 
 ARGS=""
 [ "$#" -gt 0 ] && printf -v ARGS '%q ' "$@"
