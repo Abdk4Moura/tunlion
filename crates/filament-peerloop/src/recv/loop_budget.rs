@@ -62,7 +62,8 @@ pub struct Exceeded {
     pub busy: Duration,
     /// The phase of the longest busy stretch (`handler`, `ctl`, `periodic`...).
     pub phase: &'static str,
-    /// The event or control request being handled in that iteration.
+    /// The event or control request being handled when that stretch ended
+    /// (`none` for a stretch before the iteration's event arrived).
     pub event: &'static str,
     /// Finer detail where cheap (a control message's `type`).
     pub detail: Option<String>,
@@ -180,6 +181,10 @@ pub struct IterationBudget {
     busy: Duration,
     slowest: Duration,
     slowest_phase: &'static str,
+    /// The event (and detail) being handled when the slowest stretch ended:
+    /// a slow prelude is not blamed on the event its iteration went on to get.
+    slowest_event: &'static str,
+    slowest_detail: Option<String>,
     event: &'static str,
     detail: Option<String>,
 }
@@ -196,6 +201,8 @@ impl IterationBudget {
             busy: Duration::ZERO,
             slowest: Duration::ZERO,
             slowest_phase: NO_EVENT,
+            slowest_event: NO_EVENT,
+            slowest_detail: None,
             event: NO_EVENT,
             detail: None,
         }
@@ -254,6 +261,8 @@ impl IterationBudget {
             if took >= self.slowest {
                 self.slowest = took;
                 self.slowest_phase = phase;
+                self.slowest_event = self.event;
+                self.slowest_detail.clone_from(&self.detail);
             }
         }
     }
@@ -265,14 +274,16 @@ impl IterationBudget {
         let verdict = (judged && self.busy >= self.budget).then(|| Exceeded {
             busy: self.busy,
             phase: self.slowest_phase,
-            event: self.event,
-            detail: self.detail.take(),
+            event: self.slowest_event,
+            detail: self.slowest_detail.take(),
             slowest: self.slowest,
             budget: self.budget,
         });
         self.busy = Duration::ZERO;
         self.slowest = Duration::ZERO;
         self.slowest_phase = NO_EVENT;
+        self.slowest_event = NO_EVENT;
+        self.slowest_detail = None;
         self.event = NO_EVENT;
         self.detail = None;
         verdict
@@ -417,6 +428,15 @@ mod tests {
         let v = b.finish().expect("70 + 40 ms of busy time is over a 100 ms budget");
         assert_eq!((v.phase, v.event), ("ctl", "Exec"));
         assert!(v.slowest < v.busy, "{v:?}");
+        // A slow prelude is not blamed on the event the iteration then got.
+        b.enter("prelude");
+        std::thread::sleep(Duration::from_millis(120));
+        b.idle();
+        b.enter("periodic");
+        b.event("Welcome");
+        b.enter("handler");
+        let v = b.finish().expect("120 ms of prelude is over a 100 ms budget");
+        assert_eq!((v.phase, v.event), ("prelude", "none"));
         // The next iteration starts clean.
         b.enter("prelude");
         assert!(b.finish().is_none());
