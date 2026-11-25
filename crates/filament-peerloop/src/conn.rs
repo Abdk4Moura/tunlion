@@ -1332,7 +1332,7 @@ pub struct DirectPending {
     /// a duplicate offer doesn't spawn a second race.
     pub racing: bool,
     /// kept alive so the bound UDP port stays ours until the race consumes it.
-    pub endpoint: Option<quinn::Endpoint>,
+    pub endpoint: Option<direct::BoundEndpoint>,
     /// rung-2 (TUNLION_HOLEPUNCH): a SECOND raw UDP socket, already STUN'd, kept
     /// raw (not connected) so its NAT mapping is the one we punch + run QUIC on.
     /// Consumed by the chained ladder in `on_transport_offer` only if rung-1
@@ -1950,7 +1950,7 @@ pub struct Conn {
     /// or accepted (receiver side) without racing the winner's keepalive closure.
     /// Set once in `start_direct_inner`; `None` when direct is not in use, or
     /// when multi-streaming is disabled (`direct_streams() == 1`).
-    pub direct_endpoint: Option<quinn::Endpoint>,
+    pub direct_endpoint: Option<direct::BoundEndpoint>,
     /// WARM-HOLD: keeps connections alive to recently-used and explicitly
     /// configured peers so `tunlion reach`/`ssh` is instant. Tracked per-peer
     /// with LRU eviction and exponential backoff on failures.
@@ -5925,7 +5925,7 @@ impl Conn {
             // For local peers, we don't need a QUIC endpoint.
             (None, 0u16)
         } else {
-            match direct::bind_endpoint() {
+            match direct::bind_endpoint_with_context(&self.transport_context) {
                 Ok(v) => {
                     // Clone for multi-stream worker connections before the
                     // original is consumed by the race in on_transport_offer.
@@ -5978,6 +5978,10 @@ impl Conn {
             (cands, None, None)
         } else {
             let srflx_fut = async {
+                #[cfg(feature = "sim")]
+                if self.transport_context.direct_backend().is_some() {
+                    return None;
+                }
                 if holepunch::holepunch_enabled() {
                     self.gather_srflx().await
                 } else {
@@ -7757,7 +7761,7 @@ impl Conn {
         // strongest "a new direct path may exist NOW" signal we can read without a
         // platform netlink dependency. On change, reset every armed probe's
         // backoff to fire immediately (catches the wifi/cellular handoff instantly).
-        let snap = direct::local_ip_snapshot();
+        let snap = direct::local_ip_snapshot_with_context(&self.transport_context);
         if snap != self.resil.iface_snapshot {
             if !self.resil.iface_snapshot.is_empty() {
                 // DEBUG, resilience internal (upgrade-probe trigger).
