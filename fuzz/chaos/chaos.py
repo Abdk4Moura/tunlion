@@ -942,7 +942,8 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
             rc = w.daemons[d].returncode if w.daemons[d] else None
             verdict["findings"].append({"oracle": "O3-daemon-died", "hard": True,
                                         "what": f"{d} daemon exited (rc {rc}) without being killed by the schedule"})
-    seen = wait_signaling(w, alive, SETTLE_SIGNALING, allow_unreported=True)
+    seen = wait_signaling(w, alive, SETTLE_SIGNALING, allow_unreported=True,
+                          dumps=verdict.setdefault("thread_dumps", {}))
     for d, (st, raw) in seen.items():
         if st == "down":
             verdict["findings"].append({"oracle": "O1-no-recovery", "hard": True,
@@ -951,6 +952,8 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
         if w.cap_status(d) is None:
             verdict["findings"].append({"oracle": "O3-unresponsive", "hard": True,
                                         "what": f"{d} daemon does not answer its control socket after heal"})
+            if d not in verdict["thread_dumps"]:
+                verdict["thread_dumps"][d] = thread_dump(w.daemons[d].pid)
     post = []
     for st in [{"op": "exec", "src": "bravo", "dst": OWNER}, {"op": "exec", "src": "charlie", "dst": OWNER},
                {"op": "send", "src": OWNER, "dst": "bravo", "kib": 64},
@@ -992,6 +995,8 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
         # Confirm and minimize replay the schedule and overwrite the daemon
         # logs. Keep the logs of THIS run, the one that failed.
         verdict["evidence_logs"] = {f"{d}-daemon.log": t for d, t in logs.items()}
+        for d, dump in (verdict.get("thread_dumps") or {}).items():
+            verdict["evidence_logs"][f"{d}-threads.txt"] = dump
         bl = w.work / "backend.log"
         if bl.exists():
             verdict["evidence_logs"]["backend.log"] = bl.read_text(errors="replace")[-400000:]
@@ -1032,6 +1037,26 @@ def sig_state(w: World, d: str) -> tuple[str, object]:
     return ("connected" if sig.get("state") == "connected" else "down"), sig
 
 
+def thread_dump(pid: int) -> str:
+    """Where every thread of a wedged process is. Kernel wait channels and
+    stacks tell a thread blocked in a syscall from an idle runtime whose task
+    awaits a future that never resolves; gdb (if present, and if the binary
+    has symbols: CHAOS_SYMBOLS=1 in run-on-lease.sh) names the functions."""
+    parts = []
+    for t in sorted(Path(f"/proc/{pid}/task").glob("*"), key=lambda x: int(x.name)):
+        def rd(name):
+            try:
+                return (t / name).read_text(errors="replace").strip()
+            except OSError:
+                return "?"
+        parts.append(f"--- tid {t.name} comm={rd('comm')} wchan={rd('wchan')}\n{rd('stack')}")
+    if shutil.which("gdb"):
+        r = sh(["gdb", "-p", str(pid), "-batch", "-nx", "-ex", "set pagination off",
+                "-ex", "thread apply all bt 40"], check=False, timeout=60)
+        parts.append("=== gdb thread apply all bt\n" + r.stdout[-60000:])
+    return "\n".join(parts)
+
+
 def stale_links(w: World, gone: str, secs: float) -> list[dict]:
     """O10 (soft until tunlion documents a detection bound): after `gone` has
     been silent on every network for `secs`, a peer that still reports a warm
@@ -1049,14 +1074,23 @@ def stale_links(w: World, gone: str, secs: float) -> list[dict]:
     return out
 
 
-def wait_signaling(w: World, devs: list[str], limit: float, allow_unreported: bool = False) -> dict:
+def wait_signaling(w: World, devs: list[str], limit: float, allow_unreported: bool = False,
+                   dumps: dict | None = None) -> dict:
     """Wait until every device is connected (or unreported, when allowed).
-    Returns {device: (state, raw)} as last seen, for the caller to judge."""
+    Returns {device: (state, raw)} as last seen, for the caller to judge.
+    With `dumps`, a daemon seen not answering has its threads captured the
+    first time, while it is still stuck (it may exit later)."""
     ok = {"connected", "unreported"} if allow_unreported else {"connected"}
     t0 = time.monotonic()
     seen = {}
     while True:
         seen = {d: sig_state(w, d) for d in devs}
+        if dumps is not None:
+            for d, (st, _) in seen.items():
+                p = w.daemons.get(d)
+                if st == "noanswer" and d not in dumps and p and p.poll() is None:
+                    dumps[d] = thread_dump(p.pid)
+                    log(f"  {d} is not answering: captured its threads")
         if all(st in ok for st, _ in seen.values()) or time.monotonic() - t0 >= limit:
             return seen
         time.sleep(1)

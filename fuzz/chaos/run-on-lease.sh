@@ -26,6 +26,13 @@ if [ -n "$(git -C "$ROOT" status --porcelain -- fuzz cli crates backend)" ]; the
   exit 2
 fi
 TREE=$(git -C "$ROOT" rev-parse HEAD:cli HEAD:crates HEAD:Cargo.lock | sha256sum | cut -c1-16)
+# CHAOS_SYMBOLS=1: keep line tables and skip strip, so a wedged daemon's
+# thread dump names functions. A different binary, so a different cache key.
+SYMS=""
+if [ "${CHAOS_SYMBOLS:-0}" = 1 ]; then
+  TREE="$TREE-syms"
+  SYMS="CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only"
+fi
 JOB="chaos-$SHA-$MODE-$(date +%s)"
 TAR=$(mktemp -d)/"$JOB.tar"
 git -C "$ROOT" archive --format=tar HEAD -o "$TAR"
@@ -50,13 +57,14 @@ cached="\$root/chaos-bins/$TREE/tunlion"
 if [ -x "\$cached" ]; then
   echo "== reusing binary built for product tree $TREE"
 else
-  flock --close "\$root/build.lock" cargo build --features test-hooks --release 2>&1 | tail -3
+  flock --close "\$root/build.lock" env $SYMS cargo build --features test-hooks --release 2>&1 | tail -3
   mkdir -p "\$root/chaos-bins/$TREE"
   cp "\$CARGO_TARGET_DIR/release/tunlion" "\$cached"
 fi
 cp "\$cached" "\$job/tunlion-under-test"
 sha256sum "\$job/tunlion-under-test"
 python3 -m venv "\$root/chaos-venv" 2>/dev/null || true
+command -v gdb >/dev/null || sudo apt-get install -y -qq gdb >/dev/null 2>&1 || echo "gdb unavailable: thread dumps without function names"
 "\$root/chaos-venv/bin/pip" -q install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
 cd "\$job"
 set +e
