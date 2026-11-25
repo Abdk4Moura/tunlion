@@ -88,11 +88,6 @@ ssh-bootstrap = ["dep:authkeys-managed"]
 # Fault-injection hooks the peer-loop paths read. The CLI forwards its own
 # `test-hooks` feature here, so a gate build injects into the moved code too.
 test-hooks = []
-# Diagnostic only: on the first loop stall, dump every tokio task's async
-# backtrace to the log. Needs `RUSTFLAGS="--cfg tokio_unstable"` (tokio refuses
-# its `taskdump` feature without it), so it is a separate feature, never on in
-# a normal or a gate build.
-taskdump = ["test-hooks", "tokio/taskdump"]
 debug-logs = []
 
 [dependencies]
@@ -161,3 +156,12 @@ windows-sys = { version = "0.59", features = [
 # fixtures keyed by hex device keys.
 ring = "0.17"
 hex = "0.4"
+
+# `tunlion_taskdump`: a diagnostic build that prints every tokio task's async
+# backtrace when the daemon loop stalls (recv/lifecycle.rs). Not a feature: it
+# needs tokio's own unstable cfg, and a feature would put tokio's optional
+# backtrace dependency in the lockfile of every build. Build it with
+#   RUSTFLAGS="--cfg tokio_unstable --cfg tunlion_taskdump" \
+#     cargo build --release --features test-hooks,tokio/taskdump
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tunlion_taskdump)'] }

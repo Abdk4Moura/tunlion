@@ -2259,7 +2259,9 @@ impl Peer {
     /// webrtc-rs call made from the event loop (see [`PC_OP_INLINE_BUDGET`]):
     /// a reading that cannot be had at once is reported as unknown.
     async fn selected_pair(&self) -> Option<webrtc::ice_transport::ice_candidate_pair::RTCIceCandidatePair> {
-        let ice = self.pc.sctp().transport().ice_transport();
+        let sctp = self.pc.sctp();
+        let dtls = sctp.transport();
+        let ice = dtls.ice_transport();
         tokio::time::timeout(PC_OP_INLINE_BUDGET, ice.get_selected_candidate_pair())
             .await
             .ok()

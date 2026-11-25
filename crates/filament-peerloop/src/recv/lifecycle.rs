@@ -230,18 +230,18 @@ impl LoopWatchdog {
         let observe_every = self.observe_every;
         let threshold_secs = self.threshold_secs;
         let exit = self.exit.clone();
-        #[cfg(feature = "taskdump")]
+        #[cfg(tunlion_taskdump)]
         let dump = tokio::runtime::Handle::try_current().ok();
         let spawned = std::thread::Builder::new()
             .name("loop-watchdog".into())
             .spawn(move || {
-                #[cfg(feature = "taskdump")]
+                #[cfg(tunlion_taskdump)]
                 let dump_on_stall = |log: &dyn LogSink| {
                     if let Some(handle) = dump.as_ref() {
                         dump_tasks(handle, log);
                     }
                 };
-                #[cfg(not(feature = "taskdump"))]
+                #[cfg(not(tunlion_taskdump))]
                 let dump_on_stall = |_: &dyn LogSink| {};
                 observe(
                     last_tick_ms,
@@ -376,12 +376,12 @@ fn observe(
     }
 }
 
-/// Diagnostic build only (`--features taskdump`, `RUSTFLAGS="--cfg
-/// tokio_unstable"`, Linux): print every runtime task's async backtrace, so a
+/// Diagnostic build only (`--cfg tunlion_taskdump`, see the peerloop
+/// Cargo.toml for the build line; Linux): print every runtime task's async backtrace, so a
 /// stalled loop names the await it is parked on. The workers are idle while the
 /// loop task waits on a pending future, so they can answer the trace request;
 /// the bound covers a worker that is itself blocked.
-#[cfg(feature = "taskdump")]
+#[cfg(tunlion_taskdump)]
 fn dump_tasks(handle: &tokio::runtime::Handle, log: &dyn LogSink) {
     let dumped = handle.block_on(async {
         tokio::time::timeout(std::time::Duration::from_secs(10), handle.dump()).await
