@@ -1656,7 +1656,8 @@ async fn run_build_task(
         }
         match tokio::time::timeout(
             PEER_BUILD_BUDGET,
-            net::Peer::connect(
+            net::Peer::connect_with_context(
+                &context,
                 connect_pid,
                 my_uid,
                 connect_polite,
@@ -3807,7 +3808,8 @@ impl Conn {
         }
         let peer = tokio::time::timeout(
             PEER_BUILD_BUDGET,
-            net::Peer::connect(
+            net::Peer::connect_with_context(
+                &self.transport_context,
                 plan.peer_id.clone(),
                 self.my_uid.clone(),
                 plan.polite,
@@ -14009,7 +14011,7 @@ mod warm_identity_tests {
         )
         .await
         .expect("local offerer");
-        let ld = offerer.pc.local_description().await.expect("offer");
+        let ld = offerer.raw_pc().local_description().await.expect("offer");
         json!({
             "from": pid,
             "data": { "type": "description", "uid": "cli-l2-far", "pc": pc, "description": ld }
@@ -14059,7 +14061,7 @@ mod warm_identity_tests {
         for v in replayed {
             conn.apply_signal(pid, v["data"].clone()).await;
         }
-        let local = peer.pc.local_description().await.expect("answer");
+        let local = peer.raw_pc().local_description().await.expect("answer");
         assert_eq!(local.sdp_type.to_string(), "answer");
         assert_eq!(peer.remote_pc().await, Some(1));
     }
@@ -14113,7 +14115,7 @@ mod warm_identity_tests {
         let new = conn.links[pid].peer.clone().expect("fresh responder");
         assert!(!Arc::ptr_eq(&old, &new), "the old responder was renegotiated");
         assert_eq!(new.remote_pc().await, Some(2));
-        let local = new.pc.local_description().await.expect("answer");
+        let local = new.raw_pc().local_description().await.expect("answer");
         assert_eq!(local.sdp_type.to_string(), "answer");
     }
 
@@ -14190,7 +14192,7 @@ mod warm_identity_tests {
         conn.deliver_sdp_signal(&offer2).await;
         assert!(!conn.held_signals.contains_key(other), "held with no pending");
         let p = conn.links[other].peer.clone().expect("responder");
-        assert!(p.pc.local_description().await.is_some(), "the offer was not applied");
+        assert!(p.raw_pc().local_description().await.is_some(), "the offer was not applied");
     }
 
     /// The upgrade adoption site discards a hold too.
