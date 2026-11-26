@@ -50,12 +50,15 @@ struct Health {
     silence: Option<(u64, Instant)>,
 }
 
+/// The two halves of the control connection. Boxed so this file holds no
+/// platform type: only the connect in `sock` is Unix-specific.
+type Writer = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+type Reader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+
 /// The daemon's link, seen through the control socket.
 pub(crate) struct WarmSendTransport {
-    #[cfg(unix)]
-    writer: tokio::sync::Mutex<Option<tokio::net::unix::OwnedWriteHalf>>,
-    #[cfg(unix)]
-    reader: Mutex<Option<tokio::net::unix::OwnedReadHalf>>,
+    writer: tokio::sync::Mutex<Option<Writer>>,
+    reader: Mutex<Option<Reader>>,
     reader_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     dead: AtomicBool,
     why: Mutex<Option<String>>,
@@ -105,7 +108,6 @@ impl WarmSendTransport {
         }
     }
 
-    #[cfg(unix)]
     async fn write(&self, kind: u8, payload: &[u8]) -> Result<()> {
         if self.dead.load(Ordering::SeqCst) {
             bail!("the warm link to the daemon is closed");
@@ -121,15 +123,9 @@ impl WarmSendTransport {
         Ok(())
     }
 
-    #[cfg(not(unix))]
-    async fn write(&self, _kind: u8, _payload: &[u8]) -> Result<()> {
-        bail!("no warm link on this platform")
-    }
-
     /// Start delivering the daemon's frames to the send loop as events of link
     /// `pid`. Called once, after the loop has adopted the link, so no answer
     /// can arrive for a link the loop does not know yet.
-    #[cfg(unix)]
     pub(crate) fn start(self: &Arc<Self>, pid: String, tx: mpsc::UnboundedSender<Ev>) {
         use filament_peerloop::l2::warm_send::{WS_CLOSE, WS_FLUSHED, WS_HEALTH, WS_INBOUND};
         let _ = self.wake.set(tx.clone());
@@ -190,9 +186,6 @@ impl WarmSendTransport {
             *g = Some(task);
         }
     }
-
-    #[cfg(not(unix))]
-    pub(crate) fn start(self: &Arc<Self>, _pid: String, _tx: mpsc::UnboundedSender<Ev>) {}
 }
 
 #[async_trait]
@@ -293,7 +286,6 @@ impl Transport for WarmSendTransport {
                 h.abort();
             }
         }
-        #[cfg(unix)]
         if let Ok(mut w) = self.writer.try_lock() {
             // Dropping the write half closes this process's side of the
             // control connection; the daemon ends the session and parks what
@@ -317,30 +309,21 @@ impl Transport for WarmSendTransport {
 
 /// The reply bound: the daemon pings the link once before it answers, and on
 /// a slow link that ping may take a few round trips.
-#[cfg(unix)]
 const REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// Ask the local daemon for a warm link to `peer` for a send that will offer
 /// `ids`. `None` means build the send's own link. `any` also takes a held
 /// link that is not direct (see `ReqKind::SendLink`).
-#[cfg(unix)]
 pub(crate) async fn try_send_link(peer: &str, ids: &[String], any: bool) -> Option<WarmSendLink> {
     if crate::ctl::reuse_disabled() {
         return None;
     }
-    try_send_link_at(&crate::ctl::control_sock_path(), peer, ids, any).await
-}
-
-#[cfg(not(unix))]
-pub(crate) async fn try_send_link(_peer: &str, _ids: &[String], _any: bool) -> Option<WarmSendLink> {
-    // Windows has no control socket yet: every send builds its own link.
-    None
+    sock::try_send_link_at(&crate::ctl::control_sock_path(), peer, ids, any).await
 }
 
 /// Read the one JSON reply line, byte at a time, so the binary frames that
 /// follow stay unread.
-#[cfg(unix)]
-async fn read_line(s: &mut tokio::net::UnixStream, max: usize) -> Result<String> {
+async fn read_line<R: tokio::io::AsyncRead + Unpin>(s: &mut R, max: usize) -> Result<String> {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::with_capacity(128);
     let mut byte = [0u8; 1];
@@ -359,17 +342,17 @@ async fn read_line(s: &mut tokio::net::UnixStream, max: usize) -> Result<String>
     Ok(String::from_utf8(buf)?)
 }
 
-/// `try_send_link` against an explicit socket path, so tests can drive a fake
-/// daemon.
-#[cfg(unix)]
-pub(crate) async fn try_send_link_at(
-    path: &std::path::Path,
+/// The `send-link` exchange over an open control connection: the request
+/// line, the reply line, and on a yes the transport. Platform-neutral; the
+/// connect is `sock`'s.
+async fn handshake(
+    mut reader: Reader,
+    mut writer: Writer,
     peer: &str,
     ids: &[String],
     any: bool,
 ) -> Option<WarmSendLink> {
     use tokio::io::AsyncWriteExt;
-    let mut sock = tokio::net::UnixStream::connect(path).await.ok()?;
     let mut req = serde_json::json!({ "op": "send-link", "peer": peer, "ids": ids });
     if any {
         req["any"] = serde_json::json!(true);
@@ -379,11 +362,11 @@ pub(crate) async fn try_send_link_at(
     if line.len() > 1024 * 1024 {
         return None;
     }
-    sock.write_all(&line).await.ok()?;
-    sock.flush().await.ok()?;
+    writer.write_all(&line).await.ok()?;
+    writer.flush().await.ok()?;
     // A daemon from before this op closes without a reply: that is a miss,
     // and so is any refusal or a reply that does not arrive in time.
-    let reply = tokio::time::timeout(REPLY_WAIT, read_line(&mut sock, 64 * 1024))
+    let reply = tokio::time::timeout(REPLY_WAIT, read_line(&mut reader, 64 * 1024))
         .await
         .ok()?
         .ok()?;
@@ -413,10 +396,9 @@ pub(crate) async fn try_send_link_at(
         _ => "direct-quic",
     };
     let link = v["link"].as_str().unwrap_or("link");
-    let (read_half, write_half) = sock.into_split();
     let transport = Arc::new(WarmSendTransport {
-        writer: tokio::sync::Mutex::new(Some(write_half)),
-        reader: Mutex::new(Some(read_half)),
+        writer: tokio::sync::Mutex::new(Some(writer)),
+        reader: Mutex::new(Some(reader)),
         reader_task: Mutex::new(None),
         dead: AtomicBool::new(false),
         why: Mutex::new(None),
@@ -436,6 +418,41 @@ pub(crate) async fn try_send_link_at(
         sid_base,
         route,
     })
+}
+
+/// The control socket is a Unix-domain socket, so the connect is the one
+/// platform fact here. Windows has no control socket yet: a NAMED absence,
+/// and every send there builds its own link.
+#[cfg(unix)]
+mod sock {
+    use super::WarmSendLink;
+
+    /// `try_send_link` against an explicit socket path, so tests can drive a
+    /// fake daemon.
+    pub(crate) async fn try_send_link_at(
+        path: &std::path::Path,
+        peer: &str,
+        ids: &[String],
+        any: bool,
+    ) -> Option<WarmSendLink> {
+        let s = tokio::net::UnixStream::connect(path).await.ok()?;
+        let (r, w) = s.into_split();
+        super::handshake(Box::new(r), Box::new(w), peer, ids, any).await
+    }
+}
+
+#[cfg(not(unix))]
+mod sock {
+    use super::WarmSendLink;
+
+    pub(crate) async fn try_send_link_at(
+        _path: &std::path::Path,
+        _peer: &str,
+        _ids: &[String],
+        _any: bool,
+    ) -> Option<WarmSendLink> {
+        None
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -473,7 +490,7 @@ mod tests {
         let dir = sock_dir("a");
         let path = dir.join("control.sock");
         let ids = vec!["s-1-1".to_string()];
-        assert!(try_send_link_at(&path, "box", &ids, false).await.is_none());
+        assert!(sock::try_send_link_at(&path, "box", &ids, false).await.is_none());
 
         let listener = UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
@@ -491,8 +508,8 @@ mod tests {
             let _ = read_req(&mut s).await;
             drop(s);
         });
-        assert!(try_send_link_at(&path, "box", &ids, false).await.is_none());
-        assert!(try_send_link_at(&path, "box", &ids, false).await.is_none());
+        assert!(sock::try_send_link_at(&path, "box", &ids, false).await.is_none());
+        assert!(sock::try_send_link_at(&path, "box", &ids, false).await.is_none());
         server.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -544,7 +561,7 @@ mod tests {
             // Hold the socket open: death comes from the health report alone.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         });
-        let link = try_send_link_at(&path, "box", &["s-1-1".to_string()], false).await.expect("warm link");
+        let link = sock::try_send_link_at(&path, "box", &["s-1-1".to_string()], false).await.expect("warm link");
         assert_eq!(link.pid, "warm:abc");
         assert_eq!(link.sid_base, 0x4000_0010);
         let t = link.transport.clone();
@@ -614,7 +631,7 @@ mod tests {
             // Read the flush request, then vanish without answering it.
             let _ = read_frame(&mut r).await;
         });
-        let link = try_send_link_at(&path, "box", &["s-2-1".to_string()], false).await.expect("warm link");
+        let link = sock::try_send_link_at(&path, "box", &["s-2-1".to_string()], false).await.expect("warm link");
         let t = link.transport.clone();
         let (tx, _rx) = mpsc::unbounded_channel();
         t.start(link.pid.clone(), tx);
@@ -643,7 +660,7 @@ mod tests {
             .unwrap();
         });
         let ids = vec!["a".to_string(), "b".to_string()];
-        assert!(try_send_link_at(&path, "box", &ids, false).await.is_none());
+        assert!(sock::try_send_link_at(&path, "box", &ids, false).await.is_none());
         server.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
