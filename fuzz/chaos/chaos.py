@@ -909,15 +909,34 @@ def apply_fault(w: World, st: dict, uid: str) -> Applied | None:
 
         def tc(n, *args):
             return sh((["ip", "netns", "exec", n] if n else []) + ["tc", *args], check=False)
-        for n, dv in devs:
-            tc(n, "qdisc", "replace", "dev", dv, "root", "netem", *spec)
+        # One netem qdisc per device, but impairments on the same device can
+        # overlap. Each holds a place on a per-device stack: the newest active
+        # spec is installed, and healing one re-installs what is still active
+        # (or removes the qdisc when nothing is). Without this, the first heal
+        # deleted the qdisc the other still relied on, and the second then
+        # refused the whole campaign as "fault mechanism absent" (2026-11-26,
+        # after 270 runs).
+        stacks = w.__dict__.setdefault("netem_stacks", {})
+        stack = stacks.setdefault(st["target"], [])
+        token = object()
+        stack.append((token, spec))
+
+        def install(top):
+            for n, dv in devs:
+                tc(n, "qdisc", "replace", "dev", dv, "root", "netem", *top)
+        install(spec)
 
         def heal():
-            for n, dv in devs:
-                tc(n, "qdisc", "del", "dev", dv, "root")
+            stack[:] = [(t, sp) for t, sp in stack if t is not token]
+            if stack:
+                install(stack[-1][1])
+            else:
+                for n, dv in devs:
+                    tc(n, "qdisc", "del", "dev", dv, "root")
 
         def present():
-            return all("netem" in tc(n, "qdisc", "show", "dev", dv).stdout for n, dv in devs)
+            mine = any(t is token for t, _ in stack)
+            return mine and all("netem" in tc(n, "qdisc", "show", "dev", dv).stdout for n, dv in devs)
 
         def bit():
             s = "".join(tc(n, "-s", "qdisc", "show", "dev", dv).stdout for n, dv in devs)
@@ -2155,6 +2174,16 @@ def cmd_selftest() -> int:
     assert judge_diagnosis(selfmsg, own) == [], "a true self-blame is the right diagnosis"
     other = [{"step": {"fault": "net.impair", "target": "bravo"}, "start": 0.0, "end": 80.0}]
     assert judge_diagnosis(selfmsg, other)[0]["oracle"] == "O9-misdiagnosis", "blaming a healthy own link is wrong"
+    # Overlapping impairments on one device: the stack logic, without tc.
+    class _W:
+        pass
+    _w = _W()
+    stacks = _w.__dict__.setdefault("netem_stacks", {})
+    st_ = stacks.setdefault("charlie", [])
+    t1, t2 = object(), object()
+    st_ += [(t1, ["loss", "20%"]), (t2, ["duplicate", "5%"])]
+    st_[:] = [(t, sp) for t, sp in st_ if t is not t1]
+    assert st_ and st_[-1][1] == ["duplicate", "5%"] and not any(t is t1 for t, _ in st_), "first heal leaves the second"
     for p in sorted((HERE / "corpus").glob("*.json")) + sorted((HERE / "corpus-grown").glob("*.json")):
         s = json.loads(p.read_text())
         assert s.get("version") == 1 and s["steps"], p
