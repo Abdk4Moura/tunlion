@@ -53,6 +53,31 @@ rule fired, every operation's exit code and stderr, every fault and whether it
 bit) and every daemon's log. To keep a finding as a regression test, copy its
 `schedule.json` into `corpus/` with an `origin` line saying what it caught.
 
+## Visitors
+
+A `visit` op brings a transient device through a world: a fresh namespace
+joins with the run's reusable runner invitation (alpha mints one per run with
+`add --for runner --reuse <visits+1>`), runs `up`, proves alpha answers it
+(`reach alpha`), optionally sends one file (`"act": "send"`), stays `stay`
+seconds and vanishes with no goodbye (its traffic is dropped before its
+processes die, so not even a FIN leaves). Visits run like any op, so they can
+be sequential or overlap:
+
+    {"at": 2.0, "op": "visit", "src": "alpha", "dst": "vis1", "stay": 5.0, "act": "none"}
+
+A schedule with visits turns on alpha's debug log and adds two rules:
+
+- O12-redial-departed: in the 150 s that start 5 s after the last visitor
+  left, alpha must not establish any peer id other than a live device's more
+  than MAX_ATTEMPTS (5) times: the stuck-retry ladder gives up after that.
+- O13-enrollment-starved: one more visitor, after all of them left, must enroll
+  within 60 s and be answered; so must any visitor that comes after another one
+  engaged.
+
+A visitor that cannot engage before any other visitor did refuses the run, as
+does a missing ESTABLISH line in alpha's log (the rule would be blind).
+`corpus/transient-visitors-sequential.json` is the 2026-11-26 production case.
+
 ## Retiring a hand-written gate
 
 Only when reverting that gate's original fix makes `replay` of the matching

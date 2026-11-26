@@ -126,6 +126,12 @@ pub struct LiveObs {
     pub in_flight: bool,
     /// A transport (data channel / QUIC) exists for this link.
     pub transport_up: bool,
+    /// The link HAD a transport and every one of them (primary and workers)
+    /// is severed (`Conn::transport_severed`: latched dead or not alive). Not the same as `!transport_up`: no transport yet is
+    /// an establishment, a dead one is a link that will never move another
+    /// byte and that nothing but this watchdog repairs while its peer
+    /// connection still reads connected.
+    pub transport_dead: bool,
     /// The transport exposes a tracked idle clock for current activity.
     pub flowed: bool,
     /// Ms since the last tracked data byte (`u64::MAX` if unavailable).
@@ -154,6 +160,15 @@ pub fn phase_threshold(flowed: bool, grace_ms: u64, stall_ms: u64) -> u64 {
 pub fn classify(o: &LiveObs) -> Liveness {
     if !o.in_flight {
         return Liveness::Idle;
+    }
+    // A transport that existed and died is not establishing. A WebRTC data
+    // channel declares itself dead on a write or flush the association never
+    // acknowledges (heavy loss), while its peer connection stays connected, so
+    // the establishment watchdog (which keys on the peer connection) never
+    // fires either. Judged Establishing, the transfer waited on a channel that
+    // could never carry a byte again, forever.
+    if o.transport_dead {
+        return Liveness::Stalled;
     }
     // No transport at all yet: ESTABLISHING, unconditionally. There is no
     // transport-open clock for the bytes watchdog to measure, and a link that
@@ -238,7 +253,7 @@ mod tests {
     const STALL: u64 = 6_000;
 
     fn obs(in_flight: bool, transport_up: bool, flowed: bool, idle_ms: u64) -> LiveObs {
-        LiveObs { in_flight, transport_up, flowed, idle_ms, grace_ms: GRACE, stall_ms: STALL }
+        LiveObs { in_flight, transport_up, transport_dead: false, flowed, idle_ms, grace_ms: GRACE, stall_ms: STALL }
     }
 
     #[test]
@@ -288,6 +303,23 @@ mod tests {
         assert_eq!(classify(&obs(true, true, false, u64::MAX)), Liveness::Stalled);
     }
 
+    /// The shape `stall_observation` really reports for a dead data channel:
+    /// NOT up (a dead transport is not observed as up), no activity clock.
+    /// Classified Establishing, the stall ladder never fired and a send whose
+    /// channel died under loss waited on it until its rejoin window ran out,
+    /// long after the network healed. Dead is a stall at once, whatever the
+    /// clock says; no transport at all is still an establishment.
+    #[test]
+    fn a_dead_transport_is_stalled_not_establishing() {
+        for idle in [0u64, STALL + 1, u64::MAX] {
+            let dead = LiveObs { transport_dead: true, ..obs(true, false, false, idle) };
+            assert_eq!(classify(&dead), Liveness::Stalled, "idle={idle}");
+        }
+        let idle_dead = LiveObs { transport_dead: true, ..obs(false, false, false, u64::MAX) };
+        assert_eq!(classify(&idle_dead), Liveness::Idle, "nothing in flight, nothing to repair");
+        assert_eq!(classify(&obs(true, false, false, u64::MAX)), Liveness::Establishing);
+    }
+
     #[test]
     fn phase_threshold_is_grace_before_first_byte_stall_after() {
         assert_eq!(phase_threshold(false, GRACE, STALL), GRACE);
@@ -313,7 +345,7 @@ mod tests {
         // not-yet-flowed link is judged by whatever grace was given, net::
         // establish_grace_ms() enforces grace >= stall, so this documents the
         // contract the classifier relies on.
-        let weird = LiveObs { in_flight: true, transport_up: true, flowed: false, idle_ms: 5_000, grace_ms: 1_000, stall_ms: 6_000 };
+        let weird = LiveObs { in_flight: true, transport_up: true, transport_dead: false, flowed: false, idle_ms: 5_000, grace_ms: 1_000, stall_ms: 6_000 };
         // idle 5000 >= grace 1000 -> Stalled (classifier honors the inputs).
         assert_eq!(classify(&weird), Liveness::Stalled);
     }

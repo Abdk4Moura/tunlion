@@ -481,7 +481,7 @@ async fn print_cold(server: &str, peer: &str, relay: bool, timeout: Option<u64>)
             } else {
                 ui::say(&format!(
                     "  {}",
-                    ui::paint(Tone::Dim, &format!("─ {}", unreachable_hint(peer, o.failed_phase)))
+                    ui::paint(Tone::Dim, &format!("─ {}", unreachable_hint(peer, o.failed_phase, slow_own_link(&o))))
                 ));
             }
             Some(kind)
@@ -625,20 +625,45 @@ pub(crate) fn reach_json_cold(
     v
 }
 
+/// How long this machine took to reach the tunlion server, when that was over
+/// the signaling budget: our own connection is slow or lossy, so a later
+/// presence failure is as likely ours as the peer's. None when signaling was
+/// within budget (or did not complete). Pure.
+pub(crate) fn slow_own_link(o: &crate::l2::ProbeOutcome) -> Option<u64> {
+    o.timings
+        .iter()
+        .find(|t| t.phase == crate::diag::Phase::Signaling && t.over_budget)
+        .map(|t| t.dur_ms)
+}
+
+/// The sentence for a presence failure while this machine's own link to the
+/// server was slow: the peer may be fine. Never the reset/forget advice. Pure.
+pub(crate) fn own_link_hint(peer: &str, signaling_ms: u64) -> String {
+    format!(
+        "{peer} did not appear on the tunlion server in time, but this machine's own connection to the \
+         server is slow (connecting took {:.1} s), so {peer} may be fine: check this machine's network, then \
+         retry. `tunlion doctor` checks it",
+        signaling_ms as f64 / 1000.0
+    )
+}
+
 /// What a failed reach says about the cause. Failing at `establishing` or
 /// later means the peer already appeared on the tunlion server, so "may be
 /// offline, or not running `tunlion up`" pointed the user at a machine that
 /// was up: the chaos fuzzer found it with only UDP blocked between the two.
-/// Before that (or unknown) the peer really may be offline. Pure.
-pub(crate) fn unreachable_hint(peer: &str, failed_phase: Option<crate::diag::Phase>) -> String {
+/// Failing earlier with our OWN server link over budget points at this
+/// machine first: the fuzzer found that too, with loss and 1.5 s delay on the
+/// machine running reach. Otherwise the peer really may be offline. Pure.
+pub(crate) fn unreachable_hint(peer: &str, failed_phase: Option<crate::diag::Phase>, own_slow_ms: Option<u64>) -> String {
     use crate::diag::Phase;
-    match failed_phase {
-        Some(Phase::Establishing | Phase::Ready | Phase::L2Open | Phase::Up) => format!(
+    match (failed_phase, own_slow_ms) {
+        (Some(Phase::Establishing | Phase::Ready | Phase::L2Open | Phase::Up), _) => format!(
             "{peer} is listed on the tunlion server, but no connection to it came up: a firewall may block \
              every path between you (direct UDP, and the relay), or it went offline just now. \
              `tunlion doctor {}` shows which paths were tried",
             crate::refusal::word(peer)
         ),
+        (_, Some(ms)) => own_link_hint(peer, ms),
         _ => format!("{peer} may be offline, or not running `tunlion up` / `--shell`"),
     }
 }
@@ -650,14 +675,24 @@ mod tests {
     #[test]
     fn a_reach_that_found_the_peer_blames_the_path_not_the_peer() {
         use crate::diag::Phase;
-        let path = unreachable_hint("bravo", Some(Phase::Establishing));
+        let path = unreachable_hint("bravo", Some(Phase::Establishing), None);
         assert!(path.contains("listed on the tunlion server") && path.contains("firewall"), "{path}");
         assert!(!path.contains("not running"), "{path}");
         assert!(path.contains("`tunlion doctor bravo`"), "{path}");
         for early in [Some(Phase::Presence), Some(Phase::Signaling), None] {
-            let h = unreachable_hint("bravo", early);
+            let h = unreachable_hint("bravo", early, None);
             assert!(h.contains("may be offline"), "{early:?}: {h}");
         }
+    }
+
+    #[test]
+    fn a_presence_failure_on_a_slow_own_link_blames_this_machine() {
+        use crate::diag::Phase;
+        let h = unreachable_hint("charlie", Some(Phase::Presence), Some(3400));
+        assert!(h.contains("this machine's own connection") && h.contains("3.4 s"), "{h}");
+        assert!(!h.contains("may be offline") && !h.contains("forget"), "{h}");
+        // Establishing still blames the path, whatever our own link did.
+        assert!(unreachable_hint("charlie", Some(Phase::Establishing), Some(3400)).contains("firewall"));
     }
 
     /// E3: `reach` told a device with no shell grant on beta that "ssh/pty to

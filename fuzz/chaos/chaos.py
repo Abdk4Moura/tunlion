@@ -6,7 +6,8 @@ a shell grant) each live in their own network namespace, routed through the
 root namespace where the signaling backend runs. A SCHEDULE says which faults
 to apply when (network impairment, partitions, signaling blackhole or reset,
 SIGSTOP, SIGKILL and restart, backend restart) and which user operations to run
-meanwhile (exec, send, reach). After every fault heals, ORACLES judge the run.
+meanwhile (exec, send, reach, and `visit`: a transient device that enrolls,
+lives briefly and vanishes). After every fault heals, ORACLES judge the run.
 
 The fuzzer is greybox, in the AFL sense but over behaviour rather than
 branches: a schedule that makes the daemons log a kind of line never seen
@@ -95,6 +96,30 @@ STORM_QUIET_EXIT = 10.0
 LOOP_STALL_GRACE = 150.0    # a logged stall must be followed by recovery or exit
 STALE_LINK_AFTER = 90.0     # O10: a peer silent this long should not still look warm
 
+# VISITORS: transient devices that enroll with a reusable runner invitation,
+# run `up` briefly and vanish with no goodbye (a lease worker whose VM is
+# destroyed). The owner used to keep re-dialling every departed one forever and,
+# once those dead links filled its link table, refused new enrollments
+# (production, 2026-11-26; fix #735). A visitor is the op {"op": "visit",
+# "src": "alpha", "dst": "vis<i>", "stay": s, "act": "none"|"send"}. Its device
+# gets its own namespace at 10.<net>.(VISITOR_BASE+i).0/24 for its life only.
+VISITOR_BASE = 10
+MAX_VISITORS = 200
+VISIT_STAY_MAX = 120.0
+VISIT_JOIN_DEADLINE = 90.0  # the CLI gives up on an enrollment after 60 s itself
+ENROLL_BOUND = 60.0         # O13: a visitor that enrolls slower than this is starved
+VISIT_SEEN_DEADLINE = 45.0  # join done -> the owner must have answered the visitor
+# O12: the stuck-retry ladder rebuilds a link at most MAX_ATTEMPTS times
+# (crates/filament-peerloop/src/limits.rs) and then drops it. A departed peer
+# established more often than that inside REDIAL_QUIET seconds that start
+# REDIAL_GRACE after the last visitor left is being re-dialled without bound.
+# A zombie was rebuilt about every 16 s, so the window holds 9 of them.
+REDIAL_MAX = 5
+REDIAL_GRACE = 5.0
+REDIAL_QUIET = 150.0
+# A whole visitor's life: join, being seen, one send, its stay, its removal.
+OP_DEADLINE["visit"] = VISIT_JOIN_DEADLINE + VISIT_SEEN_DEADLINE + OP_DEADLINE["send"] + VISIT_STAY_MAX + 30.0
+
 # CHAOS: device to device (FORWARD). CHAOS_IN: device to the backend (INPUT).
 # CHAOS_OUT: the backend's replies to a device (OUTPUT), needed to isolate it.
 # These are ROLE names; World.chain() maps a role to the world's own chain.
@@ -162,8 +187,18 @@ def sh(cmd: list[str], check: bool = True, timeout: float = 30.0) -> subprocess.
     return r
 
 
+def visitor_no(name: str) -> int | None:
+    m = re.fullmatch(r"vis(\d{1,3})", name)
+    return int(m.group(1)) if m and 1 <= int(m.group(1)) <= MAX_VISITORS else None
+
+
 def dev_index(name: str) -> int:
-    return DEVICES.index(name) + 1
+    if name in DEVICES:
+        return DEVICES.index(name) + 1
+    i = visitor_no(name)
+    if i is None:
+        raise ValueError(f"not a device or visitor name: {name}")
+    return VISITOR_BASE + i
 
 
 # ----------------------------------------------------------------- schedule --
@@ -258,6 +293,22 @@ def mutate(parent: dict, rng: random.Random) -> dict:
     return normalize(s)
 
 
+def check_visits(s: dict) -> None:
+    """A visit step names a visitor slot of its own: two steps sharing a name
+    would share one namespace and one config."""
+    names = [st["dst"] for st in s["steps"] if st.get("op") == "visit"]
+    for st in s["steps"]:
+        if st.get("op") == "visit":
+            if st.get("src") != OWNER or visitor_no(st["dst"]) is None:
+                raise ValueError(f"visit must be from {OWNER} to vis<1..{MAX_VISITORS}>: {st}")
+            if not 0 <= float(st.get("stay", 5.0)) <= VISIT_STAY_MAX or st.get("act", "none") not in ("none", "send"):
+                raise ValueError(f"visit stay must be 0..{VISIT_STAY_MAX:.0f}s and act none|send: {st}")
+    if len(names) != len(set(names)):
+        raise ValueError(f"visitor names repeat in one schedule: {names}")
+    if names and max(visitor_no(n) for n in names) >= MAX_VISITORS:
+        raise ValueError(f"vis{MAX_VISITORS} is reserved for the final probe visitor")
+
+
 def window_end(s: dict) -> float:
     ends = [st["at"] + st.get("dur", 0.0) for st in s["steps"] if "fault" in st]
     ends += [st["at"] for st in s["steps"] if "op" in st]
@@ -324,6 +375,9 @@ class World:
         self.bin_sha = self._sha(binary)
         self.can_netem = False
         self.snapshot = work / "snapshot"
+        self.visitors: dict[str, subprocess.Popen] = {}   # visitor name -> its `up`
+        self.visit_inv: Path | None = None               # this run's reusable invitation
+        self.visitor_logs: dict[str, str] = {}           # this run's departed visitors' logs
 
     # -- preconditions ------------------------------------------------------
     @staticmethod
@@ -400,7 +454,7 @@ class World:
         Other slots are never touched: another campaign may own them."""
         mine = str(self.work)
         victims = set()
-        for d in DEVICES:
+        for d in DEVICES + self.visitor_names_present():
             r = sh(["ip", "netns", "pids", self.ns(d)], check=False)
             victims |= {int(x) for x in r.stdout.split() if x.isdigit()}
         marks = [f"/tmp/chz.w{self.k}.", f"http://10.{self.net}."]
@@ -482,6 +536,16 @@ class World:
             sh(["ip", "netns", "del", self.ns(d)], check=False)
             sh(["ip", "link", "del", self.veth_root(d)], check=False)
             shutil.rmtree(Path("/etc/netns") / self.ns(d), ignore_errors=True)
+        for v in self.visitor_names_present():
+            self.visitor_remove(v)
+        # Stray visitor veths and the blackholes left where visitors were.
+        r = sh(["ip", "-o", "link", "show"], check=False)
+        for m in re.finditer(rf"^\d+: (chz{self.k}r(\d+))[@:]", r.stdout, re.M):
+            if int(m.group(2)) > VISITOR_BASE:
+                sh(["ip", "link", "del", m.group(1)], check=False)
+        r = sh(["ip", "route", "show", "type", "blackhole"], check=False)
+        for m in re.finditer(rf"^blackhole (10\.{self.net}\.\d+\.0/24)", r.stdout, re.M):
+            sh(["ip", "route", "del", "blackhole", m.group(1)], check=False)
 
     def syn_counts(self) -> dict[str, int]:
         """Every device's SYN counter, from one listing."""
@@ -595,6 +659,116 @@ class World:
                 pass
             p.wait()
 
+    # -- visitors -----------------------------------------------------------
+    def visitor_names_present(self) -> list[str]:
+        """Visitor namespaces of THIS slot that exist now."""
+        r = sh(["ip", "netns", "list"], check=False)
+        pre = f"chz{self.k}_"
+        out = []
+        for ln in r.stdout.splitlines():
+            n = (ln.split() or [""])[0]
+            if n.startswith(pre) and visitor_no(n[len(pre):]) is not None:
+                out.append(n[len(pre):])
+        return out
+
+    def visitor_subnet(self, v: str) -> str:
+        return f"10.{self.net}.{dev_index(v)}.0/24"
+
+    def visitor_up(self, v: str) -> None:
+        """A fresh machine: its own namespace, address and config, nothing
+        left from a visitor of the same name in an earlier run."""
+        self.visitor_remove(v)
+        sh(["ip", "route", "del", "blackhole", self.visitor_subnet(v)], check=False)
+        n, r, dv = self.ns(v), self.veth_root(v), self.veth_dev(v)
+        sh(["ip", "netns", "add", n])
+        sh(["ip", "-n", n, "link", "set", "lo", "up"])
+        sh(["ip", "link", "add", r, "type", "veth", "peer", "name", dv])
+        sh(["ip", "link", "set", dv, "netns", n])
+        sh(["ip", "addr", "add", f"{self.gw_ip(v)}/24", "dev", r])
+        sh(["ip", "link", "set", r, "up"])
+        sh(["ip", "-n", n, "addr", "add", f"{self.dev_ip(v)}/24", "dev", dv])
+        sh(["ip", "-n", n, "link", "set", dv, "up"])
+        sh(["ip", "-n", n, "route", "add", "default", "via", self.gw_ip(v)])
+        etc = Path("/etc/netns") / n
+        etc.mkdir(parents=True, exist_ok=True)
+        (etc / "resolv.conf").write_text("nameserver 127.0.0.1\noptions timeout:1 attempts:1\n")
+        c = self.cfg(v)
+        shutil.rmtree(c, ignore_errors=True)
+        for sub in ["cfg", "home/.config", "run", "drop", "files"]:
+            (c / sub).mkdir(parents=True, exist_ok=True)
+        os.chmod(c / "run", 0o700)
+        subprocess.run(["chown", "-R", f"{self.uid}:{self.gid}", str(c)], check=True)
+
+    def visitor_daemon_start(self, v: str) -> None:
+        logf = open(self.cfg(v) / "daemon.1.log", "ab")
+        self.visitors[v] = subprocess.Popen(self.as_dev(v, ["up", "--dir", str(self.cfg(v) / "drop")]),
+                                            env=self.env_for(v), stdout=logf, stderr=subprocess.STDOUT,
+                                            stdin=subprocess.DEVNULL, start_new_session=True)
+
+    def visitor_vanish(self, v: str) -> None:
+        """The machine is destroyed with no goodbye. Its traffic is dropped
+        FIRST, so not even the FIN of a killed socket leaves (killing a
+        process closes its sockets gracefully; a destroyed VM sends nothing),
+        then every process in it dies and its namespace goes. Its subnet is
+        blackholed so packets to it vanish silently, as they do towards a
+        destroyed machine, instead of following the default route out."""
+        ip = self.dev_ip(v)
+        tag = f"chz-gone-{v}"
+        C, C_IN, C_OUT = self.chain("CHAOS"), self.chain("CHAOS_IN"), self.chain("CHAOS_OUT")
+        rules = [(C, ["-s", ip]), (C, ["-d", ip]), (C_IN, ["-s", ip]), (C_OUT, ["-d", ip])]
+        for chain, r in rules:
+            ipt(["-I", chain, "1", *r, "-m", "comment", "--comment", tag, "-j", "DROP"])
+        try:
+            self.visitor_remove(v)
+            sh(["ip", "route", "replace", "blackhole", self.visitor_subnet(v)])
+        finally:
+            for chain, r in rules:
+                ipt(["-D", chain, *r, "-m", "comment", "--comment", tag, "-j", "DROP"], check=False)
+
+    def visitor_remove(self, v: str) -> None:
+        p = self.visitors.pop(v, None)
+        r = sh(["ip", "netns", "pids", self.ns(v)], check=False)
+        for pid in {int(x) for x in r.stdout.split() if x.isdigit()} | ({p.pid} if p else set()):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if p:
+            try:
+                p.wait(10)
+            except subprocess.TimeoutExpired:
+                pass
+        sh(["ip", "link", "del", self.veth_root(v)], check=False)
+        sh(["ip", "netns", "del", self.ns(v)], check=False)
+        shutil.rmtree(Path("/etc/netns") / self.ns(v), ignore_errors=True)
+
+    def mint_visitor_invitation(self, uses: int) -> None:
+        """One reusable runner invitation per run, as a lease pool uses one
+        for every worker it brings up (`add --for runner --reuse N`)."""
+        inv = self.cfg(OWNER) / "files" / f"visitors-{time.time_ns()}.inv"
+        rc, out, err, _ = self.cli(OWNER, ["add", "--for", "runner", "--name", "visitor", "--reuse", str(uses),
+                                           "--out", str(inv), "--yes", "--no-interactive"], 60)
+        if rc != 0 or not inv.exists():
+            raise Refused(f"instrument: visitor invitation not minted rc={rc}: {err.strip()[-300:]}")
+        self.visit_inv = inv
+
+    def list_warm(self, d: str, timeout: float = 3.0) -> list[dict] | None:
+        try:
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(timeout)
+            s.connect(str(self.cfg(d) / "cfg" / "control.sock"))
+            s.sendall(b'{"op":"list-warm"}\n')
+            buf = b""
+            while not buf.endswith(b"\n"):
+                c = s.recv(65536)
+                if not c:
+                    break
+                buf += c
+            s.close()
+            return json.loads(buf).get("links") or []
+        except (OSError, ValueError, AttributeError):
+            return None
+
     def all_daemon_logs(self) -> dict[str, str]:
         out = {}
         for d in DEVICES:
@@ -654,6 +828,9 @@ class World:
         """Every run starts from the same enrolled state with fresh daemons."""
         for d in DEVICES:
             self.daemon_stop(d, signal.SIGKILL)
+        for v in self.visitor_names_present():
+            self.visitor_remove(v)
+        self.visit_inv = None
         self.server_down = 0
         if not self.backend_healthy():
             self.backend_stop()
@@ -857,8 +1034,81 @@ def apply_fault(w: World, st: dict, uid: str) -> Applied | None:
 
 # -------------------------------------------------------------------- ops --
 
+def run_visit(w: World, st: dict, phase: str) -> dict:
+    """One visitor's life: a fresh machine joins with the run's reusable
+    runner invitation, runs `up`, proves the owner answers it (`reach` the
+    owner until it does), optionally sends one file, stays `stay` seconds and
+    vanishes with no goodbye. Never raises: a broken mechanism is recorded as
+    `mech_error` and judged (refused) with the other visitors."""
+    v = st["dst"]
+    res = {"op": "visit", "src": st["src"], "dst": v, "phase": phase, "at": st.get("at"),
+           "deadline": OP_DEADLINE["visit"], "rc": None, "ok": False, "lie": False, "joined": False,
+           "seen": False, "m_start": time.monotonic(), "m_engaged": None, "m_gone": None,
+           "stderr_tail": "", "stdout_tail": "", "mech_error": None}
+    try:
+        w.visitor_up(v)
+        if w.visit_inv is None:
+            raise RuntimeError("no visitor invitation was minted for this run")
+        inv = w.cfg(v) / "files" / "inv.txt"
+        shutil.copy(w.visit_inv, inv)
+        os.chown(inv, w.uid, w.gid)
+    except Exception as e:
+        res["mech_error"] = f"visitor {v} could not be set up: {e}"
+        w.visitor_remove(v)
+        res["m_gone"] = time.monotonic()
+        return res
+    try:
+        rc, out, err, el = w.cli(v, ["join", "--invite-file", str(inv), "--name", v, "--no-interactive"],
+                                 VISIT_JOIN_DEADLINE)
+        res.update(rc=rc, join_s=round(el, 2), joined=rc == 0)
+        res["stderr_tail"] = (err or "").strip()[-400:]
+        res["stderr_full"] = (err or "").strip()[-20000:]
+        res["stdout_tail"] = (out or "").strip()[-200:]
+        if rc != 0:
+            return res
+        w.visitor_daemon_start(v)
+        t_seen = time.monotonic() + VISIT_SEEN_DEADLINE
+        tries = []
+        while time.monotonic() < t_seen:
+            r_rc, _, r_err, r_el = w.cli(v, ["reach", OWNER], min(20.0, max(1.0, t_seen - time.monotonic())))
+            tries.append({"rc": r_rc, "elapsed": round(r_el, 2), "stderr_tail": (r_err or "").strip()[-200:]})
+            if r_rc == 0:
+                res["seen"] = True
+                res["m_engaged"] = time.monotonic()
+                break
+            p = w.visitors.get(v)
+            if p is None or p.poll() is not None:
+                break
+            time.sleep(1.0)
+        res["reach"] = tries[-6:]
+        res["ok"] = res["seen"]
+        if not res["seen"]:
+            res["stderr_tail"] = "visitor joined but the owner never answered it: " + \
+                (tries[-1]["stderr_tail"] if tries else "no reach attempt")
+            return res
+        if st.get("act") == "send":
+            a = run_op(w, {"op": "send", "src": v, "dst": OWNER, "kib": 16}, phase)
+            res["act"] = {k: a.get(k) for k in ("rc", "ok", "lie", "elapsed", "stderr_tail")}
+        time.sleep(max(0.0, min(float(st.get("stay", 5.0)), VISIT_STAY_MAX)))
+        return res
+    finally:
+        p = w.visitors.get(v)
+        res["daemon_rc_before_vanish"] = None if p is None else p.poll()
+        logf = w.cfg(v) / "daemon.1.log"
+        try:
+            w.visitor_vanish(v)
+        except Exception as e:
+            res["mech_error"] = f"visitor {v} could not be removed: {e}"
+        res["m_gone"] = time.monotonic()
+        res["gone_wall"] = time.time()
+        if logf.exists():
+            res["daemon_log"] = logf.read_text(errors="replace")[-200000:]
+
+
 def run_op(w: World, st: dict, phase: str) -> dict:
     kind = st["op"]
+    if kind == "visit":
+        return run_visit(w, st, phase)
     src, dst = st["src"], st["dst"]
     res = {"op": kind, "src": src, "dst": dst, "phase": phase, "at": st.get("at"),
            "deadline": st.get("deadline", OP_DEADLINE[kind])}
@@ -990,6 +1240,135 @@ def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
                      f"{r['stderr_tail'][-180:]}"}]
 
 
+def _overlaps(f: dict, lo: float, hi: float) -> bool:
+    end = f["end"] if f["end"] is not None else float("inf")
+    return f["start"] < hi and end > lo
+
+
+def judge_visits(visits: list[dict], fault_windows: list[dict]) -> list[dict]:
+    """Every visitor must ENGAGE (join, then be answered by the owner) or the
+    run proves nothing about it, like a fault whose mechanism is absent. A
+    broken mechanism, or a visitor that fails before any other visitor proved
+    the path, refuses the run. A visitor that fails AFTER another one engaged
+    is O13: the owner stopped admitting newcomers (the 2026-11-26 link-table
+    starvation), unless a fault of the schedule overlapped it."""
+    vs = sorted(visits, key=lambda r: r["t_start"])
+    for r in vs:
+        if r.get("mech_error"):
+            raise Refused("instrument: " + r["mech_error"])
+    engaged = [r["t_engaged"] for r in vs if r.get("t_engaged") is not None]
+    if not engaged:
+        r = vs[0]
+        raise Refused(f"no visitor engaged; first, {r['dst']}: joined={r.get('joined')} rc={r.get('rc')}: "
+                      f"{(r.get('stderr_tail') or '')[-240:]}")
+    out = []
+    for r in vs:
+        lo, hi = r["t_start"], r["t_gone"]
+        if r.get("t_engaged") is not None:
+            if r.get("join_s", 0) > ENROLL_BOUND:
+                out.append({"oracle": "O13-enrollment-starved", "hard": True,
+                            "what": f"visitor {r['dst']} took {r['join_s']:.0f}s to enroll (bound {ENROLL_BOUND:.0f}s)"})
+            continue
+        if any(_overlaps(f, lo, hi) for f in fault_windows):
+            r["excused"] = "a fault of the schedule overlapped this visitor"
+            continue
+        if not any(e < lo for e in engaged):
+            raise Refused(f"visitor {r['dst']} did not engage and no visitor before it had proved the path "
+                          f"(rc {r.get('rc')}): {(r.get('stderr_tail') or '')[-240:]}")
+        what = ("could not enroll" if not r.get("joined") else "enrolled but the owner never answered it")
+        out.append({"oracle": "O13-enrollment-starved", "hard": True,
+                    "what": f"visitor {r['dst']} {what} after an earlier visitor had engaged "
+                            f"(rc {r.get('rc')}): {(r.get('stderr_tail') or '')[-200:]}"})
+    return out
+
+
+def judge_probe(r: dict, departed: int) -> list[dict]:
+    """O13, final arm: after every visitor left, one more must still enroll
+    within ENROLL_BOUND and be answered by the owner."""
+    if r.get("mech_error"):
+        raise Refused("instrument: " + r["mech_error"])
+    if r.get("joined") and r.get("join_s", 0) <= ENROLL_BOUND and r.get("seen"):
+        return []
+    if not r.get("joined"):
+        what = f"could not enroll (rc {r.get('rc')}, {r.get('join_s', 0):.0f}s)"
+    elif r.get("join_s", 0) > ENROLL_BOUND:
+        what = f"took {r['join_s']:.0f}s to enroll (bound {ENROLL_BOUND:.0f}s)"
+    else:
+        what = "enrolled but the owner never answered it"
+    return [{"oracle": "O13-enrollment-starved", "hard": True,
+             "what": f"a new visitor {what} after {departed} visitor(s) had left: "
+                     f"{(r.get('stderr_tail') or '')[-200:]}"}]
+
+
+_ESTABLISH = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s.*?\bESTABLISH peer=(\S+)", re.M)
+
+
+def establish_events(text: str) -> list[tuple[int, str]]:
+    """(epoch second, peer id) of every link the daemon (re)established."""
+    import calendar
+    return [(calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ")), m.group(2))
+            for m in _ESTABLISH.finditer(text)]
+
+
+def judge_redial(text: str, lo: float, hi: float, live: set[str], k: int = REDIAL_MAX) -> tuple[list[dict], dict]:
+    """O12: in [lo, hi] every visitor is gone. A peer id, other than a live
+    device's, that the owner established more than `k` times in that window is
+    being re-dialled past the designed ladder (MAX_ATTEMPTS rebuilds, then
+    drop). No ESTABLISH line in the whole log means debug logging is not
+    reaching the file, so the rule could not see a storm: refused, never
+    passed."""
+    ev = establish_events(text)
+    if not ev:
+        raise Refused("instrument: the owner's log has no timestamped ESTABLISH line; O12 is blind")
+    counts: dict[str, int] = {}
+    for t, sid in ev:
+        if int(lo) <= t <= hi and sid not in live:
+            counts[sid] = counts.get(sid, 0) + 1
+    out = [{"oracle": "O12-redial-departed", "hard": True,
+            "what": f"alpha re-established departed peer {sid[:12]} {c} times in {hi - lo:.0f}s after every "
+                    f"visitor had left (ladder bound {k})"}
+           for sid, c in sorted(counts.items(), key=lambda x: -x[1]) if c > k]
+    return out, counts
+
+
+def visitor_oracles(w: World, visits: list[dict], t0: float, fault_windows: list[dict], verdict: dict) -> list[dict]:
+    for r in visits:
+        r["t_start"] = round(r.pop("m_start") - t0, 1)
+        e = r.pop("m_engaged")
+        r["t_engaged"] = None if e is None else round(e - t0, 1)
+        r["t_gone"] = round(r.pop("m_gone") - t0, 1)
+        log_text = r.pop("daemon_log", None)
+        if log_text:
+            w.visitor_logs[f"{r['dst']}-daemon.log"] = log_text
+    found = judge_visits(visits, fault_windows)
+    info: dict = {"visitors": len(visits), "engaged": sum(1 for r in visits if r.get("t_engaged") is not None)}
+    verdict["visitors"] = info
+    alpha = w.daemons.get(OWNER)
+    if not alpha or alpha.poll() is not None:
+        info["skipped"] = "the owner's daemon is not running"
+        return found
+    gone = max(r.get("gone_wall", 0.0) for r in visits)
+    lo, hi = gone + REDIAL_GRACE, gone + REDIAL_GRACE + REDIAL_QUIET
+    while time.time() < hi:
+        if w.stop.is_set():
+            raise Aborted()
+        time.sleep(min(2.0, max(0.05, hi - time.time())))
+    live = {l.get("pid") for l in (w.list_warm(OWNER) or []) if l.get("name") in DEVICES}
+    f12, counts = judge_redial(w.all_daemon_logs()[OWNER], lo, hi, live)
+    found += f12
+    info["redial_window_s"] = round(hi - lo, 1)
+    info["redial_counts"] = dict(sorted(counts.items(), key=lambda x: -x[1])[:20])
+    used = max(visitor_no(r["dst"]) or 0 for r in visits)    # < MAX_VISITORS: check_visits
+    pr = run_visit(w, {"op": "visit", "src": OWNER, "dst": f"vis{used + 1}", "stay": 0.0}, "probe")
+    for k in ("m_start", "m_engaged", "m_gone"):
+        pr.pop(k, None)
+    if pr.get("daemon_log"):
+        w.visitor_logs[f"vis{used + 1}-probe-daemon.log"] = pr.pop("daemon_log")
+    info["probe"] = {k: pr.get(k) for k in ("dst", "rc", "joined", "join_s", "seen", "stderr_tail")}
+    found += judge_probe(pr, len(visits))
+    return found
+
+
 # ------------------------------------------------------------- one run ---
 
 def run_schedule(w: World, sched: dict, label: str) -> dict:
@@ -997,7 +1376,17 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
     product misbehaviour; raises Refused for fixture problems)."""
     t_wall = time.monotonic()
     w.assert_binary_unchanged()
-    w.reset_for_run(sched.get("hooks", {}))
+    try:
+        check_visits(sched)
+    except ValueError as e:
+        raise Refused(f"instrument: bad schedule: {e}")
+    n_visits = sum(1 for st in sched["steps"] if st.get("op") == "visit")
+    hooks = copy.deepcopy(sched.get("hooks", {}))
+    if n_visits:
+        # O12 reads the owner's ESTABLISH lines, which are debug level.
+        hooks.setdefault(OWNER, {}).setdefault("TUNLION_LOG", "debug")
+    w.visitor_logs = {}
+    w.reset_for_run(hooks)
     verdict: dict = {"label": label, "schedule": sched, "findings": [], "ops": [], "faults": []}
 
     # Baseline: the fixture must work before any fault, or the run proves nothing.
@@ -1009,6 +1398,8 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
     base = run_op(w, {"op": "exec", "src": "bravo", "dst": OWNER}, "baseline")
     if not base["ok"]:
         raise Refused(f"baseline exec bravo->alpha failed rc={base['rc']}: {base['stderr_tail'][-200:]}")
+    if n_visits:
+        w.mint_visitor_invitation(n_visits + 1)     # +1: the final probe visitor
 
     t0 = time.monotonic()
     active: list[tuple[float, Applied]] = []
@@ -1069,6 +1460,10 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
     verdict["fault_windows"] = [{"fault": f["step"]["fault"], "start": round(f["start"], 1),
                                  "end": None if f["end"] is None else round(f["end"], 1)} for f in fault_windows]
     for r in results:
+        if r["op"] == "visit":
+            if not r.get("mech_error"):
+                verdict["findings"].extend(judge_op(r))
+            continue
         verdict["findings"].extend(judge_op(r))
         verdict["findings"].extend(judge_diagnosis(r, fault_windows))
         verdict["findings"].extend(judge_local_status(r, fault_windows))
@@ -1115,6 +1510,13 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
             verdict["findings"].append({"oracle": "O5-reconnect-storm", "hard": True,
                                         "what": f"{d} opened {c} server connections in the post-heal window"})
 
+    # Visitors: every one engaged, the owner lets go of the departed ones,
+    # and a newcomer is still admitted (O12, O13). After the storm window, so
+    # the checks above keep their meaning.
+    visits = [r for r in results if r["op"] == "visit"]
+    if visits:
+        verdict["findings"].extend(visitor_oracles(w, visits, t0, fault_windows, verdict))
+
     logs = w.all_daemon_logs()
     for d, text in logs.items():
         if "panicked at" in text:
@@ -1138,6 +1540,7 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
         # Confirm and minimize replay the schedule and overwrite the daemon
         # logs. Keep the logs of THIS run, the one that failed.
         verdict["evidence_logs"] = {f"{d}-daemon.log": t for d, t in logs.items()}
+        verdict["evidence_logs"].update(getattr(w, "visitor_logs", {}))
         for d, dump in (verdict.get("thread_dumps") or {}).items():
             verdict["evidence_logs"][f"{d}-threads.txt"] = dump
         bl = w.work / "backend.log"
@@ -1187,7 +1590,7 @@ def record_run(w: "World", verdict: dict) -> None:
         _run_seq[0] += 1
         n = _run_seq[0] - 1
     rec = {k: verdict.get(k) for k in ("label", "schedule", "faults", "fault_windows", "ops", "findings", "elapsed_s",
-                                       "unreported_signaling", "storm", "wall_s")}
+                                       "unreported_signaling", "storm", "wall_s", "visitors")}
     rec["world"] = w.k
     rec["kinds_count"] = len(verdict.get("kinds", []))
     safe = re.sub(r"[^\w.-]", "_", re.sub(r"\.json$", "", verdict["label"]))[:60]
@@ -1290,6 +1693,7 @@ def _save_finding(out: Path, verdict: dict, w: World, repro: str) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     (d / "schedule.json").write_text(json.dumps(verdict["schedule"], indent=2, sort_keys=True))
     v = {k: verdict[k] for k in ("label", "findings", "ops", "faults")}
+    v["visitors"] = verdict.get("visitors")
     v["reproduced"] = repro
     (d / "verdict.json").write_text(json.dumps(v, indent=2, sort_keys=True))
     logs = d / "logs"
@@ -1558,6 +1962,77 @@ def cmd_hookcheck(worlds: list[World], out: Path, repeat: int = 3, first=None) -
     return 0
 
 
+def selftest_visitors() -> None:
+    """O12 and O13 judged on fixed inputs: the production log shape of the
+    2026-11-26 zombie (one departed sid rebuilt every ~16 s), the designed
+    ladder (at most MAX_ATTEMPTS rebuilds, then drop) and the engagement rules."""
+    import calendar
+
+    def stamp(t: int) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    base = calendar.timegm((2026, 11, 26, 0, 0, 0, 0, 0, 0))
+    lo, hi = base + 10, base + 10 + REDIAL_QUIET
+
+    def est(t: int, sid: str) -> str:
+        return f"{stamp(t)} tunlion: ESTABLISH peer={sid} caller=cli/src/conn.rs:7181 early=0 signals=0"
+    zombie = [est(base + i * 16, "ZOMBIEsid1") for i in range(15)]           # forever, 2/5 again and again
+    ladder = [est(base + 12 + i * 16, "LADDERsid2") for i in range(REDIAL_MAX)]  # gives up as designed
+    live = [est(base + 20 + i * 5, "BRAVOsid") for i in range(20)]            # a live device's own sid
+    noise = [f"{stamp(base + 30)} tunlion: peer 'bravo' reconnected", "not a stamped line ESTABLISH peer=X"]
+    text = "\n".join(sorted(zombie + ladder + live + noise))
+    f, counts = judge_redial(text, lo, hi, {"BRAVOsid"})
+    assert [x["oracle"] for x in f] == ["O12-redial-departed"] and "ZOMBIEsid1"[:12] in f[0]["what"], f
+    assert counts["ZOMBIEsid1"] > REDIAL_MAX and counts["LADDERsid2"] == REDIAL_MAX and "BRAVOsid" not in counts, counts
+    f, _ = judge_redial(text, lo, hi, set())
+    assert {x["what"].split()[4] for x in f} == {"ZOMBIEsid1", "BRAVOsid"}, "without the live set a busy sid counts"
+    before = "\n".join(est(base - 200 + i * 16, "OLDsid") for i in range(10)) + "\n" + est(base + 20, "x")
+    assert judge_redial(before, lo, hi, set())[0] == [], "dials before the window are not counted"
+    try:
+        judge_redial(f"{stamp(base)} tunlion: peer joined\n", lo, hi, set())
+        raise AssertionError("an owner log without ESTABLISH lines must refuse, not pass")
+    except Refused as e:
+        assert str(e).startswith("instrument"), e
+    # Engagement: refuse when nothing engaged or a failure has no earlier proof;
+    # a failure after a proof is O13; a fault overlapping excuses it.
+    ok = lambda name, t, j=2.0: {"dst": name, "t_start": t, "t_engaged": t + 5, "t_gone": t + 10,  # noqa: E731
+                                 "joined": True, "join_s": j, "seen": True}
+    bad = {"dst": "vis3", "t_start": 40.0, "t_engaged": None, "t_gone": 100.0, "joined": False, "rc": 1,
+           "stderr_tail": "enrollment timed out after 60s (no response from peer)"}
+    assert judge_visits([ok("vis1", 1.0), ok("vis2", 20.0)], []) == []
+    f = judge_visits([ok("vis1", 1.0), ok("vis2", 20.0), bad], [])
+    assert len(f) == 1 and f[0]["oracle"] == "O13-enrollment-starved" and "could not enroll" in f[0]["what"], f
+    iso = [{"step": {"fault": "net.isolate", "target": OWNER}, "start": 30.0, "end": 60.0}]
+    assert judge_visits([ok("vis1", 1.0), dict(bad)], iso) == [], "a fault of the schedule excuses it"
+    for vs in ([dict(bad, t_start=0.0)], [dict(bad, t_start=0.0), ok("vis2", 20.0)]):
+        try:
+            judge_visits(vs, [])
+            raise AssertionError(f"must refuse: {vs}")
+        except Refused:
+            pass
+    try:
+        judge_visits([dict(ok("vis1", 1.0), mech_error="visitor vis1 could not be set up: x")], [])
+        raise AssertionError("a broken visitor mechanism must refuse")
+    except Refused as e:
+        assert str(e).startswith("instrument"), e
+    assert judge_visits([ok("vis1", 1.0, j=75.0)], [])[0]["oracle"] == "O13-enrollment-starved"
+    assert judge_probe(ok("vis15", 400.0), 14) == []
+    assert judge_probe(dict(bad, dst="vis15"), 14)[0]["oracle"] == "O13-enrollment-starved"
+    assert judge_probe(dict(ok("vis15", 400.0), seen=False), 14)[0]["oracle"] == "O13-enrollment-starved"
+    # Visitor names map into the world's /16 without touching the devices.
+    assert dev_index("vis1") == VISITOR_BASE + 1 and dev_index("alpha") == 1 and visitor_no("vis0") is None
+    vw = World.__new__(World)
+    vw.k, vw.net = 15, 105
+    assert len(vw.veth_root(f"vis{MAX_VISITORS}")) <= 15 and vw.dev_ip(f"vis{MAX_VISITORS}").split(".")[2] == "210"
+    for bad_s in ([{"op": "visit", "at": 1, "src": OWNER, "dst": "vis1"}] * 2,
+                  [{"op": "visit", "at": 1, "src": "bravo", "dst": "vis1"}],
+                  [{"op": "visit", "at": 1, "src": OWNER, "dst": f"vis{MAX_VISITORS}"}]):
+        try:
+            check_visits({"steps": bad_s})
+            raise AssertionError(bad_s)
+        except ValueError:
+            pass
+
+
 def cmd_selftest() -> int:
     rng = random.Random(1)
     for _ in range(500):
@@ -1653,13 +2128,17 @@ def cmd_selftest() -> int:
     assert len({x.chain(r) for x in ws for r, _ in CHAINS}) == 3 * len(CHAINS)
     assert re.search(r"LOOP-BUDGET-EXCEEDED (\d+) (\S+)",
                      "2026-11-25T23:01:02Z LOOP-BUDGET-EXCEEDED 2007 handler/Control:file-end slowest_ms=2007 budget_ms=1000").groups() == ("2007", "handler/Control:file-end")
+    selftest_visitors()
     for p in sorted((HERE / "corpus").glob("*.json")) + sorted((HERE / "corpus-grown").glob("*.json")):
         s = json.loads(p.read_text())
         assert s.get("version") == 1 and s["steps"], p
+        check_visits(s)
         for st in s["steps"]:
             assert ("fault" in st) != ("op" in st), (p, st)
             if "fault" in st:
                 assert st["fault"] in FAULTS, (p, st)
+            else:
+                assert st["op"] in OPS + ["visit"], (p, st)
     print("selftest ok")
     return 0
 
