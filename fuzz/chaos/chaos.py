@@ -1188,6 +1188,10 @@ _NAMES_PATH = re.compile(r"firewall|\bpath\b|relay|\bUDP\b|network between", re.
 # Faults that really can make the peer look offline. A partition between two
 # devices or a degraded link cannot: the peer is still up and announced.
 _PEER_DOWN_FAULTS = {"proc.freeze", "proc.kill", "sig.blackhole", "sig.reset", "net.isolate"}
+# A message that says the problem is on this machine's side (#732, #736).
+_BLAMES_SELF = re.compile(r"this machine's own connection|can't reach the tunlion server from this machine", re.I)
+# Faults on a device's own network path that make such a message true.
+_SELF_NET_FAULTS = {"net.impair", "net.isolate", "sig.blackhole", "sig.reset"}
 
 
 def judge_local_status(r: dict, fault_windows: list[dict]) -> list[dict]:
@@ -1219,10 +1223,25 @@ def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
     if r.get("ok") or r.get("rc") in (None, 0) or "t_start" not in r:
         return []
     err = r.get("stderr_tail") or ""
-    if not _BLAMES_PEER.search(err) or _NAMES_PATH.search(err):
-        return []
     dst = r["dst"]
     lo, hi = r["t_start"] - 15.0, r["t_end"]
+    # A message that puts the cause on THIS machine's own connection is a
+    # claim we can check: it is right only if a fault on the source's own
+    # network overlapped the command. Blaming a healthy own link is just as
+    # wrong as blaming a healthy peer.
+    if _BLAMES_SELF.search(err):
+        src = r["src"]
+        for f in fault_windows:
+            st = f["step"]
+            if not _overlaps(f, lo, hi):
+                continue
+            if st["fault"] == "server.down" or (st["fault"] in _SELF_NET_FAULTS and st.get("target") == src):
+                return []
+        return [{"oracle": "O9-misdiagnosis", "hard": True,
+                 "what": f"{r['op']} {src}->{dst} blamed this machine's own connection (rc {r['rc']}), but no "
+                         f"fault touched {src}'s network: {err[-180:]}"}]
+    if not _BLAMES_PEER.search(err) or _NAMES_PATH.search(err):
+        return []
     for f in fault_windows:
         st = f["step"]
         end = f["end"] if f["end"] is not None else float("inf")
@@ -2129,6 +2148,13 @@ def cmd_selftest() -> int:
     assert re.search(r"LOOP-BUDGET-EXCEEDED (\d+) (\S+)",
                      "2026-11-25T23:01:02Z LOOP-BUDGET-EXCEEDED 2007 handler/Control:file-end slowest_ms=2007 budget_ms=1000").groups() == ("2007", "handler/Control:file-end")
     selftest_visitors()
+    selfmsg = dict(blamed, src="alpha", dst="charlie", stderr_tail="charlie did not appear on the tunlion server "
+                   "in time, but this machine's own connection to the server is slow (connecting took 23.1 s), "
+                   "so charlie may be fine")
+    own = [{"step": {"fault": "net.impair", "target": "alpha"}, "start": 0.0, "end": 80.0}]
+    assert judge_diagnosis(selfmsg, own) == [], "a true self-blame is the right diagnosis"
+    other = [{"step": {"fault": "net.impair", "target": "bravo"}, "start": 0.0, "end": 80.0}]
+    assert judge_diagnosis(selfmsg, other)[0]["oracle"] == "O9-misdiagnosis", "blaming a healthy own link is wrong"
     for p in sorted((HERE / "corpus").glob("*.json")) + sorted((HERE / "corpus-grown").glob("*.json")):
         s = json.loads(p.read_text())
         assert s.get("version") == 1 and s["steps"], p
