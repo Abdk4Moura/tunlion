@@ -1346,6 +1346,33 @@ def judge_local_status(r: dict, fault_windows: list[dict]) -> list[dict]:
                      f"were active ({', '.join(faults)}): {r['stderr_tail'][:200]}"}]
 
 
+# O14: how long after a fault heals an op may still fail for that fault's
+# sake (presence, ICE and the retry ladder settle; the post-heal probes judge
+# recovery itself).
+UNFAULTED_SETTLE = 30.0
+
+
+def judge_unfaulted(r: dict, fault_windows: list[dict]) -> list[dict]:
+    """O14: an op that failed while nothing was injected. Hooks in a schedule
+    are RECOVERABLE by definition (hookcheck proves each one), so with no
+    fault overlapping the op, nor ending within UNFAULTED_SETTLE before it,
+    the op must succeed. Without this rule a schedule of hooks alone judged
+    nothing about its ops: 24/24 code receives to stdout failed with
+    "Permission denied" and every run was called clean (2026-11-26)."""
+    if r.get("ok") or "t_start" not in r or r.get("op") == "visit":
+        return []
+    lo, hi = r["t_start"] - UNFAULTED_SETTLE, r["t_end"]
+    for f in fault_windows:
+        end = f["end"] if f["end"] is not None else float("inf")
+        if f["start"] <= hi and end >= lo:
+            return []
+    rc = "hung" if r.get("rc") is None else f"rc {r.get('rc')}"
+    tail = (r.get("stderr_tail") or "").strip().splitlines()[-1:] or [""]
+    return [{"oracle": "O14-failed-unfaulted", "hard": True,
+             "what": f"{r['op']} {r['src']}->{r['dst']} failed ({rc}) with no fault active or healed within "
+                     f"{UNFAULTED_SETTLE:.0f}s: {tail[0][:200]}"}]
+
+
 def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
     """O9: the command blamed the peer (offline, not running) while the peer
     was up: no fault that could take it offline overlapped the command (15 s
@@ -1617,6 +1644,7 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
         verdict["findings"].extend(judge_op(r))
         verdict["findings"].extend(judge_diagnosis(r, fault_windows))
         verdict["findings"].extend(judge_local_status(r, fault_windows))
+        verdict["findings"].extend(judge_unfaulted(r, fault_windows))
 
     # After heal: every daemon reconnects, every path works, nobody storms.
     alive = [d for d in DEVICES if w.daemons[d] and w.daemons[d].poll() is None]
@@ -2259,6 +2287,15 @@ def cmd_selftest() -> int:
     assert judge_diagnosis(blamed, part)[0]["oracle"] == "O9-misdiagnosis"
     frozen = [{"step": {"fault": "proc.freeze", "target": "bravo"}, "start": 0.0, "end": 60.0}]
     assert judge_diagnosis(blamed, frozen) == []
+    failed = {"op": "send", "src": "alpha", "dst": "bravo", "ok": False, "rc": 6, "t_start": 50.0, "t_end": 60.0,
+              "stderr_tail": "Error: Permission denied (os error 13)"}
+    assert judge_unfaulted(failed, [])[0]["oracle"] == "O14-failed-unfaulted"
+    assert judge_unfaulted(dict(failed, rc=None), [])[0]["what"].startswith("send alpha->bravo failed (hung)")
+    assert judge_unfaulted(dict(failed, ok=True), []) == []
+    assert judge_unfaulted(failed, [{"step": {}, "start": 55.0, "end": 70.0}]) == [], "overlapping fault"
+    assert judge_unfaulted(failed, [{"step": {}, "start": 5.0, "end": 25.0}]) == [], "healed within the settle"
+    assert judge_unfaulted(failed, [{"step": {}, "start": 5.0, "end": None}]) == [], "never healed"
+    assert judge_unfaulted(failed, [{"step": {}, "start": 1.0, "end": 10.0}])[0]["oracle"] == "O14-failed-unfaulted"
     assert judge_diagnosis(dict(blamed, dst_signaling_after="down"), part) == []
     assert judge_diagnosis(dict(blamed, stderr_tail="connect timeout: couldn't reach 'bravo' in 45s"), part) == []
     old = [{"step": {"fault": "proc.kill", "target": "bravo"}, "start": 0.0, "end": 1.0}]

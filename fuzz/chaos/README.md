@@ -75,6 +75,7 @@ A schedule with visits turns on alpha's debug log and adds two rules:
   left, alpha must not establish any peer id other than a live device's more
   than MAX_ATTEMPTS (5) times: the stuck-retry ladder gives up after that.
 - O13-enrollment-starved: one more visitor, after all of them left, must enroll
+- O14-failed-unfaulted: an op that ran with no fault active, nor one healed within 30 s before it, must succeed (hooks are recoverable by definition)
   within 60 s and be answered; so must any visitor that comes after another one
   engaged.
 
