@@ -4071,6 +4071,7 @@ async fn recv_run(
         // a PERIODIC OBSERVATION of link-up state, deliberately not an event
         // fired by message receipt (a traffic-driven refresh would reap healthy
         // quiet devices exactly the way xats reaped chief-ux).
+        loop_budget.enter("liveness");
         if daemon && last_liveness_observe.elapsed() >= Duration::from_secs(8) {
             last_liveness_observe = Instant::now();
             let live: Vec<String> = conn
@@ -4106,6 +4107,7 @@ async fn recv_run(
         // record as evidence (option b, decided deliberately), EXCEPT an
         // ephemeral device's and an ended fleet sibling's, which are removed
         // (DeviceStore::devices_sweep_lapsed).
+        loop_budget.enter("sweep");
         if daemon && last_sweep.elapsed() >= Duration::from_secs(30) {
             last_sweep = Instant::now();
             let lapsed = ports.store.devices_sweep_lapsed(filament_id::now_secs());
@@ -4138,6 +4140,7 @@ async fn recv_run(
         // Each attempt is spawned rather than awaited: the two ends rendezvous
         // on a QUIC bi-stream, so whichever side ticks first waits for the
         // other, and blocking the daemon loop on that would stall everything.
+        loop_budget.enter("wg-reconcile");
         if daemon
             && last_wg_check.elapsed() >= Duration::from_secs(10)
             && host
@@ -4189,6 +4192,7 @@ async fn recv_run(
         // reconciler is deaf to exactly the event it most needs to hear. For an
         // exit node that gap is the difference between a stale entry and a
         // machine holding a default route into a tunnel nobody is carrying.
+        loop_budget.enter("route-reconcile");
         if daemon && last_route_reconcile.elapsed() >= Duration::from_secs(15) {
             last_route_reconcile = Instant::now();
             if let Some(l3) = l3.as_ref() {
@@ -4207,6 +4211,7 @@ async fn recv_run(
         // device is a fleet member whose certificate is in its last third, so
         // the common case is a few comparisons. It asks every live peer because
         // only a primary can answer and we do not know which one that is.
+        loop_budget.enter("cert-renewal");
         if daemon && last_renewal_check.elapsed() >= Duration::from_secs(30) {
             last_renewal_check = Instant::now();
             let live: Vec<String> = conn
@@ -4223,6 +4228,7 @@ async fn recv_run(
         // ROSTER (v1, owner-only): push the mesh roster over live links on a
         // membership change, a validity refresh, or a newly-established link.
         // Runs faster than the sweep so a new link gets the roster promptly.
+        loop_budget.enter("roster-push");
         if daemon && last_roster_push.elapsed() >= Duration::from_secs(5) {
             last_roster_push = Instant::now();
             conn.roster_maintenance().await;
@@ -4231,6 +4237,7 @@ async fn recv_run(
 
         // Daemon-managed mount health check: the host server owns the mount
         // table and the child processes; the loop only paces it.
+        loop_budget.enter("mount-health");
         if daemon && last_mount_check.elapsed() >= Duration::from_secs(30) {
             last_mount_check = Instant::now();
             ports.daemon.mount_health_tick(host.as_ref()).await;
@@ -4240,6 +4247,7 @@ async fn recv_run(
         // no link to, for as long as the server is unreachable, and at start
         // (until 40 s) for any device signaling has not linked within the
         // online grace. Every 15 s.
+        loop_budget.enter("lan-dial");
         if conn.lan.is_some()
             && last_lan_dial.map_or(lan_started.elapsed() >= Duration::from_millis(300), |t| t.elapsed() >= Duration::from_secs(15))
         {
@@ -4270,6 +4278,7 @@ async fn recv_run(
         // WARM-HOLD: periodically check for warm peers that need connections.
         // This keeps recently-used and explicitly configured peers connected
         // so `tunlion reach`/`ssh` is instant. Runs every 10s, daemon-only.
+        loop_budget.enter("warm-hold");
         if daemon && last_warm_hold_tick.elapsed() >= Duration::from_secs(10) {
             last_warm_hold_tick = Instant::now();
             // Warm-all is the DEFAULT (auto-warm setting, opt-out). L3 forces it on:
