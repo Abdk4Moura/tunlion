@@ -76,6 +76,7 @@ EXPECTED_GREEN=(
   "shrinking-source: sender stopped|shrinking-source"
   "dead receiver: sender gave up|dead receiver"
   "stdout-pipe: -o - into a slow pipe|stdout-pipe"
+  "stdout-promote: -o - across a mid-stream path promote|stdout-promote"
   "sender-killed: receiver gave up|sender-killed"
   # Known-red gates repaired by fix/known-red-gates, measured green on GitHub
   # runners on main and on integration/launch-candidate before being listed.

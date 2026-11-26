@@ -234,8 +234,11 @@ def random_op(rng: random.Random) -> dict:
     if kind == "exec":
         return {"op": "exec", "at": at, "src": rng.choice(DELEGATES), "dst": OWNER}
     if kind == "send":
-        return {"op": "send", "at": at, "src": OWNER, "dst": rng.choice(DELEGATES),
-                "kib": rng.choice([4, 256, 4096])}
+        op = {"op": "send", "at": at, "src": OWNER, "dst": rng.choice(DELEGATES),
+              "kib": rng.choice([4, 256, 4096])}
+        if rng.random() < 0.3:
+            op["via"] = "stdout"
+        return op
     if kind == "status":
         # Asking your own machine must answer fast, even with its daemon frozen.
         d = rng.choice(DEVICES)
@@ -1124,6 +1127,86 @@ def run_visit(w: World, st: dict, phase: str) -> dict:
             res["daemon_log"] = logf.read_text(errors="replace")[-200000:]
 
 
+# A send whose receiver writes to stdout: `send --word` on src, a one-shot
+# `receive <code> -y -o -` on dst, its stdout read slowly so the pipe fills (the
+# shape of gate T3). Stdout cannot be rewound, so the oracle is about what the
+# reader got: either end exiting 0 while those bytes are not the source is O7.
+STDOUT_WORD = "gigantic-element"
+STDOUT_CODE = re.compile(rb"gigantic-element-[0-9]{3,5}", re.I)
+
+
+def stdout_send_verdict(src: bytes, got: bytes, send_rc: int | None, recv_rc: int | None) -> tuple[bool, bool]:
+    """(ok, lie) for a send to stdout. Pure."""
+    intact = hashlib.sha256(got).digest() == hashlib.sha256(src).digest()
+    ok = send_rc == 0 and recv_rc == 0 and intact
+    return ok, (send_rc == 0 or recv_rc == 0) and not intact
+
+
+def send_to_stdout(w: World, st: dict, res: dict, deadline: float) -> None:
+    src, dst = st["src"], st["dst"]
+    t0 = time.monotonic()
+    tag = f"{random.randrange(1 << 40):x}"
+    f = w.cfg(src) / "files" / f"chz-{tag}.bin"
+    data = os.urandom(st.get("kib", 4) * 1024)
+    f.write_bytes(data)
+    os.chown(f, w.uid, w.gid)
+    slog = w.cfg(src) / f"stdout-send-{tag}.log"
+    rlog = w.cfg(dst) / f"stdout-recv-{tag}.log"
+    with open(slog, "wb") as so:
+        sp = subprocess.Popen(w.as_dev(src, ["send", str(f), "--word", STDOUT_WORD]), env=w.env_for(src),
+                              stdout=so, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                              start_new_session=True)
+    code = None
+    while time.monotonic() - t0 < deadline and sp.poll() is None:
+        m = STDOUT_CODE.search(slog.read_bytes())
+        if m:
+            code = m.group(0).decode()
+            break
+        time.sleep(0.3)
+    got = bytearray()
+    recv_rc = None
+    rerr = b""
+    if code:
+        with open(rlog, "wb") as re_:
+            rp = subprocess.Popen(w.as_dev(dst, ["receive", code, "-y", "-o", "-", "--timeout", "60"]),
+                                  env=w.env_for(dst), stdout=subprocess.PIPE, stderr=re_,
+                                  stdin=subprocess.DEVNULL, start_new_session=True)
+
+        def drain() -> None:
+            while True:
+                b = rp.stdout.read(65536)
+                if not b:
+                    return
+                got.extend(b)
+                time.sleep(0.05)
+
+        th = threading.Thread(target=drain, daemon=True)
+        th.start()
+        try:
+            recv_rc = rp.wait(max(1.0, deadline - (time.monotonic() - t0)))
+        except subprocess.TimeoutExpired:
+            os.killpg(rp.pid, signal.SIGKILL)
+            rp.wait()
+        th.join(10)
+        rerr = rlog.read_bytes()
+    try:
+        send_rc = sp.wait(max(1.0, deadline - (time.monotonic() - t0)))
+    except subprocess.TimeoutExpired:
+        os.killpg(sp.pid, signal.SIGKILL)
+        sp.wait()
+        send_rc = None
+    ok, lie = stdout_send_verdict(data, bytes(got), send_rc, recv_rc)
+    # The op's rc is the first end that did not succeed (None: a hang), so the
+    # rc and silence oracles judge whichever end failed.
+    rc = send_rc if send_rc != 0 or not code else recv_rc
+    err = (b"send: " + slog.read_bytes()[-10000:] + b"\nreceive: " + rerr[-10000:]).decode(errors="replace")
+    res.update(rc=rc, elapsed=round(time.monotonic() - t0, 2), ok=ok, lie=lie, via="stdout",
+               send_rc=send_rc, recv_rc=recv_rc, got_bytes=len(got), want_bytes=len(data))
+    res["stderr_tail"] = err.strip()[-400:]
+    res["stderr_full"] = err.strip()[-20000:]
+    res["stdout_tail"] = ""
+
+
 def run_op(w: World, st: dict, phase: str) -> dict:
     kind = st["op"]
     if kind == "visit":
@@ -1138,6 +1221,9 @@ def run_op(w: World, st: dict, phase: str) -> dict:
         rc, out, err, el = w.cli(src, ["exec", dst, "--", *cmd], deadline)
         res.update(rc=rc, elapsed=round(el, 2), ok=(rc == 0 and token in out))
         res["lie"] = rc == 0 and token not in out
+    elif kind == "send" and st.get("via") == "stdout":
+        send_to_stdout(w, st, res, deadline)
+        return res
     elif kind == "send":
         name = f"chz-{random.randrange(1 << 40):x}.bin"
         f = w.cfg(src) / "files" / name
@@ -1187,8 +1273,11 @@ def judge_op(r: dict) -> list[dict]:
     elif r["rc"] not in DOCUMENTED_RC:
         f.append({"oracle": "O6-undocumented-rc", "hard": True, "what": f"{who} exited {r['rc']}"})
     if r.get("lie"):
-        f.append({"oracle": "O7-false-success", "hard": True,
-                  "what": f"{who} exited 0 but the result was missing or wrong"})
+        what = f"{who} exited 0 but the result was missing or wrong"
+        if r.get("via") == "stdout":
+            what = (f"{who} via stdout: send rc {r.get('send_rc')}, receive rc {r.get('recv_rc')}, "
+                    f"but stdout held {r.get('got_bytes')} bytes that are not the {r.get('want_bytes')}-byte source")
+        f.append({"oracle": "O7-false-success", "hard": True, "what": what})
     if r["rc"] not in (0, None) and not r["stderr_tail"]:
         f.append({"oracle": "O8-silent-failure", "hard": True,
                   "what": f"{who} failed (rc {r['rc']}) with nothing on stderr"})
@@ -2091,6 +2180,12 @@ def cmd_selftest() -> int:
     assert line_kind("signaling reconnected") != line_kind("signaling link closed, reconnecting")
     assert judge_op({"op": "exec", "src": "b", "dst": "a", "phase": "x", "rc": None, "stderr_tail": ""})[0]["oracle"] == "O2-hang"
     assert judge_op({"op": "send", "src": "a", "dst": "b", "phase": "x", "rc": 0, "lie": True, "stderr_tail": ""})[0]["oracle"] == "O7-false-success"
+    # T3's false success: both ends exit 0, stdout holds the file plus 60 KiB.
+    src = os.urandom(4096)
+    assert stdout_send_verdict(src, src, 0, 0) == (True, False)
+    assert stdout_send_verdict(src, src[:1024] + src, 0, 0) == (False, True)
+    assert stdout_send_verdict(src, src[:1024], 2, 0) == (False, True), "the receiver's rc 0 is a claim too"
+    assert stdout_send_verdict(src, src[:1024], 2, 4) == (False, False), "an honest failure is not a lie"
     assert judge_op({"op": "exec", "src": "b", "dst": "a", "phase": "x", "rc": 6, "stderr_tail": ""})[0]["oracle"] == "O8-silent-failure"
     assert judge_op({"op": "exec", "src": "b", "dst": "a", "phase": "x", "rc": 6, "stderr_tail": "offline"}) == []
     blamed = {"op": "send", "src": "alpha", "dst": "bravo", "ok": False, "rc": 6, "t_start": 3.0, "t_end": 63.0,

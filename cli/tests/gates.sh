@@ -1446,6 +1446,42 @@ while True:
   fi
 fi
 
+# --------------------------------------------------------------- gate T3b ---
+say "T3b: -o - stays byte-exact when the transfer moves to the direct path mid-stream"
+# T3 failed about 1 run in 10 with out.bin 61440 bytes too long while both ends
+# said "delivered + verified": the offer had been accepted on the first link,
+# the path promote moved to direct, the sender re-offered the same transfer
+# there, and `-o -` (which had no .part for the C23 duplicate guard to key on)
+# opened a SECOND stdout sink. Both wrote; the second sink's own digest matched.
+# Holding the direct path back makes that order the rule, not the exception:
+# without the fix this failed 10 of 10 (2 of them with both ends exit 0).
+D="$WORK/gT3b"; mkdir -p "$D"
+TUNLION_TEST_DIRECT_DELAY_MS=1500 "$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/gT3b-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/gT3b-send.log") || { bad "stdout-promote (no code minted)"; tail -n 3 "$WORK/gT3b-send.log"; }
+if [ -n "${W:-}" ]; then
+  { TUNLION_TEST_DIRECT_DELAY_MS=1500 timeout 120 "$BIN" receive "$W" -y -o - --server "$SERVER" 2>"$WORK/gT3b-recv.log"; echo $? >"$WORK/gT3b-recv.rc"; } \
+    | python3 -c '
+import sys, time
+out = open(sys.argv[1], "wb")
+while True:
+    b = sys.stdin.buffer.read(65536)
+    if not b:
+        break
+    out.write(b)
+    time.sleep(0.05)
+' "$D/out.bin"
+  RCR=$(cat "$WORK/gT3b-recv.rc" 2>/dev/null || echo missing)
+  wait_for_exit $SP 60; RCS=$?
+  if [ "$RCR" = 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/out.bin")" = "$H_SMALL" ]; then
+    ok "stdout-promote: -o - across a mid-stream path promote is byte-exact and verified (exit 0 both)"
+  else
+    bad "stdout-promote"
+    echo "  receiver rc=$RCR sender rc=$RCS, out.bin $(wc -c <"$D/out.bin") of $(wc -c <"$SMALL") bytes"
+    tail -n 4 "$WORK/gT3b-recv.log" "$WORK/gT3b-send.log"
+  fi
+fi
+
 # ---------------------------------------------------------------- gate T4 ---
 say "T4: one-shot receiver whose sender is SIGKILLed mid-transfer gives up honestly and in bounded time"
 # Was: ~96 s, then "lost the sender after 5 attempts; the partial is kept,

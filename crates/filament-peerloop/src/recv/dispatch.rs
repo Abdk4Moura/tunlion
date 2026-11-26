@@ -840,6 +840,24 @@ pub fn resume_replaces_own_stream<'a>(
     is_resume || reasked
 }
 
+/// `receive -o -`: the open stdout streams a new offer is the same transfer
+/// as. Same transfer id, from the same signaling peer or (after a re-dial)
+/// the same verified sender. Pure. Stdout cannot seek, so every key returned
+/// is a stream whose sink the offer must continue, never a second sink.
+pub fn stdout_streams_of_transfer<'a>(
+    open: impl Iterator<Item = (&'a (String, u32), &'a str, Option<&'a str>)>,
+    offering_pid: &str,
+    offer_id: &str,
+    offering_sender: Option<&str>,
+) -> Vec<(String, u32)> {
+    open.filter(|(k, id, sender)| {
+        *id == offer_id
+            && (k.0 == offering_pid || (sender.is_some() && *sender == offering_sender))
+    })
+    .map(|(k, _, _)| k.clone())
+    .collect()
+}
+
 /// Whether a receive that has finished its files may start its quiet exit, and
 /// the line it prints. Pure. `idle` = nothing in flight and no question open.
 /// A one-time CODE receive also ends while its sender is still connected: a
@@ -9950,6 +9968,93 @@ async fn recv_run(
                         }
                     }
 
+                    // `-o -` has no `.part` to key the C23 guard above on, so it
+                    // used to skip it: a re-offer of a transfer whose stream was
+                    // still open (a path promote mid-transfer, a rebuilt link)
+                    // opened a SECOND stdout sink, both wrote, and the reader got
+                    // the file plus the first stream's prefix while the second
+                    // sink's own digest said "verified". Stdout cannot seek, so a
+                    // transfer has exactly one sink: the re-offer continues it
+                    // from what it already wrote, or, while that stream is still
+                    // flowing, is ignored as the same duplicate a file's is.
+                    if to_stdout {
+                        let offering_sender = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                        let dup_keys = stdout_streams_of_transfer(
+                            st.by_sid.iter().filter(|(_, inc)| inc.stdout.is_some()).map(|(k, inc)| {
+                                (k, inc.id.as_str(), inc.sender.as_deref())
+                            }),
+                            &pid,
+                            &id,
+                            offering_sender.as_deref(),
+                        );
+                        if !dup_keys.is_empty() {
+                            let same_sender_resume = resume_replaces_own_stream(
+                                is_resume,
+                                dup_keys.iter().map(|k| {
+                                    let inc = st.by_sid.get(k);
+                                    Lingering {
+                                        pid: k.0.as_str(),
+                                        id: inc.map(|i| i.id.as_str()).unwrap_or_default(),
+                                        accepted_on: inc.and_then(|i| i.accepted_on),
+                                    }
+                                }),
+                                &pid,
+                                &id,
+                                conn.link(&pid).map(|l| l.source),
+                            );
+                            let any_flowing = !same_sender_resume
+                                && dup_keys.iter().any(|(p, _)| {
+                                    conn.transport_of(p)
+                                        .map(|t| t.idle_ms() < net::stall_ms())
+                                        .unwrap_or(false)
+                                });
+                            if any_flowing {
+                                log.say(&log.paint(
+                                    Tone::Dim,
+                                    &format!(
+                                        "  (duplicate offer for {name} ignored, already receiving it)"
+                                    ),
+                                ));
+                                continue;
+                            }
+                            let mut open: Vec<IncomingFile> =
+                                dup_keys.iter().filter_map(|k| st.by_sid.remove(k)).collect();
+                            // One sink per transfer is what this keeps true, so
+                            // there is at most one; any other would be the bug.
+                            let inc = open.remove(0);
+                            let written = inc
+                                .stdout
+                                .as_ref()
+                                .and_then(|s| s.lock().ok().map(|s| s.written()))
+                                .unwrap_or(0);
+                            log.debug(&format!(
+                                "{name}: re-offered on a new stream, continuing stdout at {}",
+                                crate::present::human(written)
+                            ));
+                            // The old stream's writers keep their own counters:
+                            // whatever they still put lands in the same in-order
+                            // sink, which skips bytes it already wrote.
+                            let full = inc.full.clone().or(offer_full.clone());
+                            st.by_sid.insert(
+                                (pid.clone(), sid),
+                                IncomingFile {
+                                    full,
+                                    inflight: Arc::new(AtomicI64::new(0)),
+                                    end_seen: Arc::new(AtomicBool::new(false)),
+                                    completion: Arc::new(crate::recv::CompletionGate::default()),
+                                    ack_sid: 0,
+                                    sender: offering_sender,
+                                    accepted_on: conn.link(&pid).map(|l| l.source),
+                                    ..inc
+                                },
+                            );
+                            let mut accept = protocol::accept_msg(&id, written);
+                            accept["sequential"] = json!(true);
+                            t.send_control(&accept).await?;
+                            continue;
+                        }
+                    }
+
                     if to_stdout {
                         // Pipe mode: no part files, no resume, pure stream.
                         // Write through a dup'd stdout fd so dropping the
@@ -9974,7 +10079,10 @@ async fn recv_run(
                             // hashes what it writes, so the stream is verified
                             // against the offered digest and acked like a file.
                             let sink = Arc::new(std::sync::Mutex::new(
-                                crate::recv::StdoutSink::new(out.try_clone()?),
+                                crate::recv::StdoutSink::sharing(
+                                    out.try_clone()?,
+                                    crate::recv::process_stdout_ledger(),
+                                ),
                             ));
                             st.by_sid.insert(
                                 (pid.clone(), sid),
@@ -10347,7 +10455,7 @@ async fn recv_run(
                     })
                     .await;
                     if to_stdout {
-                        stdout_delivered(&inc, &conn, &pid, sid, &report).await?;
+                        stdout_delivered(&inc, &conn, &pid, sid, &report, &ports.env.delivery).await?;
                         st.completed += 1;
                         conn.note_completed_transfer(&pid, sender.as_deref());
                         continue;
@@ -10592,7 +10700,7 @@ async fn recv_run(
                 if let Some(mut inc) = st.by_sid.remove(&(pid.clone(), sid)) {
                     let sender = inc.sender.clone();
                     if to_stdout {
-                        stdout_delivered(&inc, &conn, &pid, ack_sid, &report).await?;
+                        stdout_delivered(&inc, &conn, &pid, ack_sid, &report, &ports.env.delivery).await?;
                         st.completed += 1;
                         conn.note_completed_transfer(&pid, sender.as_deref());
                         continue;
@@ -11747,6 +11855,7 @@ async fn stdout_delivered(
     pid: &str,
     sid: u32,
     report: &RecvReport,
+    delivery: &Arc<std::sync::Mutex<HashMap<String, crate::recv::ports::DeliveredFile>>>,
 ) -> Result<()> {
     let Some(sink) = &inc.stdout else {
         return Ok(());
@@ -11762,6 +11871,20 @@ async fn stdout_delivered(
     }
     inc.bar.done(written);
     report.note_stored(&inc.name, written, inc.full.as_deref(), "-");
+    // A retry of this transfer (its ack lost across a rebuilt link) is then
+    // re-acked by the offer path instead of opening a fresh sink that would
+    // write the whole file to stdout a second time.
+    if let Ok(mut m) = delivery.lock() {
+        m.insert(
+            inc.id.clone(),
+            crate::recv::ports::DeliveredFile {
+                name: inc.name.clone(),
+                size: inc.size,
+                full: inc.full.clone(),
+                stored_name: "-".to_string(),
+            },
+        );
+    }
     if inc.full.is_some() {
         if let Some(t) = conn.transport_of(pid) {
             let _ = t
@@ -11898,7 +12021,7 @@ mod offer_consent_tests {
 
 #[cfg(test)]
 mod resume_own_stream_tests {
-    use super::{resume_replaces_own_stream, Lingering};
+    use super::{resume_replaces_own_stream, stdout_streams_of_transfer, Lingering};
     use filament_transport::net::SourceId;
 
     /// The chaos replay's repaired send: it re-dialed the same sid and
@@ -11935,6 +12058,25 @@ mod resume_own_stream_tests {
         // A stream with no recorded link is never judged replaced.
         let unknown = Lingering { pid: "sid-a", id: "t1", accepted_on: None };
         assert!(!resume_replaces_own_stream(false, [unknown].into_iter(), "sid-a", "t1", fresh));
+    }
+
+    /// `-o -`: a re-offer of the same transfer finds its open stdout stream,
+    /// from the same peer or the same verified sender re-dialed, so it never
+    /// opens a second sink. Another transfer, or an unverified stranger
+    /// reusing the id, is not that stream.
+    #[test]
+    fn stdout_reoffer_finds_its_open_stream() {
+        let a = ("sid-a".to_string(), 1u32);
+        let b = ("sid-b".to_string(), 2u32);
+        let open = || {
+            vec![(&a, "t1", Some("laptop")), (&b, "t2", None)].into_iter()
+        };
+        assert_eq!(stdout_streams_of_transfer(open(), "sid-a", "t1", Some("laptop")), vec![a.clone()]);
+        assert_eq!(stdout_streams_of_transfer(open(), "sid-z", "t1", Some("laptop")), vec![a.clone()]);
+        assert!(stdout_streams_of_transfer(open(), "sid-z", "t1", None).is_empty());
+        assert!(stdout_streams_of_transfer(open(), "sid-z", "t1", Some("other")).is_empty());
+        assert!(stdout_streams_of_transfer(open(), "sid-a", "t3", Some("laptop")).is_empty());
+        assert_eq!(stdout_streams_of_transfer(open(), "sid-b", "t2", None), vec![b.clone()]);
     }
 }
 
