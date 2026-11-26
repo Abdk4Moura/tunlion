@@ -994,6 +994,9 @@ pub(crate) async fn send_cmd(
     // sender fails honestly instead of waiting forever (gate 11 measured 90 s
     // and still alive).
     let mut link_down_since: Option<Instant> = None;
+    // The clock behind it: one episode across the warm link, the wait for the
+    // daemon's repaired link and the send's own dials (send_liveness::DownClock).
+    let mut down_clock = crate::send_liveness::DownClock::default();
     let mut remedy_said = false;
     let peer_label = known_target
         .as_ref()
@@ -1120,42 +1123,57 @@ pub(crate) async fn send_cmd(
                     .await;
             }
         }
-        let rejoin_window = conn.rejoin.rejoin_window;
         // Once a channel has been up, the clock runs until a live transport
         // to the target is back, not merely until the dead one is gone. The
         // stall ladder replaces a dead link with one that is still dialing (no
         // transport yet), and a frozen receiver keeps that dial retrying; when
         // that read as "not down" the clock restarted on every repair and the
         // send never reached its honest end (gate 11).
-        let link_down = match conn.active.as_ref().and_then(|p| conn.transport_of(p)) {
+        //
+        // The window is the rejoin window only for a receiver that left the
+        // server or said it steps away; otherwise LINK_DOWN_WINDOW. A receiver
+        // that stayed on the server while its link died (a warm link whose
+        // re-dials never landed) was held to the 120 s REJOIN_WINDOW and ran
+        // past every caller's bound (chaos 22b3f2a918, 83e2d5588e). A link
+        // that comes back restarts the clock only once it stays up
+        // (LINK_UP_CONFIRM), and a receiver that keepalives but has been silent
+        // for the whole window counts as down.
+        let down_window = crate::send_liveness::link_down_window(
+            conn.rejoin.rejoin_window,
+            conn.rejoin.waiting_rejoin.is_some(),
+            conn.rejoin.away.as_ref().is_some_and(|(_, until)| *until > Instant::now()),
+        );
+        let (transport_down, silent) = match conn.active.as_ref().and_then(|p| conn.transport_of(p)) {
             Some(t) => {
-                let silent = t.heard_ms();
-                !t.is_alive()
-                    || t.is_dead()
-                    || silent == Some(u64::MAX)
-                    || silent.is_some_and(|ms| ms > rejoin_window.as_millis() as u64)
+                let heard = t.heard_ms();
+                (
+                    !t.is_alive()
+                        || t.is_dead()
+                        || heard == Some(u64::MAX)
+                        || heard.is_some_and(|ms| ms > conn.rejoin.rejoin_window.as_millis() as u64),
+                    t.keepalive_silence_ms().map(Duration::from_millis),
+                )
             }
-            None => established,
+            None => (established, None),
         };
+        let link_down = down_clock.observe(Instant::now(), transport_down, silent, down_window);
         if link_down {
             link_seen_down = Some(Instant::now());
             let unfinished = outgoing.lock().await.iter().any(|o| !o.done && !o.declined);
             if unfinished {
-                let since = *link_down_since.get_or_insert_with(Instant::now);
-                if since.elapsed() > rejoin_window {
+                if down_clock.expired(Instant::now(), down_window) {
                     ui::clear_sticky();
                     let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
                     bail!(crate::send_liveness::receiver_gone_message(
-                        rejoin_window.as_secs(),
+                        down_window.as_secs(),
                         use_code && known_target.is_none(),
                     ));
                 }
             } else {
-                link_down_since = None;
+                down_clock.clear();
             }
-        } else {
-            link_down_since = None;
         }
+        link_down_since = down_clock.down_since();
         // Never a silent minute: while the peer has not connected, or has
         // stopped answering mid-send, say so every few seconds. Not while a
         // code waits to be typed, and not while a person there is deciding.
@@ -1574,7 +1592,12 @@ pub(crate) async fn send_cmd(
                 // transport is NOT dead AND the control path is silent — which
                 // means the peer itself is gone (the C3/C4 establishment path
                 // owns that case).
-                if transport_dead || conn.link_alive(&active).await {
+                // The daemon's warm link has no C3/C4 path of its own here,
+                // and its probe can sit behind a data write the daemon is not
+                // taking: the stall always goes to the warm grace (the
+                // TransferStalled arm), never to "the peer is gone".
+                let warm_active = warm_pid.as_deref() == Some(active.as_str());
+                if transport_dead || warm_active || conn.link_alive(&active).await {
                     let _ = tx.send(Ev::TransferStalled(active, idle));
                 } else {
                     conn.note_progress(&active);
@@ -3347,7 +3370,7 @@ pub(crate) async fn send_cmd(
                 // re-fetch possible by then). On a DataChannel both are just
                 // flush(); on QUIC this keeps the stream open for a resume.
                 if let Some(t) = conn.transport() {
-                    let _ = t.flush().await;
+                    let _ = bounded_flush(&t, warm_rides(&conn, warm_pid.as_deref())).await;
                 }
             }
             if do_reprobe {
@@ -3370,7 +3393,7 @@ pub(crate) async fn send_cmd(
                         ));
                         let _ = t.send_control(&protocol::end_msg(id, *sid)).await;
                     }
-                    let _ = t.flush().await;
+                    let _ = bounded_flush(&t, warm_rides(&conn, warm_pid.as_deref())).await;
                 }
             }
             if give_up {
@@ -3723,6 +3746,34 @@ const WARM_STALL_GRACE: Duration = Duration::from_secs(15);
 /// second build from this process raced it, and on a lossy path neither won
 /// (chaos replay of send-stuck-reconnecting-after-heal).
 const WARM_RETRY_WINDOW: Duration = Duration::from_secs(30);
+/// How long the send loop waits on a flush of the daemon's warm link. That
+/// flush answers only once the daemon has put every earlier frame on its link,
+/// and a daemon writing into a link that takes nothing never answers it: the
+/// loop then stopped running its own clocks (no heartbeat, no down clock, no
+/// answer bound). Nothing waits on it for correctness: the receiver's
+/// whole-file `delivery-ack` decides what is done.
+const WARM_FLUSH_BOUND: Duration = Duration::from_secs(5);
+
+/// Whether the active link is the daemon's warm link.
+fn warm_rides(conn: &Conn, warm_pid: Option<&str>) -> bool {
+    warm_pid.is_some_and(|w| conn.is_active(w))
+}
+
+/// The send loop's flush: bounded on the daemon's warm link (see
+/// `WARM_FLUSH_BOUND`), as it was everywhere else.
+async fn bounded_flush(t: &Arc<dyn Transport>, warm: bool) -> Result<()> {
+    if !warm {
+        return t.flush().await;
+    }
+    match tokio::time::timeout(WARM_FLUSH_BOUND, t.flush()).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!(
+            "the daemon did not finish flushing its warm link in {}s",
+            WARM_FLUSH_BOUND.as_secs()
+        )),
+    }
+}
+
 /// Event wait while a code ceremony is in flight (see the send loop).
 const CEREMONY_TICK: Duration = Duration::from_millis(100);
 

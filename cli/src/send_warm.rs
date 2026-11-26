@@ -64,6 +64,13 @@ pub(crate) struct WarmSendTransport {
     why: Mutex<Option<String>>,
     health: Mutex<Health>,
     last_data: Mutex<Instant>,
+    /// When the daemon last passed on anything the receiver sent this send:
+    /// an answer, or a link-wide frame. A receiver sends its `state` on every
+    /// link every 10 s, so on a live link this never gets old. It is the only
+    /// word from the receiver a send over a direct QUIC link gets: the daemon
+    /// reports no `heard_ms` for those, and the 83e2d5588e replay had an offer
+    /// go unanswered for 60 s on a link that never read as silent.
+    last_inbound: Mutex<Instant>,
     flushes: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
     next_flush: AtomicU64,
     max_payload: usize,
@@ -72,7 +79,20 @@ pub(crate) struct WarmSendTransport {
     wake: OnceLock<mpsc::UnboundedSender<Ev>>,
 }
 
+/// The fresher of the daemon's own reading (when it has one) and ours.
+fn fresher(daemon: Option<u64>, ours: u64) -> u64 {
+    daemon.map_or(ours, |d| d.min(ours))
+}
+
 impl WarmSendTransport {
+    /// Milliseconds since the receiver last said anything to this send.
+    fn inbound_ms(&self) -> u64 {
+        self.last_inbound
+            .lock()
+            .map(|g| u64::try_from(g.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(u64::MAX)
+    }
+
     /// Why the daemon ended the session, when it said.
     pub(crate) fn end_reason(&self) -> Option<String> {
         self.why.lock().ok().and_then(|g| g.clone())
@@ -148,6 +168,9 @@ impl WarmSendTransport {
                 };
                 match kind {
                     WS_INBOUND => {
+                        if let Ok(mut g) = t.last_inbound.lock() {
+                            *g = Instant::now();
+                        }
                         if let Ok(v) = serde_json::from_slice::<Value>(&payload) {
                             let _ = tx.send(Ev::Sourced {
                                 pid: pid.clone(),
@@ -256,15 +279,28 @@ impl Transport for WarmSendTransport {
     }
 
     fn heard_ms(&self) -> Option<u64> {
+        if self.is_dead() {
+            return Some(u64::MAX);
+        }
         let h = self.health.lock().ok()?;
-        h.heard
-            .map(|(ms, at)| ms.saturating_add(u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)))
+        let daemon = h
+            .heard
+            .map(|(ms, at)| ms.saturating_add(u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)));
+        Some(fresher(daemon, self.inbound_ms()))
     }
 
+    /// The receiver's silence on this link: the daemon's keepalive verdict
+    /// when its link has one, and the frames passed on to this send either
+    /// way, whichever is fresher. Any word from the receiver is a keepalive.
     fn keepalive_silence_ms(&self) -> Option<u64> {
+        if self.is_dead() {
+            return Some(u64::MAX);
+        }
         let h = self.health.lock().ok()?;
-        h.silence
-            .map(|(ms, at)| ms.saturating_add(u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)))
+        let daemon = h
+            .silence
+            .map(|(ms, at)| ms.saturating_add(u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)));
+        Some(fresher(daemon, self.inbound_ms()))
     }
 
     fn is_alive(&self) -> bool {
@@ -405,6 +441,8 @@ async fn handshake(
         // The daemon checked the link before it answered.
         health: Mutex::new(Health { alive: true, heard: None, silence: None }),
         last_data: Mutex::new(Instant::now()),
+        // The daemon's preflight heard the receiver just before it answered.
+        last_inbound: Mutex::new(Instant::now()),
         flushes: Mutex::new(HashMap::new()),
         next_flush: AtomicU64::new(1),
         max_payload,
@@ -607,6 +645,56 @@ mod tests {
         assert_eq!(t.idle_ms(), u64::MAX);
         assert!(t.send_frame(0x4000_0010, 5, b"x").await.is_err());
         assert!(t.flush().await.is_err());
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The receiver's silence on a warm link is visible to the send even when
+    /// the daemon's link reports none (direct QUIC): every frame the daemon
+    /// passes on (the receiver's `state` every 10 s, its answers) is word from
+    /// the receiver. Chaos 83e2d5588e: an offer on a warm link went unanswered
+    /// for 60 s, the link never read as silent, and the send blamed the
+    /// receiver's disk.
+    #[tokio::test]
+    async fn a_silent_receiver_on_a_warm_link_reads_as_silent() {
+        let dir = sock_dir("s");
+        let path = dir.join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        let (dead_tx, dead_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _ = read_req(&mut s).await;
+            s.write_all(
+                format!("{}\n", json!({"ok": true, "sid_base": 0x4000_0200u32, "max_payload": 65536, "link": "q"}))
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let (_r, mut w) = s.into_split();
+            // A QUIC link: alive, no heard/silence of the daemon's own.
+            write_frame(&mut w, WS_HEALTH, b"{\"alive\":true}").await.unwrap();
+            let _ = go_rx.await;
+            write_frame(&mut w, WS_INBOUND, json!({"type":"state","v":1}).to_string().as_bytes())
+                .await
+                .unwrap();
+            let _ = dead_rx.await;
+        });
+        let link = sock::try_send_link_at(&path, "box", &["s-3-1".to_string()], false).await.expect("warm link");
+        let t = link.transport.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        t.start(link.pid.clone(), tx);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let quiet = t.keepalive_silence_ms().expect("a warm link always reads its receiver's silence");
+        assert!(quiet >= 400, "{quiet}");
+        assert!(t.heard_ms().is_some_and(|h| h >= 400));
+        go_tx.send(()).unwrap();
+        let _ = rx.recv().await.unwrap();
+        assert!(t.keepalive_silence_ms().is_some_and(|s| s < 300), "a state frame is word from the receiver");
+        assert!(t.heard_ms().is_some_and(|h| h < 300));
+        t.force_close();
+        assert_eq!(t.keepalive_silence_ms(), Some(u64::MAX));
+        let _ = dead_tx.send(());
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }

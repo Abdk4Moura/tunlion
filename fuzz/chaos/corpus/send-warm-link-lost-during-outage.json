@@ -1,0 +1,66 @@
+{
+  "hooks": {
+    "bravo": {
+      "TUNLION_TEST_CORRUPT_ONCE": "1"
+    }
+  },
+  "origin": "chaos finding 83e2d5588e (campaign chaos-fa8400dda723-explore-1795696394-1138214, main f497c9088, reproduced 2/3, replay 9/12): alpha's 4 MiB send to bravo during alpha's server outage and 50% loss on bravo rode the daemon's warm link, which died; a local-network link came up for 7 s and died, restarting the down clock, then more dials under the 120 s rejoin window: still running at 90 s (O2 hang). 1 in 12 replays instead had the warm offer unanswered for 60 s on a link that never read silent, blamed on bravo's disk (O9)",
+  "seed": 217562758,
+  "steps": [
+    {
+      "at": 0.3,
+      "dur": 18.1,
+      "fault": "proc.kill",
+      "target": "charlie"
+    },
+    {
+      "at": 3.6,
+      "dst": "bravo",
+      "kib": 4,
+      "op": "send",
+      "src": "alpha",
+      "via": "stdout"
+    },
+    {
+      "a": "alpha",
+      "at": 4.9,
+      "b": "bravo",
+      "dur": 14.2,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 16.6,
+      "dst": "charlie",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "args": {
+        "delay_ms": 0,
+        "dup": 0,
+        "jitter_ms": 300,
+        "loss": 50,
+        "reorder": 25
+      },
+      "at": 25.4,
+      "dur": 96.9,
+      "fault": "net.impair",
+      "target": "bravo"
+    },
+    {
+      "at": 27.4,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "at": 27.4,
+      "dst": "bravo",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

@@ -6,6 +6,6 @@
 #![allow(unused_imports)]
 
 pub(crate) use filament_peerloop::send::liveness::{
-    disconnect_line, ladder_exhausted_message, receiver_gone_message, still_waiting_line,
-    HEARTBEAT,
+    disconnect_line, ladder_exhausted_message, link_down_window, receiver_gone_message,
+    still_waiting_line, DownClock, HEARTBEAT,
 };
