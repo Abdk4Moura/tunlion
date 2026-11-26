@@ -1280,7 +1280,7 @@ mod tests {
             crate::shell::exec::ExecOpen {
                 argv: vec!["/bin/true".into()],
                 cwd: None, env: vec![], tty: false,
-                err_sid: crate::l2::L2_SID_BASE | 62, alive_ms: None,
+                err_sid: crate::l2::L2_SID_BASE | 62, alive_ms: None, window: None,
             }
         }
 

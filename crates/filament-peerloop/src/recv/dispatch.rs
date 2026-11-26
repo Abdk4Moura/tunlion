@@ -8771,7 +8771,12 @@ async fn recv_run(
                 // or forwarding its user's Ctrl-C (`exec-signal`). Routed only
                 // through THIS peer's mux, by sid, so it can reach nothing but
                 // a session this same peer opened.
-                Some("exec-alive") | Some("exec-signal") => {
+                Some("exec-alive") | Some("exec-signal") | Some("exec-credit") => {
+                    // Output grants ride `exec-credit` and every heartbeat;
+                    // they feed the served session's output pumps directly.
+                    if let (Some(mux), Some(sid)) = (l2_muxes.get(&pid), l2::wire_sid(&v)) {
+                        mux.on_exec_credit(sid, &v).await;
+                    }
                     if let (Some(mux), Some(sid), Some(msg)) = (
                         l2_muxes.get(&pid),
                         l2::wire_sid(&v),

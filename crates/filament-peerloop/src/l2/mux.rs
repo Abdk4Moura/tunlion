@@ -172,6 +172,14 @@ pub struct Mux {
     /// stream pipes, so a warm exec needs no second listener on the shared
     /// event channel. Bounded and dropped with the stream.
     exec_init: Mutex<HashMap<u32, mpsc::Sender<Value>>>,
+    /// Acceptor only: the output credit an exec initiator has granted, per
+    /// served exec sid, as the cumulative `(stdout, stderr)` frame counts it
+    /// has CONSUMED. The output pumps read it directly (not through the
+    /// session loop), so a pump waiting for credit after the child exited
+    /// still sees the grants that free it. A watch, not a queue: the values
+    /// are cumulative, so a newer grant supersedes any older one and nothing
+    /// can be lost to a full channel. Dropped with the stream.
+    exec_credit: Mutex<HashMap<u32, tokio::sync::watch::Sender<(u64, u64)>>>,
     /// The `link-revoked` frame this link received, kept for the life of the
     /// mux. The per-exec channels above are bounded and lossy, so a warm exec
     /// that ends on a transport failure reads this before reporting one: a
@@ -216,6 +224,7 @@ impl Mux {
             close_err: Mutex::new(HashMap::new()),
             exec_ctl: Mutex::new(HashMap::new()),
             exec_init: Mutex::new(HashMap::new()),
+            exec_credit: Mutex::new(HashMap::new()),
             revoked: std::sync::Mutex::new(None),
             acked_nonces: std::sync::Mutex::new(Vec::new()),
         })
@@ -401,6 +410,7 @@ impl Mux {
         self.open_ack_tx.lock().await.remove(&sid);
         self.exec_ctl.lock().await.remove(&sid);
         self.exec_init.lock().await.remove(&sid);
+        self.exec_credit.lock().await.remove(&sid);
         drop(streams);
         if let Some(s) = removed {
             if let Some(h) = s.read_pump {
@@ -466,6 +476,7 @@ impl Mux {
         self.open_ack_tx.lock().await.remove(&sid);
         self.exec_ctl.lock().await.remove(&sid);
         self.exec_init.lock().await.remove(&sid);
+        self.exec_credit.lock().await.remove(&sid);
         drop(streams);
         if let Some(h) = s.read_pump {
             h.abort();
@@ -640,6 +651,38 @@ impl Mux {
         rx
     }
 
+    /// Acceptor: open the output-credit watch for the exec session on `sid`
+    /// (only for an initiator that announced a `window` in its open). The
+    /// receiver sees the cumulative `(stdout, stderr)` frames the initiator
+    /// has consumed; it closes when the stream is dropped.
+    pub async fn register_exec_credit(&self, sid: u32) -> tokio::sync::watch::Receiver<(u64, u64)> {
+        let (tx, rx) = tokio::sync::watch::channel((0u64, 0u64));
+        self.exec_credit.lock().await.insert(sid, tx);
+        rx
+    }
+
+    /// Acceptor: apply the consumed counts an `exec-credit` (or a heartbeat
+    /// carrying them) reports for `sid`. Counts only move forward, so a
+    /// reordered or repeated grant can never take credit back. Every call
+    /// notifies, even with unchanged counts: a heartbeat is proof the
+    /// initiator is still there, which is what a pump waiting on a slow
+    /// reader needs to know. Returns whether a served exec holds `sid`.
+    pub async fn on_exec_credit(&self, sid: u32, v: &Value) -> bool {
+        let out = v.get("out").and_then(Value::as_u64);
+        let err = v.get("err").and_then(Value::as_u64);
+        let map = self.exec_credit.lock().await;
+        let Some(tx) = map.get(&sid) else { return false };
+        tx.send_modify(|(o, e)| {
+            if let Some(n) = out {
+                *o = (*o).max(n);
+            }
+            if let Some(n) = err {
+                *e = (*e).max(n);
+            }
+        });
+        true
+    }
+
     /// Acceptor: deliver an initiator's `exec-alive`/`exec-signal` to the
     /// session on `sid`. A frame for no live session is dropped, as is one
     /// that finds the session's small queue full (heartbeats are idempotent,
@@ -736,6 +779,7 @@ impl Mux {
         self.open_ack_tx.lock().await.clear();
         self.exec_ctl.lock().await.clear();
         self.exec_init.lock().await.clear();
+        self.exec_credit.lock().await.clear();
         // Do NOT clear `close_err`: a denial that raced the transport's death
         // must still be readable by the pump that is about to end. The map is
         // bounded by the streams drained here and sids are not reused. Nor

@@ -188,6 +188,10 @@ async fn run_warm_exec(
         "err_sid": err_sid,
         "argv": argv,
         "alive_ms": crate::shell::exec::EXEC_ALIVE_INTERVAL.as_millis() as u64,
+        // Output flow control: the peer keeps at most this many frames per
+        // stream in flight beyond what this session has consumed, so a slow
+        // local reader slows the command instead of overflowing the pipe.
+        "window": crate::shell::exec::EXEC_OUTPUT_WINDOW,
     });
     if let Some(cwd) = cwd {
         open["cwd"] = json!(cwd);
@@ -290,19 +294,20 @@ async fn run_warm_exec(
         }
         let _ = w.flush().await;
     });
+    // Output frames consumed per stream, granted back to the peer as credit.
+    let ledger = Arc::new(crate::shell::exec::ExecCreditLedger::default());
     // Heartbeat: the peer ends the remote command when these stop. Spawned so a
-    // slow local socket never looks like a dead initiator.
+    // slow local socket never looks like a dead initiator. Each beat restates
+    // the consumed counts, so a lost grant cannot hold the window shut.
     let beats = {
         let t = t.clone();
+        let ledger = ledger.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(crate::shell::exec::EXEC_ALIVE_INTERVAL);
             tick.tick().await;
             loop {
                 tick.tick().await;
-                if t.send_control(&json!({ "type": "exec-alive", "sid": sid }))
-                    .await
-                    .is_err()
-                {
+                if t.send_control(&ledger.alive(sid)).await.is_err() {
                     break;
                 }
             }
@@ -321,8 +326,26 @@ async fn run_warm_exec(
     let mut last_heard = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
     ticker.tick().await;
+    // One output frame taken off a pipe and not yet handed to the client
+    // writer. While it waits for room, the pipes are not read (so the peer's
+    // window closes and the command slows down), but control frames, stdin
+    // and the liveness ticker still are: a slow local reader must never stop
+    // this loop from hearing the peer, or the silence watchdog would read the
+    // reader's slowness as a dead link.
+    let mut pending: Option<Out> = None;
     loop {
         tokio::select! {
+            permit = out_tx.reserve(), if pending.is_some() => match permit {
+                Ok(permit) => {
+                    if let Some(msg) = pending.take() {
+                        permit.send(msg);
+                    }
+                }
+                Err(_) => {
+                    client_gone = true;
+                    break;
+                }
+            },
             frame = in_rx.recv() => match frame {
                 Some((FRAME_STDIN, payload)) => {
                     // The link's own payload bound decides the chunk size, the
@@ -403,13 +426,14 @@ async fn run_warm_exec(
                     break;
                 }
             },
-            item = out_pipe.recv(), if out_open => match item {
+            item = out_pipe.recv(), if out_open && pending.is_none() => match item {
                 Some(Some(bytes)) => {
                     last_heard = tokio::time::Instant::now();
                     out_count += bytes.len() as u64;
-                    if out_tx.send(Out::Data(FRAME_STDOUT, bytes)).await.is_err() {
-                        client_gone = true;
-                        break;
+                    pending = Some(Out::Data(FRAME_STDOUT, bytes));
+                    ledger.consumed(false);
+                    if ledger.due() {
+                        let _ = t.send_control(&ledger.grant(sid)).await;
                     }
                 }
                 // A clean stream EOF is not the end of the session: the
@@ -444,13 +468,14 @@ async fn run_warm_exec(
                     break;
                 }
             },
-            item = err_pipe.recv(), if err_open => match item {
+            item = err_pipe.recv(), if err_open && pending.is_none() => match item {
                 Some(Some(bytes)) => {
                     last_heard = tokio::time::Instant::now();
                     err_count += bytes.len() as u64;
-                    if out_tx.send(Out::Data(FRAME_STDERR, bytes)).await.is_err() {
-                        client_gone = true;
-                        break;
+                    pending = Some(Out::Data(FRAME_STDERR, bytes));
+                    ledger.consumed(true);
+                    if ledger.due() {
+                        let _ = t.send_control(&ledger.grant(sid)).await;
                     }
                 }
                 Some(None) => {}
@@ -485,11 +510,20 @@ async fn run_warm_exec(
     if terminal.is_none() && status.is_none() {
         terminal = Some(stream_ended(&mux, &peer, sid).await);
     }
+    // Output already taken off a pipe belongs to the client whatever ends the
+    // session: deliver it before the drain or the terminal frame.
+    if let Some(msg) = pending.take() {
+        if !client_gone && out_tx.send(msg).await.is_err() {
+            client_gone = true;
+        }
+    }
     // Bounded drain: a fast-exiting child can beat its own tail. The close
-    // announces both byte counts, so collect until they are met (3 s cap on a
-    // dying link), exactly like the cold initiator.
-    if terminal.is_none() && status.is_some() {
-        let deadline = tokio::time::Instant::now() + EXEC_TAIL_DRAIN;
+    // announces both byte counts, so collect until they are met. The 3 s
+    // bound is on the LINK going quiet, not on the local reader: it restarts
+    // whenever a frame arrives, so a slow reader draining a full window is
+    // never cut short (a fixed deadline truncated output with a clean exit).
+    if terminal.is_none() && status.is_some() && !client_gone {
+        let mut deadline = tokio::time::Instant::now() + EXEC_TAIL_DRAIN;
         loop {
             let met = match (want_out, want_err) {
                 (Some(o), Some(e)) => out_count >= o && err_count >= e,
@@ -502,20 +536,24 @@ async fn run_warm_exec(
                 item = out_pipe.recv(), if out_open => match item {
                     Some(Some(bytes)) => {
                         out_count += bytes.len() as u64;
+                        ledger.consumed(false);
                         if out_tx.send(Out::Data(FRAME_STDOUT, bytes)).await.is_err() {
                             client_gone = true;
                             break;
                         }
+                        deadline = tokio::time::Instant::now() + EXEC_TAIL_DRAIN;
                     }
                     _ => out_open = false,
                 },
                 item = err_pipe.recv(), if err_open => match item {
                     Some(Some(bytes)) => {
                         err_count += bytes.len() as u64;
+                        ledger.consumed(true);
                         if out_tx.send(Out::Data(FRAME_STDERR, bytes)).await.is_err() {
                             client_gone = true;
                             break;
                         }
+                        deadline = tokio::time::Instant::now() + EXEC_TAIL_DRAIN;
                     }
                     _ => err_open = false,
                 },
