@@ -1189,19 +1189,34 @@ def send_to_stdout(w: World, st: dict, res: dict, deadline: float) -> None:
             rp.wait()
         th.join(10)
         rerr = rlog.read_bytes()
+    # A code send waits for its code to be claimed (it advertises minutes).
+    # When the receiver ended without getting a byte, a sender still waiting
+    # is doing what it says, not hanging: stop it after a grace and judge the
+    # receiver's own exit. A sender that outlives a receiver that DID get data
+    # (or succeeded) is still a hang. (False O2 on 2026-11-26: receiver hit
+    # "Can't reach the tunlion server" under 50% loss, sender kept waiting.)
+    unclaimed = code is not None and recv_rc not in (None, 0) and not got
+    wait_for = 30.0 if unclaimed else max(1.0, deadline - (time.monotonic() - t0))
+    stopped_waiting = False
     try:
-        send_rc = sp.wait(max(1.0, deadline - (time.monotonic() - t0)))
+        send_rc = sp.wait(wait_for)
     except subprocess.TimeoutExpired:
         os.killpg(sp.pid, signal.SIGKILL)
         sp.wait()
         send_rc = None
+        stopped_waiting = unclaimed
     ok, lie = stdout_send_verdict(data, bytes(got), send_rc, recv_rc)
     # The op's rc is the first end that did not succeed (None: a hang), so the
-    # rc and silence oracles judge whichever end failed.
-    rc = send_rc if send_rc != 0 or not code else recv_rc
+    # rc and silence oracles judge whichever end failed. A sender we stopped
+    # while it waited for a claim is judged by the receiver's exit instead.
+    if stopped_waiting:
+        rc = recv_rc
+    else:
+        rc = send_rc if send_rc != 0 or not code else recv_rc
     err = (b"send: " + slog.read_bytes()[-10000:] + b"\nreceive: " + rerr[-10000:]).decode(errors="replace")
     res.update(rc=rc, elapsed=round(time.monotonic() - t0, 2), ok=ok, lie=lie, via="stdout",
-               send_rc=send_rc, recv_rc=recv_rc, got_bytes=len(got), want_bytes=len(data))
+               send_rc=send_rc, recv_rc=recv_rc, got_bytes=len(got), want_bytes=len(data),
+               sender_stopped_waiting_for_claim=stopped_waiting)
     res["stderr_tail"] = err.strip()[-400:]
     res["stderr_full"] = err.strip()[-20000:]
     res["stdout_tail"] = ""
