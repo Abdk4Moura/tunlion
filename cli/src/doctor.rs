@@ -163,6 +163,11 @@ fn reset_hint_for(device: &str, o: &crate::l2::ProbeOutcome, names: &[String]) -
     if o.established || o.failed_phase != Some(Phase::Presence) {
         return None;
     }
+    // Our own link to the server was over budget: the peer may be fine, and
+    // the reset advice (forget, re-pair) would delete a healthy pairing.
+    if let Some(ms) = crate::ping::slow_own_link(o) {
+        return Some(crate::ping::own_link_hint(device, ms));
+    }
     let successor = crate::reset_hints::successor_of(device, names.iter().map(String::as_str));
     Some(crate::reset_hints::offline_hint(device, successor.as_deref()))
 }
