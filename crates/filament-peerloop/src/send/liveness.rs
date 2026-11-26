@@ -63,6 +63,103 @@ pub fn ladder_exhausted_message(down_secs: Option<u64>, attempts: u32, by_code: 
 /// How often a send that is waiting says so. `exec` uses the same 7 s.
 pub const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(7);
 
+/// How long a send keeps looking for its receiver once the link it had is
+/// gone, when the receiver neither left the server nor said it was stepping
+/// away. Before this the bound was the 120 s `REJOIN_WINDOW` (the window is
+/// only shortened when a peer-left arrives), so a send whose link died while
+/// the receiver stayed on the server ran past any bound a caller could hold:
+/// chaos findings 22b3f2a918 and 83e2d5588e, a warm send whose daemon link
+/// died and whose re-dials never landed, still "trying to reconnect" at 90 s.
+/// Long enough for the daemon's repair (`WARM_RETRY_WINDOW`, 30 s) and a dial
+/// of the send's own after it; with the time to notice a dead link (at most
+/// about 20 s) it ends a send well inside 90 s.
+pub const LINK_DOWN_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// How long a link that came back must stay up before the down clock restarts.
+/// A dial that connects and dies again within seconds is not the receiver
+/// back: when each such flap restarted the clock, a send kept re-dialing past
+/// any bound (the debug replay of 83e2d5588e: a local-network link up for 7 s,
+/// then three more dials).
+pub const LINK_UP_CONFIRM: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The window the down clock enforces. A receiver that left the server
+/// (`receiver_left`) or announced that it steps away (`away`) gets the rejoin
+/// window opened for it (`rejoin_window`, the one the send printed). Otherwise
+/// the shorter of that window and [`LINK_DOWN_WINDOW`]. Pure.
+pub fn link_down_window(
+    rejoin_window: std::time::Duration,
+    receiver_left: bool,
+    away: bool,
+) -> std::time::Duration {
+    if receiver_left || away {
+        rejoin_window
+    } else {
+        rejoin_window.min(LINK_DOWN_WINDOW)
+    }
+}
+
+/// How long the send's link to its receiver has been down, across every way
+/// it can be: no transport, a dead one, or one whose receiver (a peer that
+/// keepalives) has been silent for the whole window. One clock for the warm
+/// link, the wait for the daemon's repaired link and the send's own dials, so
+/// moving between them never restarts it; only a link that stays up for
+/// [`LINK_UP_CONFIRM`] does.
+#[derive(Debug, Default, Clone)]
+pub struct DownClock {
+    down_since: Option<std::time::Instant>,
+    up_since: Option<std::time::Instant>,
+}
+
+impl DownClock {
+    /// Feed one observation at `now`. `down`: there is no live link. `silent`:
+    /// how long a receiver that keepalives has sent nothing on the link that
+    /// reads up (None when its silence means nothing). Returns true when the
+    /// link counts as down. Silence of at least `window` is down, and dates
+    /// the clock from the last time the receiver was heard.
+    pub fn observe(
+        &mut self,
+        now: std::time::Instant,
+        down: bool,
+        silent: Option<std::time::Duration>,
+        window: std::time::Duration,
+    ) -> bool {
+        let silent_out = silent.filter(|s| *s >= window);
+        if down || silent_out.is_some() {
+            self.up_since = None;
+            let since = self.down_since.get_or_insert(now);
+            if let Some(last_heard) = silent_out.and_then(|s| now.checked_sub(s)) {
+                if last_heard < *since {
+                    *since = last_heard;
+                }
+            }
+            return true;
+        }
+        let up = *self.up_since.get_or_insert(now);
+        if now.saturating_duration_since(up) >= LINK_UP_CONFIRM {
+            self.down_since = None;
+        }
+        false
+    }
+
+    /// Since when the link has been down (kept while a link that came back is
+    /// not yet confirmed).
+    pub fn down_since(&self) -> Option<std::time::Instant> {
+        self.down_since
+    }
+
+    /// Nothing is owed any more: forget the episode.
+    pub fn clear(&mut self) {
+        self.down_since = None;
+        self.up_since = None;
+    }
+
+    /// Down for longer than `window`.
+    pub fn expired(&self, now: std::time::Instant, window: std::time::Duration) -> bool {
+        self.down_since
+            .is_some_and(|s| now.saturating_duration_since(s) > window)
+    }
+}
+
 /// The progress line for a send that is waiting on its peer, or None when
 /// there is nothing to say. A peer frozen or killed mid-send used to mean a
 /// minute of silence before the error. `heard_ms` is how long since the peer
@@ -129,6 +226,67 @@ mod tests {
         assert!(m.contains("new code") && !m.contains("lost the receiving peer"), "{m}");
         let n = ladder_exhausted_message(None, 5, true);
         assert!(n.starts_with("lost the receiving peer after 5 attempts"), "{n}");
+    }
+
+    /// Chaos 22b3f2a918 / 83e2d5588e: a send whose receiver never left the
+    /// server waited out the 120 s rejoin window; it gets LINK_DOWN_WINDOW. A
+    /// receiver that left, or said it steps away, keeps the window it got.
+    #[test]
+    fn a_receiver_that_did_not_leave_gets_the_link_down_window() {
+        use std::time::Duration;
+        let rejoin = Duration::from_secs(120);
+        assert_eq!(link_down_window(rejoin, false, false), LINK_DOWN_WINDOW);
+        assert_eq!(link_down_window(rejoin, true, false), rejoin);
+        assert_eq!(link_down_window(rejoin, false, true), rejoin);
+        // A shorter window already in force stays.
+        let short = Duration::from_secs(10);
+        assert_eq!(link_down_window(short, false, false), short);
+        // With the time to notice a dead link, the bound ends a send inside
+        // the 90 s every chaos send is held to.
+        assert!(LINK_DOWN_WINDOW + Duration::from_secs(21) + Duration::from_secs(15) < Duration::from_secs(90));
+    }
+
+    /// The 83e2d5588e debug replay: the link went down, a local-network link
+    /// came up for 7 s and died, then more dials. Each flap restarted the
+    /// clock, so it never ran out. A flap shorter than LINK_UP_CONFIRM keeps
+    /// it running; a link that stays up restarts it.
+    #[test]
+    fn a_flapping_link_does_not_restart_the_down_clock() {
+        use std::time::{Duration, Instant};
+        let w = LINK_DOWN_WINDOW;
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut c = DownClock::default();
+        assert!(c.observe(at(20), true, None, w));
+        assert!(!c.observe(at(25), false, None, w));
+        assert!(!c.observe(at(31), false, None, w));
+        assert_eq!(c.down_since(), Some(at(20)), "a 6 s flap is not the receiver back");
+        assert!(c.observe(at(32), true, None, w));
+        assert!(!c.expired(at(64), w));
+        assert!(c.expired(at(66), w), "down since 20 s, window 45 s");
+        // A link that stays up for the confirm time restarts the clock.
+        let mut c = DownClock::default();
+        c.observe(at(20), true, None, w);
+        c.observe(at(25), false, None, w);
+        c.observe(at(25) + LINK_UP_CONFIRM, false, None, w);
+        assert_eq!(c.down_since(), None);
+    }
+
+    /// A link that reads up while its receiver has said nothing for the whole
+    /// window is down, dated from when the receiver was last heard, so the
+    /// send ends now instead of one window later.
+    #[test]
+    fn a_silent_receiver_counts_as_down_from_when_it_was_last_heard() {
+        use std::time::{Duration, Instant};
+        let w = LINK_DOWN_WINDOW;
+        let t0 = Instant::now();
+        let mut c = DownClock::default();
+        assert!(!c.observe(t0, false, Some(w - Duration::from_secs(1)), w));
+        let now = t0 + Duration::from_secs(1);
+        assert!(c.observe(now, false, Some(w + Duration::from_secs(1)), w));
+        assert!(c.expired(now, w));
+        c.clear();
+        assert_eq!(c.down_since(), None);
     }
 
     #[test]
