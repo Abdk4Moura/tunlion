@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use filament_transport::clock;
 
@@ -18,6 +18,7 @@ pub struct AssertionReport {
     pub always_checks: u64,
     pub always_failures: Vec<AlwaysFailure>,
     pub sometimes_hits: BTreeMap<String, u64>,
+    pub antecedents_seen: BTreeSet<String>,
 }
 
 thread_local! {
@@ -32,6 +33,12 @@ pub fn record_sometimes(tag: &'static str) {
     SIM_ASSERTIONS.with(|cell| {
         let mut r = cell.borrow_mut();
         *r.sometimes_hits.entry(tag.to_string()).or_insert(0) += 1;
+    });
+}
+
+pub fn record_antecedent(tag: &'static str) {
+    SIM_ASSERTIONS.with(|cell| {
+        cell.borrow_mut().antecedents_seen.insert(tag.to_string());
     });
 }
 
@@ -74,6 +81,7 @@ pub enum OracleKind {
     CapStatusFailed,
     AlwaysAssertionFailed,
     PostHealLivenessViolation,
+    FormalInvariantViolation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,19 +126,103 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
     // (a) if a node was restarted with >=10s remaining and is not blackholed
     // past restart+5s, it must re-establish signaling after restart;
     // (b) once all partitions/blackholes heal after a link-severing fault with
-    // >=15s clean tail remaining, paired nodes must show post-heal connect progress.
+    // >=15s clean tail remaining, paired nodes must show post-heal connect progress;
+    // (c) in clean non-faulted windows outside a 5s post-heal grace, signaling
+    // reconnects remain bounded (no defect-1/defect-2 reconnect storm).
     if config.nodes.len() >= 2 && config.duration_ms >= 20_000 {
+        let mut still_bh_nodes: BTreeSet<String> = BTreeSet::new();
+        let mut active_partitions: usize = 0;
+        let mut active_blackholes: usize = 0;
+        let mut last_heal_ms = config.restart_node.as_ref().map_or(0, |(_, _, r)| *r);
+        let mut faulted_windows: Vec<(u64, u64)> = Vec::new();
+        let mut part_start: Option<u64> = None;
+        let mut bh_starts: BTreeMap<String, u64> = BTreeMap::new();
+
+        if config.semantic_faults.is_empty() {
+            for sf in &config.schedule {
+                match &sf.fault {
+                    Fault::Partition { .. } => {
+                        if active_partitions == 0 {
+                            part_start = Some(sf.at_ms);
+                        }
+                        active_partitions = active_partitions.saturating_add(1);
+                    }
+                    Fault::HealPartition { .. } => {
+                        active_partitions = active_partitions.saturating_sub(1);
+                        if active_partitions == 0 {
+                            if let Some(s) = part_start.take() {
+                                faulted_windows.push((s, sf.at_ms + 5_000));
+                            }
+                        }
+                        last_heal_ms = last_heal_ms.max(sf.at_ms);
+                    }
+                    Fault::BlackholeSignaling { node, active: true } => {
+                        still_bh_nodes.insert(node.clone());
+                        bh_starts.entry(node.clone()).or_insert(sf.at_ms);
+                        active_blackholes = active_blackholes.saturating_add(1);
+                    }
+                    Fault::BlackholeSignaling { node, active: false } => {
+                        still_bh_nodes.remove(node);
+                        if let Some(s) = bh_starts.remove(node) {
+                            faulted_windows.push((s, sf.at_ms + 5_000));
+                        }
+                        active_blackholes = active_blackholes.saturating_sub(1);
+                        last_heal_ms = last_heal_ms.max(sf.at_ms);
+                    }
+                    Fault::Impair { .. }
+                    | Fault::ClearImpair { .. }
+                    | Fault::Hang { .. }
+                    | Fault::SetMessageChaos { .. }
+                    | Fault::ClearMessageChaos => {}
+                }
+            }
+        } else {
+            for ne in &outcome.net_events {
+                if let Some(rest) = ne.event.strip_prefix("fault:partition:") {
+                    let _ = rest;
+                    if active_partitions == 0 {
+                        part_start = Some(ne.at_ms);
+                    }
+                    active_partitions = active_partitions.saturating_add(1);
+                } else if ne.event.starts_with("fault:heal:") {
+                    active_partitions = active_partitions.saturating_sub(1);
+                    if active_partitions == 0 {
+                        if let Some(s) = part_start.take() {
+                            faulted_windows.push((s, ne.at_ms + 5_000));
+                        }
+                    }
+                    last_heal_ms = last_heal_ms.max(ne.at_ms);
+                } else if let Some(rest) = ne.event.strip_prefix("fault:blackhole:") {
+                    if let Some((node, active_str)) = rest.rsplit_once(':') {
+                        if active_str == "true" {
+                            still_bh_nodes.insert(node.to_string());
+                            bh_starts.entry(node.to_string()).or_insert(ne.at_ms);
+                            active_blackholes = active_blackholes.saturating_add(1);
+                        } else if active_str == "false" {
+                            still_bh_nodes.remove(node);
+                            if let Some(s) = bh_starts.remove(node) {
+                                faulted_windows.push((s, ne.at_ms + 5_000));
+                            }
+                            active_blackholes = active_blackholes.saturating_sub(1);
+                            last_heal_ms = last_heal_ms.max(ne.at_ms);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(s) = part_start {
+            faulted_windows.push((s, config.duration_ms));
+        }
+        for (_, s) in bh_starts {
+            faulted_windows.push((s, config.duration_ms));
+        }
+        if let Some((_, k, r)) = config.restart_node {
+            faulted_windows.push((k, r + 5_000));
+        }
+
         if let Some((ref rnode, _kill_ms, restart_ms)) = config.restart_node {
             let tail = config.duration_ms.saturating_sub(restart_ms);
-            let still_bh = config.schedule.iter().any(|sf| match &sf.fault {
-                Fault::BlackholeSignaling { node, active: true } if node == rnode => {
-                    !config.schedule.iter().any(|h| {
-                        h.at_ms > sf.at_ms
-                            && matches!(&h.fault, Fault::BlackholeSignaling { node: n2, active: false } if n2 == rnode && h.at_ms <= config.duration_ms.saturating_sub(10_000))
-                    })
-                }
-                _ => false,
-            });
+            let still_bh = still_bh_nodes.contains(rnode);
             if tail >= 10_000 && !still_bh {
                 let reconnected = outcome.net_events.iter().any(|ne| {
                     ne.at_ms >= restart_ms && ne.event.starts_with(&format!("sig:connect:{rnode}:"))
@@ -146,34 +238,10 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
             }
         }
 
-        let mut active_partitions: usize = 0;
-        let mut active_blackholes: usize = 0;
-        let mut last_heal_ms = config.restart_node.as_ref().map_or(0, |(_, _, r)| *r);
         let severed_before_heal = outcome
             .net_events
             .iter()
             .any(|ne| ne.event.starts_with("link:dropped_by_partition:"));
-
-        for sf in &config.schedule {
-            match &sf.fault {
-                Fault::Partition { .. } => {
-                    active_partitions = active_partitions.saturating_add(1);
-                }
-                Fault::HealPartition { .. } => {
-                    active_partitions = active_partitions.saturating_sub(1);
-                    last_heal_ms = last_heal_ms.max(sf.at_ms);
-                }
-                Fault::BlackholeSignaling { active: true, .. } => {
-                    active_blackholes = active_blackholes.saturating_add(1);
-                }
-                Fault::BlackholeSignaling { active: false, .. } => {
-                    active_blackholes = active_blackholes.saturating_sub(1);
-                    last_heal_ms = last_heal_ms.max(sf.at_ms);
-                }
-                Fault::Impair { .. } | Fault::ClearImpair { .. } | Fault::Hang { .. } => {}
-            }
-        }
-
         let clean_tail_ms = config.duration_ms.saturating_sub(last_heal_ms);
         if severed_before_heal
             && active_partitions == 0
@@ -190,6 +258,30 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
                     kind: OracleKind::PostHealLivenessViolation,
                     summary: format!(
                         "no signaling/direct progress after severed link healed at {last_heal_ms}ms (tail={clean_tail_ms}ms)"
+                    ),
+                });
+            }
+        }
+
+        record_antecedent("est_clean_window_checked");
+        let mut clean_connects: BTreeMap<String, usize> = BTreeMap::new();
+        for ne in &outcome.net_events {
+            if let Some(rest) = ne.event.strip_prefix("sig:connect:") {
+                let node = rest.split(':').next().unwrap_or("");
+                let in_fault = faulted_windows
+                    .iter()
+                    .any(|(s, e)| ne.at_ms >= *s && ne.at_ms <= *e);
+                if !in_fault && !node.is_empty() {
+                    *clean_connects.entry(node.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        for (node, cnt) in clean_connects {
+            if cnt > 6 {
+                violations.push(OracleViolation {
+                    kind: OracleKind::FormalInvariantViolation,
+                    summary: format!(
+                        "est_no_clean_reconnect_storm: node {node} had {cnt} clean signaling connects"
                     ),
                 });
             }

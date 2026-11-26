@@ -8,7 +8,7 @@ pub use assertions::{
     evaluate_oracles, AssertionReport, AlwaysFailure, OracleKind, OracleViolation,
 };
 pub use fuzz::{CampaignConfig, CampaignReport, Finding, Fuzzer, GuideFlags};
-pub use net::{Fault, HangSite, Proto, SimNetwork, SimRng};
+pub use net::{Fault, HangSite, MessageChaosPolicy, Proto, SimNetwork, SimRng};
 pub use semantic::{
     NodeProtoState, ProtoEvent, SemanticAction, SemanticFault, SemanticTrigger, SignalMsgKind,
     StateEdge, StateTransition,

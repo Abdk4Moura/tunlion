@@ -43,6 +43,8 @@ pub enum SimMutant {
     TimerEdgeSilenceBoundary,
     /// Simulates the send-reconnect bug dropping post-heal reconnects (caught by Tier-1 oracle).
     PostHealDroppedReconnect,
+    /// Simulates a signaling-reorder glare bug violating Establishment I1 role order.
+    ReorderGlareViolation,
 }
 
 #[derive(Debug, Clone)]

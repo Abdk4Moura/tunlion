@@ -18,7 +18,7 @@ use filament_transport::{HttpBackend, SignalingConnector, TransportContext};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
-use crate::sim::assertions::record_sometimes;
+use crate::sim::assertions::{record_always, record_antecedent, record_sometimes};
 use crate::sim::semantic::{
     NodeStateTracker, ProtoEvent, SignalMsgKind, StateEdge, StateTransition,
 };
@@ -81,6 +81,13 @@ pub enum HangSite {
     DirectRace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MessageChaosPolicy {
+    pub drop_pct: u8,
+    pub duplicate_pct: u8,
+    pub reorder_max_delay_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
     Impair {
@@ -110,6 +117,10 @@ pub enum Fault {
         site: HangSite,
         duration_ms: u64,
     },
+    SetMessageChaos {
+        policy: MessageChaosPolicy,
+    },
+    ClearMessageChaos,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -184,12 +195,102 @@ struct NetInner {
     hangs: BTreeMap<(String, HangSite), u64>,
     direct_waiters: Vec<DirectWaiter>,
     active_closers: BTreeMap<String, Vec<Arc<AtomicBool>>>,
+    msg_chaos: MessageChaosPolicy,
+    sig_msg_chaos_triggered: bool,
     tracker: NodeStateTracker,
     event_tx: Option<mpsc::UnboundedSender<(u64, String, ProtoEvent)>>,
     trace: Vec<NetTraceEvent>,
 }
 
+struct PendingSigDelivery {
+    tx: mpsc::UnboundedSender<Incoming>,
+    name: String,
+    data: Value,
+    delay_ms: u64,
+    kind_tag: Option<&'static str>,
+}
+
+fn dispatch_sig_deliveries(planned: Vec<PendingSigDelivery>) {
+    for p in planned {
+        if let Some(tag) = p.kind_tag {
+            record_sometimes(tag);
+        }
+        if p.delay_ms == 0 {
+            let _ = p.tx.send(Incoming::Event {
+                name: p.name,
+                data: p.data,
+            });
+        } else {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(p.delay_ms)).await;
+                let _ = p.tx.send(Incoming::Event {
+                    name: p.name,
+                    data: p.data,
+                });
+            });
+        }
+    }
+}
+
 impl NetInner {
+    fn plan_sig_deliveries(
+        &mut self,
+        items: Vec<(mpsc::UnboundedSender<Incoming>, &str, Value)>,
+    ) -> Vec<PendingSigDelivery> {
+        let mut out = Vec::with_capacity(items.len());
+        let policy = self.msg_chaos;
+        let active = policy.drop_pct > 0
+            || policy.duplicate_pct > 0
+            || policy.reorder_max_delay_ms > 0;
+        for (tx, name, data) in items {
+            if !active || name == "welcome" {
+                out.push(PendingSigDelivery {
+                    tx,
+                    name: name.to_string(),
+                    data,
+                    delay_ms: 0,
+                    kind_tag: None,
+                });
+                continue;
+            }
+            if self.rng.chance_pct(policy.drop_pct) {
+                self.sig_msg_chaos_triggered = true;
+                record_sometimes("sig_msg_dropped");
+                continue;
+            }
+            let delay_ms = if policy.reorder_max_delay_ms > 0 {
+                self.rng.gen_range_u64(policy.reorder_max_delay_ms + 1)
+            } else {
+                0
+            };
+            let kind_tag = if delay_ms > 0 {
+                self.sig_msg_chaos_triggered = true;
+                Some("sig_msg_reordered")
+            } else {
+                None
+            };
+            if self.rng.chance_pct(policy.duplicate_pct) {
+                self.sig_msg_chaos_triggered = true;
+                let dup_delay = delay_ms.saturating_add(5 + self.rng.gen_range_u64(145));
+                out.push(PendingSigDelivery {
+                    tx: tx.clone(),
+                    name: name.to_string(),
+                    data: data.clone(),
+                    delay_ms: dup_delay,
+                    kind_tag: Some("sig_msg_duplicated"),
+                });
+            }
+            out.push(PendingSigDelivery {
+                tx,
+                name: name.to_string(),
+                data,
+                delay_ms,
+                kind_tag,
+            });
+        }
+        out
+    }
+
     fn emit_proto_event(&mut self, node: &str, event: ProtoEvent) {
         let at_ms = clock::now_ms();
         self.tracker.record(at_ms, node, event);
@@ -291,6 +392,8 @@ impl SimNetwork {
                 hangs: BTreeMap::new(),
                 direct_waiters: Vec::new(),
                 active_closers: BTreeMap::new(),
+                msg_chaos: MessageChaosPolicy::default(),
+                sig_msg_chaos_triggered: false,
                 tracker: NodeStateTracker::default(),
                 event_tx: None,
                 trace: Vec::new(),
@@ -407,41 +510,54 @@ impl SimNetwork {
                 g.record(format!("fault:hang:{node}:{site:?}:{duration_ms}"));
                 g.hangs.insert((node, site), duration_ms);
             }
+            Fault::SetMessageChaos { policy } => {
+                g.record(format!(
+                    "fault:msg_chaos:drop={}:dup={}:delay={}",
+                    policy.drop_pct, policy.duplicate_pct, policy.reorder_max_delay_ms
+                ));
+                g.msg_chaos = policy;
+            }
+            Fault::ClearMessageChaos => {
+                g.record("fault:clear_msg_chaos");
+                g.msg_chaos = MessageChaosPolicy::default();
+            }
         }
     }
 
     /// Tear down all active signaling and transport handles for a killed node.
     pub fn disconnect_node(&self, node: &str) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.record(format!("node:disconnect:{node}"));
-        g.emit_proto_event(node, ProtoEvent::SigDisconnected);
-        let dead_cids: Vec<u64> = g
-            .sig_clients
-            .iter()
-            .filter(|(_, c)| c.node == node)
-            .map(|(cid, _)| *cid)
-            .collect();
-        let mut dead_sids = Vec::new();
-        for cid in dead_cids {
-            if let Some(c) = g.sig_clients.remove(&cid) {
-                g.sid_to_node.remove(&c.sid);
-                dead_sids.push(c.sid);
+        let planned = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.record(format!("node:disconnect:{node}"));
+            g.emit_proto_event(node, ProtoEvent::SigDisconnected);
+            let dead_cids: Vec<u64> = g
+                .sig_clients
+                .iter()
+                .filter(|(_, c)| c.node == node)
+                .map(|(cid, _)| *cid)
+                .collect();
+            let mut dead_sids = Vec::new();
+            for cid in dead_cids {
+                if let Some(c) = g.sig_clients.remove(&cid) {
+                    g.sid_to_node.remove(&c.sid);
+                    dead_sids.push(c.sid);
+                }
             }
-        }
-        for sid in &dead_sids {
-            for (_, other) in g.sig_clients.iter() {
-                let _ = other.tx.send(Incoming::Event {
-                    name: "peer-left".to_string(),
-                    data: json!({ "id": sid }),
-                });
+            let mut raw = Vec::new();
+            for sid in &dead_sids {
+                for (_, other) in g.sig_clients.iter() {
+                    raw.push((other.tx.clone(), "peer-left", json!({ "id": sid })));
+                }
             }
-        }
-        g.direct_waiters.retain(|w| w.node != node);
-        if let Some(closers) = g.active_closers.remove(node) {
-            for flag in closers {
-                flag.store(true, Ordering::Release);
+            g.direct_waiters.retain(|w| w.node != node);
+            if let Some(closers) = g.active_closers.remove(node) {
+                for flag in closers {
+                    flag.store(true, Ordering::Release);
+                }
             }
-        }
+            g.plan_sig_deliveries(raw)
+        };
+        dispatch_sig_deliveries(planned);
     }
 
     pub fn trace_events(&self) -> Vec<NetTraceEvent> {
@@ -674,20 +790,17 @@ impl SimSigBackend {
                 }
                 g.record(format!("sig:subscribe:{}:chans={}", self.node, chans.len()));
                 g.emit_proto_event(&self.node, ProtoEvent::SigSubscribed);
-                for (tx, kp) in notifications {
-                    let _ = tx.send(Incoming::Event {
-                        name: "known-peer".to_string(),
-                        data: kp,
-                    });
-                }
+                let items = notifications
+                    .into_iter()
+                    .map(|(tx, kp)| (tx, "known-peer", kp))
+                    .collect();
+                let planned = g.plan_sig_deliveries(items);
+                drop(g);
+                dispatch_sig_deliveries(planned);
             }
             "sync" => {
                 let me = g.sig_clients.get(&self.conn_id).cloned().unwrap_or(me);
-                let _ = me.tx.send(Incoming::Event {
-                    name: "synced".to_string(),
-                    data: json!({ "peers": [] }),
-                });
-                let mut notifications: Vec<(mpsc::UnboundedSender<Incoming>, Value)> = Vec::new();
+                let mut items = vec![(me.tx.clone(), "synced", json!({ "peers": [] }))];
                 for (_, other) in g.sig_clients.iter() {
                     if other.conn_id == self.conn_id || g.blackholed.contains(&other.node) {
                         continue;
@@ -697,8 +810,9 @@ impl SimSigBackend {
                     }
                     for ch in &me.channels {
                         if other.channels.contains(ch) {
-                            notifications.push((
+                            items.push((
                                 me.tx.clone(),
+                                "known-peer",
                                 json!({
                                     "id": other.sid,
                                     "name": other.display_name.clone().unwrap_or_else(|| other.node.clone()),
@@ -709,12 +823,9 @@ impl SimSigBackend {
                         }
                     }
                 }
-                for (tx, kp) in notifications {
-                    let _ = tx.send(Incoming::Event {
-                        name: "known-peer".to_string(),
-                        data: kp,
-                    });
-                }
+                let planned = g.plan_sig_deliveries(items);
+                drop(g);
+                dispatch_sig_deliveries(planned);
             }
             "signal" => {
                 let to = data["to"].as_str().unwrap_or_default();
@@ -738,13 +849,16 @@ impl SimSigBackend {
                             &self.node,
                             ProtoEvent::SignalRelayed(SignalMsgKind::from_type(sig_type)),
                         );
-                        let _ = target_tx.send(Incoming::Event {
-                            name: "signal".to_string(),
-                            data: json!({
+                        let planned = g.plan_sig_deliveries(vec![(
+                            target_tx,
+                            "signal",
+                            json!({
                                 "from": me.sid,
                                 "data": inner,
                             }),
-                        });
+                        )]);
+                        drop(g);
+                        dispatch_sig_deliveries(planned);
                     }
                 }
             }
@@ -806,18 +920,22 @@ impl SignalingBackend for SimSigBackend {
 
     fn disconnect<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let mut g = self.net.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(removed) = g.sig_clients.remove(&self.conn_id) {
-                g.sid_to_node.remove(&removed.sid);
-                g.record(format!("sig:disconnect:{}:{}", self.node, removed.sid));
-                g.emit_proto_event(&self.node, ProtoEvent::SigDisconnected);
-                for (_, other) in g.sig_clients.iter() {
-                    let _ = other.tx.send(Incoming::Event {
-                        name: "peer-left".to_string(),
-                        data: json!({ "id": removed.sid }),
-                    });
+            let planned = {
+                let mut g = self.net.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(removed) = g.sig_clients.remove(&self.conn_id) {
+                    g.sid_to_node.remove(&removed.sid);
+                    g.record(format!("sig:disconnect:{}:{}", self.node, removed.sid));
+                    g.emit_proto_event(&self.node, ProtoEvent::SigDisconnected);
+                    let mut items = Vec::new();
+                    for (_, other) in g.sig_clients.iter() {
+                        items.push((other.tx.clone(), "peer-left", json!({ "id": removed.sid })));
+                    }
+                    g.plan_sig_deliveries(items)
+                } else {
+                    Vec::new()
                 }
-            }
+            };
+            dispatch_sig_deliveries(planned);
             Ok(())
         })
     }
@@ -921,6 +1039,26 @@ impl DirectBackend for SimDirectBackend {
                     req.route, self.node, peer_waiter.node
                 ));
                 let peer_node_ev = peer_waiter.node.clone();
+                let glare_corrupt = matches!(g.mutant, SimMutant::ReorderGlareViolation)
+                    && g.sig_msg_chaos_triggered;
+                let peer_answerer = peer_waiter.my_uid < peer_waiter.peer_uid;
+                let local_answerer = if glare_corrupt {
+                    peer_answerer
+                } else {
+                    req.my_uid < req.peer_uid
+                };
+                record_antecedent("est_i1_glare_free");
+                record_always(
+                    "est_i1_glare_free",
+                    local_answerer != peer_answerer,
+                    || {
+                        format!(
+                            "glare role collision between {} and {}: local_answerer={} peer_answerer={}",
+                            self.node, peer_node_ev, local_answerer, peer_answerer
+                        )
+                    },
+                );
+                record_antecedent("est_i2_pair_symmetry");
                 g.emit_proto_event(&self.node, ProtoEvent::DirectPaired);
                 g.emit_proto_event(&peer_node_ev, ProtoEvent::DirectPaired);
                 record_sometimes("direct_paired");

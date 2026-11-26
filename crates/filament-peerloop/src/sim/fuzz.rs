@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::sim::assertions::{evaluate_oracles, OracleKind, OracleViolation};
-use crate::sim::net::{Fault, HangSite, Proto, SimRng};
+use crate::sim::assertions::{evaluate_oracles, take_assertions, OracleKind, OracleViolation};
+use crate::sim::net::{Fault, HangSite, MessageChaosPolicy, Proto, SimRng};
 use crate::sim::semantic::{ProtoEvent, SemanticAction, SemanticFault, SemanticTrigger, StateEdge};
 use crate::sim::world::{NodeSpec, ScheduledFault, SimConfig, SimMutant, SimOutcome, SimWorld};
 
@@ -15,6 +15,7 @@ pub struct GuideFlags {
     pub sometimes: bool,
     pub hill_climb: bool,
     pub semantic: bool,
+    pub message_chaos: bool,
     pub target_phase: Option<String>,
 }
 
@@ -66,6 +67,22 @@ impl GuideFlags {
         }
     }
 
+    pub fn message_chaos_only() -> Self {
+        Self {
+            message_chaos: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn full_semantic() -> Self {
+        Self {
+            swarm: true,
+            semantic: true,
+            message_chaos: true,
+            ..Self::default()
+        }
+    }
+
     pub fn married() -> Self {
         // Empirical Drop Rule: keep only `swarm`, which beat or tied `unguided`
         // across all 4 primary rediscovery targets. `sometimes`, `timer_edges`,
@@ -76,6 +93,7 @@ impl GuideFlags {
             sometimes: false,
             hill_climb: false,
             semantic: false,
+            message_chaos: false,
             target_phase: None,
         }
     }
@@ -112,6 +130,7 @@ pub struct CampaignReport {
     pub milestone_counts: BTreeMap<String, usize>,
     pub state_edges: BTreeSet<StateEdge>,
     pub state_edges_discovered: usize,
+    pub antecedents_seen: BTreeSet<String>,
     pub max_iter_busy_ms_seen: u64,
     pub max_cap_status_latency_ms_seen: u64,
 }
@@ -142,6 +161,7 @@ struct FuzzSchedule {
     hang: Option<(usize, HangSite, u64, u64)>,
     restart: Option<(usize, u64, u64)>,
     status_query: Option<(usize, u64)>,
+    msg_chaos: Option<(MessageChaosPolicy, u64, u64)>,
     semantic_faults: Vec<SemanticFault>,
 }
 
@@ -275,6 +295,16 @@ impl FuzzSchedule {
                     site,
                     duration_ms: dur_ms,
                 },
+            });
+        }
+        if let Some((policy, start, end)) = self.msg_chaos {
+            schedule.push(ScheduledFault {
+                at_ms: start,
+                fault: Fault::SetMessageChaos { policy },
+            });
+            schedule.push(ScheduledFault {
+                at_ms: end,
+                fault: Fault::ClearMessageChaos,
             });
         }
 
@@ -542,6 +572,17 @@ fn generate_schedule(
         }
     }
 
+    let msg_chaos = (flags.message_chaos && rng.chance_pct(75)).then(|| {
+        let policy = MessageChaosPolicy {
+            drop_pct: (5 + rng.gen_range_u64(21)) as u8,
+            duplicate_pct: (10 + rng.gen_range_u64(26)) as u8,
+            reorder_max_delay_ms: 40 + rng.gen_range_u64(280),
+        };
+        let start = rng.gen_range_u64(4_000);
+        let end = (start + 15_000 + rng.gen_range_u64(35_000)).min(duration_ms - 5_000);
+        (policy, start, end.max(start + 1_000))
+    });
+
     FuzzSchedule {
         sim_seed: rng.next_u64(),
         duration_ms,
@@ -554,6 +595,7 @@ fn generate_schedule(
         hang,
         restart,
         status_query,
+        msg_chaos,
         semantic_faults,
     }
 }
@@ -577,7 +619,7 @@ fn mutate_schedule(
     let fresh = generate_schedule(rng, flags, allow_gather_hang);
 
     // Perform 1 targeted structural/timing mutation per child.
-    match rng.gen_range_u64(7) {
+    match rng.gen_range_u64(8) {
         0 => s.impair_range = fresh.impair_range,
         1 => {
             if flags.swarm && rng.chance_pct(45) {
@@ -628,9 +670,8 @@ fn mutate_schedule(
             }
             s.status_query = Some((node, at));
         }
-        _ => {
-            s.semantic_faults = fresh.semantic_faults;
-        }
+        6 => s.semantic_faults = fresh.semantic_faults,
+        _ => s.msg_chaos = fresh.msg_chaos,
     }
     if flags.swarm && rng.chance_pct(35) {
         s.partition = None;
@@ -762,6 +803,7 @@ impl Fuzzer {
             milestone_counts: BTreeMap::new(),
             state_edges: BTreeSet::new(),
             state_edges_discovered: 0,
+            antecedents_seen: BTreeSet::new(),
             max_iter_busy_ms_seen: 0,
             max_cap_status_latency_ms_seen: 0,
         };
@@ -775,6 +817,7 @@ impl Fuzzer {
                 *merged.milestone_counts.entry(k).or_insert(0) += v;
             }
             merged.state_edges.extend(rep.state_edges);
+            merged.antecedents_seen.extend(rep.antecedents_seen);
             if merged.findings.is_empty() || !campaign.stop_on_first_finding {
                 merged.findings.extend(rep.findings);
             }
@@ -791,6 +834,7 @@ impl Fuzzer {
         let mut milestone_counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut seen_edges: BTreeSet<StateEdge> = BTreeSet::new();
         let mut edge_counts: BTreeMap<StateEdge, usize> = BTreeMap::new();
+        let mut antecedents_seen: BTreeSet<String> = BTreeSet::new();
         let mut corpus: Vec<CorpusEntry> = Vec::new();
         let mut max_iter_busy_ms_seen = 0u64;
         let mut max_cap_status_latency_ms_seen = 0u64;
@@ -881,6 +925,9 @@ impl Fuzzer {
             }
 
             let violations = evaluate_oracles(&outcome, &cfg);
+            let post_eval = take_assertions();
+            antecedents_seen.extend(outcome.assertions.antecedents_seen.iter().cloned());
+            antecedents_seen.extend(post_eval.antecedents_seen.iter().cloned());
             if !violations.is_empty() {
                 // Verify bit-exact deterministic replay with full logging before reporting.
                 let mut full_cfg = cfg.clone();
@@ -951,6 +998,7 @@ impl Fuzzer {
             milestone_counts,
             state_edges: seen_edges,
             state_edges_discovered,
+            antecedents_seen,
             max_iter_busy_ms_seen,
             max_cap_status_latency_ms_seen,
         }
