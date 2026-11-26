@@ -1,0 +1,86 @@
+{
+  "hooks": {
+    "alpha": {
+      "TUNLION_TEST_CORRUPT_ONCE": "1"
+    },
+    "bravo": {
+      "TUNLION_TEST_CORRUPT_ONCE": "1"
+    }
+  },
+  "origin": "chaos finding 22b3f2a918 (campaign chaos-fa8400dda723-explore-1795696394-1138214, main f497c9088, reproduced 2/3, replay 6/12): alpha's 256 KiB send to charlie rode the daemon's warm link, which died under 1500 ms delay on alpha; the daemon had no link to offer for 30 s and the send's own dials never landed, and with charlie still on the server the only bound was the 120 s rejoin window: still 'trying to reconnect' at 90 s (O2 hang)",
+  "seed": 336543326,
+  "steps": [
+    {
+      "a": "alpha",
+      "at": 0.0,
+      "b": "charlie",
+      "dur": 7.8,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 1.7,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "alpha"
+    },
+    {
+      "at": 5.3,
+      "dst": "bravo",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 12.6,
+      "dur": 3.2,
+      "fault": "proc.freeze",
+      "target": "alpha"
+    },
+    {
+      "args": {
+        "delay_ms": 1500,
+        "dup": 5,
+        "jitter_ms": 300,
+        "loss": 5,
+        "reorder": 25
+      },
+      "at": 14.8,
+      "dur": 262.8,
+      "fault": "net.impair",
+      "target": "alpha"
+    },
+    {
+      "at": 15.4,
+      "dst": "charlie",
+      "op": "status",
+      "src": "charlie"
+    },
+    {
+      "at": 18.5,
+      "dur": 3.3,
+      "fault": "proc.kill",
+      "target": "bravo"
+    },
+    {
+      "at": 18.8,
+      "dst": "charlie",
+      "kib": 256,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 33.4,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "bravo"
+    },
+    {
+      "at": 39.1,
+      "dst": "charlie",
+      "op": "status",
+      "src": "charlie"
+    }
+  ],
+  "version": 1
+}
