@@ -1875,14 +1875,24 @@ struct PeerSignalState {
 /// the stall exit) while every other peer went unserved. A healthy operation
 /// finishes in milliseconds, so the caller still sees its result; a wedged one
 /// keeps its place in the peer's queue and the loop moves on.
-pub const PC_OP_INLINE_BUDGET: Duration = Duration::from_secs(1);
+///
+/// The bound is a quarter of the daemon loop's one-second iteration budget,
+/// not equal to it. At one second a single wedged operation used the whole
+/// budget by itself (chaos finding d6e0cd7c93: 1001 ms in handler/PcState),
+/// and a handler that makes two such calls in sequence (`fingerprints` reads
+/// both descriptions; a glare rebuild applies a signal twice) could wait two.
+/// 250 ms is still two orders of magnitude above a healthy operation, and an
+/// operation that outlives it loses nothing: it keeps its place in the queue
+/// and applies in order (`handle_signal`). Operations whose outcome no caller
+/// needs (`restart_ice`) are not waited for at all.
+pub const PC_OP_INLINE_BUDGET: Duration = Duration::from_millis(250);
 
 /// One negotiation operation on a peer connection, run by the peer's own
 /// task in arrival order. Order matters: a description must land before the
 /// candidates that follow it, and an answer must follow its offer.
 enum PcOp {
     Signal(Value, Option<tokio::sync::oneshot::Sender<Result<SignalOutcome>>>),
-    RestartIce(Option<tokio::sync::oneshot::Sender<()>>),
+    RestartIce,
 }
 
 /// What the peer's negotiation task needs: shared handles only, so no
@@ -2186,13 +2196,15 @@ impl Peer {
     }
 
     /// C4: nudge ICE recovery after a transient 'disconnected' (impolite side
-    /// only, mirroring the browser). Runs on the peer's negotiation task; the
-    /// caller waits at most [`PC_OP_INLINE_BUDGET`] (see there for why).
-    pub async fn restart_ice(&self) {
-        let (done, wait) = tokio::sync::oneshot::channel();
-        if self.enqueue(PcOp::RestartIce(Some(done))) {
-            let _ = tokio::time::timeout(PC_OP_INLINE_BUDGET, wait).await;
-        }
+    /// only, mirroring the browser). Queued on the peer's negotiation task and
+    /// never waited for: no caller uses its outcome (the restart's offer goes
+    /// out on signaling and the answer comes back as a signal), and the moment
+    /// it is asked for is exactly when webrtc-rs is likeliest to be holding its
+    /// locks across a stalled network. Waited for, even under
+    /// [`PC_OP_INLINE_BUDGET`], it parked the daemon loop for that whole budget
+    /// in the `disconnected` PcState handler (chaos finding d6e0cd7c93).
+    pub fn restart_ice(&self) {
+        let _ = self.enqueue(PcOp::RestartIce);
     }
 
     /// Queue one negotiation operation. True when the caller should wait for
@@ -2443,12 +2455,7 @@ impl PcWorker {
                             _ => {}
                         }
                     }
-                    PcOp::RestartIce(reply) => {
-                        self.restart_ice().await;
-                        if let Some(reply) = reply {
-                            let _ = reply.send(());
-                        }
-                    }
+                    PcOp::RestartIce => self.restart_ice().await,
                 }
                 busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -4094,6 +4101,55 @@ mod negotiation_off_loop_tests {
             "candidate": format!("candidate:{n} 1 udp 1 10.0.0.{n} 9 typ host") } })
     }
 
+    /// Chaos finding d6e0cd7c93: the `disconnected` PcState handler asked for
+    /// an ICE restart while the negotiation task was wedged and the queue was
+    /// otherwise idle, and waited out the whole inline budget (1001 ms against
+    /// the loop's 1000 ms). Nothing uses a restart's outcome, so the caller
+    /// must not wait for it at all, not even on an idle queue.
+    #[tokio::test]
+    async fn an_ice_restart_never_waits_for_a_wedged_negotiation() {
+        let p = peer(false).await;
+        let guard = p.hold.lock().await;
+        assert_eq!(p.negotiation_backlog(), 0, "the queue starts idle");
+        let started = std::time::Instant::now();
+        p.restart_ice();
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(50),
+            "an ICE restart on an idle queue waited {waited:?} for a wedged negotiation"
+        );
+        assert_eq!(p.negotiation_backlog(), 1, "the restart was not queued");
+        // Released, the queued restart still runs.
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while p.negotiation_backlog() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the queued restart runs once released");
+    }
+
+    /// The inline bound leaves the event loop most of its iteration budget even
+    /// when a handler meets a wedged negotiation twice in a row.
+    #[tokio::test]
+    async fn two_wedged_inline_operations_stay_well_inside_the_loop_budget() {
+        // Behind its own wedge a second call returns at once, so the worst
+        // case for one handler is two wedged operations on idle queues (two
+        // descriptions read, or a signal applied to two connections).
+        let (p, q) = (peer(true).await, peer(true).await);
+        let (guard_p, guard_q) = (p.hold.lock().await, q.hold.lock().await);
+        let started = std::time::Instant::now();
+        assert!(matches!(p.handle_signal(candidate(1)).await, Ok(SignalOutcome::Handled)));
+        assert!(matches!(q.handle_signal(candidate(2)).await, Ok(SignalOutcome::Handled)));
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(700),
+            "two wedged inline operations held the caller {waited:?}"
+        );
+        drop((guard_p, guard_q));
+    }
+
     #[tokio::test]
     async fn a_wedged_negotiation_does_not_park_the_caller() {
         let p = peer(true).await;
@@ -4111,7 +4167,7 @@ mod negotiation_off_loop_tests {
         for n in 2..=20 {
             p.handle_signal(candidate(n)).await.expect("queued");
         }
-        p.restart_ice().await;
+        p.restart_ice();
         assert!(
             started.elapsed() < Duration::from_millis(200),
             "queued negotiation operations waited {:?}",
