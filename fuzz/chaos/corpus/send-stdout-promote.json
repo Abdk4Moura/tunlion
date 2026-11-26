@@ -1,0 +1,23 @@
+{
+  "hooks": {
+    "alpha": {
+      "TUNLION_TEST_DIRECT_DELAY_MS": "1500"
+    },
+    "bravo": {
+      "TUNLION_TEST_DIRECT_DELAY_MS": "1500"
+    }
+  },
+  "origin": "gate T3b (stdout, relay then direct mid-transfer): with the direct path delayed 1500 ms on both ends a code transfer to stdout starts on the relay and promotes; pre-#746 the promote opened a second stdout sink while both ends said verified",
+  "seed": 7,
+  "steps": [
+    {
+      "at": 1.0,
+      "dst": "bravo",
+      "kib": 5120,
+      "op": "send",
+      "src": "alpha",
+      "via": "stdout"
+    }
+  ],
+  "version": 1
+}

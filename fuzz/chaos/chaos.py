@@ -139,7 +139,9 @@ OPS = ["exec", "send", "reach", "status", "doctor"]
 # canaries, not faults.
 RECOVERABLE_HOOKS = {
     "TUNLION_TEST_DIRECT_FLAKY": ["1"],
-    "TUNLION_TEST_DIRECT_DELAY_MS": ["500", "3000"],
+    # 1500 ms is the delay gate T3b uses to make a code transfer start on the
+    # relay and switch to a direct path mid-stream (the #746 corruption).
+    "TUNLION_TEST_DIRECT_DELAY_MS": ["500", "1500", "3000"],
     "TUNLION_TEST_ESTABLISH_DELAY_MS": ["500", "4000"],
     "TUNLION_TEST_DROP_PEER_LEFT": ["1"],
     "TUNLION_TEST_CORRUPT_ONCE": ["1"],
@@ -1153,7 +1155,13 @@ def send_to_stdout(w: World, st: dict, res: dict, deadline: float) -> None:
     slog = w.cfg(src) / f"stdout-send-{tag}.log"
     rlog = w.cfg(dst) / f"stdout-recv-{tag}.log"
     with open(slog, "wb") as so:
-        sp = subprocess.Popen(w.as_dev(src, ["send", str(f), "--word", STDOUT_WORD]), env=w.env_for(src),
+        # A code send and its receive are one-shot processes with their own
+        # transport, not the daemon's, so the device's hooks must reach them
+        # too or the paths those hooks open (a mid-transfer upgrade to direct)
+        # are unreachable: replaying the pre-#746 tree found 0/24 corruptions
+        # without this, while gate T3b finds it with the hook on both ends.
+        sp = subprocess.Popen(w.as_dev(src, ["send", str(f), "--word", STDOUT_WORD]),
+                              env=w.env_for(src, w.hooks.get(src, {})),
                               stdout=so, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                               start_new_session=True)
     code = None
@@ -1169,7 +1177,7 @@ def send_to_stdout(w: World, st: dict, res: dict, deadline: float) -> None:
     if code:
         with open(rlog, "wb") as re_:
             rp = subprocess.Popen(w.as_dev(dst, ["receive", code, "-y", "-o", "-", "--timeout", "60"]),
-                                  env=w.env_for(dst), stdout=subprocess.PIPE, stderr=re_,
+                                  env=w.env_for(dst, w.hooks.get(dst, {})), stdout=subprocess.PIPE, stderr=re_,
                                   stdin=subprocess.DEVNULL, start_new_session=True)
 
         def drain() -> None:
