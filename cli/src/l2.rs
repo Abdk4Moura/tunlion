@@ -1400,6 +1400,22 @@ pub(crate) async fn bring_up_to_known(
                 // one lingers on the server's roster as a ghost), and waiting
                 // out the whole connect timeout only delays the answer.
                 if role == "exec" && connect_started.elapsed() >= EXEC_SILENT_PEER {
+                    // Before blaming the peer, look at our own side: the local
+                    // daemon's server link, this attempt's own signaling time,
+                    // or no welcome from the server at all.
+                    let own = crate::ping::own_link_from_daemon(crate::daemon_health::signaling().await.as_ref())
+                        .or_else(|| crate::ping::slow_own_link_in(diag.timings()))
+                        .or_else(|| {
+                            my_id.is_none().then(|| crate::ping::OwnLink::Slow {
+                                signaling_ms: connect_started.elapsed().as_millis() as u64,
+                            })
+                        });
+                    if let Some(own) = own {
+                        bail!(
+                            "{}",
+                            crate::ping::exec_silent_peer_own_link(peer_name, EXEC_SILENT_PEER.as_secs(), own)
+                        );
+                    }
                     bail!(
                         "'{peer_name}' did not answer within {}s: it is offline, or `tunlion up` is not running there",
                         EXEC_SILENT_PEER.as_secs()
