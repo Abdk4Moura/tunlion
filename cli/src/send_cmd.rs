@@ -916,18 +916,22 @@ pub(crate) async fn send_cmd(
     loop {
         conn.pump_builds();
         let rejoin_window = conn.rejoin.rejoin_window;
-        let link_down = conn
-            .active
-            .as_ref()
-            .and_then(|p| conn.transport_of(p))
-            .map(|t| {
+        // Once a channel has been up, the clock runs until a live transport
+        // to the target is back, not merely until the dead one is gone. The
+        // stall ladder replaces a dead link with one that is still dialing (no
+        // transport yet), and a frozen receiver keeps that dial retrying; when
+        // that read as "not down" the clock restarted on every repair and the
+        // send never reached its honest end (gate 11).
+        let link_down = match conn.active.as_ref().and_then(|p| conn.transport_of(p)) {
+            Some(t) => {
                 let silent = t.heard_ms();
                 !t.is_alive()
                     || t.is_dead()
                     || silent == Some(u64::MAX)
                     || silent.is_some_and(|ms| ms > rejoin_window.as_millis() as u64)
-            })
-            .unwrap_or(false);
+            }
+            None => established,
+        };
         if link_down {
             let unfinished = outgoing.lock().await.iter().any(|o| !o.done && !o.declined);
             if unfinished {
