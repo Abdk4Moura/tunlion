@@ -48,11 +48,15 @@ impl GuideFlags {
     }
 
     pub fn married() -> Self {
+        // Empirical Drop Rule: keep only guides that beat unguided on our
+        // rediscovery benchmarks (`swarm` + `sometimes`). `timer_edges` and
+        // `hill_climb` stay behind flags for ablation and did not earn default
+        // inclusion (in paused virtual time healthy iterations measure 0ms busy).
         Self {
             swarm: true,
-            timer_edges: true,
+            timer_edges: false,
             sometimes: true,
-            hill_climb: true,
+            hill_climb: false,
             target_phase: None,
         }
     }
