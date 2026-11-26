@@ -7468,6 +7468,18 @@ impl Conn {
         if self.resil.warm_cutover.contains(pid) {
             return Rung::Repaired;
         }
+        // The send loop measures a stall on every pass and the event that
+        // carries it is handled later, so several are queued before the first
+        // one repairs anything. Once a repair is converging (a re-dial pending,
+        // or the link rebuilding with no transport yet), the rest were measured
+        // on the link that repair already replaced. Counting them climbed the
+        // ladder from attempt 1 to the relay escalation in one second, and with
+        // no TURN server that relay-only re-dial could never connect.
+        if self.resil.stall_repairs.get(pid).is_some_and(|s| s.pending)
+            && (self.direct_pending.contains_key(pid) || self.transport_of(pid).is_none())
+        {
+            return Rung::Repaired;
+        }
         // Check transport dead BEFORE the mutable borrow so the borrow-split
         // is unambiguous. When the transport is structurally dead (I/O error,
         // not a vanished peer), rung (a) Resume (re-offer on the same transport)
@@ -11225,6 +11237,14 @@ mod warm_identity_tests {
         );
         assert!(conn.direct_pending.contains_key(pid), "no fresh dial was armed");
         assert_eq!(conn.active.as_deref(), Some(pid));
+        // Stalls queued before that repair ran were measured on the link it
+        // replaced: they must not climb the ladder toward the relay.
+        let attempts = conn.resil.stall_repairs.get(pid).map(|s| s.attempts);
+        for _ in 0..STALL_MAX_REPAIRS {
+            assert_eq!(conn.correct_stall(pid).await, Rung::Repaired);
+        }
+        assert_eq!(conn.resil.stall_repairs.get(pid).map(|s| s.attempts), attempts);
+        assert!(!conn.relay_only, "queued stalls escalated to the relay");
         // While that dial converges the ladder holds instead of re-firing.
         assert!(conn.detect_stall(pid, true, true).is_none());
     }
