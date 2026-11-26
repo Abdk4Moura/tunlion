@@ -801,6 +801,18 @@ pub fn recv_pake_expired_message(any_pake_heard: bool, budget_secs: u64) -> Stri
     }
 }
 
+/// Whether a re-offer is the same sender resuming over its own lingering
+/// stream(s) for that file. Such a sender has judged those streams dead, and
+/// the transport its pid maps to now is the fresh link it re-dialed, so that
+/// link's activity says nothing about the old stream. Pure.
+pub fn resume_replaces_own_stream<'a>(
+    is_resume: bool,
+    mut lingering_pids: impl Iterator<Item = &'a str>,
+    offering_pid: &str,
+) -> bool {
+    is_resume && lingering_pids.all(|p| p == offering_pid)
+}
+
 /// Whether a receive that has finished its files may start its quiet exit, and
 /// the line it prints. Pure. `idle` = nothing in flight and no question open.
 /// A one-time CODE receive also ends while its sender is still connected: a
@@ -4563,7 +4575,10 @@ async fn recv_run(
             let all_pids: Vec<String> = conn.links.keys().cloned().collect();
             for pid in all_pids {
                 let in_flight = st.by_sid.keys().any(|(p, _)| *p == pid);
-                if let Some(idle) = conn.detect_stall(&pid, in_flight) {
+                // A dead channel is NOT a stall here: the sender owns
+                // re-establishing it and this side answers its re-dial
+                // (see `Conn::detect_stall`).
+                if let Some(idle) = conn.detect_stall(&pid, in_flight, false) {
                     let transport_dead = conn
                         .transport_of(&pid)
                         .map(|t| t.is_dead())
@@ -9832,11 +9847,26 @@ async fn recv_run(
                             .collect();
                         if !dup_keys.is_empty() {
                             // Is ANY existing stream for this file still flowing?
-                            let any_flowing = dup_keys.iter().any(|(p, _)| {
-                                conn.transport_of(p)
-                                    .map(|t| t.idle_ms() < net::stall_ms())
-                                    .unwrap_or(false)
-                            });
+                            //
+                            // Not when the same sender re-offers with resume:
+                            // it only does that once it judged its own stream
+                            // dead (a channel that died, a stall), and when it
+                            // re-dialed the same signaling id, `transport_of`
+                            // here is the FRESH link, idle for milliseconds
+                            // because the offer just arrived on it. Read as
+                            // "still flowing", the resume was ignored and the
+                            // repaired send never moved another byte.
+                            let same_sender_resume = resume_replaces_own_stream(
+                                is_resume,
+                                dup_keys.iter().map(|(p, _)| p.as_str()),
+                                &pid,
+                            );
+                            let any_flowing = !same_sender_resume
+                                && dup_keys.iter().any(|(p, _)| {
+                                    conn.transport_of(p)
+                                        .map(|t| t.idle_ms() < net::stall_ms())
+                                        .unwrap_or(false)
+                                });
                             if any_flowing {
                                 // A real concurrent duplicate, first (flowing)
                                 // stream wins. Ignore WITHOUT marking the sender
@@ -11805,6 +11835,23 @@ mod offer_consent_tests {
     fn the_receive_help_promises_what_the_code_path_does() {
         let help = include_str!("../../../../cli/src/cli_def.rs");
         assert!(help.contains("`receive <code>` never asks"));
+    }
+}
+
+#[cfg(test)]
+mod resume_own_stream_tests {
+    use super::resume_replaces_own_stream;
+
+    /// The chaos replay's repaired send: it re-dialed the same sid and
+    /// re-offered with resume, and the receiver ignored it as a duplicate.
+    #[test]
+    fn a_same_sender_resume_replaces_its_lingering_stream() {
+        assert!(resume_replaces_own_stream(true, ["sid-a"].into_iter(), "sid-a"));
+        // Not a resume: a concurrent duplicate keeps the flowing check.
+        assert!(!resume_replaces_own_stream(false, ["sid-a"].into_iter(), "sid-a"));
+        // A different sender (a rejoin on a new sid) keeps the flowing check.
+        assert!(!resume_replaces_own_stream(true, ["sid-a"].into_iter(), "sid-b"));
+        assert!(!resume_replaces_own_stream(true, ["sid-a", "sid-b"].into_iter(), "sid-a"));
     }
 }
 
