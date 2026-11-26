@@ -49,6 +49,12 @@ pub struct WarmHold {
     pub last_use: HashMap<String, Instant>,
     /// Per-peer reconnect backoff state
     backoff: HashMap<String, WarmBackoff>,
+    /// Peers whose last warm dial only STARTED a build (no live link yet).
+    /// Settled by the next look: a carrying link is a success, a fresh
+    /// establish decision means the build never came up and is a failure.
+    /// Without it such a dial counted as neither, the backoff never grew, and
+    /// a peer whose builds always fail was re-dialled at the tick rate.
+    pending: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -186,8 +192,34 @@ impl WarmHold {
         }
     }
 
+    /// A warm dial started a build that is not live yet: the next look
+    /// settles it (`settle_pending`). Stamps the attempt so `due` measures
+    /// the backoff from this dial.
+    pub fn note_started(&mut self, peer: &str) {
+        self.pending.insert(peer.to_string());
+        self.backoff.entry(peer.to_string()).or_default().last_attempt = Some(Instant::now());
+    }
+
+    /// Settle a started build on the next look at the peer: `carried` true
+    /// (a link to it carries traffic) is a success, false (warm-hold has to
+    /// establish again, the build never came up) a failure. A peer with no
+    /// started build is left alone.
+    pub fn settle_pending(&mut self, peer: &str, carried: bool) {
+        if !self.pending.remove(peer) {
+            return;
+        }
+        if carried {
+            self.note_success(peer);
+        } else {
+            self.note_failure(peer);
+        }
+    }
+
     /// Resume a dormant peer (e.g., when it reappears in signaling presence)
     pub fn resume(&mut self, peer: &str) {
+        // A reappearance is a new start: the build to the old sid says nothing
+        // about the new one.
+        self.pending.remove(peer);
         if let Some(b) = self.backoff.get_mut(peer) {
             b.dormant = false;
             b.failures = 0;
@@ -390,5 +422,56 @@ mod warm_hold_tests {
         // After WARM_DORMANT_RETRY, would be due (can't easily test Instant::elapsed
         // without injecting time, so just verify the dormant flag is set)
         assert!(wh.backoff["dovm"].dormant);
+    }
+
+    /// A warm dial that only STARTED a build used to count as neither success
+    /// nor failure, so a peer whose builds never come up (a departed visitor:
+    /// the ladder exhausts or the link cap evicts it, and warm-hold dials it
+    /// again) was re-dialled at the tick rate forever. The next look settles
+    /// it: having to establish again is a failure, so the backoff grows to
+    /// dormancy; a link that carries is a success.
+    #[test]
+    fn a_started_build_that_never_comes_up_is_a_failure() {
+        let mut wh = WarmHold::default();
+        wh.auto.insert("visitor-4".into());
+        for n in 1..=WARM_DORMANT_THRESHOLD {
+            wh.note_started("visitor-4");
+            assert!(!wh.due("visitor-4"), "a just-started dial is due again at once");
+            wh.settle_pending("visitor-4", false);
+            assert_eq!(wh.failures("visitor-4"), n);
+            // Settling twice counts once.
+            wh.settle_pending("visitor-4", false);
+            assert_eq!(wh.failures("visitor-4"), n);
+        }
+        assert!(wh.is_dormant("visitor-4"), "endless failed builds never went dormant");
+        assert!(!wh.due("visitor-4"));
+    }
+
+    #[test]
+    fn a_started_build_that_carries_is_a_success() {
+        let mut wh = WarmHold::default();
+        wh.note_failure("laptop");
+        wh.note_started("laptop");
+        wh.settle_pending("laptop", true);
+        assert_eq!(wh.failures("laptop"), 0);
+        // Nothing pending any more: a later establish is not charged to it.
+        wh.settle_pending("laptop", false);
+        assert_eq!(wh.failures("laptop"), 0);
+    }
+
+    /// A laptop that slept: its builds to the old sid failed into dormancy,
+    /// then it reappears on a new sid. Presence resumes it at once, and the
+    /// build still pending against the old sid is not charged to the new one.
+    #[test]
+    fn a_reappearance_resumes_and_forgets_the_old_build() {
+        let mut wh = WarmHold::default();
+        for _ in 0..WARM_DORMANT_THRESHOLD {
+            wh.note_failure("laptop");
+        }
+        wh.note_started("laptop");
+        wh.resume("laptop");
+        assert!(!wh.is_dormant("laptop"));
+        wh.settle_pending("laptop", false);
+        assert_eq!(wh.failures("laptop"), 0, "the old sid's build was charged to the return");
     }
 }

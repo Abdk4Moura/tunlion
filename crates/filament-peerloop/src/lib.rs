@@ -114,7 +114,7 @@ pub use adoption::{
     AdoptSource, CodeAuthorityRefusal, CodeSession, CodeTransport, active_binding_matches,
     code_authority_check, match_adoption_source, peer_targetable,
 };
-pub use liveness::{RevokeRecheck, direct_permitted, ice_fallback_allowed, link_dead_for, link_has_live_for};
+pub use liveness::{RevokeRecheck, direct_permitted, ice_fallback_allowed, link_carries_for, link_dead_for, link_has_live_for};
 pub use petname::{LinkPetname, link_petname};
 pub use retry::{schedule_retry, stuck_backoff};
 pub use warm::{WarmBackoff, WarmHold};

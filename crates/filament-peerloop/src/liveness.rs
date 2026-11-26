@@ -38,6 +38,19 @@ pub fn link_has_live_for(peer_live: bool, primary_ok: bool, workers_ok: bool) ->
     peer_live || primary_ok || workers_ok
 }
 
+/// Whether a link CARRIES anything: a transport or worker serves, or the
+/// WebRTC peer reached Connected. Narrower than [`link_has_live_for`] on
+/// purpose: an attempt still gathering or checking ICE is progress for a
+/// re-dial decision, but it is no evidence the far end still exists. The
+/// roster asks this one. A sid the server reports gone keeps its roster entry
+/// only while a link to it really carries traffic; an in-flight attempt
+/// toward it used to count as live, so a departed visitor whose retry ladder
+/// was mid-attempt at every digest was never forgotten, and warm-hold dialled
+/// it from that stale entry without bound.
+pub fn link_carries_for(peer_connected: bool, primary_ok: bool, workers_ok: bool) -> bool {
+    peer_connected || primary_ok || workers_ok
+}
+
 /// Whether an establish may proceed on STUN alone when the config API is slow.
 /// Not under a forced relay, which needs the TURN credentials only the API has.
 pub fn ice_fallback_allowed(relay_only: bool) -> bool {
