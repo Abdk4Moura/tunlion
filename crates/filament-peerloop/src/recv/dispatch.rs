@@ -801,6 +801,18 @@ pub fn recv_pake_expired_message(any_pake_heard: bool, budget_secs: u64) -> Stri
     }
 }
 
+/// Whether a re-offer is the same sender resuming over its own lingering
+/// stream(s) for that file. Such a sender has judged those streams dead, and
+/// the transport its pid maps to now is the fresh link it re-dialed, so that
+/// link's activity says nothing about the old stream. Pure.
+pub fn resume_replaces_own_stream<'a>(
+    is_resume: bool,
+    mut lingering_pids: impl Iterator<Item = &'a str>,
+    offering_pid: &str,
+) -> bool {
+    is_resume && lingering_pids.all(|p| p == offering_pid)
+}
+
 /// Whether a receive that has finished its files may start its quiet exit, and
 /// the line it prints. Pure. `idle` = nothing in flight and no question open.
 /// A one-time CODE receive also ends while its sender is still connected: a
@@ -9844,8 +9856,11 @@ async fn recv_run(
                             // because the offer just arrived on it. Read as
                             // "still flowing", the resume was ignored and the
                             // repaired send never moved another byte.
-                            let same_sender_resume =
-                                is_resume && dup_keys.iter().all(|(p, _)| *p == pid);
+                            let same_sender_resume = resume_replaces_own_stream(
+                                is_resume,
+                                dup_keys.iter().map(|(p, _)| p.as_str()),
+                                &pid,
+                            );
                             let any_flowing = !same_sender_resume
                                 && dup_keys.iter().any(|(p, _)| {
                                     conn.transport_of(p)
@@ -11815,6 +11830,23 @@ mod offer_consent_tests {
     fn the_receive_help_promises_what_the_code_path_does() {
         let help = include_str!("../../../../cli/src/cli_def.rs");
         assert!(help.contains("`receive <code>` never asks"));
+    }
+}
+
+#[cfg(test)]
+mod resume_own_stream_tests {
+    use super::resume_replaces_own_stream;
+
+    /// The chaos replay's repaired send: it re-dialed the same sid and
+    /// re-offered with resume, and the receiver ignored it as a duplicate.
+    #[test]
+    fn a_same_sender_resume_replaces_its_lingering_stream() {
+        assert!(resume_replaces_own_stream(true, ["sid-a"].into_iter(), "sid-a"));
+        // Not a resume: a concurrent duplicate keeps the flowing check.
+        assert!(!resume_replaces_own_stream(false, ["sid-a"].into_iter(), "sid-a"));
+        // A different sender (a rejoin on a new sid) keeps the flowing check.
+        assert!(!resume_replaces_own_stream(true, ["sid-a"].into_iter(), "sid-b"));
+        assert!(!resume_replaces_own_stream(true, ["sid-a", "sid-b"].into_iter(), "sid-a"));
     }
 }
 
