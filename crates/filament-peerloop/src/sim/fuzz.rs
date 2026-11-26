@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::sim::assertions::{evaluate_oracles, OracleKind, OracleViolation};
@@ -61,7 +63,7 @@ impl GuideFlags {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CampaignConfig {
     pub seed: u64,
     pub max_runs: usize,
@@ -69,6 +71,7 @@ pub struct CampaignConfig {
     pub flags: GuideFlags,
     pub mutant: SimMutant,
     pub allow_gather_hang: bool,
+    pub quiet_logs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +274,7 @@ impl FuzzSchedule {
             cap_status_queries,
             inline_stall_injection: None,
             mutant,
+            quiet_logs: false,
         }
     }
 
@@ -583,6 +587,59 @@ pub struct Fuzzer;
 
 impl Fuzzer {
     pub fn run(campaign: &CampaignConfig) -> CampaignReport {
+        Self::run_with_stop(campaign, None)
+    }
+
+    pub fn run_parallel(campaign: &CampaignConfig, workers: usize) -> CampaignReport {
+        let t0 = Instant::now();
+        let workers = workers.max(1).min(campaign.max_runs.max(1));
+        if workers == 1 {
+            return Self::run(campaign);
+        }
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let base_runs = campaign.max_runs / workers;
+        let rem = campaign.max_runs % workers;
+
+        let worker_reports: Vec<CampaignReport> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|w| {
+                    let count = base_runs + usize::from(w < rem);
+                    let mut sub = campaign.clone();
+                    sub.seed = campaign.seed
+                        ^ ((w as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    sub.max_runs = count;
+                    let stop = Arc::clone(&stop_flag);
+                    scope.spawn(move || Self::run_with_stop(&sub, Some(&stop)))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("fuzz worker panicked")).collect()
+        });
+
+        let mut merged = CampaignReport {
+            runs_executed: 0,
+            total_wall_ms: t0.elapsed().as_millis() as u64,
+            findings: Vec::new(),
+            milestone_counts: BTreeMap::new(),
+            max_iter_busy_ms_seen: 0,
+            max_cap_status_latency_ms_seen: 0,
+        };
+        for rep in worker_reports {
+            merged.runs_executed += rep.runs_executed;
+            merged.max_iter_busy_ms_seen = merged.max_iter_busy_ms_seen.max(rep.max_iter_busy_ms_seen);
+            merged.max_cap_status_latency_ms_seen = merged
+                .max_cap_status_latency_ms_seen
+                .max(rep.max_cap_status_latency_ms_seen);
+            for (k, v) in rep.milestone_counts {
+                *merged.milestone_counts.entry(k).or_insert(0) += v;
+            }
+            if merged.findings.is_empty() || !campaign.stop_on_first_finding {
+                merged.findings.extend(rep.findings);
+            }
+        }
+        merged
+    }
+
+    fn run_with_stop(campaign: &CampaignConfig, stop_flag: Option<&AtomicBool>) -> CampaignReport {
         let t0 = Instant::now();
         let mut rng = SimRng::new(campaign.seed);
         let mut findings = Vec::new();
@@ -597,6 +654,9 @@ impl Fuzzer {
         let corpus_active = campaign.flags.sometimes || campaign.flags.hill_climb;
 
         for run_idx in 0..campaign.max_runs {
+            if stop_flag.is_some_and(|f| f.load(Ordering::Acquire)) {
+                break;
+            }
             runs_executed = run_idx + 1;
             let sched = if corpus_active && !corpus.is_empty() && rng.chance_pct(40) {
                 let idx = select_parent_idx(&corpus, &milestone_counts, &mut rng, &campaign.flags);
@@ -609,7 +669,8 @@ impl Fuzzer {
             } else {
                 generate_schedule(&mut rng, &campaign.flags, campaign.allow_gather_hang)
             };
-            let cfg = sched.to_sim_config(campaign.mutant.clone());
+            let mut cfg = sched.to_sim_config(campaign.mutant.clone());
+            cfg.quiet_logs = campaign.quiet_logs;
             let outcome: SimOutcome = SimWorld::run(cfg.clone());
 
             let mut hit_rare_milestone = false;
@@ -655,32 +716,39 @@ impl Fuzzer {
 
             let violations = evaluate_oracles(&outcome, &cfg);
             if !violations.is_empty() {
-                // Verify bit-exact deterministic replay before reporting any finding.
-                let replay = SimWorld::run(cfg.clone());
-                let replay_violations = evaluate_oracles(&replay, &cfg);
-                let replay_verified = replay.trace_hash == outcome.trace_hash
+                // Verify bit-exact deterministic replay with full logging before reporting.
+                let mut full_cfg = cfg.clone();
+                full_cfg.quiet_logs = false;
+                let full_orig = if cfg.quiet_logs {
+                    SimWorld::run(full_cfg.clone())
+                } else {
+                    outcome.clone()
+                };
+                let replay = SimWorld::run(full_cfg.clone());
+                let replay_violations = evaluate_oracles(&replay, &full_cfg);
+                let replay_verified = replay.trace_hash == full_orig.trace_hash
                     && !replay_violations.is_empty();
                 let finding_kinds: BTreeSet<_> =
                     violations.iter().map(|v| format!("{:?}", v.kind)).collect();
                 if !replay_verified {
                     eprintln!(
                         "REPLAY_DIFF: orig_ev={} replay_ev={} orig_net={} replay_net={}",
-                        outcome.events.len(),
+                        full_orig.events.len(),
                         replay.events.len(),
-                        outcome.net_events.len(),
+                        full_orig.net_events.len(),
                         replay.net_events.len()
                     );
-                    for i in 0..outcome.events.len().min(replay.events.len()) {
-                        if outcome.events[i] != replay.events[i] {
-                            eprintln!("FIRST_EV_DIFF[{i}]: orig={:?} replay={:?}", outcome.events[i], replay.events[i]);
+                    for i in 0..full_orig.events.len().min(replay.events.len()) {
+                        if full_orig.events[i] != replay.events[i] {
+                            eprintln!("FIRST_EV_DIFF[{i}]: orig={:?} replay={:?}", full_orig.events[i], replay.events[i]);
                             break;
                         }
                     }
-                    for i in 0..outcome.net_events.len().min(replay.net_events.len()) {
-                        if outcome.net_events[i].at_ms != replay.net_events[i].at_ms
-                            || outcome.net_events[i].event != replay.net_events[i].event
+                    for i in 0..full_orig.net_events.len().min(replay.net_events.len()) {
+                        if full_orig.net_events[i].at_ms != replay.net_events[i].at_ms
+                            || full_orig.net_events[i].event != replay.net_events[i].event
                         {
-                            eprintln!("FIRST_NET_DIFF[{i}]: orig={:?} replay={:?}", outcome.net_events[i], replay.net_events[i]);
+                            eprintln!("FIRST_NET_DIFF[{i}]: orig={:?} replay={:?}", full_orig.net_events[i], replay.net_events[i]);
                             break;
                         }
                     }
@@ -688,19 +756,22 @@ impl Fuzzer {
                 assert!(
                     replay_verified,
                     "DST finding failed bit-exact replay! seed={} orig_hash={:#x} replay_hash={:#x} kinds={:?}",
-                    cfg.seed, outcome.trace_hash, replay.trace_hash, finding_kinds
+                    full_cfg.seed, full_orig.trace_hash, replay.trace_hash, finding_kinds
                 );
                 findings.push(Finding {
                     label: "sim-only",
                     run_index: run_idx + 1,
                     wall_ms: t0.elapsed().as_millis() as u64,
-                    seed: cfg.seed,
-                    trace_hash: outcome.trace_hash,
+                    seed: full_cfg.seed,
+                    trace_hash: full_orig.trace_hash,
                     replay_verified,
                     violations,
                     schedule_summary: sched.summary(),
                 });
                 if campaign.stop_on_first_finding {
+                    if let Some(f) = stop_flag {
+                        f.store(true, Ordering::Release);
+                    }
                     break;
                 }
             }

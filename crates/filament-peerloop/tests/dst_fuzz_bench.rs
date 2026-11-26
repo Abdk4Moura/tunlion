@@ -14,6 +14,7 @@ fn test_clean_build_zero_false_positives() {
         flags: GuideFlags::married(),
         mutant: SimMutant::None,
         allow_gather_hang: false,
+        ..Default::default()
     });
     println!(
         "CLEAN_BUILD_40_RUNS: findings={} wall_ms={} max_busy_ms={} max_status_ms={} milestones={:?}",
@@ -44,6 +45,7 @@ fn test_canary_planted_bug_found_and_replays_bit_exact() {
         flags: GuideFlags::married(),
         mutant: SimMutant::CanaryOnBlackholeStatus,
         allow_gather_hang: false,
+        ..Default::default()
     });
     assert!(
         !report.findings.is_empty(),
@@ -79,6 +81,7 @@ fn eval_cell(flags: &GuideFlags, mutant: &SimMutant, allow_gather_hang: bool, ma
             flags: flags.clone(),
             mutant: mutant.clone(),
             allow_gather_hang,
+            ..Default::default()
         });
         if let Some(first_run) = rep.first_detection_run() {
             detected += 1;

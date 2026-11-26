@@ -28,6 +28,7 @@ fn two_node_config(seed: u64, duration_ms: u64) -> SimConfig {
         cap_status_queries: vec![("alpha".to_string(), 6_000)],
         inline_stall_injection: None,
         mutant: SimMutant::None,
+        ..Default::default()
     }
 }
 
@@ -193,6 +194,7 @@ fn test_replay_status_stall_blackhole_plus_peer_restart() {
         cap_status_queries: vec![("charlie".to_string(), 39_100)],
         inline_stall_injection: None,
         mutant: SimMutant::None,
+        ..Default::default()
     };
 
     let outcome = SimWorld::run(cfg);

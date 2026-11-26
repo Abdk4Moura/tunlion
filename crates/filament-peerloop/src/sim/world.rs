@@ -93,11 +93,13 @@ pub struct SimConfig {
     pub cap_status_queries: Vec<(String, u64)>,
     pub inline_stall_injection: Option<(u64, u64)>,
     pub mutant: SimMutant,
+    pub quiet_logs: bool,
 }
 
 struct CapturingLog {
     node: String,
     sink: Arc<Mutex<Vec<SimTraceEntry>>>,
+    quiet_logs: bool,
 }
 
 impl LogSink for CapturingLog {
@@ -134,6 +136,9 @@ impl LogSink for CapturingLog {
 
 impl CapturingLog {
     fn push(&self, level: &str, line: &str) {
+        if self.quiet_logs && level != "critical" {
+            return;
+        }
         let mut g = self.sink.lock().unwrap_or_else(|e| e.into_inner());
         g.push(SimTraceEntry {
             at_ms: clock::now_ms(),
@@ -607,6 +612,7 @@ fn spawn_daemon(
     spec: &NodeSpec,
     pid: u32,
     logs: Arc<Mutex<Vec<SimTraceEntry>>>,
+    quiet_logs: bool,
 ) -> RunningNode {
     net.register_node_identity(&spec.name, &spec.uid);
     let ctl_slot = Arc::new(Mutex::new(None));
@@ -614,6 +620,7 @@ fn spawn_daemon(
     let log: Arc<dyn LogSink> = Arc::new(CapturingLog {
         node: spec.name.clone(),
         sink: logs,
+        quiet_logs,
     });
     let host: Arc<dyn HostServices> = Arc::new(SimHost {
         peers: spec.peers.clone(),
@@ -772,7 +779,7 @@ impl SimWorld {
                 .map(|spec| {
                     let pid = next_pid;
                     next_pid += 1;
-                    spawn_daemon(&net, spec, pid, logs.clone())
+                    spawn_daemon(&net, spec, pid, logs.clone(), config.quiet_logs)
                 })
                 .collect();
 
@@ -873,7 +880,7 @@ impl SimWorld {
                             let spec = running[pos].spec.clone();
                             let pid = next_pid;
                             next_pid += 1;
-                            running[pos] = spawn_daemon(&net, &spec, pid, logs.clone());
+                            running[pos] = spawn_daemon(&net, &spec, pid, logs.clone(), config.quiet_logs);
                         }
                     }
                     Action::QueryCapStatus(name) => {
