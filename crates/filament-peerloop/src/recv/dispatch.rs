@@ -69,6 +69,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+/// What `-o -` says when it cannot get its own handle on fd 1. Names the
+/// descriptor (there is no path) and the way out.
+#[cfg(unix)]
+const STDOUT_DUP_FAILED: &str = "-o -: could not get a handle on stdout (fd 1) to write the \
+     file to; run with stdout open for writing, or use --dir DIR to save it instead";
+
 /// How long the event loop waits, after writing a delivery-ack, for the peer to
 /// acknowledge it at the transport. Short on purpose: the ack is already queued
 /// and is delivered without this wait; it only lets a live peer take it before
@@ -10076,10 +10082,8 @@ async fn recv_run(
                         }
                         #[cfg(unix)]
                         {
-                            let out = crate::recv::dup_stdout().context(
-                                "-o -: could not get a handle on stdout (fd 1) to write the file to; \
-                                 run with stdout open for writing, or use --dir DIR to save it instead",
-                            )?;
+                            let out = crate::recv::dup_stdout().context(STDOUT_DUP_FAILED)?;
+                            let sink_out = out.try_clone().context(STDOUT_DUP_FAILED)?;
                             // A pipe cannot seek, so stdout gets an in-order
                             // writer (StdoutSink) instead of positional writes,
                             // which failed every `-o - | reader` with ESPIPE. It
@@ -10087,7 +10091,7 @@ async fn recv_run(
                             // against the offered digest and acked like a file.
                             let sink = Arc::new(std::sync::Mutex::new(
                                 crate::recv::StdoutSink::sharing(
-                                    out.try_clone().context("-o -: could not duplicate the stdout handle")?,
+                                    sink_out,
                                     crate::recv::process_stdout_ledger(),
                                 ),
                             ));
