@@ -4068,10 +4068,12 @@ impl InstanceLock {
             if let Ok(mut v) = OWN_INSTANCE_LOCKS.lock() {
                 v.push(id);
             }
-            return Ok(Some(InstanceLock { _file: file, id }));
+            Ok(Some(InstanceLock { _file: file, id }))
         }
-        #[allow(unreachable_code)]
-        Ok(Some(InstanceLock { _file: file }))
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            Ok(Some(InstanceLock { _file: file }))
+        }
     }
 
     /// Write this process's pid into the lock file, so a loser can say WHICH
