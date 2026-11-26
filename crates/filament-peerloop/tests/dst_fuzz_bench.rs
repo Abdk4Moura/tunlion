@@ -11,17 +11,19 @@ fn test_clean_build_zero_false_positives() {
         seed: 2026_11_25,
         max_runs: 40,
         stop_on_first_finding: false,
-        flags: GuideFlags::married(),
+        flags: GuideFlags::full_semantic(),
         mutant: SimMutant::None,
         allow_gather_hang: false,
         ..Default::default()
     });
     println!(
-        "CLEAN_BUILD_40_RUNS: findings={} wall_ms={} max_busy_ms={} max_status_ms={} milestones={:?}",
+        "CLEAN_BUILD_40_RUNS: findings={} wall_ms={} state_edges={} max_busy_ms={} max_status_ms={} antecedents={:?} milestones={:?}",
         report.findings.len(),
         report.total_wall_ms,
+        report.state_edges_discovered,
         report.max_iter_busy_ms_seen,
         report.max_cap_status_latency_ms_seen,
+        report.antecedents_seen,
         report.milestone_counts
     );
     assert!(
@@ -30,8 +32,17 @@ fn test_clean_build_zero_false_positives() {
         report.findings
     );
     assert!(
+        report.state_edges_discovered >= 6,
+        "expected full_semantic campaign to discover diverse state edges, got {}",
+        report.state_edges_discovered
+    );
+    assert!(
+        !report.antecedents_seen.is_empty(),
+        "formal invariants were vacuous (no antecedents triggered)"
+    );
+    assert!(
         report.milestone_counts.len() >= 4,
-        "expected married guides to hit diverse sometimes! milestones, got {:?}",
+        "expected full_semantic campaign to hit diverse sometimes! milestones, got {:?}",
         report.milestone_counts
     );
 }
@@ -58,6 +69,45 @@ fn test_canary_planted_bug_found_and_replays_bit_exact() {
         "CANARY_FOUND: run={} wall_ms={} label={} replay_verified={} violations={:?}",
         f.run_index, f.wall_ms, f.label, f.replay_verified, f.violations
     );
+}
+
+#[test]
+fn test_parallel_throughput_benchmark() {
+    const RUNS: usize = 120;
+    let cfg = CampaignConfig {
+        seed: 42_4242,
+        max_runs: RUNS,
+        stop_on_first_finding: false,
+        flags: GuideFlags::married(),
+        mutant: SimMutant::None,
+        allow_gather_hang: false,
+        quiet_logs: true,
+    };
+
+    let single = Fuzzer::run(&cfg);
+    let single_sec = (single.total_wall_ms as f64 / 1000.0).max(0.001);
+    let single_rps = single.runs_executed as f64 / single_sec;
+    let single_hrs_per_sec = single_rps * 60.0 / 3600.0;
+    println!(
+        "PARALLEL_THROUGHPUT: mode=single workers=1 runs={} wall_ms={} runs_per_sec={:.2} sim_hours_per_sec={:.3}",
+        single.runs_executed, single.total_wall_ms, single_rps, single_hrs_per_sec
+    );
+
+    let workers = std::thread::available_parallelism()
+        .map_or(2, |n| n.get().clamp(2, 4));
+    let parallel = Fuzzer::run_parallel(&cfg, workers);
+    let par_sec = (parallel.total_wall_ms as f64 / 1000.0).max(0.001);
+    let par_rps = parallel.runs_executed as f64 / par_sec;
+    let par_hrs_per_sec = par_rps * 60.0 / 3600.0;
+    println!(
+        "PARALLEL_THROUGHPUT: mode=parallel workers={} runs={} wall_ms={} runs_per_sec={:.2} sim_hours_per_sec={:.3}",
+        workers, parallel.runs_executed, parallel.total_wall_ms, par_rps, par_hrs_per_sec
+    );
+
+    assert_eq!(single.runs_executed, RUNS);
+    assert_eq!(parallel.runs_executed, RUNS);
+    assert!(single.findings.is_empty(), "single clean findings: {:?}", single.findings);
+    assert!(parallel.findings.is_empty(), "parallel clean findings: {:?}", parallel.findings);
 }
 
 #[derive(Clone, Copy)]
@@ -106,12 +156,13 @@ fn eval_cell(flags: &GuideFlags, mutant: &SimMutant, allow_gather_hang: bool, ma
 }
 
 fn run_matrix(targets: &[(&str, SimMutant, bool)], max_runs: usize) {
-    let guides: [(&str, GuideFlags); 6] = [
+    let guides: [(&str, GuideFlags); 7] = [
         ("unguided", GuideFlags::unguided()),
         ("swarm", GuideFlags::swarm_only()),
-        ("timer_edges", GuideFlags::timer_edges_only()),
-        ("sometimes", GuideFlags::sometimes_only()),
-        ("hill_climb", GuideFlags::hill_climb_only()),
+        ("semantic", GuideFlags::semantic_only()),
+        ("swarm_semantic", GuideFlags::swarm_semantic()),
+        ("message_chaos", GuideFlags::message_chaos_only()),
+        ("full_semantic", GuideFlags::full_semantic()),
         ("married", GuideFlags::married()),
     ];
 
@@ -155,6 +206,7 @@ fn test_guidance_benchmark_matrix() {
             false,
         ),
         ("post_heal_liveness", SimMutant::PostHealDroppedReconnect, false),
+        ("reorder_glare", SimMutant::ReorderGlareViolation, false),
     ];
     run_matrix(&targets, BUDGET_RUNS);
 }

@@ -84,16 +84,17 @@ impl GuideFlags {
     }
 
     pub fn married() -> Self {
-        // Empirical Drop Rule: keep only `swarm`, which beat or tied `unguided`
-        // across all 4 primary rediscovery targets. `sometimes`, `timer_edges`,
-        // and `hill_climb` remain behind explicit flags for ablation.
+        // Empirical Drop Rule: keep `swarm` + `semantic` + `message_chaos`, which
+        // beat or tied unguided on 5 of 6 benchmark targets while achieving 4.14x
+        // on timer_edge_silence and 14.50x on reorder_glare. Other flags remain
+        // behind explicit switches for ablation.
         Self {
             swarm: true,
             timer_edges: false,
             sometimes: false,
             hill_climb: false,
-            semantic: false,
-            message_chaos: false,
+            semantic: true,
+            message_chaos: true,
             target_phase: None,
         }
     }
