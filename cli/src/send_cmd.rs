@@ -444,7 +444,7 @@ pub(crate) async fn send_cmd(
     if let Some(t) = to.as_deref().filter(|t| !use_code && !relay && !fleet_indexed_name(t)) {
         if let Some((n, _)) = devices_load().into_iter().find(|(n, _)| n.eq_ignore_ascii_case(t)) {
             let ids: Vec<String> = outgoing.iter().map(|o| o.id.clone()).collect();
-            warm = crate::send_warm::try_send_link(&n, &ids).await;
+            warm = crate::send_warm::try_send_link(&n, &ids, false).await;
             if let Some(w) = warm.as_ref() {
                 // The daemon's link may carry other sends to the same device:
                 // its own sid range keeps the receiver from mixing streams.
@@ -827,9 +827,15 @@ pub(crate) async fn send_cmd(
             }
         }
     }
-    // Set when the warm link failed and this send went looking for its own:
+    // Set when the warm link failed and this send went looking for another:
     // the first link that proves the target takes the empty slot.
     let mut warm_fell_back = false;
+    // After the warm link died: until when the send keeps asking the daemon
+    // for its repaired link instead of building its own (WARM_RETRY_WINDOW),
+    // the next ask, and the ask in flight.
+    let mut warm_retry_until: Option<Instant> = None;
+    let mut warm_retry_next = Instant::now();
+    let mut warm_retry_task: Option<tokio::task::JoinHandle<Option<crate::send_warm::WarmSendLink>>> = None;
     // When the warm link stopped moving bytes mid-transfer (see the
     // TransferStalled arm).
     let mut warm_stall_since: Option<Instant> = None;
@@ -1023,7 +1029,7 @@ pub(crate) async fn send_cmd(
                         .unwrap_or_else(|| "the warm link died".to_string())
                 };
                 ui::debug(&format!(
-                    "send: the local daemon's warm link ended ({why}); connecting on our own"
+                    "send: the local daemon's warm link ended ({why}); asking it for the repaired one"
                 ));
                 conn.drop_link(&wp);
                 if conn.is_active(&wp) {
@@ -1042,11 +1048,12 @@ pub(crate) async fn send_cmd(
                 sent_all_at = None;
                 ack_reprobed = false;
                 reprobed_at = None;
-                if let Some((_, sec)) = &known_target {
-                    sess.channels = vec![channel_of(sec)];
-                    sess.emit(&sio, "subscribe", json!({ "channels": [channel_of(sec)] }))
-                        .await;
-                }
+                // The daemon owns the link to the device and is repairing it
+                // already (often the device itself moved it to a relay). A link
+                // of our own now only races that repair, so ask the daemon
+                // again first, and build our own only when it has nothing.
+                warm_retry_until = Some(Instant::now() + WARM_RETRY_WINDOW);
+                warm_retry_next = Instant::now();
             } else if warm_stall_since.is_some()
                 && conn
                     .transport_of(&wp)
@@ -1054,6 +1061,63 @@ pub(crate) async fn send_cmd(
             {
                 // Bytes are moving again on the warm link.
                 warm_stall_since = None;
+            }
+        }
+        // Waiting for the daemon's repaired link (see above).
+        if let (Some(until), Some((n, sec))) = (warm_retry_until, known_target.clone()) {
+            let mut go_cold = false;
+            if warm_retry_task.as_ref().is_some_and(|t| t.is_finished()) {
+                let got = match warm_retry_task.take() {
+                    Some(t) => t.await.ok().flatten(),
+                    None => None,
+                };
+                match got {
+                    Some(w) => {
+                        {
+                            let mut out = outgoing.lock().await;
+                            for (i, o) in out.iter_mut().enumerate() {
+                                o.sid = w.sid_base + i as u32;
+                            }
+                        }
+                        let t: Arc<dyn Transport> = w.transport.clone();
+                        if conn.adopt_warm_link(&w.pid, t.clone(), &n, &sec, w.route) {
+                            w.transport.start(w.pid.clone(), tx.clone());
+                            ui::debug(&format!(
+                                "send: riding the local daemon's repaired link to '{n}' ({})",
+                                w.route
+                            ));
+                            let _ = tx.send(Ev::sourced_channel_ready(w.pid.clone(), t));
+                            warm_pid = Some(w.pid.clone());
+                            warm_link = Some(w.transport.clone());
+                            warm_retry_until = None;
+                        } else {
+                            w.transport.force_close();
+                            go_cold = true;
+                        }
+                    }
+                    None => {
+                        if Instant::now() >= until || !ctl::daemon_present().await {
+                            go_cold = true;
+                        } else {
+                            warm_retry_next = Instant::now() + Duration::from_secs(1);
+                        }
+                    }
+                }
+            } else if warm_retry_task.is_none() && Instant::now() >= warm_retry_next {
+                let ids: Vec<String> = outgoing.lock().await.iter().map(|o| o.id.clone()).collect();
+                let name = n.clone();
+                warm_retry_task = Some(tokio::spawn(async move {
+                    crate::send_warm::try_send_link(&name, &ids, true).await
+                }));
+            }
+            if go_cold {
+                ui::debug(&format!(
+                    "send: the local daemon has no link to '{n}' to offer; connecting on our own"
+                ));
+                warm_retry_until = None;
+                sess.channels = vec![channel_of(&sec)];
+                sess.emit(&sio, "subscribe", json!({ "channels": [channel_of(&sec)] }))
+                    .await;
             }
         }
         let rejoin_window = conn.rejoin.rejoin_window;
@@ -3653,6 +3717,12 @@ const SEND_ANSWER_WAIT: Duration = Duration::from_secs(60);
 /// link this process owns gets (it repairs those in place), shorter than the
 /// QUIC idle timeout that would end a dead one anyway.
 const WARM_STALL_GRACE: Duration = Duration::from_secs(15);
+/// After the daemon's warm link died mid-send, how long the send keeps asking
+/// the daemon for its repaired link before it builds its own. The daemon (and
+/// the device, which repairs from its end too) rebuilds that link anyway; a
+/// second build from this process raced it, and on a lossy path neither won
+/// (chaos replay of send-stuck-reconnecting-after-heal).
+const WARM_RETRY_WINDOW: Duration = Duration::from_secs(30);
 /// Event wait while a code ceremony is in flight (see the send loop).
 const CEREMONY_TICK: Duration = Duration::from_millis(100);
 

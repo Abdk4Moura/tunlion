@@ -908,7 +908,8 @@ mod imp {
                         if ids.is_empty() || ids.len() > 65536 {
                             return;
                         }
-                        ReqKind::SendLink { peer, ids }
+                        let any = v["any"].as_bool().unwrap_or(false);
+                        ReqKind::SendLink { peer, ids, any }
                     }
                     Some("bootstrap") => {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };

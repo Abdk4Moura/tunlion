@@ -321,17 +321,18 @@ impl Transport for WarmSendTransport {
 const REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// Ask the local daemon for a warm link to `peer` for a send that will offer
-/// `ids`. `None` means build the send's own link.
+/// `ids`. `None` means build the send's own link. `any` also takes a held
+/// link that is not direct (see `ReqKind::SendLink`).
 #[cfg(unix)]
-pub(crate) async fn try_send_link(peer: &str, ids: &[String]) -> Option<WarmSendLink> {
+pub(crate) async fn try_send_link(peer: &str, ids: &[String], any: bool) -> Option<WarmSendLink> {
     if crate::ctl::reuse_disabled() {
         return None;
     }
-    try_send_link_at(&crate::ctl::control_sock_path(), peer, ids).await
+    try_send_link_at(&crate::ctl::control_sock_path(), peer, ids, any).await
 }
 
 #[cfg(not(unix))]
-pub(crate) async fn try_send_link(_peer: &str, _ids: &[String]) -> Option<WarmSendLink> {
+pub(crate) async fn try_send_link(_peer: &str, _ids: &[String], _any: bool) -> Option<WarmSendLink> {
     // Windows has no control socket yet: every send builds its own link.
     None
 }
@@ -365,10 +366,14 @@ pub(crate) async fn try_send_link_at(
     path: &std::path::Path,
     peer: &str,
     ids: &[String],
+    any: bool,
 ) -> Option<WarmSendLink> {
     use tokio::io::AsyncWriteExt;
     let mut sock = tokio::net::UnixStream::connect(path).await.ok()?;
-    let req = serde_json::json!({ "op": "send-link", "peer": peer, "ids": ids });
+    let mut req = serde_json::json!({ "op": "send-link", "peer": peer, "ids": ids });
+    if any {
+        req["any"] = serde_json::json!(true);
+    }
     let mut line = serde_json::to_vec(&req).ok()?;
     line.push(b'\n');
     if line.len() > 1024 * 1024 {
@@ -404,6 +409,7 @@ pub(crate) async fn try_send_link_at(
     }
     let route = match v["route"].as_str() {
         Some(filament_transport::lan::ROUTE_LAN) => filament_transport::lan::ROUTE_LAN,
+        Some("relay") => "relay",
         _ => "direct-quic",
     };
     let link = v["link"].as_str().unwrap_or("link");
@@ -467,7 +473,7 @@ mod tests {
         let dir = sock_dir("a");
         let path = dir.join("control.sock");
         let ids = vec!["s-1-1".to_string()];
-        assert!(try_send_link_at(&path, "box", &ids).await.is_none());
+        assert!(try_send_link_at(&path, "box", &ids, false).await.is_none());
 
         let listener = UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
@@ -485,8 +491,8 @@ mod tests {
             let _ = read_req(&mut s).await;
             drop(s);
         });
-        assert!(try_send_link_at(&path, "box", &ids).await.is_none());
-        assert!(try_send_link_at(&path, "box", &ids).await.is_none());
+        assert!(try_send_link_at(&path, "box", &ids, false).await.is_none());
+        assert!(try_send_link_at(&path, "box", &ids, false).await.is_none());
         server.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -538,7 +544,7 @@ mod tests {
             // Hold the socket open: death comes from the health report alone.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         });
-        let link = try_send_link_at(&path, "box", &["s-1-1".to_string()]).await.expect("warm link");
+        let link = try_send_link_at(&path, "box", &["s-1-1".to_string()], false).await.expect("warm link");
         assert_eq!(link.pid, "warm:abc");
         assert_eq!(link.sid_base, 0x4000_0010);
         let t = link.transport.clone();
@@ -608,7 +614,7 @@ mod tests {
             // Read the flush request, then vanish without answering it.
             let _ = read_frame(&mut r).await;
         });
-        let link = try_send_link_at(&path, "box", &["s-2-1".to_string()]).await.expect("warm link");
+        let link = try_send_link_at(&path, "box", &["s-2-1".to_string()], false).await.expect("warm link");
         let t = link.transport.clone();
         let (tx, _rx) = mpsc::unbounded_channel();
         t.start(link.pid.clone(), tx);
@@ -637,7 +643,7 @@ mod tests {
             .unwrap();
         });
         let ids = vec!["a".to_string(), "b".to_string()];
-        assert!(try_send_link_at(&path, "box", &ids).await.is_none());
+        assert!(try_send_link_at(&path, "box", &ids, false).await.is_none());
         server.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

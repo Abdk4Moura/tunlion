@@ -275,7 +275,7 @@ mod imp {
         probes: &crate::daemon_ctl::LivenessProbes,
         req: control::Req,
     ) {
-        let control::ReqKind::SendLink { peer, ids } = req.kind.clone() else {
+        let control::ReqKind::SendLink { peer, ids, any } = req.kind.clone() else {
             return;
         };
         let Some((pid, t)) = warm_link_for(conn, &peer) else {
@@ -287,14 +287,17 @@ mod imp {
             req.reject("no warm path: no live link to that peer").await;
             return;
         };
-        // Direct QUIC only: a relayed or data-channel link is the slow path
-        // this exists to avoid, and the CLI's own build may do better.
-        if !link.direct || t.is_dead() || !t.is_alive() {
+        // Direct QUIC first: a relayed or data-channel link is the slow path
+        // this exists to avoid, and the CLI's own build may do better. Once a
+        // send's warm link died, though, the daemon's repaired link (often a
+        // relay) is the one that reaches the device, and a second build from
+        // the CLI only races the daemon's own: `any` takes it.
+        if (!link.direct && !any) || t.is_dead() || !t.is_alive() {
             req.reject("no warm path: the held link is not a live direct link")
                 .await;
             return;
         }
-        let route = link.direct_route;
+        let route = if link.direct { link.direct_route } else { "relay" };
         let log = conn.log.clone();
         let probes = probes.clone();
         conn.log.debug(&format!(

@@ -66,7 +66,10 @@ pub enum ReqKind {
     /// A daemon with no live direct link answers `no warm path`, which is the
     /// client's signal to build its own link. Nothing is offered before the
     /// reply, so a miss is always safe to fall back from.
-    SendLink { peer: String, ids: Vec<String> },
+    /// `any`: also accept a held link that is not direct (a relayed one). Sent
+    /// only to resume a send whose warm link died, when the daemon's repaired
+    /// link is what reaches the device now.
+    SendLink { peer: String, ids: Vec<String>, any: bool },
     /// Run the ssh `shell-bootstrap` over the daemon's warm link instead of a
     /// fresh cold establish: install our managed `pubkey` on `peer` and return
     /// the peer's host keys + login. The reply is deferred (it awaits the
