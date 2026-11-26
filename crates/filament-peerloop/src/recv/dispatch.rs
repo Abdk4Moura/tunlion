@@ -2014,7 +2014,20 @@ async fn recv_run(
     let mut ctl_ready: Option<tokio::sync::oneshot::Receiver<()>> = None;
     #[cfg(unix)]
     {
-        if daemon && ports.daemon.daemon_alive() == Some(ports.env.pid) {
+        let elected = if daemon { ports.daemon.daemon_alive() } else { None };
+        if daemon && elected != Some(ports.env.pid) {
+            // Not silent: a daemon that does not serve its control socket
+            // makes every local command say "no local daemon" while it is
+            // plainly running. This branch once fired for the elected daemon
+            // itself (a misread of /proc/locks), and only the missing socket
+            // showed it.
+            log.critical(&format!(
+                "tunlion: this daemon (pid {}) is not the one this config's pidfile and lock name ({}),                  so it does not serve the control socket; local commands will not reach it",
+                ports.env.pid,
+                elected.map_or_else(|| "none".to_string(), |p| format!("pid {p}"))
+            ));
+        }
+        if daemon && elected == Some(ports.env.pid) {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
             ctl_ready = Some(ready_rx);
             let ctl_tx = ctl_tx.clone();
