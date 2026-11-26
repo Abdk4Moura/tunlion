@@ -1040,6 +1040,14 @@ def apply_fault(w: World, st: dict, uid: str) -> Applied | None:
                 return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
             except OSError:
                 return "?"
+        # SIGSTOP is delivered asynchronously: read right after kill(), the
+        # state is often still R/S. Wait (bounded) for the kernel to stop it,
+        # so the mechanism is proven at apply time. Sampling only once here
+        # and again at heal refused a whole campaign when a proc.kill inside
+        # the freeze window had reaped the pid by heal time (2026-11-26).
+        t_end = time.monotonic() + 2.0
+        while state() != "T" and time.monotonic() < t_end:
+            time.sleep(0.01)
         seen = {"T": state() == "T"}
 
         def heal():
