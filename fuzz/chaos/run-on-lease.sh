@@ -66,7 +66,7 @@ if [ -n "${CHAOS_RUSTFLAGS:-}" ]; then
   RFKEY=$(printf '%s' "$CHAOS_RUSTFLAGS" | sha256sum | cut -c1-8)
   TREE="$TREE-$RFKEY"
 fi
-JOB="chaos-$SHA-$MODE-$(date +%s)"
+JOB="chaos-$SHA-$MODE-$(date +%s)-$$"   # pid: two runs started in the same second must not share a job dir
 TAR=$(mktemp -d)/"$JOB.tar"
 git -C "$ROOT" archive --format=tar HEAD -o "$TAR"
 echo "== ship $SHA ($(du -h "$TAR" | cut -f1)) to $WORKER"
