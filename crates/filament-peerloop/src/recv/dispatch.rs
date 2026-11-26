@@ -2797,6 +2797,10 @@ async fn recv_run(
     // observation revived them). State-only; the gate already denies past the
     // deadline, the sweep is what makes LAPSED visible in `devices`.
     let mut last_sweep = Instant::now();
+    // The lapsed sweep and the LAN state file run OFF the loop (see their
+    // sites below); each keeps at most one job in flight.
+    let mut sweep_job: Option<tokio::task::JoinHandle<(usize, Option<String>)>> = None;
+    let mut lan_state_job: Option<tokio::task::JoinHandle<()>> = None;
     // Whether the delisted-sibling store problem was already said (once per
     // episode, not every sweep).
     let mut delisted_problem_said = false;
@@ -4108,23 +4112,41 @@ async fn recv_run(
         // ephemeral device's and an ended fleet sibling's, which are removed
         // (DeviceStore::devices_sweep_lapsed).
         loop_budget.enter("sweep");
-        if daemon && last_sweep.elapsed() >= Duration::from_secs(30) {
-            last_sweep = Instant::now();
-            let lapsed = ports.store.devices_sweep_lapsed(filament_id::now_secs());
-            if lapsed > 0 {
-                log.say(&format!(
-                    "{} {lapsed} device(s) lapsed or ended (offline past their budget, lease over, or removed by the owner)",
-                    log.paint(Tone::Warn, log.glyph_warn())
-                ));
-            }
-            match ports.store.delisted_siblings_problem() {
-                Some(why) if !delisted_problem_said => {
-                    delisted_problem_said = true;
-                    log.critical(&format!("fleet: delisted-sibling store: {why}"));
+        //
+        // The sweep is a locked read-modify-write of devices.json with fsyncs
+        // (and its backup), so it runs on a blocking thread and its result is
+        // reported on a later pass. Run inline it held the loop for as long as
+        // the disk took: busy passes of 1011 ms in this stretch on a daemon
+        // that was never paused (chaos finding d5fc523a8b, O11), and 100 to
+        // 220 ms per sweep with only the disk loaded.
+        if sweep_job.as_ref().is_some_and(|j| j.is_finished()) {
+            if let Some(Ok((lapsed, problem))) = match sweep_job.take() {
+                Some(j) => Some(j.await),
+                None => None,
+            } {
+                if lapsed > 0 {
+                    log.say(&format!(
+                        "{} {lapsed} device(s) lapsed or ended (offline past their budget, lease over, or removed by the owner)",
+                        log.paint(Tone::Warn, log.glyph_warn())
+                    ));
                 }
-                Some(_) => {}
-                None => delisted_problem_said = false,
+                match problem {
+                    Some(why) if !delisted_problem_said => {
+                        delisted_problem_said = true;
+                        log.critical(&format!("fleet: delisted-sibling store: {why}"));
+                    }
+                    Some(_) => {}
+                    None => delisted_problem_said = false,
+                }
             }
+        }
+        if daemon && sweep_job.is_none() && last_sweep.elapsed() >= Duration::from_secs(30) {
+            last_sweep = Instant::now();
+            let store = ports.store.clone();
+            sweep_job = Some(tokio::task::spawn_blocking(move || {
+                let lapsed = store.devices_sweep_lapsed(filament_id::now_secs());
+                (lapsed, store.delisted_siblings_problem())
+            }));
         }
 
         // WIREGUARD RECONCILE. On a timer, and deliberately NOT on an event.
@@ -4252,8 +4274,12 @@ async fn recv_run(
             && last_lan_dial.map_or(lan_started.elapsed() >= Duration::from_millis(300), |t| t.elapsed() >= Duration::from_secs(15))
         {
             last_lan_dial = Some(Instant::now());
+            // A temp-file write with an fsync: off the loop, one at a time.
             if let Some(l) = conn.lan.as_ref() {
-                l.write_state(&host.config_dir());
+                if lan_state_job.as_ref().is_none_or(|j| j.is_finished()) {
+                    let (l, dir) = (l.clone(), host.config_dir());
+                    lan_state_job = Some(tokio::task::spawn_blocking(move || l.write_state(&dir)));
+                }
             }
             let offline = signaling_down_since.is_some();
             let since = lan_started.elapsed();
