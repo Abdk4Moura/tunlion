@@ -478,12 +478,15 @@ pub(crate) async fn send_cmd(
     // the local network while the server works.
     let mut lan_svc: Option<filament_transport::lan::LanService> = None;
     let mut lan_offline = false;
-    let bounded = |d: u64| Duration::from_secs(if lan_target.is_some() { d } else { 3600 });
+    // Bounded when something else can reach the device without the server:
+    // its remembered local addresses, or the daemon's warm link.
+    let server_optional = lan_target.is_some() || warm.is_some();
+    let bounded = |d: u64| Duration::from_secs(if server_optional { d } else { 3600 });
     let room = match room {
         Some(r) => r,
         None => match tokio::time::timeout(bounded(5), net::fetch_auto_room(&transport_context, server)).await {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) | Err(_) if lan_target.is_some() => {
+            Ok(Err(_)) | Err(_) if server_optional => {
                 ui::debug("lan: no room from the server; trying the local network too");
                 lan_offline = true;
                 String::new()
@@ -494,7 +497,7 @@ pub(crate) async fn send_cmd(
     };
     let mut sio = match tokio::time::timeout(bounded(12), net::connect_signaling(&transport_context, server, tx.clone())).await {
         Ok(Ok(c)) => c,
-        Ok(Err(_)) | Err(_) if lan_target.is_some() => {
+        Ok(Err(_)) | Err(_) if server_optional => {
             lan_offline = true;
             filament_signal::Client::offline().await?
         }
@@ -507,10 +510,16 @@ pub(crate) async fn send_cmd(
     let mut redial_task: Option<tokio::task::JoinHandle<Result<filament_signal::Client>>> = None;
     if lan_offline {
         if let Some((n, sec)) = lan_target.as_ref() {
-            ui::say("can't reach the tunlion server; looking on the local network");
+            // Riding the daemon's warm link needs neither the server nor the
+            // local network; the service only stands by for a fallback.
+            if warm.is_none() {
+                ui::say("can't reach the tunlion server; looking on the local network");
+            }
             match crate::lan_send::start(&transport_context, tx.clone()).await {
                 Ok(svc) => {
-                    crate::lan_send::dial_now(&svc, n, sec);
+                    if warm.is_none() {
+                        crate::lan_send::dial_now(&svc, n, sec);
+                    }
                     lan_svc = Some(svc);
                 }
                 Err(e) => ui::debug(&format!("lan: local discovery unavailable for this send: {e:#}")),

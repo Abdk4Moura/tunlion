@@ -22,7 +22,7 @@
 //! The transport never finishes or closes the shared link: `drain_finish` is a
 //! flush, and dropping it only closes this process's control connection.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use filament_transport::net::{Ev, SourceId, Transport};
 use serde_json::Value;
@@ -116,7 +116,7 @@ impl WarmSendTransport {
         };
         if let Err(e) = filament_peerloop::exec_frame::write_frame(w, kind, payload).await {
             self.mark_dead("the daemon's control connection closed");
-            return Err(anyhow!("the warm link to the daemon closed: {e}"));
+            return Err(anyhow::anyhow!("the warm link to the daemon closed: {e}"));
         }
         Ok(())
     }
