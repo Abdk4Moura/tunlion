@@ -1,0 +1,46 @@
+{
+  "hooks": {
+    "alpha": {
+      "TUNLION_TEST_ESTABLISH_DELAY_MS": "4000"
+    },
+    "charlie": {
+      "TUNLION_TEST_DROP_PEER_LEFT": "1"
+    }
+  },
+  "origin": "found by exploration 2026-11-26 on main f1d9854e9 (O9, 3/3): alpha (the machine running reach) fully isolated; reach failed at presence and blamed charlie (\"may be offline\") because the probe signaling phase looked healthy on a silently cut socket",
+  "seed": 92218457,
+  "steps": [
+    {
+      "at": 0.2,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 11.2,
+      "dur": 35.3,
+      "fault": "net.isolate",
+      "target": "alpha"
+    },
+    {
+      "at": 12.4,
+      "dst": "charlie",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 13.7,
+      "dst": "charlie",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 19.0,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "charlie"
+    }
+  ],
+  "version": 1
+}

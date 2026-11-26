@@ -72,7 +72,9 @@ async fn probe_mode(
             ui::json_out(&single_json(device, &outcome));
         } else {
             print_ladder(device, &outcome);
-            print_reset_hint(device, &outcome);
+            // Ask the daemon about our own link only when the probe failed.
+            let own = if outcome.established { None } else { crate::ping::own_link_state(&outcome).await };
+            print_reset_hint(device, &outcome, own);
         }
         return probe_result(std::slice::from_ref(&outcome));
     }
@@ -102,7 +104,7 @@ async fn probe_mode(
     } else {
         print_distribution(device, &outcomes);
         if let Some(failed) = outcomes.iter().find(|o| !o.established) {
-            print_reset_hint(device, failed);
+            print_reset_hint(device, failed, crate::ping::own_link_state(failed).await);
         }
     }
     probe_result(&outcomes)
@@ -147,26 +149,26 @@ fn probe_progress_line(device: &str, secs: u64) -> String {
 /// `send` gives: a device that was reset runs `up` under a NEW key the old
 /// record can never find, so "presence FAILED" alone sent people to check a
 /// machine that was running fine.
-fn print_reset_hint(device: &str, o: &crate::l2::ProbeOutcome) {
+fn print_reset_hint(device: &str, o: &crate::l2::ProbeOutcome, own: Option<crate::ping::OwnLink>) {
     let names: Vec<String> = crate::devices_store::devices_load()
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    if let Some(hint) = reset_hint_for(device, o, &names) {
+    if let Some(hint) = reset_hint_for(device, o, &names, own) {
         ui::say(&format!("  {hint}"));
     }
 }
 
 /// Pure half of `print_reset_hint`: the hint when the probe died before the
 /// device appeared (signaling up, presence never satisfied), else None.
-fn reset_hint_for(device: &str, o: &crate::l2::ProbeOutcome, names: &[String]) -> Option<String> {
+fn reset_hint_for(device: &str, o: &crate::l2::ProbeOutcome, names: &[String], own: Option<crate::ping::OwnLink>) -> Option<String> {
     if o.established || o.failed_phase != Some(Phase::Presence) {
         return None;
     }
     // Our own link to the server was over budget: the peer may be fine, and
     // the reset advice (forget, re-pair) would delete a healthy pairing.
-    if let Some(ms) = crate::ping::slow_own_link(o) {
-        return Some(crate::ping::own_link_hint(device, ms));
+    if let Some(own) = own.or_else(|| crate::ping::slow_own_link(o)) {
+        return Some(crate::ping::own_link_hint(device, own));
     }
     let successor = crate::reset_hints::successor_of(device, names.iter().map(String::as_str));
     Some(crate::reset_hints::offline_hint(device, successor.as_deref()))
@@ -1080,13 +1082,13 @@ mod tests {
     fn a_presence_failure_carries_the_reset_hint() {
         let names = vec!["p9-b".to_string(), "p9-b-2".to_string()];
         let o = offline("establishment timed out after 30s");
-        let hint = reset_hint_for("p9-b", &o, &names).expect("presence failure hints");
+        let hint = reset_hint_for("p9-b", &o, &names, None).expect("presence failure hints");
         assert!(hint.contains("p9-b-2") && hint.contains("tunlion devices forget p9-b"), "{hint}");
-        let alone = reset_hint_for("p9-b", &o, &["p9-b".to_string()]).unwrap();
+        let alone = reset_hint_for("p9-b", &o, &["p9-b".to_string()], None).unwrap();
         assert!(alone.contains("reset"), "{alone}");
         let mut later = offline("l2 open refused");
         later.failed_phase = Some(Phase::L2Open);
-        assert_eq!(reset_hint_for("p9-b", &later, &names), None);
+        assert_eq!(reset_hint_for("p9-b", &later, &names, None), None);
         assert!(probe_progress_line("p9-b", 30).contains("30s"));
     }
 

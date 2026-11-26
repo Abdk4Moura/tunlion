@@ -479,9 +479,10 @@ async fn print_cold(server: &str, peer: &str, relay: bool, timeout: Option<u64>)
             if let Some(line) = exit_codes::summary_line(kind, o.error.as_deref().unwrap_or_default()) {
                 ui::say(&format!("  {}", ui::paint(Tone::Dim, line)));
             } else {
+                let own = own_link_state(&o).await;
                 ui::say(&format!(
                     "  {}",
-                    ui::paint(Tone::Dim, &format!("─ {}", unreachable_hint(peer, o.failed_phase, slow_own_link(&o))))
+                    ui::paint(Tone::Dim, &format!("─ {}", unreachable_hint(peer, o.failed_phase, own)))
                 ));
             }
             Some(kind)
@@ -625,25 +626,57 @@ pub(crate) fn reach_json_cold(
     v
 }
 
-/// How long this machine took to reach the tunlion server, when that was over
-/// the signaling budget: our own connection is slow or lossy, so a later
-/// presence failure is as likely ours as the peer's. None when signaling was
-/// within budget (or did not complete). Pure.
-pub(crate) fn slow_own_link(o: &crate::l2::ProbeOutcome) -> Option<u64> {
+/// What is known about THIS machine's own link to the tunlion server when a
+/// probe failed: slow to connect (the probe's own signaling phase was over
+/// budget), or down (the local daemon reports its server link reconnecting
+/// or flapping). A silently cut machine keeps an existing socket "connected"
+/// until a silence timeout notices, so the probe's phase timings alone can
+/// look healthy; the daemon's own view catches that (chaos fuzzer, machine
+/// fully isolated: the probe failed at presence with a fast signaling phase).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum OwnLink {
+    Slow { signaling_ms: u64 },
+    Down { for_secs: u64 },
+}
+
+/// The probe-only half of [`own_link_state`]. Pure.
+pub(crate) fn slow_own_link(o: &crate::l2::ProbeOutcome) -> Option<OwnLink> {
     o.timings
         .iter()
         .find(|t| t.phase == crate::diag::Phase::Signaling && t.over_budget)
-        .map(|t| t.dur_ms)
+        .map(|t| OwnLink::Slow { signaling_ms: t.dur_ms })
+}
+
+/// The daemon-reported half: `Some(Down)` when this machine's daemon answers
+/// and says its server link is not connected. Pure.
+pub(crate) fn own_link_from_daemon(sig: Option<&serde_json::Value>) -> Option<OwnLink> {
+    let sig = sig?;
+    crate::daemon_health::degraded_reason(sig)?;
+    Some(OwnLink::Down { for_secs: sig["for_secs"].as_u64().unwrap_or(0) })
+}
+
+/// Both views; the daemon's "down" wins over the probe's "slow".
+pub(crate) async fn own_link_state(o: &crate::l2::ProbeOutcome) -> Option<OwnLink> {
+    let sig = crate::daemon_health::signaling().await;
+    own_link_from_daemon(sig.as_ref()).or_else(|| slow_own_link(o))
 }
 
 /// The sentence for a presence failure while this machine's own link to the
-/// server was slow: the peer may be fine. Never the reset/forget advice. Pure.
-pub(crate) fn own_link_hint(peer: &str, signaling_ms: u64) -> String {
+/// server was slow or down: the peer may be fine. Never the reset/forget
+/// advice. Pure.
+pub(crate) fn own_link_hint(peer: &str, own: OwnLink) -> String {
+    let why = match own {
+        OwnLink::Slow { signaling_ms } => format!(
+            "this machine's own connection to the server is slow (connecting took {:.1} s)",
+            signaling_ms as f64 / 1000.0
+        ),
+        OwnLink::Down { for_secs } => format!(
+            "this machine's own connection to the server is down (its daemon has been reconnecting for {for_secs} s)"
+        ),
+    };
     format!(
-        "{peer} did not appear on the tunlion server in time, but this machine's own connection to the \
-         server is slow (connecting took {:.1} s), so {peer} may be fine: check this machine's network, then \
-         retry. `tunlion doctor` checks it",
-        signaling_ms as f64 / 1000.0
+        "{peer} did not appear on the tunlion server in time, but {why}, so {peer} may be fine: check this \
+         machine's network, then retry. `tunlion doctor` checks it"
     )
 }
 
@@ -654,16 +687,16 @@ pub(crate) fn own_link_hint(peer: &str, signaling_ms: u64) -> String {
 /// Failing earlier with our OWN server link over budget points at this
 /// machine first: the fuzzer found that too, with loss and 1.5 s delay on the
 /// machine running reach. Otherwise the peer really may be offline. Pure.
-pub(crate) fn unreachable_hint(peer: &str, failed_phase: Option<crate::diag::Phase>, own_slow_ms: Option<u64>) -> String {
+pub(crate) fn unreachable_hint(peer: &str, failed_phase: Option<crate::diag::Phase>, own: Option<OwnLink>) -> String {
     use crate::diag::Phase;
-    match (failed_phase, own_slow_ms) {
+    match (failed_phase, own) {
         (Some(Phase::Establishing | Phase::Ready | Phase::L2Open | Phase::Up), _) => format!(
             "{peer} is listed on the tunlion server, but no connection to it came up: a firewall may block \
              every path between you (direct UDP, and the relay), or it went offline just now. \
              `tunlion doctor {}` shows which paths were tried",
             crate::refusal::word(peer)
         ),
-        (_, Some(ms)) => own_link_hint(peer, ms),
+        (_, Some(own)) => own_link_hint(peer, own),
         _ => format!("{peer} may be offline, or not running `tunlion up` / `--shell`"),
     }
 }
@@ -688,11 +721,25 @@ mod tests {
     #[test]
     fn a_presence_failure_on_a_slow_own_link_blames_this_machine() {
         use crate::diag::Phase;
-        let h = unreachable_hint("charlie", Some(Phase::Presence), Some(3400));
+        let slow = Some(OwnLink::Slow { signaling_ms: 3400 });
+        let h = unreachable_hint("charlie", Some(Phase::Presence), slow);
         assert!(h.contains("this machine's own connection") && h.contains("3.4 s"), "{h}");
         assert!(!h.contains("may be offline") && !h.contains("forget"), "{h}");
         // Establishing still blames the path, whatever our own link did.
-        assert!(unreachable_hint("charlie", Some(Phase::Establishing), Some(3400)).contains("firewall"));
+        assert!(unreachable_hint("charlie", Some(Phase::Establishing), slow).contains("firewall"));
+    }
+
+    #[test]
+    fn a_presence_failure_while_our_daemon_is_disconnected_blames_this_machine() {
+        use crate::diag::Phase;
+        use serde_json::json;
+        let down = own_link_from_daemon(Some(&json!({"state": "reconnecting", "for_secs": 31})));
+        assert_eq!(down, Some(OwnLink::Down { for_secs: 31 }));
+        let h = unreachable_hint("charlie", Some(Phase::Presence), down);
+        assert!(h.contains("is down") && h.contains("31 s") && !h.contains("may be offline"), "{h}");
+        // A connected daemon says nothing about our side.
+        assert_eq!(own_link_from_daemon(Some(&json!({"state": "connected", "for_secs": 9}))), None);
+        assert_eq!(own_link_from_daemon(None), None);
     }
 
     /// E3: `reach` told a device with no shell grant on beta that "ssh/pty to
