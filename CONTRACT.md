@@ -994,6 +994,31 @@ a,b` scopes it to the listed peers/devices identically: a peer outside the
   default `auto-warm` tier and `warm-max` cap remain the only pool, so exec
   never creates an unbounded background fleet. A per-exec idle TTL/drop is a
   follow-up, not part of this rule.
+- WARM SEND (sender side, Unix): `send --to <paired device>` first asks the
+  local `up` daemon, via the control socket's `send-link` op naming the
+  transfer ids it will offer, to carry the send over the live DIRECT link the
+  daemon already holds to that device. The daemon answers `no warm path` when
+  it has none (or the link does not answer one liveness ping); nothing has
+  been offered at that point, so the client builds its own link exactly as
+  before. Otherwise the daemon reserves the session a range of file sids
+  (low half, never shared with another session) and bridges the socket with
+  the `exec_frame` framing: the client's `file-offer`/`file-end`/`file-cancel`
+  for its own ids and sids and its data frames go out on the link, a flush is
+  answered, and the receiver's answers that name one of those ids
+  (`file-accept`, `file-decline`, `file-pending`, `delivery-ack`) come back to
+  the client and are NOT acted on by the daemon; `state`, `link-revoked`,
+  `brb` and `back` on that link are copied to the client and still handled by
+  the daemon. The receiver sees the same offer from the same device and runs
+  the same admission. The client never finishes or closes the shared link.
+  When the link dies, or moves no bytes for 15 s mid-transfer, the client
+  drops it, builds its own link and re-offers everything unfinished; the
+  whole-file `delivery-ack` still decides what is done.
+- `{ type: "file-park", id }` -- the sender stopped streaming that transfer on
+  THIS link and will resume it on another: the receiver keeps the partial and
+  releases the stream (a daemon sends it for a warm send that ended with
+  transfers unfinished while the link is still up). An offer of the same
+  transfer id from the same proven device over a different link replaces a
+  lingering stream for that file, resume or not.
 
 ## Capability ledger (append-only signed ops)
 

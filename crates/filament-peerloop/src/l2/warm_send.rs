@@ -209,6 +209,30 @@ pub fn decode_data(b: &[u8]) -> Option<(u32, u64, &[u8])> {
     Some((sid, off, &b[12..]))
 }
 
+/// The control frames a warm-send client may put on the daemon's link: the
+/// sender's own vocabulary, naming one of its own transfers and sids. Anything
+/// else is dropped, so the pipe can carry a send and nothing more.
+pub fn client_control_allowed(v: &Value, ids: &[String], base: u32, n: u32) -> bool {
+    let own_id = || v["id"].as_str().is_some_and(|id| ids.iter().any(|i| i == id));
+    let own_sid = || {
+        v["sid"]
+            .as_u64()
+            .and_then(|s| u32::try_from(s).ok())
+            .is_some_and(|s| in_range(s, base, n))
+    };
+    match v["type"].as_str() {
+        Some("file-offer" | "file-end" | "file-cancel") => own_id() && own_sid(),
+        // The send loop's bounded liveness probe on a stalled transfer.
+        Some("ping") => true,
+        _ => false,
+    }
+}
+
+/// Is `sid` one of the `n` sids starting at `base`?
+pub fn in_range(sid: u32, base: u32, n: u32) -> bool {
+    sid >= base && sid - base < n.max(1)
+}
+
 #[cfg(unix)]
 pub use imp::handle_warm_send;
 
@@ -229,14 +253,20 @@ mod imp {
     /// The longest a session waits to tell the peer to park its streams.
     const PARK_BUDGET: Duration = Duration::from_secs(3);
 
-    /// The bound on the preflight ping: the usual reach window, stretched to
-    /// four round trips on a slow link so a live link at a high RTT is not
-    /// mistaken for a zombie. A miss here only means "no warm path".
+    /// The bound on the preflight ping. Generous on purpose: a miss sends the
+    /// client to build its own link, which on the slow, lossy path this exists
+    /// for costs tens of seconds and often fails, while a live link there may
+    /// need a retransmission or two (and quinn's RTT estimate can still be the
+    /// one from before the path degraded). At least `PREFLIGHT_MIN`, four
+    /// round trips on a slower link, never more than `PREFLIGHT_MAX`. Only a
+    /// link that is truly gone pays it, once.
     fn preflight_window(t: &Arc<dyn Transport>) -> Duration {
-        let base = crate::daemon_ctl::liveness_window();
+        let base = crate::daemon_ctl::liveness_window().max(PREFLIGHT_MIN);
         let rtt = t.rtt_ms().map(|ms| Duration::from_millis(ms.saturating_mul(4)));
-        rtt.map_or(base, |r| base.max(r)).min(Duration::from_secs(8))
+        rtt.map_or(base, |r| base.max(r)).min(PREFLIGHT_MAX)
     }
+    const PREFLIGHT_MIN: Duration = Duration::from_secs(5);
+    const PREFLIGHT_MAX: Duration = Duration::from_secs(8);
 
     /// Handle one `send-link` control request. Resolves the warm link inline
     /// (cheap) and spawns the session, so nothing here blocks the receive loop.
@@ -319,7 +349,8 @@ mod imp {
         let _live = crate::l2::mux::WarmExecLive::enter();
         let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Value>();
         let reg = register(&pid, &ids, in_tx);
-        let base = alloc_sids(ids.len() as u32);
+        let n_sids = ids.len() as u32;
+        let base = alloc_sids(n_sids);
         let mut sock = req.sock;
         let mut reply = json!({
             "ok": true,
@@ -357,6 +388,7 @@ mod imp {
         let pump = {
             let t = t.clone();
             let out_tx = out_tx.clone();
+            let ids = ids.clone();
             tokio::spawn(async move {
                 let mut r = tokio::io::BufReader::new(read_half);
                 loop {
@@ -370,6 +402,12 @@ mod imp {
                             let Ok(v) = serde_json::from_slice::<Value>(&payload) else {
                                 continue;
                             };
+                            // A sender's vocabulary only, about this send's
+                            // own transfers: the pipe carries a send, not
+                            // arbitrary frames on the daemon's link.
+                            if !client_control_allowed(&v, &ids, base, n_sids) {
+                                continue;
+                            }
                             if t.send_control(&v).await.is_err() {
                                 return "the warm link died";
                             }
@@ -380,7 +418,7 @@ mod imp {
                             };
                             // Only file sids: the high half is the L2 streams
                             // the daemon's own mux owns on this link.
-                            if crate::l2::is_l2_sid(sid) {
+                            if crate::l2::is_l2_sid(sid) || !in_range(sid, base, n_sids) {
                                 continue;
                             }
                             if t.send_frame(sid, off, bytes).await.is_err() {
@@ -536,6 +574,24 @@ mod tests {
         for s in [a, a + 2, b] {
             assert!(!crate::l2::is_l2_sid(s));
             assert!(s >= SID_FIRST && s < SID_LIMIT);
+        }
+    }
+
+    #[test]
+    fn the_client_may_only_speak_about_its_own_transfers() {
+        let ids = vec!["s-7-1".to_string(), "s-7-2".to_string()];
+        let base = 0x4000_0100;
+        let offer = |id: &str, sid: u32| json!({ "type": "file-offer", "id": id, "sid": sid });
+        assert!(client_control_allowed(&offer("s-7-1", base), &ids, base, 2));
+        assert!(client_control_allowed(&json!({ "type": "file-end", "id": "s-7-2", "sid": base + 1 }), &ids, base, 2));
+        assert!(client_control_allowed(&json!({ "type": "ping", "v": 1 }), &ids, base, 2));
+        // Another send's transfer, or a sid outside this session's range.
+        assert!(!client_control_allowed(&offer("s-8-1", base), &ids, base, 2));
+        assert!(!client_control_allowed(&offer("s-7-1", base + 2), &ids, base, 2));
+        assert!(!client_control_allowed(&offer("s-7-1", 1), &ids, base, 2));
+        // Anything that is not a sender's own vocabulary.
+        for kind in ["pair-proof", "link-revoked", "l2-open", "exec-open", "state", "pair-keep"] {
+            assert!(!client_control_allowed(&json!({ "type": kind, "id": "s-7-1", "sid": base }), &ids, base, 2), "{kind}");
         }
     }
 
