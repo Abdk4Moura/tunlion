@@ -280,26 +280,24 @@ mod imp {
                     None => break Err(warm_link_died(peer)),
                 },
                 chunk = stdin_rx.recv(), if !stdin_done => match chunk {
+                    // A write that fails means the daemon stopped reading:
+                    // usually because the command already exited and its exit
+                    // frame is waiting in the read half. Stop sending stdin
+                    // and let the frames decide; a session that really died
+                    // ends the read half too (`None` above). Failing here
+                    // turned a command that exited 0 before it read its empty
+                    // stdin into "control connection closed" (chaos baseline
+                    // exec, refused 2 jobs of 12 worlds on 2026-11-26).
                     Some(c) if c.is_empty() => {
-                        if write_frame(&mut write_half, FRAME_STDIN_EOF, &[]).await.is_err() {
-                            break Err(anyhow::anyhow!(
-                                "the warm exec control connection closed while sending stdin"
-                            ));
-                        }
+                        let _ = write_frame(&mut write_half, FRAME_STDIN_EOF, &[]).await;
                         stdin_done = true;
                     }
                     Some(c) => {
-                        let mut failed = false;
                         for chunk in c.chunks(16 * 1024) {
                             if write_frame(&mut write_half, FRAME_STDIN, chunk).await.is_err() {
-                                failed = true;
+                                stdin_done = true;
                                 break;
                             }
-                        }
-                        if failed {
-                            break Err(anyhow::anyhow!(
-                                "the warm exec control connection closed while sending stdin"
-                            ));
                         }
                     }
                     None => stdin_done = true,
