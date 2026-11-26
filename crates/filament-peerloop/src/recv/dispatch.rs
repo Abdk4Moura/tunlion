@@ -5723,6 +5723,15 @@ async fn recv_run(
                         let known = host.devices_load().into_iter().find(|(n, _)| {
                             conn.links.get(&from).map(|l| l.name == *n).unwrap_or(false)
                         });
+                        // The re-arm below can take this peer's arm slot and
+                        // still start nothing: `start_direct` declines a peer it
+                        // already holds a live transport to. A one-shot fleet
+                        // dialer that this device knows by a paired name (the
+                        // owner, for a device it enrolled) has exactly that, a
+                        // WebRTC link, so the answer just below then read the
+                        // slot as taken and the dialer waited out its candidate
+                        // bound. An arm that armed nothing does not spend it.
+                        let mut rearm_armed_nothing = false;
                         if let Some((name, secret)) = known {
                             // Bounded like the fleet arms: this offer site
                             // fires on every transport-offer the peer sends.
@@ -5734,6 +5743,7 @@ async fn recv_run(
                             ) {
                                 fleet_arm_at.insert(from.clone(), now);
                                 conn.start_direct(&from, &name, &secret).await;
+                                rearm_armed_nothing = !conn.direct_pending.contains_key(&from);
                             } else {
                                 log.debug(&format!(
                                     "fleet: re-arm for {from} skipped, armed recently"
@@ -5765,11 +5775,13 @@ async fn recv_run(
                                     log.debug(&format!(
                                         "fleet: answer for {from} skipped, it is a live pair link"
                                     ));
-                                } else if fleet_arm_allowed(
-                                    fleet_arm_at.get(&from).copied(),
-                                    now,
-                                    FLEET_ARM_COOLDOWN,
-                                ) {
+                                } else if rearm_armed_nothing
+                                    || fleet_arm_allowed(
+                                        fleet_arm_at.get(&from).copied(),
+                                        now,
+                                        FLEET_ARM_COOLDOWN,
+                                    )
+                                {
                                     fleet_arm_at.insert(from.clone(), now);
                                     log.debug(&format!(
                                         "fleet: answering a one-shot dialer's transport-offer from {from}"
