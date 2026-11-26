@@ -133,6 +133,17 @@
       ]
     },
     {
+      "path": "cli/tests/send-warm-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/fuzz/tunlion bash cli/tests/send-warm-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/core-send-e2e-gates.sh",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion TUNLION_CORE_SEND_BIN=target/release/send-code bash cli/tests/core-send-e2e-gates.sh",
@@ -654,7 +665,7 @@
       "disposition": "diagnostic",
       "issue": "https://github.com/Abdk4Moura/tunlion/issues/318",
       "owner": "pi-director",
-      "expires": "2026-11-18"
+      "expires": "2026-12-26"
     },
     {
       "path": "cli/tests/mount-revoke-gates.sh",
