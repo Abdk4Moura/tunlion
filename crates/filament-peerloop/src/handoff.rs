@@ -201,6 +201,12 @@ impl Transport for HandoffTransport {
     fn is_dead(&self) -> bool {
         self.current().is_dead()
     }
+    fn keepalive_silence_ms(&self) -> Option<u64> {
+        self.current().keepalive_silence_ms()
+    }
+    fn sever(&self) {
+        self.current().sever()
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

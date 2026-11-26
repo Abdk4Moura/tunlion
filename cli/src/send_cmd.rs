@@ -1263,9 +1263,36 @@ pub(crate) async fn send_cmd(
         // correction ladder below. The control-channel liveness probe gates it so
         // a genuinely DEAD link falls to the C3/C4 path instead.
         if let Some(active) = conn.active.clone() {
+            let unanswered = answer_clock.is_some()
+                && outgoing
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|o| !o.done && !o.declined && !o.accepted_once);
+            // The half-open link: an offer is out, and a peer that keepalives
+            // has sent nothing for DC_PEER_SILENT. Its answer cannot reach us
+            // (its channel died, or it dropped the link and the close was
+            // lost), while our own writes still drain, so nothing else here
+            // sees it before the answer bound. Sever it so the watchdog below
+            // repairs it the way it repairs a channel that died mid-transfer.
+            if let Some(t) = conn.transport_of(&active) {
+                if offer_link_half_open(unanswered, receiver_asking, t.keepalive_silence_ms())
+                    && !Conn::transport_severed(t.as_ref())
+                {
+                    ui::debug(&format!(
+                        "  no word from the receiver for {}s while an offer waits: severing the link to re-dial",
+                        t.keepalive_silence_ms().unwrap_or_default() / 1000
+                    ));
+                    t.sever();
+                }
+            }
+            let severed = conn
+                .transport_of(&active)
+                .is_some_and(|t| Conn::transport_severed(t.as_ref()));
             let in_flight = {
                 let out = outgoing.lock().await;
-                out.iter().any(|o| o.accepted_once && !o.sent)
+                let streaming = out.iter().any(|o| o.accepted_once && !o.sent);
+                stall_watch_in_flight(streaming, unanswered, severed)
             };
             // A dead channel is a stall here: the sender owns re-establishing it.
             if let Some(idle) = conn.detect_stall(&active, in_flight, true) {
@@ -3545,6 +3572,69 @@ pub(crate) fn no_peer_hint(to: Option<&str>, use_code: bool, room: Option<&str>)
         }
         (None, false, Some(r)) => format!("is a receiver waiting in room '{r}'?"),
         _ => "is a receiver running on this network?".to_string(),
+    }
+}
+
+/// Whether the send's stall watchdog has a transfer in flight on its link.
+/// Streaming (accepted, not all sent) always is. An offer still waiting for
+/// its answer is too, but only on a channel that is already dead: waiting on
+/// an answer moves no bytes, so judging it by the byte clock would cut off a
+/// receiver that is simply deciding, while a dead channel can never carry the
+/// answer at all. Without this, a receiver whose channel died before its
+/// `file-accept` reached us (a half-open link) left the send waiting out its
+/// 60 s answer bound instead of re-dialing as it does mid-transfer. Pure.
+fn stall_watch_in_flight(streaming: bool, offer_unanswered: bool, severed: bool) -> bool {
+    streaming || (offer_unanswered && severed)
+}
+
+/// Whether the link an offer waits on is half-open: the offer is unanswered,
+/// no person is deciding (a `file-pending` receiver is alive and says so), and
+/// a peer that sends a keepalive has been silent past `DC_PEER_SILENT`.
+/// `keepalive_silence_ms` is `None` for a peer whose silence means nothing (a
+/// browser, or a transport with its own keepalive verdict). Pure.
+fn offer_link_half_open(
+    offer_unanswered: bool,
+    receiver_asking: bool,
+    keepalive_silence_ms: Option<u64>,
+) -> bool {
+    offer_unanswered && !receiver_asking && net::peer_silent(keepalive_silence_ms)
+}
+
+#[cfg(test)]
+mod stall_watch_tests {
+    use super::{offer_link_half_open, stall_watch_in_flight};
+    use filament_transport::net::DC_PEER_SILENT;
+
+    /// The chaos replay's half-open link: the receiver's channel died before
+    /// its file-accept reached us, and the send waited out its 60 s answer
+    /// bound on a link that read alive because our own writes still drained.
+    #[test]
+    fn a_silent_receiver_with_an_offer_out_is_half_open() {
+        let silent = Some(DC_PEER_SILENT.as_millis() as u64);
+        let heard = Some(DC_PEER_SILENT.as_millis() as u64 - 1);
+        assert!(offer_link_half_open(true, false, silent));
+        // Heard within the bound: still waiting on a live receiver.
+        assert!(!offer_link_half_open(true, false, heard));
+        // A person is deciding: the receiver said so, it is not gone.
+        assert!(!offer_link_half_open(true, true, silent));
+        // Nothing owed: an idle link's silence is not ours to act on.
+        assert!(!offer_link_half_open(false, false, silent));
+        // A peer that sends no keepalive (a browser) is never judged by it.
+        assert!(!offer_link_half_open(true, false, None));
+    }
+
+    #[test]
+    fn an_unanswered_offer_on_a_dead_channel_is_in_flight() {
+        // Streaming is in flight whatever the channel says.
+        assert!(stall_watch_in_flight(true, false, false));
+        assert!(stall_watch_in_flight(true, true, true));
+        // The half-open link: the answer can never arrive, so repair it.
+        assert!(stall_watch_in_flight(false, true, true));
+        // A live channel waiting on a receiver that is deciding: not a stall.
+        assert!(!stall_watch_in_flight(false, true, false));
+        // Nothing outstanding: nothing to repair, dead or not.
+        assert!(!stall_watch_in_flight(false, false, true));
+        assert!(!stall_watch_in_flight(false, false, false));
     }
 }
 
