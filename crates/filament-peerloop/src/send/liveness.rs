@@ -98,12 +98,23 @@ pub fn link_down_window(
     }
 }
 
+/// A link that came back counts as back only while its receiver has been heard
+/// within this long (two of the `state` frames every receiver sends every
+/// 10 s). One that reads up while its receiver says nothing is not the
+/// receiver back: the 83e2d5588e replay on the first fix had a fresh WebRTC
+/// link come up 50 s into the send, its receiver silent from then on, and the
+/// clock restarted by it.
+pub const LINK_UP_HEARD: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Slack for a receiver heard just before the loop first saw its link up.
+const HEARD_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long the send's link to its receiver has been down, across every way
 /// it can be: no transport, a dead one, or one whose receiver (a peer that
 /// keepalives) has been silent for the whole window. One clock for the warm
 /// link, the wait for the daemon's repaired link and the send's own dials, so
 /// moving between them never restarts it; only a link that stays up for
-/// [`LINK_UP_CONFIRM`] does.
+/// [`LINK_UP_CONFIRM`] with its receiver heard does.
 #[derive(Debug, Default, Clone)]
 pub struct DownClock {
     down_since: Option<std::time::Instant>,
@@ -115,7 +126,9 @@ impl DownClock {
     /// how long a receiver that keepalives has sent nothing on the link that
     /// reads up (None when its silence means nothing). Returns true when the
     /// link counts as down. Silence of at least `window` is down, and dates
-    /// the clock from the last time the receiver was heard.
+    /// the clock from the last time the receiver was heard. While a down
+    /// episode is open, a link that came back but whose receiver has not been
+    /// heard on it since is still down.
     pub fn observe(
         &mut self,
         now: std::time::Instant,
@@ -135,7 +148,14 @@ impl DownClock {
             return true;
         }
         let up = *self.up_since.get_or_insert(now);
-        if now.saturating_duration_since(up) >= LINK_UP_CONFIRM {
+        let up_for = now.saturating_duration_since(up);
+        // Unknown silence (a transport whose peer sends no keepalive) is
+        // taken as heard, as before: only a known silence holds the clock.
+        let heard_since_up = silent.is_none_or(|s| s <= up_for + HEARD_SLACK);
+        if !heard_since_up {
+            return self.down_since.is_some();
+        }
+        if up_for >= LINK_UP_CONFIRM && silent.is_none_or(|s| s < LINK_UP_HEARD) {
             self.down_since = None;
         }
         false
@@ -270,6 +290,33 @@ mod tests {
         c.observe(at(25), false, None, w);
         c.observe(at(25) + LINK_UP_CONFIRM, false, None, w);
         assert_eq!(c.down_since(), None);
+    }
+
+    /// The first fix's 83e2d5588e failure: the warm link died 10 s in, a cold
+    /// link came up at 50 s and its receiver never said a word on it. That
+    /// link is not the receiver back: the clock keeps running and ends the
+    /// send, instead of restarting and waiting a whole window of silence.
+    #[test]
+    fn a_link_back_whose_receiver_says_nothing_is_still_down() {
+        use std::time::{Duration, Instant};
+        let w = LINK_DOWN_WINDOW;
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut c = DownClock::default();
+        assert!(c.observe(at(10), true, None, w));
+        // Up at 50 s; the receiver was last heard before that and not since.
+        assert!(!c.observe(at(50), false, Some(Duration::ZERO), w), "heard as it came up");
+        assert!(c.observe(at(60), false, Some(Duration::from_secs(13)), w));
+        assert!(c.observe(at(61), false, Some(Duration::from_secs(14)), w));
+        assert_eq!(c.down_since(), Some(at(10)));
+        assert!(c.expired(at(61), w));
+        // The same link with its receiver talking (state every 10 s) is back.
+        let mut c = DownClock::default();
+        c.observe(at(10), true, None, w);
+        assert!(!c.observe(at(50), false, Some(Duration::ZERO), w));
+        assert!(!c.observe(at(55), false, Some(Duration::from_secs(4)), w));
+        assert!(!c.observe(at(60), false, Some(Duration::from_secs(1)), w));
+        assert_eq!(c.down_since(), None, "up 10 s and heard: the clock restarts");
     }
 
     /// A link that reads up while its receiver has said nothing for the whole
