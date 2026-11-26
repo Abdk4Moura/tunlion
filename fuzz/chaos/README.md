@@ -78,6 +78,17 @@ A visitor that cannot engage before any other visitor did refuses the run, as
 does a missing ESTABLISH line in alpha's log (the rule would be blind).
 `corpus/transient-visitors-sequential.json` is the 2026-11-26 production case.
 
+## Sends to stdout
+
+A send op with `"via": "stdout"` runs `send <file> --word ...` on `src` and a
+one-shot `receive <code> -y -o -` on `dst`, reading its stdout slowly so the
+pipe fills (the shape of gate T3). Stdout cannot be rewound, so O7
+(false success) judges what the reader got: either end exiting 0 while those
+bytes are not the source file is a finding. `random_op` picks it for about a
+third of sends; `corpus/send-stdout.json` is the T3 case.
+
+    {"at": 1.0, "op": "send", "via": "stdout", "src": "alpha", "dst": "bravo", "kib": 5120}
+
 ## Retiring a hand-written gate
 
 Only when reverting that gate's original fix makes `replay` of the matching
