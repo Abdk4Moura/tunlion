@@ -99,6 +99,14 @@ async fn offer_pair_keep(conn: &Conn, pid: &str, secret: &str) -> bool {
     handed
 }
 
+/// The error for a stall ladder that ran out on the active link: once a
+/// channel was up, the receiver is unreachable after the time the link has
+/// been down (`send_liveness::ladder_exhausted_message`).
+fn ladder_exhausted(established: bool, link_down_since: Option<Instant>, by_code: bool) -> String {
+    let down = established.then(|| link_down_since.map_or(0, |t| t.elapsed().as_secs()));
+    crate::send_liveness::ladder_exhausted_message(down, MAX_ATTEMPTS, by_code)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_cmd(
     server: &str,
@@ -958,11 +966,14 @@ pub(crate) async fn send_cmd(
             let waiting_for_claim = use_code && known_target.is_none() && !code_used;
             if !waiting_for_claim && !receiver_asking {
                 let unfinished = outgoing.lock().await.iter().any(|o| !o.done && !o.declined);
-                let heard = conn
-                    .active
-                    .as_ref()
-                    .and_then(|p| conn.transport_of(p))
-                    .and_then(|t| t.heard_ms().or_else(|| Some(t.idle_ms())));
+                // No transport to the target after one was up (a re-dial in
+                // progress, or the ladder ran out and the rejoin window is
+                // being waited out) is a link that is down, and says so.
+                let heard = match conn.active.as_ref().and_then(|p| conn.transport_of(p)) {
+                    Some(t) => t.heard_ms().or_else(|| Some(t.idle_ms())),
+                    None if established => Some(u64::MAX),
+                    None => None,
+                };
                 if let Some(line) = crate::send_liveness::still_waiting_line(
                     &peer_label,
                     established,
@@ -2948,26 +2959,17 @@ pub(crate) async fn send_cmd(
                     .on_stuck(&pid, generation, "stuck while connecting")
                     .await?
                 {
-                    bail!(
-                        "lost the receiving peer after {} attempts; the partial is kept, re-run the same `tunlion send` to resume",
-                        MAX_ATTEMPTS
-                    );
+                    bail!(ladder_exhausted(established, link_down_since, use_code && known_target.is_none()));
                 }
             }
             Ev::RetryLink(pid, generation) => {
                 if conn.on_retry_due(&pid, generation).await? {
-                    bail!(
-                        "lost the receiving peer after {} attempts; the partial is kept, re-run the same `tunlion send` to resume",
-                        MAX_ATTEMPTS
-                    );
+                    bail!(ladder_exhausted(established, link_down_since, use_code && known_target.is_none()));
                 }
             }
             Ev::GraceExpired(pid, generation) => {
                 if conn.on_stuck(&pid, generation, "lost").await? {
-                    bail!(
-                        "lost the receiving peer after {} attempts; the partial is kept, re-run the same `tunlion send` to resume",
-                        MAX_ATTEMPTS
-                    );
+                    bail!(ladder_exhausted(established, link_down_since, use_code && known_target.is_none()));
                 }
             }
             Ev::PcState(pid, s) => conn.on_pc_state(&pid, &s).await,
