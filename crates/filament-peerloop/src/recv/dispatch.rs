@@ -1772,11 +1772,16 @@ async fn recv_run(
     // (`recv` vs `pair`) decides whether the agreed secret is discarded or kept.
     // So `recv` no longer redirects a 4-digit code away (the old width-based
     // hint is obsolete); any well-formed code is a valid claim here.
-    // Owner-only: peers write here (the host's create_inbox_dir).
-    host.create_inbox_dir(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
-    // Interrupted transfers' partials wait PARTIAL_TTL_SECS for a resume, then go.
-    crate::recv::files::expire_partials_and_say(&dir, log.as_ref());
+    // `-o -` writes nothing to a directory, so it neither creates nor sweeps
+    // one: a receive to stdout from a directory this user cannot write (`/`,
+    // a job dir) must not depend on it, nor delete partials it finds there.
+    if !to_stdout {
+        // Owner-only: peers write here (the host's create_inbox_dir).
+        host.create_inbox_dir(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        // Interrupted transfers' partials wait PARTIAL_TTL_SECS for a resume, then go.
+        crate::recv::files::expire_partials_and_say(&dir, log.as_ref());
+    }
     let my_uid = ports.env.uid.clone();
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     // P2 (GAP-2): `mut` so the long-lived acceptor's outer reconnect loop can
@@ -9535,7 +9540,9 @@ async fn recv_run(
                     // resume after a process restart can still verify-on-completion
                     // even if this particular re-offer omits `full`.
                     let mut prior_full: Option<String> = None;
-                    if part_path.is_file() {
+                    // Stdout cannot resume: a same-named partial in the
+                    // directory is not this stream's.
+                    if !to_stdout && part_path.is_file() {
                         let prior = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
                         match PartMeta::load(&meta_path) {
                             Some(m) if m.size == size && prior <= size => {
@@ -10057,22 +10064,22 @@ async fn recv_run(
 
                     if to_stdout {
                         // Pipe mode: no part files, no resume, pure stream.
-                        // Write through a dup'd stdout fd so dropping the
-                        // writer never closes the process's real fd 1; the
-                        // /dev/stdout open is the portable-unix way to dup.
+                        // Write through a dup of fd 1 so dropping the writer
+                        // never closes the process's real stdout. A dup, not
+                        // an open of /dev/stdout: that reopen re-checks the
+                        // pipe's permissions and failed with a bare EACCES
+                        // under a privilege drop (see `dup_stdout`).
                         // (Windows: -o - is not supported yet; see G-e.)
-                        #[cfg(unix)]
-                        let out = tokio::fs::OpenOptions::new()
-                            .write(true)
-                            .open("/dev/stdout")
-                            .await?;
                         #[cfg(not(unix))]
                         {
                             bail!("-o - (stdout streaming) is not supported on this platform yet");
                         }
                         #[cfg(unix)]
                         {
-                            let out = out.into_std().await;
+                            let out = crate::recv::dup_stdout().context(
+                                "-o -: could not get a handle on stdout (fd 1) to write the file to; \
+                                 run with stdout open for writing, or use --dir DIR to save it instead",
+                            )?;
                             // A pipe cannot seek, so stdout gets an in-order
                             // writer (StdoutSink) instead of positional writes,
                             // which failed every `-o - | reader` with ESPIPE. It
@@ -10080,7 +10087,7 @@ async fn recv_run(
                             // against the offered digest and acked like a file.
                             let sink = Arc::new(std::sync::Mutex::new(
                                 crate::recv::StdoutSink::sharing(
-                                    out.try_clone()?,
+                                    out.try_clone().context("-o -: could not duplicate the stdout handle")?,
                                     crate::recv::process_stdout_ledger(),
                                 ),
                             ));
