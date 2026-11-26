@@ -47,6 +47,14 @@ pub const MARKER: &str = "LOOP-BUDGET-EXCEEDED";
 /// knob.
 pub const BUDGET: Duration = Duration::from_secs(1);
 
+// A handler waits for at most two bounded WebRTC operations in sequence
+// (`Peer::fingerprints` reads both descriptions; a glare rebuild applies a
+// signal twice). Together they must leave most of the budget to the handler
+// itself, or a wedged peer connection alone trips it.
+const _: () = assert!(
+    2 * filament_transport::net::PC_OP_INLINE_BUDGET.as_millis() <= BUDGET.as_millis() / 2
+);
+
 /// Env var that turns a report into a panic (test-hooks builds only).
 pub const PANIC_ENV: &str = "TUNLION_TEST_LOOP_BUDGET_PANIC";
 

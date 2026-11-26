@@ -368,6 +368,8 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         revoked_bindings: HashSet::new(),
         link_events: HashMap::new(),
         candidate_wake: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        direct_gathering: HashMap::new(),
+        direct_gathered: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         closing: HashMap::new(),
         pending_sources: HashMap::new(),
         replaying_sources: HashMap::new(),

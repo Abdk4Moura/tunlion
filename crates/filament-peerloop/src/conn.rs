@@ -1606,6 +1606,226 @@ fn drain_candidate_events(state: &mut BuildState) -> bool {
     }
 }
 
+/// How long a pending direct attempt may spend gathering its candidates
+/// before the fallback reaper gives up on it. Gathering is bounded by its own
+/// timeouts (whoami 3 s; with hole-punching the config fetch's retries and
+/// STUN), so this is a backstop for a gathering task that never reports, not
+/// a budget a healthy attempt comes near.
+const DIRECT_GATHER_GRACE: Duration = Duration::from_secs(10);
+
+/// The direct ladder's budget, counted from the moment our transport-offer
+/// goes out. The WebRTC fallback reaper (`expired_direct`) fires at its end.
+/// rung-1's race always burns the full DIRECT_BUDGET when it can't win (its
+/// acceptor future never self-completes), so with hole-punch enabled the
+/// deadline MUST cover the WHOLE ladder, rung-1 budget + punch budget + QUIC
+/// handshake slack, or the reaper would race WebRTC against an in-flight punch
+/// and the route would be a coin flip. Flag-gated, so rung-1-only timing is
+/// byte-identical.
+fn direct_ladder_budget() -> Duration {
+    if holepunch::holepunch_enabled() {
+        direct::DIRECT_BUDGET + holepunch::PUNCH_BUDGET + Duration::from_secs(3)
+    } else {
+        direct::DIRECT_BUDGET
+    }
+}
+
+/// A pending direct attempt whose candidates are still being gathered off the
+/// event loop (`gather_and_offer`). A peer's transport-offer that arrives in
+/// that window is held here and raced once gathering reports.
+pub struct DirectGathering {
+    pub attempt: net::AttemptId,
+    pub offer: Option<BufferedOffer>,
+}
+
+/// What a finished gathering task hands back to the loop (`pump_builds`).
+pub struct DirectGathered {
+    pub pid: String,
+    pub attempt: net::AttemptId,
+    /// rung-2 (TUNLION_HOLEPUNCH): the STUN'd raw socket and its srflx.
+    pub punch_sock: Option<std::net::UdpSocket>,
+    pub my_srflx: Option<std::net::SocketAddr>,
+}
+
+/// Everything `gather_and_offer` needs, owned, so it runs off the loop.
+struct GatherJob {
+    context: filament_transport::TransportContext,
+    server: String,
+    sio: filament_signal::Client,
+    log: Arc<dyn LogSink>,
+    pid: String,
+    name: String,
+    attempt: net::AttemptId,
+    port: u16,
+    /// A same-machine peer's candidates, already known: nothing to gather.
+    local_cands: Option<Vec<String>>,
+    channel: String,
+    probe: bool,
+    cancel: Arc<AtomicBool>,
+    done: Arc<std::sync::Mutex<Vec<DirectGathered>>>,
+    wake: mpsc::UnboundedSender<Ev>,
+}
+
+/// Gather a direct attempt's candidates, report them to the loop, then send
+/// the transport-offer and its re-emits. Runs on its own task: gathering
+/// awaits HTTP and STUN, which must never hold the daemon event loop
+/// (`Conn::start_direct_inner`).
+async fn gather_and_offer(job: GatherJob) {
+    let GatherJob {
+        context,
+        server,
+        sio,
+        log,
+        pid,
+        name,
+        attempt,
+        port,
+        local_cands,
+        channel,
+        probe,
+        cancel,
+        done,
+        wake,
+    } = job;
+    // #1 (parallelism): gather the host/public candidates (incl. the
+    // /api/whoami HTTP) and the rung-2 STUN srflx CONCURRENTLY. Both are
+    // independent network round-trips that must finish before the
+    // transport-offer can go out, and the initiator's "establishing" phase
+    // waits on exactly that offer, so overlapping them shaves a round-trip off
+    // every cold connect.
+    //
+    // rung-2 (TUNLION_HOLEPUNCH): bind a SECOND raw socket and STUN it so we
+    // can advertise a server-reflexive candidate. This socket is kept RAW
+    // (not handed to quinn), its NAT mapping is the one we'll punch + run
+    // QUIC on if rung-1's host-candidate race fails. STUN failure is graceful:
+    // no srflx is advertised and rung-2 simply won't fire for this peer.
+    //
+    // #237: gather_candidates is the ONE computation of both the candidate
+    // set and the server-asserted address adopted into it (Some exactly
+    // when a server-chosen address was pushed and no peer had observed us
+    // yet). The offer carries that value to the peer so the PEER's race can
+    // dial it and, if it never answers, name it at ITS fallback decision.
+    // No second copy of the rule exists to desynchronize.
+    let (cands, server_public, srflx) = match local_cands {
+        Some(cands) => (cands, None, None),
+        None => {
+            let srflx_fut = async {
+                if holepunch::holepunch_enabled() {
+                    gather_srflx(&context, &server).await
+                } else {
+                    None
+                }
+            };
+            let ((cands, server_public), srflx) =
+                tokio::join!(direct::gather_candidates(&context, &server, port), srflx_fut);
+            (cands, server_public, srflx)
+        }
+    };
+    let (punch_sock, my_srflx) = match srflx {
+        Some((sock, srflx)) => (Some(sock), Some(srflx)),
+        None => (None, None),
+    };
+    // Report BEFORE the offer goes out: the peer answers our offer with its
+    // own, and the loop must already hold the rung-2 socket and the restarted
+    // budget when that answer is raced.
+    done.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(DirectGathered { pid: pid.clone(), attempt, punch_sock, my_srflx });
+    let _ = wake.send(Ev::BuildWake);
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    // transport-offer rides the OPAQUE signaling relay (same channel as ICE
+    // signals); the server cannot read or forge it without failing the MAC.
+    let mut offer = json!({ "type": "transport-offer", "v": 1, "proto": 2, "addrs": cands });
+    // The meeting place this dial is for. A daemon that has since FORGOTTEN
+    // the secret behind it can then answer "not recognized" at once instead
+    // of buffering an offer it can never match (recv_cmd, forgotten_channels).
+    offer["ch"] = json!(channel);
+    if let Some(s) = my_srflx {
+        offer["srflx"] = json!(s.to_string());
+    }
+    // #237: the candidate this offer adopts on the server's say-so alone.
+    // The peer dials it; if it never answers, the peer's fallback can name
+    // exactly this address instead of claiming a cause it never dialed.
+    if let Some(s) = server_public {
+        // Test-only (gate C-negative/mismatch): advertise a server_public
+        // label that is NOT the dialed candidate, modelling a peer (or
+        // adversarially-mislabeled offer) whose claimed address is not in
+        // its addrs. The peer that dials THIS offer's addrs must NOT name
+        // this label on fallback - it never dialed 8.8.8.8:53.
+        let tag = if std::env::var("TUNLION_DIRECT_SERVER_PUBLIC_MISMATCH")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            "8.8.8.8:53".to_string()
+        } else {
+            s
+        };
+        offer["server_public"] = json!(tag);
+    }
+    // P5 (GAP-6): tag a probe offer so the PEER races it as an upgrade probe
+    // too, its winning side then posts Ev::DirectUpgradeReady (verify-before-
+    // upgrade) instead of clobbering ITS serving relay link. Both ends must
+    // treat the new direct path as a standby until verified, or one end would
+    // tear down its relay link unilaterally.
+    if probe {
+        offer["probe"] = json!(true);
+    }
+    let _ = sio
+        .emit("signal", json!({ "to": pid, "data": offer.clone() }))
+        .await;
+    // TRACE, direct-offer / signaling detail.
+    log.trace(&format!(
+        "tunlion: {} sent to {name} ({pid}), port {} srflx {}",
+        if probe { "UPGRADE-PROBE-OFFER" } else { "DIRECT-OFFER" },
+        port,
+        my_srflx.map(|s| s.to_string()).unwrap_or_else(|| "-".into())
+    ));
+    // Re-send the offer periodically. The L2 initiator (netcat/ssh) subscribes
+    // to the channel AFTER us, so on a late join it can miss BOTH our single
+    // fire-once offer AND its own KnownPeer for us (presence delivery is racy),
+    // the cross-machine stall. Re-emitting lets it catch a later offer and
+    // dial our (reachable) candidates; the initiator only races the FIRST
+    // offer it gets, so the extra emits are harmless once linked.
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let _ = sio
+            .emit("signal", json!({ "to": pid, "data": offer.clone() }))
+            .await;
+    }
+}
+
+/// rung-2: bind a raw punch socket and discover its srflx via STUN against
+/// the ICE config's STUN server. Returns (raw socket, srflx) or None.
+async fn gather_srflx(
+    context: &filament_transport::TransportContext,
+    server: &str,
+) -> Option<(std::net::UdpSocket, std::net::SocketAddr)> {
+    let cfg = net::fetch_config(context, server).await.ok()?;
+    let stun_urls: Vec<String> = cfg
+        .ice_servers
+        .iter()
+        .flat_map(|s| s.urls.iter().cloned())
+        .collect();
+    // #3 (parallelism): race ALL configured STUN servers so a slow/dead one
+    // never stalls gathering (the offer the initiator waits on).
+    let stun_addrs = holepunch::stun_server_addrs(&stun_urls);
+    if stun_addrs.is_empty() {
+        return None;
+    }
+    let sock = holepunch::bind_punch_socket().ok()?;
+    // STUN is blocking UDP I/O, run it off the reactor.
+    tokio::task::spawn_blocking(move || {
+        holepunch::stun_srflx_any(&sock, &stun_addrs).map(|srflx| (sock, srflx))
+    })
+    .await
+    .ok()?
+    .ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_build_task(
     plan: BuildPlan,
@@ -2019,6 +2239,11 @@ pub struct Conn {
     /// `pump_builds` before it drains. One wake is outstanding at a time, so a
     /// busy data channel cannot flood the main queue with wakes.
     pub candidate_wake: Arc<AtomicBool>,
+    /// Direct attempts whose candidates are still being gathered off the
+    /// loop, keyed by pid (`start_direct_inner`, `apply_direct_gathered`).
+    pub direct_gathering: HashMap<String, DirectGathering>,
+    /// Finished gatherings, drained by `pump_builds`.
+    pub direct_gathered: Arc<std::sync::Mutex<Vec<DirectGathered>>>,
     /// Links cut by a revocation whose refusal is still in flight, keyed by the
     /// refusal's nonce. See `ClosingLink` and `drop_link_after_refusal`.
     pub closing: HashMap<String, ClosingLink>,
@@ -2266,6 +2491,8 @@ impl Conn {
             revoked_bindings: HashSet::new(),
             link_events: HashMap::new(),
             candidate_wake: Arc::new(AtomicBool::new(false)),
+            direct_gathering: HashMap::new(),
+            direct_gathered: Arc::new(std::sync::Mutex::new(Vec::new())),
             closing: HashMap::new(),
             pending_sources: HashMap::new(),
             replaying_sources: HashMap::new(),
@@ -3421,21 +3648,10 @@ impl Conn {
             // proves nothing and is exactly what the room digest reconcile reaps
             // as a room peer that left.
             if let Some((petname, secret)) = &device {
-                // Candidate gathering (public_ip probe + srflx) can take seconds
-                // per peer and is awaited BEFORE the direct intent is inserted.
-                // Bound it on the daemon loop: a skipped warm dial is harmless
-                // (signaling still establishes), a 20 s stalled loop is not.
-                if tokio::time::timeout(
-                    Duration::from_secs(1),
-                    self.start_direct(&pid, petname, secret),
-                )
-                .await
-                .is_err()
-                {
-                    self.log.debug(&format!(
-                        "warm-hold: direct candidate gathering for '{peer}' exceeded the loop budget"
-                    ));
-                }
+                // Candidate gathering (public_ip probe + srflx) runs off the
+                // loop (`gather_and_offer`), so arming the warm dial returns at
+                // once and is never cut short half-way.
+                self.start_direct(&pid, petname, secret).await;
                 self.note_binding(&pid, (petname.clone(), secret.clone()));
             }
             let result = self.establish_as(info, None).await;
@@ -4001,6 +4217,16 @@ impl Conn {
         // flag clear and sends a fresh wake, so it is never left for an
         // unrelated event to collect; one queued before it is drained below.
         self.candidate_wake.store(false, Ordering::SeqCst);
+        // Finished candidate gatherings: their pendings can now race.
+        let gathered = std::mem::take(
+            &mut *self
+                .direct_gathered
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for done in gathered {
+            self.apply_direct_gathered(done);
+        }
         // Installed-link event streams are candidate-local. Forward them only
         // while the link still carries the generation that created the stream;
         // a replaced/dropped link's queued events are discarded, never applied
@@ -6087,147 +6313,36 @@ impl Conn {
                 }
             }
         };
-        // #1 (parallelism): gather the host/public candidates (incl. the
-        // /api/whoami HTTP) and the rung-2 STUN srflx CONCURRENTLY. Both are
-        // independent network round-trips that must finish before the
-        // transport-offer can go out, and the initiator's "establishing" phase
-        // waits on exactly that offer, so overlapping them shaves a round-trip off
-        // every cold connect. Both borrow &self immutably, so join! is sound.
+        // Candidate gathering is network I/O: the `/api/whoami` round trip on
+        // a cold cache (its timeout is 3 s, and the first contact after a
+        // daemon start always finds the cache cold) and, with
+        // TUNLION_HOLEPUNCH, an `/api/config` fetch plus STUN. Awaited here it
+        // parked the whole daemon event loop on a known-peer contact (chaos
+        // finding 83681ee4ef: 1224 ms in handler/KnownPeer, a restarted daemon
+        // under 20% loss). So the pending is armed NOW, because idempotency,
+        // the fallback reaper, promotion and the offer buffer all key on it,
+        // and the gathering, the transport-offer and its re-emits run on a
+        // task (`gather_and_offer`). The task reports the rung-2 socket back
+        // through `pump_builds` and sends the offer the moment gathering ends,
+        // as the inline path did: no round trip is added to a connect.
         //
-        // rung-2 (TUNLION_HOLEPUNCH): bind a SECOND raw socket and STUN it so we
-        // can advertise a server-reflexive candidate. This socket is kept RAW
-        // (not handed to quinn), its NAT mapping is the one we'll punch + run
-        // QUIC on if rung-1's host-candidate race fails. STUN failure is graceful:
-        // no srflx is advertised and rung-2 simply won't fire for this peer.
-
-        // #237: gather_candidates is the ONE computation of both the candidate
-        // set and the server-asserted address adopted into it (Some exactly
-        // when a server-chosen address was pushed and no peer had observed us
-        // yet). The offer carries that value to the peer so the PEER's race can
-        // dial it and, if it never answers, name it at ITS fallback decision.
-        // No second copy of the rule exists to desynchronize.
-        let (cands, server_public, srflx) = if is_local {
-            // For local peers, ensure we have a listener and return TCP candidate.
+        // A same-machine peer needs no gathering: its one candidate is the
+        // local TCP listener, bound here (a local bind, no network).
+        let local_cands = if is_local {
             if self.local_port.is_none() {
                 let (listener, port) = crate::local::listen_local().await.unwrap();
                 self.local_listener = Some(Arc::new(listener));
                 self.local_port = Some(port);
             }
-            let cands = vec![format!(
+            Some(vec![format!(
                 "{{\"type\":\"tcp-localhost\",\"port\":{}}}",
                 self.local_port.unwrap()
-            )];
-            (cands, None, None)
+            )])
         } else {
-            let srflx_fut = async {
-                if holepunch::holepunch_enabled() {
-                    self.gather_srflx().await
-                } else {
-                    None
-                }
-            };
-            let ((cands, server_public), srflx) =
-                tokio::join!(direct::gather_candidates(&self.transport_context, &self.server, port), srflx_fut);
-            (cands, server_public, srflx)
+            None
         };
-
-        let (punch_sock, my_srflx) = match srflx {
-            Some((sock, srflx)) => (Some(sock), Some(srflx)),
-            None => (None, None),
-        };
-
-        // transport-offer rides the OPAQUE signaling relay (same channel as ICE
-        // signals); the server cannot read or forge it without failing the MAC.
-        let mut offer = json!({ "type": "transport-offer", "v": 1, "proto": 2, "addrs": cands });
-        // The meeting place this dial is for. A daemon that has since FORGOTTEN
-        // the secret behind it can then answer "not recognized" at once instead
-        // of buffering an offer it can never match (recv_cmd, forgotten_channels).
-        offer["ch"] = json!(self.host.channel_of(secret));
-        if let Some(s) = my_srflx {
-            offer["srflx"] = json!(s.to_string());
-        }
-        // #237: the candidate this offer adopts on the server's say-so alone.
-        // The peer dials it; if it never answers, the peer's fallback can name
-        // exactly this address instead of claiming a cause it never dialed.
-        if let Some(s) = server_public {
-            // Test-only (gate C-negative/mismatch): advertise a server_public
-            // label that is NOT the dialed candidate, modelling a peer (or
-            // adversarially-mislabeled offer) whose claimed address is not in
-            // its addrs. The peer that dials THIS offer's addrs must NOT name
-            // this label on fallback - it never dialed 8.8.8.8:53.
-            let tag = if std::env::var("TUNLION_DIRECT_SERVER_PUBLIC_MISMATCH")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            {
-                "8.8.8.8:53".to_string()
-            } else {
-                s
-            };
-            offer["server_public"] = json!(tag);
-        }
-        // P5 (GAP-6): tag a probe offer so the PEER races it as an upgrade probe
-        // too, its winning side then posts Ev::DirectUpgradeReady (verify-before-
-        // upgrade) instead of clobbering ITS serving relay link. Both ends must
-        // treat the new direct path as a standby until verified, or one end would
-        // tear down its relay link unilaterally.
-        if probe {
-            offer["probe"] = json!(true);
-        }
-        let _ = self
-            .sio
-            .emit("signal", json!({ "to": pid, "data": offer.clone() }))
-            .await;
-        // TRACE, direct-offer / signaling detail.
-        self.log.trace(&format!(
-            "tunlion: {} sent to {name} ({pid}), port {} srflx {}",
-            if probe {
-                "UPGRADE-PROBE-OFFER"
-            } else {
-                "DIRECT-OFFER"
-            },
-            port,
-            my_srflx
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "-".into())
-        ));
-        // Re-send the offer periodically. The L2 initiator (netcat/ssh) subscribes
-        // to the channel AFTER us, so on a late join it can miss BOTH our single
-        // fire-once offer AND its own KnownPeer for us (presence delivery is racy),
-        // the cross-machine stall. Re-emitting lets it catch a later offer and
-        // dial our (reachable) candidates; the initiator only races the FIRST
-        // offer it gets, so the extra emits are harmless once linked.
         let cancel_emitter = Arc::new(AtomicBool::new(false));
-        {
-            let sio = self.sio.clone();
-            let pid_c = pid.to_string();
-            let cancel = cancel_emitter.clone();
-            tokio::spawn(async move {
-                for _ in 0..6 {
-                    tokio::time::sleep(Duration::from_millis(1200)).await;
-                    if cancel.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let _ = sio
-                        .emit("signal", json!({ "to": pid_c, "data": offer.clone() }))
-                        .await;
-                }
-            });
-        }
-        // The WebRTC fallback reaper (`expired_direct`) fires at this deadline.
-        // rung-1's race always burns the full DIRECT_BUDGET when it can't win
-        // (its acceptor future never self-completes), so with hole-punch enabled
-        // the deadline MUST cover the WHOLE ladder, rung-1 budget + punch budget
-        // + QUIC handshake slack, or the reaper would race WebRTC against an
-        // in-flight punch and the route would be a coin flip. Flag-gated, so
-        // rung-1-only timing is byte-identical.
-        let deadline = if holepunch::holepunch_enabled() {
-            Instant::now()
-                + direct::DIRECT_BUDGET
-                + holepunch::PUNCH_BUDGET
-                + Duration::from_secs(3)
-        } else {
-            Instant::now() + direct::DIRECT_BUDGET
-        };
+        let attempt = net::AttemptId::next();
         self.next_gen += 1;
         let auth = match intent {
             DirectIntent::Fleet => DirectAuth::fleet(self.next_gen),
@@ -6236,10 +6351,17 @@ impl Conn {
                 DirectAuth::device(self.next_gen, name, secret)
             }
         };
+        // Until gathering reports, the reaper deadline also covers the
+        // gathering itself. `apply_direct_gathered` restarts the ladder budget
+        // when the offer goes out, which is when it always started.
+        let deadline = Instant::now() + DIRECT_GATHER_GRACE + direct_ladder_budget();
+        // A peer offer stashed for a superseded gathering is this pid's latest
+        // offer: it carries over to the attempt that replaces it.
+        let carried = self.direct_gathering.remove(pid).and_then(|g| g.offer);
         self.direct_pending.insert(
             pid.to_string(),
             DirectPending {
-                attempt: net::AttemptId::next(),
+                attempt,
                 auth,
                 race_task: None,
                 fleet: intent == DirectIntent::Fleet,
@@ -6249,8 +6371,9 @@ impl Conn {
                 deadline,
                 racing: false,
                 endpoint: ep,
-                punch_sock,
-                my_srflx,
+                // rung-2: filled by `apply_direct_gathered`.
+                punch_sock: None,
+                my_srflx: None,
                 // #237: the peer's server-asserted candidate arrives with its transport-offer
                 // (on_transport_offer fills it); at insert time no offer has
                 // arrived yet. The per-address dial gate starts false and flips
@@ -6258,45 +6381,76 @@ impl Conn {
                 peer_server_public: None,
                 server_public_dialed: Arc::new(AtomicBool::new(false)),
                 probe,
-                cancel: cancel_emitter,
+                cancel: cancel_emitter.clone(),
             },
         );
+        self.direct_gathering
+            .insert(pid.to_string(), DirectGathering { attempt, offer: carried });
         // Nothing is torn down here, for any intent. A promotion keeps the
         // serving WebRTC link and its winner is routed to the handoff as a
         // standby (`on_transport_offer`); upgrade probes keep their relay link.
-        // Bug 2: replay any transport-offers that were buffered while we had
-        // no DirectPending (the sender re-dialed after a mid-transfer death).
-        if let Some(StagedOffer { offer: (cands, srflx, server_public, proto, _ch), .. }) =
-            self.buffered_offers.remove(pid)
-        {
+        tokio::spawn(gather_and_offer(GatherJob {
+            context: self.transport_context.clone(),
+            server: self.server.clone(),
+            sio: self.sio.clone(),
+            log: self.log.clone(),
+            pid: pid.to_string(),
+            name: name.to_string(),
+            attempt,
+            port,
+            local_cands,
+            channel: self.host.channel_of(secret),
+            probe,
+            cancel: cancel_emitter,
+            done: self.direct_gathered.clone(),
+            wake: self.tx.clone(),
+        }));
+    }
+
+    /// A gathering task finished (`gather_and_offer`): hand its rung-2 socket
+    /// to the pending it was started for, restart that pending's ladder
+    /// budget from now (the offer is going out), and race the peer's offer if
+    /// one arrived while we were gathering. A report for an attempt that was
+    /// replaced or retired meanwhile changes nothing; the peer offer it held
+    /// is kept for the next attempt, as an offer with no pending always is.
+    fn apply_direct_gathered(&mut self, done: DirectGathered) {
+        let DirectGathered { pid, attempt, punch_sock, my_srflx } = done;
+        let stashed = match self.direct_gathering.get(&pid) {
+            Some(g) if g.attempt == attempt => {
+                self.direct_gathering.remove(&pid).and_then(|g| g.offer)
+            }
+            _ => None,
+        };
+        let Some(p) = self
+            .direct_pending
+            .get_mut(&pid)
+            .filter(|p| p.attempt == attempt)
+        else {
+            if let Some(offer) = stashed {
+                self.buffer_offer(&pid, offer);
+            }
+            return;
+        };
+        p.punch_sock = punch_sock;
+        p.my_srflx = my_srflx;
+        p.deadline = Instant::now() + direct_ladder_budget();
+        // Bug 2: replay a transport-offer that was buffered while we had no
+        // DirectPending (the sender re-dialed after a mid-transfer death), or
+        // one that arrived while this attempt was gathering.
+        let offer = stashed.or_else(|| self.buffered_offers.remove(&pid).map(|s| s.offer));
+        if let Some((cands, srflx, server_public, proto, _ch)) = offer {
             self.log.debug(&format!("replaying buffered transport-offer from {pid}"));
-            self.on_transport_offer(pid, cands, srflx, server_public, proto);
+            self.on_transport_offer(&pid, cands, srflx, server_public, proto);
         }
     }
 
-    /// rung-2: bind a raw punch socket and discover its srflx via STUN against
-    /// the ICE config's STUN server. Returns (raw socket, srflx) or None.
-    async fn gather_srflx(&self) -> Option<(std::net::UdpSocket, std::net::SocketAddr)> {
-        let cfg = net::fetch_config(&self.transport_context, &self.server).await.ok()?;
-        let stun_urls: Vec<String> = cfg
-            .ice_servers
-            .iter()
-            .flat_map(|s| s.urls.iter().cloned())
-            .collect();
-        // #3 (parallelism): race ALL configured STUN servers so a slow/dead one
-        // never stalls gathering (the offer the initiator waits on).
-        let stun_addrs = holepunch::stun_server_addrs(&stun_urls);
-        if stun_addrs.is_empty() {
-            return None;
+    /// Is `pid`'s pending direct attempt still gathering its candidates (no
+    /// offer of ours out yet, no rung-2 socket)?
+    fn direct_gathering_for(&self, pid: &str) -> bool {
+        match (self.direct_gathering.get(pid), self.direct_pending.get(pid)) {
+            (Some(g), Some(p)) => g.attempt == p.attempt,
+            _ => false,
         }
-        let sock = holepunch::bind_punch_socket().ok()?;
-        // STUN is blocking UDP I/O, run it off the reactor.
-        tokio::task::spawn_blocking(move || {
-            holepunch::stun_srflx_any(&sock, &stun_addrs).map(|srflx| (sock, srflx))
-        })
-        .await
-        .ok()?
-        .ok()
     }
 
     /// The peer advertised its candidates. If we have a matching pending attempt
@@ -6319,6 +6473,15 @@ impl Conn {
         // a late/contradictory offer rather than spawning a race that could
         // later replace the WebRTC link the hint asked us to build.
         if self.webrtc_only.contains(pid) {
+            return;
+        }
+        // Our own candidates are still being gathered: race this offer once
+        // they are (`apply_direct_gathered`), with the rung-2 socket in hand.
+        // The latest offer wins, as a re-emit replaces a buffered one.
+        if self.direct_gathering_for(pid) {
+            if let Some(g) = self.direct_gathering.get_mut(pid) {
+                g.offer = Some((peer_cands, peer_srflx, peer_server_public, peer_proto, None));
+            }
             return;
         }
         let Some(p) = self.direct_pending.get_mut(pid) else {
@@ -7811,7 +7974,7 @@ impl Conn {
             }
         } else if let Some(p) = l.peer.clone() {
             // WebRTC: ICE-restart in place, no teardown, no re-key.
-            p.restart_ice().await;
+            p.restart_ice();
         }
     }
 
@@ -8935,7 +9098,7 @@ impl Conn {
                 };
                 if let Some(p) = &l.peer {
                     if !p.polite && !away {
-                        p.restart_ice().await;
+                        p.restart_ice();
                     }
                 }
                 let tx = self.tx.clone();
@@ -10276,6 +10439,100 @@ mod warm_identity_tests {
             },
         ));
         (conn, far, rx)
+    }
+
+    /// Chaos finding 83681ee4ef: a daemon restarted under 20% loss met a
+    /// known peer before its `/api/whoami` answer was cached, and the
+    /// KnownPeer handler awaited candidate gathering inline (1224 ms against
+    /// the loop's 1000 ms budget). Gathering must never hold the caller; the
+    /// attempt is armed at once and a peer offer that arrives while we gather
+    /// is raced as soon as our candidates are in.
+    #[tokio::test]
+    async fn a_known_peer_dial_never_waits_for_candidate_gathering() {
+        // A server that accepts and never answers: whoami waits out its timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let mut socks = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                socks.push(sock);
+            }
+        });
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.direct_ok = true;
+        conn.server = format!("http://{addr}");
+        let pid = "sid-alpha";
+        conn.roster
+            .insert(pid.into(), json!({ "id": pid, "uid": "uid-alpha" }));
+
+        let started = Instant::now();
+        conn.start_direct(pid, "alpha", "pair-secret").await;
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(200),
+            "arming a direct attempt waited {waited:?} for candidate gathering"
+        );
+        assert!(conn.direct_pending.contains_key(pid), "no direct attempt was armed");
+        assert!(conn.direct_gathering_for(pid), "the attempt is not marked as gathering");
+        // Still idempotent while gathering: a repeat KnownPeer arms nothing new.
+        let attempt = conn.direct_pending[pid].attempt;
+        conn.start_direct(pid, "alpha", "pair-secret").await;
+        assert_eq!(conn.direct_pending[pid].attempt, attempt, "a repeat contact re-armed");
+
+        // The peer's offer lands before our candidates: it waits for them.
+        conn.on_transport_offer(pid, vec!["127.0.0.1:9".into()], None, None, 2);
+        assert!(!conn.direct_pending[pid].racing, "raced before our candidates were gathered");
+
+        // Gathering ends; the loop's pump hands it over and races the held offer.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                conn.pump_builds();
+                if !conn.direct_gathering_for(pid) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("candidate gathering never reported back");
+        let pending = &conn.direct_pending[pid];
+        assert_eq!(pending.attempt, attempt);
+        assert!(pending.racing, "the offer that arrived while gathering was not raced");
+        assert!(
+            pending.deadline <= Instant::now() + direct_ladder_budget(),
+            "the ladder budget did not restart when gathering ended"
+        );
+        held.abort();
+    }
+
+    /// A gathering report for an attempt that was replaced or retired changes
+    /// nothing, and the peer offer it was holding is kept for the next
+    /// attempt, as an offer that finds no pending always is.
+    #[tokio::test]
+    async fn a_stale_gathering_report_touches_no_newer_attempt() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-bravo";
+        let stale = net::AttemptId::next();
+        conn.direct_gathering.insert(
+            pid.into(),
+            DirectGathering {
+                attempt: stale,
+                offer: Some((vec!["127.0.0.1:9".into()], None, None, 2, None)),
+            },
+        );
+        conn.apply_direct_gathered(DirectGathered {
+            pid: pid.into(),
+            attempt: stale,
+            punch_sock: None,
+            my_srflx: None,
+        });
+        assert!(!conn.direct_gathering.contains_key(pid), "the stale gathering lingered");
+        assert!(!conn.direct_pending.contains_key(pid), "a stale report armed an attempt");
+        assert_eq!(
+            conn.buffered_offers.get(pid).map(|s| s.offer.0.clone()),
+            Some(vec!["127.0.0.1:9".to_string()]),
+            "the held peer offer was lost"
+        );
     }
 
     /// The live LAN regression: an exact authenticated DEVICE reservation that
