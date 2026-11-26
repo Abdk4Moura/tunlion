@@ -33,6 +33,12 @@ code distinct from pass and fail, rather than print a result from a box that cou
 not have produced one. Stated in full, with the reference implementation, in the
 header of `cli/tests/lib/fixture.sh` (see "Preconditions and refusal").
 
+## Diagnostic expiry review (2026-11-26)
+
+- `cli/tests/mount-gates.sh` remains diagnostic: issue #318 (mutations return
+  EIO) is still open. The expiry moves to 2026-12-26 as a review date, not a
+  coverage claim.
+
 ## Diagnostic expiry review (2026-10-19)
 
 - `cli/tests/mount-gates.sh` remains diagnostic: its measured result is 6
