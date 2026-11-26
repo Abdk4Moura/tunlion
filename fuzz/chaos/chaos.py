@@ -1628,10 +1628,32 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
     verdict: dict = {"label": label, "schedule": sched, "findings": [], "ops": [], "faults": []}
 
     # Baseline: the fixture must work before any fault, or the run proves nothing.
-    seen = wait_signaling(w, DEVICES, 60, allow_unreported=True)
-    bad = {d: v for d, v in seen.items() if v[0] not in ("connected", "unreported")}
-    if bad:
-        raise Refused(f"baseline: signaling not ready after 60s: {bad}")
+    # No `dumps` here: every daemon is briefly 'noanswer' right after start.
+    seen = wait_signaling(w, DEVICES, BASELINE_WAIT, allow_unreported=True)
+    alive = {d: bool(w.daemons[d] and w.daemons[d].poll() is None) for d in DEVICES}
+    dumps = verdict.setdefault("thread_dumps", {})
+    for d, (st, _) in seen.items():
+        if st == "noanswer" and alive[d]:
+            dumps[d] = thread_dump(w.daemons[d].pid)
+    rcs = {d: (w.daemons[d].returncode if w.daemons[d] else None) for d in DEVICES}
+    sock = {d: (w.cfg(d) / "cfg" / "control.sock").exists() for d in DEVICES}
+    start_findings, refusal = judge_baseline(seen, alive, rcs, sock, BASELINE_WAIT)
+    if refusal:
+        raise Refused(refusal)
+    if start_findings:
+        # A daemon that is up and does not answer is the product's fault, not
+        # the fixture's: no fault was injected yet. A finding, never a refusal
+        # (a refusal ends the campaign and blames the instrument).
+        verdict["findings"].extend(start_findings)
+        logs = w.all_daemon_logs()
+        verdict["kinds"] = sorted(set().union(*(kinds_of(t) for t in logs.values())))
+        verdict["hard"] = [f for f in verdict["findings"] if f["hard"]]
+        verdict["wall_s"] = round(time.monotonic() - t_wall, 1)
+        verdict["evidence_logs"] = {f"{d}-daemon.log": t for d, t in logs.items()}
+        for d, dump in dumps.items():
+            verdict["evidence_logs"][f"{d}-threads.txt"] = dump
+        record_run(w, verdict)
+        return verdict
     verdict["unreported_signaling"] = sorted(d for d, v in seen.items() if v[0] == "unreported")
     base = run_op(w, {"op": "exec", "src": "bravo", "dst": OWNER}, "baseline")
     if not base["ok"]:
@@ -1845,6 +1867,37 @@ def record_run(w: "World", verdict: dict) -> None:
     (runs / f"{n:04d}-w{w.k}-{safe}.json").write_text(json.dumps(rec, indent=1, sort_keys=True))
 
 
+BASELINE_WAIT = 60.0
+
+
+def judge_baseline(seen: dict, alive: dict, rcs: dict, sock: dict, limit: float) -> tuple[list[dict], str | None]:
+    """The baseline, before any fault: (findings, refusal). Pure.
+
+    'noanswer' used to refuse the run whatever its cause, so a daemon that was
+    RUNNING but never served its control socket (a product bug: the elected
+    daemon misread /proc/locks and judged itself not the daemon) was reported
+    as an unready fixture, and it ended whole campaigns. Now: a running daemon
+    that does not answer is a hard finding; one that exited, or a signaling
+    link that is down, is still a refusal, and says which."""
+    findings: list[dict] = []
+    refused: list[str] = []
+    for d, (st, raw) in sorted(seen.items()):
+        if st in ("connected", "unreported"):
+            continue
+        if st == "noanswer" and alive.get(d):
+            findings.append({"oracle": "O3-unresponsive-at-start", "hard": True,
+                             "what": f"{d} daemon is running but does not answer its control socket "
+                                     f"{limit:.0f}s after start, before any fault (socket file "
+                                     f"{'present' if sock.get(d) else 'absent'})"})
+        elif st == "noanswer":
+            refused.append(f"{d} daemon exited (rc {rcs.get(d)}) before answering its control socket")
+        else:
+            refused.append(f"{d} signaling {st}: {raw}")
+    if refused:
+        return findings, f"baseline: not ready after {limit:.0f}s: " + "; ".join(refused)
+    return findings, None
+
+
 def sig_state(w: World, d: str) -> tuple[str, object]:
     """('connected' | 'down' | 'unreported' | 'noanswer', raw signaling object).
 
@@ -2035,6 +2088,8 @@ def run_worlds(worlds: list[World], job, first=None) -> None:
         k, e, tb = errors[0]
         if not isinstance(e, Refused):
             log(f"world {k} crashed:\n{tb}")
+        else:
+            log(f"world {k} refused (its daemon logs: last-run-dev/w{k})")
         raise e
 
 
@@ -2338,6 +2393,18 @@ def cmd_selftest() -> int:
         json.loads(json.dumps(s))
     assert line_kind("2026-11-25T14:56:11Z tunlion: control socket at /tmp/x/a/control.sock") == \
         line_kind("2026-11-26T01:02:03Z tunlion: control socket at /tmp/y/b/control.sock")
+    # Baseline: a RUNNING daemon that never answers is a product finding; an
+    # exited daemon or a down link is still a refusal (and names itself).
+    ok = {"alpha": ("connected", {}), "bravo": ("unreported", None)}
+    assert judge_baseline(ok, {"alpha": True, "bravo": True}, {}, {}, 60) == ([], None)
+    fs, why = judge_baseline({**ok, "charlie": ("noanswer", None)}, {"alpha": True, "bravo": True, "charlie": True},
+                             {}, {"charlie": False}, 60)
+    assert why is None and [f["oracle"] for f in fs] == ["O3-unresponsive-at-start"] and fs[0]["hard"], fs
+    assert "charlie" in fs[0]["what"] and "absent" in fs[0]["what"], fs
+    fs, why = judge_baseline({**ok, "charlie": ("noanswer", None)}, {"charlie": False}, {"charlie": 101}, {}, 60)
+    assert fs == [] and why and "exited (rc 101)" in why, why
+    fs, why = judge_baseline({**ok, "bravo": ("down", {"state": "down"})}, {"bravo": True}, {}, {}, 60)
+    assert fs == [] and why and "bravo signaling down" in why, why
     assert line_kind("peer 'bravo' reconnected after 3.2s") == line_kind("peer 'charlie' reconnected after 12s")
     assert line_kind("signaling reconnected") != line_kind("signaling link closed, reconnecting")
     assert judge_op({"op": "exec", "src": "b", "dst": "a", "phase": "x", "rc": None, "stderr_tail": ""})[0]["oracle"] == "O2-hang"

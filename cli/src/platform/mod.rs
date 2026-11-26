@@ -2989,6 +2989,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A held instance lock must be found while OTHER locks on the machine come
+    /// and go. /proc/locks re-walks the kernel's list from an index on every
+    /// read(); `read_to_string` read it 32 bytes at a time, so a lock released
+    /// anywhere between two reads made the next read skip a record, and under
+    /// 36 chaos daemons a held `up.lock` read as free about 1 time in 5. The
+    /// elected daemon then judged itself "not the daemon" and never served its
+    /// control socket. The lock here is taken with a bare flock, not an
+    /// `InstanceLock`, so only the /proc/locks reading is under test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_held_lock_is_found_while_other_locks_churn() {
+        use std::os::unix::io::AsRawFd;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = std::env::temp_dir().join(format!("tl-lockchurn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("up.lock");
+        let held = std::fs::File::create(&lock).unwrap();
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let churn: Vec<_> = (0..4)
+            .map(|t| {
+                let stop = stop.clone();
+                let files: Vec<std::fs::File> = (0..4)
+                    .map(|k| std::fs::File::create(dir.join(format!("churn-{t}-{k}"))).unwrap())
+                    .collect();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        for f in &files {
+                            unsafe {
+                                libc::flock(f.as_raw_fd(), libc::LOCK_EX);
+                                libc::flock(f.as_raw_fd(), libc::LOCK_UN);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        let me = std::process::id();
+        let mut missed = 0;
+        for _ in 0..400 {
+            if instance_lock_holder(&lock) != LockHolder::Held(Some(me)) {
+                missed += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for c in churn {
+            c.join().unwrap();
+        }
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(missed, 0, "a held lock read as not held {missed} times in 400");
+    }
+
     #[test]
     fn tree_signal_wire_names_round_trip() {
         for s in [
@@ -3805,20 +3859,87 @@ pub fn instance_lock_holder(path: &Path) -> LockHolder {
         let Ok(meta) = std::fs::metadata(path) else {
             return LockHolder::Unknown;
         };
-        let Ok(locks) = std::fs::read_to_string("/proc/locks") else {
-            return LockHolder::Unknown;
-        };
         let dev = meta.dev();
+        // This process holds it: say so from what it knows, not from a list
+        // other processes are changing while it is read (see below).
+        if own_instance_lock_held(dev, meta.ino()) {
+            return LockHolder::Held(Some(std::process::id()));
+        }
         // glibc/musl dev_t encoding (what `major(3)`/`minor(3)` decode).
         let major = ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0x0fff);
         let minor = ((dev >> 12) & 0xffff_ff00) | (dev & 0x00ff);
-        lock_holder_in(&locks, major, minor, meta.ino())
+        // /proc/locks is a seq_file over the kernel's live lock list: every
+        // read() restarts the walk at a record INDEX, so a lock released
+        // between two reads (any process's, anywhere on the box) shifts the
+        // list and the next read skips a record. `std::fs::read_to_string`
+        // reads it 32 bytes at a time, one restart per read, and under the
+        // lock churn of 36 daemons on one machine the held `up.lock` was
+        // missing from about 1 read in 5: the elected daemon then read
+        // itself as "not the daemon" and never served its control socket
+        // (the chaos fuzzer's "noanswer" baseline refusals, 2026-11-26).
+        // Read with a large buffer (one restart per page, not per 32 bytes),
+        // and believe "free" only when repeated reads agree: a skip is
+        // transient, a free lock is absent from every read. A held lock is
+        // never invented, so one sighting is enough.
+        let mut found = LockHolder::Free;
+        for _ in 0..LOCKS_FREE_CONFIRM_READS {
+            let Ok(locks) = read_proc_file(Path::new("/proc/locks")) else {
+                return LockHolder::Unknown;
+            };
+            found = lock_holder_in(&locks, major, minor, meta.ino());
+            if found != LockHolder::Free {
+                return found;
+            }
+        }
+        found
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = path;
         LockHolder::Unknown
     }
+}
+
+/// How many whole reads of /proc/locks must agree before a lock counts as
+/// free (see `instance_lock_holder`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const LOCKS_FREE_CONFIRM_READS: usize = 3;
+
+/// The whole of a /proc file, read with a buffer large enough that a seq_file
+/// fills a page per read() instead of the 32-byte probe `read_to_string`
+/// starts with. Each read() of a seq_file re-walks its list from an index, so
+/// fewer reads means fewer chances for a concurrent change to skip a record.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_proc_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut len = 0;
+    loop {
+        if len == buf.len() {
+            buf.resize(buf.len() * 2, 0);
+        }
+        match f.read(&mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(len);
+    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// The (device, inode) of every instance lock this process holds now. The
+/// elected daemon asks "am I the daemon?" (it serves its control socket only
+/// if so); it knows the answer, and must not take it from a kernel list that
+/// other processes change while it is being read.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+static OWN_INSTANCE_LOCKS: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn own_instance_lock_held(dev: u64, ino: u64) -> bool {
+    OWN_INSTANCE_LOCKS.lock().map(|v| v.contains(&(dev, ino))).unwrap_or(false)
 }
 
 /// The holder of the lock on inode (`major`:`minor`, `ino`) in the text of
@@ -3867,6 +3988,20 @@ pub fn lock_holder_in(locks: &str, major: u64, minor: u64, ino: u64) -> LockHold
 /// lock and keep it after the daemon is gone.
 pub struct InstanceLock {
     _file: std::fs::File,
+    /// (device, inode) recorded in `OWN_INSTANCE_LOCKS` while held.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    id: (u64, u64),
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        if let Ok(mut v) = OWN_INSTANCE_LOCKS.lock() {
+            if let Some(i) = v.iter().position(|x| *x == self.id) {
+                v.swap_remove(i);
+            }
+        }
+    }
 }
 
 impl InstanceLock {
@@ -3925,7 +4060,20 @@ impl InstanceLock {
                 return Err(e);
             }
         }
-        Ok(Some(InstanceLock { _file: file }))
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = file.metadata()?;
+            let id = (meta.dev(), meta.ino());
+            if let Ok(mut v) = OWN_INSTANCE_LOCKS.lock() {
+                v.push(id);
+            }
+            Ok(Some(InstanceLock { _file: file, id }))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            Ok(Some(InstanceLock { _file: file }))
+        }
     }
 
     /// Write this process's pid into the lock file, so a loser can say WHICH

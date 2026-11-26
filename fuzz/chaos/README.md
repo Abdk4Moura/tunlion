@@ -45,6 +45,14 @@ Knobs, each part of the binary cache key:
 Exit codes: 0 clean, 1 hard finding, 3 refused (a precondition is unmet, so
 there is no result), 4 the canary was not detected (the instrument is broken).
 
+The baseline runs before any fault. A daemon that is RUNNING but has not
+answered its control socket 60 s after start is a hard finding
+(O3-unresponsive-at-start, with its thread dump), not a refusal: no fault was
+injected, so the product is at fault, not the fixture. An exited daemon or a
+signaling link that is down still refuses, naming which. (Until 2026-11-26
+every case refused as "signaling not ready ... noanswer"; the cause was the
+daemon misreading /proc/locks under lock churn and not serving its socket.)
+
 ## Findings
 
 Each finding is a directory under `chaos-results/<job>/out/findings/<id>/`
