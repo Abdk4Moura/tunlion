@@ -62,7 +62,7 @@ use filament_transport::net::{self, Ev, Peer, Transport};
 pub use crate::{
     AdoptSource, CodeAuthorityRefusal, CodeSession, CodeTransport, LinkPetname, WarmHold,
     active_binding_matches, code_authority_check, direct_permitted,
-    ice_fallback_allowed, link_dead_for, link_has_live_for, link_petname, match_adoption_source,
+    ice_fallback_allowed, link_carries_for, link_dead_for, link_has_live_for, link_petname, match_adoption_source,
     peer_targetable, schedule_retry, stuck_backoff,
 };
 use anyhow::Result;
@@ -2921,6 +2921,31 @@ impl Conn {
             .unwrap_or(false)
     }
 
+    /// Does a link to `pid` actually carry traffic (see `link_carries_for`)?
+    /// The roster's liveness: an attempt still in flight does not keep a sid
+    /// the server reports gone.
+    fn link_carries(&self, pid: &str) -> bool {
+        self.links
+            .get(pid)
+            .map(|l| {
+                let peer_connected = l.peer.as_ref().is_some_and(|p| p.is_connected());
+                let primary_ok = l.transport.as_ref().is_some_and(|t| !t.is_dead());
+                let workers_ok = l.workers.iter().any(|w| !w.is_dead());
+                link_carries_for(peer_connected, primary_ok, workers_ok)
+            })
+            .unwrap_or(false)
+    }
+
+    /// May warm-hold dial `pid` from its roster entry? Not when the server's
+    /// last digest left it out (presence says it is gone; the entry only waits
+    /// out the two-digest hysteresis), and not when its retry ladder already
+    /// gave up on it (`suppressed_digest_adoptions`, lifted only by a Contact
+    /// from that sid). A device that comes back does so on a NEW sid, which is
+    /// neither, so a laptop that slept is re-warmed as soon as it reappears.
+    fn warm_dialable(&self, pid: &str) -> bool {
+        !self.roster_absent.contains_key(pid) && !self.suppressed_digest_adoptions.contains(pid)
+    }
+
     /// What link `pid` holds and how long it has been up, for log lines.
     fn link_kind(&self, pid: &str) -> String {
         let Some(l) = self.links.get(pid) else {
@@ -3269,9 +3294,9 @@ impl Conn {
                 .iter()
                 .filter(|(name, secret)| {
                     let channel = self.host.channel_of(secret);
-                    self.roster
-                        .values()
-                        .any(|v| v["channel"].as_str() == Some(channel.as_str()))
+                    self.roster.iter().any(|(pid, v)| {
+                        v["channel"].as_str() == Some(channel.as_str()) && self.warm_dialable(pid)
+                    })
                         || self.links.values().any(|l| {
                             link_petname(l).is_some_and(|p| p.eq_ignore_ascii_case(name))
                         })
@@ -3328,9 +3353,13 @@ impl Conn {
                         live: self.has_live_transport(pid),
                     })
                     .collect();
+                // Only sids presence still vouches for and the ladder has not
+                // given up on: a departed sid's entry waits out its digest
+                // hysteresis, and dialling it meanwhile restarted the ladder.
                 let roster: Vec<WarmRosterView<'_>> = self
                     .roster
                     .iter()
+                    .filter(|(pid, _)| self.warm_dialable(pid))
                     .map(|(pid, v)| WarmRosterView {
                         pid: pid.as_str(),
                         name: v["name"].as_str(),
@@ -3347,6 +3376,11 @@ impl Conn {
             };
             let pid = match decision {
                 WarmDecision::Skip { pid } => {
+                    // A link still mid-attempt is not a result yet; one that
+                    // carries traffic settles a started warm build as a success.
+                    if self.link_carries(&pid) {
+                        self.warm_hold.settle_pending(&peer, true);
+                    }
                     // The live link's principal rides along, so a gate can see
                     // what the link IS between events, not only at admission.
                     let (kind, sibling) = self
@@ -3365,14 +3399,18 @@ impl Conn {
                 }
                 WarmDecision::Establish { pid } => pid,
             };
-            self.log.debug(&format!(
-                "warm-hold: will establish '{peer}' via {pid} (no live link to it)"
-            ));
+            // Having to establish again means the build the last warm dial
+            // started never came up (the ladder gave up on it, or it was
+            // evicted): that is a failed attempt, and the backoff grows.
+            self.warm_hold.settle_pending(&peer, false);
             // Honor per-peer backoff; a dormant peer still gets one probe per
             // WARM_DORMANT_RETRY so an online-but-unlucky peer cannot stay cold forever.
             if !self.warm_hold.due(&peer) {
                 continue;
             }
+            self.log.debug(&format!(
+                "warm-hold: will establish '{peer}' via {pid} (no live link to it)"
+            ));
             let Some(info) = self.roster.get(&pid).cloned() else {
                 continue;
             };
@@ -3408,8 +3446,15 @@ impl Conn {
             }
             match result {
                 Ok(()) => {
-                    if self.has_live_transport(&pid) {
+                    // The backoff is settled on what the link CARRIES: an
+                    // attempt still in flight is only started, and the next
+                    // look decides whether it came up.
+                    if self.link_carries(&pid) {
                         self.warm_hold.note_success(&peer);
+                    } else {
+                        self.warm_hold.note_started(&peer);
+                    }
+                    if self.has_live_transport(&pid) {
                         self.log.debug(&format!("warm-hold: established connection to '{peer}'"));
                         connected.push(peer);
                     } else {
@@ -3440,7 +3485,11 @@ impl Conn {
             return false;
         };
         self.roster_absent.remove(pid);
-        if self.has_live_transport(pid) {
+        // Only a link that carries traffic keeps the entry. An attempt still
+        // in flight toward a sid the server just reported gone cannot finish
+        // (its signals are refused), and keeping the entry for it is what let
+        // warm-hold re-dial a departed visitor from that entry forever.
+        if self.link_carries(pid) {
             return false;
         }
         self.webrtc_only.remove(pid);
@@ -3470,7 +3519,11 @@ impl Conn {
             } else {
                 room_present.contains(&pid)
             };
-            if present || self.has_live_transport(&pid) {
+            // Present, or reached over a link that carries traffic. An attempt
+            // in flight is neither: a retry ladder that is mid-attempt at every
+            // digest used to reset this count each time, so the entry of a
+            // departed sid outlived it and warm-hold kept dialling it.
+            if present || self.link_carries(&pid) {
                 self.roster_absent.remove(&pid);
                 continue;
             }
@@ -4261,6 +4314,12 @@ impl Conn {
         self.log.debug(&format!(
             "tunlion: link cap ({MAX_LINKS}) reached; dropping retrying link {victim} for new contact {for_pid}"
         ));
+        // Evicting a failing link gives up on that sid as an exhausted ladder
+        // does: neither digest adoption nor warm-hold may restart it (a fresh
+        // episode at attempt 0) until the sid itself makes contact. Without
+        // this an evicted departed sid was re-dialled by warm-hold seconds
+        // later and its ladder never got to exhaust.
+        self.suppressed_digest_adoptions.insert(victim.clone());
         self.drop_link(&victim);
         true
     }
@@ -11224,6 +11283,86 @@ mod warm_identity_tests {
         assert!(conn.roster.contains_key("sid-linked"));
     }
 
+    /// A link still mid-attempt (WebRTC peer New/Connecting, nothing
+    /// serving) does not keep a departed sid in the roster. It used to: the
+    /// retry ladder toward a vanished visitor was in flight at every
+    /// known-peer-left and every digest, so the entry outlived the sid and
+    /// warm-hold re-dialled it from there without bound (chaos O12,
+    /// transient-visitors-sequential). The link itself is left to its ladder.
+    #[tokio::test]
+    async fn an_in_flight_attempt_does_not_keep_a_departed_sid_in_the_roster() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        for pid in ["sid-kpl", "sid-digest"] {
+            conn.establish_as(
+                json!({ "id": pid, "name": "visitor-4", "uid": format!("uid-{pid}") }),
+                Some(true),
+            )
+            .await
+            .expect("a WebRTC attempt that never connects");
+            assert!(conn.has_live_transport(pid), "precondition: the attempt counts as progress");
+            assert!(!conn.link_carries(pid), "an attempt in flight carries nothing");
+            conn.roster.insert(
+                pid.into(),
+                json!({ "id": pid, "name": "visitor-4", "channel": CH }),
+            );
+        }
+        assert!(conn.on_known_peer_left(&json!({ "id": "sid-kpl", "channel": CH })));
+        assert!(!conn.roster.contains_key("sid-kpl"));
+        assert!(conn.links.contains_key("sid-kpl"), "the ladder owns the link, not the roster");
+
+        let none: HashSet<String> = HashSet::new();
+        assert!(conn.prune_roster_absent(&none, &none).is_empty());
+        assert_eq!(
+            conn.prune_roster_absent(&none, &none),
+            vec!["sid-digest".to_string()],
+            "an in-flight attempt reset the absence count"
+        );
+        assert!(!conn.roster.contains_key("sid-digest"));
+    }
+
+    /// Warm-hold dials only a sid presence still vouches for and the ladder
+    /// has not given up on. A departed visitor's old sid (suppressed after its
+    /// ladder exhausted, or missing from the last digest) is never dialled and
+    /// does not hold the device in the auto tier; the same device back on a
+    /// NEW sid (a laptop waking) is dialled at once.
+    #[tokio::test]
+    async fn warm_hold_skips_a_departed_sid_and_rewarms_a_new_one() {
+        let host = Arc::new(TestHost {
+            devices: vec![("visitor-4".to_string(), "s4".to_string())],
+            ..Default::default()
+        });
+        let channel = host.channel_of("s4");
+        let (mut conn, _far, _rx) = test_conn_with_host(host).await;
+        let entry = |pid: &str| json!({ "id": pid, "name": "user@visitor-4", "uid": "uid-v4", "channel": channel });
+
+        // Its ladder gave up on the sid.
+        conn.roster.insert("sid-old".into(), entry("sid-old"));
+        conn.suppressed_digest_adoptions.insert("sid-old".into());
+        for _ in 0..3 {
+            assert!(conn.warm_hold_tick(true).await.is_empty());
+        }
+        assert!(!conn.links.contains_key("sid-old"), "warm-hold dialled a sid its ladder gave up on");
+        assert!(conn.direct_pending.is_empty(), "warm-hold armed a direct dial to it");
+        assert!(!conn.warm_hold.auto.contains("visitor-4"), "a departed sid kept the device warm");
+
+        // Missing from the last digest (presence says it is gone).
+        conn.suppressed_digest_adoptions.clear();
+        conn.roster_absent.insert("sid-old".into(), 1);
+        assert!(conn.warm_hold_tick(true).await.is_empty());
+        assert!(!conn.links.contains_key("sid-old"), "warm-hold dialled a sid presence dropped");
+        assert!(conn.direct_pending.is_empty());
+
+        // The device is back on a new sid: re-warmed.
+        conn.roster.insert("sid-new".into(), entry("sid-new"));
+        conn.warm_hold_tick(true).await;
+        assert!(conn.warm_hold.auto.contains("visitor-4"));
+        assert!(
+            conn.links.contains_key("sid-new") || conn.direct_pending.contains_key("sid-new"),
+            "the device's new sid was not dialled"
+        );
+        assert!(!conn.links.contains_key("sid-old"));
+    }
+
     #[tokio::test]
     async fn digest_absence_prunes_the_roster_after_two_digests() {
         let (mut conn, _far, _rx) = test_conn().await;
@@ -13064,6 +13203,9 @@ mod warm_identity_tests {
         assert!(conn.links.contains_key("sid-new"), "the new contact was starved");
         assert!(!conn.links.contains_key("sid-3"), "the retrying link was kept");
         assert_eq!(conn.links.len(), MAX_LINKS);
+        // Evicting gives up on the sid as an exhausted ladder does: neither
+        // digest adoption nor warm-hold restarts it at attempt 0.
+        assert!(conn.suppressed_digest_adoptions.contains("sid-3"));
     }
 
     /// Room adoption chooses its target after spawning the build. Installing
