@@ -1,0 +1,65 @@
+{
+  "hooks": {},
+  "origin": "found by exploration 2026-11-26 on 2912d65b3 (finding 22b3f2a918, seed 751353218), reproduced 3/3: alpha impaired 2.3-38.6 s and the server down 16.0-48.5 s; a 4 MiB send alpha->charlie started DURING the outage met charlie on the local network, lost that link, and at 90 s, about 40 s after the server returned, still printed 'the link is down, trying to reconnect' (O2 hang)",
+  "seed": 751353218,
+  "steps": [
+    {
+      "args": {
+        "delay_ms": 80,
+        "dup": 0,
+        "jitter_ms": 300,
+        "loss": 5,
+        "reorder": 25
+      },
+      "at": 2.3,
+      "dur": 36.3,
+      "fault": "net.impair",
+      "target": "alpha"
+    },
+    {
+      "args": {
+        "delay_ms": 80,
+        "dup": 5,
+        "jitter_ms": 50,
+        "loss": 5,
+        "reorder": 0
+      },
+      "at": 12.5,
+      "dur": 18.6,
+      "fault": "net.impair",
+      "target": "bravo"
+    },
+    {
+      "at": 16.0,
+      "dur": 32.5,
+      "fault": "server.down"
+    },
+    {
+      "at": 17.2,
+      "dst": "bravo",
+      "kib": 256,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 26.6,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 27.3,
+      "dst": "charlie",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 29.0,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

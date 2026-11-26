@@ -145,6 +145,7 @@ mod state_files;
 mod transfer_history;
 /// What `send` says, and how long it waits, when its receiver goes away.
 mod send_liveness;
+mod send_redial;
 /// What a transfer says about itself when it resumes, streams or loses its
 /// peer: the pure decisions and sentences, kept testable.
 mod transfer_truth;
