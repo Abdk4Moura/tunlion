@@ -9835,11 +9835,23 @@ async fn recv_run(
                             .collect();
                         if !dup_keys.is_empty() {
                             // Is ANY existing stream for this file still flowing?
-                            let any_flowing = dup_keys.iter().any(|(p, _)| {
-                                conn.transport_of(p)
-                                    .map(|t| t.idle_ms() < net::stall_ms())
-                                    .unwrap_or(false)
-                            });
+                            //
+                            // Not when the same sender re-offers with resume:
+                            // it only does that once it judged its own stream
+                            // dead (a channel that died, a stall), and when it
+                            // re-dialed the same signaling id, `transport_of`
+                            // here is the FRESH link, idle for milliseconds
+                            // because the offer just arrived on it. Read as
+                            // "still flowing", the resume was ignored and the
+                            // repaired send never moved another byte.
+                            let same_sender_resume =
+                                is_resume && dup_keys.iter().all(|(p, _)| *p == pid);
+                            let any_flowing = !same_sender_resume
+                                && dup_keys.iter().any(|(p, _)| {
+                                    conn.transport_of(p)
+                                        .map(|t| t.idle_ms() < net::stall_ms())
+                                        .unwrap_or(false)
+                                });
                             if any_flowing {
                                 // A real concurrent duplicate, first (flowing)
                                 // stream wins. Ignore WITHOUT marking the sender
