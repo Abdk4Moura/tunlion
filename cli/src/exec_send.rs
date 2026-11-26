@@ -369,6 +369,11 @@ async fn exec_once(
             "argv": opts.argv.clone(),
             // Heartbeat promise: the acceptor ends the command if these stop.
             "alive_ms": filament_peerloop::shell::exec::EXEC_ALIVE_INTERVAL.as_millis() as u64,
+            // Output flow control: the acceptor keeps at most this many frames
+            // per stream in flight beyond what this side consumed, so a slow
+            // local reader slows the command instead of overflowing the
+            // bounded inbound pipe (which resets the stream).
+            "window": filament_peerloop::shell::exec::EXEC_OUTPUT_WINDOW,
         });
         if let Some(cwd) = &opts.cwd {
             f["cwd"] = json!(cwd.to_string_lossy());
@@ -455,18 +460,18 @@ async fn exec_once(
     // consumer never looks like a dead initiator: the acceptor ends the
     // remote command when they stop (kill -9 of this process, a vanished
     // host), instead of letting it run on with nobody to report to.
+    // Each beat restates the consumed output counts, so a lost grant cannot
+    // hold the acceptor's window shut.
+    let ledger = std::sync::Arc::new(filament_peerloop::shell::exec::ExecCreditLedger::default());
     let beats = {
         let t = t.clone();
+        let ledger = ledger.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(filament_peerloop::shell::exec::EXEC_ALIVE_INTERVAL);
             tick.tick().await;
             loop {
                 tick.tick().await;
-                if t
-                    .send_control(&json!({ "type": "exec-alive", "sid": sid }))
-                    .await
-                    .is_err()
-                {
+                if t.send_control(&ledger.alive(sid)).await.is_err() {
                     break;
                 }
             }
@@ -503,7 +508,6 @@ async fn exec_once(
             tokio::select! {
                 item = out_pipe.recv() => match item {
                     Some(Some(bytes)) => {
-                        last_heard = std::time::Instant::now();
                         out_recv += bytes.len() as u64;
                         if let Err(e) = stdout.write_all(&bytes).await {
                             local_closed = true;
@@ -512,6 +516,13 @@ async fn exec_once(
                         if let Err(e) = stdout.flush().await {
                             local_closed = true;
                             return local_output_failed(e);
+                        }
+                        // Stamped AFTER the write: time spent blocked on a
+                        // slow local reader is not silence from the peer.
+                        last_heard = std::time::Instant::now();
+                        ledger.consumed(false);
+                        if ledger.due() {
+                            let _ = t.send_control(&ledger.grant(sid)).await;
                         }
                     }
                     _ => {
@@ -534,7 +545,6 @@ async fn exec_once(
                 },
                 item = err_pipe.recv() => match item {
                     Some(Some(bytes)) => {
-                        last_heard = std::time::Instant::now();
                         err_recv += bytes.len() as u64;
                         if let Err(e) = stderr.write_all(&bytes).await {
                             local_closed = true;
@@ -543,6 +553,11 @@ async fn exec_once(
                         if let Err(e) = stderr.flush().await {
                             local_closed = true;
                             return local_output_failed(e);
+                        }
+                        last_heard = std::time::Instant::now();
+                        ledger.consumed(true);
+                        if ledger.due() {
+                            let _ = t.send_control(&ledger.grant(sid)).await;
                         }
                     }
                     _ => {}
@@ -654,7 +669,10 @@ async fn exec_once(
         // are met -- with a 3s cap for a dying one. Skipped when the close
         // carried no status (abnormal end: nothing to collect for).
         if exit_status.is_some() {
-            let drain_end = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            // The 3 s bound is on the LINK going quiet, not on the local
+            // reader: it restarts whenever output arrives, so a slow reader
+            // draining a full window is never cut short with a clean status.
+            let mut drain_end = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
                 let met = match (want_out, want_err) {
                     (Some(o), Some(e)) => out_recv >= o && err_recv >= e,
@@ -674,17 +692,21 @@ async fn exec_once(
                 }
                 while let Ok(Some(bytes)) = out_pipe.try_recv() {
                     out_recv += bytes.len() as u64;
+                    ledger.consumed(false);
                     if let Err(e) = stdout.write_all(&bytes).await {
                         local_closed = true;
                         return local_output_failed(e);
                     }
+                    drain_end = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
                 }
                 while let Ok(Some(bytes)) = err_pipe.try_recv() {
                     err_recv += bytes.len() as u64;
+                    ledger.consumed(true);
                     if let Err(e) = stderr.write_all(&bytes).await {
                         local_closed = true;
                         return local_output_failed(e);
                     }
+                    drain_end = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
                 }
                 if let Err(e) = stdout.flush().await {
                     local_closed = true;

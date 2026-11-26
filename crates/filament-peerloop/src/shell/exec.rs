@@ -35,6 +35,79 @@ pub fn alive_deadline(alive_ms: u64) -> std::time::Duration {
     )
 }
 
+/// EXEC OUTPUT FLOW CONTROL. The initiator's inbound pipe per output stream
+/// is bounded (the mux's 256 slots) and is fed with `try_send` so a stalled
+/// consumer cannot freeze the receive loop; a full pipe resets the stream.
+/// Without a window, a producer faster than the initiator's reader (a
+/// `base64` of a big archive into a slower local pipe) filled it in well
+/// under a second on a fast link, the stream was reset, and the session was
+/// reported as a dead link. A window makes the reader's pace the producer's
+/// pace: the acceptor keeps at most this many output FRAMES per stream in
+/// flight beyond what the initiator has consumed. It is under the pipe's
+/// capacity, with room for the end sentinel and markers.
+pub const EXEC_OUTPUT_WINDOW: u64 = 192;
+
+/// The initiator reports its consumed counts after this many frames (and on
+/// every heartbeat), so the producer never waits a full window for a grant.
+pub const EXEC_CREDIT_EVERY: u64 = EXEC_OUTPUT_WINDOW / 4;
+
+/// Largest window an acceptor honours. A window only ever bounds what the
+/// acceptor sends, so a hostile value can buy nothing but this cap.
+pub const EXEC_MAX_WINDOW: u64 = 4096;
+
+/// INITIATOR side of [`EXEC_OUTPUT_WINDOW`]: counts the output frames this end
+/// has consumed from each pipe and builds the cumulative grants. Shared with
+/// the heartbeat task, so the beat carries the counts too: a grant lost to a
+/// full control queue is restated within one beat instead of stalling the
+/// producer for good.
+#[derive(Debug, Default)]
+pub struct ExecCreditLedger {
+    out: std::sync::atomic::AtomicU64,
+    err: std::sync::atomic::AtomicU64,
+    granted_out: std::sync::atomic::AtomicU64,
+    granted_err: std::sync::atomic::AtomicU64,
+}
+
+impl ExecCreditLedger {
+    /// One output frame was taken off the stdout (or stderr) pipe.
+    pub fn consumed(&self, stderr: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if stderr {
+            self.err.fetch_add(1, Relaxed);
+        } else {
+            self.out.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Enough has been consumed since the last grant that one is due now.
+    pub fn due(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.out.load(Relaxed) >= self.granted_out.load(Relaxed) + EXEC_CREDIT_EVERY
+            || self.err.load(Relaxed) >= self.granted_err.load(Relaxed) + EXEC_CREDIT_EVERY
+    }
+
+    /// The `exec-credit` grant for `sid`, recorded as sent.
+    pub fn grant(&self, sid: u32) -> Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        let out = self.out.load(Relaxed);
+        let err = self.err.load(Relaxed);
+        self.granted_out.store(out, Relaxed);
+        self.granted_err.store(err, Relaxed);
+        serde_json::json!({ "type": "exec-credit", "sid": sid, "out": out, "err": err })
+    }
+
+    /// The `exec-alive` heartbeat for `sid`, restating the consumed counts.
+    pub fn alive(&self, sid: u32) -> Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        serde_json::json!({
+            "type": "exec-alive",
+            "sid": sid,
+            "out": self.out.load(Relaxed),
+            "err": self.err.load(Relaxed),
+        })
+    }
+}
+
 /// A child's terminal state, carried without `std::process::ExitStatus` so a
 /// deterministic test child and the real adapter speak the same vocabulary.
 /// A clean exit keeps its raw code; signal death becomes 128+signal (the shell
@@ -223,6 +296,10 @@ pub struct ExecOpen {
     /// the session then ends if it stops hearing them. None for an initiator
     /// that predates heartbeats, which is held to its link alone.
     pub alive_ms: Option<u64>,
+    /// The initiator's output window in frames (see [`EXEC_OUTPUT_WINDOW`]),
+    /// when it announces one: the pumps then wait for its grants. None for an
+    /// initiator that predates flow control, which is served unpaced.
+    pub window: Option<u64>,
 }
 
 /// Parse and validate an `exec-open` frame. Returns None (caller ignores the
@@ -282,6 +359,11 @@ pub fn parse_exec_open(v: &Value) -> Option<ExecOpen> {
         .get("alive_ms")
         .and_then(|a| a.as_u64())
         .filter(|a| *a > 0);
+    let window = v
+        .get("window")
+        .and_then(|w| w.as_u64())
+        .filter(|w| *w > 0)
+        .map(|w| w.min(EXEC_MAX_WINDOW));
     Some(ExecOpen {
         argv,
         cwd,
@@ -289,6 +371,7 @@ pub fn parse_exec_open(v: &Value) -> Option<ExecOpen> {
         tty,
         err_sid,
         alive_ms,
+        window,
     })
 }
 

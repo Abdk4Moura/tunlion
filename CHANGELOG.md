@@ -13,6 +13,11 @@ release build failed and nothing was published under it.
 
 ## [Unreleased]
 
+- `tunlion exec` now streams a large output to a slow reader to completion.
+  Piping a big `base64` or `tar` stream into a slower local consumer used to
+  stop partway with "the warm link died" (or "exec stream ended without an
+  exit status" on a fresh link) while the link was healthy. The remote command
+  now runs at the reader's pace. Both ends need this version for the pacing.
 - A one-time code now covers exactly the connection its handshake confirmed,
   on both the sending and the receiving side. If that connection is rebuilt
   after the code was confirmed, nothing more is sent or accepted on the code;

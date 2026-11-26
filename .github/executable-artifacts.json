@@ -1089,6 +1089,17 @@
       ]
     },
     {
+      "path": "cli/tests/exec-stream-gates.sh",
+      "disposition": "required",
+      "entrypoint": "TUNLION_BIN=target/release/tunlion bash cli/tests/exec-stream-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/durability_soak.py",
       "disposition": "required",
       "entrypoint": "TUNLION_BIN=target/release/tunlion python3 cli/tests/durability_soak.py --runs 1 --stable-secs 150",

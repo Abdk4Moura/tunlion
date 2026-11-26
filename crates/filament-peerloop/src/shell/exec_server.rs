@@ -131,16 +131,6 @@ fn build_env(
     )
 }
 
-async fn send_frames_chunked(t: &Arc<dyn Transport>, sid: u32, data: &[u8]) -> anyhow::Result<()> {
-    let cap = t.max_payload().max(1);
-    for chunk in data.chunks(cap) {
-        t.send_frame(sid, 0, chunk)
-            .await
-            .map_err(|_| anyhow::anyhow!("send frame failed"))?;
-    }
-    Ok(())
-}
-
 /// Send `sig` to the session's whole tree (its own process group), or to the
 /// leader alone where there are no groups.
 fn deliver_signal(child: &mut dyn ExecChild, sig: TreeSignal) {
@@ -430,10 +420,30 @@ pub async fn serve_exec(
     // can beat its own tail frames -- close travels control, bytes travel
     // frames -- and breaking on close would truncate output, observed live
     // as a missing 8 KiB tail with rc=0).
+    // An initiator that announced a window paces the output with grants; one
+    // that did not is served unpaced, exactly as before.
+    let (out_gate, err_gate) = match req.window {
+        Some(window) => {
+            let credit = mux.register_exec_credit(sid).await;
+            let idle = req
+                .alive_ms
+                .map(alive_deadline)
+                .unwrap_or(std::time::Duration::from_secs(60));
+            let gate = |stderr| OutputGate {
+                credit: credit.clone(),
+                stderr,
+                window,
+                idle,
+                frames: 0,
+            };
+            (Some(gate(false)), Some(gate(true)))
+        }
+        None => (None, None),
+    };
     let t_out = t.clone();
-    let out_task = tokio::spawn(pump_output(stdout, t_out, sid));
+    let out_task = tokio::spawn(pump_output(stdout, t_out, sid, out_gate));
     let t_err = t.clone();
-    let err_task = tokio::spawn(pump_output(stderr, t_err, err_sid));
+    let err_task = tokio::spawn(pump_output(stderr, t_err, err_sid, err_gate));
     // Revoke re-check (pty precedent): a dedicated ticker at the shared
     // interval re-asks the gate while the child runs. A peer revoked
     // mid-session -- certificate OR shell grant -- loses the live exec.
@@ -757,21 +767,80 @@ async fn pump_output(
     mut reader: Box<dyn AsyncRead + Unpin + Send>,
     t: Arc<dyn Transport>,
     sid: u32,
+    mut gate: Option<OutputGate>,
 ) -> u64 {
-    let mut buf = vec![0u8; 8192];
+    // The window counts FRAMES, so the bytes it keeps in flight scale with the
+    // frame size: 64 KiB reads (a full Linux pipe buffer) let a window of
+    // EXEC_OUTPUT_WINDOW frames cover a long-RTT link, where 8 KiB reads would
+    // cap a paced stream at a few MB per round trip. Still chunked to the
+    // link's own payload bound below.
+    let mut buf = vec![0u8; 64 * 1024];
     let mut sent: u64 = 0;
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if send_frames_chunked(&t, sid, &buf[..n]).await.is_err() {
-                    break;
+                let cap = t.max_payload().max(1);
+                for chunk in buf[..n].chunks(cap) {
+                    if let Some(g) = gate.as_mut() {
+                        if !g.wait_for_room().await {
+                            // The initiator went away (its stream was
+                            // dropped, or it stopped answering while
+                            // holding the window shut): nobody is left to
+                            // read. Report what was SENT, never more.
+                            return sent;
+                        }
+                    }
+                    if t.send_frame(sid, 0, chunk).await.is_err() {
+                        return sent;
+                    }
+                    sent += chunk.len() as u64;
+                    if let Some(g) = gate.as_mut() {
+                        g.frames += 1;
+                    }
                 }
-                sent += n as u64;
             }
         }
     }
     sent
+}
+
+/// The acceptor half of exec output flow control (see
+/// [`crate::shell::exec::EXEC_OUTPUT_WINDOW`]): one output stream may have at
+/// most `window` frames in flight beyond what the initiator says it consumed.
+/// A reader slower than the link therefore slows the COMMAND (its pipe fills
+/// and it blocks on write, as it would locally) instead of overflowing the
+/// initiator's bounded pipe and resetting the stream.
+struct OutputGate {
+    credit: tokio::sync::watch::Receiver<(u64, u64)>,
+    stderr: bool,
+    window: u64,
+    /// Longest wait with NO word from the initiator (a grant or a heartbeat
+    /// restating one) before it is treated as gone. A slow reader still
+    /// heartbeats, so slowness alone never trips this.
+    idle: std::time::Duration,
+    frames: u64,
+}
+
+impl OutputGate {
+    /// Wait until one more frame fits in the window. False when the
+    /// initiator is gone: the stream was dropped, or it said nothing at all
+    /// for `idle`.
+    async fn wait_for_room(&mut self) -> bool {
+        loop {
+            let consumed = {
+                let (o, e) = *self.credit.borrow_and_update();
+                if self.stderr { e } else { o }
+            };
+            if self.frames < consumed.saturating_add(self.window) {
+                return true;
+            }
+            match tokio::time::timeout(self.idle, self.credit.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return false,
+            }
+        }
+    }
 }
 
 /// Handle one `exec-open` frame: admission, then register, ack, serve. Sends
@@ -1213,6 +1282,7 @@ mod tests {
             tty: false,
             err_sid: ERR_SID,
             alive_ms: None,
+            window: None,
         }
     }
 
@@ -1969,5 +2039,227 @@ process.stdout.write('ok\n');
             assert_eq!(steps.first(), Some(&first), "{first:?}");
             assert_eq!(steps.last(), Some(&TreeSignal::Kill), "{first:?}");
         }
+    }
+
+    /// The acceptor's transport for the streaming tests: every output frame
+    /// lands in the INITIATOR's real mux through `on_frame`, the same
+    /// never-parking `try_send` the receive loop uses, so a producer that
+    /// outruns the reader hits the real 256-slot pipe and its real flood
+    /// reset. Control frames are recorded.
+    struct WireTransport {
+        initiator: Arc<l2::Mux>,
+        controls: Mutex<Vec<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for WireTransport {
+        async fn send_control(&self, msg: &Value) -> anyhow::Result<()> {
+            self.controls.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+        async fn send_frame(&self, sid: u32, _offset: u64, payload: &[u8]) -> anyhow::Result<()> {
+            self.initiator
+                .on_frame(sid, bytes::Bytes::copy_from_slice(payload))
+                .await;
+            Ok(())
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            8192
+        }
+        fn is_alive(&self) -> bool {
+            true
+        }
+        fn is_dead(&self) -> bool {
+            false
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Serve a command whose stdout is `total` bytes to an initiator that
+    /// reads SLOWER than the command writes, over a healthy link. With
+    /// `window`, the initiator grants credit exactly as the warm and cold
+    /// initiators do. Returns what the reader received, the acceptor's
+    /// controls, and the controls the initiator's mux sent (a flood reset
+    /// shows up there).
+    async fn stream_to_slow_reader(
+        total: usize,
+        window: Option<u64>,
+    ) -> (Vec<u8>, Vec<Value>, Vec<Value>) {
+        let output: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let initiator_t = Arc::new(FakeTransport::default());
+        let initiator = l2::Mux::new(initiator_t.clone(), host());
+        let mut out_pipe = initiator.register_stream(SID).await.unwrap();
+        let mut err_pipe = initiator.register_stream(ERR_SID).await.unwrap();
+        let wire = Arc::new(WireTransport {
+            initiator: initiator.clone(),
+            controls: Mutex::new(Vec::new()),
+        });
+        let acceptor = l2::Mux::new(wire.clone(), host());
+        let process = Arc::new(FakeProcess::new(FakeChild::new(
+            &output,
+            b"",
+            ExecExit { code: Some(0), signal: None },
+        )));
+        let mut req = request();
+        req.alive_ms = Some(crate::shell::exec::EXEC_ALIVE_INTERVAL.as_millis() as u64);
+        req.window = window;
+        let (_stdin_tx, stdin_rx) = mpsc::channel(1);
+        let (_ctl_tx, ctl_rx) = mpsc::channel(1);
+        let reader_acceptor = acceptor.clone();
+        let reader = tokio::spawn(async move {
+            let ledger = crate::shell::exec::ExecCreditLedger::default();
+            let mut got = Vec::new();
+            let mut frames = 0u64;
+            loop {
+                tokio::select! {
+                    item = out_pipe.recv() => match item {
+                        Some(Some(bytes)) => {
+                            got.extend_from_slice(&bytes);
+                            ledger.consumed(false);
+                            frames += 1;
+                            // The slow local reader: a pause every few frames,
+                            // far slower than the command produces.
+                            if frames % 8 == 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            }
+                            if ledger.due() {
+                                reader_acceptor.on_exec_credit(SID, &ledger.grant(SID)).await;
+                            }
+                        }
+                        // End sentinel (clean) or the pipe dropped (reset).
+                        Some(None) | None => break,
+                    },
+                    item = err_pipe.recv() => if item.is_none() { break },
+                }
+            }
+            got
+        });
+        let served = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            serve_exec(
+                wire.clone(),
+                acceptor,
+                SID,
+                req,
+                stdin_rx,
+                ctl_rx,
+                ExecSessionAuthz {
+                    dev_name: Some("phone".into()),
+                    idev: None,
+                    terminal_scope: None,
+                    policy_allows: true,
+                    admitted_via_ceiling: false,
+                },
+                None,
+                process,
+                host(),
+                Arc::new(VecLog::new()),
+            ),
+        )
+        .await;
+        assert!(served.is_ok(), "the session must end, never wedge");
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+            .await
+            .expect("the reader ends")
+            .unwrap();
+        let acceptor_controls = wire.controls.lock().unwrap().clone();
+        (got, acceptor_controls, initiator_t.controls())
+    }
+
+    fn flooded(controls: &[Value]) -> bool {
+        controls.iter().any(|c| {
+            c["type"] == "l2-close"
+                && c["err"].as_str().is_some_and(|e| e.contains("flooded"))
+        })
+    }
+
+    /// THE CONTRACT: an exec over a healthy link streams arbitrary output to
+    /// completion, at the reader's pace. 8 MiB is 1024 frames, four times the
+    /// initiator's pipe; the reader is slower than the command. Every byte
+    /// arrives in order, the close announces exactly that many, and the
+    /// initiator never resets the stream as flooded.
+    #[tokio::test]
+    async fn large_output_to_a_slow_reader_streams_to_completion_under_the_window() {
+        let total = 8 * 1024 * 1024;
+        let (got, acceptor, initiator) = stream_to_slow_reader(
+            total,
+            Some(crate::shell::exec::EXEC_OUTPUT_WINDOW),
+        )
+        .await;
+        assert!(!flooded(&initiator), "a slow reader reset the stream: {initiator:?}");
+        assert_eq!(got.len(), total, "every byte reaches the reader");
+        assert!(
+            got.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8),
+            "the bytes arrive exact and in order"
+        );
+        let close = acceptor
+            .iter()
+            .find(|c| c["type"] == "exec-close")
+            .expect("the acceptor reports the exit");
+        assert_eq!(close["status"], 0);
+        assert_eq!(close["out_bytes"], total as u64);
+    }
+
+    /// Why the window exists, and proof the test above can fail: the SAME slow
+    /// reader against an initiator that announces no window overflows the
+    /// bounded pipe, and the mux resets the stream. This was `tunlion exec
+    /// <worker> -- base64 -w0 <archive>` dying midway with "the warm link
+    /// died" while the link was healthy.
+    #[tokio::test]
+    async fn without_a_window_the_same_slow_reader_overflows_the_pipe() {
+        let total = 8 * 1024 * 1024;
+        let (got, _, initiator) = stream_to_slow_reader(total, None).await;
+        assert!(flooded(&initiator), "an unpaced producer must overflow a slow reader");
+        assert!(got.len() < total);
+    }
+
+    /// The acceptor never puts more than the window in flight beyond the
+    /// initiator's grants, and an initiator that goes away while holding the
+    /// window shut ends the pump (its stream is dropped) instead of wedging
+    /// the session after the child exited.
+    #[tokio::test]
+    async fn the_pump_stops_at_the_window_and_ends_when_the_stream_drops() {
+        let t = Arc::new(FakeTransport::default());
+        let mux = l2::Mux::new(t.clone(), host());
+        let credit = mux.register_exec_credit(SID).await;
+        let gate = OutputGate {
+            credit,
+            stderr: false,
+            window: 3,
+            idle: std::time::Duration::from_secs(30),
+            frames: 0,
+        };
+        // 40 bytes at max_payload 4 = 10 frames; only 3 may go unacknowledged.
+        let reader: Box<dyn AsyncRead + Unpin + Send> =
+            Box::new(BytesReader { bytes: vec![7u8; 40], at: 0 });
+        let t2: Arc<dyn Transport> = t.clone();
+        let pump = tokio::spawn(pump_output(reader, t2, SID, Some(gate)));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(t.frames().len(), 3, "exactly the window is in flight");
+        // A heartbeat restating the same count is not credit.
+        mux.on_exec_credit(SID, &json!({ "type": "exec-alive", "sid": SID, "out": 0, "err": 0 }))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(t.frames().len(), 3);
+        // Two consumed: two more may go.
+        mux.on_exec_credit(SID, &json!({ "type": "exec-credit", "sid": SID, "out": 2, "err": 0 }))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(t.frames().len(), 5);
+        // A stale, smaller count never takes credit back.
+        mux.on_exec_credit(SID, &json!({ "type": "exec-credit", "sid": SID, "out": 1 }))
+            .await;
+        // The initiator goes away: the pump ends and reports what it SENT.
+        mux.drop_stream(SID).await;
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(2), pump)
+            .await
+            .expect("the pump ends when the stream drops")
+            .unwrap();
+        assert_eq!(sent, 20);
     }
 }

@@ -509,7 +509,8 @@ impl AccessDispatch {
         }
         // Initiator heartbeats/signals reach only a live exec session on THIS
         // peer's mux; the answer goes back on the same authenticated link.
-        if matches!(kind,"exec-alive"|"exec-signal"){
+        if matches!(kind,"exec-alive"|"exec-signal"|"exec-credit"){
+            if let Some(sid)=crate::l2::wire_sid(&payload){self.mux.on_exec_credit(sid,&payload).await;}
             if let (Some(sid),Some(msg))=(crate::l2::wire_sid(&payload),crate::l2::mux::ExecCtl::from_frame(&payload)){
                 let live=self.mux.exec_control(sid,msg).await;
                 if live&&msg==crate::l2::mux::ExecCtl::Alive{let _=self.send(json!({"type":"exec-alive-ack","sid":sid})).await;}
