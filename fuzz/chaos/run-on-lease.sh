@@ -126,7 +126,12 @@ set -e
 sudo chown -R "\$(id -u):\$(id -g)" "\$job/out"
 echo "CHAOS_RC=\$rc"
 tar -C "\$job" -czf "\$job/out.tgz" out
+# The essentials (verdicts, findings with their logs, grown corpus) in a small
+# tarball fetched first: the exec channel can drop a long stream, and losing
+# the per-run records must never cost the findings.
+( cd "\$job" && tar -czf out-essential.tgz --ignore-failed-read \$(cd "\$job" && ls -d out/summary.json out/throughput.json out/replay-rates.json out/canary.json out/hookcheck.json out/findings out/corpus-grown 2>/dev/null) )
 echo "CHAOS_OUT=\$job/out.tgz"
+echo "CHAOS_OUT_ESSENTIAL=\$job/out-essential.tgz"
 EOF
 )
 LOG="$ROOT/chaos-results/$JOB.log"; mkdir -p "$ROOT/chaos-results"
@@ -135,9 +140,16 @@ WENV=(--env HOME=/home/runner --env PATH=/home/runner/work/_temp/bin:/home/runne
 tunlion exec "$WORKER" "${WENV[@]}" -- bash -c "$REMOTE" 2>&1 | tee "$LOG"
 OUT=$(grep -oP '^CHAOS_OUT=\K.*' "$LOG" | tail -1)
 RC=$(grep -oP '^CHAOS_RC=\K\d+' "$LOG" | tail -1)
+ESS=$(grep -oP '^CHAOS_OUT_ESSENTIAL=\K.*' "$LOG" | tail -1)
 if [ -n "$OUT" ]; then
   DEST="$ROOT/chaos-results/$JOB"; mkdir -p "$DEST"
-  tunlion exec "$WORKER" -- base64 -w0 "$OUT" | base64 -d | tar --no-same-owner -xz -C "$DEST"
-  echo "== results in $DEST"
+  if [ -n "$ESS" ]; then
+    tunlion exec "$WORKER" -- base64 -w0 "$ESS" | base64 -d | tar --no-same-owner -xz -C "$DEST" \
+      && echo "== findings and summary in $DEST" \
+      || echo "== could not fetch the essentials; they stay on $WORKER at $ESS"
+  fi
+  tunlion exec "$WORKER" -- base64 -w0 "$OUT" | base64 -d | tar --no-same-owner -xz -C "$DEST" 2>/dev/null \
+    && echo "== full results in $DEST" \
+    || echo "== full results did not come back whole (the exec stream dropped); they stay on $WORKER at $OUT"
 fi
 exit "${RC:-3}"
