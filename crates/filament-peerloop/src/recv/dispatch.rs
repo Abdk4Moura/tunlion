@@ -1014,6 +1014,32 @@ pub struct RecvCleanup {
     trace: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
+/// How long one C30 state ping may take before it is abandoned.
+const STATE_PING_BOUND: Duration = Duration::from_secs(2);
+
+/// Send one link's C30 state ping off the event loop. The ping is a
+/// best-effort snapshot, refreshed every ~10 s, and a control write on a link
+/// whose peer is frozen, half-open or behind a partition blocks on flow
+/// control. Awaited inline, even under its 2 s bound, it held the daemon loop
+/// once per such link in the `reap` phase (chaos finding b5980957f8: all three
+/// daemons 1.4 to 2.0 s in reap/none in the same tick). A link whose previous
+/// ping is still in flight gets no second one, so a wedged link holds at most
+/// one task.
+fn spawn_state_ping(
+    inflight: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    pid: &str,
+    t: Arc<dyn Transport>,
+    msg: Value,
+) {
+    if inflight.get(pid).is_some_and(|h| !h.is_finished()) {
+        return;
+    }
+    let task = tokio::spawn(async move {
+        let _ = tokio::time::timeout(STATE_PING_BOUND, t.send_control(&msg)).await;
+    });
+    inflight.insert(pid.to_string(), task);
+}
+
 /// One served sync task. In a reduced profile the type is inert so the loop's
 /// ownership methods stay unconditional.
 #[cfg(feature = "mount-server")]
@@ -2424,6 +2450,8 @@ async fn recv_run(
     let mut digest_alone = false;
     // C30 phase 3: link mini-sync, state pings every ~10s per link.
     let mut last_state_ping = Instant::now();
+    // The state ping in flight per link (`spawn_state_ping`).
+    let mut state_pings: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     // Cross-platform `expose` apply: the control socket is unix-only, so on
     // Windows an `expose` in a sibling process could only write expose.json and
     // believe it. Reconcile on a short tick wherever an L3 endpoint exists, and
@@ -4490,6 +4518,7 @@ async fn recv_run(
         // truth every ~10s, so one-sided beliefs between PEERS can't persist.
         if last_state_ping.elapsed() >= Duration::from_secs(10) {
             last_state_ping = Instant::now();
+            state_pings.retain(|pid, _| conn.links.contains_key(pid));
             for (pid, l) in &conn.links {
                 if let Some(t) = &l.transport {
                     let mut transfers = serde_json::Map::new();
@@ -4501,22 +4530,13 @@ async fn recv_run(
                             );
                         }
                     }
-                    // BOUNDED: this runs inline in the event loop for EVERY link.
-                    // A WebRTC data-channel write against a frozen / half-open peer
-                    // can block (write_data_channel().await never returns), which
-                    // would starve the whole loop, including the signal-driven
-                    // Interrupted handler, the multi-link shutdown hang. The state
-                    // ping is best-effort, so cap it and move on.
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(2),
-                        t.send_control(&json!({
-                            "type": "state", "v": 1,
-                            "transfers": Value::Object(transfers),
-                            "trusted": l.trusted,
-                            "away": false,
-                        })),
-                    )
-                    .await;
+                    let msg = json!({
+                        "type": "state", "v": 1,
+                        "transfers": Value::Object(transfers),
+                        "trusted": l.trusted,
+                        "away": false,
+                    });
+                    spawn_state_ping(&mut state_pings, pid, t.clone(), msg);
                 }
             }
         }
@@ -13811,5 +13831,81 @@ fn control_type(ev: &Ev) -> Option<String> {
         }
         Ev::Sourced { inner, .. } => control_type(inner),
         _ => None,
+    }
+}
+
+/// Chaos finding b5980957f8: the C30 state ping awaited each link's control
+/// write inline in the `reap` phase, and a write against a link behind a
+/// partition parked all three daemons 1.4 to 2.0 s.
+#[cfg(test)]
+mod state_ping_off_loop_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A link whose control write never completes, as one behind a partition.
+    struct Wedged(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl Transport for Wedged {
+        async fn send_control(&self, _msg: &Value) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+        fn is_dead(&self) -> bool {
+            false
+        }
+        fn force_close(&self) {}
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wedged_link_never_holds_the_state_ping_caller() {
+        let wedged = Arc::new(Wedged(AtomicUsize::new(0)));
+        let t: Arc<dyn Transport> = wedged.clone();
+        let mut inflight = HashMap::new();
+        let started = Instant::now();
+        spawn_state_ping(&mut inflight, "sid-a", t.clone(), json!({ "type": "state" }));
+        spawn_state_ping(&mut inflight, "sid-b", t.clone(), json!({ "type": "state" }));
+        let waited = started.elapsed();
+        assert!(waited < Duration::from_millis(50), "the state ping held its caller {waited:?}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while wedged.0.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the pings were never sent");
+        // While a link's ping is still in flight it gets no second one.
+        spawn_state_ping(&mut inflight, "sid-a", t.clone(), json!({ "type": "state" }));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(wedged.0.load(Ordering::SeqCst), 2, "a wedged link was pinged twice at once");
+        // The bound still ends a wedged ping, and the next tick pings again.
+        tokio::time::timeout(STATE_PING_BOUND + Duration::from_secs(3), async {
+            while !inflight["sid-a"].is_finished() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a wedged ping outlived its bound");
+        spawn_state_ping(&mut inflight, "sid-a", t, json!({ "type": "state" }));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while wedged.0.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the next tick did not ping again");
     }
 }
