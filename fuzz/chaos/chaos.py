@@ -1383,7 +1383,10 @@ def judge_unfaulted(r: dict, fault_windows: list[dict]) -> list[dict]:
     "Permission denied" and every run was called clean (2026-11-26)."""
     if r.get("ok") or "t_start" not in r or r.get("op") == "visit":
         return []
-    lo, hi = r["t_start"] - UNFAULTED_SETTLE, r["t_end"]
+    # t_start/t_end are rounded to 0.1 s and a fault applied in the same tick
+    # can land while the op runs (a status at 2.2 next to a kill at 2.21 said
+    # "not running"), so a fault starting up to 2 s after the op counts.
+    lo, hi = r["t_start"] - UNFAULTED_SETTLE, r["t_end"] + 2.0
     for f in fault_windows:
         end = f["end"] if f["end"] is not None else float("inf")
         if f["start"] <= hi and end >= lo:
@@ -2318,6 +2321,8 @@ def cmd_selftest() -> int:
     assert judge_unfaulted(failed, [{"step": {}, "start": 5.0, "end": 25.0}]) == [], "healed within the settle"
     assert judge_unfaulted(failed, [{"step": {}, "start": 5.0, "end": None}]) == [], "never healed"
     assert judge_unfaulted(failed, [{"step": {}, "start": 1.0, "end": 10.0}])[0]["oracle"] == "O14-failed-unfaulted"
+    assert judge_unfaulted(dict(failed, t_start=2.2, t_end=2.2), [{"step": {}, "start": 2.21, "end": 7.2}]) == [], \
+        "a fault applied in the same tick as the op"
     assert judge_diagnosis(dict(blamed, dst_signaling_after="down"), part) == []
     assert judge_diagnosis(dict(blamed, stderr_tail="connect timeout: couldn't reach 'bravo' in 45s"), part) == []
     old = [{"step": {"fault": "proc.kill", "target": "bravo"}, "start": 0.0, "end": 1.0}]
