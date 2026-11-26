@@ -4077,6 +4077,7 @@ dependencies = [
  "rustls",
  "rustls-platform-verifier",
  "serde_json",
+ "socket2 0.5.10",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",

@@ -135,9 +135,19 @@ pub struct Client {
     reader_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     stopping: Arc<Mutex<bool>>,
     stop_tx: watch::Sender<bool>,
+    /// The socket's `TCP_USER_TIMEOUT` as the kernel reported it after
+    /// connect, see [`UNACKED_BOUND`].
+    unacked_bound: Option<std::time::Duration>,
 }
 
 impl Client {
+    /// How long this connection's unacknowledged writes may wait before the
+    /// kernel aborts it, read back from the socket. `None` on platforms without
+    /// the option, where only the caller's silence watchdog bounds a stuck send.
+    pub fn unacked_bound(&self) -> Option<std::time::Duration> {
+        self.unacked_bound
+    }
+
     /// The id of the connection behind this handle, the same value its
     /// [`Incoming::Down`] carries when it ends.
     ///
@@ -244,6 +254,7 @@ impl Client {
                 reader_task: Arc::new(Mutex::new(None)),
                 stopping: Arc::new(Mutex::new(false)),
                 stop_tx: watch::channel(false).0,
+                unacked_bound: None,
             },
             far,
         ))
@@ -388,6 +399,58 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// budget, and a peer is not required to answer a websocket Close.
 const DISCONNECT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long data this client wrote may go unacknowledged before the kernel
+/// gives up on the connection (`TCP_USER_TIMEOUT`).
+///
+/// WHY. Without it, a write made while the path to the server is down sits in
+/// TCP's retransmit queue under exponential backoff, and after a minute of
+/// outage the next retransmit is a minute away (rto 52 s, backoff 8, measured).
+/// When the path heals, the socket still looks fine: the server's own
+/// retransmits arrive and are read, but every new write queues behind the lost
+/// one until that timer fires. A daemon that was SIGSTOPped while isolated and
+/// resumed after the heal sat exactly there: presence said it was online, the
+/// server forwarded an exec request to it, and its answer waited 37 s in the
+/// send queue while the caller timed out after 15 s. The silence watchdog only
+/// caught it after its own 30 s.
+///
+/// With the bound, the kernel aborts such a connection (also while the process
+/// is stopped, its timers are the kernel's), the read loop reports it down at
+/// once, and the caller re-dials on a fresh socket. Signaling payloads are
+/// small control events, so a live link acks them within a round trip; this
+/// long without any ack is a dead link. The same figure as the daemon's
+/// signaling silence threshold.
+pub const UNACKED_BOUND: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The TCP socket under a websocket, plain or TLS.
+fn tcp_of(
+    stream: &tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Option<&tokio::net::TcpStream> {
+    match stream.get_ref() {
+        tokio_tungstenite::MaybeTlsStream::Plain(s) => Some(s),
+        tokio_tungstenite::MaybeTlsStream::Rustls(s) => Some(s.get_ref().0),
+        _ => None,
+    }
+}
+
+/// Apply [`UNACKED_BOUND`] to the socket and return what the kernel reports
+/// back, so the value is the socket's real setting, not the intent. `None` where
+/// the option does not exist (it is Linux and Android only) or was refused.
+fn bound_unacked(tcp: &tokio::net::TcpStream) -> Option<std::time::Duration> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let sock = socket2::SockRef::from(tcp);
+        let _ = sock.set_tcp_user_timeout(Some(UNACKED_BOUND));
+        sock.tcp_user_timeout().ok().flatten()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = tcp;
+        None
+    }
+}
+
 /// Connect, complete both handshakes, and start the read loop.
 ///
 /// Returns once the Socket.IO namespace is joined, so a caller that immediately
@@ -414,6 +477,7 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
         tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector))
             .await
             .with_context(|| format!("websocket connect to {url}"))?;
+    let unacked_bound = tcp_of(&stream).and_then(bound_unacked);
     let (writer, mut reader) = stream.split();
     let writer: Writer = Arc::new(Mutex::new(Some(writer)));
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -481,6 +545,7 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
         reader_task: reader_task.clone(),
         stopping: stopping.clone(),
         stop_tx,
+        unacked_bound,
     };
     *reader_task.lock().await = Some(tokio::spawn(read_loop(
         id, reader, writer, tx, pending, stopping, stop_rx,
@@ -719,6 +784,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(msg, Incoming::Down { conn, .. } if conn == client.id()));
+        client.disconnect().await.unwrap();
+        server.await.unwrap();
+    }
+
+    /// A connected client's socket carries the unacked-data bound, read back
+    /// from the kernel. Without it a write made during an outage parks every
+    /// later write behind a retransmit timer that backs off to a minute, and a
+    /// daemon resumed after the heal answers nobody until it fires (chaos
+    /// corpus thaw-after-isolation-exec.json).
+    #[tokio::test]
+    async fn connected_socket_bounds_unacked_writes() {
+        let (client, _rx, server) = local_client(|ws| tokio::spawn(reply_to_client_close(ws))).await;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(client.unacked_bound(), Some(UNACKED_BOUND));
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        assert_eq!(client.unacked_bound(), None);
+        assert!(UNACKED_BOUND <= std::time::Duration::from_secs(15), "the bound must stay within an exec's 15 s wait");
         client.disconnect().await.unwrap();
         server.await.unwrap();
     }
