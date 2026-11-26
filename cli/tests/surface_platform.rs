@@ -57,6 +57,10 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // and a NAMED absence on Windows (NamedPipe support is a follow-up).
         // 3: producer, Windows stub, and the Unix-only fake-daemon test.
         ("exec_warm.rs", 3),
+        // Warm send, the same honest split as warm exec: the control socket
+        // connect (Unix), its NAMED absence on Windows, and the Unix-only
+        // fake-daemon tests. The transport itself is platform-neutral.
+        ("send_warm.rs", 3),
         ("shell_support.rs", 3),
         ("up_logs.rs", 2),
         ("conn.rs", 1),

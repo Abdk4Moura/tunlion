@@ -18,6 +18,7 @@ pub mod policy;
 pub mod warm;
 #[cfg(unix)]
 pub mod warm_exec;
+pub mod warm_send;
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -619,12 +619,14 @@ class World:
         return ["ip", "netns", "exec", self.ns(d), "setpriv", f"--reuid={self.uid}", f"--regid={self.gid}",
                 "--clear-groups", "--", str(self.bin), "--server", self.server(d)] + args
 
-    def cli(self, d: str, args: list[str], timeout: float) -> tuple[int | None, str, str, float]:
+    def cli(self, d: str, args: list[str], timeout: float,
+            extra_env: dict | None = None) -> tuple[int | None, str, str, float]:
         """Run one CLI command as device d. rc None means it overran `timeout`."""
         t0 = time.monotonic()
         # A schedule's `op_env` (diagnosis variants only, e.g. TUNLION_LOG)
         # reaches the commands a device runs; `hooks` reach only its daemon.
-        p = subprocess.Popen(self.as_dev(d, args), env=self.env_for(d, getattr(self, "op_env", {}).get(d, {})), stdout=subprocess.PIPE,
+        env = {**getattr(self, "op_env", {}).get(d, {}), **(extra_env or {})}
+        p = subprocess.Popen(self.as_dev(d, args), env=self.env_for(d, env), stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
                              start_new_session=True)
         try:
@@ -1278,7 +1280,10 @@ def run_op(w: World, st: dict, phase: str) -> dict:
         data = os.urandom(st.get("kib", 4) * 1024)
         f.write_bytes(data)
         os.chown(f, w.uid, w.gid)
-        rc, out, err, el = w.cli(src, ["send", str(f), "--to", dst], deadline)
+        # `cold`: the send builds its own link instead of riding its daemon's
+        # warm one, so it needs the server and the receiver's signaling.
+        cold = {"TUNLION_NO_WARM_REUSE": "1"} if st.get("cold") else None
+        rc, out, err, el = w.cli(src, ["send", str(f), "--to", dst], deadline, cold)
         got = None
         if rc == 0:
             for _ in range(20):
@@ -1714,15 +1719,24 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
             if d not in verdict["thread_dumps"]:
                 verdict["thread_dumps"][d] = thread_dump(w.daemons[d].pid)
     post = []
+    # A send to a paired device rides its daemon's warm link, which a
+    # signaling outage does not touch, so it says nothing about whether the
+    # receiver can be reached on the server again. The cold sends do: each
+    # builds a fresh link through the server and the receiver's signaling.
+    # Without them a daemon that never reconnects its signaling passes every
+    # check here (the canary's broken arm went unflagged on the warm build).
     for st in [{"op": "exec", "src": "bravo", "dst": OWNER}, {"op": "exec", "src": "charlie", "dst": OWNER},
                {"op": "send", "src": OWNER, "dst": "bravo", "kib": 64},
-               {"op": "send", "src": OWNER, "dst": "charlie", "kib": 64}]:
+               {"op": "send", "src": OWNER, "dst": "charlie", "kib": 64},
+               {"op": "send", "src": OWNER, "dst": "bravo", "kib": 64, "cold": True},
+               {"op": "send", "src": OWNER, "dst": "charlie", "kib": 64, "cold": True}]:
         r = run_op(w, st, "after-heal")
         if not r["ok"] and r["rc"] is not None:
             r2 = run_op(w, st, "after-heal-retry")
             post.append(r2)
             verdict["findings"].append({"oracle": "O1-first-try-after-heal", "hard": not r2["ok"],
-                                        "what": f"{st['op']} {st['src']}->{st['dst']} failed after heal "
+                                        "what": f"{st['op']}{' (cold)' if st.get('cold') else ''} "
+                                                f"{st['src']}->{st['dst']} failed after heal "
                                                 f"(rc {r['rc']}: {r['stderr_tail'][-160:]}); retry ok={r2['ok']}"})
         post.append(r)
     verdict["ops"].extend(post)

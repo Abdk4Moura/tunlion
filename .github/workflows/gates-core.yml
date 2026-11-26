@@ -164,6 +164,23 @@ jobs:
           TUNLION_BIN="$RUNNER_TEMP/tunlion-hooks" TUNLION_OLD_BIN="$(find "$old" -name tunlion -type f | head -1)" \
             bash cli/tests/identity-expose-gates.sh
 
+      # A send to a paired device rides the local daemon's warm direct link,
+      # and when that link dies mid-transfer it resumes on its own link and
+      # still ends on the receiver's whole-file delivery-ack. Needs the
+      # test-hooks binary: the gate slows a transfer so the kill lands inside
+      # it. Runs before the loop budget verdict, so a daemon iteration this
+      # path parks fails the job.
+      - name: Send-warm gates
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          ( cd cli && cargo build --bin tunlion --features test-hooks )
+          cp target/debug/tunlion "$RUNNER_TEMP/tunlion-hooks-sw"
+          out="$(TUNLION_BIN="$RUNNER_TEMP/tunlion-hooks-sw" timeout 600 bash cli/tests/send-warm-gates.sh 2>&1)" || { echo "$out"; exit 1; }
+          echo "$out"
+          got=$(printf '%s\n' "$out" | grep -c '^PASS:' || true)
+          [ "$got" -eq 6 ] || { echo "::error::send-warm-gates passed $got of 6"; exit 1; }
+
       - name: Loop budget verdict
         if: ${{ !cancelled() }}
         shell: bash

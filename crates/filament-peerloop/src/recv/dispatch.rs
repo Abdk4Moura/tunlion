@@ -846,6 +846,35 @@ pub fn resume_replaces_own_stream<'a>(
     is_resume || reasked
 }
 
+/// Whether a re-offer is the same transfer MOVED to another link by its
+/// sender: every lingering stream for that file carries the offer's transfer
+/// id, sits on a different link, and that link proved the same device as the
+/// one offering now. A transfer id is minted by one sender process (its random
+/// uid and the file's index), so the same id from the same proven device is
+/// that process, and it streams a transfer over one link at a time. A send
+/// riding its daemon's warm link that fell back to its own link does exactly
+/// this; the daemon's link can read busy for a while after, and the "first
+/// stream wins" rule would ignore the resume and wedge the send. A device that
+/// is not proven on either link never matches. Pure.
+pub fn transfer_moved_link<'a>(
+    lingering: impl Iterator<Item = (&'a str, &'a str, Option<&'a str>)>,
+    offering_pid: &str,
+    offer_id: &str,
+    offering_device: Option<&str>,
+) -> bool {
+    let Some(device) = offering_device else {
+        return false;
+    };
+    let mut any = false;
+    for (pid, id, held_by) in lingering {
+        if pid == offering_pid || id != offer_id || held_by != Some(device) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 /// `receive -o -`: the open stdout streams a new offer is the same transfer
 /// as. Same transfer id, from the same signaling peer or (after a re-dial)
 /// the same verified sender. Pure. Stdout cannot seek, so every key returned
@@ -3271,7 +3300,7 @@ async fn recv_run(
                             // short, repeated use that should keep one link warm
                             // for the next one; the warm-hold machine owns the
                             // per-peer cap and the dial policy, not each CLI.
-                            if let ReqKind::Pty { peer, .. } | ReqKind::Exec { peer, .. } = &req.kind {
+                            if let ReqKind::Pty { peer, .. } | ReqKind::Exec { peer, .. } | ReqKind::SendLink { peer, .. } = &req.kind {
                                 conn.note_warm_use(peer);
                             }
                             ports.daemon.warm_req(&conn, &mut l2_muxes, &tx, req).await;
@@ -6759,7 +6788,16 @@ async fn recv_run(
                     }
                 }
             }
-            Ev::Control(pid, v) => match log_ctl_rx(&pid, v["type"].as_str(), log.as_ref()) {
+            Ev::Control(pid, v) => match {
+                // A sender reads these link-wide frames too: copy them to any
+                // warm send riding this link (`l2::warm_send`).
+                l2::warm_send::copy_link_frame(&pid, &v);
+                log_ctl_rx(&pid, v["type"].as_str(), log.as_ref())
+            } {
+                // An answer to a warm send's offer belongs to that send, not to
+                // this loop: hand it over and act on nothing.
+                Some("file-accept" | "file-decline" | "file-pending" | "delivery-ack")
+                    if l2::warm_send::route_answer(&pid, &v) => {}
                 // Local discovery hello: remember the peer's addresses and key.
                 // Only from a link whose identity is proven by its pair secret;
                 // a fleet link before its certificate, or a code link, is not.
@@ -9947,6 +9985,17 @@ async fn recv_run(
                                 &pid,
                                 &id,
                                 conn.link(&pid).map(|l| l.source),
+                            ) || transfer_moved_link(
+                                dup_keys.iter().map(|k| {
+                                    (
+                                        k.0.as_str(),
+                                        st.by_sid.get(k).map(|i| i.id.as_str()).unwrap_or_default(),
+                                        conn.link(&k.0).and_then(|l| l.verified_name.as_deref()),
+                                    )
+                                }),
+                                &pid,
+                                &id,
+                                conn.link(&pid).and_then(|l| l.verified_name.as_deref()),
                             );
                             let any_flowing = !same_sender_resume
                                 && dup_keys.iter().any(|(p, _)| {
@@ -10343,6 +10392,39 @@ async fn recv_run(
                     let r = t.send_control(&protocol::accept_msg(&id, offset)).await;
                     if peer_step(daemon, &pid, "accept", r, log.as_ref())?.is_none() {
                         st.by_sid.remove(&(pid.clone(), sid));
+                    }
+                }
+                // The sender stopped streaming this transfer ON THIS LINK and
+                // will resume it on another (a warm send that fell back to its
+                // own link, `l2::warm_send`). Keep the partial, release the
+                // stream: left open, it would make the resume look like a
+                // second stream into the same `.part` (C23) and be ignored.
+                // Never on a code receive (a warm send is never a code send),
+                // and never a `-o -` sink, which continues by transfer id.
+                Some("file-park") => {
+                    if recv_code_path || to_stdout {
+                        continue;
+                    }
+                    let id = v["id"].as_str().unwrap_or_default();
+                    let keys: Vec<(String, u32)> = st
+                        .by_sid
+                        .iter()
+                        .filter(|((p, _), inc)| *p == pid && inc.id == id)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for key in keys {
+                        if let Some(inc) = st.by_sid.remove(&key) {
+                            let f = inc.file.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let _ = f.sync_all();
+                            })
+                            .await;
+                            log.debug(&format!(
+                                "{}: parked at {} for resume (the sender moved it to another link)",
+                                inc.name,
+                                crate::present::human(inc.received.load(Ordering::Relaxed))
+                            ));
+                        }
                     }
                 }
                 // The sender could not read its own source part way through: the
@@ -12032,8 +12114,33 @@ mod offer_consent_tests {
 
 #[cfg(test)]
 mod resume_own_stream_tests {
-    use super::{resume_replaces_own_stream, stdout_streams_of_transfer, Lingering};
+    use super::{resume_replaces_own_stream, stdout_streams_of_transfer, transfer_moved_link, Lingering};
     use filament_transport::net::SourceId;
+
+    /// A warm send that fell back: the transfer was accepted on the daemon's
+    /// link and is offered again, same id, from the same proven device over
+    /// the sender's own link. That replaces the lingering stream whether or
+    /// not the sender saw the accept. Anything short of that keeps the
+    /// flowing check: another transfer id, a link that proved another device
+    /// (or none), or the same link.
+    #[test]
+    fn a_transfer_moved_by_its_sender_to_another_link_replaces_its_stream() {
+        let held = |pid, id, dev| [(pid, id, dev)].into_iter();
+        assert!(transfer_moved_link(held("daemon", "t1", Some("boxa")), "cli", "t1", Some("boxa")));
+        assert!(!transfer_moved_link(held("daemon", "t0", Some("boxa")), "cli", "t1", Some("boxa")));
+        assert!(!transfer_moved_link(held("daemon", "t1", Some("boxc")), "cli", "t1", Some("boxa")));
+        assert!(!transfer_moved_link(held("daemon", "t1", None), "cli", "t1", Some("boxa")));
+        assert!(!transfer_moved_link(held("daemon", "t1", Some("boxa")), "cli", "t1", None));
+        assert!(!transfer_moved_link(held("cli", "t1", Some("boxa")), "cli", "t1", Some("boxa")));
+        // Every lingering stream must be that transfer's, and there must be one.
+        assert!(!transfer_moved_link(
+            [("daemon", "t1", Some("boxa")), ("x", "t1", Some("boxc"))].into_iter(),
+            "cli",
+            "t1",
+            Some("boxa")
+        ));
+        assert!(!transfer_moved_link(std::iter::empty(), "cli", "t1", Some("boxa")));
+    }
 
     /// The chaos replay's repaired send: it re-dialed the same sid and
     /// re-offered with resume, and the receiver ignored it as a duplicate.

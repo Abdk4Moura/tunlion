@@ -134,6 +134,7 @@ mod recv_lifecycle;
 use recv_cmd::recv_cmd;
 /// `tunlion send`.
 mod send_cmd;
+mod send_warm;
 /// `tunlion send`'s source checks: refuse what cannot be read before offering.
 mod send_source;
 /// `tunlion send --json`: the result object.

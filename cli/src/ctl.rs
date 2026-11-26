@@ -892,6 +892,25 @@ mod imp {
                         let tty = v["tty"].as_bool().unwrap_or(false);
                         ReqKind::Exec { peer, argv, cwd, env, tty }
                     }
+                    Some("send-link") => {
+                        // Bounded like exec: a local 0600 socket, but a list
+                        // longer than any send offers is malformed, not buffered.
+                        let Some(peer) = v["peer"]
+                            .as_str()
+                            .filter(|s| !s.is_empty() && s.len() <= 256)
+                            .map(str::to_string)
+                        else { return };
+                        let Some(ids) = v["ids"].as_array().and_then(|a| {
+                            a.iter()
+                                .map(|x| x.as_str().filter(|s| !s.is_empty() && s.len() <= 256).map(str::to_string))
+                                .collect::<Option<Vec<String>>>()
+                        }) else { return };
+                        if ids.is_empty() || ids.len() > 65536 {
+                            return;
+                        }
+                        let any = v["any"].as_bool().unwrap_or(false);
+                        ReqKind::SendLink { peer, ids, any }
+                    }
                     Some("bootstrap") => {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
                         let Some(pubkey) = v["pubkey"].as_str().filter(|s| !s.is_empty() && s.len() <= 4096).map(str::to_string) else { return };
