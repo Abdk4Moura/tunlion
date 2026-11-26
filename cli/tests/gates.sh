@@ -1455,22 +1455,36 @@ say "T3b: -o - stays byte-exact when the transfer moves to the direct path mid-s
 # opened a SECOND stdout sink. Both wrote; the second sink's own digest matched.
 # Holding the direct path back makes that order the rule, not the exception:
 # without the fix this failed 10 of 10 (2 of them with both ends exit 0).
-D="$WORK/gT3b"; mkdir -p "$D"
+# The receive also runs the way a supervisor that drops privileges runs it:
+# from a directory it cannot write, with a stdout pipe it may write but not
+# reopen (mode 0, as another user's 0600 pipe is to it). The sink reopened
+# /dev/stdout and exited 4 with a bare "Permission denied (os error 13)" there
+# (chaos corpus send-stdout-promote, 24 of 24). Root bypasses both modes, so
+# this half only bites in an unprivileged run, which is how CI runs it.
+D="$WORK/gT3b"; mkdir -p "$D" "$D/ro"; chmod 0555 "$D/ro"
 TUNLION_TEST_DIRECT_DELAY_MS=1500 "$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/gT3b-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/gT3b-send.log") || { bad "stdout-promote (no code minted)"; tail -n 3 "$WORK/gT3b-send.log"; }
 if [ -n "${W:-}" ]; then
-  { TUNLION_TEST_DIRECT_DELAY_MS=1500 timeout 120 "$BIN" receive "$W" -y -o - --server "$SERVER" 2>"$WORK/gT3b-recv.log"; echo $? >"$WORK/gT3b-recv.rc"; } \
-    | python3 -c '
-import sys, time
-out = open(sys.argv[1], "wb")
-while True:
-    b = sys.stdin.buffer.read(65536)
-    if not b:
-        break
-    out.write(b)
-    time.sleep(0.05)
-' "$D/out.bin"
+  TUNLION_TEST_DIRECT_DELAY_MS=1500 python3 -c '
+import os, subprocess, sys, time
+out_path, rc_path, err_path, ro, argv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
+argv[0] = os.path.abspath(argv[0])
+r, w = os.pipe()
+os.fchmod(w, 0)
+with open(err_path, "wb") as err:
+    p = subprocess.Popen(["timeout", "120"] + argv, stdout=w, stderr=err, stdin=subprocess.DEVNULL, cwd=ro)
+os.close(w)
+with open(out_path, "wb") as out, os.fdopen(r, "rb") as src:
+    while True:
+        b = src.read(65536)
+        if not b:
+            break
+        out.write(b)
+        time.sleep(0.05)
+open(rc_path, "w").write(str(p.wait()))
+' "$D/out.bin" "$WORK/gT3b-recv.rc" "$WORK/gT3b-recv.log" "$D/ro" \
+    "$BIN" receive "$W" -y -o - --server "$SERVER"
   RCR=$(cat "$WORK/gT3b-recv.rc" 2>/dev/null || echo missing)
   wait_for_exit $SP 60; RCS=$?
   if [ "$RCR" = 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/out.bin")" = "$H_SMALL" ]; then

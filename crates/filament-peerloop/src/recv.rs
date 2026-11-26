@@ -618,6 +618,26 @@ pub fn stdout_put(
     s.put(pos, data).map(|()| 1)
 }
 
+/// A second handle on this process's fd 1 for a `-o -` sink, so dropping the
+/// sink never closes the real stdout.
+///
+/// This is `dup(2)` of the descriptor, never an `open("/dev/stdout")`: the
+/// open re-resolves fd 1 through `/proc/self/fd/1` and checks the file's
+/// permissions again. A pipe made by another user (a supervisor that drops
+/// privileges before running `receive -o -`, `sudo -u`, `setpriv`) is mode
+/// 0600 and owned by that user, so the reopen failed with a bare "Permission
+/// denied (os error 13)" although fd 1 was already open for writing.
+#[cfg(unix)]
+pub fn dup_stdout() -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsFd;
+    dup_fd(std::io::stdout().as_fd())
+}
+
+#[cfg(unix)]
+fn dup_fd(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<std::fs::File> {
+    fd.try_clone_to_owned().map(std::fs::File::from)
+}
+
 /// Exactly-once completion handshake between a stream's `file-end` control
 /// frame and its last background writer.
 ///
@@ -1492,6 +1512,40 @@ mod tests {
         assert_eq!(s.out.0, data);
         assert_eq!(shared.written.load(Ordering::SeqCst), data.len() as u64);
         assert_eq!(s.verdict(data.len() as u64, Some(&full)), Ok(()));
+    }
+
+    /// `-o -` behind a privilege drop: fd 1 is a pipe whose inode the receiver
+    /// may not open (mode 0600, another owner; here mode 0 so it holds for
+    /// the owner too). Reopening it by path is EACCES, the dup is not, and the
+    /// bytes written through the dup reach the reader.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stdout_handle_is_a_dup_not_a_reopen() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        assert_eq!(unsafe { libc::fchmod(w.as_raw_fd(), 0) }, 0);
+        let reopen = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", w.as_raw_fd()));
+        // Root has CAP_DAC_OVERRIDE, so only an unprivileged run sees the
+        // reopen refused; the dup must work either way.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(
+                reopen.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "the reopen this replaced is refused on this pipe"
+            );
+        }
+        let mut out = dup_fd(w.as_fd()).expect("dup of a pipe nobody may open by path");
+        drop(w);
+        out.write_all(b"payload").unwrap();
+        drop(out);
+        let mut got = Vec::new();
+        std::fs::File::from(r).read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"payload");
     }
 
     /// An early chunk is held only up to the bound, never without limit.
