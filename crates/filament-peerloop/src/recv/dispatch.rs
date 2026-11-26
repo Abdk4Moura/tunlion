@@ -4930,7 +4930,18 @@ async fn recv_run(
         // skipped its hello and inherited the old transport's verdict. Retire
         // them centrally for any peer that no longer has a link, so every drop
         // path, including future ones, starts the replacement unverified.
-        fleet_pending.retain(|p| conn.links.contains_key(p));
+        //
+        // `fleet_pending` is the exception in what it is kept for. It is not a
+        // verdict: it records that the peer was SEEN on the fleet channel, and
+        // it only ever withholds (no route, offers wait, a hello is owed). The
+        // presence that sets it starts the peer's WebRTC build OFF the loop, so
+        // for a while the peer has a build or a direct attempt but no link yet.
+        // Retiring it in that window lost the only evidence that a one-shot
+        // dialer's transport-offer (no `ch`) may be answered: the offer was
+        // buffered with no pending, the dialer got only an unbindable data
+        // channel, and `tunlion shell <sibling>` over the fleet secret timed
+        // out as "can't reach" whenever this end's sid sorted higher.
+        fleet_pending.retain(|p| conn.connecting_or_linked(p));
         fleet_verified.retain(|p| conn.links.contains_key(p));
         fleet_standing.retain(|p| conn.links.contains_key(p));
         bind_ours.retain(|p, _| conn.links.contains_key(p));
