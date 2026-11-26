@@ -179,7 +179,7 @@ jobs:
           out="$(TUNLION_BIN="$RUNNER_TEMP/tunlion-hooks-sw" timeout 600 bash cli/tests/send-warm-gates.sh 2>&1)" || { echo "$out"; exit 1; }
           echo "$out"
           got=$(printf '%s\n' "$out" | grep -c '^PASS:' || true)
-          [ "$got" -eq 5 ] || { echo "::error::send-warm-gates passed $got of 5"; exit 1; }
+          [ "$got" -eq 6 ] || { echo "::error::send-warm-gates passed $got of 6"; exit 1; }
 
       - name: Loop budget verdict
         if: ${{ !cancelled() }}

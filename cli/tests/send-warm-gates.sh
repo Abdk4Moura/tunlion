@@ -23,6 +23,11 @@
 #       transfer rides its link. The send falls back to its own link, resumes,
 #       and still ends with the receiver's whole-file delivery-ack: rc 0 and the
 #       file byte-exact (never a false success, never a corrupt file).
+#   S6  THE RECEIVER RESTARTS MID-TRANSFER: boxb's daemon is killed while a
+#       slowed transfer rides A's link and comes back a second later. A's daemon
+#       repairs its link and the send rides that repaired link (it does not race
+#       the repair with a build of its own), resumes, and ends on the whole-file
+#       delivery-ack: rc 0, byte-exact.
 #   S5  NO DAEMON: with A's daemon gone, a send builds its own link (rc 0,
 #       byte-exact, no warm claim).
 set -uo pipefail
@@ -72,9 +77,12 @@ printf '[{"name":"boxb","secret":"%s"}]\n' "$SECRET" > "$DA/devices.json"
 printf '[{"name":"boxa","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 A_ENV=(env TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa)
 
-env TUNLION_LOG=debug TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxb \
-  "$BIN" up --dir "$WORK/Bdrop" --server "$SERVER" >"$WORK/upB.log" 2>&1 &
-pids+=($!)
+start_b() {
+  env TUNLION_LOG=debug TUNLION_CONFIG_DIR="$DB" TUNLION_NAME=boxb \
+    "$BIN" up --dir "$WORK/Bdrop" --server "$SERVER" >>"$WORK/upB.log" 2>&1 &
+  BPID=$!; pids+=($BPID)
+}
+start_b
 env TUNLION_CONFIG_DIR="$DA" "$BIN" set auto-warm on >"$WORK/set.log" 2>&1 || true
 start_a() {
   env TUNLION_LOG=debug TUNLION_CONFIG_DIR="$DA" TUNLION_NAME=boxa \
@@ -163,6 +171,35 @@ if [ "$ra" = 0 ] && [ "$rb" = 0 ] && landed s3a.bin "$WORK/s3a.bin" && landed s3
 else
   echo "-- s3a.err --"; tail -20 "$WORK/s3a.err"; echo "-- s3b.err --"; tail -20 "$WORK/s3b.err"
   bad "S3: concurrent warm sends (rc=$ra,$rb)"
+fi
+
+# ===================================================================== S6 ======
+say "S6: the receiver restarts mid-transfer"
+head -c 4000000 /dev/urandom >"$WORK/s6.bin"
+( TUNLION_TEST_TRANSFER_STALL_MS=60 timeout 120 "${A_ENV[@]}" "$BIN" --server "$SERVER" -v send "$WORK/s6.bin" --to boxb \
+    >/dev/null 2>"$WORK/s6.err" </dev/null; echo $? >"$WORK/s6.rc" ) &
+P6=$!
+for _ in $(seq 1 50); do
+  grep -q "$WARM" "$WORK/s6.err" 2>/dev/null && [ -f "$WORK/Bdrop/s6.bin.part" ] && break
+  sleep 0.1
+done
+sleep 1
+echo "## killing boxb's daemon with $(stat -c %s "$WORK/Bdrop/s6.bin.part" 2>/dev/null || echo '?') bytes in its partial"
+kill -9 "$BPID" 2>/dev/null
+sleep 1
+start_b
+wait "$P6"
+rc=$(cat "$WORK/s6.rc")
+echo "## rc=$rc"
+if [ "$rc" = 0 ] && landed s6.bin "$WORK/s6.bin" \
+   && grep -q "warm link ended" "$WORK/s6.err" \
+   && grep -q "riding the local daemon's repaired link to 'boxb'" "$WORK/s6.err"; then
+  ok "S6: the receiver restarted mid-transfer; the send rode A's repaired link and the receiver verified the whole file"
+else
+  echo "-- s6.err --"; grep -v "^\[STALL\]" "$WORK/s6.err" | tail -40
+  echo "-- upA.log --"; grep -i "warm-send\|warm-hold" "$WORK/upA.log" | tail -15
+  ls -la "$WORK/Bdrop"
+  bad "S6: receiver restart mid-transfer (rc=$rc)"
 fi
 
 # ===================================================================== S4 ======
