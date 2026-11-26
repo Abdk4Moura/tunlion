@@ -460,33 +460,40 @@ pub struct StdoutSink<W: std::io::Write> {
     pending: std::collections::BTreeMap<u64, Vec<u8>>,
     pending_bytes: usize,
     hasher: Sha256,
-    /// Every byte any sink of this process put on the same output, and what
-    /// that count stood at when this sink opened. The digest above covers only
-    /// THIS sink's bytes, so on its own it said "verified" while another sink
-    /// (a re-offer of the same transfer that opened a second stream) had put
-    /// its own bytes on stdout too: the reader got the file plus a prefix and
-    /// both ends reported success. The verdict now also requires that nothing
-    /// but this sink wrote to the output while it was open.
-    shared: Arc<AtomicU64>,
-    base: u64,
+    /// What every sink of this process put on the same output. The digest
+    /// above covers only THIS sink's bytes, so on its own it said "verified"
+    /// while another sink (a re-offer of the same transfer that opened a
+    /// second stream) had put its own bytes on stdout too: the reader got the
+    /// file plus a prefix and both ends reported success. The verdict now also
+    /// requires that the output holds nothing but verified files and this one.
+    shared: Arc<StdoutLedger>,
 }
 
-/// What every `-o -` sink of this process has written to fd 1, in total.
-pub fn process_stdout_written() -> Arc<AtomicU64> {
-    static W: std::sync::OnceLock<Arc<AtomicU64>> = std::sync::OnceLock::new();
-    W.get_or_init(|| Arc::new(AtomicU64::new(0))).clone()
+/// Bytes put on one output by all its sinks, and how many of them belong to
+/// a stream whose verdict passed. Anything in between is bytes no verdict
+/// vouches for (an abandoned or concurrent stream), and from then on no
+/// stream on that output can be called verified.
+#[derive(Default)]
+pub struct StdoutLedger {
+    written: AtomicU64,
+    accounted: AtomicU64,
+}
+
+/// The ledger for this process's fd 1, shared by every `-o -` sink.
+pub fn process_stdout_ledger() -> Arc<StdoutLedger> {
+    static W: std::sync::OnceLock<Arc<StdoutLedger>> = std::sync::OnceLock::new();
+    W.get_or_init(Default::default).clone()
 }
 
 impl<W: std::io::Write> StdoutSink<W> {
     /// A sink that is the only writer of `out`.
     pub fn new(out: W) -> Self {
-        Self::sharing(out, Arc::new(AtomicU64::new(0)))
+        Self::sharing(out, Default::default())
     }
 
     /// A sink on an output other sinks may also write: `shared` counts every
-    /// byte any of them put there (see [`process_stdout_written`]).
-    pub fn sharing(out: W, shared: Arc<AtomicU64>) -> Self {
-        let base = shared.load(Ordering::SeqCst);
+    /// byte any of them put there (see [`process_stdout_ledger`]).
+    pub fn sharing(out: W, shared: Arc<StdoutLedger>) -> Self {
         StdoutSink {
             out,
             next: 0,
@@ -494,7 +501,6 @@ impl<W: std::io::Write> StdoutSink<W> {
             pending_bytes: 0,
             hasher: Sha256::new(),
             shared,
-            base,
         }
     }
 
@@ -517,7 +523,9 @@ impl<W: std::io::Write> StdoutSink<W> {
         self.out.write_all(data)?;
         self.hasher.update(data);
         self.next += data.len() as u64;
-        self.shared.fetch_add(data.len() as u64, Ordering::SeqCst);
+        self.shared
+            .written
+            .fetch_add(data.len() as u64, Ordering::SeqCst);
         Ok(())
     }
 
@@ -566,15 +574,6 @@ impl<W: std::io::Write> StdoutSink<W> {
     /// The verdict once the sender said the stream ended: every byte out, and
     /// (when the sender offered one) the digest of what was written matches.
     pub fn verdict(&self, size: u64, full: Option<&str>) -> std::result::Result<(), String> {
-        let on_output = self.shared.load(Ordering::SeqCst).saturating_sub(self.base);
-        if on_output != self.next {
-            return Err(format!(
-                "{} reached stdout while this stream wrote {} of it: another stream wrote to \
-                 stdout too, so what stdout holds is not this file (it cannot be rewound)",
-                human(on_output),
-                human(self.next)
-            ));
-        }
         if self.next != size {
             return Err(format!(
                 "the stream to stdout ended after {} of {}",
@@ -582,14 +581,27 @@ impl<W: std::io::Write> StdoutSink<W> {
                 human(size)
             ));
         }
-        match full {
-            Some(want) if want != self.digest() => Err(
+        if full.is_some_and(|want| want != self.digest()) {
+            return Err(
                 "the bytes written to stdout do not match the sender's whole-file SHA-256 \
                  (they cannot be re-fetched: stdout cannot be rewound)"
                     .to_string(),
-            ),
-            _ => Ok(()),
+            );
         }
+        // Passing here vouches for these bytes, so a later stream's verdict
+        // can tell them from bytes nothing vouched for.
+        let written = self.shared.written.load(Ordering::SeqCst);
+        let accounted = self.shared.accounted.load(Ordering::SeqCst);
+        if written != accounted + self.next {
+            return Err(format!(
+                "stdout holds {} that no verified stream accounts for besides this {}: another \
+                 stream wrote to stdout too, so what stdout holds is not this file (it cannot be rewound)",
+                human(written.saturating_sub(accounted + self.next)),
+                human(self.next)
+            ));
+        }
+        self.shared.accounted.fetch_add(self.next, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -1438,7 +1450,7 @@ mod tests {
     fn two_sinks_on_one_stdout_never_verify() {
         let data: Vec<u8> = (0..200_000u32).map(|i| (i * 13 % 251) as u8).collect();
         let full = sha256_hex(&data);
-        let shared = Arc::new(AtomicU64::new(0));
+        let shared = Arc::new(StdoutLedger::default());
         let mut first = StdoutSink::sharing(Pipe(Vec::new()), shared.clone());
         first.put(0, &data[..61_440]).unwrap();
         let mut second = StdoutSink::sharing(Pipe(Vec::new()), shared.clone());
@@ -1449,6 +1461,21 @@ mod tests {
         assert!(first.verdict(data.len() as u64, Some(&full)).is_err());
     }
 
+    /// Two files streamed one after the other are both verified: bytes a
+    /// passed verdict vouched for are not "another stream's".
+    #[test]
+    fn files_in_sequence_on_one_stdout_each_verify() {
+        let a: Vec<u8> = (0..5_000u32).map(|i| (i % 251) as u8).collect();
+        let b: Vec<u8> = (0..7_000u32).map(|i| (i * 3 % 251) as u8).collect();
+        let shared = Arc::new(StdoutLedger::default());
+        let mut first = StdoutSink::sharing(Pipe(Vec::new()), shared.clone());
+        first.put(0, &a).unwrap();
+        assert_eq!(first.verdict(a.len() as u64, Some(&sha256_hex(&a))), Ok(()));
+        let mut second = StdoutSink::sharing(Pipe(Vec::new()), shared.clone());
+        second.put(0, &b).unwrap();
+        assert_eq!(second.verdict(b.len() as u64, Some(&sha256_hex(&b))), Ok(()));
+    }
+
     /// The fix's shape: the re-offer continues the ONE sink from what it wrote,
     /// and late chunks from the old stream are skipped, so stdout holds the
     /// file exactly once and the verdict is about those bytes.
@@ -1456,14 +1483,14 @@ mod tests {
     fn reoffer_continues_the_same_sink_exactly_once() {
         let data: Vec<u8> = (0..200_000u32).map(|i| (i * 13 % 251) as u8).collect();
         let full = sha256_hex(&data);
-        let shared = Arc::new(AtomicU64::new(0));
+        let shared = Arc::new(StdoutLedger::default());
         let mut s = StdoutSink::sharing(Pipe(Vec::new()), shared.clone());
         s.put(0, &data[..61_440]).unwrap();
         let resume_at = s.written();
         s.put(resume_at, &data[resume_at as usize..]).unwrap();
         s.put(40_000, &data[40_000..70_000]).unwrap(); // the old stream, late
         assert_eq!(s.out.0, data);
-        assert_eq!(shared.load(Ordering::SeqCst), data.len() as u64);
+        assert_eq!(shared.written.load(Ordering::SeqCst), data.len() as u64);
         assert_eq!(s.verdict(data.len() as u64, Some(&full)), Ok(()));
     }
 

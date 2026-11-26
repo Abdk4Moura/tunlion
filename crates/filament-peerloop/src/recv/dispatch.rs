@@ -10081,7 +10081,7 @@ async fn recv_run(
                             let sink = Arc::new(std::sync::Mutex::new(
                                 crate::recv::StdoutSink::sharing(
                                     out.try_clone()?,
-                                    crate::recv::process_stdout_written(),
+                                    crate::recv::process_stdout_ledger(),
                                 ),
                             ));
                             st.by_sid.insert(
