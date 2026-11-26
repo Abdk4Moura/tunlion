@@ -15,6 +15,7 @@ use filament_transport::net::{
     SourceId, Transport,
 };
 use filament_transport::{HttpBackend, SignalingConnector, TransportContext};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
@@ -64,14 +65,14 @@ impl SimRng {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Proto {
     All,
     Udp,
     Tcp,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HangSite {
     SignalingConnect,
     SignalingEmit,
@@ -81,14 +82,14 @@ pub enum HangSite {
     DirectRace,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MessageChaosPolicy {
     pub drop_pct: u8,
     pub duplicate_pct: u8,
     pub reorder_max_delay_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Fault {
     Impair {
         node: String,

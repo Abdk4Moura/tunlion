@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::sim::net::Fault;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SignalMsgKind {
     TransportOffer,
     DirectCandidates,
@@ -25,7 +27,7 @@ impl SignalMsgKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ProtoEvent {
     SigConnected,
     SigSubscribed,
@@ -41,7 +43,7 @@ pub enum ProtoEvent {
     CapStatusQueried,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 pub enum NodeProtoState {
     #[default]
     Booting,
@@ -54,7 +56,7 @@ pub enum NodeProtoState {
     Healed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StateEdge {
     pub from: NodeProtoState,
     pub event: ProtoEvent,
@@ -130,7 +132,7 @@ impl NodeStateTracker {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SemanticTrigger {
     OnEvent {
         node: Option<String>,
@@ -144,7 +146,7 @@ pub enum SemanticTrigger {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SemanticAction {
     ApplyFault(Fault),
     HealBlackhole { node: String },
@@ -152,7 +154,7 @@ pub enum SemanticAction {
     RestartPeer { node: String, down_ms: u64 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticFault {
     pub trigger: SemanticTrigger,
     pub delay_ms: u64,

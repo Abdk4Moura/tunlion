@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
+
 use crate::sim::assertions::{evaluate_oracles, take_assertions, OracleKind, OracleViolation};
+use crate::sim::corpus::{self, CorpusEntry};
 use crate::sim::net::{Fault, HangSite, MessageChaosPolicy, Proto, SimRng};
 use crate::sim::semantic::{ProtoEvent, SemanticAction, SemanticFault, SemanticTrigger, StateEdge};
 use crate::sim::world::{NodeSpec, ScheduledFault, SimConfig, SimMutant, SimOutcome, SimWorld};
@@ -109,6 +113,8 @@ pub struct CampaignConfig {
     pub mutant: SimMutant,
     pub allow_gather_hang: bool,
     pub quiet_logs: bool,
+    pub corpus_dir: Option<PathBuf>,
+    pub regressions_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,9 +155,9 @@ impl CampaignReport {
     }
 }
 
-#[derive(Debug, Clone)]
-struct FuzzSchedule {
-    sim_seed: u64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuzzSchedule {
+    pub sim_seed: u64,
     duration_ms: u64,
     impair_delay_ms: u64,
     impair_jitter_ms: u64,
@@ -208,7 +214,7 @@ fn pick_from_constants(rng: &mut SimRng, min: u64, max: u64, table: &[u64]) -> u
 }
 
 impl FuzzSchedule {
-    fn to_sim_config(&self, mutant: SimMutant) -> SimConfig {
+    pub(crate) fn to_sim_config(&self, mutant: SimMutant) -> SimConfig {
         let sec_ab = "fuzz-sec-ab".to_string();
         let sec_ac = "fuzz-sec-ac".to_string();
         let sec_bc = "fuzz-sec-bc".to_string();
@@ -331,7 +337,11 @@ impl FuzzSchedule {
         }
     }
 
-    fn summary(&self) -> String {
+    pub fn semantic_fault_count(&self) -> usize {
+        self.semantic_faults.len()
+    }
+
+    pub fn summary(&self) -> String {
         format!(
             "seed={} impair={:?} part={:?} bh={:?} hang={:?} restart={:?} status={:?} sem={}",
             self.sim_seed,
@@ -601,14 +611,6 @@ fn generate_schedule(
     }
 }
 
-#[derive(Debug, Clone)]
-struct CorpusEntry {
-    sched: FuzzSchedule,
-    milestones: BTreeSet<String>,
-    edges: BTreeSet<StateEdge>,
-    score: u64,
-}
-
 fn mutate_schedule(
     base: &FuzzSchedule,
     rng: &mut SimRng,
@@ -765,11 +767,47 @@ fn non_oracle_guidance_score(outcome: &SimOutcome, target_phase: Option<&str>) -
         .saturating_add(target_bonus)
 }
 
+#[derive(Default)]
+struct SharedFrontier {
+    seen_edges: BTreeSet<StateEdge>,
+    edge_counts: BTreeMap<StateEdge, usize>,
+    corpus: Vec<CorpusEntry>,
+    best_hill_score: u64,
+    best_busy_slope: u64,
+}
+
+impl SharedFrontier {
+    fn warm_from_disk(campaign: &CampaignConfig) -> Arc<RwLock<Self>> {
+        let mut f = Self::default();
+        if let Some(ref dir) = campaign.corpus_dir {
+            let (entries, seen, counts) =
+                corpus::load_and_triage_corpus(dir, &campaign.mutant, campaign.quiet_logs);
+            f.seen_edges = seen;
+            f.edge_counts = counts;
+            f.corpus = entries;
+        }
+        Arc::new(RwLock::new(f))
+    }
+
+    fn persist_if_configured(&self, dir: Option<&Path>) {
+        if let Some(dir) = dir {
+            let minimized = corpus::minimize_corpus(self.corpus.clone());
+            let _ = corpus::save_minimized_corpus(dir, &minimized);
+        }
+    }
+}
+
 pub struct Fuzzer;
 
 impl Fuzzer {
     pub fn run(campaign: &CampaignConfig) -> CampaignReport {
-        Self::run_with_stop(campaign, None)
+        let frontier = SharedFrontier::warm_from_disk(campaign);
+        let mut rep = Self::run_with_stop(campaign, frontier.clone(), None);
+        let guard = frontier.read().unwrap_or_else(|e| e.into_inner());
+        guard.persist_if_configured(campaign.corpus_dir.as_deref());
+        rep.state_edges = guard.seen_edges.clone();
+        rep.state_edges_discovered = rep.state_edges.len();
+        rep
     }
 
     pub fn run_parallel(campaign: &CampaignConfig, workers: usize) -> CampaignReport {
@@ -778,6 +816,7 @@ impl Fuzzer {
         if workers == 1 {
             return Self::run(campaign);
         }
+        let frontier = SharedFrontier::warm_from_disk(campaign);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let base_runs = campaign.max_runs / workers;
         let rem = campaign.max_runs % workers;
@@ -791,7 +830,8 @@ impl Fuzzer {
                         ^ ((w as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
                     sub.max_runs = count;
                     let stop = Arc::clone(&stop_flag);
-                    scope.spawn(move || Self::run_with_stop(&sub, Some(&stop)))
+                    let f_ref = Arc::clone(&frontier);
+                    scope.spawn(move || Self::run_with_stop(&sub, f_ref, Some(&stop)))
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().expect("fuzz worker panicked")).collect()
@@ -817,30 +857,67 @@ impl Fuzzer {
             for (k, v) in rep.milestone_counts {
                 *merged.milestone_counts.entry(k).or_insert(0) += v;
             }
-            merged.state_edges.extend(rep.state_edges);
             merged.antecedents_seen.extend(rep.antecedents_seen);
             if merged.findings.is_empty() || !campaign.stop_on_first_finding {
                 merged.findings.extend(rep.findings);
             }
+        }
+        {
+            let guard = frontier.read().unwrap_or_else(|e| e.into_inner());
+            guard.persist_if_configured(campaign.corpus_dir.as_deref());
+            merged.state_edges = guard.seen_edges.clone();
         }
         merged.state_edges_discovered = merged.state_edges.len();
         merged.total_wall_ms = t0.elapsed().as_millis() as u64;
         merged
     }
 
-    fn run_with_stop(campaign: &CampaignConfig, stop_flag: Option<&AtomicBool>) -> CampaignReport {
+    pub fn replay_regressions(dir: &Path, mutant: SimMutant) -> Vec<Finding> {
+        let t0 = Instant::now();
+        let saved = corpus::load_regressions(dir);
+        let mut findings = Vec::new();
+        for (idx, (_path, doc)) in saved.into_iter().enumerate() {
+            let mut cfg = doc.schedule.to_sim_config(mutant.clone());
+            cfg.quiet_logs = false;
+            let orig = SimWorld::run(cfg.clone());
+            let violations = evaluate_oracles(&orig, &cfg);
+            if !violations.is_empty() {
+                let replay = SimWorld::run(cfg.clone());
+                let replay_violations = evaluate_oracles(&replay, &cfg);
+                let replay_verified =
+                    replay.trace_hash == orig.trace_hash && !replay_violations.is_empty();
+                assert!(
+                    replay_verified,
+                    "regression finding failed bit-exact replay! seed={} orig_hash={:#x} replay_hash={:#x}",
+                    cfg.seed, orig.trace_hash, replay.trace_hash
+                );
+                findings.push(Finding {
+                    label: "sim-only",
+                    run_index: idx + 1,
+                    wall_ms: t0.elapsed().as_millis() as u64,
+                    seed: cfg.seed,
+                    trace_hash: orig.trace_hash,
+                    replay_verified,
+                    violations,
+                    schedule_summary: doc.schedule.summary(),
+                });
+            }
+        }
+        findings
+    }
+
+    fn run_with_stop(
+        campaign: &CampaignConfig,
+        frontier: Arc<RwLock<SharedFrontier>>,
+        stop_flag: Option<&AtomicBool>,
+    ) -> CampaignReport {
         let t0 = Instant::now();
         let mut rng = SimRng::new(campaign.seed);
         let mut findings = Vec::new();
         let mut milestone_counts: BTreeMap<String, usize> = BTreeMap::new();
-        let mut seen_edges: BTreeSet<StateEdge> = BTreeSet::new();
-        let mut edge_counts: BTreeMap<StateEdge, usize> = BTreeMap::new();
         let mut antecedents_seen: BTreeSet<String> = BTreeSet::new();
-        let mut corpus: Vec<CorpusEntry> = Vec::new();
         let mut max_iter_busy_ms_seen = 0u64;
         let mut max_cap_status_latency_ms_seen = 0u64;
-        let mut best_hill_score = 0u64;
-        let mut best_busy_slope = 0u64;
         let mut runs_executed = 0usize;
 
         let corpus_active =
@@ -851,34 +928,32 @@ impl Fuzzer {
                 break;
             }
             runs_executed = run_idx + 1;
-            let sched = if corpus_active && !corpus.is_empty() && rng.chance_pct(40) {
-                let idx = select_parent_idx(
-                    &corpus,
-                    &milestone_counts,
-                    &edge_counts,
-                    &mut rng,
-                    &campaign.flags,
-                );
-                mutate_schedule(
-                    &corpus[idx].sched,
-                    &mut rng,
-                    &campaign.flags,
-                    campaign.allow_gather_hang,
-                )
+            let parent_sched = if corpus_active && rng.chance_pct(40) {
+                let f = frontier.read().unwrap_or_else(|e| e.into_inner());
+                if f.corpus.is_empty() {
+                    None
+                } else {
+                    let idx = select_parent_idx(
+                        &f.corpus,
+                        &milestone_counts,
+                        &f.edge_counts,
+                        &mut rng,
+                        &campaign.flags,
+                    );
+                    Some(f.corpus[idx].sched.clone())
+                }
             } else {
-                generate_schedule(&mut rng, &campaign.flags, campaign.allow_gather_hang)
+                None
+            };
+            let sched = match parent_sched {
+                Some(ref base) => {
+                    mutate_schedule(base, &mut rng, &campaign.flags, campaign.allow_gather_hang)
+                }
+                None => generate_schedule(&mut rng, &campaign.flags, campaign.allow_gather_hang),
             };
             let mut cfg = sched.to_sim_config(campaign.mutant.clone());
             cfg.quiet_logs = campaign.quiet_logs;
             let outcome: SimOutcome = SimWorld::run(cfg.clone());
-
-            let mut discovered_new_edge = false;
-            for edge in &outcome.state_edges {
-                if seen_edges.insert(*edge) {
-                    discovered_new_edge = true;
-                }
-                *edge_counts.entry(*edge).or_insert(0) += 1;
-            }
 
             let mut hit_rare_milestone = false;
             let mut hit_set = BTreeSet::new();
@@ -903,26 +978,36 @@ impl Fuzzer {
                 0
             };
             let busy_slope = outcome.telemetry.max_iter_busy_ms.min(999);
-            let improved_hill = campaign.flags.hill_climb
-                && (hill_score > best_hill_score || busy_slope > best_busy_slope);
-            if improved_hill {
-                best_hill_score = best_hill_score.max(hill_score);
-                best_busy_slope = best_busy_slope.max(busy_slope);
-            }
 
-            if (campaign.flags.sometimes && hit_rare_milestone)
-                || (campaign.flags.semantic && discovered_new_edge)
-                || improved_hill
             {
-                if corpus.len() >= 64 {
-                    corpus.remove(0);
+                let mut f = frontier.write().unwrap_or_else(|e| e.into_inner());
+                let mut discovered_new_edge = false;
+                for edge in &outcome.state_edges {
+                    if f.seen_edges.insert(*edge) {
+                        discovered_new_edge = true;
+                    }
+                    *f.edge_counts.entry(*edge).or_insert(0) += 1;
                 }
-                corpus.push(CorpusEntry {
-                    sched: sched.clone(),
-                    milestones: hit_set,
-                    edges: outcome.state_edges.clone(),
-                    score: hill_score,
-                });
+                let improved_hill = campaign.flags.hill_climb
+                    && (hill_score > f.best_hill_score || busy_slope > f.best_busy_slope);
+                if improved_hill {
+                    f.best_hill_score = f.best_hill_score.max(hill_score);
+                    f.best_busy_slope = f.best_busy_slope.max(busy_slope);
+                }
+                if (campaign.flags.sometimes && hit_rare_milestone)
+                    || (campaign.flags.semantic && discovered_new_edge)
+                    || improved_hill
+                {
+                    if f.corpus.len() >= 128 {
+                        f.corpus.remove(0);
+                    }
+                    f.corpus.push(CorpusEntry {
+                        sched: sched.clone(),
+                        milestones: hit_set,
+                        edges: outcome.state_edges.clone(),
+                        score: hill_score,
+                    });
+                }
             }
 
             let violations = evaluate_oracles(&outcome, &cfg);
@@ -972,6 +1057,9 @@ impl Fuzzer {
                     "DST finding failed bit-exact replay! seed={} orig_hash={:#x} replay_hash={:#x} kinds={:?}",
                     full_cfg.seed, full_orig.trace_hash, replay.trace_hash, finding_kinds
                 );
+                if let Some(ref rdir) = campaign.regressions_dir {
+                    let _ = corpus::save_regression(rdir, "sim-only", full_orig.trace_hash, &sched);
+                }
                 findings.push(Finding {
                     label: "sim-only",
                     run_index: run_idx + 1,
@@ -991,13 +1079,16 @@ impl Fuzzer {
             }
         }
 
-        let state_edges_discovered = seen_edges.len();
+        let (state_edges, state_edges_discovered) = {
+            let f = frontier.read().unwrap_or_else(|e| e.into_inner());
+            (f.seen_edges.clone(), f.seen_edges.len())
+        };
         CampaignReport {
             runs_executed,
             total_wall_ms: t0.elapsed().as_millis() as u64,
             findings,
             milestone_counts,
-            state_edges: seen_edges,
+            state_edges,
             state_edges_discovered,
             antecedents_seen,
             max_iter_busy_ms_seen,
