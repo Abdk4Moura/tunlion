@@ -12021,7 +12021,7 @@ mod offer_consent_tests {
 
 #[cfg(test)]
 mod resume_own_stream_tests {
-    use super::{resume_replaces_own_stream, Lingering};
+    use super::{resume_replaces_own_stream, stdout_streams_of_transfer, Lingering};
     use filament_transport::net::SourceId;
 
     /// The chaos replay's repaired send: it re-dialed the same sid and
