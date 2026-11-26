@@ -823,7 +823,29 @@ class World:
             rc, out, err, _ = self.cli(d, ["join", "--invite-file", str(dst), "--name", d, "--no-interactive"], 60)
             if rc != 0:
                 raise Refused(f"join {d} failed rc={rc}: {err.strip()[-300:]}")
-        self.daemon_stop(OWNER)
+        # Let the fleet roster reach every device before the snapshot: a
+        # delegate that never ran a daemon knows only the owner, so every run
+        # would start with bravo not knowing charlie until the roster arrived
+        # and an op in the first second failed with "no device named
+        # 'charlie'" (O14, 2026-11-26), a world that had not settled.
+        for d in DELEGATES:
+            self.daemon_start(d)
+        deadline = time.monotonic() + 90
+        missing: dict = {}
+        while time.monotonic() < deadline:
+            missing = {}
+            for d in DEVICES:
+                _, out, err, _ = self.cli(d, ["devices"], 20)
+                lack = [o for o in DEVICES if o != d and o not in out]
+                if lack:
+                    missing[d] = lack
+            if not missing:
+                break
+            time.sleep(2)
+        for d in DEVICES:
+            self.daemon_stop(d)
+        if missing:
+            raise Refused(f"setup: fleet roster did not reach every device in 90s: {missing}")
         if self.snapshot.exists():
             shutil.rmtree(self.snapshot)
         for d in DEVICES:
