@@ -1,0 +1,61 @@
+{
+  "hooks": {
+    "alpha": {
+      "TUNLION_TEST_DROP_PEER_LEFT": "1"
+    },
+    "bravo": {
+      "TUNLION_TEST_CORRUPT_ONCE": "1"
+    }
+  },
+  "origin": "found by exploration 2026-11-26 on main 2912d65b3 (O9, 3/3): 50% loss and 400 ms delay on bravo, exec bravo->alpha said alpha did not answer within 15s and is offline or not running up, while alpha was up",
+  "seed": 948540785,
+  "steps": [
+    {
+      "at": 13.5,
+      "dst": "charlie",
+      "op": "doctor",
+      "src": "bravo"
+    },
+    {
+      "args": {
+        "delay_ms": 400,
+        "dup": 5,
+        "jitter_ms": 50,
+        "loss": 50,
+        "reorder": 25
+      },
+      "at": 15.8,
+      "dur": 195.9,
+      "fault": "net.impair",
+      "target": "bravo"
+    },
+    {
+      "at": 16.0,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 24.2,
+      "dst": "bravo",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha",
+      "via": "stdout"
+    },
+    {
+      "at": 30.6,
+      "dst": "charlie",
+      "kib": 4,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 35.5,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "charlie"
+    }
+  ],
+  "version": 1
+}

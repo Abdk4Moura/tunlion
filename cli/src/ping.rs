@@ -641,7 +641,13 @@ pub(crate) enum OwnLink {
 
 /// The probe-only half of [`own_link_state`]. Pure.
 pub(crate) fn slow_own_link(o: &crate::l2::ProbeOutcome) -> Option<OwnLink> {
-    o.timings
+    slow_own_link_in(&o.timings)
+}
+
+/// [`slow_own_link`] over any attempt's phase timings (exec has no probe
+/// outcome, only its `diag::Attempt`). Pure.
+pub(crate) fn slow_own_link_in(timings: &[crate::diag::PhaseTiming]) -> Option<OwnLink> {
+    timings
         .iter()
         .find(|t| t.phase == crate::diag::Phase::Signaling && t.over_budget)
         .map(|t| OwnLink::Slow { signaling_ms: t.dur_ms })
@@ -665,7 +671,16 @@ pub(crate) async fn own_link_state(o: &crate::l2::ProbeOutcome) -> Option<OwnLin
 /// server was slow or down: the peer may be fine. Never the reset/forget
 /// advice. Pure.
 pub(crate) fn own_link_hint(peer: &str, own: OwnLink) -> String {
-    let why = match own {
+    let why = own_link_why(own);
+    format!(
+        "{peer} did not appear on the tunlion server in time, but {why}, so {peer} may be fine: check this \
+         machine's network, then retry. `tunlion doctor` checks it"
+    )
+}
+
+/// The clause naming what is wrong with this machine's own link. Pure.
+pub(crate) fn own_link_why(own: OwnLink) -> String {
+    match own {
         OwnLink::Slow { signaling_ms } => format!(
             "this machine's own connection to the server is slow (connecting took {:.1} s)",
             signaling_ms as f64 / 1000.0
@@ -673,10 +688,19 @@ pub(crate) fn own_link_hint(peer: &str, own: OwnLink) -> String {
         OwnLink::Down { for_secs } => format!(
             "this machine's own connection to the server is down (its daemon has been reconnecting for {for_secs} s)"
         ),
-    };
+    }
+}
+
+/// What `exec` says when the peer never said a word within its silence bound
+/// while THIS machine's own link was slow or down. The old sentence ("it is
+/// offline, or `tunlion up` is not running there") blamed a peer that was up:
+/// the chaos fuzzer found it with 50% loss and 400 ms delay on the exec side.
+/// Pure.
+pub(crate) fn exec_silent_peer_own_link(peer: &str, secs: u64, own: OwnLink) -> String {
     format!(
-        "{peer} did not appear on the tunlion server in time, but {why}, so {peer} may be fine: check this \
-         machine's network, then retry. `tunlion doctor` checks it"
+        "'{peer}' did not answer within {secs}s, but {}, so '{peer}' may be fine: check this machine's \
+         network, then retry. `tunlion doctor` checks it",
+        own_link_why(own)
     )
 }
 
@@ -727,6 +751,13 @@ mod tests {
         assert!(!h.contains("may be offline") && !h.contains("forget"), "{h}");
         // Establishing still blames the path, whatever our own link did.
         assert!(unreachable_hint("charlie", Some(Phase::Establishing), slow).contains("firewall"));
+    }
+
+    #[test]
+    fn an_exec_silent_peer_on_a_slow_own_link_blames_this_machine() {
+        let m = exec_silent_peer_own_link("alpha", 15, OwnLink::Slow { signaling_ms: 9200 });
+        assert!(m.contains("did not answer within 15s") && m.contains("this machine's own connection"), "{m}");
+        assert!(!m.contains("is offline") && !m.contains("not running there"), "{m}");
     }
 
     #[test]
