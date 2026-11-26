@@ -306,17 +306,7 @@ mod imp {
             // clean "no warm path"; the link itself is left to its own
             // keepalive (a slow answer is not proof it is dead).
             let window = preflight_window(&t);
-            let mut probe = probes.register(&peer, &pid);
-            let sent = t
-                .send_control(&crate::daemon_ctl::liveness_ping(probe.nonce()))
-                .await
-                .is_ok();
-            let answered = sent
-                && matches!(
-                    tokio::time::timeout(window, probe.answered()).await,
-                    Ok(true)
-                );
-            drop(probe);
+            let answered = link_answers(&t, &probes, &peer, &pid, window).await;
             if !answered {
                 log.debug(&format!(
                     "warm-send: link to '{peer}' did not answer a preflight ping in {}ms; cold fallback",
@@ -329,6 +319,72 @@ mod imp {
             run(t, pid, peer, ids, route, log, req).await;
         });
     }
+
+    /// Datagrams this end has received on the link's QUIC connection, when it
+    /// has one. Any increase is the peer's QUIC stack answering.
+    fn rx_datagrams(t: &Arc<dyn Transport>) -> Option<u64> {
+        t.quic_connection().map(|c| c.stats().udp_rx.datagrams)
+    }
+
+    /// Does the peer answer on this link within `window`? Its daemon's pong
+    /// says so, and so does any datagram its QUIC stack sends back (the ack of
+    /// the ping, a keepalive): those are answered below the application, so a
+    /// ping queued behind a large frame on a slow link still counts as heard.
+    /// A peer whose process is gone sends neither.
+    async fn link_answers(
+        t: &Arc<dyn Transport>,
+        probes: &crate::daemon_ctl::LivenessProbes,
+        peer: &str,
+        pid: &str,
+        window: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + window;
+        let rx0 = rx_datagrams(t);
+        let mut probe = probes.register(peer, pid);
+        let ping = crate::daemon_ctl::liveness_ping(probe.nonce());
+        let sent = tokio::time::timeout_at(deadline, t.send_control(&ping)).await;
+        if matches!(sent, Ok(Err(_))) {
+            return false;
+        }
+        let heard = || match (rx0, rx_datagrams(t)) {
+            (Some(a), Some(b)) => b > a,
+            _ => false,
+        };
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let answered = {
+            let pong = probe.answered();
+            tokio::pin!(pong);
+            loop {
+                tokio::select! {
+                    ok = &mut pong => break ok,
+                    _ = tick.tick() => {
+                        if heard() {
+                            break true;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            break false;
+                        }
+                    }
+                }
+            }
+        };
+        drop(probe);
+        answered
+    }
+
+    /// The largest data frame the session puts on the link. On a link with a
+    /// real round trip, a client chunk is split into frames a receiver sees
+    /// arrive steadily: it judges a transfer stalled by the time between whole
+    /// frames, and the daemon's own control frames wait behind whichever frame
+    /// is being written. A local link takes the client's chunk as it is.
+    fn data_piece(t: &Arc<dyn Transport>) -> usize {
+        match t.rtt_ms() {
+            Some(ms) if ms > 20 => SLOW_LINK_PIECE.min(t.max_payload()),
+            _ => t.max_payload(),
+        }
+        .max(1)
+    }
+    const SLOW_LINK_PIECE: usize = 64 * 1024;
 
     enum Out {
         Frame(u8, Vec<u8>),
@@ -421,8 +477,13 @@ mod imp {
                             if crate::l2::is_l2_sid(sid) || !in_range(sid, base, n_sids) {
                                 continue;
                             }
-                            if t.send_frame(sid, off, bytes).await.is_err() {
-                                return "the warm link died";
+                            let piece = data_piece(&t);
+                            let mut at = off;
+                            for chunk in bytes.chunks(piece) {
+                                if t.send_frame(sid, at, chunk).await.is_err() {
+                                    return "the warm link died";
+                                }
+                                at += chunk.len() as u64;
                             }
                         }
                         (WS_FLUSH, payload) => {
