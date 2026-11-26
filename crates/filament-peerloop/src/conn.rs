@@ -6671,6 +6671,64 @@ impl Conn {
         }
     }
 
+    /// File a link the local daemon carries for a one-shot send (warm send,
+    /// `l2::warm_send`) under `pid`, as a pre-authenticated direct link to the
+    /// known device `name`. The daemon's link is identity-proven (it only
+    /// offers one it holds a verified binding for) and direct; this process
+    /// never dialed it, so there is no pending attempt to match and no worker
+    /// to stripe over. The caller emits the ready event, as for any link.
+    /// Refuses (false) a transport with no source identity, or a `pid` that is
+    /// already filed: a warm link never replaces anything.
+    pub fn adopt_warm_link(
+        &mut self,
+        pid: &str,
+        t: Arc<dyn Transport>,
+        name: &str,
+        secret: &str,
+        route: &'static str,
+    ) -> bool {
+        let Some(source) = t.source_id() else {
+            return false;
+        };
+        if self.links.contains_key(pid) {
+            return false;
+        }
+        self.next_gen += 1;
+        let generation = self.next_gen;
+        self.links.insert(
+            pid.to_string(),
+            Link {
+                peer: None,
+                info: json!({ "id": pid, "name": name }),
+                name: name.to_string(),
+                uid: None,
+                transport: Some(t),
+                workers: vec![],
+                generation,
+                source,
+                attempt: None,
+                worker_sources: HashSet::new(),
+                attempts: 0,
+                trusted: true,
+                verified_name: Some(name.to_string()),
+                expected_secret: Some((name.to_string(), secret.to_string())),
+                lan_binding: None,
+                presence: Presence::Ready,
+                direct: true,
+                direct_route: route,
+                established_at: Some(Instant::now()),
+                identity_device_pub: None,
+                identity_user_pub: None,
+                identity_binding: BindingStrength::None,
+                identity_state: IdentityState::Pending,
+                identity_cert_expires: None,
+                principal_kind: PrincipalKind::OwnerDevice,
+                host: self.host.clone(),
+            },
+        );
+        true
+    }
+
     /// Create the Link for a direct connection that won the race. `peer: None`
     /// (no WebRTC), `direct: true`, `trusted: true` (the pair-secret MAC already
     /// proved identity, at least as strong as the DTLS pair-proof it replaces).

@@ -516,6 +516,9 @@ pub async fn handle_warm_req(
         control::ReqKind::Exec { .. } => {
             crate::l2::warm_exec::handle_warm_exec(conn, l2_muxes, tx, probes, req).await
         }
+        control::ReqKind::SendLink { .. } => {
+            crate::l2::warm_send::handle_warm_send(conn, probes, req).await
+        }
         control::ReqKind::Ping { .. } => handle_warm_ping(conn, probes, req).await,
         // Bootstrap is dispatched before this (it defers its reply), so it never
         // reaches here; reject defensively so a future caller falls back to cold.
