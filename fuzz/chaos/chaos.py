@@ -374,6 +374,7 @@ class World:
         self.server_down = 0          # overlapping server.down faults now active
         self.daemons: dict[str, subprocess.Popen | None] = {d: None for d in DEVICES}
         self.hooks: dict[str, dict] = {}
+        self.op_env: dict[str, dict] = {}
         self.incarnation: dict[str, int] = {d: 0 for d in DEVICES}
         self.bin_sha = self._sha(binary)
         self.can_netem = False
@@ -619,7 +620,9 @@ class World:
     def cli(self, d: str, args: list[str], timeout: float) -> tuple[int | None, str, str, float]:
         """Run one CLI command as device d. rc None means it overran `timeout`."""
         t0 = time.monotonic()
-        p = subprocess.Popen(self.as_dev(d, args), env=self.env_for(d), stdout=subprocess.PIPE,
+        # A schedule's `op_env` (diagnosis variants only, e.g. TUNLION_LOG)
+        # reaches the commands a device runs; `hooks` reach only its daemon.
+        p = subprocess.Popen(self.as_dev(d, args), env=self.env_for(d, getattr(self, "op_env", {}).get(d, {})), stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
                              start_new_session=True)
         try:
@@ -1311,6 +1314,13 @@ _NAMES_PATH = re.compile(r"firewall|\bpath\b|relay|\bUDP\b|network between", re.
 # Faults that really can make the peer look offline. A partition between two
 # devices or a degraded link cannot: the peer is still up and announced.
 _PEER_DOWN_FAULTS = {"proc.freeze", "proc.kill", "sig.blackhole", "sig.reset", "net.isolate"}
+# A message that blames the RECEIVER'S STORAGE (a full disk, a name its
+# filesystem refuses). The fuzzer never faults a disk, so on a schedule whose
+# network fault touched the link this is the wrong cause (finding 83e2d5588e:
+# a 4 KiB send whose link was down said bravo might be unable to save it).
+_BLAMES_STORAGE = re.compile(r"full disk|name its filesystem refuses|unable to save", re.I)
+# Faults that can cut or starve the data link between src and dst.
+_LINK_FAULTS = {"net.impair", "net.isolate"}
 # A message that says the problem is on this machine's side (#732, #736).
 _BLAMES_SELF = re.compile(r"this machine's own connection|can't reach the tunlion server from this machine", re.I)
 # Faults on a device's own network path that make such a message true.
@@ -1363,6 +1373,18 @@ def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
         return [{"oracle": "O9-misdiagnosis", "hard": True,
                  "what": f"{r['op']} {src}->{dst} blamed this machine's own connection (rc {r['rc']}), but no "
                          f"fault touched {src}'s network: {err[-180:]}"}]
+    if _BLAMES_STORAGE.search(err):
+        src = r["src"]
+        for f in fault_windows:
+            st = f["step"]
+            if not _overlaps(f, lo, hi):
+                continue
+            on_link = (st["fault"] in _LINK_FAULTS and st.get("target") in (src, dst)) or \
+                (st["fault"] == "net.partition" and {st.get("a"), st.get("b")} == {src, dst})
+            if on_link:
+                return [{"oracle": "O9-misdiagnosis", "hard": True,
+                         "what": f"{r['op']} {src}->{dst} blamed {dst}'s storage (rc {r['rc']}) while a "
+                                 f"{st['fault']} fault was on the link between them: {err[-180:]}"}]
     if not _BLAMES_PEER.search(err) or _NAMES_PATH.search(err):
         return []
     for f in fault_windows:
@@ -1529,6 +1551,7 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
         hooks.setdefault(OWNER, {}).setdefault("TUNLION_LOG", "debug")
     w.visitor_logs = {}
     w.reset_for_run(hooks)
+    w.op_env = copy.deepcopy(sched.get("op_env", {}))
     verdict: dict = {"label": label, "schedule": sched, "findings": [], "ops": [], "faults": []}
 
     # Baseline: the fixture must work before any fault, or the run proves nothing.
@@ -2269,6 +2292,18 @@ def cmd_selftest() -> int:
     ex = dict(blamed, op="exec", src="bravo", dst="alpha", stderr_tail="Error: no answer from 'alpha' - it may be "
               "unresponsive or running a build without exec", dst_signaling_after="connected")
     assert judge_diagnosis(dict(ex, dst="bravo"), part)[0]["oracle"] == "O9-misdiagnosis"
+    # Finding 83e2d5588e: a send whose link was down blamed the receiver's disk.
+    disk = dict(blamed, t_start=11.6, t_end=73.7, stderr_tail="the receiver neither accepted nor refused x.bin in "
+                "60s; it may be unable to save it (a full disk, a name its filesystem refuses)")
+    lossy = [{"step": {"fault": "net.impair", "target": "bravo"}, "start": 8.2, "end": 116.1}]
+    assert judge_diagnosis(disk, lossy)[0]["oracle"] == "O9-misdiagnosis", "a link fault is not a full disk"
+    assert judge_diagnosis(disk, part)[0]["oracle"] == "O9-misdiagnosis"
+    assert judge_diagnosis(disk, [{"step": {"fault": "net.impair", "target": "charlie"}, "start": 0.0,
+                                   "end": 80.0}]) == [], "a fault off the link says nothing about it"
+    assert judge_diagnosis(disk, []) == []
+    linkmsg = dict(disk, stderr_tail="'bravo' neither accepted nor refused x.bin in 60s: the link to it was down "
+                   "for 52s of that wait")
+    assert judge_diagnosis(linkmsg, lossy) == [], "naming the link is the right diagnosis"
     # The adaptive quiet window, on a fake clock and fake counters.
     def storm(series: list[dict]) -> dict:
         t = [0.0]

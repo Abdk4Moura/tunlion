@@ -8,6 +8,11 @@
       "TUNLION_TEST_DIRECT_FLAKY": "1"
     }
   },
+  "op_env": {
+    "alpha": {
+      "TUNLION_LOG": "debug"
+    }
+  },
   "origin": "diagnosis variant of send-slow-lossy-link: same schedule with debug logs on alpha and bravo",
   "seed": 284687184,
   "steps": [
