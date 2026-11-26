@@ -1258,8 +1258,7 @@ pub(crate) async fn send_cmd(
             if let Some(idle) = conn.detect_stall(&active, in_flight, true) {
                 let transport_dead = conn
                     .transport_of(&active)
-                    .map(|t| t.is_dead())
-                    .unwrap_or(false);
+                    .is_some_and(|t| Conn::transport_severed(t.as_ref()));
                 // A dead transport can't pass link_alive (write_framed sees
                 // dead=true and returns Err), but a structurally dead transport
                 // (I/O error, not a vanished peer) IS repairable via the
@@ -2775,7 +2774,7 @@ pub(crate) async fn send_cmd(
                         .active
                         .as_ref()
                         .and_then(|a| conn.transport_of(a))
-                        .is_none_or(|t| t.is_dead());
+                        .is_none_or(|t| Conn::transport_severed(t.as_ref()));
                     let successor = if active_dead {
                         conn.links
                             .iter()
@@ -2784,7 +2783,9 @@ pub(crate) async fn send_cmd(
                                 l.expected_secret
                                     .as_ref()
                                     .is_some_and(|(_, s)| channel_of(s) == channel)
-                                    && l.transport.as_ref().is_some_and(|t| !t.is_dead())
+                                    && l.transport.as_ref().is_some_and(|t| {
+                                        !Conn::transport_severed(t.as_ref())
+                                    })
                             })
                             .map(|(pid, l)| (pid.clone(), l.transport.clone()))
                     } else {

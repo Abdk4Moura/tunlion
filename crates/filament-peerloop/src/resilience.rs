@@ -127,7 +127,7 @@ pub struct LiveObs {
     /// A transport (data channel / QUIC) exists for this link.
     pub transport_up: bool,
     /// The link HAD a transport and every one of them (primary and workers)
-    /// has latched dead. Not the same as `!transport_up`: no transport yet is
+    /// is severed (`Conn::transport_severed`: latched dead or not alive). Not the same as `!transport_up`: no transport yet is
     /// an establishment, a dead one is a link that will never move another
     /// byte and that nothing but this watchdog repairs while its peer
     /// connection still reads connected.
