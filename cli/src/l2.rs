@@ -1015,6 +1015,24 @@ pub(crate) async fn bring_up_to_known(
     LinkGuard,
     crate::diag::Attempt,
 )> {
+    bring_up_to_known_in_span(server, peer_name, relay, role, crate::diag::correlation_id()).await
+}
+
+/// [`bring_up_to_known`] recording its connect span under `span_id`, so a
+/// caller that loses the `Attempt` (an error, or its own deadline dropping
+/// this future) can still read back where THIS bring-up died.
+async fn bring_up_to_known_in_span(
+    server: &str,
+    peer_name: &str,
+    relay: bool,
+    role: &'static str,
+    span_id: String,
+) -> Result<(
+    Arc<dyn Transport>,
+    mpsc::UnboundedReceiver<Ev>,
+    LinkGuard,
+    crate::diag::Attempt,
+)> {
     // A paired device has its own secret. A FLEET sibling is indexed WITHOUT one
     // (design-fleet-automesh.md), so fall back to the fleet secret, which is what
     // the daemon dials such peers with. `fleet_mode` matters at the return sites:
@@ -1089,7 +1107,7 @@ pub(crate) async fn bring_up_to_known(
     // L2Open round trip and the final `up`. We start in Signaling (socket + the
     // first `welcome`); the loop drives the phase transitions below.
     let mut diag =
-        crate::diag::Attempt::new(server, &crate::diag::peer_hash_from_secret(&secret), role);
+        crate::diag::Attempt::with_id(span_id, server, &crate::diag::peer_hash_from_secret(&secret), role);
     // Latch so we record the Presence->Establishing transition exactly once
     // (the loop dequeues a candidate every time `peer` is idle, but the connect
     // lifecycle's "establishing" begins at the FIRST candidate).
@@ -1919,7 +1937,10 @@ pub async fn establish_probe_within(
     let probe_secs = doctor_probe_secs(timeout_secs);
     let deadline = std::time::Duration::from_secs(probe_secs);
 
-    match tokio::time::timeout(deadline, bring_up_to_known(server, peer, relay, "doctor")).await {
+    // The span id is ours, so a failure reads back THIS probe's ladder, not
+    // whichever process wrote to the shared diag JSONL last.
+    let span_id = crate::diag::correlation_id();
+    match tokio::time::timeout(deadline, bring_up_to_known_in_span(server, peer, relay, "doctor", span_id.clone())).await {
         Ok(Ok((t, rx, guard, mut diag))) => {
             // The link is up (Ready recorded). Exercise the L2Open round trip the
             // same way netcat does: pump inbound events, open one stream (sends
@@ -1966,7 +1987,7 @@ pub async fn establish_probe_within(
             // bring_up_to_known recorded `fail` on its (now-consumed) Attempt and
             // wrote the partial ladder to the JSONL. Read it back so the verdict
             // can name where it died, the SAME timings a live connect recorded.
-            let (timings, failed_phase) = match crate::diag::latest_span_ladder() {
+            let (timings, failed_phase) = match crate::diag::span_ladder(&span_id) {
                 Some((t, p)) => (t, Some(p)),
                 None => (Vec::new(), None),
             };
@@ -1982,7 +2003,7 @@ pub async fn establish_probe_within(
         Err(_elapsed) => {
             // The outer wall fired: the bring-up is still running (the Attempt was
             // never returned). Recover whatever ladder it logged so far.
-            let (timings, failed_phase) = match crate::diag::latest_span_ladder() {
+            let (timings, failed_phase) = match crate::diag::span_ladder(&span_id) {
                 Some((t, p)) => (t, Some(p)),
                 None => (Vec::new(), None),
             };
