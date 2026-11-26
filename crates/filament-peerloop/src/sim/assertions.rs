@@ -130,13 +130,13 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
     // (c) in clean non-faulted windows outside a 5s post-heal grace, signaling
     // reconnects remain bounded (no defect-1/defect-2 reconnect storm).
     if config.nodes.len() >= 2 && config.duration_ms >= 20_000 {
-        let mut still_bh_nodes: BTreeSet<String> = BTreeSet::new();
         let mut active_partitions: usize = 0;
         let mut active_blackholes: usize = 0;
         let mut last_heal_ms = config.restart_node.as_ref().map_or(0, |(_, _, r)| *r);
         let mut faulted_windows: Vec<(u64, u64)> = Vec::new();
         let mut part_start: Option<u64> = None;
         let mut bh_starts: BTreeMap<String, u64> = BTreeMap::new();
+        let mut node_bh_intervals: BTreeMap<String, Vec<(u64, u64)>> = BTreeMap::new();
 
         if config.semantic_faults.is_empty() {
             for sf in &config.schedule {
@@ -157,14 +157,16 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
                         last_heal_ms = last_heal_ms.max(sf.at_ms);
                     }
                     Fault::BlackholeSignaling { node, active: true } => {
-                        still_bh_nodes.insert(node.clone());
                         bh_starts.entry(node.clone()).or_insert(sf.at_ms);
                         active_blackholes = active_blackholes.saturating_add(1);
                     }
                     Fault::BlackholeSignaling { node, active: false } => {
-                        still_bh_nodes.remove(node);
                         if let Some(s) = bh_starts.remove(node) {
                             faulted_windows.push((s, sf.at_ms + 5_000));
+                            node_bh_intervals
+                                .entry(node.clone())
+                                .or_default()
+                                .push((s, sf.at_ms));
                         }
                         active_blackholes = active_blackholes.saturating_sub(1);
                         last_heal_ms = last_heal_ms.max(sf.at_ms);
@@ -195,13 +197,15 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
                 } else if let Some(rest) = ne.event.strip_prefix("fault:blackhole:") {
                     if let Some((node, active_str)) = rest.rsplit_once(':') {
                         if active_str == "true" {
-                            still_bh_nodes.insert(node.to_string());
                             bh_starts.entry(node.to_string()).or_insert(ne.at_ms);
                             active_blackholes = active_blackholes.saturating_add(1);
                         } else if active_str == "false" {
-                            still_bh_nodes.remove(node);
                             if let Some(s) = bh_starts.remove(node) {
                                 faulted_windows.push((s, ne.at_ms + 5_000));
+                                node_bh_intervals
+                                    .entry(node.to_string())
+                                    .or_default()
+                                    .push((s, ne.at_ms));
                             }
                             active_blackholes = active_blackholes.saturating_sub(1);
                             last_heal_ms = last_heal_ms.max(ne.at_ms);
@@ -213,8 +217,12 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
         if let Some(s) = part_start {
             faulted_windows.push((s, config.duration_ms));
         }
-        for (_, s) in bh_starts {
+        for (node, s) in bh_starts {
             faulted_windows.push((s, config.duration_ms));
+            node_bh_intervals
+                .entry(node)
+                .or_default()
+                .push((s, config.duration_ms));
         }
         if let Some((_, k, r)) = config.restart_node {
             faulted_windows.push((k, r + 5_000));
@@ -222,8 +230,13 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
 
         if let Some((ref rnode, _kill_ms, restart_ms)) = config.restart_node {
             let tail = config.duration_ms.saturating_sub(restart_ms);
-            let still_bh = still_bh_nodes.contains(rnode);
-            if tail >= 10_000 && !still_bh {
+            let bh_blocks_restart = node_bh_intervals.get(rnode).is_some_and(|ivs| {
+                ivs.iter().any(|&(s, e)| {
+                    (s <= restart_ms.saturating_add(5_000) && e >= restart_ms)
+                        || e > config.duration_ms.saturating_sub(10_000)
+                })
+            });
+            if tail >= 10_000 && !bh_blocks_restart {
                 let reconnected = outcome.net_events.iter().any(|ne| {
                     ne.at_ms >= restart_ms && ne.event.starts_with(&format!("sig:connect:{rnode}:"))
                 });
