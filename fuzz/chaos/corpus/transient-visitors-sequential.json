@@ -1,0 +1,120 @@
+{
+ "version": 1,
+ "seed": 11,
+ "origin": "production 2026-11-26: lease workers enrolled on the owner with one reusable runner invitation (add --for runner --reuse N), ran `up` and vanished; the owner re-dialled every departed sid forever ('connection stuck while connecting, retrying (2/5)', ESTABLISH every ~16 s) and, with about 12 zombies in its 16-slot link table, timed out new enrollments. Fixed by #735. 14 sequential visitors; O12 and O13 judge it",
+ "hooks": {},
+ "steps": [
+  {
+   "at": 2.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis1",
+   "stay": 5.0,
+   "act": "send"
+  },
+  {
+   "at": 20.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis2",
+   "stay": 5.0,
+   "act": "none"
+  },
+  {
+   "at": 38.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis3",
+   "stay": 5.0,
+   "act": "none"
+  },
+  {
+   "at": 56.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis4",
+   "stay": 5.0,
+   "act": "send"
+  },
+  {
+   "at": 74.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis5",
+   "stay": 5.0,
+   "act": "none"
+  },
+  {
+   "at": 92.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis6",
+   "stay": 5.0,
+   "act": "none"
+  },
+  {
+   "at": 110.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis7",
+   "stay": 5.0,
+   "act": "send"
+  },
+  {
+   "at": 128.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis8",
+   "stay": 5.0,
+   "act": "none"
+  },
+  {
+   "at": 146.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis9",
+   "stay": 5.0,
+   "act": "none"
+  },
+  {
+   "at": 164.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis10",
+   "stay": 5.0,
+   "act": "send"
+  },
+  {
+   "at": 182.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis11",
+   "stay": 5.0,
+   "act": "none"
+  },
+  {
+   "at": 200.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis12",
+   "stay": 5.0,
+   "act": "none"
+  },
+  {
+   "at": 218.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis13",
+   "stay": 5.0,
+   "act": "send"
+  },
+  {
+   "at": 236.0,
+   "op": "visit",
+   "src": "alpha",
+   "dst": "vis14",
+   "stay": 5.0,
+   "act": "none"
+  }
+ ]
+}
