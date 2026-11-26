@@ -460,16 +460,41 @@ pub struct StdoutSink<W: std::io::Write> {
     pending: std::collections::BTreeMap<u64, Vec<u8>>,
     pending_bytes: usize,
     hasher: Sha256,
+    /// Every byte any sink of this process put on the same output, and what
+    /// that count stood at when this sink opened. The digest above covers only
+    /// THIS sink's bytes, so on its own it said "verified" while another sink
+    /// (a re-offer of the same transfer that opened a second stream) had put
+    /// its own bytes on stdout too: the reader got the file plus a prefix and
+    /// both ends reported success. The verdict now also requires that nothing
+    /// but this sink wrote to the output while it was open.
+    shared: Arc<AtomicU64>,
+    base: u64,
+}
+
+/// What every `-o -` sink of this process has written to fd 1, in total.
+pub fn process_stdout_written() -> Arc<AtomicU64> {
+    static W: std::sync::OnceLock<Arc<AtomicU64>> = std::sync::OnceLock::new();
+    W.get_or_init(|| Arc::new(AtomicU64::new(0))).clone()
 }
 
 impl<W: std::io::Write> StdoutSink<W> {
+    /// A sink that is the only writer of `out`.
     pub fn new(out: W) -> Self {
+        Self::sharing(out, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// A sink on an output other sinks may also write: `shared` counts every
+    /// byte any of them put there (see [`process_stdout_written`]).
+    pub fn sharing(out: W, shared: Arc<AtomicU64>) -> Self {
+        let base = shared.load(Ordering::SeqCst);
         StdoutSink {
             out,
             next: 0,
             pending: Default::default(),
             pending_bytes: 0,
             hasher: Sha256::new(),
+            shared,
+            base,
         }
     }
 
@@ -492,6 +517,7 @@ impl<W: std::io::Write> StdoutSink<W> {
         self.out.write_all(data)?;
         self.hasher.update(data);
         self.next += data.len() as u64;
+        self.shared.fetch_add(data.len() as u64, Ordering::SeqCst);
         Ok(())
     }
 
@@ -540,6 +566,15 @@ impl<W: std::io::Write> StdoutSink<W> {
     /// The verdict once the sender said the stream ended: every byte out, and
     /// (when the sender offered one) the digest of what was written matches.
     pub fn verdict(&self, size: u64, full: Option<&str>) -> std::result::Result<(), String> {
+        let on_output = self.shared.load(Ordering::SeqCst).saturating_sub(self.base);
+        if on_output != self.next {
+            return Err(format!(
+                "{} reached stdout while this stream wrote {} of it: another stream wrote to \
+                 stdout too, so what stdout holds is not this file (it cannot be rewound)",
+                human(on_output),
+                human(self.next)
+            ));
+        }
         if self.next != size {
             return Err(format!(
                 "the stream to stdout ended after {} of {}",
@@ -1392,6 +1427,44 @@ mod tests {
             .unwrap_err()
             .contains("SHA-256"));
         assert!(s.verdict(20_000, None).unwrap_err().contains("ended after"));
+    }
+
+    /// T3's false success: a re-offer of the same transfer opened a second
+    /// sink on stdout. The first had written 60 KiB, the second wrote the whole
+    /// file, and its own digest matched, so both ends said "verified" while the
+    /// reader held 60 KiB too much. Sinks on one output now account for each
+    /// other: neither may pass once the other wrote too.
+    #[test]
+    fn two_sinks_on_one_stdout_never_verify() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 13 % 251) as u8).collect();
+        let full = sha256_hex(&data);
+        let shared = Arc::new(AtomicU64::new(0));
+        let mut first = StdoutSink::sharing(Pipe(Vec::new()), shared.clone());
+        first.put(0, &data[..61_440]).unwrap();
+        let mut second = StdoutSink::sharing(Pipe(Vec::new()), shared.clone());
+        second.put(0, &data).unwrap();
+        assert_eq!(second.digest(), full, "the second sink's own bytes are the file");
+        let why = second.verdict(data.len() as u64, Some(&full)).unwrap_err();
+        assert!(why.contains("another stream"), "{why}");
+        assert!(first.verdict(data.len() as u64, Some(&full)).is_err());
+    }
+
+    /// The fix's shape: the re-offer continues the ONE sink from what it wrote,
+    /// and late chunks from the old stream are skipped, so stdout holds the
+    /// file exactly once and the verdict is about those bytes.
+    #[test]
+    fn reoffer_continues_the_same_sink_exactly_once() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 13 % 251) as u8).collect();
+        let full = sha256_hex(&data);
+        let shared = Arc::new(AtomicU64::new(0));
+        let mut s = StdoutSink::sharing(Pipe(Vec::new()), shared.clone());
+        s.put(0, &data[..61_440]).unwrap();
+        let resume_at = s.written();
+        s.put(resume_at, &data[resume_at as usize..]).unwrap();
+        s.put(40_000, &data[40_000..70_000]).unwrap(); // the old stream, late
+        assert_eq!(s.out.0, data);
+        assert_eq!(shared.load(Ordering::SeqCst), data.len() as u64);
+        assert_eq!(s.verdict(data.len() as u64, Some(&full)), Ok(()));
     }
 
     /// An early chunk is held only up to the bound, never without limit.

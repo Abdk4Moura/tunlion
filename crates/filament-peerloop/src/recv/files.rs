@@ -307,6 +307,17 @@ pub async fn sweep_completed_streams(
                     let _ = f.sync_all();
                 })
                 .await;
+                // Every byte arrived, but arriving is not what stdout holds:
+                // count it complete only when what was WRITTEN is the file.
+                if let Some(sink) = &inc.stdout {
+                    let verdict = sink
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("the stdout writer for {} failed", inc.name))?
+                        .verdict(inc.size, inc.full.as_deref());
+                    if let Err(why) = verdict {
+                        anyhow::bail!("{}: {why}", inc.name);
+                    }
+                }
                 *completed += 1;
                 senders.extend(inc.sender.clone());
                 continue;
