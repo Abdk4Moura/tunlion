@@ -903,6 +903,11 @@ pub(crate) async fn send_cmd(
         .map(Duration::from_secs)
         .unwrap_or(SEND_ANSWER_WAIT);
     let mut answer_clock: Option<Instant> = None;
+    // The last moment the link to the receiver was seen down. An offer that
+    // went unanswered while it was down was most likely never delivered, so
+    // the no-answer bound says so instead of blaming the receiver's disk
+    // (chaos finding 83e2d5588e).
+    let mut link_seen_down: Option<Instant> = None;
     let mut receiver_asking = false;
     // The receiver the unfinished files were last offered to (its signaling id).
     let mut offered_to: Option<String> = None;
@@ -945,6 +950,7 @@ pub(crate) async fn send_cmd(
             None => established,
         };
         if link_down {
+            link_seen_down = Some(Instant::now());
             let unfinished = outgoing.lock().await.iter().any(|o| !o.done && !o.declined);
             if unfinished {
                 let since = *link_down_since.get_or_insert_with(Instant::now);
@@ -1002,25 +1008,18 @@ pub(crate) async fn send_cmd(
                         .map(|o| o.name.clone())
                         .collect();
                     if !waiting.is_empty() {
+                        let link = answer_link_state(
+                            since,
+                            link_seen_down,
+                            link_down_since.filter(|_| link_down),
+                        );
+                        let (line, reason) =
+                            no_answer_message(&peer_label, &waiting.join(", "), answer_wait.as_secs(), link);
                         ui::clear_sticky();
-                        ui::critical(&ui::paint(
-                            ui::Tone::Err,
-                            &format!(
-                                "  the receiver neither accepted nor refused {} in {}s; it may be unable to save it (a full disk, a name its filesystem refuses). Its log says why: `tunlion logs` there. (TUNLION_SEND_STALL_SECS changes this bound, 0 disables it.)",
-                                waiting.join(", "),
-                                answer_wait.as_secs()
-                            ),
-                        ));
+                        ui::critical(&ui::paint(ui::Tone::Err, &line));
                         let _ = sio.disconnect().await;
                         // Said above; exit as "did not answer in time".
-                        return Err(exit_codes::reported_because(
-                            ExitKind::Unreachable,
-                            format!(
-                                "the receiver neither accepted nor refused {} in {}s; it may be unable to save it",
-                                waiting.join(", "),
-                                answer_wait.as_secs()
-                            ),
-                        ));
+                        return Err(exit_codes::reported_because(ExitKind::Unreachable, reason));
                     }
                     answer_clock = None;
                 }
@@ -3644,6 +3643,95 @@ pub(crate) fn no_peer_hint(to: Option<&str>, use_code: bool, room: Option<&str>)
         }
         (None, false, Some(r)) => format!("is a receiver waiting in room '{r}'?"),
         _ => "is a receiver running on this network?".to_string(),
+    }
+}
+
+/// What the link to the receiver did while an offer waited for its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnswerLink {
+    /// Never seen down: the receiver had the offer and said nothing.
+    Up,
+    /// Down for this many seconds and still down when the bound ran out.
+    DownFor(u64),
+    /// Down at some point during the wait, back up at the end.
+    WasDown,
+}
+
+/// Classify the link during the answer wait that started at `wait_started`.
+/// `seen_down` is the last moment it was seen down, `down_since` when the
+/// current outage began (None when it is up now). Pure but for the clock.
+fn answer_link_state(
+    wait_started: Instant,
+    seen_down: Option<Instant>,
+    down_since: Option<Instant>,
+) -> AnswerLink {
+    if let Some(t) = down_since {
+        return AnswerLink::DownFor(t.max(wait_started).elapsed().as_secs());
+    }
+    match seen_down {
+        Some(t) if t >= wait_started => AnswerLink::WasDown,
+        _ => AnswerLink::Up,
+    }
+}
+
+/// The line printed and the reason recorded when an offer got no answer
+/// within the bound. A link that was down during the wait is the cause most
+/// likely true there (the offer may never have arrived), so the receiver's
+/// storage is blamed only when the link stayed up: finding 83e2d5588e had a
+/// send over a lossy link say "a full disk" after 52 s of "the link is down".
+fn no_answer_message(peer: &str, names: &str, secs: u64, link: AnswerLink) -> (String, String) {
+    let reason = match link {
+        AnswerLink::Up => {
+            return (
+                format!(
+                    "  the receiver neither accepted nor refused {names} in {secs}s; it may be unable to save it (a full disk, a name its filesystem refuses). Its log says why: `tunlion logs` there. (TUNLION_SEND_STALL_SECS changes this bound, 0 disables it.)"
+                ),
+                format!("the receiver neither accepted nor refused {names} in {secs}s; it may be unable to save it"),
+            )
+        }
+        AnswerLink::DownFor(down) => format!(
+            "no answer from {peer} to the offer of {names} in {secs}s: the link to it has been down for {down}s and is not back, so the offer may never have reached it"
+        ),
+        AnswerLink::WasDown => format!(
+            "no answer from {peer} to the offer of {names} in {secs}s: the link to it went down during the wait, so the offer may never have reached it"
+        ),
+    };
+    (
+        format!(
+            "  {reason}. Check the network between the two machines and re-run the same `tunlion send`; it continues from any partial. (TUNLION_SEND_STALL_SECS changes this bound, 0 disables it.)"
+        ),
+        reason,
+    )
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    use super::*;
+
+    #[test]
+    fn a_link_down_during_the_wait_is_named_not_the_disk() {
+        let (line, reason) = no_answer_message("'bravo'", "a.bin", 60, AnswerLink::DownFor(52));
+        assert!(line.contains("down for 52s") && line.contains("'bravo'") && line.contains("a.bin"), "{line}");
+        assert!(!line.contains("disk") && !line.contains("filesystem"), "{line}");
+        assert!(reason.contains("link") && !reason.contains("unable to save"), "{reason}");
+        let (line, _) = no_answer_message("'bravo'", "a.bin", 60, AnswerLink::WasDown);
+        assert!(line.contains("went down during the wait") && !line.contains("disk"), "{line}");
+        // A link that stayed up: the receiver had the offer, its storage is the
+        // likely cause, as before.
+        let (line, reason) = no_answer_message("'bravo'", "a.bin", 60, AnswerLink::Up);
+        assert!(line.contains("full disk") && reason.contains("unable to save"), "{line}");
+    }
+
+    #[test]
+    fn the_link_state_counts_only_this_wait() {
+        let start = Instant::now();
+        let before = start - Duration::from_secs(5);
+        assert_eq!(answer_link_state(start, None, None), AnswerLink::Up);
+        // Down before this offer went out, up since: not this wait's cause.
+        assert_eq!(answer_link_state(start, Some(before), None), AnswerLink::Up);
+        assert_eq!(answer_link_state(start, Some(start), None), AnswerLink::WasDown);
+        // An outage that began before the wait counts from the wait.
+        assert!(matches!(answer_link_state(start, Some(start), Some(before)), AnswerLink::DownFor(0)));
     }
 }
 
