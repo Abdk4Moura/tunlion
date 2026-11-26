@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::sim::assertions::{evaluate_oracles, OracleKind, OracleViolation};
 use crate::sim::net::{Fault, HangSite, Proto, SimRng};
+use crate::sim::semantic::{ProtoEvent, SemanticAction, SemanticFault, SemanticTrigger, StateEdge};
 use crate::sim::world::{NodeSpec, ScheduledFault, SimConfig, SimMutant, SimOutcome, SimWorld};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub struct GuideFlags {
     pub timer_edges: bool,
     pub sometimes: bool,
     pub hill_climb: bool,
+    pub semantic: bool,
     pub target_phase: Option<String>,
 }
 
@@ -49,6 +51,21 @@ impl GuideFlags {
         }
     }
 
+    pub fn semantic_only() -> Self {
+        Self {
+            semantic: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn swarm_semantic() -> Self {
+        Self {
+            swarm: true,
+            semantic: true,
+            ..Self::default()
+        }
+    }
+
     pub fn married() -> Self {
         // Empirical Drop Rule: keep only `swarm`, which beat or tied `unguided`
         // across all 4 primary rediscovery targets. `sometimes`, `timer_edges`,
@@ -58,6 +75,7 @@ impl GuideFlags {
             timer_edges: false,
             sometimes: false,
             hill_climb: false,
+            semantic: false,
             target_phase: None,
         }
     }
@@ -92,6 +110,8 @@ pub struct CampaignReport {
     pub total_wall_ms: u64,
     pub findings: Vec<Finding>,
     pub milestone_counts: BTreeMap<String, usize>,
+    pub state_edges: BTreeSet<StateEdge>,
+    pub state_edges_discovered: usize,
     pub max_iter_busy_ms_seen: u64,
     pub max_cap_status_latency_ms_seen: u64,
 }
@@ -122,6 +142,7 @@ struct FuzzSchedule {
     hang: Option<(usize, HangSite, u64, u64)>,
     restart: Option<(usize, u64, u64)>,
     status_query: Option<(usize, u64)>,
+    semantic_faults: Vec<SemanticFault>,
 }
 
 const NODE_NAMES: [&str; 3] = ["alpha", "bravo", "charlie"];
@@ -275,19 +296,21 @@ impl FuzzSchedule {
             inline_stall_injection: None,
             mutant,
             quiet_logs: false,
+            semantic_faults: self.semantic_faults.clone(),
         }
     }
 
     fn summary(&self) -> String {
         format!(
-            "seed={} impair={:?} part={:?} bh={:?} hang={:?} restart={:?} status={:?}",
+            "seed={} impair={:?} part={:?} bh={:?} hang={:?} restart={:?} status={:?} sem={}",
             self.sim_seed,
             self.impair_range,
             self.partition,
             self.blackhole,
             self.hang,
             self.restart,
-            self.status_query
+            self.status_query,
+            self.semantic_faults.len()
         )
     }
 }
@@ -387,11 +410,11 @@ fn generate_schedule(
         let b = rng.gen_range_u64(2) as usize;
         (a, b, rng.chance_pct(60), s, e)
     });
-    let blackhole = (mask.blackhole && rng.chance_pct(bh_prob)).then(|| {
+    let mut blackhole = (mask.blackhole && rng.chance_pct(bh_prob)).then(|| {
         let (s, e) = pick_window(rng, 3_000, 40_000, true);
         (rng.gen_range_u64(3) as usize, s, e)
     });
-    let hang = (mask.hang && rng.chance_pct(hang_prob)).then(|| {
+    let mut hang = (mask.hang && rng.chance_pct(hang_prob)).then(|| {
         let site = if allow_gather_hang && rng.chance_pct(35) {
             HangSite::GatherCandidates
         } else if rng.chance_pct(50) {
@@ -403,12 +426,12 @@ fn generate_schedule(
         let dur = 1_100 + rng.gen_range_u64(2_400);
         (rng.gen_range_u64(3) as usize, site, at_ms, dur)
     });
-    let restart = (mask.restart && rng.chance_pct(restart_prob)).then(|| {
+    let mut restart = (mask.restart && rng.chance_pct(restart_prob)).then(|| {
         let k = 2_000 + rng.gen_range_u64(35_000);
         let gap = 1_000 + rng.gen_range_u64(6_000);
         (rng.gen_range_u64(3) as usize, k, (k + gap).min(duration_ms - 5_000))
     });
-    let status_query = (mask.status_query && rng.chance_pct(status_prob)).then(|| {
+    let mut status_query = (mask.status_query && rng.chance_pct(status_prob)).then(|| {
         let node = rng.gen_range_u64(3) as usize;
         let mut at = if flags.timer_edges {
             pick_boundary_value(rng, 4_000, 52_000)
@@ -423,6 +446,102 @@ fn generate_schedule(
         (node, at)
     });
 
+    let mut semantic_faults = Vec::new();
+    if flags.semantic && rng.chance_pct(65) {
+        if let Some((bh_idx, _, _)) = blackhole {
+            let bh_node = NODE_NAMES[bh_idx % 3].to_string();
+            blackhole = None;
+            semantic_faults.push(SemanticFault {
+                trigger: SemanticTrigger::OnEvent {
+                    node: Some(bh_node.clone()),
+                    event: ProtoEvent::SigConnected,
+                    nth: 1,
+                },
+                delay_ms: 40 + rng.gen_range_u64(160),
+                action: SemanticAction::ApplyFault(Fault::BlackholeSignaling {
+                    node: bh_node.clone(),
+                    active: true,
+                }),
+            });
+            let boundary = if rng.chance_pct(60) { 15_000 } else { 30_000 };
+            let jitter = (rng.gen_range_u64(801) as i64) - 400;
+            semantic_faults.push(SemanticFault {
+                trigger: SemanticTrigger::OnSilenceBoundary {
+                    node: bh_node.clone(),
+                    boundary_ms: boundary,
+                    jitter_ms: jitter,
+                },
+                delay_ms: 0,
+                action: SemanticAction::HealBlackhole {
+                    node: bh_node.clone(),
+                },
+            });
+            if status_query.is_some() {
+                status_query = None;
+                if rng.chance_pct(60) {
+                    semantic_faults.push(SemanticFault {
+                        trigger: SemanticTrigger::OnEvent {
+                            node: Some(bh_node.clone()),
+                            event: ProtoEvent::SigBlackholeHealed,
+                            nth: 1,
+                        },
+                        delay_ms: 40 + rng.gen_range_u64(200),
+                        action: SemanticAction::QueryCapStatus {
+                            node: bh_node.clone(),
+                        },
+                    });
+                } else {
+                    semantic_faults.push(SemanticFault {
+                        trigger: SemanticTrigger::OnEvent {
+                            node: Some(bh_node.clone()),
+                            event: ProtoEvent::SigHeartbeatUnderBlackhole,
+                            nth: 1,
+                        },
+                        delay_ms: 40 + rng.gen_range_u64(200),
+                        action: SemanticAction::QueryCapStatus {
+                            node: bh_node.clone(),
+                        },
+                    });
+                }
+            }
+            if restart.is_some() && rng.chance_pct(50) {
+                restart = None;
+                let rnode = NODE_NAMES[rng.gen_range_u64(3) as usize].to_string();
+                let down_ms = 1_200 + rng.gen_range_u64(2_800);
+                semantic_faults.push(SemanticFault {
+                    trigger: SemanticTrigger::OnEvent {
+                        node: None,
+                        event: ProtoEvent::SigHeartbeatUnderBlackhole,
+                        nth: 1,
+                    },
+                    delay_ms: 50 + rng.gen_range_u64(300),
+                    action: SemanticAction::RestartPeer {
+                        node: rnode,
+                        down_ms,
+                    },
+                });
+            }
+        } else if allow_gather_hang {
+            if let Some((hn, HangSite::GatherCandidates, _, dur)) = hang {
+                let hnode = NODE_NAMES[hn % 3].to_string();
+                hang = None;
+                semantic_faults.push(SemanticFault {
+                    trigger: SemanticTrigger::OnEvent {
+                        node: Some(hnode.clone()),
+                        event: ProtoEvent::SigConnected,
+                        nth: 1,
+                    },
+                    delay_ms: 20,
+                    action: SemanticAction::ApplyFault(Fault::Hang {
+                        node: hnode,
+                        site: HangSite::GatherCandidates,
+                        duration_ms: dur,
+                    }),
+                });
+            }
+        }
+    }
+
     FuzzSchedule {
         sim_seed: rng.next_u64(),
         duration_ms,
@@ -435,6 +554,7 @@ fn generate_schedule(
         hang,
         restart,
         status_query,
+        semantic_faults,
     }
 }
 
@@ -442,6 +562,7 @@ fn generate_schedule(
 struct CorpusEntry {
     sched: FuzzSchedule,
     milestones: BTreeSet<String>,
+    edges: BTreeSet<StateEdge>,
     score: u64,
 }
 
@@ -456,7 +577,7 @@ fn mutate_schedule(
     let fresh = generate_schedule(rng, flags, allow_gather_hang);
 
     // Perform 1 targeted structural/timing mutation per child.
-    match rng.gen_range_u64(6) {
+    match rng.gen_range_u64(7) {
         0 => s.impair_range = fresh.impair_range,
         1 => {
             if flags.swarm && rng.chance_pct(45) {
@@ -493,7 +614,7 @@ fn mutate_schedule(
                 s.restart = fresh.restart;
             }
         }
-        _ => {
+        5 => {
             let node = rng.gen_range_u64(3) as usize;
             let mut at = if flags.timer_edges {
                 pick_boundary_value(rng, 4_000, 52_000)
@@ -507,6 +628,13 @@ fn mutate_schedule(
             }
             s.status_query = Some((node, at));
         }
+        _ => {
+            s.semantic_faults = fresh.semantic_faults;
+        }
+    }
+    if flags.swarm && rng.chance_pct(35) {
+        s.partition = None;
+        s.impair_range = None;
     }
     s
 }
@@ -518,6 +646,7 @@ fn is_trivial_startup_milestone(name: &str) -> bool {
 fn select_parent_idx(
     corpus: &[CorpusEntry],
     milestone_counts: &BTreeMap<String, usize>,
+    edge_counts: &BTreeMap<StateEdge, usize>,
     rng: &mut SimRng,
     flags: &GuideFlags,
 ) -> usize {
@@ -539,6 +668,17 @@ fn select_parent_idx(
                     })
                     .sum();
                 w = w.saturating_add(rarity);
+            }
+            if flags.semantic {
+                let edge_rarity: u64 = entry
+                    .edges
+                    .iter()
+                    .map(|e| {
+                        let c = edge_counts.get(e).copied().unwrap_or(1).max(1) as u64;
+                        5_000 / c.saturating_mul(c).max(1)
+                    })
+                    .sum();
+                w = w.saturating_add(edge_rarity);
             }
             if flags.hill_climb {
                 w = w.saturating_add(entry.score);
@@ -620,6 +760,8 @@ impl Fuzzer {
             total_wall_ms: t0.elapsed().as_millis() as u64,
             findings: Vec::new(),
             milestone_counts: BTreeMap::new(),
+            state_edges: BTreeSet::new(),
+            state_edges_discovered: 0,
             max_iter_busy_ms_seen: 0,
             max_cap_status_latency_ms_seen: 0,
         };
@@ -632,10 +774,13 @@ impl Fuzzer {
             for (k, v) in rep.milestone_counts {
                 *merged.milestone_counts.entry(k).or_insert(0) += v;
             }
+            merged.state_edges.extend(rep.state_edges);
             if merged.findings.is_empty() || !campaign.stop_on_first_finding {
                 merged.findings.extend(rep.findings);
             }
         }
+        merged.state_edges_discovered = merged.state_edges.len();
+        merged.total_wall_ms = t0.elapsed().as_millis() as u64;
         merged
     }
 
@@ -644,6 +789,8 @@ impl Fuzzer {
         let mut rng = SimRng::new(campaign.seed);
         let mut findings = Vec::new();
         let mut milestone_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut seen_edges: BTreeSet<StateEdge> = BTreeSet::new();
+        let mut edge_counts: BTreeMap<StateEdge, usize> = BTreeMap::new();
         let mut corpus: Vec<CorpusEntry> = Vec::new();
         let mut max_iter_busy_ms_seen = 0u64;
         let mut max_cap_status_latency_ms_seen = 0u64;
@@ -651,7 +798,8 @@ impl Fuzzer {
         let mut best_busy_slope = 0u64;
         let mut runs_executed = 0usize;
 
-        let corpus_active = campaign.flags.sometimes || campaign.flags.hill_climb;
+        let corpus_active =
+            campaign.flags.sometimes || campaign.flags.hill_climb || campaign.flags.semantic;
 
         for run_idx in 0..campaign.max_runs {
             if stop_flag.is_some_and(|f| f.load(Ordering::Acquire)) {
@@ -659,7 +807,13 @@ impl Fuzzer {
             }
             runs_executed = run_idx + 1;
             let sched = if corpus_active && !corpus.is_empty() && rng.chance_pct(40) {
-                let idx = select_parent_idx(&corpus, &milestone_counts, &mut rng, &campaign.flags);
+                let idx = select_parent_idx(
+                    &corpus,
+                    &milestone_counts,
+                    &edge_counts,
+                    &mut rng,
+                    &campaign.flags,
+                );
                 mutate_schedule(
                     &corpus[idx].sched,
                     &mut rng,
@@ -672,6 +826,14 @@ impl Fuzzer {
             let mut cfg = sched.to_sim_config(campaign.mutant.clone());
             cfg.quiet_logs = campaign.quiet_logs;
             let outcome: SimOutcome = SimWorld::run(cfg.clone());
+
+            let mut discovered_new_edge = false;
+            for edge in &outcome.state_edges {
+                if seen_edges.insert(*edge) {
+                    discovered_new_edge = true;
+                }
+                *edge_counts.entry(*edge).or_insert(0) += 1;
+            }
 
             let mut hit_rare_milestone = false;
             let mut hit_set = BTreeSet::new();
@@ -703,13 +865,17 @@ impl Fuzzer {
                 best_busy_slope = best_busy_slope.max(busy_slope);
             }
 
-            if (campaign.flags.sometimes && hit_rare_milestone) || improved_hill {
+            if (campaign.flags.sometimes && hit_rare_milestone)
+                || (campaign.flags.semantic && discovered_new_edge)
+                || improved_hill
+            {
                 if corpus.len() >= 64 {
                     corpus.remove(0);
                 }
                 corpus.push(CorpusEntry {
                     sched: sched.clone(),
                     milestones: hit_set,
+                    edges: outcome.state_edges.clone(),
                     score: hill_score,
                 });
             }
@@ -777,11 +943,14 @@ impl Fuzzer {
             }
         }
 
+        let state_edges_discovered = seen_edges.len();
         CampaignReport {
             runs_executed,
             total_wall_ms: t0.elapsed().as_millis() as u64,
             findings,
             milestone_counts,
+            state_edges: seen_edges,
+            state_edges_discovered,
             max_iter_busy_ms_seen,
             max_cap_status_latency_ms_seen,
         }

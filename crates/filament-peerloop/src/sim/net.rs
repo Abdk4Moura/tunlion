@@ -19,6 +19,9 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
 use crate::sim::assertions::record_sometimes;
+use crate::sim::semantic::{
+    NodeStateTracker, ProtoEvent, SignalMsgKind, StateEdge, StateTransition,
+};
 use crate::sim::world::SimMutant;
 
 /// Deterministic SplitMix64 PRNG so every simulation run with the same seed
@@ -181,10 +184,19 @@ struct NetInner {
     hangs: BTreeMap<(String, HangSite), u64>,
     direct_waiters: Vec<DirectWaiter>,
     active_closers: BTreeMap<String, Vec<Arc<AtomicBool>>>,
+    tracker: NodeStateTracker,
+    event_tx: Option<mpsc::UnboundedSender<(u64, String, ProtoEvent)>>,
     trace: Vec<NetTraceEvent>,
 }
 
 impl NetInner {
+    fn emit_proto_event(&mut self, node: &str, event: ProtoEvent) {
+        let at_ms = clock::now_ms();
+        self.tracker.record(at_ms, node, event);
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send((at_ms, node.to_string(), event));
+        }
+    }
     fn ensure_node(&mut self, node: &str) -> u16 {
         if let Some(&idx) = self.node_idx.get(node) {
             return idx;
@@ -279,6 +291,8 @@ impl SimNetwork {
                 hangs: BTreeMap::new(),
                 direct_waiters: Vec::new(),
                 active_closers: BTreeMap::new(),
+                tracker: NodeStateTracker::default(),
+                event_tx: None,
                 trace: Vec::new(),
             }),
         })
@@ -353,6 +367,8 @@ impl SimNetwork {
             Fault::Partition { a, b, proto } => {
                 g.record(format!("fault:partition:{a}:{b}:{proto:?}"));
                 g.partitions.insert(NetInner::pair_key(&a, &b), proto);
+                g.emit_proto_event(&a, ProtoEvent::LinkDroppedByPartition);
+                g.emit_proto_event(&b, ProtoEvent::LinkDroppedByPartition);
             }
             Fault::HealPartition { a, b } => {
                 g.record(format!("fault:heal:{a}:{b}"));
@@ -376,8 +392,10 @@ impl SimNetwork {
             Fault::BlackholeSignaling { node, active } => {
                 g.record(format!("fault:blackhole:{node}:{active}"));
                 if active {
+                    g.emit_proto_event(&node, ProtoEvent::SigBlackholeStarted);
                     g.blackholed.insert(node);
                 } else {
+                    g.emit_proto_event(&node, ProtoEvent::SigBlackholeHealed);
                     g.blackholed.remove(&node);
                 }
             }
@@ -396,6 +414,7 @@ impl SimNetwork {
     pub fn disconnect_node(&self, node: &str) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.record(format!("node:disconnect:{node}"));
+        g.emit_proto_event(node, ProtoEvent::SigDisconnected);
         let dead_cids: Vec<u64> = g
             .sig_clients
             .iter()
@@ -431,6 +450,38 @@ impl SimNetwork {
             .unwrap_or_else(|e| e.into_inner())
             .trace
             .clone()
+    }
+
+    pub fn attach_event_bus(&self, tx: mpsc::UnboundedSender<(u64, String, ProtoEvent)>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .event_tx = Some(tx);
+    }
+
+    pub fn record_proto_event(&self, node: &str, event: ProtoEvent) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .emit_proto_event(node, event);
+    }
+
+    pub fn state_edges(&self) -> BTreeSet<StateEdge> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tracker
+            .edges()
+            .clone()
+    }
+
+    pub fn state_transitions(&self) -> Vec<StateTransition> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tracker
+            .transitions()
+            .to_vec()
     }
 
     pub fn is_blackholed(&self, node: &str) -> bool {
@@ -529,6 +580,7 @@ impl SignalingConnector for SimSignalingConnector {
                 if !suppress_heal {
                     g.record(format!("sig:connect:{}:{sid}", self.node));
                 }
+                g.emit_proto_event(&self.node, ProtoEvent::SigConnected);
                 sid
             };
             record_sometimes("sig_connected");
@@ -621,6 +673,7 @@ impl SimSigBackend {
                     }
                 }
                 g.record(format!("sig:subscribe:{}:chans={}", self.node, chans.len()));
+                g.emit_proto_event(&self.node, ProtoEvent::SigSubscribed);
                 for (tx, kp) in notifications {
                     let _ = tx.send(Incoming::Event {
                         name: "known-peer".to_string(),
@@ -681,6 +734,10 @@ impl SimSigBackend {
                             "sig:relay:{}->{}:{sig_type}",
                             self.node, target_node
                         ));
+                        g.emit_proto_event(
+                            &self.node,
+                            ProtoEvent::SignalRelayed(SignalMsgKind::from_type(sig_type)),
+                        );
                         let _ = target_tx.send(Incoming::Event {
                             name: "signal".to_string(),
                             data: json!({
@@ -735,6 +792,8 @@ impl SignalingBackend for SimSigBackend {
             if blackholed {
                 if event == "sync" {
                     record_sometimes("heartbeat_fired_under_blackhole");
+                    self.net
+                        .record_proto_event(&self.node, ProtoEvent::SigHeartbeatUnderBlackhole);
                 }
                 tokio::time::sleep(timeout).await;
                 return Ok(None);
@@ -751,6 +810,7 @@ impl SignalingBackend for SimSigBackend {
             if let Some(removed) = g.sig_clients.remove(&self.conn_id) {
                 g.sid_to_node.remove(&removed.sid);
                 g.record(format!("sig:disconnect:{}:{}", self.node, removed.sid));
+                g.emit_proto_event(&self.node, ProtoEvent::SigDisconnected);
                 for (_, other) in g.sig_clients.iter() {
                     let _ = other.tx.send(Incoming::Event {
                         name: "peer-left".to_string(),
@@ -860,6 +920,9 @@ impl DirectBackend for SimDirectBackend {
                     "direct:pair:{}:{}<->{}",
                     req.route, self.node, peer_waiter.node
                 ));
+                let peer_node_ev = peer_waiter.node.clone();
+                g.emit_proto_event(&self.node, ProtoEvent::DirectPaired);
+                g.emit_proto_event(&peer_node_ev, ProtoEvent::DirectPaired);
                 record_sometimes("direct_paired");
                 if g.had_partition_heal {
                     record_sometimes("direct_after_partition_heal");
@@ -1134,6 +1197,7 @@ impl PeerFactory for SimPeerFactory {
         let hang_ms = {
             let mut g = self.net.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.record(format!("webrtc:connect:{}:{}", self.node, req.peer_id));
+            g.emit_proto_event(&self.node, ProtoEvent::WebRtcFallback);
             g.take_hang(&self.node, HangSite::PeerConnect)
         };
         if let Some(ms) = hang_ms {
