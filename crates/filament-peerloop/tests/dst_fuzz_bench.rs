@@ -82,6 +82,7 @@ fn test_parallel_throughput_benchmark() {
         mutant: SimMutant::None,
         allow_gather_hang: false,
         quiet_logs: true,
+        ..Default::default()
     };
 
     let single = Fuzzer::run(&cfg);
@@ -108,6 +109,110 @@ fn test_parallel_throughput_benchmark() {
     assert_eq!(parallel.runs_executed, RUNS);
     assert!(single.findings.is_empty(), "single clean findings: {:?}", single.findings);
     assert!(parallel.findings.is_empty(), "parallel clean findings: {:?}", parallel.findings);
+}
+
+#[test]
+fn test_disk_corpus_persistence_minimize_and_regression_replay() {
+    let base = std::env::temp_dir().join(format!("tunlion-dst-corpus-test-{}", std::process::id()));
+    let corpus_dir = base.join("corpus");
+    let reg_dir = base.join("regressions");
+    let _ = std::fs::remove_dir_all(&base);
+
+    let dir_stats = |d: &std::path::Path| -> (usize, u64) {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for ent in rd.flatten() {
+                if ent.path().extension().is_some_and(|e| e == "json") {
+                    count += 1;
+                    if let Ok(m) = ent.metadata() {
+                        bytes += m.len();
+                    }
+                }
+            }
+        }
+        (count, bytes)
+    };
+
+    let rep1 = Fuzzer::run(&CampaignConfig {
+        seed: 55_001,
+        max_runs: 20,
+        stop_on_first_finding: false,
+        flags: GuideFlags::married(),
+        mutant: SimMutant::None,
+        allow_gather_hang: false,
+        quiet_logs: true,
+        corpus_dir: Some(corpus_dir.clone()),
+        regressions_dir: None,
+    });
+    assert!(rep1.findings.is_empty(), "clean run1 findings: {:?}", rep1.findings);
+    let (files1, bytes1) = dir_stats(&corpus_dir);
+    println!(
+        "PERSISTENCE_RUN1: files={} total_bytes={} state_edges={}",
+        files1, bytes1, rep1.state_edges_discovered
+    );
+    assert!(files1 > 0 && files1 <= rep1.state_edges_discovered);
+
+    // Plant a redundant copy of an existing seed to confirm set-cover pruning.
+    let first_seed = std::fs::read_dir(&corpus_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "json"))
+        .expect("at least one seed file");
+    let dup_path = corpus_dir.join("seed-duplicate-obsolete.json");
+    std::fs::copy(&first_seed, &dup_path).unwrap();
+
+    let rep2 = Fuzzer::run_parallel(
+        &CampaignConfig {
+            seed: 55_002,
+            max_runs: 10,
+            stop_on_first_finding: false,
+            flags: GuideFlags::married(),
+            mutant: SimMutant::None,
+            allow_gather_hang: false,
+            quiet_logs: true,
+            corpus_dir: Some(corpus_dir.clone()),
+            regressions_dir: None,
+        },
+        2,
+    );
+    assert!(rep2.findings.is_empty(), "clean run2 findings: {:?}", rep2.findings);
+    let (files2, bytes2) = dir_stats(&corpus_dir);
+    println!(
+        "PERSISTENCE_RUN2: files={} total_bytes={} state_edges={}",
+        files2, bytes2, rep2.state_edges_discovered
+    );
+    assert!(
+        !dup_path.exists(),
+        "set-cover minimization should prune duplicate obsolete seed"
+    );
+
+    let bug_rep = Fuzzer::run(&CampaignConfig {
+        seed: 7777,
+        max_runs: 40,
+        stop_on_first_finding: true,
+        flags: GuideFlags::married(),
+        mutant: SimMutant::CanaryOnBlackholeStatus,
+        allow_gather_hang: false,
+        quiet_logs: false,
+        corpus_dir: None,
+        regressions_dir: Some(reg_dir.clone()),
+    });
+    assert!(!bug_rep.findings.is_empty(), "canary should trigger regression save");
+    let (reg_files, reg_bytes) = dir_stats(&reg_dir);
+    assert_eq!(reg_files, 1, "expected 1 saved regression file");
+
+    let mut_replays = Fuzzer::replay_regressions(&reg_dir, SimMutant::CanaryOnBlackholeStatus);
+    assert!(!mut_replays.is_empty(), "regression bank failed to reproduce canary bug");
+    let clean_replays = Fuzzer::replay_regressions(&reg_dir, SimMutant::None);
+    assert!(clean_replays.is_empty(), "clean build failed persisted regression: {:?}", clean_replays);
+    println!(
+        "REGRESSION_BANK: files={} total_bytes={} canary_replays={} clean_replays={}",
+        reg_files, reg_bytes, mut_replays.len(), clean_replays.len()
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[derive(Clone, Copy)]
