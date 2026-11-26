@@ -5101,6 +5101,18 @@ impl Conn {
             && self.transport_of(pid).is_none()
     }
 
+    /// True while anything connects us to `pid`: an installed link, a WebRTC
+    /// build that has not installed one yet, or a direct attempt. The build
+    /// runs off the loop, so right after adoption a present peer has a build
+    /// and no link; state that belongs to the peer's presence rather than to
+    /// one transport must survive that window.
+    pub fn connecting_or_linked(&self, pid: &str) -> bool {
+        self.links.contains_key(pid)
+            || self.builds.contains_key(pid)
+            || self.build_deferred.contains_key(pid)
+            || self.direct_pending.contains_key(pid)
+    }
+
     /// A different binding the store still authorizes is a real re-pair and may
     /// supersede an older in-flight/deferred intent for the same pid. Any other
     /// case is a duplicate establish and is deduped.
@@ -13443,6 +13455,21 @@ mod warm_identity_tests {
             "the shipping task path never installed its link"
         );
         assert!(conn.builds.is_empty());
+    }
+
+    /// A present peer is being connected from adoption on, before its build
+    /// installs a link: the fleet presence evidence is kept through exactly
+    /// that window (recv dispatch), and lost once nothing connects to it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_peer_with_an_uninstalled_build_is_connecting() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-building";
+        assert!(!conn.connecting_or_linked(pid));
+        conn.builds.insert(pid.to_string(), build_state(1));
+        assert!(!conn.links.contains_key(pid), "premise: no link while it builds");
+        assert!(conn.connecting_or_linked(pid));
+        conn.cancel_build(pid);
+        assert!(!conn.connecting_or_linked(pid));
     }
 
     /// The production retry ladder: every stuck rebuild goes through the

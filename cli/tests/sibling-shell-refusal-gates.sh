@@ -106,7 +106,14 @@ assert_refused B SHELL-MARK-B
 # daemon and the dialer's own daemon sit on it too), so one attempt can pass by
 # luck. Several attempts, each asserted.
 W_REPS=${W_REPS:-4}
-hide_sock() { [ -S "$WORK/bravo/control.sock" ] && mv "$WORK/bravo/control.sock" "$WORK/bravo-control.sock.hidden"; }
+# The daemon moves its socket out of a config dir whose path is too long for a
+# unix socket (platform::control_socket_path), and then there is nothing here
+# to hide: the "Windows-shaped" dial would quietly take the warm daemon path
+# and W/GW would pass without dialing the fleet secret at all. Refuse that.
+hide_sock() {
+  [ -S "$WORK/bravo/control.sock" ] && mv "$WORK/bravo/control.sock" "$WORK/bravo-control.sock.hidden" && return 0
+  fixture_die "setup: no control socket at $WORK/bravo/control.sock to hide (moved for a long path? use a short TMPDIR), so the fleet-secret dial cannot be forced"
+}
 show_sock() { [ -S "$WORK/bravo-control.sock.hidden" ] && mv "$WORK/bravo-control.sock.hidden" "$WORK/bravo/control.sock"; }
 
 say "W: Windows-shaped dial (no control socket: fleet-secret fallback), x$W_REPS"
