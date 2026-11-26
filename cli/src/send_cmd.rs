@@ -473,7 +473,7 @@ pub(crate) async fn send_cmd(
             Err(_) => anyhow::bail!("the tunlion server did not answer"),
         },
     };
-    let sio = match tokio::time::timeout(bounded(12), net::connect_signaling(&transport_context, server, tx.clone())).await {
+    let mut sio = match tokio::time::timeout(bounded(12), net::connect_signaling(&transport_context, server, tx.clone())).await {
         Ok(Ok(c)) => c,
         Ok(Err(_)) | Err(_) if lan_target.is_some() => {
             lan_offline = true;
@@ -482,6 +482,10 @@ pub(crate) async fn send_cmd(
         Ok(Err(e)) => return Err(e),
         Err(_) => anyhow::bail!("the tunlion server did not answer"),
     };
+    // Started on the offline stand-in: re-dial the server until it answers,
+    // so its return is seen (send_redial.rs).
+    let mut redial = crate::send_redial::Redial::new(lan_offline, Instant::now());
+    let mut redial_task: Option<tokio::task::JoinHandle<Result<filament_signal::Client>>> = None;
     if lan_offline {
         if let Some((n, sec)) = lan_target.as_ref() {
             ui::say("can't reach the tunlion server; looking on the local network");
@@ -1133,6 +1137,67 @@ pub(crate) async fn send_cmd(
         };
         // C30: converge session state every iteration (incl. ticks).
         sess.tick(&sio).await;
+        // The server was unreachable (the send started without it, or its
+        // socket closed): re-dial it, paced like the daemon's re-dial. Every
+        // re-dial of the data link rides signaling, so without this a send
+        // whose link dropped during an outage could never recover once the
+        // server came back (chaos finding 22b3f2a918). Only a send to a known
+        // device: its target is found again by presence on its channel.
+        if known_target.is_some() {
+            if redial.due(redial_task.is_some(), Instant::now()) {
+                redial.tried(Instant::now());
+                let (ctx, srv, tx2) = (conn.transport_context.clone(), conn.server.clone(), tx.clone());
+                redial_task = Some(tokio::spawn(async move {
+                    match tokio::time::timeout(crate::send_redial::CONNECT_BOUND, net::reconnect_signaling(&ctx, &srv, tx2)).await {
+                        Ok(r) => r,
+                        Err(_) => Err(anyhow::anyhow!("no answer in {}s", crate::send_redial::CONNECT_BOUND.as_secs())),
+                    }
+                }));
+            }
+            if redial_task.as_ref().is_some_and(|t| t.is_finished()) {
+                let joined = match redial_task.take() {
+                    Some(t) => t.await.unwrap_or_else(|e| Err(anyhow::anyhow!("reconnect task: {e}"))),
+                    None => Err(anyhow::anyhow!("no reconnect task")),
+                };
+                match joined {
+                    Ok(new_sio) => {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                        sio = new_sio;
+                        conn.sio = sio.clone();
+                        redial.up();
+                        // A fresh sid holds nothing: re-assert what this send
+                        // wants. A send that never reached the server has no
+                        // room; it meets its target on the channel alone.
+                        if sess.room.as_deref() == Some("") {
+                            sess.room = None;
+                        }
+                        sess.invalidate();
+                        if let Some(r) = sess.room.clone() {
+                            sess.emit(&sio, "join", json!({ "room": r, "name": display_name(), "uid": conn.my_uid })).await;
+                        }
+                        if !sess.channels.is_empty() {
+                            let chans = sess.channels.clone();
+                            sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
+                        }
+                        sess.tick(&sio).await;
+                        ui::debug("send: reached the tunlion server again; looking for the receiver there too");
+                    }
+                    Err(e) => ui::debug(&format!("send: the tunlion server is still unreachable ({e:#})")),
+                }
+            }
+        }
+        // While the server is unreachable, the local network is the only way
+        // back to the target: re-dial its remembered addresses instead of
+        // waiting minutes for the next sweep to find it.
+        if let Some((n, sec)) = lan_target.as_ref() {
+            if redial.lan_due(lan_offline && redial.is_down(), conn.lan.is_some(), conn.has_link_to(n), Instant::now()) {
+                ui::debug(&format!("lan: no live link to '{n}', dialing its remembered addresses again"));
+                conn.lan_dial(n, sec, false, &[], &crate::lan_send::ownership(n));
+                if let Some(l) = conn.lan.as_ref() {
+                    l.query_soon();
+                }
+            }
+        }
         // #28: discharge any deferred peer-left whose channel has gone idle/dead.
         conn.reap_deferred();
         // A remember offer is retried on the live transports until acked. The
@@ -2993,6 +3058,11 @@ pub(crate) async fn send_cmd(
                             &crate::send_liveness::disconnect_line(gone.as_deref(), secs, by_code),
                         ));
                     }
+                }
+            }
+            Ev::SignalingDown(reason, closed) => {
+                if redial.on_close(closed, sio.id(), Instant::now()) {
+                    ui::debug(&format!("send: signaling closed ({reason}); re-dialing the server"));
                 }
             }
             _ => {}
