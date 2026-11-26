@@ -1519,6 +1519,15 @@ pub(crate) enum BuildStart {
     Busy,
 }
 
+/// See `Conn::stuck_episode`.
+struct StuckEpisode {
+    attempts: u32,
+    presence: Presence,
+    channel_absent: Option<u8>,
+    room_absent: Option<u8>,
+    digest_deferred: Option<Instant>,
+}
+
 /// A build always reports a terminal result, so a failed task releases its
 /// per-peer slot instead of blocking retries until the reap grace.
 pub enum BuildDone {
@@ -2813,7 +2822,10 @@ impl Conn {
         }
 
         if !self.links.contains_key(&peer_id) {
-            if self.links.len() >= MAX_LINKS {
+            if self.links.len() >= MAX_LINKS && !self.evict_retrying_link(&peer_id) {
+                self.log.debug(&format!(
+                    "tunlion: ADOPT-REFUSED peer={peer_id}: link cap ({MAX_LINKS}) reached"
+                ));
                 return Ok(false);
             }
             self.establish_as(v.clone(), None).await?;
@@ -4190,6 +4202,69 @@ impl Conn {
         self.link_events.insert(pid, LinkEvents { generation, rx: std::sync::Mutex::new(candidate_rx), departure_ready: None, departure_pending: None });
     }
 
+    /// The retry-episode state a stuck-attempt rebuild must not lose: the
+    /// ladder count (`on_retry_due` stamps it on the old link before the
+    /// build lands), the presence it reports, and the departure evidence the
+    /// digest reapers have gathered. None when there is no link to carry from.
+    fn stuck_episode(&self, pid: &str) -> Option<StuckEpisode> {
+        let l = self.links.get(pid)?;
+        Some(StuckEpisode {
+            attempts: l.attempts,
+            presence: l.presence,
+            channel_absent: self.channel_digest_absent.get(pid).copied(),
+            room_absent: self.room_digest_absent.get(pid).copied(),
+            digest_deferred: self.digest_deferred.get(pid).copied(),
+        })
+    }
+
+    fn restore_stuck_episode(&mut self, pid: &str, episode: StuckEpisode) {
+        if let Some(l) = self.links.get_mut(pid) {
+            l.attempts = episode.attempts;
+            l.presence = episode.presence;
+        }
+        if let Some(n) = episode.channel_absent {
+            self.channel_digest_absent.insert(pid.to_string(), n);
+        }
+        if let Some(n) = episode.room_absent {
+            self.room_digest_absent.insert(pid.to_string(), n);
+        }
+        if let Some(at) = episode.digest_deferred {
+            self.digest_deferred.insert(pid.to_string(), at);
+        }
+    }
+
+    /// At the link cap, a fresh contact may displace a link the retry ladder
+    /// is still failing to (re)connect: it has failed at least once, its peer
+    /// is not connected and no transport or worker carries bytes. A full table
+    /// of such links is exactly what starved enrollment on the owner daemon
+    /// (every new device was refused silently while dead sids kept retrying).
+    /// Never evicts the active target or a link that is up. Returns true when
+    /// a slot was freed.
+    fn evict_retrying_link(&mut self, for_pid: &str) -> bool {
+        let victim = self
+            .links
+            .iter()
+            .filter(|(pid, l)| {
+                pid.as_str() != for_pid
+                    && !l.direct
+                    && l.attempts > 0
+                    && l.peer.as_ref().is_some_and(|p| !p.is_connected())
+                    && l.transport.as_ref().is_none_or(|t| t.is_dead())
+                    && l.workers.iter().all(|w| w.is_dead())
+                    && self.active.as_deref() != Some(pid.as_str())
+            })
+            .max_by_key(|(_, l)| l.attempts)
+            .map(|(pid, _)| pid.clone());
+        let Some(victim) = victim else {
+            return false;
+        };
+        self.log.debug(&format!(
+            "tunlion: link cap ({MAX_LINKS}) reached; dropping retrying link {victim} for new contact {for_pid}"
+        ));
+        self.drop_link(&victim);
+        true
+    }
+
     fn install_built(
         &mut self,
         built: BuiltPeer,
@@ -4246,6 +4321,15 @@ impl Conn {
                 None
             }
         });
+        // A stuck-attempt rebuild continues the SAME retry episode against the
+        // same sid. `drop_link` below wipes everything keyed by that sid, which
+        // made each off-loop rebuild install at attempts 0 with fresh digest
+        // clocks: the ladder logged "retrying (2/5)" forever and a departed
+        // peer was never retired (prod owner daemon, 12 dead sids re-dialled
+        // every ~16 s until the link cap starved enrollment). Carry the episode.
+        let carried = (built.replace == Replace::StuckAttempt)
+            .then(|| self.stuck_episode(&built.peer_id))
+            .flatten();
         self.drop_link(&built.peer_id);
         if webrtc_only {
             self.webrtc_only.insert(built.peer_id.clone());
@@ -4281,6 +4365,9 @@ impl Conn {
                 host: self.host.clone(),
             },
         );
+        if let Some(episode) = carried {
+            self.restore_stuck_episode(&built.peer_id, episode);
+        }
         if built.active_on_apply || pending_active || selected_while_building {
             self.active = Some(built.peer_id.clone());
         }
@@ -12781,6 +12868,86 @@ mod warm_identity_tests {
             "the shipping task path never installed its link"
         );
         assert!(conn.builds.is_empty());
+    }
+
+    /// The production retry ladder: every stuck rebuild goes through the
+    /// off-loop build and `install_built`. Before the fix the install reset
+    /// `attempts` to 0 (the stamp `on_retry_due` put on the old link died with
+    /// it), so a dead peer was re-dialled at "retrying (2/5)" forever and
+    /// every digest clock restarted. The ladder must exhaust and drop the link.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shipping_stuck_rebuilds_keep_the_episode_and_exhaust() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-departed";
+        conn.establish_as(
+            json!({ "id": pid, "name": "ci-worker", "uid": "uid-departed" }),
+            Some(true),
+        )
+        .await
+        .expect("a WebRTC link that will never connect");
+        conn.room_digest_absent.insert(pid.to_string(), 1);
+        let deferred_at = Instant::now();
+        conn.digest_deferred.insert(pid.to_string(), deferred_at);
+        let mut rebuilds = 0u32;
+        loop {
+            let Some(g) = conn.links.get(pid).map(|l| l.generation) else {
+                break;
+            };
+            assert!(
+                rebuilds < MAX_ATTEMPTS + 1,
+                "the ladder never exhausted ({rebuilds} rebuilds)"
+            );
+            conn.on_stuck(pid, g, "stuck").await.unwrap();
+            if !conn.links.contains_key(pid) {
+                break;
+            }
+            test_inline::set(false);
+            let due = conn.on_retry_due(pid, g).await;
+            test_inline::set(true);
+            due.unwrap();
+            for _ in 0..200 {
+                conn.pump_builds();
+                if conn.links.get(pid).is_some_and(|l| l.generation != g) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let l = conn.links.get(pid).expect("the rebuild installed");
+            assert_ne!(l.generation, g, "the off-loop rebuild never installed");
+            rebuilds += 1;
+            assert_eq!(l.attempts, rebuilds, "the install lost the ladder count");
+            assert_eq!(conn.room_digest_absent.get(pid), Some(&1));
+            assert_eq!(conn.digest_deferred.get(pid), Some(&deferred_at));
+        }
+        assert!(!conn.links.contains_key(pid), "the dead peer is still linked");
+        assert_eq!(rebuilds, MAX_ATTEMPTS - 1);
+    }
+
+    /// At the link cap a new contact (an enrolling device) displaces a link
+    /// the retry ladder keeps failing on, never a link that has not failed.
+    #[tokio::test]
+    async fn link_cap_admits_a_new_contact_over_a_retrying_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        for i in 0..MAX_LINKS {
+            conn.establish_as(
+                json!({ "id": format!("sid-{i}"), "name": format!("p{i}"), "uid": format!("uid-{i}") }),
+                Some(true),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(conn.links.len(), MAX_LINKS);
+        let newcomer = json!({ "id": "sid-new", "name": "enrollee", "uid": "uid-new" });
+        conn.maybe_adopt(&newcomer, false).await.unwrap();
+        assert!(
+            !conn.links.contains_key("sid-new"),
+            "a link that never failed was evicted"
+        );
+        conn.links.get_mut("sid-3").unwrap().attempts = 2;
+        conn.maybe_adopt(&newcomer, false).await.unwrap();
+        assert!(conn.links.contains_key("sid-new"), "the new contact was starved");
+        assert!(!conn.links.contains_key("sid-3"), "the retrying link was kept");
+        assert_eq!(conn.links.len(), MAX_LINKS);
     }
 
     /// Room adoption chooses its target after spawning the build. Installing
