@@ -26,6 +26,8 @@ tokio = { version = "1", features = ["rt", "time", "sync", "macros", "net", "io-
 # tungstenite's own root feature is only what its rustls backend requires.
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 url = "2"
+# TCP_USER_TIMEOUT on the signaling socket (lib.rs, UNACKED_BOUND).
+socket2 = { version = "0.5", features = ["all"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # Trust for tunlion's servers (src/tls.rs): the Mozilla roots are Android's
 # store and the fallback where a Unix machine has no system store at all.
