@@ -79,6 +79,42 @@ pub const DC_FLUSH_STALL: std::time::Duration = std::time::Duration::from_secs(1
 /// threshold the transfer ladder already acts on.
 pub const DC_WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// The longest a DataChannel write or flush waits with nothing acknowledged
+/// while the peer is still heard from. webrtc-sctp backs its retransmit timer
+/// off exponentially up to a 60 s RTO_MAX, so on a lossy, high-RTT path an
+/// association that is alive and delivering can go well past `DC_WRITE_STALL`
+/// between acknowledgements (chaos finding 83e2d5588e: 20 % loss and 400 ms
+/// each way on one end, sends latched dead at 15 s while the receiver was
+/// still getting their bytes, and every rebuild over that path lost the
+/// progress). Past this, a peer we hear but that acknowledges nothing (a
+/// one-way path) is gone whatever it says.
+pub const DC_ACK_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a write or flush that has seen no acknowledgement for `no_ack`
+/// must declare the channel dead. `silence_ms` is how long the peer has been
+/// silent when it is known to send the keepalive (`keepalive_silence_ms`),
+/// None when its silence says nothing (a browser end).
+///
+/// Progress, never throughput, as before: an acknowledged byte restarts
+/// `no_ack`. What changed is the evidence for "the peer is gone": past
+/// `DC_WRITE_STALL` with nothing acknowledged, a peer that sends keepalives
+/// and was heard within that same bound is alive and its acknowledgements
+/// are in SCTP's retransmit backoff, so the wait goes on up to
+/// `DC_ACK_CEILING`. A killed peer sends nothing, so it still ends at
+/// `DC_WRITE_STALL`. Pure.
+pub fn ack_stall_is_dead(no_ack: std::time::Duration, silence_ms: Option<u64>) -> bool {
+    if no_ack < DC_WRITE_STALL {
+        return false;
+    }
+    if no_ack >= DC_ACK_CEILING {
+        return true;
+    }
+    match silence_ms {
+        Some(ms) => ms >= DC_WRITE_STALL.as_millis() as u64,
+        None => true,
+    }
+}
+
 /// How long a peer that sends the 5 s DataChannel keepalive may be silent
 /// while it owes us an answer before the link is judged half-open: our writes
 /// still drain (its SCTP stack outlives its channel), but nothing it sends
@@ -901,6 +937,15 @@ impl DataChannelTransport {
         self.dead.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The peer's keepalive silence for the ack-stall verdict: None when the
+    /// peer sends no keepalive. Read before the channel is latched, so it is
+    /// never the `u64::MAX` a dead channel reports.
+    fn keepalive_silence_ms_live(&self) -> Option<u64> {
+        self.peer_keepalives
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| now_ms().saturating_sub(self.last_heard.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+
     /// Mark the channel dead and wake every sender parked on it.
     fn declare_dead(&self) {
         self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -918,7 +963,7 @@ impl DataChannelTransport {
     ) -> Result<T> {
         tokio::pin!(ready);
         let mut last = self.raw.buffered_amount();
-        let mut deadline = tokio::time::Instant::now() + DC_WRITE_STALL;
+        let mut acked_at = tokio::time::Instant::now();
         loop {
             if self.is_dead() {
                 return Err(anyhow!("channel closed"));
@@ -933,14 +978,15 @@ impl DataChannelTransport {
             }
             let now = self.raw.buffered_amount();
             if now < last {
-                deadline = tokio::time::Instant::now() + DC_WRITE_STALL;
+                acked_at = tokio::time::Instant::now();
             }
             last = now;
-            if tokio::time::Instant::now() >= deadline {
+            let no_ack = acked_at.elapsed();
+            if ack_stall_is_dead(no_ack, self.keepalive_silence_ms_live()) {
                 self.declare_dead();
                 return Err(anyhow!(
                     "data channel {what} got no acknowledgement for {}s, the peer is gone",
-                    DC_WRITE_STALL.as_secs()
+                    no_ack.as_secs()
                 ));
             }
         }
@@ -1083,23 +1129,26 @@ impl Transport for DataChannelTransport {
         // delivery-ack the sender had already read before exiting. Any drop in
         // `buffered_amount` restarts the clock, so a slow link that still moves
         // is never cut off; only a peer that acknowledges nothing at all is.
+        // The same verdict as a write (`ack_stall_is_dead`): a peer still
+        // heard from extends the wait up to `DC_ACK_CEILING`.
         let mut last = self.raw.buffered_amount();
-        let mut deadline = tokio::time::Instant::now() + DC_FLUSH_STALL;
+        let mut acked_at = tokio::time::Instant::now();
         while self.raw.buffered_amount() > 0 {
             if self.is_dead() {
                 return Err(anyhow!("channel closed while flushing"));
             }
             let now = self.raw.buffered_amount();
             if now < last {
-                deadline = tokio::time::Instant::now() + DC_FLUSH_STALL;
+                acked_at = tokio::time::Instant::now();
             }
             last = now;
-            if tokio::time::Instant::now() >= deadline {
+            let no_ack = acked_at.elapsed();
+            if no_ack >= DC_FLUSH_STALL && ack_stall_is_dead(no_ack, self.keepalive_silence_ms_live()) {
                 self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 self.drained.notify_waiters();
                 return Err(anyhow!(
                     "data channel flush got no acknowledgement for {}s, the peer is gone",
-                    DC_FLUSH_STALL.as_secs()
+                    no_ack.as_secs()
                 ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -3121,9 +3170,17 @@ async fn wire_channel(
                             // association this write never returns (see
                             // DC_WRITE_STALL), and a parked keepalive is a task
                             // that outlives its link.
+                            // A keepalive that could not go out within the
+                            // bound (the gate held by a data write parked on a
+                            // slow association) is skipped, not the end of
+                            // keepalives: stopping here made a slow but live
+                            // link read as a silent peer on the other end,
+                            // which then severed it (finding 83e2d5588e). The
+                            // dead check above still ends the task with its link.
                             match write_within(&gate_k, DC_WRITE_STALL, raw_k.write_data_channel(&frame, true)).await {
                                 Some(Ok(_)) => {}
-                                _ => break,
+                                Some(Err(_)) => break,
+                                None => continue,
                             }
                             act_k.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                         }
@@ -3518,6 +3575,29 @@ mod tests {
     /// The half-open bound: past `DC_WRITE_STALL` plus a keepalive period, so
     /// the peer's own write-stall latch fires first; nothing is silent without
     /// a keepalive to miss.
+    /// Finding 83e2d5588e: no acknowledgement for `DC_WRITE_STALL` is a dead
+    /// peer only when the peer is silent too (or sends no keepalive to tell);
+    /// a peer still heard from gets until `DC_ACK_CEILING`.
+    #[test]
+    fn a_slow_association_with_a_live_peer_is_not_dead() {
+        let s = |secs: u64| std::time::Duration::from_secs(secs);
+        let stall = DC_WRITE_STALL.as_secs();
+        let heard = Some(2_000);
+        let silent = Some(DC_WRITE_STALL.as_millis() as u64);
+        // Under the stall bound nothing is dead, silent or not.
+        assert!(!ack_stall_is_dead(s(stall - 1), silent));
+        assert!(!ack_stall_is_dead(s(stall - 1), None));
+        // Past it: a killed peer (silent) and an untracked one end as before.
+        assert!(ack_stall_is_dead(s(stall), silent));
+        assert!(ack_stall_is_dead(s(stall), None));
+        // A peer heard just now is in SCTP's backoff, not gone.
+        assert!(!ack_stall_is_dead(s(stall), heard));
+        assert!(!ack_stall_is_dead(DC_ACK_CEILING - s(1), heard));
+        // Heard, but nothing acknowledged for the ceiling: a one-way path.
+        assert!(ack_stall_is_dead(DC_ACK_CEILING, heard));
+        assert!(DC_ACK_CEILING > DC_WRITE_STALL && DC_ACK_CEILING > DC_PEER_SILENT);
+    }
+
     #[test]
     fn a_silent_keepalive_peer_is_half_open() {
         let bound = DC_PEER_SILENT.as_millis() as u64;

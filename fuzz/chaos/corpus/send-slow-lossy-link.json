@@ -1,0 +1,57 @@
+{
+  "hooks": {
+    "bravo": {
+      "TUNLION_TEST_DIRECT_FLAKY": "1"
+    }
+  },
+  "origin": "chaos finding 83e2d5588e (campaign chaos-6fe153464017-explore-1795675222-1102329, reproduced 3/3 on main 6fe153464): 20% loss + 400 ms delay on bravo for 108 s; the 256 KiB send alpha->bravo cycled 'link is down, trying to reconnect' and was still running at 90 s (O2 hang), and the 4 KiB send failed after 60 s blaming bravo's disk while its link was down",
+  "seed": 284687184,
+  "steps": [
+    {
+      "args": {
+        "delay_ms": 400,
+        "dup": 0,
+        "jitter_ms": 0,
+        "loss": 20,
+        "reorder": 0
+      },
+      "at": 8.2,
+      "dur": 107.9,
+      "fault": "net.impair",
+      "target": "bravo"
+    },
+    {
+      "at": 11.3,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "charlie"
+    },
+    {
+      "at": 11.6,
+      "dst": "bravo",
+      "kib": 4,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 17.6,
+      "dst": "bravo",
+      "kib": 256,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 17.6,
+      "dur": 11.5,
+      "fault": "net.isolate",
+      "target": "charlie"
+    },
+    {
+      "at": 22.4,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "bravo"
+    }
+  ],
+  "version": 1
+}

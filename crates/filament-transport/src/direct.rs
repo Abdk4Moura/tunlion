@@ -2227,6 +2227,74 @@ fn preferred_connection(is_dialer: bool, answerer: bool) -> bool {
     is_dialer == !answerer
 }
 
+/// How long the race waits for the preferred direction once a non-preferred
+/// connection authenticated over a path with this `rtt`. The two ends finish
+/// authenticating the same connection about a round trip apart, more with a
+/// retransmit, and they must pick the SAME connection: one that took the
+/// fallback while the other took the preferred one dropped the connection the
+/// other end chose, and both saw "connection lost" with zero frames right
+/// after DIRECT-CONNECT ok (finding 83e2d5588e, 800 ms RTT). So the grace is
+/// a quarter of the budget, or four round trips when that is longer. The
+/// caller's `DIRECT_BUDGET` still bounds the whole race. Pure.
+fn preferred_grace(rtt: std::time::Duration) -> std::time::Duration {
+    (DIRECT_BUDGET / 4).max(rtt * 4)
+}
+
+/// Take the race's winner from `set`: the first PREFERRED connection, or,
+/// once a non-preferred one has authenticated, whichever is held when `grace`
+/// more has passed with no preferred one. The grace starts at that first
+/// non-preferred authentication, never at the start of the race: started at
+/// the start (#71 to this fix), it capped the WHOLE race at `DIRECT_BUDGET / 4`
+/// (1.25 s), so on a path whose handshake plus authentication takes longer
+/// (about 800 ms RTT with loss, chaos finding 83e2d5588e) direct QUIC never won
+/// and every link fell back to a WebRTC data channel that crawled there. The
+/// caller's `DIRECT_BUDGET` still bounds the whole race. Errors are skipped
+/// (an unreachable candidate is noise; an auth failure is traced).
+async fn pick_preferred<T, S>(
+    set: &mut S,
+    is_preferred: impl Fn(&T) -> bool,
+    grace: impl Fn(&T) -> std::time::Duration,
+    budget: std::time::Duration,
+) -> Option<T>
+where
+    S: futures_util::Stream<Item = Result<T>> + Unpin,
+{
+    use futures_util::StreamExt;
+    let mut fallback: Option<T> = None;
+    // Nothing authenticated within `budget`: no direct path. Once one has,
+    // the wait for the preferred one is its grace, within the same budget (the
+    // caller's WebRTC fallback runs on that clock), and a connection held when
+    // the budget runs out is the winner, never dropped for the budget's sake.
+    let end = tokio::time::Instant::now() + budget;
+    let mut deadline = end;
+    loop {
+        let next = match tokio::time::timeout_at(deadline, set.next()).await {
+            Ok(v) => v,
+            Err(_) => return fallback,
+        };
+        let Some(res) = next else { return fallback };
+        match res {
+            Ok(w) => {
+                if is_preferred(&w) {
+                    return Some(w);
+                }
+                if fallback.is_none() {
+                    deadline = (tokio::time::Instant::now() + grace(&w)).min(end);
+                    fallback = Some(w);
+                }
+            }
+            Err(e) => {
+                // Auth failures are the negative-gate signal, make them
+                // greppable. Dial failures (unreachable candidate) are noise.
+                let s = e.to_string();
+                if s.contains("DIRECT-AUTH-FAIL") {
+                    crate::hooks::trace(&format!("tunlion: {s}"));
+                }
+            }
+        }
+    }
+}
+
 /// The simultaneous-open race: run the acceptor AND dial every peer candidate
 /// concurrently; the FIRST connection to pass the pair-secret MAC wins, the
 /// rest are dropped. Returns an authenticated `Arc<dyn Transport>` or None
@@ -2437,48 +2505,26 @@ pub async fn race_connect_labeled(
     }
 
     let race = async {
-        use futures_util::stream::{FuturesUnordered, StreamExt};
+        use futures_util::stream::FuturesUnordered;
         let mut set: FuturesUnordered<_> = futs.into_iter().collect();
-        let mut fallback = None;
         // Prefer the connection dialed by the non-answerer. If both directions
         // authenticate, both ends see and choose that same connection. If only
         // one direction exists, both ends fall back to that sole connection.
         // The fallback is unique because mutual authentication plus this
         // single accept bounds successful connections to one per direction;
         // changing accept into a loop would require a new winner rule.
-        // Give the preferred direction a quarter of the existing direct budget
-        // to arrive after a non-preferred auth. This is bounded by a derived
-        // transport timeout, not a new magic latency, and only matters when the
-        // answerer authenticated its own dial first.
-        let preferred_deadline = tokio::time::Instant::now() + DIRECT_BUDGET / 4;
-        loop {
-            let next = tokio::time::timeout_at(preferred_deadline, set.next()).await;
-            let Some(res) = (match next {
-                Ok(value) => value,
-                Err(_) => return fallback,
-            }) else { return fallback };
-            match res {
-                Ok((conn, send, recv, is_dialer)) => {
-                    if preferred_connection(is_dialer, answerer) {
-                        return Some((conn, send, recv, is_dialer));
-                    }
-                    fallback = Some((conn, send, recv, is_dialer));
-                }
-                Err(e) => {
-                    // Auth failures are the negative-gate signal, make them
-                    // greppable. Dial failures (unreachable candidate) are noise.
-                    let s = e.to_string();
-                    if s.contains("DIRECT-AUTH-FAIL") {
-                        crate::hooks::trace(&format!("tunlion: {s}"));
-                    }
-                    continue;
-                }
-            }
-        }
-        
+        pick_preferred(
+            &mut set,
+            |w| preferred_connection(w.3, answerer),
+            |w| preferred_grace(w.0.rtt()),
+            DIRECT_BUDGET,
+        )
+        .await
     };
 
-    let winner = match tokio::time::timeout(DIRECT_BUDGET, race).await {
+    // `pick_preferred` ends the race at DIRECT_BUDGET, keeping a connection it
+    // holds; this outer bound is a backstop only.
+    let winner = match tokio::time::timeout(DIRECT_BUDGET + std::time::Duration::from_secs(1), race).await {
         Ok(Some(w)) => w,
         _ => {
             endpoint.close(0u32.into(), b"direct-timeout");
@@ -3069,6 +3115,66 @@ mod tests {
         assert_ne!(dialer, acceptor, "direction-tagged tags differ");
         // Wrong secret -> wrong tag (the negative-auth property).
         assert_ne!(auth_tag(&k2, &km, "dialer"), dialer);
+    }
+
+    /// Finding 83e2d5588e: the preferred-direction grace capped the whole race
+    /// at a quarter of the budget, so a connection that took longer than that
+    /// to authenticate was never taken.
+    #[tokio::test]
+    async fn a_slow_handshake_still_wins_the_race() {
+        use futures_util::stream::FuturesUnordered;
+        type Fut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(u32, bool)>> + Send>>;
+        let after = |ms: u64, id: u32, preferred: bool| -> Fut {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                Ok((id, preferred))
+            })
+        };
+        let grace = |_: &(u32, bool)| std::time::Duration::from_millis(50);
+        let bound = std::time::Duration::from_secs(5);
+        // One connection, arriving well past the grace: it is the winner.
+        let mut set: FuturesUnordered<Fut> = vec![after(200, 1, false)].into_iter().collect();
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_secs(2))).await;
+        assert_eq!(got.expect("race bounded").map(|w| w.0), Some(1), "a slow sole connection was dropped");
+        // A preferred one inside the grace after a non-preferred one beats it.
+        let mut set: FuturesUnordered<Fut> =
+            vec![after(10, 1, false), after(40, 2, true)].into_iter().collect();
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_secs(2))).await;
+        assert_eq!(got.expect("race bounded").map(|w| w.0), Some(2));
+        // Past the grace, the non-preferred one held is taken; the race does
+        // not wait for a preferred one that is still far off.
+        let mut set: FuturesUnordered<Fut> =
+            vec![after(10, 1, false), after(3_000, 2, true)].into_iter().collect();
+        let t0 = std::time::Instant::now();
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_secs(2))).await;
+        assert_eq!(got.expect("race bounded").map(|w| w.0), Some(1));
+        assert!(t0.elapsed() < std::time::Duration::from_millis(1_500), "waited past the grace");
+        // Nothing at all within the budget: no direct path.
+        let mut set: FuturesUnordered<Fut> = vec![after(3_000, 1, true)].into_iter().collect();
+        let t0 = std::time::Instant::now();
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_millis(100))).await;
+        assert!(got.expect("race bounded").is_none() && t0.elapsed() < std::time::Duration::from_millis(1_500));
+        // A connection held when the budget runs out is kept, not dropped.
+        let mut set: FuturesUnordered<Fut> =
+            vec![after(80, 1, false), after(3_000, 2, true)].into_iter().collect();
+        let long = |_: &(u32, bool)| std::time::Duration::from_secs(2);
+        let t0 = std::time::Instant::now();
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, long, std::time::Duration::from_millis(300))).await;
+        assert_eq!(got.expect("race bounded").map(|w| w.0), Some(1));
+        assert!(t0.elapsed() < std::time::Duration::from_millis(1_500), "the grace ran past the budget");
+        // Only errors: nothing, once the set is exhausted.
+        let mut set: FuturesUnordered<Fut> =
+            vec![Box::pin(async { Err(anyhow!("unreachable")) }) as Fut].into_iter().collect();
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_secs(2))).await;
+        assert!(got.expect("race bounded").is_none());
+    }
+
+    #[test]
+    fn the_preferred_grace_covers_a_slow_path() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(preferred_grace(ms(1)), DIRECT_BUDGET / 4);
+        assert_eq!(preferred_grace(ms(800)), ms(3_200));
+        assert!(preferred_grace(ms(800)) < DIRECT_BUDGET);
     }
 
     #[test]
