@@ -48,6 +48,7 @@ source "$HERE/lib/fixture.sh"
 trap 'stop_all; fixture_cleanup' EXIT
 KNOWN_RED_ALLOW=()
 now() { date +%s; }
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
 
 as_dir() { # as_dir DIR -- run the CLI against that config dir
   local d="$1"; shift
@@ -131,18 +132,25 @@ S2="$WORK/s2"
 init_owner "$S2"
 start_daemon "$S2" 600000
 wait_for_line "$S2.log" "LOOP-STALL-HOLD" 40 || fixture_die "S2: the hold hook never fired"
-T_HOLD=$(now)
+# Milliseconds, not whole seconds: `date +%s` truncates both ends, so a true
+# 5.98s read as 5 and failed "before the limit" (2026-11-26, PR #756 smoke).
+# T_HOLD is when the poll SAW the hold line, up to one 0.25s poll after the
+# hold began, so the measured span can be short by at most POLL_MS.
+POLL_MS=250
+T_HOLD_MS=$(now_ms)
 for _ in $(seq 1 $(((LIMIT_SECS + SLACK_SECS) * 4))); do
   [ -f "$S2.rc" ] && break
   sleep 0.25
 done
-T_END=$(now)
+T_END_MS=$(now_ms)
+T_HOLD=$((T_HOLD_MS / 1000)); T_END=$((T_END_MS / 1000))
+S2_MS=$((T_END_MS - T_HOLD_MS))
 if [ -f "$S2.rc" ]; then
   rc=$(cat "$S2.rc")
   [ "$rc" = "$STALLED_EXIT" ] && ok "S2: exited with $STALLED_EXIT after $((T_END - T_HOLD))s" \
     || bad "S2: exited with $rc, wanted $STALLED_EXIT"
-  [ $((T_END - T_HOLD)) -ge "$LIMIT_SECS" ] && ok "S2: not before the limit" \
-    || bad "S2: exited after $((T_END - T_HOLD))s, before the ${LIMIT_SECS}s limit"
+  [ $((S2_MS + POLL_MS)) -ge $((LIMIT_SECS * 1000)) ] && ok "S2: not before the limit (${S2_MS}ms after the hold was seen)" \
+    || bad "S2: exited ${S2_MS}ms after the hold was seen, before the ${LIMIT_SECS}s limit"
 else
   bad "S2: still running $((T_END - T_HOLD))s into a stall past the ${LIMIT_SECS}s limit"
 fi
