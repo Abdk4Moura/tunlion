@@ -7535,10 +7535,11 @@ impl Conn {
     /// the activity sample, and the maximum idle age prevents a worker from
     /// masking a stalled primary.
     /// Whether a transport can never carry another byte: latched dead, or
-    /// reporting itself not alive. Both, because the two shapes disagree: a
-    /// WebRTC data channel that latched dead answers `is_alive() == false`
-    /// but keeps the trait's default `is_dead() == false`, so a check on
-    /// `is_dead()` alone never saw it die.
+    /// reporting itself not alive. A WebRTC data channel answers both the same
+    /// way (its `is_dead` is the latch `is_alive` reads). Both are still asked
+    /// because a direct QUIC link disagrees for a moment: quinn has closed the
+    /// connection (`is_alive() == false`) before the reader latched `dead`, and
+    /// a link in that window is just as gone.
     pub fn transport_severed(t: &dyn Transport) -> bool {
         t.is_dead() || !t.is_alive()
     }
@@ -10218,9 +10219,9 @@ mod warm_identity_tests {
             Self::with(u64::MAX, Some(u64::MAX), false, true, false)
         }
         /// A WebRTC data channel that latched dead, as the trait sees it:
-        /// not alive, heard never, but the default `is_dead() == false`.
+        /// dead, not alive, heard never.
         fn dead_data_channel() -> Arc<Self> {
-            Self::with(u64::MAX, Some(u64::MAX), false, false, true)
+            Self::with(u64::MAX, Some(u64::MAX), false, true, false)
         }
         /// QUIC has closed the connection (`is_alive` false) but the `dead`
         /// flag has not latched yet (`is_dead` false).
@@ -11679,14 +11680,18 @@ mod warm_identity_tests {
     async fn a_dead_webrtc_transport_reaches_the_stall_ladder() {
         let (mut conn, _far, _rx) = test_conn().await;
         let dc = FakeQuic::dead_data_channel();
-        assert!(!dc.is_dead() && !dc.is_alive(), "fixture: the data channel's real shape");
+        assert!(dc.is_dead() && !dc.is_alive(), "fixture: the data channel's real shape");
         let pid = "sid-dc";
         conn.links
             .insert(pid.into(), relay_link(pid, "bravo", "bravo", dc));
         assert!(conn.detect_stall(pid, true, true).is_some(), "a dead channel mid-transfer is a stall");
-        conn.links
-            .insert("sid-latched".into(), relay_link("sid-latched", "bravo", "bravo", FakeQuic::dead()));
-        assert!(conn.detect_stall("sid-latched", true, true).is_some());
+        // Closed but not yet latched (quinn's window before the reader sees
+        // it): `transport_severed` still calls that dead.
+        conn.links.insert(
+            "sid-closed".into(),
+            relay_link("sid-closed", "bravo", "bravo", FakeQuic::closed_not_dead()),
+        );
+        assert!(conn.detect_stall("sid-closed", true, true).is_some());
         assert!(conn.detect_stall(pid, false, true).is_none(), "nothing in flight, nothing to repair");
         // The receiver leaves a dead channel to the sender's re-dial.
         assert!(conn.detect_stall(pid, true, false).is_none());

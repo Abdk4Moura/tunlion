@@ -717,6 +717,11 @@ pub struct IncomingFile {
     /// file-end, or a fleet direct adopted in place is re-verifying). `None`
     /// when the link had no proven name: a claimed name is never recorded.
     pub sender: Option<String>,
+    /// The build (`Link::source`) of the link this stream was accepted on.
+    /// A same-transfer re-offer over a link rebuilt since then is the sender
+    /// asking again because our accept never reached it
+    /// (`resume_replaces_own_stream`). `None` when no link was known.
+    pub accepted_on: Option<filament_transport::net::SourceId>,
 }
 
 /// P4 (GAP-5): recompute the whole-file sha256 of the received `.part` and

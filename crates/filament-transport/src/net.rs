@@ -78,6 +78,34 @@ pub const DC_FLUSH_STALL: std::time::Duration = std::time::Duration::from_secs(1
 /// never cut off. 15 s with zero acknowledged bytes is well past the 6 s stall
 /// threshold the transfer ladder already acts on.
 pub const DC_WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long a peer that sends the 5 s DataChannel keepalive may be silent
+/// while it owes us an answer before the link is judged half-open: our writes
+/// still drain (its SCTP stack outlives its channel), but nothing it sends
+/// reaches us. Its channel latched dead on a write the association never
+/// acknowledged, so its keepalive stopped, or it dropped the link and the close
+/// never arrived. Waited out, only the transfer's minute-long bounds ended it.
+///
+/// Four keepalive periods, past `DC_WRITE_STALL`: the peer's own write-stall
+/// latch fires first. Not applied to an idle link: a channel under heavy loss
+/// can go this long between deliveries (SCTP's retransmit backoff) and still
+/// recover, so only a caller that is waiting on the peer acts on it
+/// (`Transport::keepalive_silence_ms`, `Transport::sever`).
+pub const DC_PEER_SILENT: std::time::Duration = std::time::Duration::from_secs(20);
+/// The keepalive period (see the keepalive task in `wire_data_channel`).
+const DC_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a peer last heard `heard_ms` ago has gone silent past
+/// `DC_PEER_SILENT`. `None` (a transport whose peer sends no keepalive, so its
+/// silence says nothing) is never silent. Pure.
+pub fn peer_silent(keepalive_silence_ms: Option<u64>) -> bool {
+    keepalive_silence_ms.is_some_and(|ms| ms >= DC_PEER_SILENT.as_millis() as u64)
+}
+
+/// Whether a decoded control is the peer's periodic keepalive. Pure.
+fn is_keepalive(v: &Value) -> bool {
+    v["type"] == "ping" && v["reason"] == "keepalive"
+}
 /// The label `Peer::route` gives a path through a TURN relay. Callers that
 /// must react to a relayed path (the relay-honesty banner) compare against
 /// THIS, not a literal of their own: the CLI compared against "relayed" while
@@ -644,6 +672,19 @@ pub trait Transport: Send + Sync {
     fn is_dead(&self) -> bool {
         false
     }
+    /// Milliseconds since the peer last sent anything, ONLY when the peer is
+    /// known to send a periodic keepalive (a CLI end of a DataChannel), so
+    /// that silence means it is not reaching us. `None` otherwise: a browser
+    /// end sends no keepalive, and direct QUIC has its own keepalive verdict
+    /// in `is_alive`. See `DC_PEER_SILENT`.
+    fn keepalive_silence_ms(&self) -> Option<u64> {
+        None
+    }
+    /// Latch this transport dead from outside: a caller judged it unable to
+    /// carry the answer it waits for (a half-open link, see `DC_PEER_SILENT`).
+    /// Afterwards `is_dead()` is true and writes fail. Default no-op for
+    /// transports with their own liveness verdict.
+    fn sever(&self) {}
     /// Downcast to a concrete type so the caller can extract transport-specific
     /// fields (e.g. the quinn::Connection from DirectTransport) without coupling
     /// the trait interface to every transport implementation. Each concrete
@@ -829,6 +870,10 @@ pub struct DataChannelTransport {
     // before-first-byte establishment grace (a link awaiting its first chunk over
     // a high-RTT relay is establishing, not stalled).
     first_data: Arc<std::sync::atomic::AtomicBool>,
+    // Whether the peer sends the 5 s keepalive, so its silence past
+    // `DC_PEER_SILENT` while it owes us an answer means the link is half-open
+    // (`Transport::keepalive_silence_ms`).
+    peer_keepalives: Arc<std::sync::atomic::AtomicBool>,
     // The `polite` role for this link (opposite on the two ends). Selects which
     // half of the L2 sid space this end allocates from, so the two ends never
     // collide (Transport::sid_answerer).
@@ -1097,6 +1142,29 @@ impl Transport for DataChannelTransport {
     /// silently-evicted relay path.
     fn is_alive(&self) -> bool {
         !self.is_dead()
+    }
+
+    /// The same latch `is_alive` reads. A channel only exists once it opened,
+    /// so dead here always means it came up and then died: EOF or a read
+    /// error, a write or flush the association never acknowledged
+    /// (`DC_WRITE_STALL`, `DC_FLUSH_STALL`), or a caller's `sever`. Left at
+    /// the trait default, a latched channel read `is_dead() == false` and every
+    /// caller that asked the strict question (reconcile, re-dial gates, a fresh
+    /// responder for a re-dialed peer) treated a channel that will never carry
+    /// a byte as serving.
+    fn is_dead(&self) -> bool {
+        DataChannelTransport::is_dead(self)
+    }
+
+    fn keepalive_silence_ms(&self) -> Option<u64> {
+        if !self.peer_keepalives.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        self.heard_ms()
+    }
+
+    fn sever(&self) {
+        self.declare_dead();
     }
 
     fn sid_answerer(&self) -> bool {
@@ -2056,9 +2124,14 @@ impl Peer {
             }));
         }
 
+        let state = Arc::new(Mutex::new(PeerSignalState {
+            pending_candidates: Vec::new(),
+            has_remote: false,
+            remote_pc: None,
+        }));
         if !polite {
             let dc = pc.create_data_channel("filament", None).await?;
-            wire_channel(peer_id.clone(), dc, tx.clone(), closed.clone(), polite, source).await;
+            wire_channel(peer_id.clone(), dc, tx.clone(), closed.clone(), polite, source, state.clone()).await;
             let offer = pc.create_offer(None).await?;
             pc.set_local_description(offer).await?;
             let ld = pc
@@ -2075,12 +2148,14 @@ impl Peer {
             let tx = tx.clone();
             let closed = closed.clone();
             let pid = peer_id.clone();
+            let state = state.clone();
             pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
                 let tx = tx.clone();
                 let closed = closed.clone();
                 let pid = pid.clone();
+                let state = state.clone();
                 Box::pin(async move {
-                    wire_channel(pid, dc, tx, closed, polite, source).await;
+                    wire_channel(pid, dc, tx, closed, polite, source, state).await;
                 })
             }));
         }
@@ -2112,11 +2187,6 @@ impl Peer {
             });
         }
 
-        let state = Arc::new(Mutex::new(PeerSignalState {
-            pending_candidates: Vec::new(),
-            has_remote: false,
-            remote_pc: None,
-        }));
         let fps = Arc::new(Mutex::new((None, None)));
         let worker = PcWorker {
             id: peer_id.clone(),
@@ -2885,6 +2955,7 @@ async fn wire_channel(
     closed: Arc<std::sync::atomic::AtomicBool>,
     polite: bool,
     source: SourceId,
+    signal: Arc<Mutex<PeerSignalState>>,
 ) {
     // With detach_data_channels(), on_open still fires but webrtc-rs's
     // managed (65535-byte-buffer) read loop never starts, we detach and run
@@ -2894,6 +2965,7 @@ async fn wire_channel(
         let dc2 = dc2.clone();
         let tx = tx.clone();
         let closed = closed.clone();
+        let signal = signal.clone();
         Box::pin(async move {
             let raw = match dc2.detach().await {
                 Ok(raw) => raw,
@@ -2910,6 +2982,15 @@ async fn wire_channel(
             // Seeded at open too: a link that just came up has just heard its peer.
             let last_heard = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
             let first_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Whether this peer sends the keepalive, so its silence means
+            // something (see `DC_PEER_SILENT`). Known at open when its
+            // description carried a `pc` tag: every CLI end tags and
+            // keepalives, a browser does neither. A keepalive that arrives
+            // also sets it. Knowing it up front matters: a channel whose
+            // reverse direction never worked hears NOTHING, and that is the
+            // half-open link this exists for.
+            let peer_cli = signal.lock().await.remote_pc.is_some();
+            let keepalives_heard = Arc::new(std::sync::atomic::AtomicBool::new(peer_cli));
             // L3-over-relay queues, created BEFORE the read loop so the reader
             // owns the inbound sender and the transport owns the receiver.
             let (l3_in_tx, l3_in_rx) = tokio::sync::mpsc::channel::<Bytes>(L3_QUEUE);
@@ -2942,6 +3023,7 @@ async fn wire_channel(
                 let last_activity = last_activity.clone();
                 let last_heard = last_heard.clone();
                 let first_data = first_data.clone();
+                let keepalives_heard = keepalives_heard.clone();
                 let peer_id = peer_id.clone();
                 async move {
                     let mut buf = vec![0u8; READ_BUF];
@@ -2961,6 +3043,9 @@ async fn wire_channel(
                             Ok((n, true)) => {
                                 if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                                     if let Some(v) = crate::control_limits::decode_control(&buf[..n]) {
+                                        if is_keepalive(&v) {
+                                            keepalives_heard.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        }
                                         let _ = tx.send(Ev::Sourced {
                                             pid: peer_id.clone(),
                                             source,
@@ -3028,7 +3113,7 @@ async fn wire_channel(
                     tokio::spawn(async move {
                         let frame = Bytes::from(json!({ "type": "ping", "reason": "keepalive" }).to_string());
                         loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            tokio::time::sleep(DC_KEEPALIVE).await;
                             if dead_k.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }
@@ -3075,7 +3160,8 @@ async fn wire_channel(
                 }
                 let transport: Arc<dyn Transport> =
                     Arc::new(DataChannelTransport {
-                        raw, source, drained, dead, last_activity, last_heard, first_data, answerer: polite,
+                        raw, source, drained, dead, last_activity, last_heard, first_data,
+                        peer_keepalives: keepalives_heard, answerer: polite,
                         write_gate,
                         l3_in: tokio::sync::Mutex::new(l3_in_rx),
                         l3_out: l3_out_tx,
@@ -3279,12 +3365,10 @@ mod tests {
         assert!(Arc::ptr_eq(&inner_transport, &transport), "the callback transport was replaced");
     }
 
-    /// REAL constructor regression: build an actual `webrtc-data` channel over
-    /// an in-memory SCTP association pair (the public `webrtc::util` Bridge
-    /// seam, no ICE/network), wrap it in the production
-    /// `DataChannelTransport`, and prove the getter returns the build source.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn real_data_channel_transport_exposes_its_build_source() {
+    /// An actual `webrtc-data` channel over an in-memory SCTP association pair
+    /// (the public `webrtc::util` Bridge seam, no ICE/network), wrapped in the
+    /// production `DataChannelTransport`. Returns its source and `dead` latch.
+    async fn real_data_channel_transport() -> (Arc<dyn Transport>, SourceId, DcLatches) {
         use webrtc::data::data_channel::Config as DataChannelConfig;
         use webrtc::sctp::association::{Association as SctpAssociation, Config as SctpConfig};
         use webrtc::util::conn::conn_bridge::Bridge;
@@ -3327,21 +3411,44 @@ mod tests {
         let _ = ticker.await;
 
         let source = SourceId::next();
+        let latches = DcLatches {
+            dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_heard: Arc::new(std::sync::atomic::AtomicU64::new(now_ms())),
+            peer_keepalives: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
         let (l3_out_tx, _l3_out_rx) = mpsc::channel(1);
         let (_l3_in_tx, l3_in_rx) = mpsc::channel(1);
         let transport: Arc<dyn Transport> = Arc::new(DataChannelTransport {
             raw: Arc::new(raw),
             source,
             drained: Arc::new(Notify::new()),
-            dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dead: latches.dead.clone(),
             last_activity: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            last_heard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_heard: latches.last_heard.clone(),
             first_data: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            peer_keepalives: latches.peer_keepalives.clone(),
             answerer: false,
             write_gate: Arc::new(WriteGate::new()),
             l3_in: Mutex::new(l3_in_rx),
             l3_out: l3_out_tx,
         });
+        (transport, source, latches)
+    }
+
+    /// The shared state a real `DataChannelTransport`'s tasks write.
+    struct DcLatches {
+        dead: Arc<std::sync::atomic::AtomicBool>,
+        last_heard: Arc<std::sync::atomic::AtomicU64>,
+        peer_keepalives: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// REAL constructor regression: build an actual `webrtc-data` channel over
+    /// an in-memory SCTP association pair (the public `webrtc::util` Bridge
+    /// seam, no ICE/network), wrap it in the production
+    /// `DataChannelTransport`, and prove the getter returns the build source.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_data_channel_transport_exposes_its_build_source() {
+        let (transport, source, _dead) = real_data_channel_transport().await;
         assert!(
             transport.as_any().is::<DataChannelTransport>(),
             "the fixture built a different transport"
@@ -3360,6 +3467,69 @@ mod tests {
         };
         assert_eq!(inner_pid, "webrtc");
         assert!(Arc::ptr_eq(&inner_transport, &transport), "re-emit swapped the transport");
+    }
+
+    /// The REAL transport answers the strict question through the trait. A
+    /// channel that latched dead (here as a write the association never
+    /// acknowledged latches it) kept the trait default `is_dead() == false`
+    /// while `is_alive()` said false, so every caller that asked `is_dead()`
+    /// (reconcile, re-dial gates, the fresh-responder check for a re-dialed
+    /// peer) went on treating it as serving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_data_channel_is_dead_through_the_trait() {
+        let (transport, _source, latches) = real_data_channel_transport().await;
+        assert!(!transport.is_dead() && transport.is_alive(), "a fresh channel reads dead");
+        latches.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(transport.is_dead(), "a latched channel reads not-dead through the trait");
+        assert!(!transport.is_alive());
+        assert_eq!(transport.heard_ms(), Some(u64::MAX));
+        assert!(transport.send_control(&json!({ "type": "ping" })).await.is_err());
+    }
+
+    /// The half-open link, on the real transport: a CLI peer (it keepalives)
+    /// reports how long it has been silent, a browser peer (no keepalive)
+    /// reports nothing, and `sever` latches the channel dead through the trait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_silent_cli_peer_is_reported_and_severable() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // `now_ms` counts from a process-wide monotonic epoch, so a test can
+        // only make a peer older by moving `last_heard` back to that epoch.
+        let (browser, _, b) = real_data_channel_transport().await;
+        b.last_heard.store(0, Relaxed);
+        assert_eq!(browser.keepalive_silence_ms(), None, "a quiet browser peer was judged by its silence");
+        assert!(!browser.is_dead(), "silence alone latched a channel");
+
+        let (cli, _, c) = real_data_channel_transport().await;
+        c.peer_keepalives.store(true, Relaxed);
+        let fresh = cli.keepalive_silence_ms().expect("a CLI peer reports its silence");
+        assert!(!peer_silent(Some(fresh)), "a CLI peer heard just now reads silent: {fresh}ms");
+        c.last_heard.store(0, Relaxed);
+        let before = now_ms();
+        let old = cli.keepalive_silence_ms().expect("a CLI peer reports its silence");
+        assert!(old >= before, "silence is not measured from the last word: {old}ms < {before}ms");
+        assert!(!cli.is_dead(), "silence alone latched a channel");
+        cli.sever();
+        assert!(cli.is_dead() && !cli.is_alive(), "sever did not latch the channel dead");
+        assert!(c.dead.load(Relaxed));
+        assert_eq!(cli.keepalive_silence_ms(), Some(u64::MAX), "a severed channel reads heard");
+        assert!(cli.send_control(&json!({ "type": "ping" })).await.is_err());
+    }
+
+    /// The half-open bound: past `DC_WRITE_STALL` plus a keepalive period, so
+    /// the peer's own write-stall latch fires first; nothing is silent without
+    /// a keepalive to miss.
+    #[test]
+    fn a_silent_keepalive_peer_is_half_open() {
+        let bound = DC_PEER_SILENT.as_millis() as u64;
+        assert!(bound >= DC_WRITE_STALL.as_millis() as u64 + DC_KEEPALIVE.as_millis() as u64);
+        assert!(!peer_silent(Some(0)));
+        assert!(!peer_silent(Some(bound - 1)));
+        assert!(peer_silent(Some(bound)));
+        assert!(peer_silent(Some(u64::MAX)));
+        assert!(!peer_silent(None));
+        assert!(is_keepalive(&json!({ "type": "ping", "reason": "keepalive" })));
+        assert!(!is_keepalive(&json!({ "type": "ping", "v": 1, "reason": "stall-probe" })));
+        assert!(!is_keepalive(&json!({ "type": "state", "v": 1 })));
     }
 
 

@@ -801,16 +801,43 @@ pub fn recv_pake_expired_message(any_pake_heard: bool, budget_secs: u64) -> Stri
     }
 }
 
-/// Whether a re-offer is the same sender resuming over its own lingering
+/// One stream already open for the file a re-offer names: who it belongs
+/// to, which transfer, and the link build it was accepted on.
+pub struct Lingering<'a> {
+    pub pid: &'a str,
+    pub id: &'a str,
+    pub accepted_on: Option<net::SourceId>,
+}
+
+/// Whether a re-offer is the same sender replacing its own lingering
 /// stream(s) for that file. Such a sender has judged those streams dead, and
 /// the transport its pid maps to now is the fresh link it re-dialed, so that
 /// link's activity says nothing about the old stream. Pure.
+///
+/// Two shapes. A resume: the sender saw our accept, streamed, and asks to
+/// continue. And the SAME transfer offered again without resume over a link
+/// rebuilt since we accepted it: the sender never saw our `file-accept` (our
+/// channel died before it arrived, the half-open link), re-dialed, and asked
+/// again. Nothing can flow on that stream (the link it was accepted on is
+/// gone, and a sender streams nothing before it sees the accept), so the
+/// "first stream wins" rule would only wedge the send. On the link the stream
+/// was accepted on, a repeated offer stays a duplicate: that accept may still
+/// arrive.
 pub fn resume_replaces_own_stream<'a>(
     is_resume: bool,
-    mut lingering_pids: impl Iterator<Item = &'a str>,
+    lingering: impl Iterator<Item = Lingering<'a>>,
     offering_pid: &str,
+    offer_id: &str,
+    link_source: Option<net::SourceId>,
 ) -> bool {
-    is_resume && lingering_pids.all(|p| p == offering_pid)
+    let mut reasked = true;
+    for l in lingering {
+        if l.pid != offering_pid {
+            return false;
+        }
+        reasked &= l.id == offer_id && l.accepted_on.is_some() && l.accepted_on != link_source;
+    }
+    is_resume || reasked
 }
 
 /// Whether a receive that has finished its files may start its quiet exit, and
@@ -9878,8 +9905,17 @@ async fn recv_run(
                             // repaired send never moved another byte.
                             let same_sender_resume = resume_replaces_own_stream(
                                 is_resume,
-                                dup_keys.iter().map(|(p, _)| p.as_str()),
+                                dup_keys.iter().map(|k| {
+                                    let inc = st.by_sid.get(k);
+                                    Lingering {
+                                        pid: k.0.as_str(),
+                                        id: inc.map(|i| i.id.as_str()).unwrap_or_default(),
+                                        accepted_on: inc.and_then(|i| i.accepted_on),
+                                    }
+                                }),
                                 &pid,
+                                &id,
+                                conn.link(&pid).map(|l| l.source),
                             );
                             let any_flowing = !same_sender_resume
                                 && dup_keys.iter().any(|(p, _)| {
@@ -9960,6 +9996,7 @@ async fn recv_run(
                                     write_err: Arc::new(std::sync::Mutex::new(None)),
                                     stdout: Some(sink),
                                     sender: conn.link(&pid).and_then(|l| l.verified_name.clone()),
+                                    accepted_on: conn.link(&pid).map(|l| l.source),
                                 },
                             );
                             // Ask for ONE in-order stream: split across parallel
@@ -10178,6 +10215,7 @@ async fn recv_run(
                             write_err: Arc::new(std::sync::Mutex::new(None)),
                             stdout: None,
                             sender: conn.link(&pid).and_then(|l| l.verified_name.clone()),
+                            accepted_on: conn.link(&pid).map(|l| l.source),
                         },
                     );
                     // The accept could not be sent (the link died under us): drop
@@ -11860,18 +11898,43 @@ mod offer_consent_tests {
 
 #[cfg(test)]
 mod resume_own_stream_tests {
-    use super::resume_replaces_own_stream;
+    use super::{resume_replaces_own_stream, Lingering};
+    use filament_transport::net::SourceId;
 
     /// The chaos replay's repaired send: it re-dialed the same sid and
     /// re-offered with resume, and the receiver ignored it as a duplicate.
     #[test]
     fn a_same_sender_resume_replaces_its_lingering_stream() {
-        assert!(resume_replaces_own_stream(true, ["sid-a"].into_iter(), "sid-a"));
-        // Not a resume: a concurrent duplicate keeps the flowing check.
-        assert!(!resume_replaces_own_stream(false, ["sid-a"].into_iter(), "sid-a"));
+        let old = Some(SourceId::next());
+        let l = |pid: &'static str| Lingering { pid, id: "t1", accepted_on: old };
+        assert!(resume_replaces_own_stream(true, [l("sid-a")].into_iter(), "sid-a", "t1", old));
+        // Not a resume, on the link it was accepted on: a concurrent duplicate
+        // keeps the flowing check.
+        assert!(!resume_replaces_own_stream(false, [l("sid-a")].into_iter(), "sid-a", "t1", old));
         // A different sender (a rejoin on a new sid) keeps the flowing check.
-        assert!(!resume_replaces_own_stream(true, ["sid-a"].into_iter(), "sid-b"));
-        assert!(!resume_replaces_own_stream(true, ["sid-a", "sid-b"].into_iter(), "sid-a"));
+        assert!(!resume_replaces_own_stream(true, [l("sid-a")].into_iter(), "sid-b", "t1", old));
+        assert!(!resume_replaces_own_stream(true, [l("sid-a"), l("sid-b")].into_iter(), "sid-a", "t1", old));
+    }
+
+    /// The half-open link: our `file-accept` never reached the sender (our
+    /// channel died first), so it re-dialed the same sid and offered the SAME
+    /// transfer again, without resume because it never saw the accept. The
+    /// stream we opened for that accept lingers and the fresh link reads busy;
+    /// ignored as a duplicate, the send waited out its answer bound.
+    #[test]
+    fn a_same_transfer_reoffered_on_a_rebuilt_link_replaces_its_stream() {
+        let (old, fresh) = (Some(SourceId::next()), Some(SourceId::next()));
+        let l = |pid: &'static str, id: &'static str| Lingering { pid, id, accepted_on: old };
+        assert!(resume_replaces_own_stream(false, [l("sid-a", "t1")].into_iter(), "sid-a", "t1", fresh));
+        // The link the accept went out on is still there: it may yet arrive.
+        assert!(!resume_replaces_own_stream(false, [l("sid-a", "t1")].into_iter(), "sid-a", "t1", old));
+        // A different transfer of the same file name keeps the flowing check.
+        assert!(!resume_replaces_own_stream(false, [l("sid-a", "t0")].into_iter(), "sid-a", "t1", fresh));
+        // Another sender offering that id keeps it too.
+        assert!(!resume_replaces_own_stream(false, [l("sid-a", "t1")].into_iter(), "sid-b", "t1", fresh));
+        // A stream with no recorded link is never judged replaced.
+        let unknown = Lingering { pid: "sid-a", id: "t1", accepted_on: None };
+        assert!(!resume_replaces_own_stream(false, [unknown].into_iter(), "sid-a", "t1", fresh));
     }
 }
 
@@ -13558,6 +13621,7 @@ mod code_stream_tests {
             write_err: Arc::new(std::sync::Mutex::new(None)),
             stdout: None,
             sender: None,
+            accepted_on: None,
         }
     }
 
