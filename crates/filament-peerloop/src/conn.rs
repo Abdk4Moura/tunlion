@@ -7474,7 +7474,9 @@ impl Conn {
         // is guaranteed wasted — send_frame checks the dead flag and errors
         // immediately. Skip ahead to rung (c) Repair (re-dial direct QUIC) on
         // the first ladder tick, collapsing a wasted stall cycle.
-        let dead_on_entry = self.transport_of(pid).map(|t| t.is_dead()).unwrap_or(false);
+        let dead_on_entry = self
+            .transport_of(pid)
+            .is_some_and(|t| Self::transport_severed(t.as_ref()));
         let st = self.resil.stall_repairs.entry(pid.to_string()).or_default();
         st.pending = true;
         if dead_on_entry && st.attempts == 0 {
