@@ -1833,8 +1833,24 @@ def _save_finding(out: Path, verdict: dict, w: World, repro: str) -> Path:
     key = hashlib.sha1("\n".join(sorted(finding_key(f) for f in verdict["hard"])).encode()).hexdigest()[:10]
     d = out / "findings" / key
     d.mkdir(parents=True, exist_ok=True)
-    (d / "schedule.json").write_text(json.dumps(verdict["schedule"], indent=2, sort_keys=True))
+    # schedule.json is what to replay: the minimized schedule when there is
+    # one. The logs, ops and faults below are from the run that FAILED, whose
+    # schedule may hold faults minimization dropped, so that one is saved as
+    # run-schedule.json and verdict.json names it. (Finding 5335b79ffb,
+    # 2026-11-26: charlie's 39 s signaling outage looked unexplained because
+    # schedule.json no longer had the sig.reset on charlie that caused it.)
+    run_sched = verdict["schedule"]
+    replay = verdict.get("minimized") or run_sched
+    for stale in ("schedule.json", "run-schedule.json"):
+        (d / stale).unlink(missing_ok=True)
+    (d / "schedule.json").write_text(json.dumps(replay, indent=2, sort_keys=True))
+    logs_from = "schedule.json"
+    if replay != run_sched:
+        logs_from = "run-schedule.json"
+        (d / logs_from).write_text(json.dumps(run_sched, indent=2, sort_keys=True))
     v = {k: verdict[k] for k in ("label", "findings", "ops", "faults")}
+    v["fault_windows"] = verdict.get("fault_windows")
+    v["schedule_of_this_run"] = logs_from
     v["visitors"] = verdict.get("visitors")
     v["reproduced"] = repro
     (d / "verdict.json").write_text(json.dumps(v, indent=2, sort_keys=True))
@@ -2049,7 +2065,9 @@ def cmd_explore(worlds: list[World], out: Path, budget_s: float, seed: int, corp
             # campaign (an instrument refusal still ends it).
             try:
                 repro = confirm(w, sched, v)
-                v["schedule"] = minimize(w, sched, {f["oracle"] for f in v["hard"]})
+                # Kept beside, never over, v["schedule"]: the logs, ops and
+                # faults in this verdict all come from the run of v["schedule"].
+                v["minimized"] = minimize(w, sched, {f["oracle"] for f in v["hard"]})
             except Refused as e:
                 if str(e).startswith("instrument"):
                     raise
@@ -2173,6 +2191,29 @@ def selftest_visitors() -> None:
             raise AssertionError(bad_s)
         except ValueError:
             pass
+
+
+def selftest_save_finding() -> None:
+    """A minimized finding keeps the schedule its logs came from."""
+    import tempfile
+    reset = {"at": 1.1, "dur": 25.8, "fault": "sig.reset", "target": "charlie"}
+    impair = {"at": 15.8, "dur": 195.9, "fault": "net.impair", "target": "bravo", "args": {"loss": 50}}
+    full = {"version": 1, "seed": 0, "hooks": {}, "steps": [reset, impair]}
+    small = {"version": 1, "seed": 0, "hooks": {}, "steps": [impair]}
+    hard = [{"oracle": "O2-hang", "hard": True, "what": "send alpha->bravo still running"}]
+    base = {"label": "explore-1", "findings": hard, "hard": hard, "ops": [], "faults": [],
+            "fault_windows": [{"fault": "sig.reset", "start": 1.2, "end": 27.0}]}
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _save_finding(Path(tmp), dict(base, schedule=full, minimized=small), None, "3/3")
+        assert json.loads((d / "schedule.json").read_text()) == small, "replay the minimized schedule"
+        assert json.loads((d / "run-schedule.json").read_text()) == full, "the logs' own schedule is kept"
+        v = json.loads((d / "verdict.json").read_text())
+        assert v["schedule_of_this_run"] == "run-schedule.json" and v["fault_windows"][0]["fault"] == "sig.reset"
+        # Nothing dropped (or no minimize ran): one schedule, no stale second file.
+        d = _save_finding(Path(tmp), dict(base, schedule=full), None, "3/3")
+        assert json.loads((d / "schedule.json").read_text()) == full
+        assert not (d / "run-schedule.json").exists(), "a stale run-schedule.json would mislead"
+        assert json.loads((d / "verdict.json").read_text())["schedule_of_this_run"] == "schedule.json"
 
 
 def cmd_selftest() -> int:
@@ -2304,6 +2345,7 @@ def cmd_selftest() -> int:
                 assert st["fault"] in FAULTS, (p, st)
             else:
                 assert st["op"] in OPS + ["visit"], (p, st)
+    selftest_save_finding()
     print("selftest ok")
     return 0
 

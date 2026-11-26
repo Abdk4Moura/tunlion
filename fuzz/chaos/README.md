@@ -49,8 +49,12 @@ there is no result), 4 the canary was not detected (the instrument is broken).
 
 Each finding is a directory under `chaos-results/<job>/out/findings/<id>/`
 with `schedule.json` (replay it with `replay <file>`), `verdict.json` (which
-rule fired, every operation's exit code and stderr, every fault and whether it
-bit) and every daemon's log. To keep a finding as a regression test, copy its
+rule fired, every operation's exit code and stderr, every fault, its window and
+whether it bit) and every daemon's log. An explore finding's `schedule.json` is
+the MINIMIZED schedule, while the logs and `verdict.json` come from the run that
+failed first; when minimization dropped a fault, that run's schedule is in
+`run-schedule.json` (`verdict.json` names it as `schedule_of_this_run`). Read
+the logs against that one: a fault it holds is absent from `schedule.json`. To keep a finding as a regression test, copy its
 `schedule.json` into `corpus/` with an `origin` line saying what it caught.
 
 ## Visitors
