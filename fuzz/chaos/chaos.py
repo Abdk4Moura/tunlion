@@ -139,7 +139,9 @@ OPS = ["exec", "send", "reach", "status", "doctor"]
 # canaries, not faults.
 RECOVERABLE_HOOKS = {
     "TUNLION_TEST_DIRECT_FLAKY": ["1"],
-    "TUNLION_TEST_DIRECT_DELAY_MS": ["500", "3000"],
+    # 1500 ms is the delay gate T3b uses to make a code transfer start on the
+    # relay and switch to a direct path mid-stream (the #746 corruption).
+    "TUNLION_TEST_DIRECT_DELAY_MS": ["500", "1500", "3000"],
     "TUNLION_TEST_ESTABLISH_DELAY_MS": ["500", "4000"],
     "TUNLION_TEST_DROP_PEER_LEFT": ["1"],
     "TUNLION_TEST_CORRUPT_ONCE": ["1"],
@@ -824,7 +826,29 @@ class World:
             rc, out, err, _ = self.cli(d, ["join", "--invite-file", str(dst), "--name", d, "--no-interactive"], 60)
             if rc != 0:
                 raise Refused(f"join {d} failed rc={rc}: {err.strip()[-300:]}")
-        self.daemon_stop(OWNER)
+        # Let the fleet roster reach every device before the snapshot: a
+        # delegate that never ran a daemon knows only the owner, so every run
+        # would start with bravo not knowing charlie until the roster arrived
+        # and an op in the first second failed with "no device named
+        # 'charlie'" (O14, 2026-11-26), a world that had not settled.
+        for d in DELEGATES:
+            self.daemon_start(d)
+        deadline = time.monotonic() + 90
+        missing: dict = {}
+        while time.monotonic() < deadline:
+            missing = {}
+            for d in DEVICES:
+                _, out, err, _ = self.cli(d, ["devices"], 20)
+                lack = [o for o in DEVICES if o != d and o not in out]
+                if lack:
+                    missing[d] = lack
+            if not missing:
+                break
+            time.sleep(2)
+        for d in DEVICES:
+            self.daemon_stop(d)
+        if missing:
+            raise Refused(f"setup: fleet roster did not reach every device in 90s: {missing}")
         if self.snapshot.exists():
             shutil.rmtree(self.snapshot)
         for d in DEVICES:
@@ -1156,7 +1180,13 @@ def send_to_stdout(w: World, st: dict, res: dict, deadline: float) -> None:
     slog = w.cfg(src) / f"stdout-send-{tag}.log"
     rlog = w.cfg(dst) / f"stdout-recv-{tag}.log"
     with open(slog, "wb") as so:
-        sp = subprocess.Popen(w.as_dev(src, ["send", str(f), "--word", STDOUT_WORD]), env=w.env_for(src),
+        # A code send and its receive are one-shot processes with their own
+        # transport, not the daemon's, so the device's hooks must reach them
+        # too or the paths those hooks open (a mid-transfer upgrade to direct)
+        # are unreachable: replaying the pre-#746 tree found 0/24 corruptions
+        # without this, while gate T3b finds it with the hook on both ends.
+        sp = subprocess.Popen(w.as_dev(src, ["send", str(f), "--word", STDOUT_WORD]),
+                              env=w.env_for(src, w.hooks.get(src, {})),
                               stdout=so, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                               start_new_session=True)
     code = None
@@ -1172,7 +1202,7 @@ def send_to_stdout(w: World, st: dict, res: dict, deadline: float) -> None:
     if code:
         with open(rlog, "wb") as re_:
             rp = subprocess.Popen(w.as_dev(dst, ["receive", code, "-y", "-o", "-", "--timeout", "60"]),
-                                  env=w.env_for(dst), stdout=subprocess.PIPE, stderr=re_,
+                                  env=w.env_for(dst, w.hooks.get(dst, {})), stdout=subprocess.PIPE, stderr=re_,
                                   stdin=subprocess.DEVNULL, start_new_session=True)
 
         def drain() -> None:
@@ -1346,6 +1376,36 @@ def judge_local_status(r: dict, fault_windows: list[dict]) -> list[dict]:
     return [{"oracle": "O3b-unresponsive-during-network-fault", "hard": True,
              "what": f"status on {r['src']} said its daemon was not responding while only network faults "
                      f"were active ({', '.join(faults)}): {r['stderr_tail'][:200]}"}]
+
+
+# O14: how long after a fault heals an op may still fail for that fault's
+# sake (presence, ICE and the retry ladder settle; the post-heal probes judge
+# recovery itself).
+UNFAULTED_SETTLE = 30.0
+
+
+def judge_unfaulted(r: dict, fault_windows: list[dict]) -> list[dict]:
+    """O14: an op that failed while nothing was injected. Hooks in a schedule
+    are RECOVERABLE by definition (hookcheck proves each one), so with no
+    fault overlapping the op, nor ending within UNFAULTED_SETTLE before it,
+    the op must succeed. Without this rule a schedule of hooks alone judged
+    nothing about its ops: 24/24 code receives to stdout failed with
+    "Permission denied" and every run was called clean (2026-11-26)."""
+    if r.get("ok") or "t_start" not in r or r.get("op") == "visit":
+        return []
+    # t_start/t_end are rounded to 0.1 s and a fault applied in the same tick
+    # can land while the op runs (a status at 2.2 next to a kill at 2.21 said
+    # "not running"), so a fault starting up to 2 s after the op counts.
+    lo, hi = r["t_start"] - UNFAULTED_SETTLE, r["t_end"] + 2.0
+    for f in fault_windows:
+        end = f["end"] if f["end"] is not None else float("inf")
+        if f["start"] <= hi and end >= lo:
+            return []
+    rc = "hung" if r.get("rc") is None else f"rc {r.get('rc')}"
+    tail = (r.get("stderr_tail") or "").strip().splitlines()[-1:] or [""]
+    return [{"oracle": "O14-failed-unfaulted", "hard": True,
+             "what": f"{r['op']} {r['src']}->{r['dst']} failed ({rc}) with no fault active or healed within "
+                     f"{UNFAULTED_SETTLE:.0f}s: {tail[0][:200]}"}]
 
 
 def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
@@ -1632,6 +1692,7 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
         verdict["findings"].extend(judge_op(r))
         verdict["findings"].extend(judge_diagnosis(r, fault_windows))
         verdict["findings"].extend(judge_local_status(r, fault_windows))
+        verdict["findings"].extend(judge_unfaulted(r, fault_windows))
 
     # After heal: every daemon reconnects, every path works, nobody storms.
     alive = [d for d in DEVICES if w.daemons[d] and w.daemons[d].poll() is None]
@@ -2274,6 +2335,17 @@ def cmd_selftest() -> int:
     assert judge_diagnosis(blamed, part)[0]["oracle"] == "O9-misdiagnosis"
     frozen = [{"step": {"fault": "proc.freeze", "target": "bravo"}, "start": 0.0, "end": 60.0}]
     assert judge_diagnosis(blamed, frozen) == []
+    failed = {"op": "send", "src": "alpha", "dst": "bravo", "ok": False, "rc": 6, "t_start": 50.0, "t_end": 60.0,
+              "stderr_tail": "Error: Permission denied (os error 13)"}
+    assert judge_unfaulted(failed, [])[0]["oracle"] == "O14-failed-unfaulted"
+    assert judge_unfaulted(dict(failed, rc=None), [])[0]["what"].startswith("send alpha->bravo failed (hung)")
+    assert judge_unfaulted(dict(failed, ok=True), []) == []
+    assert judge_unfaulted(failed, [{"step": {}, "start": 55.0, "end": 70.0}]) == [], "overlapping fault"
+    assert judge_unfaulted(failed, [{"step": {}, "start": 5.0, "end": 25.0}]) == [], "healed within the settle"
+    assert judge_unfaulted(failed, [{"step": {}, "start": 5.0, "end": None}]) == [], "never healed"
+    assert judge_unfaulted(failed, [{"step": {}, "start": 1.0, "end": 10.0}])[0]["oracle"] == "O14-failed-unfaulted"
+    assert judge_unfaulted(dict(failed, t_start=2.2, t_end=2.2), [{"step": {}, "start": 2.21, "end": 7.2}]) == [], \
+        "a fault applied in the same tick as the op"
     assert judge_diagnosis(dict(blamed, dst_signaling_after="down"), part) == []
     assert judge_diagnosis(dict(blamed, stderr_tail="connect timeout: couldn't reach 'bravo' in 45s"), part) == []
     old = [{"step": {"fault": "proc.kill", "target": "bravo"}, "start": 0.0, "end": 1.0}]

@@ -77,6 +77,7 @@ A schedule with visits turns on alpha's debug log and adds two rules:
 - O13-enrollment-starved: one more visitor, after all of them left, must enroll
   within 60 s and be answered; so must any visitor that comes after another one
   engaged.
+- O14-failed-unfaulted: an op that ran with no fault active, nor one healed within 30 s before it, must succeed (hooks are recoverable by definition)
 
 A visitor that cannot engage before any other visitor did refuses the run, as
 does a missing ESTABLISH line in alpha's log (the rule would be blind).
