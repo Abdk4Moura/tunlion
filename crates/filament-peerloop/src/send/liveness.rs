@@ -106,8 +106,14 @@ pub fn link_down_window(
 /// clock restarted by it.
 pub const LINK_UP_HEARD: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Slack for a receiver heard just before the loop first saw its link up.
-const HEARD_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+/// How much later than the moment the loop first saw the link up a word must
+/// arrive to count as the receiver heard on it. A data channel stamps "last
+/// heard" when it opens, just before the loop sees it up, so a receiver that
+/// never says a word reads as silent for about as long as the link has been
+/// up. The old 2 s slack the other way counted that stamp as a word: a late
+/// link with a silent receiver restarted the down clock after 10 s and the
+/// send ran past its bound (send-warm-link-lost-during-outage, 1-2/12).
+const HEARD_AFTER_UP: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long the send's link to its receiver has been down, across every way
 /// it can be: no transport, a dead one, or one whose receiver (a peer that
@@ -151,7 +157,10 @@ impl DownClock {
         let up_for = now.saturating_duration_since(up);
         // Unknown silence (a transport whose peer sends no keepalive) is
         // taken as heard, as before: only a known silence holds the clock.
-        let heard_since_up = silent.is_none_or(|s| s <= up_for + HEARD_SLACK);
+        // Heard since up: the last word is later than the moment the link
+        // was first seen up (silence shorter than the uptime), not a stamp
+        // set as the link opened.
+        let heard_since_up = silent.is_none_or(|s| s + HEARD_AFTER_UP <= up_for);
         if !heard_since_up {
             return self.down_since.is_some();
         }
@@ -305,7 +314,9 @@ mod tests {
         let mut c = DownClock::default();
         assert!(c.observe(at(10), true, None, w));
         // Up at 50 s; the receiver was last heard before that and not since.
-        assert!(!c.observe(at(50), false, Some(Duration::ZERO), w), "heard as it came up");
+        // Up at 50 s with only the stamp set as it opened: no word since up,
+        // so while the episode is open it is still down.
+        assert!(c.observe(at(50), false, Some(Duration::ZERO), w), "no word since up");
         assert!(c.observe(at(60), false, Some(Duration::from_secs(13)), w));
         assert!(c.observe(at(61), false, Some(Duration::from_secs(14)), w));
         assert_eq!(c.down_since(), Some(at(10)));
@@ -313,10 +324,41 @@ mod tests {
         // The same link with its receiver talking (state every 10 s) is back.
         let mut c = DownClock::default();
         c.observe(at(10), true, None, w);
-        assert!(!c.observe(at(50), false, Some(Duration::ZERO), w));
-        assert!(!c.observe(at(55), false, Some(Duration::from_secs(4)), w));
+        assert!(c.observe(at(50), false, Some(Duration::ZERO), w), "nothing heard since up yet");
+        assert!(!c.observe(at(55), false, Some(Duration::from_secs(4)), w), "heard 1 s after up");
         assert!(!c.observe(at(60), false, Some(Duration::from_secs(1)), w));
         assert_eq!(c.down_since(), None, "up 10 s and heard: the clock restarts");
+    }
+
+    /// The residual send-warm-link-lost-during-outage hang: a data channel
+    /// stamps "last heard" when it opens, so a late link whose receiver never
+    /// says a word reads as silent for exactly as long as it has been up.
+    /// That stamp is not a word: the clock must keep running and end the send
+    /// at down_since + window, not restart 10 s after the link came up.
+    #[test]
+    fn a_link_with_only_its_open_stamp_does_not_restart_the_down_clock() {
+        use std::time::{Duration, Instant};
+        let w = LINK_DOWN_WINDOW;
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut c = DownClock::default();
+        assert!(c.observe(at(20), true, None, w));
+        // Opened at 44.8 s, first seen up at 45 s; silence tracks the uptime.
+        let opened = t0 + Duration::from_millis(44_800);
+        for s in 45..=66 {
+            let now = at(s);
+            assert!(c.observe(now, false, Some(now - opened), w), "{s}s: only the open stamp");
+        }
+        assert_eq!(c.down_since(), Some(at(20)));
+        assert!(c.expired(at(66), w), "down since 20 s, window 45 s");
+        // The same link whose receiver speaks 3 s after up is back.
+        let mut c = DownClock::default();
+        c.observe(at(20), true, None, w);
+        assert!(c.observe(at(45), false, Some(at(45) - opened), w));
+        for s in 48..=55 {
+            assert!(!c.observe(at(s), false, Some(at(s) - at(48)), w), "{s}s: heard at 48 s");
+        }
+        assert_eq!(c.down_since(), None, "up 10 s and heard after up: the clock restarts");
     }
 
     /// A link that reads up while its receiver has said nothing for the whole
