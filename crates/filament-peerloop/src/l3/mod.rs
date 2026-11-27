@@ -402,7 +402,7 @@ fn spawn_hosts_writer(log: Arc<dyn LogSink>) -> (tokio::sync::mpsc::UnboundedSen
                 continue;
             };
             let entries = snapshot.entries;
-            match tokio::task::spawn_blocking(move || rewrite_hosts_block(&entries)).await {
+            match crate::sim_rt::run_blocking(move || rewrite_hosts_block(&entries)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => log.debug(&format!(
                     "  MagicDNS: /etc/hosts not updated ({e}); overlay still works by IP"

@@ -23,7 +23,8 @@
 
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 
 /// A refusal's local cause, in the library's own vocabulary.
 ///

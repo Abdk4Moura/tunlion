@@ -67,10 +67,12 @@ pub use crate::{
 };
 use anyhow::Result;
 use serde_json::{Value, json};
+use crate::sim_rt::{SimHashMap, SimHashSet};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 /// An in-flight code transfer on its peer's current link.
@@ -583,10 +585,10 @@ pub struct LanBinding {
 ///
 /// Returns the store's casing of the name. This is a ROUTING name: it grants no
 /// capability and never marks the link trusted or Proven.
-pub fn authenticated_lan_device_name<'a>(
+pub fn authenticated_lan_device_name<'a, S: std::hash::BuildHasher>(
     binding: Option<&LanBinding>,
     devices: &'a [(String, String)],
-    revoked: &HashSet<String>,
+    revoked: &HashSet<String, S>,
     record_revoked: &dyn Fn(&str) -> bool,
 ) -> Option<&'a str> {
     let (bound_name, secret) = binding?.device.as_ref()?;
@@ -751,7 +753,7 @@ pub struct Link {
     /// Immutable identities of the current parallel worker transports. Kept
     /// separate from `source` so a worker can never authorize primary teardown
     /// and a stale worker source is removed with its worker.
-    pub worker_sources: HashSet<net::SourceId>,
+    pub worker_sources: SimHashSet<net::SourceId>,
     pub attempts: u32,
     /// C12: proof-verified known device (per link, not global)
     pub trusted: bool,
@@ -843,10 +845,10 @@ impl Link {
     /// fleet-reserved link resolves
     /// nothing: the store lookup is exact on `(name, secret)` and the secret
     /// must not be in `revoked`.
-    pub fn authenticated_device_name<'a>(
+    pub fn authenticated_device_name<'a, S: std::hash::BuildHasher>(
         &self,
         devices: &'a [(String, String)],
-        revoked: &HashSet<String>,
+        revoked: &HashSet<String, S>,
         record_revoked: &dyn Fn(&str) -> bool,
     ) -> Option<&'a str> {
         authenticated_lan_device_name(self.lan_binding.as_ref(), devices, revoked, record_revoked)
@@ -1075,14 +1077,14 @@ pub struct ResilienceState {
     /// the current stall episode (bounded by MAX_ATTEMPTS) and whether a repair
     /// is in flight, so a single stall can't re-fire the ladder every tick while
     /// a repair is converging. Reset once the link starts flowing again.
-    pub stall_repairs: HashMap<String, StallState>,
+    pub stall_repairs: SimHashMap<String, StallState>,
     /// P1 (GAP-4): peers this session has COMMITTED to the relay route after the
     /// direct ladder exhausted (rung d). Once a pid is in here, we stop dialing /
     /// answering direct-QUIC for it (the direct path is what just failed and would
     /// only re-freeze, racing the relay link); all (re)establishment for it goes
     /// over relay-only WebRTC. Survives link drops (keyed by pid, not stored on the
     /// Link), so a re-establish never bounces back to the known-bad direct path.
-    pub relay_committed: std::collections::HashSet<String>,
+    pub relay_committed: SimHashSet<String>,
     /// P3 (GAP-3): the WARM-REDUNDANCY selectivity gate. TRUE only for long-lived
     /// / interactive sessions (the `up`/`up --shell` daemon acceptor; a transfer
     /// flagged interactive via `TUNLION_WARM_STANDBY=1` standing in for a tunnel),
@@ -1102,14 +1104,14 @@ pub struct ResilienceState {
     /// path can't re-fire the instant cutover every tick (it falls through to the
     /// bounded relay-stalled `Exhausted` honesty instead). Cleared by
     /// `note_progress` once bytes move again.
-    pub warm_cutover: std::collections::HashSet<String>,
+    pub warm_cutover: SimHashSet<String>,
     /// P5 (GAP-6): per-peer relay->direct UPGRADE-PROBE bookkeeping. Present only
     /// for peers currently committed to relay (`relay_committed`) on a session
     /// where the prober is eligible (warm_standby/daemon, relay permitted). Drives
     /// the backoff schedule (probe soon, then steady cadence) and the
     /// verify-before-upgrade window for a connected direct standby. Removed on a
     /// successful upgrade (cutover) or when the peer leaves.
-    pub upgrade_probe: HashMap<String, UpgradeProbe>,
+    pub upgrade_probe: SimHashMap<String, UpgradeProbe>,
     /// P5: a snapshot of the local interface set (sorted IP strings) at the last
     /// probe schedule. A change (new/removed interface, wifi<->cellular,
     /// default-route move surfacing a new local IP) is the "walked home onto wifi"
@@ -1119,7 +1121,7 @@ pub struct ResilienceState {
     /// When each peer's current inbound/outbound transfer became in flight, so
     /// the bytes-moved watchdog measures silence since the transfer began, not
     /// since the link was opened. See `detect_stall`.
-    pub in_flight_since: HashMap<String, Instant>,
+    pub in_flight_since: SimHashMap<String, Instant>,
 }
 
 /// ORCHESTRATION: peer-absence / rejoin-grace bookkeeping, split out of the Conn
@@ -1818,7 +1820,7 @@ async fn gather_srflx(
     }
     let sock = holepunch::bind_punch_socket().ok()?;
     // STUN is blocking UDP I/O, run it off the reactor.
-    tokio::task::spawn_blocking(move || {
+    crate::sim_rt::run_blocking(move || {
         holepunch::stun_srflx_any(&sock, &stun_addrs).map(|srflx| (sock, srflx))
     })
     .await
@@ -2051,14 +2053,14 @@ pub struct Conn {
     pub my_id: String,
     pub relay_only: bool,
     pub to_filter: Option<String>,
-    pub links: HashMap<String, Link>,
-    pub roster: HashMap<String, Value>, // sid -> {id,name,uid} from welcome/peer-joined
+    pub links: SimHashMap<String, Link>,
+    pub roster: SimHashMap<String, Value>, // sid -> {id,name,uid} from welcome/peer-joined
     /// Local discovery (`filament_transport::lan`), when it is on for this
     /// session. Set by the loop after construction.
     pub lan: Option<filament_transport::lan::LanService>,
     /// Peer IDs whose exhausted stall ladder deliberately gave up. Contact
     /// clears these; digest reconciliation skips them.
-    pub suppressed_digest_adoptions: HashSet<String>,
+    pub suppressed_digest_adoptions: SimHashSet<String>,
     pub active: Option<String>, // the transfer-target sid (send side)
     /// A code-claimed receive is bound to the peer that completed PAKE. The sid
     /// may change on signaling reconnect, so retain its install uid as well.
@@ -2086,7 +2088,7 @@ pub struct Conn {
     /// reconnect never goes idle (the transfer completes on it), so its entry
     /// is reaped harmlessly once done. Cleared in drop_link so a supersede of a
     /// deferred sid can't leave a stale blocker.
-    pub deferred_left: HashMap<String, Value>,
+    pub deferred_left: SimHashMap<String, Value>,
     /// Digest reconcile deferral: sid -> when its live transport was first seen
     /// absent from a digest while it could not yet be called departed. A
     /// signaling reconnect gives the peer a fresh sid, so the old sid disappears
@@ -2097,14 +2099,14 @@ pub struct Conn {
     /// Cleared when the sid reappears, when the link is dropped, and on a fresh
     /// signaling sid. Not used by `on_peer_left`, which keeps its own payload
     /// (`deferred_left`) because a peer-left is a real roster departure.
-    pub digest_deferred: HashMap<String, Instant>,
+    pub digest_deferred: SimHashMap<String, Instant>,
     /// Per-surface digest hysteresis, kept with `digest_deferred` so a link is
     /// always judged by the digest that OWNS it. A channel-introduced link must
     /// never be ticked by the room surface (and vice versa): the other surface
     /// is legitimately missing it, and clearing its clock there turned the
     /// bounded deferral into an eternal one. Values are consecutive misses.
-    pub channel_digest_absent: HashMap<String, u8>,
-    pub room_digest_absent: HashMap<String, u8>,
+    pub channel_digest_absent: SimHashMap<String, u8>,
+    pub room_digest_absent: SimHashMap<String, u8>,
     /// Gate-18 Mode B: set TRUE by the recv loop, each tick, exactly when the
     /// transfer is COMPLETE and nothing is in flight (`completed>0 &&
     /// by_sid.is_empty() && !keep_open`). When it holds, `on_stuck` DROPS a
@@ -2126,13 +2128,13 @@ pub struct Conn {
     /// (sequential, per the design review, avoids two transports racing to
     /// ChannelReady). On deadline expiry with no DirectReady the entry is
     /// dropped and the normal WebRTC `establish` runs; the fallback is unchanged.
-    pub retired_attempts: HashMap<net::AttemptId, RetiredAttempt>,
-    pub direct_pending: HashMap<String, DirectPending>,
+    pub retired_attempts: SimHashMap<net::AttemptId, RetiredAttempt>,
+    pub direct_pending: SimHashMap<String, DirectPending>,
     /// Peers that explicitly announced `direct:false` (WebRTC-only, e.g. the
     /// browser). Kept OUT of the roster because presence pushes replace roster
     /// entries; this fact must survive every KnownPeer/sync refresh for the
     /// lifetime of the peer's sid.
-    pub webrtc_only: HashSet<String>,
+    pub webrtc_only: SimHashSet<String>,
     /// Bug 2: transport-offers that arrived before the receiver's DirectPending
     /// was created (peer's re-dial after a mid-transfer death). Same class as Bug
     /// 1 (pre-PAKE offers): buffered here and replayed once a pending OR a link
@@ -2141,17 +2143,17 @@ pub struct Conn {
     /// transport-offer handler (`install_built`). pid → (candidates, srflx,
     /// server_public, proto, ch) plus the intent/link facts captured when it
     /// was buffered (`StagedOffer`). Insert only through `buffer_offer`.
-    pub buffered_offers: HashMap<String, StagedOffer>,
+    pub buffered_offers: SimHashMap<String, StagedOffer>,
     /// WebRTC offers (and their candidates) held while a direct attempt for the
     /// same sid is pending; replayed into the fallback responder's build. Insert
     /// only through `hold_for_direct`. `pub` only because the CLI builds a
     /// `Conn` with a struct literal (cli/src/membership.rs); its contents stay
     /// private, so start it as `HashMap::new()` and never insert directly.
-    pub held_signals: HashMap<String, HeldSignals>,
+    pub held_signals: SimHashMap<String, HeldSignals>,
     /// Post-PAKE promotions in progress (make-before-break; see `handoff`),
     /// keyed by peer sid. Each pairs with an ephemeral `direct_pending` entry
     /// that must survive beside the serving link until the handoff resolves.
-    pub promotions: HashMap<String, PromoteState>,
+    pub promotions: SimHashMap<String, PromoteState>,
     /// RESILIENCE bookkeeping (stall/relay/warm/upgrade); see ResilienceState.
     pub resil: ResilienceState,
     /// Is the rung-1 direct-QUIC path allowed for THIS session? Normally this is
@@ -2195,7 +2197,7 @@ pub struct Conn {
     pub fleet_grants_pushed: HashMap<String, (u64, u64)>,
     /// Retry ladder: the stuck attempt per peer sid whose backoff timer is
     /// running. `on_stuck` records it and returns; `Ev::RetryLink` resumes it.
-    pub stuck_retry: HashMap<String, StuckRetry>,
+    pub stuck_retry: SimHashMap<String, StuckRetry>,
     /// Last good ICE config and when it was fetched, so an establish does not
     /// block the event loop on the config GET (see `ice_config`). Shared with
     /// the off-loop refresh task.
@@ -2203,38 +2205,38 @@ pub struct Conn {
     /// Off-loop WebRTC build lifecycle: one bounded task per peer, a deferred
     /// intent map for the global cap, and the completion channel the drivers
     /// pump each iteration. No driver holds a lock across a build await.
-    pub builds: HashMap<String, BuildState>,
+    pub builds: SimHashMap<String, BuildState>,
     pub build_deferred: std::collections::BTreeMap<String, (BuildPlan, Instant)>,
     pub build_tx: mpsc::UnboundedSender<BuildDone>,
     pub build_rx: std::sync::Mutex<mpsc::UnboundedReceiver<BuildDone>>,
     /// Pair bindings and active intent captured by the caller before a build
     /// starts, applied only when the candidate is installed.
-    pub pending_bindings: HashMap<String, (String, String)>,
-    pub pending_active: HashSet<String>,
+    pub pending_bindings: SimHashMap<String, (String, String)>,
+    pub pending_active: SimHashSet<String>,
     /// Per-peer intent generations retired by cancel/drop/peer-left/reap. A
     /// Ready or Failed completion at or below the retired generation is dead:
     /// a queued failure cannot retry a peer that already left, and an older
     /// completion cannot remove a newer intent. A fresh intent gets a higher
     /// `next_gen`, so cancelling one peer never blocks another.
-    pub cancelled_intents: HashMap<String, RetiredIntent>,
+    pub cancelled_intents: SimHashMap<String, RetiredIntent>,
     /// The generation of the newest intent prepared for each pid. Any older
     /// spawn/deferred retry/apply is stale, so a re-pair supersedes an older
     /// retry instead of racing it.
-    pub current_intent: HashMap<String, u32>,
+    pub current_intent: SimHashMap<String, u32>,
     /// Peers whose current intent was explicitly forgotten/revoked, with the
     /// generation retired. A same-pid rebuild is refused unless it carries a
     /// fresh authorized binding; a new-signaling-session pid is a new peer.
-    pub revoked_peers: HashMap<String, RetiredIntent>,
+    pub revoked_peers: SimHashMap<String, RetiredIntent>,
     /// Stable device secrets the store has forgotten. A build carrying one is
     /// refused regardless of pid, so a reconnect cannot re-use a stale label;
     /// only an authenticated re-pair/vouch clears that exact secret. Fleet
     /// rendezvous secrets are NOT device identities and never enter this set.
-    pub revoked_bindings: HashSet<String>,
+    pub revoked_bindings: SimHashSet<String>,
     /// Candidate-origin event streams for INSTALLED links, keyed by pid. The
     /// entry is owned by the link: drop_link/replacement removes and drains it,
     /// so a queued ChannelReady/Control from the old generation is discarded
     /// instead of being replayed onto the new link.
-    pub link_events: HashMap<String, LinkEvents>,
+    pub link_events: SimHashMap<String, LinkEvents>,
     /// Set by a candidate sender when it has queued a `BuildWake`, cleared by
     /// `pump_builds` before it drains. One wake is outstanding at a time, so a
     /// busy data channel cannot flood the main queue with wakes.
@@ -2246,15 +2248,15 @@ pub struct Conn {
     pub direct_gathered: Arc<std::sync::Mutex<Vec<DirectGathered>>>,
     /// Links cut by a revocation whose refusal is still in flight, keyed by the
     /// refusal's nonce. See `ClosingLink` and `drop_link_after_refusal`.
-    pub closing: HashMap<String, ClosingLink>,
+    pub closing: SimHashMap<String, ClosingLink>,
     /// Source-bound standby/upgrade events awaiting adoption. Bounded per source
     /// and in total; overflow closes the standby instead of growing forever.
-    pub pending_sources: HashMap<net::SourceId, PendingSource>,
-    pub replaying_sources: HashMap<net::SourceId, PendingSource>,
-    pub replay_departures: HashMap<String, (net::SourceId, bool)>,
+    pub pending_sources: SimHashMap<net::SourceId, PendingSource>,
+    pub replaying_sources: SimHashMap<net::SourceId, PendingSource>,
+    pub replay_departures: SimHashMap<String, (net::SourceId, bool)>,
     /// Roster sids absent from consecutive channel/room digests, for the
     /// two-tick hysteresis in `prune_roster_absent`.
-    pub roster_absent: HashMap<String, u8>,
+    pub roster_absent: SimHashMap<String, u8>,
     /// The injected terminal sink. Every line `Conn` renders goes through this
     /// instead of `crate::ui`, so the host can be a test capture or a daemon
     /// journal. See `filament_peerloop::host`.
@@ -2435,9 +2437,9 @@ impl Conn {
             my_id: String::new(),
             relay_only,
             to_filter,
-            links: HashMap::new(),
-            roster: HashMap::new(),
-            suppressed_digest_adoptions: HashSet::new(),
+            links: SimHashMap::default(),
+            roster: SimHashMap::default(),
+            suppressed_digest_adoptions: SimHashSet::default(),
             active: None,
             active_binding: None,
             code_session: None,
@@ -2448,26 +2450,26 @@ impl Conn {
                 away: None,
             },
             chunk_size: net::MAX_DC_PAYLOAD,
-            deferred_left: HashMap::new(),
-            digest_deferred: HashMap::new(),
-            channel_digest_absent: HashMap::new(),
-            room_digest_absent: HashMap::new(),
+            deferred_left: SimHashMap::default(),
+            digest_deferred: SimHashMap::default(),
+            channel_digest_absent: SimHashMap::default(),
+            room_digest_absent: SimHashMap::default(),
             recv_done: false,
-            direct_pending: HashMap::new(),
-            retired_attempts: HashMap::new(),
+            direct_pending: SimHashMap::default(),
+            retired_attempts: SimHashMap::default(),
             lan: None,
-            webrtc_only: HashSet::new(),
-            buffered_offers: HashMap::new(),
-            held_signals: HashMap::new(),
-            promotions: HashMap::new(),
+            webrtc_only: SimHashSet::default(),
+            buffered_offers: SimHashMap::default(),
+            held_signals: SimHashMap::default(),
+            promotions: SimHashMap::default(),
             resil: ResilienceState {
-                stall_repairs: HashMap::new(),
-                relay_committed: std::collections::HashSet::new(),
+                stall_repairs: SimHashMap::default(),
+                relay_committed: SimHashSet::default(),
                 warm_standby: net::warm_standby_override().unwrap_or(warm_standby_default),
-                warm_cutover: std::collections::HashSet::new(),
-                upgrade_probe: HashMap::new(),
+                warm_cutover: SimHashSet::default(),
+                upgrade_probe: SimHashMap::default(),
                 iface_snapshot: Vec::new(),
-                in_flight_since: HashMap::new(),
+                in_flight_since: SimHashMap::default(),
             },
             direct_ok: direct_permitted(relay_only, direct_ok),
             local_port: None,
@@ -2477,27 +2479,27 @@ impl Conn {
             worker_port_tx: HashMap::new(),
             roster_pushed: None,
             fleet_grants_pushed: HashMap::new(),
-            stuck_retry: HashMap::new(),
+            stuck_retry: SimHashMap::default(),
             ice_cache: SharedIceCache::default(),
-            builds: HashMap::new(),
+            builds: SimHashMap::default(),
             build_deferred: std::collections::BTreeMap::new(),
             build_tx,
             build_rx: std::sync::Mutex::new(build_rx),
-            pending_bindings: HashMap::new(),
-            pending_active: HashSet::new(),
-            cancelled_intents: HashMap::new(),
-            current_intent: HashMap::new(),
-            revoked_peers: HashMap::new(),
-            revoked_bindings: HashSet::new(),
-            link_events: HashMap::new(),
+            pending_bindings: SimHashMap::default(),
+            pending_active: SimHashSet::default(),
+            cancelled_intents: SimHashMap::default(),
+            current_intent: SimHashMap::default(),
+            revoked_peers: SimHashMap::default(),
+            revoked_bindings: SimHashSet::default(),
+            link_events: SimHashMap::default(),
             candidate_wake: Arc::new(AtomicBool::new(false)),
             direct_gathering: HashMap::new(),
             direct_gathered: Arc::new(std::sync::Mutex::new(Vec::new())),
-            closing: HashMap::new(),
-            pending_sources: HashMap::new(),
-            replaying_sources: HashMap::new(),
-            replay_departures: HashMap::new(),
-            roster_absent: HashMap::new(),
+            closing: SimHashMap::default(),
+            pending_sources: SimHashMap::default(),
+            replaying_sources: SimHashMap::default(),
+            replay_departures: SimHashMap::default(),
+            roster_absent: SimHashMap::default(),
             log,
             host,
             present: Arc::new(NoScreen),
@@ -4631,7 +4633,7 @@ impl Conn {
                 generation: built.generation,
                 source: built.source,
                 attempt: None,
-                worker_sources: HashSet::new(),
+                worker_sources: SimHashSet::default(),
                 attempts: 0,
                 trusted: false,
                 expected_secret: binding,
@@ -6719,7 +6721,7 @@ impl Conn {
                 generation,
                 source,
                 attempt: None,
-                worker_sources: HashSet::new(),
+                worker_sources: SimHashSet::default(),
                 attempts: 0,
                 trusted: true,
                 verified_name: Some(name.to_string()),
@@ -7105,7 +7107,7 @@ impl Conn {
                     generation,
                     source,
                     attempt: Some(attempt),
-                    worker_sources: HashSet::new(),
+                    worker_sources: SimHashSet::default(),
                     attempts: 0,
                     // A direct link is normally born identity-bound: its PAIR-secret
                     // MAC already proved who it is. A FLEET link is not. Its MAC was
@@ -8499,7 +8501,7 @@ impl Conn {
                 generation,
                 source,
                 attempt: Some(attempt),
-                worker_sources: HashSet::new(),
+                worker_sources: SimHashSet::default(),
                 attempts: 0,
                 trusted: upgrade_principal(&carried).0,
                 verified_name: known.as_ref().map(|(n, _)| n.clone()),
@@ -10352,7 +10354,7 @@ mod warm_identity_tests {
             generation: 7,
             source,
             attempt,
-            worker_sources: HashSet::new(),
+            worker_sources: SimHashSet::default(),
             attempts: 0,
             trusted: true,
             expected_secret: Some((petname.to_string(), "s3cret".to_string())),

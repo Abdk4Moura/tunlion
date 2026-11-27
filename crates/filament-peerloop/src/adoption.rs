@@ -18,8 +18,8 @@ pub enum AdoptSource {
     Digest,
 }
 
-pub fn match_adoption_source(
-    suppressed: &mut HashSet<String>,
+pub fn match_adoption_source<S: std::hash::BuildHasher>(
+    suppressed: &mut HashSet<String, S>,
     peer_id: &str,
     source: AdoptSource,
 ) -> bool {

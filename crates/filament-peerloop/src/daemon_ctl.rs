@@ -23,7 +23,8 @@ use crate::link_manager::peer_present;
 use filament_transport::net;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 
 /// Is something listening on this host's own loopback `port` - i.e. an sshd a
 /// `tunlion shell --ssh` initiator could actually reach? A fast connect probe: a
@@ -369,7 +370,7 @@ pub async fn handle_list_warm(conn: &Conn, req: control::Req) {
 /// or reap it on timeout. A `Vec` per pid handles concurrent ssh to one peer (the
 /// ack is identical, so every waiter gets the same answer).
 #[cfg(unix)]
-pub type PendingBootstraps = HashMap<String, Vec<(tokio::net::UnixStream, std::time::Instant)>>;
+pub type PendingBootstraps = HashMap<String, Vec<(tokio::net::UnixStream, filament_transport::clock::Instant)>>;
 
 /// DEBUG: dump every link's warm-reuse eligibility so a miss-despite-a-live-link
 /// is diagnosable (visible at `-v` / TUNLION_LOG=debug only).
@@ -422,7 +423,7 @@ pub async fn handle_warm_bootstrap(
         req.reject("warm link send failed").await;
         return;
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    let deadline = filament_transport::clock::Instant::now() + Duration::from_secs(12);
     pending.entry(pid).or_default().push((req.sock, deadline));
 }
 
@@ -445,7 +446,7 @@ pub fn reap_warm_bootstraps(pending: &mut PendingBootstraps) {
     if pending.is_empty() {
         return;
     }
-    let now = std::time::Instant::now();
+    let now = filament_transport::clock::Instant::now();
     for waiters in pending.values_mut() {
         waiters.retain(|(_, deadline)| *deadline > now);
     }

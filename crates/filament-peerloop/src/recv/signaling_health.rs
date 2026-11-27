@@ -28,7 +28,8 @@
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 
 /// A connection that stayed up this long has earned a fresh backoff ladder.
 /// Anything shorter counts as part of the same outage, so a link that drops
@@ -75,11 +76,19 @@ pub fn reconnect_delay(attempt: u32, unit: f64) -> Duration {
 /// A uniform value in [0, 1) for [`reconnect_delay`]. Two daemons that lost the
 /// same server at the same moment must not re-dial in lockstep.
 pub fn jitter_unit() -> f64 {
-    let mut b = [0u8; 4];
-    if getrandom::getrandom(&mut b).is_err() {
-        return 0.5;
+    #[cfg(feature = "sim")]
+    {
+        let v = (crate::sim_rt::next_sim_u64() >> 32) as u32;
+        return v as f64 / (u32::MAX as f64 + 1.0);
     }
-    u32::from_le_bytes(b) as f64 / (u32::MAX as f64 + 1.0)
+    #[cfg(not(feature = "sim"))]
+    {
+        let mut b = [0u8; 4];
+        if getrandom::getrandom(&mut b).is_err() {
+            return 0.5;
+        }
+        u32::from_le_bytes(b) as f64 / (u32::MAX as f64 + 1.0)
+    }
 }
 
 /// The attempt counter to use for the re-dial after a close. `up_for` is how

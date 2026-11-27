@@ -483,7 +483,7 @@ const PUBIP_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 pub(crate) struct PubIpEntry {
     server: String,
     ip: IpAddr,
-    at: std::time::Instant,
+    at: crate::clock::Instant,
 }
 
 
@@ -565,7 +565,7 @@ async fn fetch_public_ip(context: &crate::TransportContext, server: &str) -> Opt
     // Record for the next connect. A concurrent cold fetch may overwrite this
     // with an identical value, which is harmless (idempotent).
     let mut guard = cache.lock().await;
-    *guard = Some(PubIpEntry { server: server.to_string(), ip, at: std::time::Instant::now() });
+    *guard = Some(PubIpEntry { server: server.to_string(), ip, at: crate::clock::Instant::now() });
     Some(ip)
 }
 
@@ -1218,11 +1218,7 @@ impl Drop for DirectTransport {
 const KIND_CONTROL: u8 = 0;
 const KIND_DATA: u8 = 1;
 
-fn now_ms() -> u64 {
-    use std::sync::OnceLock;
-    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
-}
+use crate::clock::now_ms;
 
 impl DirectTransport {
     /// Frame: [1B kind][4B BE len][payload].
@@ -1256,20 +1252,20 @@ impl DirectTransport {
         hdr[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
         // --- TRACE ---
         let trace = cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
-        let t_lock_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_lock_start = if trace { Some(crate::clock::Instant::now()) } else { None };
         let mut s = self.lock_send(kind).await?;
         let lock_us = t_lock_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(anyhow!("direct connection closed"));
         }
-        let t_hdr_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_hdr_start = if trace { Some(crate::clock::Instant::now()) } else { None };
         // QUIC streams apply flow control internally; a write parks on the
         // peer's receive window, that IS the backpressure (no manual high-water
         // loop needed). A frozen receiver stalls here, so last_activity stops
         // advancing exactly like the DataChannel path's #28 guard.
         self.write_progressing(&mut s, &hdr, budget, "hdr").await?;
         let hdr_us = t_hdr_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-        let t_body_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_body_start = if trace { Some(crate::clock::Instant::now()) } else { None };
         self.write_progressing(&mut s, payload, budget, "body").await?;
         let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         if trace && lock_us + hdr_us + body_us > 1000 {
@@ -1344,8 +1340,8 @@ impl DirectTransport {
     async fn write_data_frame(&self, sid: u32, offset: u64, payload: &[u8]) -> Result<()> {
         let budget = write_stall_budget(KIND_DATA);
         let trace = cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
-        let t_total_start = if trace { Some(std::time::Instant::now()) } else { None };
-        let t_lock_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_total_start = if trace { Some(crate::clock::Instant::now()) } else { None };
+        let t_lock_start = if trace { Some(crate::clock::Instant::now()) } else { None };
         let mut s = self.lock_send(KIND_DATA).await?;
         let lock_us = t_lock_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1355,16 +1351,16 @@ impl DirectTransport {
         hdr[0] = KIND_DATA;
         let payload_len = (4 + 8 + payload.len()) as u32;
         hdr[1..5].copy_from_slice(&payload_len.to_be_bytes());
-        let t_hdr_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_hdr_start = if trace { Some(crate::clock::Instant::now()) } else { None };
         self.write_progressing(&mut s, &hdr, budget, "hdr").await?;
         let hdr_us = t_hdr_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-        let t_sid_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_sid_start = if trace { Some(crate::clock::Instant::now()) } else { None };
         self.write_progressing(&mut s, &sid.to_be_bytes(), budget, "sid").await?;
         let sid_us = t_sid_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-        let t_off_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_off_start = if trace { Some(crate::clock::Instant::now()) } else { None };
         self.write_progressing(&mut s, &offset.to_be_bytes(), budget, "offset").await?;
         let off_us = t_off_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-        let t_body_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_body_start = if trace { Some(crate::clock::Instant::now()) } else { None };
         self.write_progressing(&mut s, payload, budget, "body").await?;
         let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         drop(s);
@@ -1766,10 +1762,10 @@ fn reader_task(
     async move {
         let mut frames: u64 = 0;
         let trace = cfg!(feature = "debug-logs") && std::env::var("TUNLION_TRACE_THROUGHPUT").is_ok();
-        let mut last_chunk_time = if trace { Some(std::time::Instant::now()) } else { None };
+        let mut last_chunk_time = if trace { Some(crate::clock::Instant::now()) } else { None };
         let mut chunk_counter: u64 = 0;
         loop {
-            let t_hdr_start = if trace { Some(std::time::Instant::now()) } else { None };
+            let t_hdr_start = if trace { Some(crate::clock::Instant::now()) } else { None };
             let mut hdr = [0u8; 5];
             if let Err(e) = recv.read_exact(&mut hdr).await {
                 // FinishedEarly is the peer cleanly ending their send half
@@ -1833,7 +1829,7 @@ fn reader_task(
                 break;
             }
             let hdr_us = t_hdr_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-            let t_body_start = if trace { Some(std::time::Instant::now()) } else { None };
+            let t_body_start = if trace { Some(crate::clock::Instant::now()) } else { None };
             let mut body = vec![0u8; len];
             if let Err(e) = recv.read_exact(&mut body).await {
                 // FinishedEarly after a header means clean end-of-stream after
@@ -1886,7 +1882,7 @@ fn reader_task(
                         // --- TRACE ---
                         if trace {
                             chunk_counter += 1;
-                            let now = std::time::Instant::now();
+                            let now = crate::clock::Instant::now();
                             let since_last = last_chunk_time.map(|t| now.duration_since(t).as_micros()).unwrap_or(0);
                             last_chunk_time = Some(now);
                             if chunk_counter % 10 == 0 || since_last > 5000 {
@@ -2682,8 +2678,8 @@ mod tests {
     /// Poll a predicate for a bounded time, so a test states HOW LONG it is
     /// willing to wait instead of assuming the reader has already run.
     async fn within(mut f: impl FnMut() -> bool, ms: u64) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-        while std::time::Instant::now() < deadline {
+        let deadline = crate::clock::Instant::now() + std::time::Duration::from_millis(ms);
+        while crate::clock::Instant::now() < deadline {
             if f() {
                 return true;
             }
@@ -2716,7 +2712,7 @@ mod tests {
             });
             // Let the flood fill the peer's receive window and park.
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-            let t0 = std::time::Instant::now();
+            let t0 = crate::clock::Instant::now();
             let r = ours.send_control(&serde_json::json!({"type": "liveness-pong"})).await;
             assert!(r.is_err(), "a control send behind a wedged peer must fail, not succeed silently");
             assert!(
@@ -2752,7 +2748,7 @@ mod tests {
             let chunk = vec![7u8; 60 * 1024];
             let mut stalled = None;
             for i in 0..2000u64 {
-                let t0 = std::time::Instant::now();
+                let t0 = crate::clock::Instant::now();
                 if ours.send_frame(0x8000_0001, i, &chunk).await.is_err() {
                     stalled = Some(t0.elapsed());
                     break;
@@ -2834,7 +2830,7 @@ mod tests {
                 expected.extend_from_slice(&SID.to_be_bytes());
                 expected.extend_from_slice(&offset.to_be_bytes());
                 expected.extend_from_slice(&payload);
-                let t0 = std::time::Instant::now();
+                let t0 = crate::clock::Instant::now();
                 if let Err(e) = ours.send_frame(SID, offset, &payload).await {
                     panic!("send_frame {i} to a slow but draining reader failed: {e}");
                 }
@@ -2879,7 +2875,7 @@ mod tests {
             let control_bound = send_lock_budget(KIND_CONTROL);
             // Another writer holds the lock for longer than either bound.
             let held = dt.send.lock().await;
-            let t0 = std::time::Instant::now();
+            let t0 = crate::clock::Instant::now();
             let r = ours.send_frame(0x8000_0001, 0, b"queued").await;
             let took = t0.elapsed();
             assert!(r.is_err(), "a data write that cannot get the send lock in time must fail");
@@ -2888,7 +2884,7 @@ mod tests {
                 "the data write must give up at its lock bound ({data_bound:?}), took {took:?}"
             );
             assert!(!ours.is_dead(), "lock contention must not mark the link dead");
-            let t0 = std::time::Instant::now();
+            let t0 = crate::clock::Instant::now();
             let r = ours.send_control(&serde_json::json!({"type": "liveness-pong"})).await;
             let took = t0.elapsed();
             assert!(r.is_err(), "a control write that cannot get the send lock in time must fail");
@@ -3433,7 +3429,7 @@ mod instance_context_tests {
             *a.public_ip_cache().lock().await = Some(PubIpEntry {
                 server: "https://signal.example".into(),
                 ip: "203.0.113.9".parse().unwrap(),
-                at: std::time::Instant::now(),
+                at: crate::clock::Instant::now(),
             });
             assert!(a.public_ip_cache().lock().await.is_some());
             assert!(b.public_ip_cache().lock().await.is_none());

@@ -221,6 +221,12 @@ impl LoopWatchdog {
         if !matches!(self.phase, Phase::Idle | Phase::Running) {
             return;
         }
+        if crate::sim_rt::is_sim_watchdog_disabled() {
+            self.last_tick_ms
+                .store(filament_transport::clock::now_ms(), Ordering::Relaxed);
+            self.phase = Phase::Running;
+            return;
+        }
         self.last_tick_ms.store(now_ms(), Ordering::Relaxed);
         if self.phase == Phase::Running {
             return;

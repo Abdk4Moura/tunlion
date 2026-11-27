@@ -17,7 +17,7 @@ use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use filament_transport::clock::Instant;
 
 const MOUNTS_FILE: &str = "mounts.json";
 

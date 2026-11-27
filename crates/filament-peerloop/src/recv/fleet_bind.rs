@@ -17,7 +17,8 @@
 //!   and nothing here can hand it out for signing.
 
 use filament_transport::net::SourceId;
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 
 /// The installed transport a challenge belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

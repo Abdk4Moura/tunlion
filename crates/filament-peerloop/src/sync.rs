@@ -2097,7 +2097,7 @@ mod tests {
             Ok::<(), String>(())
         });
         let bound = Duration::from_millis(100);
-        let started = std::time::Instant::now();
+        let started = filament_transport::clock::Instant::now();
         let outcome = join_bounded(handle, bound).await;
         let waited = started.elapsed();
         assert!(
