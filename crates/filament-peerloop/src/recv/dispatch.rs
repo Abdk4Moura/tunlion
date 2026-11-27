@@ -4607,6 +4607,7 @@ async fn recv_run(
         // from ordinary adoption. Correlate DIRECT-FALLBACK with the following
         // ADOPT for the same peer; that sequence is not sound if peers recover
         // concurrently, so caller attribution alone is insufficient here.
+        loop_budget.enter("direct-fallback");
         for (pid, info, (n, sec)) in conn.expired_direct() {
             conn.note_binding(&pid, (n.clone(), sec.clone()));
             let adopted = conn.maybe_adopt(&info, true).await.with_context(|| {
@@ -4624,6 +4625,7 @@ async fn recv_run(
             }
         }
 
+        loop_budget.enter("l3-tick");
         #[cfg(feature = "mesh")]
         if daemon && last_l3_tick.elapsed() >= Duration::from_secs(1) {
             last_l3_tick = Instant::now();
@@ -4642,6 +4644,7 @@ async fn recv_run(
                 }
             }
         }
+        loop_budget.enter("expose-reload");
         if daemon && l3.is_some() && last_expose_tick.elapsed() >= Duration::from_secs(1) {
             last_expose_tick = Instant::now();
             ports.servers.reload_expose().await;
@@ -4649,6 +4652,7 @@ async fn recv_run(
 
         // C30 phase 3: state pings, each open link hears our transfer/away
         // truth every ~10s, so one-sided beliefs between PEERS can't persist.
+        loop_budget.enter("state-ping");
         if last_state_ping.elapsed() >= Duration::from_secs(10) {
             last_state_ping = Instant::now();
             state_pings.retain(|pid, _| conn.links.contains_key(pid));
@@ -4675,6 +4679,7 @@ async fn recv_run(
         }
 
         // G-k completion sweep (top-of-loop): see sweep_completed_streams.
+        loop_budget.enter("completion-sweep");
         let mut swept_senders = crate::recv::files::sweep_completed_streams(
             host.as_ref(),
             log.as_ref(),
@@ -4720,6 +4725,7 @@ async fn recv_run(
         // Ev::TransferStalled for each such link (liveness-gated), whose handler
         // re-arms this side's direct dial (rung c). The on-disk `.part` is kept,
         // so the resumed stream continues from the saved offset.
+        loop_budget.enter("stall-watch");
         {
             // Per-link: in_flight = this peer has an inbound file mid-transfer
             // (a by_sid entry) OR a stall episode is already open for it (the
