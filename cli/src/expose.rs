@@ -373,15 +373,32 @@ mod imp {
     /// Record the ports THIS daemon has bound right now, plus why any requested
     /// port failed (see `bound_state`). An error is evidence, not a log line: the
     /// `expose` command reads it to fail loudly instead of claiming success.
-    fn record_bound(ports: &[u16], bindings: &HashMap<u16, Binding>, errors: &HashMap<u16, String>) {
-        let v = serde_json::json!({
+    /// This is the record's text, with the maps in port order so the same state
+    /// always reads the same (`record_bound` compares it). Pure.
+    fn bound_record(ports: &[u16], bindings: &HashMap<u16, Binding>, errors: &HashMap<u16, String>) -> String {
+        let bindings: std::collections::BTreeMap<_, _> = bindings.iter().collect();
+        let errors: std::collections::BTreeMap<_, _> = errors.iter().collect();
+        serde_json::json!({
             "pid": std::process::id(),
             "ports": ports,
             "bindings": bindings,
             "errors": errors,
-        });
-        if let Err(e) = crate::platform::SecretFile::write_str(&super::bound_path(), &v.to_string()) {
-            crate::ui::debug(&format!("tunlion: could not record the bound expose ports: {e}"));
+        })
+        .to_string()
+    }
+
+    /// Write the record unless it is what this process last wrote. The daemon
+    /// reconciles every second, and rewriting the same record each time (a
+    /// tmp write, an fsync and a rename, inline in the event loop) held the
+    /// loop for as long as the disk took: 190 ms typical with only the disk
+    /// loaded, 740 ms at worst (chaos finding ccf732bf9d, O11).
+    fn record_bound(last: &mut Option<String>, text: String) {
+        if last.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        match crate::platform::SecretFile::write_str(&super::bound_path(), &text) {
+            Ok(()) => *last = Some(text),
+            Err(e) => crate::ui::debug(&format!("tunlion: could not record the bound expose ports: {e}")),
         }
     }
 
@@ -391,11 +408,13 @@ mod imp {
     pub struct Exposer {
         l3: Arc<dyn MeshTunnel>,
         active: Mutex<HashMap<u16, (Binding, JoinHandle<()>)>>,
+        /// The bound record this process last wrote (see `record_bound`).
+        recorded: std::sync::Mutex<Option<String>>,
     }
 
     impl Exposer {
         pub fn new(l3: Arc<dyn MeshTunnel>) -> Arc<Exposer> {
-            Arc::new(Exposer { l3, active: Mutex::new(HashMap::new()) })
+            Arc::new(Exposer { l3, active: Mutex::new(HashMap::new()), recorded: std::sync::Mutex::new(None) })
         }
 
         /// Differential reconcile against `expose.json`: leave unchanged ports
@@ -446,7 +465,8 @@ mod imp {
             ports.sort_unstable();
             let bindings: HashMap<u16, Binding> =
                 active.iter().map(|(p, (b, _))| (*p, b.clone())).collect();
-            record_bound(&ports, &bindings, &errors);
+            let text = bound_record(&ports, &bindings, &errors);
+            record_bound(&mut self.recorded.lock().unwrap_or_else(|p| p.into_inner()), text);
             active.len()
         }
 
@@ -499,6 +519,27 @@ mod imp {
                     None => false,
                 },
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_same_bound_state_always_makes_the_same_record() {
+            // record_bound skips a write equal to the last one, so a record
+            // must not depend on HashMap iteration order.
+            let b = |port: u16| Binding { port, target: format!("127.0.0.1:{port}"), peers: None };
+            let ports: Vec<u16> = (8000..8016).collect();
+            let fwd: HashMap<u16, Binding> = ports.iter().map(|p| (*p, b(*p))).collect();
+            let rev: HashMap<u16, Binding> = ports.iter().rev().map(|p| (*p, b(*p))).collect();
+            let errs: HashMap<u16, String> = HashMap::from([(9001, "in use".into()), (9002, "denied".into())]);
+            let errs2: HashMap<u16, String> = HashMap::from([(9002, "denied".into()), (9001, "in use".into())]);
+            assert_eq!(bound_record(&ports, &fwd, &errs), bound_record(&ports, &rev, &errs2));
+            let mut changed = rev.clone();
+            changed.insert(8000, Binding { port: 8000, target: "127.0.0.1:1".into(), peers: None });
+            assert_ne!(bound_record(&ports, &fwd, &errs), bound_record(&ports, &changed, &errs));
         }
     }
 }

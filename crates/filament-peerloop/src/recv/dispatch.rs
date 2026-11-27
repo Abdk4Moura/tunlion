@@ -2560,6 +2560,10 @@ async fn recv_run(
     // for `expose --list`/`status` to trust it.
     #[cfg(feature = "mesh")]
     let mut last_l3_tick = Instant::now();
+    // The per-second L3 state refresh is a file write with fsyncs: it runs on
+    // a blocking thread, one at a time (see the tick below).
+    #[cfg(feature = "mesh")]
+    let mut l3_state_job: Option<tokio::task::JoinHandle<()>> = None;
     // L2 (ssh/TCP tunnel) acceptor: one mux per link, created on the first
     // l2-open seen on that link. `l2_enabled` is computed once above (it also
     // gates the direct-QUIC path); reused here for the mux/cap machinery.
@@ -4639,8 +4643,18 @@ async fn recv_run(
                         json!({"state": "down", "mode": "none", "reason": "L3 endpoint lost"})
                     });
                 }
-                if let Ok(text) = serde_json::to_string(&l3_status) {
-                    host.l3_state_report(&text);
+                // Off the loop: inline, this tmp-write + fsync + rename every
+                // second held the loop as long as the disk took (chaos
+                // finding ccf732bf9d, O11: 1020 ms in reap on a daemon that was
+                // never paused; 200 ms typical with only the disk loaded). A
+                // tick whose previous write is still running is skipped; the
+                // record's readers allow it 6 s.
+                if l3_state_job.as_ref().is_none_or(|j| j.is_finished()) {
+                    if let Ok(text) = serde_json::to_string(&l3_status) {
+                        let host = host.clone();
+                        l3_state_job =
+                            Some(tokio::task::spawn_blocking(move || host.l3_state_report(&text)));
+                    }
                 }
             }
         }
