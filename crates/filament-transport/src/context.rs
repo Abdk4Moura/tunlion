@@ -40,6 +40,8 @@ struct Inner {
     signaling_connector: Option<Arc<dyn SignalingConnector>>,
     #[cfg(feature = "sim")]
     http_backend: Option<Arc<dyn HttpBackend>>,
+    #[cfg(feature = "sim")]
+    peer_factory: Option<Arc<dyn crate::net::PeerFactory>>,
 }
 
 impl Default for TransportContext {
@@ -74,6 +76,8 @@ impl TransportContext {
             signaling_connector: None,
             #[cfg(feature = "sim")]
             http_backend: None,
+            #[cfg(feature = "sim")]
+            peer_factory: None,
         }))
     }
 
@@ -93,6 +97,7 @@ impl TransportContext {
             observed_ip: Mutex::new(None),
             signaling_connector: Some(connector),
             http_backend: self.0.http_backend.clone(),
+            peer_factory: self.0.peer_factory.clone(),
         }))
     }
 
@@ -111,11 +116,31 @@ impl TransportContext {
             observed_ip: Mutex::new(None),
             signaling_connector: self.0.signaling_connector.clone(),
             http_backend: Some(backend),
+            peer_factory: self.0.peer_factory.clone(),
         }))
     }
 
     #[cfg(feature = "sim")]
     pub fn http_backend(&self) -> Option<&Arc<dyn HttpBackend>> {
         self.0.http_backend.as_ref()
+    }
+
+    #[cfg(feature = "sim")]
+    pub fn with_peer_factory(&self, factory: Arc<dyn crate::net::PeerFactory>) -> Self {
+        Self(Arc::new(Inner {
+            dns_cache_path: self.0.dns_cache_path.clone(),
+            settings: Arc::clone(&self.0.settings),
+            membership: Arc::clone(&self.0.membership),
+            public_ip: Mutex::new(None),
+            observed_ip: Mutex::new(None),
+            signaling_connector: self.0.signaling_connector.clone(),
+            http_backend: self.0.http_backend.clone(),
+            peer_factory: Some(factory),
+        }))
+    }
+
+    #[cfg(feature = "sim")]
+    pub fn peer_factory(&self) -> Option<&Arc<dyn crate::net::PeerFactory>> {
+        self.0.peer_factory.as_ref()
     }
 }
