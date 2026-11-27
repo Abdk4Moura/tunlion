@@ -2400,10 +2400,20 @@ pub(crate) async fn send_cmd(
                             Some(p) => p.fingerprints().await,
                             None => None,
                         } {
-                            t.send_control(&json!({
+                            let proof = json!({
                                 "type": "pair-proof",
                                 "mac": proof_for(sec, &conn.my_uid, &conn.my_uid, l.uid.as_deref().unwrap_or(""), &my_fp, &their_fp),
-                            })).await?;
+                            });
+                            // Same as the offer below: a link that died
+                            // before this write is lost, not the send's end.
+                            if let Err(e) = t.send_control(&proof).await {
+                                ui::debug(&format!("send: proving identity on {pid} failed ({e}); the link is lost"));
+                                conn.drop_link(&pid);
+                                if conn.is_active(&pid) {
+                                    conn.active = None;
+                                }
+                                continue;
+                            }
                         } else {
                             ui::say(&ui::paint(
                                 ui::Tone::Warn,
