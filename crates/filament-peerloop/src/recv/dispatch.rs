@@ -2576,6 +2576,10 @@ async fn recv_run(
     // for `expose --list`/`status` to trust it.
     #[cfg(feature = "mesh")]
     let mut last_l3_tick = Instant::now();
+    // The per-second L3 state refresh is a file write with fsyncs: it runs on
+    // a blocking thread, one at a time (see the tick below).
+    #[cfg(feature = "mesh")]
+    let mut l3_state_job: Option<tokio::task::JoinHandle<()>> = None;
     // L2 (ssh/TCP tunnel) acceptor: one mux per link, created on the first
     // l2-open seen on that link. `l2_enabled` is computed once above (it also
     // gates the direct-QUIC path); reused here for the mux/cap machinery.
@@ -2813,6 +2817,10 @@ async fn recv_run(
     // observation revived them). State-only; the gate already denies past the
     // deadline, the sweep is what makes LAPSED visible in `devices`.
     let mut last_sweep = Instant::now();
+    // The lapsed sweep and the LAN state file run OFF the loop (see their
+    // sites below); each keeps at most one job in flight.
+    let mut sweep_job: Option<tokio::task::JoinHandle<(usize, Option<String>)>> = None;
+    let mut lan_state_job: Option<tokio::task::JoinHandle<()>> = None;
     // Whether the delisted-sibling store problem was already said (once per
     // episode, not every sweep).
     let mut delisted_problem_said = false;
@@ -4095,6 +4103,7 @@ async fn recv_run(
         // a PERIODIC OBSERVATION of link-up state, deliberately not an event
         // fired by message receipt (a traffic-driven refresh would reap healthy
         // quiet devices exactly the way xats reaped chief-ux).
+        loop_budget.enter("liveness");
         if daemon && last_liveness_observe.elapsed() >= Duration::from_secs(8) {
             last_liveness_observe = Instant::now();
             let live: Vec<String> = conn
@@ -4130,23 +4139,42 @@ async fn recv_run(
         // record as evidence (option b, decided deliberately), EXCEPT an
         // ephemeral device's and an ended fleet sibling's, which are removed
         // (DeviceStore::devices_sweep_lapsed).
-        if daemon && last_sweep.elapsed() >= Duration::from_secs(30) {
-            last_sweep = Instant::now();
-            let lapsed = ports.store.devices_sweep_lapsed(filament_id::now_secs());
-            if lapsed > 0 {
-                log.say(&format!(
-                    "{} {lapsed} device(s) lapsed or ended (offline past their budget, lease over, or removed by the owner)",
-                    log.paint(Tone::Warn, log.glyph_warn())
-                ));
-            }
-            match ports.store.delisted_siblings_problem() {
-                Some(why) if !delisted_problem_said => {
-                    delisted_problem_said = true;
-                    log.critical(&format!("fleet: delisted-sibling store: {why}"));
+        loop_budget.enter("sweep");
+        //
+        // The sweep is a locked read-modify-write of devices.json with fsyncs
+        // (and its backup), so it runs on a blocking thread and its result is
+        // reported on a later pass. Run inline it held the loop for as long as
+        // the disk took: busy passes of 1011 ms in this stretch on a daemon
+        // that was never paused (chaos finding d5fc523a8b, O11), and 100 to
+        // 220 ms per sweep with only the disk loaded.
+        if sweep_job.as_ref().is_some_and(|j| j.is_finished()) {
+            if let Some(Ok((lapsed, problem))) = match sweep_job.take() {
+                Some(j) => Some(j.await),
+                None => None,
+            } {
+                if lapsed > 0 {
+                    log.say(&format!(
+                        "{} {lapsed} device(s) lapsed or ended (offline past their budget, lease over, or removed by the owner)",
+                        log.paint(Tone::Warn, log.glyph_warn())
+                    ));
                 }
-                Some(_) => {}
-                None => delisted_problem_said = false,
+                match problem {
+                    Some(why) if !delisted_problem_said => {
+                        delisted_problem_said = true;
+                        log.critical(&format!("fleet: delisted-sibling store: {why}"));
+                    }
+                    Some(_) => {}
+                    None => delisted_problem_said = false,
+                }
             }
+        }
+        if daemon && sweep_job.is_none() && last_sweep.elapsed() >= Duration::from_secs(30) {
+            last_sweep = Instant::now();
+            let store = ports.store.clone();
+            sweep_job = Some(tokio::task::spawn_blocking(move || {
+                let lapsed = store.devices_sweep_lapsed(filament_id::now_secs());
+                (lapsed, store.delisted_siblings_problem())
+            }));
         }
 
         // WIREGUARD RECONCILE. On a timer, and deliberately NOT on an event.
@@ -4162,6 +4190,7 @@ async fn recv_run(
         // Each attempt is spawned rather than awaited: the two ends rendezvous
         // on a QUIC bi-stream, so whichever side ticks first waits for the
         // other, and blocking the daemon loop on that would stall everything.
+        loop_budget.enter("wg-reconcile");
         if daemon
             && last_wg_check.elapsed() >= Duration::from_secs(10)
             && host
@@ -4213,6 +4242,7 @@ async fn recv_run(
         // reconciler is deaf to exactly the event it most needs to hear. For an
         // exit node that gap is the difference between a stale entry and a
         // machine holding a default route into a tunnel nobody is carrying.
+        loop_budget.enter("route-reconcile");
         if daemon && last_route_reconcile.elapsed() >= Duration::from_secs(15) {
             last_route_reconcile = Instant::now();
             if let Some(l3) = l3.as_ref() {
@@ -4231,6 +4261,7 @@ async fn recv_run(
         // device is a fleet member whose certificate is in its last third, so
         // the common case is a few comparisons. It asks every live peer because
         // only a primary can answer and we do not know which one that is.
+        loop_budget.enter("cert-renewal");
         if daemon && last_renewal_check.elapsed() >= Duration::from_secs(30) {
             last_renewal_check = Instant::now();
             let live: Vec<String> = conn
@@ -4247,6 +4278,7 @@ async fn recv_run(
         // ROSTER (v1, owner-only): push the mesh roster over live links on a
         // membership change, a validity refresh, or a newly-established link.
         // Runs faster than the sweep so a new link gets the roster promptly.
+        loop_budget.enter("roster-push");
         if daemon && last_roster_push.elapsed() >= Duration::from_secs(5) {
             last_roster_push = Instant::now();
             conn.roster_maintenance().await;
@@ -4255,6 +4287,7 @@ async fn recv_run(
 
         // Daemon-managed mount health check: the host server owns the mount
         // table and the child processes; the loop only paces it.
+        loop_budget.enter("mount-health");
         if daemon && last_mount_check.elapsed() >= Duration::from_secs(30) {
             last_mount_check = Instant::now();
             ports.daemon.mount_health_tick(host.as_ref()).await;
@@ -4264,12 +4297,17 @@ async fn recv_run(
         // no link to, for as long as the server is unreachable, and at start
         // (until 40 s) for any device signaling has not linked within the
         // online grace. Every 15 s.
+        loop_budget.enter("lan-dial");
         if conn.lan.is_some()
             && last_lan_dial.map_or(lan_started.elapsed() >= Duration::from_millis(300), |t| t.elapsed() >= Duration::from_secs(15))
         {
             last_lan_dial = Some(Instant::now());
+            // A temp-file write with an fsync: off the loop, one at a time.
             if let Some(l) = conn.lan.as_ref() {
-                l.write_state(&host.config_dir());
+                if lan_state_job.as_ref().is_none_or(|j| j.is_finished()) {
+                    let (l, dir) = (l.clone(), host.config_dir());
+                    lan_state_job = Some(tokio::task::spawn_blocking(move || l.write_state(&dir)));
+                }
             }
             let offline = signaling_down_since.is_some();
             let since = lan_started.elapsed();
@@ -4294,6 +4332,7 @@ async fn recv_run(
         // WARM-HOLD: periodically check for warm peers that need connections.
         // This keeps recently-used and explicitly configured peers connected
         // so `tunlion reach`/`ssh` is instant. Runs every 10s, daemon-only.
+        loop_budget.enter("warm-hold");
         if daemon && last_warm_hold_tick.elapsed() >= Duration::from_secs(10) {
             last_warm_hold_tick = Instant::now();
             // Warm-all is the DEFAULT (auto-warm setting, opt-out). L3 forces it on:
@@ -4596,6 +4635,7 @@ async fn recv_run(
         // from ordinary adoption. Correlate DIRECT-FALLBACK with the following
         // ADOPT for the same peer; that sequence is not sound if peers recover
         // concurrently, so caller attribution alone is insufficient here.
+        loop_budget.enter("direct-fallback");
         for (pid, info, (n, sec)) in conn.expired_direct() {
             conn.note_binding(&pid, (n.clone(), sec.clone()));
             let adopted = conn.maybe_adopt(&info, true).await.with_context(|| {
@@ -4613,6 +4653,7 @@ async fn recv_run(
             }
         }
 
+        loop_budget.enter("l3-tick");
         #[cfg(feature = "mesh")]
         if daemon && last_l3_tick.elapsed() >= Duration::from_secs(1) {
             last_l3_tick = Instant::now();
@@ -4626,11 +4667,22 @@ async fn recv_run(
                         json!({"state": "down", "mode": "none", "reason": "L3 endpoint lost"})
                     });
                 }
-                if let Ok(text) = serde_json::to_string(&l3_status) {
-                    host.l3_state_report(&text);
+                // Off the loop: inline, this tmp-write + fsync + rename every
+                // second held the loop as long as the disk took (chaos
+                // finding ccf732bf9d, O11: 1020 ms in reap on a daemon that was
+                // never paused; 200 ms typical with only the disk loaded). A
+                // tick whose previous write is still running is skipped; the
+                // record's readers allow it 6 s.
+                if l3_state_job.as_ref().is_none_or(|j| j.is_finished()) {
+                    if let Ok(text) = serde_json::to_string(&l3_status) {
+                        let host = host.clone();
+                        l3_state_job =
+                            Some(tokio::task::spawn_blocking(move || host.l3_state_report(&text)));
+                    }
                 }
             }
         }
+        loop_budget.enter("expose-reload");
         if daemon && l3.is_some() && last_expose_tick.elapsed() >= Duration::from_secs(1) {
             last_expose_tick = Instant::now();
             ports.servers.reload_expose().await;
@@ -4638,6 +4690,7 @@ async fn recv_run(
 
         // C30 phase 3: state pings, each open link hears our transfer/away
         // truth every ~10s, so one-sided beliefs between PEERS can't persist.
+        loop_budget.enter("state-ping");
         if last_state_ping.elapsed() >= Duration::from_secs(10) {
             last_state_ping = Instant::now();
             state_pings.retain(|pid, _| conn.links.contains_key(pid));
@@ -4664,6 +4717,7 @@ async fn recv_run(
         }
 
         // G-k completion sweep (top-of-loop): see sweep_completed_streams.
+        loop_budget.enter("completion-sweep");
         let mut swept_senders = crate::recv::files::sweep_completed_streams(
             host.as_ref(),
             log.as_ref(),
@@ -4709,6 +4763,7 @@ async fn recv_run(
         // Ev::TransferStalled for each such link (liveness-gated), whose handler
         // re-arms this side's direct dial (rung c). The on-disk `.part` is kept,
         // so the resumed stream continues from the saved offset.
+        loop_budget.enter("stall-watch");
         {
             // Per-link: in_flight = this peer has an inbound file mid-transfer
             // (a by_sid entry) OR a stall episode is already open for it (the
