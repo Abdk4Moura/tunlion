@@ -85,7 +85,7 @@ pub fn over_budget(p: Phase, elapsed_ms: u64) -> bool {
 
 /// A short, NON-secret correlation id so the local JSONL and the remote beacon
 /// for one connect span can be stitched together. 8 hex chars of CSPRNG.
-fn correlation_id() -> String {
+pub(crate) fn correlation_id() -> String {
     crate::fresh_secret()[..8].to_string()
 }
 
@@ -143,9 +143,16 @@ impl Attempt {
     /// Open a span (emits a "start" event). `peer_hash` MUST already be the
     /// short hash (see `peer_hash_from_secret`), never a petname.
     pub fn new(server: &str, peer_hash: &str, role: &'static str) -> Attempt {
+        Self::with_id(correlation_id(), server, peer_hash, role)
+    }
+
+    /// [`Attempt::new`] under a span id the caller chose, so it can read back
+    /// THIS span's ladder from the JSONL after the bring-up future was dropped
+    /// (see [`span_ladder`]).
+    pub fn with_id(id: String, server: &str, peer_hash: &str, role: &'static str) -> Attempt {
         let now = Instant::now();
         let a = Attempt {
-            id: correlation_id(),
+            id,
             server: server.to_string(),
             peer: peer_hash.to_string(),
             role,
@@ -468,38 +475,35 @@ pub fn summarize_lines(text: &str, limit: usize) -> Summary {
     Summary { considered, ups, fails, median_total_ms, worst_phase, spans_with_stall }
 }
 
-/// Read back the MOST RECENT span's phase ladder + last phase from the JSONL.
-/// The `doctor` probe uses this on a FAILED/timed-out establish (where the
-/// `Attempt` was consumed by the erroring `bring_up_to_known`) to recover the
-/// partial ladder it managed to record, so the verdict can name where it died.
-/// Returns `(timings, last_phase)` for the latest span that has any events.
-pub fn latest_span_ladder() -> Option<(Vec<PhaseTiming>, Phase)> {
+/// Read back ONE span's phase ladder + last phase from the JSONL, by the id
+/// its `Attempt` was opened with. The `doctor`/`reach` probe uses this on a
+/// FAILED/timed-out establish (where the `Attempt` was consumed by the
+/// erroring `bring_up_to_known`, or dropped with it) to recover the partial
+/// ladder it managed to record, so the verdict can name where it died.
+///
+/// By id, never "the latest span in the file": the file is shared with every
+/// other tunlion process on the machine. A `send` running beside a `reach`
+/// opens its own span straight into `presence`, and the reach, reading that
+/// span as its own, said the peer "may be offline" while its own probe had
+/// never reached the server (chaos fuzzer, alpha isolated, O9).
+pub fn span_ladder(id: &str) -> Option<(Vec<PhaseTiming>, Phase)> {
     let raw = std::fs::read_to_string(diag_path()).ok()?;
-    latest_span_ladder_lines(&raw)
+    span_ladder_lines(&raw, id)
 }
 
-/// Pure core of `latest_span_ladder` (testable without the filesystem).
-pub fn latest_span_ladder_lines(text: &str) -> Option<(Vec<PhaseTiming>, Phase)> {
-    // Find the id of the LAST span to appear (the most recent connect).
-    let mut last_id: Option<String> = None;
-    for line in text.lines() {
-        if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
-            if let Some(id) = v["id"].as_str() {
-                if last_id.as_deref() != Some(id) {
-                    last_id = Some(id.to_string());
-                }
-            }
-        }
-    }
-    let id = last_id?;
+/// Pure core of `span_ladder` (testable without the filesystem). `None` when
+/// the span wrote nothing (the bring-up failed before opening it).
+pub fn span_ladder_lines(text: &str, id: &str) -> Option<(Vec<PhaseTiming>, Phase)> {
+    let mut seen = false;
     // Replay that span's phase events into a ladder + track the deepest phase.
     let mut timings = Vec::new();
     let mut last_phase = Phase::Signaling;
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
-        if v["id"].as_str() != Some(id.as_str()) {
+        if v["id"].as_str() != Some(id) {
             continue;
         }
+        seen = true;
         match v["ev"].as_str() {
             Some("phase") => {
                 if let Some(prev) = v["prev"].as_str().and_then(phase_from_label) {
@@ -519,7 +523,7 @@ pub fn latest_span_ladder_lines(text: &str) -> Option<(Vec<PhaseTiming>, Phase)>
             _ => {}
         }
     }
-    Some((timings, last_phase))
+    seen.then_some((timings, last_phase))
 }
 
 /// Median of a SORTED slice. Even-length takes the lower-middle (a stable,
@@ -547,6 +551,30 @@ enum Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_reads_its_own_span_not_the_latest_writer() {
+        // Chaos finding f208eb6b04: a `reach` whose own probe never got past
+        // signaling (its machine was cut off) read back a concurrent `send`'s
+        // span, which opens straight into presence, and blamed the peer.
+        let text = [
+            r#"{"ev":"start","phase":"signaling","id":"probe001","role":"doctor"}"#,
+            r#"{"ev":"start","phase":"signaling","id":"send0001","role":"send"}"#,
+            r#"{"ev":"phase","phase":"presence","prev":"signaling","dur_ms":0,"id":"send0001","role":"send"}"#,
+        ]
+        .join("\n");
+        let (timings, phase) = span_ladder_lines(&text, "probe001").expect("own span");
+        assert_eq!(phase, Phase::Signaling);
+        assert!(timings.is_empty());
+        assert_eq!(span_ladder_lines(&text, "send0001").map(|x| x.1), Some(Phase::Presence));
+        // A bring-up that failed before opening its span has no ladder at all.
+        assert!(span_ladder_lines(&text, "nevrseen").is_none());
+        // And the failed phase decides the exit kind: not the peer's fault.
+        assert_eq!(
+            crate::ping::cold_kind(Some(phase.label()), Some("establishment timed out after 30s")),
+            crate::exit_codes::ExitKind::Network
+        );
+    }
 
     #[test]
     fn budgets_are_positive_except_up() {

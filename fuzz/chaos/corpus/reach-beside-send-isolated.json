@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "seed": 689477330,
+  "origin": "found by exploration 2026-11-26 on main 5b4211895 (finding f208eb6b04, O9, 3/3): alpha fully isolated, a send from alpha running beside each reach; the reach probe read back the send's diag span (which opens straight into presence) as its own and blamed bravo (\"may be offline\") although its own probe never reached the server",
+  "hooks": {
+    "alpha": {
+      "TUNLION_TEST_CORRUPT_ONCE": "1"
+    }
+  },
+  "steps": [
+    {
+      "at": 0.0,
+      "dur": 82.8,
+      "fault": "net.isolate",
+      "target": "alpha"
+    },
+    {
+      "at": 4.4,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 6.5,
+      "dst": "bravo",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 8.3,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 17.9,
+      "dur": 62.8,
+      "fault": "proc.kill",
+      "target": "alpha"
+    },
+    {
+      "at": 18.6,
+      "dst": "charlie",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 26.4,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    }
+  ]
+}
