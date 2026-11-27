@@ -33,7 +33,7 @@ use filament_transport::net::Transport;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use filament_transport::clock::Instant;
 
 /// #161: how long the possession challenge stays LIVE. Must be raised in
 /// lockstep with the offer hold and the nonce lifetime: if the challenge entry

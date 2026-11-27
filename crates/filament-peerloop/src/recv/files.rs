@@ -156,7 +156,7 @@ pub async fn finalize_incoming(
     delivery: &std::sync::Arc<Mutex<HashMap<String, crate::recv::ports::DeliveredFile>>>,
 ) -> Result<bool> {
     let f = inc.file.clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    let _ = crate::sim_rt::run_blocking(move || {
         let _ = f.sync_all();
     })
     .await;
@@ -263,7 +263,7 @@ pub async fn finalize_incoming(
 pub async fn flush_inflight(by_sid: &mut HashMap<(String, u32), IncomingFile>) {
     for (_, inc) in by_sid.drain() {
         let f = inc.file.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = crate::sim_rt::run_blocking(move || {
             let _ = f.sync_all();
         })
         .await;
@@ -303,7 +303,7 @@ pub async fn sweep_completed_streams(
         if let Some(inc) = by_sid.remove(&key) {
             if to_stdout {
                 let f = inc.file.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                let _ = crate::sim_rt::run_blocking(move || {
                     let _ = f.sync_all();
                 })
                 .await;

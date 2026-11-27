@@ -33,7 +33,8 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Values the process resolved before the dispatch started: the things that are

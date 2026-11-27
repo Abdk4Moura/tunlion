@@ -22,7 +22,8 @@ use quinn::Endpoint;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 
 use crate::host::LogSink;
 use filament_transport::direct;
@@ -368,7 +369,7 @@ pub async fn connect(
     log: Arc<dyn LogSink>,
 ) -> Option<direct::UnreadTransport> {
     // Punch on a blocking thread (blocking UDP I/O), reclaim the socket.
-    let punch_result = tokio::task::spawn_blocking(move || {
+    let punch_result = crate::sim_rt::run_blocking(move || {
         let r = punch(&punch_sock, peer_srflx);
         (r, punch_sock)
     })

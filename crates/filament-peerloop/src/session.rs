@@ -15,7 +15,8 @@
 
 use filament_signal::Client;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 
 /// At most one sync per this interval unless desire changed.
 const SYNC_MIN_INTERVAL: Duration = Duration::from_secs(5);

@@ -51,19 +51,19 @@ pub(crate) const RESEND_CAP: Duration = Duration::from_secs(2);
 /// mints anything per retry, so a re-send is never another password guess.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Resend {
-    next: Option<std::time::Instant>,
+    next: Option<filament_transport::clock::Instant>,
     step: u32,
 }
 
 impl Resend {
     /// A new message just went out: its first re-send is `RESEND_FIRST` away.
-    pub(crate) fn arm(&mut self, now: std::time::Instant) {
+    pub(crate) fn arm(&mut self, now: filament_transport::clock::Instant) {
         self.step = 0;
         self.next = Some(now + RESEND_FIRST);
     }
 
     /// Whether a re-send is due at `now`. Advances the backoff when it is.
-    pub(crate) fn due(&mut self, now: std::time::Instant) -> bool {
+    pub(crate) fn due(&mut self, now: filament_transport::clock::Instant) -> bool {
         match self.next {
             Some(at) if now >= at => {
                 self.step = self.step.saturating_add(1);
@@ -84,7 +84,7 @@ mod resend_tests {
 
     #[test]
     fn ceremony_resend_backs_off_and_caps() {
-        let t0 = std::time::Instant::now();
+        let t0 = filament_transport::clock::Instant::now();
         let mut r = Resend::default();
         assert!(!r.due(t0 + Duration::from_secs(60)), "never armed: never due");
         r.arm(t0);

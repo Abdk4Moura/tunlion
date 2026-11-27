@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use filament_transport::clock::Instant;
+use std::time::Duration;
 
 use filament_transport::lan::{self, LanEvent, LanKey};
 use filament_transport::net::{AttemptId, Ev};

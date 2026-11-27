@@ -17,7 +17,7 @@ use filament_transfer::Outgoing;
 use serde_json::json;
 use std::io::SeekFrom;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Stream one offered file from `offset`.
@@ -52,7 +52,7 @@ pub async fn stream_one(
     {
         let mut out = outgoing.lock().await;
         if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-            o.stream_started = Some(Instant::now());
+            o.stream_started = Some(std::time::Instant::now());
             o.stream_bytes = size.saturating_sub(offset);
         }
     }
@@ -96,7 +96,7 @@ pub async fn stream_one(
                 return Ok(());
             }
             let t_first_read = if trace {
-                Some(std::time::Instant::now())
+                Some(filament_transport::clock::Instant::now())
             } else {
                 None
             };
@@ -150,7 +150,7 @@ pub async fn stream_one(
                     &buf_b[..cur_n]
                 };
                 let t_send_start = if trace {
-                    Some(std::time::Instant::now())
+                    Some(filament_transport::clock::Instant::now())
                 } else {
                     None
                 };
@@ -163,7 +163,7 @@ pub async fn stream_one(
                 chunk_idx += 1;
                 let should_tick = chunk_idx % 8 == 0 || pos >= end;
                 let t_tick_start = if trace && should_tick {
-                    Some(std::time::Instant::now())
+                    Some(filament_transport::clock::Instant::now())
                 } else {
                     None
                 };
