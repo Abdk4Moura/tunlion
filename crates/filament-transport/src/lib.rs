@@ -25,7 +25,7 @@ pub mod control_limits;
 mod context;
 pub use context::TransportContext;
 #[cfg(feature = "sim")]
-pub use context::SignalingConnector;
+pub use context::{HttpBackend, SignalingConnector};
 pub mod hooks;
 pub mod http;
 pub mod lan;
