@@ -104,6 +104,8 @@ pub mod send;
 pub mod session;
 pub mod shell;
 pub mod shell_gate;
+#[cfg(feature = "sim")]
+pub mod sim;
 pub mod sim_rt;
 pub mod ssh_ca;
 pub mod sync;

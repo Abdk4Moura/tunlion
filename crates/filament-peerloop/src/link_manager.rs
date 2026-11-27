@@ -127,7 +127,7 @@ pub fn eligible(l: &LinkObs<'_>, peer: &str) -> bool {
 /// Ties are broken by the lexicographically smallest pid, not by iteration
 /// order, so the same link set always yields the same placement.
 pub fn place(_work: Work, peer: &str, links: &[LinkObs<'_>]) -> Placement {
-    links
+    let decision = links
         .iter()
         .filter(|l| eligible(l, peer))
         .max_by(|a, b| {
@@ -138,7 +138,39 @@ pub fn place(_work: Work, peer: &str, links: &[LinkObs<'_>]) -> Placement {
                 .then_with(|| b.pid.cmp(a.pid))
         })
         .map(|l| Placement::Reuse { pid: l.pid.to_string() })
-        .unwrap_or(Placement::Establish)
+        .unwrap_or(Placement::Establish);
+
+    #[cfg(feature = "sim")]
+    {
+        crate::sim::assertions::record_antecedent("lm_placement_checked");
+        match &decision {
+            Placement::Reuse { pid } => {
+                if let Some(chosen) = links.iter().find(|l| l.pid == pid) {
+                    crate::sim::assertions::record_always(
+                        "lm_p1_p4_eligible",
+                        eligible(chosen, peer),
+                        || format!("link_manager chose ineligible link pid={pid} for peer={peer}"),
+                    );
+                    let any_direct = links.iter().any(|l| eligible(l, peer) && l.direct);
+                    crate::sim::assertions::record_always(
+                        "lm_p6_prefer_direct",
+                        !any_direct || chosen.direct,
+                        || format!("link_manager picked relay pid={pid} while direct existed"),
+                    );
+                }
+            }
+            Placement::Establish => {
+                let any_eligible = links.iter().any(|l| eligible(l, peer));
+                crate::sim::assertions::record_always(
+                    "lm_p5_reuse_available",
+                    !any_eligible,
+                    || format!("link_manager returned Establish while an eligible link existed for peer={peer}"),
+                );
+            }
+        }
+    }
+
+    decision
 }
 
 /// A link's lifetime for placement. Unknown ranks as youngest (0 ms), so it
