@@ -530,17 +530,17 @@ impl RecvPorts {
 #[allow(dead_code)]
 fn _type_anchors(_: &IncomingFile, _: &RecvReport, _: &Path, _: &HashSet<String>, _: IntroScope) {}
 
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "sim"))]
+pub mod test_support {
     use super::*;
     use crate::recv::dispatch::ParkedOpen;
 
-    pub(crate) struct NoIdentity;
-    pub(crate) struct NoStore;
-    pub(crate) struct NoServers;
-    pub(crate) struct NoDaemon;
-    pub(crate) struct NoPrompt;
-    pub(crate) struct NoPty;
+    pub struct NoIdentity;
+    pub struct NoStore;
+    pub struct NoServers;
+    pub struct NoDaemon;
+    pub struct NoPrompt;
+    pub struct NoPty;
 
     fn fail() -> ! {
         panic!("this test capability was not expected to be called")

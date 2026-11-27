@@ -142,3 +142,77 @@ pub fn is_sim_watchdog_disabled() -> bool {
         false
     }
 }
+
+#[cfg(feature = "sim")]
+thread_local! {
+    static SIM_INLINE_STALL_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Inject a one-shot virtual-time inline stall inside the daemon event loop
+/// (`recv_run`) under `--features sim` to verify the loop-budget oracle.
+#[cfg(feature = "sim")]
+pub fn set_sim_inline_stall_ms(ms: u64) {
+    SIM_INLINE_STALL_MS.with(|cell| cell.set(ms));
+}
+
+#[cfg(feature = "sim")]
+pub(crate) fn take_sim_inline_stall_ms() -> u64 {
+    SIM_INLINE_STALL_MS.with(|cell| cell.replace(0))
+}
+
+/// Read-only per-run loop-budget telemetry collected for search guidance.
+/// Guidance uses continuous metrics here (`max_iter_busy_ms`, phase histogram)
+/// and never alters `recv::loop_budget::BUDGET` or any oracle threshold.
+#[cfg(feature = "sim")]
+#[derive(Debug, Clone, Default)]
+pub struct SimTelemetry {
+    pub iterations: u64,
+    pub max_iter_busy_ms: u64,
+    pub max_slowest_ms: u64,
+    pub max_phase: String,
+    pub max_event: String,
+    pub phases_hit: std::collections::BTreeMap<String, u64>,
+    pub events_hit: std::collections::BTreeMap<String, u64>,
+    pub phase_first_seen_ms: std::collections::BTreeMap<String, u64>,
+}
+
+#[cfg(feature = "sim")]
+thread_local! {
+    static SIM_TELEMETRY: std::cell::RefCell<SimTelemetry> =
+        std::cell::RefCell::new(SimTelemetry::default());
+}
+
+#[cfg(feature = "sim")]
+pub fn reset_sim_telemetry() {
+    SIM_TELEMETRY.with(|cell| *cell.borrow_mut() = SimTelemetry::default());
+}
+
+#[cfg(feature = "sim")]
+pub(crate) fn record_iter_busy(
+    busy_ms: u64,
+    slowest_ms: u64,
+    phase: &'static str,
+    event: &'static str,
+) {
+    let now = filament_transport::clock::now_ms();
+    SIM_TELEMETRY.with(|cell| {
+        let mut t = cell.borrow_mut();
+        t.iterations = t.iterations.saturating_add(1);
+        if busy_ms >= t.max_iter_busy_ms {
+            t.max_iter_busy_ms = busy_ms;
+            t.max_phase = phase.to_string();
+            t.max_event = event.to_string();
+        }
+        if slowest_ms > t.max_slowest_ms {
+            t.max_slowest_ms = slowest_ms;
+        }
+        *t.phases_hit.entry(phase.to_string()).or_insert(0) += 1;
+        *t.events_hit.entry(event.to_string()).or_insert(0) += 1;
+        t.phase_first_seen_ms.entry(phase.to_string()).or_insert(now);
+    });
+}
+
+#[cfg(feature = "sim")]
+pub fn take_sim_telemetry() -> SimTelemetry {
+    SIM_TELEMETRY.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}

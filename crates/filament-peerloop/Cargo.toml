@@ -89,7 +89,7 @@ ssh-bootstrap = ["dep:authkeys-managed"]
 # `test-hooks` feature here, so a gate build injects into the moved code too.
 test-hooks = []
 debug-logs = []
-sim = ["filament-transport/sim", "filament-signal/sim"]
+sim = ["filament-transport/sim", "filament-signal/sim", "tokio/test-util"]
 
 [dependencies]
 # Versions copied verbatim from cli/Cargo.toml, so the dependency graph and
