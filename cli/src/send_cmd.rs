@@ -2233,7 +2233,21 @@ pub(crate) async fn send_cmd(
                 // as verified, and the send waited out its window as "no peer
                 // connected". The session that actually connects and holds the
                 // target's secret IS the target, so it takes the slot.
-                if !conn.is_active(&pid) && (!established || warm_fell_back) && !use_code && !fleet_target {
+                //
+                // The same holds once the send is established, when the link
+                // it was using is gone: a send that met its target on the
+                // local network during a server outage lost that link, and the
+                // LAN re-dial (send_redial.rs) linked to the target again under
+                // a NEW pid. That link was kept as a mere responder while the
+                // stall ladder went on rebuilding the dead pid, which nothing
+                // can rebuild (a LAN pid is not on the server), until the down
+                // clock ended the send with its receiver online and linked
+                // (chaos corpus send-lan-link-lost-during-server-outage, 12/12).
+                let active_lost = conn
+                    .active
+                    .as_ref()
+                    .is_none_or(|a| !conn.transport_of(a).is_some_and(|t| t.is_alive() && !t.is_dead()));
+                if !conn.is_active(&pid) && (!established || warm_fell_back || active_lost) && !use_code && !fleet_target {
                     // A pair-proof link matches on `expected_secret`; a LAN link
                     // matches on its exact authenticated DEVICE reservation while
                     // that binding is still the store's. Either way this decides
@@ -2244,7 +2258,8 @@ pub(crate) async fn send_cmd(
                     if proves_target {
                         if let Some(old) = conn.active.clone() {
                             ui::debug(&format!(
-                                "send: {pid} connected as the target; releasing the slot held by {old}, which never did"
+                                "send: {pid} connected as the target; releasing the slot held by {old}, {}",
+                                if established { "whose link is gone" } else { "which never did" }
                             ));
                             conn.drop_link(&old);
                         }
