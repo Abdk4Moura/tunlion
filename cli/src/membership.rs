@@ -8,16 +8,14 @@
 //! No cfg branches, no test hooks, no dlog, no spawned tasks in either body.
 //! `introduce_cmd` carries one function-local `use ring::rand::{SecureRandom,
 //! SystemRandom};`, which travels with it.
-use crate::conn::{RejoinState, ResilienceState, WarmHold};
 use crate::net::{self, Ev};
 use crate::{
-    AdoptSource, Conn, REJOIN_WINDOW, channel_of, device_cert_for, devices_load, direct,
-    display_name, fresh_secret, is_self_uid, joined_owner_record, mk_uid, overlay, proof_for,
-    session, ui,
+    AdoptSource, Conn, channel_of, device_cert_for, devices_load, direct, display_name,
+    fresh_secret, is_self_uid, joined_owner_record, mk_uid, overlay, proof_for, session, ui,
 };
 use anyhow::{Result, anyhow, bail};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -302,84 +300,20 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         ui::paint(ui::Tone::Bold, &b_name)
     ));
 
-    let (build_tx, build_rx) = mpsc::unbounded_channel();
-    let mut conn = Conn {
+    let mut conn = Conn::for_command(
         transport_context,
-        server: server.to_string(),
-        sio: sio.clone(),
-        tx: tx.clone(),
-        my_uid: my_uid.clone(),
-        my_id: String::new(),
-        relay_only: relay,
-        to_filter: None,
-        links: HashMap::new(),
-        roster: HashMap::new(),
-        suppressed_digest_adoptions: HashSet::new(),
-        active: None,
-        active_binding: None,
-        code_session: None,
-        next_gen: 0,
-        rejoin: RejoinState {
-            waiting_rejoin: None,
-            rejoin_window: REJOIN_WINDOW,
-            away: None,
-        },
-        chunk_size: net::MAX_DC_PAYLOAD,
-        deferred_left: HashMap::new(),
-        digest_deferred: HashMap::new(),
-        channel_digest_absent: HashMap::new(),
-        room_digest_absent: HashMap::new(),
-        recv_done: false,
-        direct_pending: HashMap::new(),
-        retired_attempts: HashMap::new(),
-        lan: None,
-        webrtc_only: std::collections::HashSet::new(),
-        buffered_offers: HashMap::new(),
-        promotions: HashMap::new(),
-        resil: ResilienceState {
-            stall_repairs: HashMap::new(),
-            relay_committed: std::collections::HashSet::new(),
-            warm_standby: net::warm_standby_override().unwrap_or(false),
-            warm_cutover: std::collections::HashSet::new(),
-            upgrade_probe: HashMap::new(),
-            iface_snapshot: Vec::new(),
-            in_flight_since: std::collections::HashMap::new(),
-        },
-        // --relay: never direct (see `direct_permitted`).
-        direct_ok: crate::conn::direct_permitted(relay, direct::direct_enabled()),
-        local_port: None,
-        local_listener: None,
-        direct_endpoint: None,
-        warm_hold: WarmHold::default(),
-        worker_port_tx: HashMap::new(),
-        roster_pushed: None,
-        fleet_grants_pushed: Default::default(),
-        stuck_retry: HashMap::new(),
-        ice_cache: crate::conn::SharedIceCache::default(),
-        builds: HashMap::new(),
-        build_deferred: std::collections::BTreeMap::new(),
-        build_tx,
-        build_rx: std::sync::Mutex::new(build_rx),
-        pending_bindings: HashMap::new(),
-        pending_active: HashSet::new(),
-        cancelled_intents: HashMap::new(),
-        current_intent: HashMap::new(),
-        revoked_peers: HashMap::new(),
-        revoked_bindings: HashSet::new(),
-        link_events: HashMap::new(),
-        candidate_wake: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        direct_gathering: HashMap::new(),
-        direct_gathered: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-        closing: HashMap::new(),
-        pending_sources: HashMap::new(),
-        replaying_sources: HashMap::new(),
-        replay_departures: HashMap::new(),
-        roster_absent: HashMap::new(),
-        held_signals: HashMap::new(),
-        log: crate::host_impl::cli_log(),
-        host: crate::host_impl::cli_host(),
-        present: crate::host_impl::cli_screen(),
-    };
+        server,
+        sio.clone(),
+        tx.clone(),
+        my_uid.clone(),
+        relay,
+        None,
+        false,
+        direct::direct_enabled(),
+        crate::host_impl::cli_log(),
+        crate::host_impl::cli_host(),
+    )
+    .with_presentation(crate::host_impl::cli_screen());
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
     let mut sent: [bool; 2] = [false, false];
