@@ -75,9 +75,13 @@ jobs:
           python-version: '3.11'
       - name: Install backend deps
         run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+      - name: Install fast linker (mold)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq mold clang
+          echo "RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }-Clinker=clang -Clink-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
       - name: Test
         working-directory: cli
-        run: cargo test --release
+        run: cargo test --profile ci-test --locked
         env:
           CMAKE_C_COMPILER_LAUNCHER: sccache
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
@@ -117,7 +121,7 @@ jobs:
         working-directory: cli
         run: |
           set -euo pipefail
-          exe=$(cargo test --release --bin tunlion --no-run --message-format=json \
+          exe=$(cargo test --profile ci-test --locked --bin tunlion --no-run --message-format=json \
                 | jq -r 'select(.reason=="compiler-artifact" and .profile.test==true and .executable!=null) | .executable' \
                 | tail -1)
           echo "test binary: $exe"
@@ -144,7 +148,7 @@ jobs:
                    filament-transfer filament-transport authkeys-managed tunlion-core tunlion-lan; do
             if [ -f "crates/$c/Cargo.toml" ]; then
               echo "::group::$c"
-              cargo test --release --manifest-path "crates/$c/Cargo.toml"
+              cargo test --profile ci-test --locked --manifest-path "crates/$c/Cargo.toml"
               echo "::endgroup::"
             fi
           done 2>&1 | tee /tmp/crate-tests.log
@@ -159,17 +163,23 @@ jobs:
       # resolution through PeerLink, kernel-start honesty and the moved route /
       # exit-route tests. This is the exact-head gate for the library API.
       - name: L3 overlay library (feature l3, no TUN)
-        run: cargo test --release -p tunlion-peerloop --features l3
+        run: cargo test --profile ci-test --locked -p tunlion-peerloop --features l3
         env:
           CMAKE_C_COMPILER_LAUNCHER: sccache
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
           CC: sccache cc
           CXX: sccache c++
-      # The CLI's no-endpoint expose/addr answers are a separate integration
-      # test binary. `cargo test` in cli/ runs it too, but naming it here makes
-      # the exact-head gate explicit and keeps it from silently filtering out.
+      # The CLI's no-endpoint expose/addr answers live in `cli_integration`
+      # (`l3_state_cli` module). Reuses the already-built `cli_integration`
+      # binary from the Test step instead of triggering a fresh cross-workspace
+      # rebuild.
       - name: L3 CLI state (no-endpoint expose/addr)
-        run: cargo test --release -p tunlion --test l3_state_cli
+        working-directory: cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --profile ci-test --locked --test cli_integration l3_state_cli:: -- --nocapture | tee "$RUNNER_TEMP/l3-state-cli.log"
+          grep -q 'test result: ok. 2 passed' "$RUNNER_TEMP/l3-state-cli.log"
 
       # The loop above is hand-maintained on purpose (its own comment says so),
       # and that is how two crates fell out of it: filament-transport (23 tests,
@@ -226,7 +236,7 @@ jobs:
       - name: Test
         working-directory: cli
         shell: bash
-        run: cargo test --release
+        run: cargo test --profile ci-test --locked
       # `cargo test` in cli/ builds path dependencies but does not run their
       # tests. The Linux job has the explicit local-crates loop; without this
       # step the Windows-specific arms in a path dependency would run nowhere.
@@ -234,22 +244,22 @@ jobs:
       # confinement, including the Windows directory-symlink escape test.
       - name: Test the transfer crate (Windows path bounds)
         shell: bash
-        run: cargo test --release --manifest-path crates/filament-transfer/Cargo.toml
+        run: cargo test --profile ci-test --locked --manifest-path crates/filament-transfer/Cargo.toml
       - name: Test sync receive (Windows confinement, staging and finalization)
         shell: bash
-        run: cargo test --release --manifest-path crates/filament-peerloop/Cargo.toml 'sync::'
+        run: cargo test --profile ci-test --locked --manifest-path crates/filament-peerloop/Cargo.toml 'sync::'
       - name: Test Windows pinned-handle path primitives
         shell: bash
-        run: cargo test --release --manifest-path crates/filament-peerloop/Cargo.toml 'mount_proto::'
+        run: cargo test --profile ci-test --locked --manifest-path crates/filament-peerloop/Cargo.toml 'mount_proto::'
       - name: Test exec child environment (Windows baseline + Node)
         shell: bash
-        run: cargo test --release --manifest-path crates/filament-peerloop/Cargo.toml 'shell::exec_server::tests::'
+        run: cargo test --profile ci-test --locked --manifest-path crates/filament-peerloop/Cargo.toml 'shell::exec_server::tests::'
       # Windows trusts SSL_CERT_FILE / SSL_CERT_DIR by ADDING them to the OS
       # store (Linux replaces the default locations), so the private-CA
       # signaling test has a Windows-only arm that runs nowhere else.
       - name: Test TLS trust (OS store plus SSL_CERT_FILE / SSL_CERT_DIR)
         shell: bash
-        run: cargo test --release --manifest-path crates/filament-signal/Cargo.toml 'tls::'
+        run: cargo test --profile ci-test --locked --manifest-path crates/filament-signal/Cargo.toml 'tls::'
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
@@ -398,4 +408,4 @@ jobs:
       - name: Interactive cells
         working-directory: cli
         shell: bash
-        run: cargo test --release --test pty_flows -- --ignored --nocapture --test-threads=1
+        run: cargo test --profile ci-test --locked --test pty_flows -- --ignored --nocapture --test-threads=1
