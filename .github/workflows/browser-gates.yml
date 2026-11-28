@@ -16,6 +16,10 @@
 name: Browser gates
 
 on:
+  # By hand, for a CLI change: the path filters below never start this for
+  # cli/ alone, so a send or receive change reached main without the browser
+  # half ever being run against it (the published edge CLI is what it tests).
+  workflow_dispatch:
   push:
     branches: [main, "integration/**"]
     paths:
