@@ -82,6 +82,9 @@ pub enum OracleKind {
     AlwaysAssertionFailed,
     PostHealLivenessViolation,
     FormalInvariantViolation,
+    /// A one-shot fleet dial of a live, reachable daemon was not answered with
+    /// a direct link within the dialer's candidate bound.
+    OneShotUnanswered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,5 +306,114 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
         }
     }
 
+    violations.extend(one_shot_violations(outcome, config));
     violations
+}
+
+/// A one-shot dial of a reachable live peer is answered within the dialer's
+/// candidate bound (`oneshot::CANDIDATE_BOUND`, the CLI's `WATCHDOG_SECS`).
+///
+/// "Reachable live peer" is judged from the trace, so semantic (event-driven)
+/// faults count the same as scheduled ones. Around the dial (5 s before it to
+/// 1 s past the bound) the target must stay connected to signaling (no
+/// connect, disconnect or kill), and no fault may touch its reachability: a
+/// signaling blackhole or an impairment on the target, a hang injected on the
+/// target, or signaling message chaos. A partition or a slow disk does not
+/// excuse it: neither stops the dialer reaching the target, so a dial they
+/// break is a defect.
+pub fn one_shot_violations(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleViolation> {
+    let bound_ms = crate::sim::oneshot::CANDIDATE_BOUND.as_millis() as u64;
+    let mut out = Vec::new();
+    let ev = &outcome.net_events;
+    for start in ev.iter().filter(|e| e.event.starts_with("oneshot:start:")) {
+        let rest = &start.event["oneshot:start:".len()..];
+        let Some((dialer, target)) = rest.split_once(':') else { continue };
+        let (w0, w1) = (start.at_ms.saturating_sub(5_000), start.at_ms + bound_ms + 1_000);
+        if w1 > config.duration_ms {
+            continue;
+        }
+        record_antecedent("one_shot_dial_judged_window");
+        // Target connected to signaling at w0 and steady through the window.
+        let mut up = false;
+        let mut steady = true;
+        let conn_prefix = format!("sig:connect:{target}:");
+        let disc_prefix = format!("sig:disconnect:{target}:");
+        let kill = format!("node:disconnect:{target}");
+        for e in ev {
+            let is_conn = e.event.starts_with(&conn_prefix);
+            let is_disc = e.event.starts_with(&disc_prefix) || e.event == kill;
+            if !(is_conn || is_disc) {
+                continue;
+            }
+            if e.at_ms < w0 {
+                up = is_conn;
+            } else if e.at_ms <= w1 {
+                steady = false;
+            }
+        }
+        if !up || !steady {
+            continue;
+        }
+        // Faults that excuse a dial, as (start, end) intervals.
+        let mut excused = false;
+        let mut open: BTreeMap<&str, u64> = BTreeMap::new();
+        let bh_on = format!("fault:blackhole:{target}:true");
+        let bh_off = format!("fault:blackhole:{target}:false");
+        let imp_on = format!("fault:impair:{target}:");
+        let imp_off = format!("fault:clear_impair:{target}");
+        let hang = format!("fault:hang:{target}:");
+        let overlaps = |s: u64, e: u64| s <= w1 && e >= w0;
+        for e in ev {
+            let t = e.at_ms;
+            if e.event == bh_on {
+                open.insert("bh", t);
+            } else if e.event == bh_off {
+                if let Some(s) = open.remove("bh") {
+                    excused |= overlaps(s, t);
+                }
+            } else if e.event.starts_with(&imp_on) {
+                open.insert("imp", t);
+            } else if e.event == imp_off {
+                if let Some(s) = open.remove("imp") {
+                    excused |= overlaps(s, t);
+                }
+            } else if e.event.starts_with("fault:msg_chaos:") {
+                open.insert("chaos", t);
+            } else if e.event == "fault:clear_msg_chaos" {
+                if let Some(s) = open.remove("chaos") {
+                    excused |= overlaps(s, t);
+                }
+            } else if e.event.starts_with(&hang) {
+                // A hang fires at the next use of its site, which may be much
+                // later: any hang injected before the window ends excuses it.
+                excused |= t <= w1;
+            }
+        }
+        for (_, s) in open {
+            excused |= overlaps(s, config.duration_ms);
+        }
+        if excused {
+            continue;
+        }
+        record_antecedent("one_shot_dial_clean_window");
+        let answered = format!("oneshot:answered:{dialer}:{target}");
+        if !ev.iter().any(|e| e.event == answered) {
+            let why = ev
+                .iter()
+                .find_map(|e| {
+                    e.event
+                        .strip_prefix(&format!("oneshot:gaveup:{dialer}:{target}:"))
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "no outcome".to_string());
+            out.push(OracleViolation {
+                kind: OracleKind::OneShotUnanswered,
+                summary: format!(
+                    "one-shot {dialer} dialed live {target} at {}ms and was not answered within {}ms ({why})",
+                    start.at_ms, bound_ms
+                ),
+            });
+        }
+    }
+    out
 }
