@@ -17,6 +17,33 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+# Fast CI test profile: matches release semantics (debug_assertions = false,
+# optimized dependencies) without single-threaded fat LTO across test binaries.
+[profile.ci-test]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 256
+debug = "line-tables-only"
+strip = false
+
+[profile.ci-test.package."*"]
+opt-level = 2
+codegen-units = 16
+
+# Fast developer/agent inner-loop test profile: unoptimized workspace for fast
+# incremental rebuilds, with optimized third-party dependencies.
+[profile.fast-test]
+inherits = "dev"
+opt-level = 0
+debug = 0
+codegen-units = 256
+incremental = true
+
+[profile.fast-test.package."*"]
+opt-level = 2
+codegen-units = 16
+
 # Fast functional iteration for real-binary gates. This is not release evidence:
 # optimization-sensitive measurements must be repeated with `--release`.
 [profile.measure]
