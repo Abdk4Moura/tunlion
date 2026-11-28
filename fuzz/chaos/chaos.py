@@ -244,6 +244,10 @@ def random_op(rng: random.Random) -> dict:
             # A one-shot dialer: no local daemon to ride or broker through
             # (a machine with no `up`, as on Windows). See World.oneshot_env.
             op["oneshot"] = True
+        if rng.random() < 0.2:
+            # Bulk output to a slow reader: the stream must arrive whole.
+            op["out_mib"] = rng.choice([8, 40])
+            op["stall_s"] = rng.choice([0.0, 15.0])
         return op
     if kind == "send":
         op = {"op": "send", "at": at, "src": OWNER, "dst": rng.choice(DELEGATES),
@@ -1320,6 +1324,92 @@ def send_to_stdout(w: World, st: dict, res: dict, deadline: float) -> None:
     res["stdout_tail"] = ""
 
 
+# Bulk exec output (`"out_mib"` on an exec op): the command on dst cats a file
+# of that many MiB of random bytes; the CLI's stdout on src is read by a SLOW
+# reader (paced to BULK_READ_BPS, and with `stall_s`, stopped that long after
+# the first BULK_STALL_AFTER bytes), the shape of fetching results with
+# `exec <worker> -- base64 ...` into a pipe. The output must arrive whole and
+# byte-exact with the command's rc. A stream moves for as long as it takes, so
+# the hang rule here is NO PROGRESS for the op's deadline (counted from the
+# last byte read, or the end of the reader's own stall), with BULK_CAP as an
+# overall bound.
+BULK_READ_BPS = 8 << 20
+BULK_STALL_AFTER = 4 << 20
+BULK_CAP = 600.0
+
+
+def exec_bulk(w: World, st: dict, res: dict, idle_deadline: float, extra: dict | None) -> None:
+    src, dst = st["src"], st["dst"]
+    tag = f"{random.randrange(1 << 40):x}"
+    f = w.cfg(dst) / "files" / f"bulk-{tag}.bin"
+    want = hashlib.sha256()
+    size = int(st["out_mib"]) << 20
+    with open(f, "wb") as fh:
+        left = size
+        while left:
+            b = os.urandom(min(left, 1 << 20))
+            want.update(b)
+            fh.write(b)
+            left -= len(b)
+    os.chown(f, w.uid, w.gid)
+    elog = w.cfg(src) / f"bulk-exec-{tag}.stderr"
+    env = {**getattr(w, "op_env", {}).get(src, {}), **(extra or {})}
+    t0 = time.monotonic()
+    got = hashlib.sha256()
+    prog = {"n": 0, "last": t0, "stall_end": t0}
+    stall = float(st.get("stall_s", 0.0))
+    try:
+        with open(elog, "wb") as ef:
+            p = subprocess.Popen(w.as_dev(src, ["exec", dst, "--", "/bin/cat", str(f)]), env=w.env_for(src, env),
+                                 stdout=subprocess.PIPE, stderr=ef, stdin=subprocess.DEVNULL, start_new_session=True)
+
+        def drain() -> None:
+            stalled = stall <= 0
+            while True:
+                b = p.stdout.read(65536)
+                if not b:
+                    return
+                got.update(b)
+                prog["n"] += len(b)
+                prog["last"] = time.monotonic()
+                if not stalled and prog["n"] >= BULK_STALL_AFTER:
+                    stalled = True
+                    time.sleep(stall)
+                    prog["stall_end"] = time.monotonic()
+                time.sleep(len(b) / BULK_READ_BPS)
+        th = threading.Thread(target=drain, daemon=True)
+        th.start()
+        rc = None
+        why = ""
+        while True:
+            try:
+                rc = p.wait(1.0)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            idle = now - max(prog["last"], prog["stall_end"])
+            if idle > idle_deadline or now - t0 > BULK_CAP:
+                why = (f"no output for {idle:.0f}s" if idle > idle_deadline else f"over the {BULK_CAP:.0f}s cap") + \
+                      f" after {prog['n']} of {size} bytes"
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+                break
+        th.join(30)
+        intact = prog["n"] == size and got.digest() == want.digest()
+        err = elog.read_bytes()[-20000:].decode(errors="replace").strip()
+        res.update(rc=rc, elapsed=round(time.monotonic() - t0, 2), ok=(rc == 0 and intact), lie=(rc == 0 and not intact),
+                   got_bytes=prog["n"], want_bytes=size, out_mib=st["out_mib"], stall_s=stall)
+        if why:
+            res["hang_why"] = why
+        res["stderr_tail"] = err[-400:]
+        res["stderr_full"] = err
+        res["stdout_tail"] = ""
+    finally:
+        f.unlink(missing_ok=True)
+        elog.unlink(missing_ok=True)
+
+
 def run_op(w: World, st: dict, phase: str) -> dict:
     kind = st["op"]
     if kind == "visit":
@@ -1339,6 +1429,9 @@ def run_op(w: World, st: dict, phase: str) -> dict:
                 return res
             res["oneshot"] = True
         try:
+            if st.get("out_mib"):
+                exec_bulk(w, st, res, deadline, extra)
+                return res
             token = f"CHZ{random.randrange(1 << 40):x}"
             cmd = st.get("cmd") or ["/bin/echo", token]
             rc, out, err, el = w.cli(src, ["exec", dst, "--", *cmd], deadline, extra)
@@ -1392,6 +1485,8 @@ def op_label(r: dict) -> str:
     tags = []
     if r.get("oneshot"):
         tags.append("one-shot")
+    if r.get("out_mib"):
+        tags.append(f"{r['out_mib']} MiB")
     return r["op"] + (f" ({', '.join(tags)})" if tags else "")
 
 
@@ -1400,8 +1495,10 @@ def judge_op(r: dict) -> list[dict]:
     f = []
     who = f"{op_label(r)} {r['src']}->{r['dst']}"
     if r["rc"] is None:
-        f.append({"oracle": "O2-hang", "hard": True,
-                  "what": f"{who} still running after {r.get('deadline', OP_DEADLINE[r['op']]):.0f}s ({r['phase']})"})
+        what = f"{who} still running after {r.get('deadline', OP_DEADLINE[r['op']]):.0f}s ({r['phase']})"
+        if r.get("hang_why"):
+            what = f"{who} stuck: {r['hang_why']} ({r['phase']})"
+        f.append({"oracle": "O2-hang", "hard": True, "what": what})
         return f
     if r["rc"] == 101:
         f.append({"oracle": "O4-panic", "hard": True, "what": f"{who} panicked: {r['stderr_tail'][-200:]}"})
@@ -1411,6 +1508,9 @@ def judge_op(r: dict) -> list[dict]:
         f.append({"oracle": "O6-undocumented-rc", "hard": True, "what": f"{who} exited {r['rc']}"})
     if r.get("lie"):
         what = f"{who} exited 0 but the result was missing or wrong"
+        if r.get("out_mib"):
+            what = (f"{who} exited 0 but its stdout held {r.get('got_bytes')} bytes that are not the command's "
+                    f"{r.get('want_bytes')}-byte output")
         if r.get("via") == "stdout":
             what = (f"{who} via stdout: send rc {r.get('send_rc')}, receive rc {r.get('recv_rc')}, "
                     f"but stdout held {r.get('got_bytes')} bytes that are not the {r.get('want_bytes')}-byte source")
@@ -2523,6 +2623,20 @@ def selftest_exec_variants() -> None:
     assert unf and unf[0]["oracle"] == "O14-failed-unfaulted" and unf[0]["what"].startswith("exec (one-shot) bravo"), unf
 
 
+def selftest_exec_bulk() -> None:
+    """Bulk-output execs are drawn blindly; a wrong stream with rc 0 is O7, a
+    stream that stops moving is O2."""
+    rng = random.Random(4)
+    ex = [o for o in (random_op(rng) for _ in range(3000)) if o["op"] == "exec"]
+    assert any(o.get("out_mib") for o in ex), "bulk output never drawn"
+    r = {"op": "exec", "src": "bravo", "dst": "charlie", "phase": "x", "rc": 0, "lie": True, "stderr_tail": "",
+         "oneshot": True, "out_mib": 40, "got_bytes": 1 << 20, "want_bytes": 40 << 20}
+    f = judge_op(r)
+    assert f[0]["oracle"] == "O7-false-success" and "exec (one-shot, 40 MiB) bravo->charlie" in f[0]["what"], f
+    f = judge_op(dict(r, rc=None, hang_why="no output for 80s after 5 of 40 bytes"))
+    assert f[0]["oracle"] == "O2-hang" and "no output for 80s" in f[0]["what"], f
+
+
 def cmd_selftest() -> int:
     rng = random.Random(1)
     for _ in range(500):
@@ -2690,6 +2804,7 @@ def cmd_selftest() -> int:
     selftest_save_finding()
     selftest_kinds_and_coverage()
     selftest_exec_variants()
+    selftest_exec_bulk()
     print("selftest ok")
     return 0
 

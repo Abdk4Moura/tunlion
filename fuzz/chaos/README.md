@@ -134,8 +134,15 @@ The delegates grant each other shell at setup, so an exec goes to the owner
   no `up`, as on Windows. To a sibling it dials the fleet secret.
   `corpus/exec-oneshot-fleet-sibling.json` is the Revoke Gates sibling-shell
   case (#757), `corpus/exec-from-degraded-machine-oneshot.json` the #749 one.
+- `"out_mib": N` (with `"stall_s"`): the command cats N MiB of random bytes on
+  `dst`, and the CLI's stdout on `src` is read slowly (it stops `stall_s`
+  after the first 4 MiB, then reads at 8 MB/s). The output must arrive whole
+  and byte-exact with rc 0 (O7 judges a 0 with other bytes). The hang rule for
+  a stream is no progress for the op's deadline, with a 600 s cap.
+  `corpus/exec-bulk-output-slow-reader.json` is the #760 case.
 
     {"at": 35.0, "op": "exec", "src": "bravo", "dst": "charlie", "oneshot": true}
+    {"at": 35.0, "op": "exec", "src": "bravo", "dst": "alpha", "out_mib": 40, "stall_s": 15.0}
 
 ## Retiring a hand-written gate
 

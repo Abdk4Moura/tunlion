@@ -1,0 +1,46 @@
+{
+  "hooks": {},
+  "origin": "written 2026-11-28 to catch #760 (ed62fea0c), found while fetching results, not by the fuzzer: 40 MiB of exec output to a reader that stops 15 s after 4 MiB and then reads at 8 MB/s, warm, warm to a sibling, and one-shot; each must arrive whole and byte-exact with rc 0 (O14, O7)",
+  "seed": 0,
+  "steps": [
+    {
+      "args": {
+        "delay_ms": 10,
+        "dup": 0,
+        "jitter_ms": 0,
+        "loss": 0,
+        "reorder": 0
+      },
+      "at": 1.0,
+      "dur": 2.0,
+      "fault": "net.impair",
+      "target": "alpha"
+    },
+    {
+      "at": 35.0,
+      "dst": "alpha",
+      "op": "exec",
+      "out_mib": 40,
+      "src": "bravo",
+      "stall_s": 15.0
+    },
+    {
+      "at": 36.0,
+      "dst": "bravo",
+      "op": "exec",
+      "out_mib": 40,
+      "src": "charlie",
+      "stall_s": 0.0
+    },
+    {
+      "at": 75.0,
+      "dst": "alpha",
+      "oneshot": true,
+      "op": "exec",
+      "out_mib": 40,
+      "src": "bravo",
+      "stall_s": 15.0
+    }
+  ],
+  "version": 1
+}
