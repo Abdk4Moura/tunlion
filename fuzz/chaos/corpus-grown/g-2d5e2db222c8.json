@@ -1,0 +1,91 @@
+{
+  "hooks": {
+    "alpha": {
+      "TUNLION_TEST_DIRECT_FLAKY": "1"
+    },
+    "bravo": {
+      "TUNLION_TEST_CORRUPT_ONCE": "1"
+    }
+  },
+  "seed": 869856751,
+  "steps": [
+    {
+      "at": 1.0,
+      "dur": 27.3,
+      "fault": "sig.blackhole",
+      "target": "bravo"
+    },
+    {
+      "a": "alpha",
+      "at": 5.2,
+      "b": "bravo",
+      "dur": 165.6,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 10.9,
+      "dur": 10.2,
+      "fault": "sig.blackhole",
+      "target": "alpha"
+    },
+    {
+      "at": 17.4,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 18.5,
+      "dur": 9.2,
+      "fault": "proc.freeze",
+      "target": "charlie"
+    },
+    {
+      "a": "charlie",
+      "at": 18.7,
+      "b": "bravo",
+      "dur": 97.3,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "at": 19.5,
+      "dur": 116.0,
+      "fault": "net.isolate",
+      "target": "alpha"
+    },
+    {
+      "at": 23.2,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 30.6,
+      "dst": "bravo",
+      "op": "status",
+      "src": "bravo"
+    },
+    {
+      "at": 31.1,
+      "dst": "bravo",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 32.3,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 36.0,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "charlie"
+    }
+  ],
+  "version": 1
+}
