@@ -20,6 +20,12 @@ on:
   # cli/ alone, so a send or receive change reached main without the browser
   # half ever being run against it (the published edge CLI is what it tests).
   workflow_dispatch:
+  # Standing: after every edge build of main, so each CLI change on main gets
+  # the browser half against the binary that was just published.
+  workflow_run:
+    workflows: [publish-edge]
+    types: [completed]
+    branches: [main]
   push:
     branches: [main, "integration/**"]
     paths:
@@ -45,6 +51,7 @@ jobs:
   # workflow does not start for CLI-only changes (scripts/check_ci_paths.py),
   # and a frontend change is what can break the browser half.
   known-device:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -61,10 +68,13 @@ jobs:
       - name: The published CLI (no build)
         env:
           GH_TOKEN: ${{ github.token }}
+          EDGE_RUN: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
           api="repos/${GITHUB_REPOSITORY}/actions"
-          run=$(gh api "$api/workflows/publish-edge.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].id')
+          # The edge build that started this run, else main's latest one.
+          run="${EDGE_RUN:-}"
+          [ -n "$run" ] || run=$(gh api "$api/workflows/publish-edge.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].id')
           id=$(gh api "$api/runs/${run}/artifacts" --jq '[.artifacts[] | select(.name=="tunlion-edge")][0].id')
           gh api "$api/artifacts/${id}/zip" > "$RUNNER_TEMP/tunlion.zip"
           mkdir -p "$RUNNER_TEMP/bin" && unzip -oq "$RUNNER_TEMP/tunlion.zip" -d "$RUNNER_TEMP/bin"
@@ -93,6 +103,8 @@ jobs:
         run: bash cli/tests/known-device-gates.sh
 
   gates:
+    # Frontend unit tests: nothing to do for a CLI-only edge build.
+    if: ${{ github.event_name != 'workflow_run' }}
     runs-on: ubuntu-latest
     # 40: the same-room pairing gate runs 40 real pairings.
     timeout-minutes: 40
