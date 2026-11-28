@@ -118,26 +118,45 @@ python3 -m venv "\$root/chaos-venv" 2>/dev/null || true
 command -v gdb >/dev/null || sudo apt-get install -y -qq gdb >/dev/null 2>&1 || echo "gdb unavailable: thread dumps without function names"
 "\$root/chaos-venv/bin/pip" -q install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
 cd "\$job"
-set +e
+# The campaign runs DETACHED from this exec session (setsid, its own log), so a
+# dropped link (2026-11-28: an unattended upgrade restarted the owner daemon
+# 35 minutes into a campaign) no longer kills it; the owner reattaches below.
+cat > "\$job/campaign.sh" <<'CAMPAIGN'
+job="\$1"; root="\$2"
+cd "\$job"
 sudo -E env "PATH=\$PATH" python3 -I fuzz/chaos/chaos.py $MODE --bin "\$job/tunlion-under-test" \
   --python "\$root/chaos-venv/bin/python" --out "\$job/out" $ARGS
 rc=\$?
-set -e
 sudo chown -R "\$(id -u):\$(id -g)" "\$job/out"
-echo "CHAOS_RC=\$rc"
 tar -C "\$job" -czf "\$job/out.tgz" out
 # The essentials (verdicts, findings with their logs, grown corpus) in a small
 # tarball fetched first: the exec channel can drop a long stream, and losing
 # the per-run records must never cost the findings.
-( cd "\$job" && tar -czf out-essential.tgz --ignore-failed-read \$(cd "\$job" && ls -d out/summary.json out/seen.json out/throughput.json out/replay-rates.json out/canary.json out/hookcheck.json out/findings out/corpus-grown 2>/dev/null) )
+( cd "\$job" && tar -czf out-essential.tgz --ignore-failed-read \$(ls -d out/summary.json out/seen.json out/throughput.json out/replay-rates.json out/canary.json out/hookcheck.json out/findings out/corpus-grown 2>/dev/null) )
+echo "CHAOS_RC=\$rc"
 echo "CHAOS_OUT=\$job/out.tgz"
 echo "CHAOS_OUT_ESSENTIAL=\$job/out-essential.tgz"
+CAMPAIGN
+setsid nohup bash "\$job/campaign.sh" "\$job" "\$root" > "\$job/campaign.log" 2>&1 < /dev/null &
+echo \$! > "\$job/campaign.pid"
+echo "CHAOS_JOB=\$job"
+tail -n +1 -F "\$job/campaign.log" --pid="\$(cat "\$job/campaign.pid")" 2>/dev/null
 EOF
 )
 LOG="$ROOT/chaos-results/$JOB.log"; mkdir -p "$ROOT/chaos-results"
 echo "== run $MODE on $WORKER (log: $LOG)"
 WENV=(--env HOME=/home/runner --env PATH=/home/runner/work/_temp/bin:/home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)
 tunlion exec "$WORKER" "${WENV[@]}" -- bash -c "$REMOTE" 2>&1 | tee "$LOG"
+# The link dropped before the campaign finished: it is still running on the
+# worker, detached. Reattach and follow it to the end (bounded).
+JOBDIR=$(grep -oP '^CHAOS_JOB=\K.*' "$LOG" | tail -1)
+tries=0
+while [ -n "$JOBDIR" ] && ! grep -q '^CHAOS_OUT_ESSENTIAL=' "$LOG" && [ "$tries" -lt 30 ]; do
+  tries=$((tries + 1))
+  echo "== the exec link dropped; reattaching to the campaign on $WORKER (try $tries)" | tee -a "$LOG"
+  sleep 20
+  tunlion exec "$WORKER" -- bash -c "p=\$(cat '$JOBDIR/campaign.pid' 2>/dev/null); [ -n \"\$p\" ] && tail -n 0 -F '$JOBDIR/campaign.log' --pid=\"\$p\" 2>/dev/null; grep '^CHAOS_' '$JOBDIR/campaign.log'" 2>&1 | tee -a "$LOG"
+done
 OUT=$(grep -oP '^CHAOS_OUT=\K.*' "$LOG" | tail -1)
 RC=$(grep -oP '^CHAOS_RC=\K\d+' "$LOG" | tail -1)
 ESS=$(grep -oP '^CHAOS_OUT_ESSENTIAL=\K.*' "$LOG" | tail -1)
