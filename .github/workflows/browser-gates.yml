@@ -45,7 +45,7 @@ jobs:
   # workflow does not start for CLI-only changes (scripts/check_ci_paths.py),
   # and a frontend change is what can break the browser half.
   known-device:
-    runs-on: ubuntu-24.04  # Playwright 1.60 has no chromium for ubuntu-latest (26.04)
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
@@ -93,7 +93,7 @@ jobs:
         run: bash cli/tests/known-device-gates.sh
 
   gates:
-    runs-on: ubuntu-24.04  # Playwright 1.60 has no chromium for ubuntu-latest (26.04)
+    runs-on: ubuntu-latest
     # 40: the same-room pairing gate runs 40 real pairings.
     timeout-minutes: 40
     # The Redis registry is the multi-replica path; exercise its atomic Lua
