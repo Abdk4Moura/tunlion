@@ -234,7 +234,17 @@ def random_op(rng: random.Random) -> dict:
     kind = rng.choice(OPS)
     at = round(rng.uniform(0, 40), 1)
     if kind == "exec":
-        return {"op": "exec", "at": at, "src": rng.choice(DELEGATES), "dst": OWNER}
+        src = rng.choice(DELEGATES)
+        # The delegates grant each other shell (World.setup), so an exec may go
+        # to the owner (a paired device) or to the other delegate (a fleet
+        # sibling, dialled on the fleet secret when no daemon brokers it).
+        op = {"op": "exec", "at": at, "src": src,
+              "dst": OWNER if rng.random() < 0.6 else next(d for d in DELEGATES if d != src)}
+        if rng.random() < 0.3:
+            # A one-shot dialer: no local daemon to ride or broker through
+            # (a machine with no `up`, as on Windows). See World.oneshot_env.
+            op["oneshot"] = True
+        return op
     if kind == "send":
         op = {"op": "send", "at": at, "src": OWNER, "dst": rng.choice(DELEGATES),
               "kib": rng.choice([4, 256, 4096])}
@@ -650,6 +660,26 @@ class World:
             out, err = p.communicate()
             return None, out, err, time.monotonic() - t0
 
+    def oneshot_env(self, d: str) -> tuple[dict, Path]:
+        """The env of a ONE-SHOT dialer on device d: the device's identity and
+        state, but no local daemon to ride or to broker through (a machine
+        that runs no `up`, as on Windows). Its config dir is a copy without the
+        daemon's runtime files, so there is no control socket to find, and
+        warm reuse is off. Returns (env, dir to remove afterwards)."""
+        tmp = self.cfg(d) / f"oneshot-{random.randrange(1 << 40):x}"
+        for attempt in range(5):
+            try:
+                shutil.copytree(self.cfg(d) / "cfg", tmp, symlinks=True, ignore=RUNTIME_FILES)
+                break
+            except (shutil.Error, OSError):
+                # The daemon replaced a file while it was copied (tmp + rename).
+                shutil.rmtree(tmp, ignore_errors=True)
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
+        subprocess.run(["chown", "-R", f"{self.uid}:{self.gid}", str(tmp)], check=True)
+        return {"TUNLION_CONFIG_DIR": str(tmp), "TUNLION_NO_WARM_REUSE": "1"}, tmp
+
     def fresh_dirs(self) -> None:
         for d in DEVICES:
             c = self.cfg(d)
@@ -860,10 +890,22 @@ class World:
             if not missing:
                 break
             time.sleep(2)
+        # The delegates grant each other shell, so an exec between fleet
+        # siblings is a positive path (it must run), judged like one to the
+        # owner. A sibling dial with no daemon goes over the fleet secret.
+        granted = {}
+        if not missing:
+            for d in DELEGATES:
+                other = next(x for x in DELEGATES if x != d)
+                rc, out, err, _ = self.cli(d, ["grant", other, "shell"], 30)
+                if rc != 0:
+                    granted[d] = f"rc={rc}: {(err or out).strip()[-200:]}"
         for d in DEVICES:
             self.daemon_stop(d)
         if missing:
             raise Refused(f"setup: fleet roster did not reach every device in 90s: {missing}")
+        if granted:
+            raise Refused(f"setup: sibling shell grant failed: {granted}")
         if self.snapshot.exists():
             shutil.rmtree(self.snapshot)
         for d in DEVICES:
@@ -1287,9 +1329,22 @@ def run_op(w: World, st: dict, phase: str) -> dict:
            "deadline": st.get("deadline", OP_DEADLINE[kind])}
     deadline = st.get("deadline", OP_DEADLINE[kind])
     if kind == "exec":
-        token = f"CHZ{random.randrange(1 << 40):x}"
-        cmd = st.get("cmd") or ["/bin/echo", token]
-        rc, out, err, el = w.cli(src, ["exec", dst, "--", *cmd], deadline)
+        extra, tmp = None, None
+        if st.get("oneshot"):
+            try:
+                extra, tmp = w.oneshot_env(src)
+            except (shutil.Error, OSError, subprocess.CalledProcessError) as e:
+                res.update(rc=None, ok=False, lie=False, stderr_tail="", stdout_tail="",
+                           mech_error=f"one-shot config copy for {src} failed: {e}")
+                return res
+            res["oneshot"] = True
+        try:
+            token = f"CHZ{random.randrange(1 << 40):x}"
+            cmd = st.get("cmd") or ["/bin/echo", token]
+            rc, out, err, el = w.cli(src, ["exec", dst, "--", *cmd], deadline, extra)
+        finally:
+            if tmp is not None:
+                shutil.rmtree(tmp, ignore_errors=True)
         res.update(rc=rc, elapsed=round(el, 2), ok=(rc == 0 and token in out))
         res["lie"] = rc == 0 and token not in out
     elif kind == "send" and st.get("via") == "stdout":
@@ -1332,10 +1387,18 @@ def run_op(w: World, st: dict, phase: str) -> dict:
     return res
 
 
+def op_label(r: dict) -> str:
+    """The op's kind with its variants, e.g. `exec (one-shot)`."""
+    tags = []
+    if r.get("oneshot"):
+        tags.append("one-shot")
+    return r["op"] + (f" ({', '.join(tags)})" if tags else "")
+
+
 def judge_op(r: dict) -> list[dict]:
     """UX oracles that hold for every operation, faults or not."""
     f = []
-    who = f"{r['op']} {r['src']}->{r['dst']}"
+    who = f"{op_label(r)} {r['src']}->{r['dst']}"
     if r["rc"] is None:
         f.append({"oracle": "O2-hang", "hard": True,
                   "what": f"{who} still running after {r.get('deadline', OP_DEADLINE[r['op']]):.0f}s ({r['phase']})"})
@@ -1430,7 +1493,7 @@ def judge_unfaulted(r: dict, fault_windows: list[dict]) -> list[dict]:
     rc = "hung" if r.get("rc") is None else f"rc {r.get('rc')}"
     tail = (r.get("stderr_tail") or "").strip().splitlines()[-1:] or [""]
     return [{"oracle": "O14-failed-unfaulted", "hard": True,
-             "what": f"{r['op']} {r['src']}->{r['dst']} failed ({rc}) with no fault active or healed within "
+             "what": f"{op_label(r)} {r['src']}->{r['dst']} failed ({rc}) with no fault active or healed within "
                      f"{UNFAULTED_SETTLE:.0f}s: {tail[0][:200]}"}]
 
 
@@ -1457,7 +1520,7 @@ def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
             if st["fault"] == "server.down" or (st["fault"] in _SELF_NET_FAULTS and st.get("target") == src):
                 return []
         return [{"oracle": "O9-misdiagnosis", "hard": True,
-                 "what": f"{r['op']} {src}->{dst} blamed this machine's own connection (rc {r['rc']}), but no "
+                 "what": f"{op_label(r)} {src}->{dst} blamed this machine's own connection (rc {r['rc']}), but no "
                          f"fault touched {src}'s network: {err[-180:]}"}]
     if _BLAMES_STORAGE.search(err):
         src = r["src"]
@@ -1469,7 +1532,7 @@ def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
                 (st["fault"] == "net.partition" and {st.get("a"), st.get("b")} == {src, dst})
             if on_link:
                 return [{"oracle": "O9-misdiagnosis", "hard": True,
-                         "what": f"{r['op']} {src}->{dst} blamed {dst}'s storage (rc {r['rc']}) while a "
+                         "what": f"{op_label(r)} {src}->{dst} blamed {dst}'s storage (rc {r['rc']}) while a "
                                  f"{st['fault']} fault was on the link between them: {err[-180:]}"}]
     if not _BLAMES_PEER.search(err) or _NAMES_PATH.search(err):
         return []
@@ -1485,7 +1548,7 @@ def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
     if r.get("dst_signaling_after") != "connected":
         return []
     return [{"oracle": "O9-misdiagnosis", "hard": True,
-             "what": f"{r['op']} {r['src']}->{dst} told the user the peer was offline or not running "
+             "what": f"{op_label(r)} {r['src']}->{dst} told the user the peer was offline or not running "
                      f"(rc {r['rc']}), but {dst} was up and connected; real cause was elsewhere: "
                      f"{r['stderr_tail'][-180:]}"}]
 
@@ -1732,6 +1795,9 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
     fault_windows = [{"step": tl["step"], "start": tl["start"], "end": tl["end"]} for tl in timeline]
     verdict["fault_windows"] = [{"fault": f["step"]["fault"], "start": round(f["start"], 1),
                                  "end": None if f["end"] is None else round(f["end"], 1)} for f in fault_windows]
+    for r in results:
+        if r.get("mech_error") and r["op"] != "visit":
+            raise Refused("instrument: " + r["mech_error"])
     for r in results:
         if r["op"] == "visit":
             if not r.get("mech_error"):
@@ -2443,6 +2509,20 @@ def selftest_save_finding() -> None:
         assert json.loads((d / "verdict.json").read_text())["schedule_of_this_run"] == "schedule.json"
 
 
+def selftest_exec_variants() -> None:
+    """Explore draws one-shot execs and execs to a fleet sibling blindly, and
+    their judgement uses the common oracles."""
+    rng = random.Random(3)
+    ex = [o for o in (random_op(rng) for _ in range(3000)) if o["op"] == "exec"]
+    assert any(o.get("oneshot") for o in ex), "one-shot never drawn"
+    assert any(o["dst"] in DELEGATES for o in ex) and any(o["dst"] == OWNER for o in ex), "exec targets"
+    assert all(o["src"] in DELEGATES and o["dst"] != o["src"] for o in ex), ex[:3]
+    r = {"op": "exec", "src": "bravo", "dst": "charlie", "phase": "x", "rc": 6, "ok": False, "lie": False,
+         "oneshot": True, "t_start": 50.0, "t_end": 60.0, "stderr_tail": "connect timeout: couldn't reach 'charlie'"}
+    unf = judge_unfaulted(r, [])
+    assert unf and unf[0]["oracle"] == "O14-failed-unfaulted" and unf[0]["what"].startswith("exec (one-shot) bravo"), unf
+
+
 def cmd_selftest() -> int:
     rng = random.Random(1)
     for _ in range(500):
@@ -2609,6 +2689,7 @@ def cmd_selftest() -> int:
                 assert st["op"] in OPS + ["visit"], (p, st)
     selftest_save_finding()
     selftest_kinds_and_coverage()
+    selftest_exec_variants()
     print("selftest ok")
     return 0
 
