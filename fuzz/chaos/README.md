@@ -154,6 +154,20 @@ The delegates grant each other shell at setup, so an exec goes to the owner
     {"at": 35.0, "op": "exec", "src": "bravo", "dst": "charlie", "oneshot": true}
     {"at": 35.0, "op": "exec", "src": "bravo", "dst": "alpha", "out_mib": 40, "stall_s": 15.0}
 
+## Host load
+
+`disk.slow` keeps a loop that writes 128 MiB, fsyncs it and pauses 0.5 s
+(`dd ... conv=fsync`) on the filesystem of `target`'s config dir for the
+fault's window, so every fsync a daemon does waits behind it. The disk is the
+machine's: every device (and every world) shares it, `target` only says where
+the load is written. It is skipped when the work dir is on tmpfs, where an
+fsync costs nothing. It is what #768 (fsync'd state writes on the event loop,
+O11) needed: that only reproduced with the worker's disk loaded by hand. Under
+it main still trips O11 in receive-completion handlers (MaybeComplete,
+Control:file-end), so no disk schedule is in `corpus/` until that is fixed.
+
+    {"at": 0.5, "dur": 150.0, "fault": "disk.slow", "target": "alpha"}
+
 ## Retiring a hand-written gate
 
 Only when reverting that gate's original fix makes `replay` of the matching

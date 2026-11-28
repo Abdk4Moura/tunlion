@@ -126,7 +126,7 @@ OP_DEADLINE["visit"] = VISIT_JOIN_DEADLINE + VISIT_SEEN_DEADLINE + OP_DEADLINE["
 CHAINS = [("CHAOS", "FORWARD"), ("CHAOS_IN", "INPUT"), ("CHAOS_OUT", "OUTPUT")]
 
 FAULTS = ["net.impair", "net.partition", "net.isolate", "sig.blackhole", "sig.reset",
-          "proc.freeze", "proc.kill", "server.down"]
+          "proc.freeze", "proc.kill", "server.down", "disk.slow"]
 OPS = ["exec", "send", "reach", "status", "doctor"]
 
 # Env hooks (test-hooks builds) that add INTERNAL faults with a designed
@@ -413,6 +413,8 @@ class World:
         self.incarnation: dict[str, int] = {d: 0 for d in DEVICES}
         self.bin_sha = self._sha(binary)
         self.can_netem = False
+        self.can_disk_load = False                       # disk.slow: set in net_up
+        self.host_loads: list[subprocess.Popen] = []     # disk.slow loads now running
         self.snapshot = work / "snapshot"
         self.visitors: dict[str, subprocess.Popen] = {}   # visitor name -> its `up`
         self.visit_inv: Path | None = None               # this run's reusable invitation
@@ -563,6 +565,13 @@ class World:
             sh(["tc", "qdisc", "del", "dev", probe, "root"], check=False)
         else:
             log(f"netem unavailable ({r.stderr.strip()[:120]}); net.impair is DISABLED for this run")
+        # disk.slow loads the filesystem the daemons write to. On tmpfs an
+        # fsync costs nothing, so the fault would be a no-op that reads as
+        # applied: disable it instead.
+        fs = sh(["stat", "-f", "-c", "%T", str(self.work)], check=False).stdout.strip()
+        self.can_disk_load = fs not in ("tmpfs", "ramfs", "")
+        if not self.can_disk_load:
+            log(f"{self.work} is on {fs or 'an unknown filesystem'}; disk.slow is DISABLED for this run")
 
     def net_down(self) -> None:
         for role, hook in CHAINS:
@@ -921,8 +930,21 @@ class World:
         for d in DEVICES:
             shutil.copytree(self.cfg(d) / "cfg", self.snapshot / d, symlinks=True, ignore=RUNTIME_FILES)
 
+    def stop_host_loads(self) -> None:
+        for p in self.host_loads:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.wait()
+        self.host_loads = []
+        for d in DEVICES:
+            for f in self.cfg(d).glob("diskload-*.bin"):
+                f.unlink(missing_ok=True)
+
     def reset_for_run(self, hooks: dict) -> None:
         """Every run starts from the same enrolled state with fresh daemons."""
+        self.stop_host_loads()
         for d in DEVICES:
             self.daemon_stop(d, signal.SIGKILL)
         for v in self.visitor_names_present():
@@ -953,6 +975,7 @@ class World:
             self.daemon_start(d)
 
     def teardown(self) -> None:
+        self.stop_host_loads()
         for d in DEVICES:
             self.daemon_stop(d, signal.SIGKILL)
         self.backend_stop()
@@ -1153,6 +1176,54 @@ def apply_fault(w: World, st: dict, uid: str) -> Applied | None:
             if w.server_down == 0:
                 w.backend_start()
         return Applied(st, heal, lambda: not w.backend_healthy() or True, lambda: True)
+
+    if k == "disk.slow":
+        # The disk is busy (a backup, an indexer, another tenant): a loop that
+        # writes 128 MiB, fsyncs it and pauses 0.5 s, on the filesystem that
+        # holds the target's config dir, for the fault's window. Each fsync a
+        # daemon does then waits for that dirty data (ext4 commits its journal
+        # in order). Measured on a lease: a 4 KiB fsync took 0.8 ms idle, 38 ms
+        # on average and up to 290 ms under this loop. A loop of small dsync
+        # writes barely loads it (the disk's write cache absorbs them); 512 MiB
+        # with no pause loaded it so hard, with 12 worlds at once, that
+        # baselines failed before any fault. The disk is the machine's, so
+        # every device of the world, and other worlds, feel it: `target` only
+        # picks where the load is written. Nothing knows a code site: an fsync
+        # anywhere on an event loop is what it makes slow.
+        if not w.can_disk_load:
+            return None
+        d = st["target"]
+        f = w.cfg(d) / f"diskload-{uid}.bin"
+        p = subprocess.Popen(["ip", "netns", "exec", w.ns(d), "sh", "-c",
+                              f"while :; do dd if=/dev/zero of={f} bs=1M count=128 conv=fsync,notrunc "
+                              f"status=none || exit 1; sleep 0.5; done"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        w.host_loads.append(p)
+        wrote = {"max": 0}
+
+        def size() -> int:
+            try:
+                n = f.stat().st_size
+            except OSError:
+                n = 0
+            wrote["max"] = max(wrote["max"], n)
+            return wrote["max"]
+
+        def heal():
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.wait()
+            if p in w.host_loads:
+                w.host_loads.remove(p)
+            f.unlink(missing_ok=True)
+
+        def present():
+            size()
+            return p.poll() is None
+        return Applied(st, heal, present, lambda: size() > 0)
     raise ValueError(k)
 
 
@@ -2695,6 +2766,17 @@ def selftest_cold_and_recovery() -> None:
     assert judge_recovered(dict(rr, rc=None), early) == [] and judge_recovered(dict(rr, ok=True), early) == []
 
 
+def selftest_disk_slow() -> None:
+    """disk.slow is drawn blindly, and skipped (never applied as a no-op)
+    where there is no disk to load."""
+    rng = random.Random(6)
+    faults = [random_fault(rng) for _ in range(3000)]
+    assert any(f["fault"] == "disk.slow" and f["target"] in DEVICES for f in faults), "disk.slow never drawn"
+    fw = World.__new__(World)
+    fw.k, fw.can_disk_load = 0, False
+    assert apply_fault(fw, {"fault": "disk.slow", "target": "bravo", "at": 0, "dur": 5}, "t") is None
+
+
 def cmd_selftest() -> int:
     rng = random.Random(1)
     for _ in range(500):
@@ -2864,6 +2946,7 @@ def cmd_selftest() -> int:
     selftest_exec_variants()
     selftest_exec_bulk()
     selftest_cold_and_recovery()
+    selftest_disk_slow()
     print("selftest ok")
     return 0
 
