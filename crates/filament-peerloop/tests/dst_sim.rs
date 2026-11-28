@@ -389,3 +389,48 @@ fn test_first_fleet_hello_index_write_stays_off_the_loop() {
     assert!(!indexed.is_empty(), "no fleet sibling was indexed");
     assert!(out.budget_violations.is_empty(), "{:?}", out.budget_violations);
 }
+
+/// A certificate renewal writes on both ends: the owner upserts the renewed
+/// certificate into its device record before it acks
+/// (`renew_device_cert`), and the requester writes its own certificate
+/// record when it adopts the ack (`adopt_renewed_cert`). Each is a durable
+/// write. With every disk slower than the loop budget, neither may run on
+/// the event loop: the loop-budget oracle fires if one does. The ack must
+/// still follow the owner's write.
+#[test]
+fn test_cert_renewal_writes_stay_off_the_loop() {
+    let mut cfg = fleet_config(3, vec![]);
+    cfg.fleet_primary = Some("alpha".to_string());
+    cfg.renewal_due = vec!["bravo".to_string()];
+    cfg.schedule = ["alpha", "bravo", "charlie"]
+        .iter()
+        .map(|n| ScheduledFault {
+            at_ms: 0,
+            fault: Fault::SlowDisk { node: n.to_string(), write_ms: 1_500 },
+        })
+        .collect();
+    let out = SimWorld::run(cfg.clone());
+    assert_eq!(out.trace_hash, SimWorld::run(cfg).trace_hash, "did not replay");
+    let first = |node: &str, needle: &str| {
+        out.events
+            .iter()
+            .position(|e| e.node == node && e.message.contains(needle))
+    };
+    let renewed = first("alpha", "renewed certificate for");
+    let adopted = first("bravo", "certificate renewed");
+    let renewal_lines: Vec<String> = out
+        .events
+        .iter()
+        .filter(|e| e.message.contains("renew"))
+        .map(|e| format!("{}@{}: {}", e.node, e.at_ms, e.message))
+        .collect();
+    println!("RENEWAL: {renewal_lines:?}");
+    println!("BUDGET_VIOLATIONS: {:?}", out.budget_violations);
+    // Not vacuous: the owner renewed and the requester adopted the renewal,
+    // under the slow disk.
+    let renewed = renewed.expect("the owner never renewed a certificate");
+    let adopted = adopted.expect("the requester never adopted a renewed certificate");
+    // The requester adopts only what the owner acked, after its write.
+    assert!(renewed < adopted, "adopted at event {adopted} before the owner renewed at {renewed}");
+    assert!(out.budget_violations.is_empty(), "{:?}", out.budget_violations);
+}
