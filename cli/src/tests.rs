@@ -5759,6 +5759,8 @@ fn every_fleet_proof_verify_site_is_listed_and_refuses_the_own_key() {
         // Test-only occurrences.
         ("crates/filament-peerloop/src/recv/fleet_rv.rs", announce, 1, None),
         ("crates/filament-overlay/src/lib.rs", announce, 3, None),
+        // The sim fleet's tests check its hello with the production verifier.
+        ("crates/filament-peerloop/src/sim/fleet.rs", hello, 2, None),
     ];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     // Scan roots come from the workspace's own member list, so a member added
