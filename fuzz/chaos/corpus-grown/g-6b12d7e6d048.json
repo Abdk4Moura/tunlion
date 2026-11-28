@@ -1,0 +1,70 @@
+{
+  "hooks": {
+    "alpha": {
+      "TUNLION_TEST_CORRUPT_ONCE": "1"
+    },
+    "bravo": {
+      "TUNLION_TEST_CORRUPT_ONCE": "1"
+    }
+  },
+  "seed": 377720476,
+  "steps": [
+    {
+      "at": 1.5,
+      "dur": 3.5,
+      "fault": "proc.freeze",
+      "target": "charlie"
+    },
+    {
+      "a": "alpha",
+      "at": 2.4,
+      "b": "bravo",
+      "dur": 10.1,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 3.8,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "charlie"
+    },
+    {
+      "at": 7.2,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "alpha"
+    },
+    {
+      "at": 11.9,
+      "dur": 2.3,
+      "fault": "sig.blackhole",
+      "target": "alpha"
+    },
+    {
+      "at": 13.1,
+      "dst": "charlie",
+      "op": "doctor",
+      "src": "alpha"
+    },
+    {
+      "at": 20.0,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 24.6,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "at": 28.5,
+      "dst": "alpha",
+      "op": "status",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

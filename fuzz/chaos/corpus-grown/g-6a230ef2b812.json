@@ -1,0 +1,45 @@
+{
+  "hooks": {},
+  "seed": 92985482,
+  "steps": [
+    {
+      "a": "alpha",
+      "at": 2.4,
+      "b": "bravo",
+      "dur": 10.1,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 7.2,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "alpha"
+    },
+    {
+      "at": 11.9,
+      "dur": 9.2,
+      "fault": "sig.blackhole",
+      "target": "alpha"
+    },
+    {
+      "at": 13.1,
+      "dst": "charlie",
+      "op": "doctor",
+      "src": "alpha"
+    },
+    {
+      "at": 24.6,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "at": 33.7,
+      "dst": "alpha",
+      "op": "status",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

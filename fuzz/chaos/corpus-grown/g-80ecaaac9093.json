@@ -1,0 +1,65 @@
+{
+  "hooks": {
+    "bravo": {
+      "TUNLION_TEST_CORRUPT_ONCE": "1"
+    }
+  },
+  "seed": 692008884,
+  "steps": [
+    {
+      "a": "alpha",
+      "at": 3.3,
+      "b": "bravo",
+      "dur": 165.6,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 7.5,
+      "dur": 109.2,
+      "fault": "sig.blackhole",
+      "target": "bravo"
+    },
+    {
+      "at": 8.0,
+      "dst": "charlie",
+      "kib": 256,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 17.4,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "a": "charlie",
+      "at": 18.7,
+      "b": "bravo",
+      "dur": 97.3,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "at": 23.2,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 30.6,
+      "dst": "bravo",
+      "op": "status",
+      "src": "bravo"
+    },
+    {
+      "at": 31.1,
+      "dst": "bravo",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

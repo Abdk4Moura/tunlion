@@ -1,0 +1,86 @@
+{
+  "hooks": {},
+  "seed": 1060781382,
+  "steps": [
+    {
+      "a": "alpha",
+      "at": 0.9,
+      "b": "charlie",
+      "dur": 7.8,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 1.7,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "alpha"
+    },
+    {
+      "at": 2.7,
+      "dst": "charlie",
+      "op": "status",
+      "src": "charlie"
+    },
+    {
+      "at": 4.9,
+      "dur": 49.7,
+      "fault": "sig.blackhole",
+      "target": "charlie"
+    },
+    {
+      "at": 11.2,
+      "dst": "charlie",
+      "kib": 256,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "args": {
+        "delay_ms": 400,
+        "dup": 5,
+        "jitter_ms": 0,
+        "loss": 20,
+        "reorder": 0
+      },
+      "at": 12.7,
+      "dur": 71.0,
+      "fault": "net.impair",
+      "target": "bravo"
+    },
+    {
+      "a": "bravo",
+      "at": 13.3,
+      "b": "alpha",
+      "dur": 12.9,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 18.5,
+      "dur": 3.3,
+      "fault": "proc.kill",
+      "target": "bravo"
+    },
+    {
+      "at": 20.2,
+      "dst": "bravo",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 35.7,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "bravo"
+    },
+    {
+      "at": 39.1,
+      "dst": "charlie",
+      "op": "status",
+      "src": "charlie"
+    }
+  ],
+  "version": 1
+}

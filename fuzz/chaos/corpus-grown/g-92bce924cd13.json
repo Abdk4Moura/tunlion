@@ -1,0 +1,83 @@
+{
+  "hooks": {},
+  "seed": 481355053,
+  "steps": [
+    {
+      "at": 1.3,
+      "dur": 3.6,
+      "fault": "sig.blackhole",
+      "target": "bravo"
+    },
+    {
+      "at": 2.7,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "a": "alpha",
+      "at": 3.3,
+      "b": "charlie",
+      "dur": 8.4,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "a": "alpha",
+      "at": 6.4,
+      "b": "bravo",
+      "dur": 32.3,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "at": 6.5,
+      "dur": 99.9,
+      "fault": "proc.freeze",
+      "target": "alpha"
+    },
+    {
+      "at": 6.7,
+      "dur": 25.8,
+      "fault": "sig.blackhole",
+      "target": "charlie"
+    },
+    {
+      "at": 6.8,
+      "dur": 5.6,
+      "fault": "sig.reset",
+      "target": "charlie"
+    },
+    {
+      "at": 8.2,
+      "dur": 10.3,
+      "fault": "proc.kill",
+      "target": "bravo"
+    },
+    {
+      "at": 14.4,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "charlie"
+    },
+    {
+      "at": 24.2,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "at": 35.0,
+      "dst": "charlie",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 39.3,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}
