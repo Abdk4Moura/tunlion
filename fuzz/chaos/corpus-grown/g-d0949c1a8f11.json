@@ -1,0 +1,48 @@
+{
+  "hooks": {
+    "bravo": {
+      "TUNLION_TEST_ESTABLISH_DELAY_MS": "500"
+    }
+  },
+  "seed": 755044644,
+  "steps": [
+    {
+      "at": 0.3,
+      "dur": 12.6,
+      "fault": "disk.slow",
+      "target": "bravo"
+    },
+    {
+      "at": 2.6,
+      "dst": "charlie",
+      "op": "doctor",
+      "src": "bravo"
+    },
+    {
+      "at": 4.6,
+      "dst": "bravo",
+      "kib": 256,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 14.7,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 15.8,
+      "dur": 12.3,
+      "fault": "sig.blackhole",
+      "target": "charlie"
+    },
+    {
+      "at": 28.0,
+      "dst": "charlie",
+      "op": "reach",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

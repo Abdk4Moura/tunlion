@@ -1,0 +1,76 @@
+{
+  "hooks": {
+    "alpha": {
+      "TUNLION_TEST_DIRECT_FLAKY": "1"
+    }
+  },
+  "seed": 265373835,
+  "steps": [
+    {
+      "args": {
+        "delay_ms": 80,
+        "dup": 0,
+        "jitter_ms": 300,
+        "loss": 5,
+        "reorder": 0
+      },
+      "at": 3.7,
+      "dur": 61.5,
+      "fault": "net.impair",
+      "target": "bravo"
+    },
+    {
+      "at": 4.6,
+      "dst": "charlie",
+      "kib": 256,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "args": {
+        "delay_ms": 400,
+        "dup": 5,
+        "jitter_ms": 0,
+        "loss": 50,
+        "reorder": 0
+      },
+      "at": 7.3,
+      "dur": 84.3,
+      "fault": "net.impair",
+      "target": "bravo"
+    },
+    {
+      "args": {
+        "delay_ms": 0,
+        "dup": 0,
+        "jitter_ms": 300,
+        "loss": 0,
+        "reorder": 0
+      },
+      "at": 16.8,
+      "dur": 59.2,
+      "fault": "net.impair",
+      "target": "alpha"
+    },
+    {
+      "at": 17.4,
+      "dst": "bravo",
+      "kib": 4,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 30.7,
+      "dst": "bravo",
+      "op": "status",
+      "src": "bravo"
+    },
+    {
+      "at": 30.8,
+      "dst": "charlie",
+      "op": "doctor",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

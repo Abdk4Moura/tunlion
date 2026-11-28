@@ -1,0 +1,74 @@
+{
+  "hooks": {
+    "alpha": {},
+    "bravo": {
+      "TUNLION_TEST_CORRUPT_ONCE": "1"
+    },
+    "charlie": {
+      "TUNLION_TEST_DIRECT_DELAY_MS": "500"
+    }
+  },
+  "seed": 1020731879,
+  "steps": [
+    {
+      "at": 4.9,
+      "dur": 26.0,
+      "fault": "sig.reset",
+      "target": "alpha"
+    },
+    {
+      "a": "alpha",
+      "at": 6.0,
+      "b": "charlie",
+      "dur": 64.9,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "at": 6.0,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "at": 11.8,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 17.4,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "a": "charlie",
+      "at": 18.7,
+      "b": "bravo",
+      "dur": 97.3,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "at": 24.2,
+      "dst": "bravo",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 33.9,
+      "dst": "bravo",
+      "op": "status",
+      "src": "bravo"
+    },
+    {
+      "at": 35.0,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "charlie"
+    }
+  ],
+  "version": 1
+}
