@@ -125,9 +125,17 @@ if wait_log "$WORK/up-charlie.log" "fleet device 'bravo' joined the mesh" 30; th
   ok "gateM2: charlie admitted bravo over the fleet channel"
 else bad "gateM2: charlie never admitted bravo"; grep -iE "fleet|roster" "$WORK/up-charlie.log" | tail -20; fi
 if python3 - "$WORK/bravo/devices.json" charlie "$WORK/charlie/devices.json" bravo <<'PY'
-import json,sys
+import json,sys,time
+# The index write runs off the daemon loop (StoreLane, #796): the admission
+# line can print before devices.json has the record. Wait for the record to
+# appear, then check it as before.
 for path, name in ((sys.argv[1], sys.argv[2]), (sys.argv[3], sys.argv[4])):
-    recs = [d for d in json.load(open(path)) if d.get("name") == name]
+    deadline = time.time() + 15
+    while True:
+        recs = [d for d in json.load(open(path)) if d.get("name") == name]
+        if recs or time.time() >= deadline:
+            break
+        time.sleep(0.25)
     assert recs, f"{name} not indexed in {path}"
     assert all(not d.get("secret") for d in recs), f"{name} carries a pair secret in {path}"
     assert all(d.get("deviceCert") for d in recs), f"{name} indexed without its certificate"
