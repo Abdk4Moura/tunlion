@@ -106,6 +106,7 @@ A schedule with visits turns on alpha's debug log and adds two rules:
   within 60 s and be answered; so must any visitor that comes after another one
   engaged.
 - O14-failed-unfaulted: an op that ran with no fault active, nor one healed within 30 s before it, must succeed (hooks are recoverable by definition)
+- O15-no-recovery-in-op: an op that a fault overlapped, still running 30 s after the last fault had healed (and no other fault active), must not then fail: the world was whole for as long as O14 allows to settle
 
 A visitor that cannot engage before any other visitor did refuses the run, as
 does a missing ESTABLISH line in alpha's log (the rule would be blind).
@@ -121,6 +122,15 @@ bytes are not the source file is a finding. `random_op` picks it for about a
 third of sends; `corpus/send-stdout.json` is the T3 case.
 
     {"at": 1.0, "op": "send", "via": "stdout", "src": "alpha", "dst": "bravo", "kib": 5120}
+
+## Cold sends
+
+`"cold": true` on a send makes it build its own link (`TUNLION_NO_WARM_REUSE=1`)
+instead of riding its daemon's warm one, as every send did before #754; its own
+signaling client, dials and re-dials are only reachable that way. `random_op`
+draws it for about a fifth of sends. A cold send whose local-network link is
+cut while the server is down (the #748 shape) fails by O15 on main today; its
+schedule goes in with the product fix.
 
 ## Exec variants
 
