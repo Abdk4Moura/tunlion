@@ -333,6 +333,17 @@ fn test_guidance_benchmark_matrix() {
 #[test]
 fn test_clean_main_1000_runs_married() {
     const RUNS: usize = 1_000;
+    // DST_CLEAN_GUIDE picks the guide (default `married`), so the same seed and
+    // budget can be compared across guides for coverage and findings.
+    let guide = std::env::var("DST_CLEAN_GUIDE").unwrap_or_else(|_| "married".to_string());
+    let flags = match guide.as_str() {
+        "married" => GuideFlags::married(),
+        "unguided" => GuideFlags::unguided(),
+        "swarm" => GuideFlags::swarm_only(),
+        "message_chaos" => GuideFlags::message_chaos_only(),
+        "semantic" => GuideFlags::semantic_only(),
+        other => panic!("unknown DST_CLEAN_GUIDE {other}"),
+    };
     let workers = std::thread::available_parallelism()
         .map_or(2, |n| n.get().clamp(2, 4));
     let report = Fuzzer::run_parallel(
@@ -340,7 +351,7 @@ fn test_clean_main_1000_runs_married() {
             seed: 2026_11_27,
             max_runs: RUNS,
             stop_on_first_finding: false,
-            flags: GuideFlags::married(),
+            flags,
             mutant: SimMutant::None,
             allow_gather_hang: true,
             quiet_logs: true,
@@ -349,7 +360,8 @@ fn test_clean_main_1000_runs_married() {
         workers,
     );
     println!(
-        "CLEAN_MAIN_1000: runs={} workers={} findings={} wall_ms={} state_edges={} max_busy_ms={} max_status_ms={}",
+        "CLEAN_MAIN_1000: guide={} runs={} workers={} findings={} wall_ms={} state_edges={} max_busy_ms={} max_status_ms={}",
+        guide,
         report.runs_executed,
         workers,
         report.findings.len(),
