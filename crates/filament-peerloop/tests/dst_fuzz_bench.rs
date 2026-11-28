@@ -333,9 +333,10 @@ fn test_guidance_benchmark_matrix() {
 #[test]
 fn test_clean_main_1000_runs_married() {
     const RUNS: usize = 1_000;
-    // DST_CLEAN_GUIDE picks the guide (default `married`), so the same seed and
-    // budget can be compared across guides for coverage and findings.
-    let guide = std::env::var("DST_CLEAN_GUIDE").unwrap_or_else(|_| "married".to_string());
+    // DST_CLEAN_GUIDE picks the guide (default `unguided`, the campaign
+    // default; `married` is provisional, see GuideFlags::married), so the same
+    // seed and budget can be compared across guides for coverage and findings.
+    let guide = std::env::var("DST_CLEAN_GUIDE").unwrap_or_else(|_| "unguided".to_string());
     let flags = match guide.as_str() {
         "married" => GuideFlags::married(),
         "unguided" => GuideFlags::unguided(),

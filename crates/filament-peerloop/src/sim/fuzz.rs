@@ -61,6 +61,15 @@ impl GuideFlags {
         }
     }
 
+    /// PROVISIONAL: not shown to find real bugs faster than [`Self::unguided`].
+    /// Chosen and judged on the same two bugs: #738 was not blind (its hang
+    /// fault was placed at the bug site) and #729 is a tie (median 2 runs for
+    /// both). The held-out check on 2026-11-28 could not run: none of
+    /// #757, #761, #762, #763 or #768 is reachable in the sim (no fleet
+    /// identity or one-shot dialer, no TCP socket, no slow disk, CLI code).
+    /// On 1000 clean runs it reached 57 state edges to unguided's 54. Campaigns
+    /// default to unguided (`CampaignConfig::default()`); keep it that way
+    /// until a held-out bug the sim can reach shows this preset wins.
     pub fn married() -> Self {
         Self {
             swarm: true,
