@@ -1,0 +1,32 @@
+{
+  "hooks": {},
+  "seed": 906154522,
+  "steps": [
+    {
+      "at": 7.1,
+      "dur": 71.6,
+      "fault": "disk.slow",
+      "target": "charlie"
+    },
+    {
+      "at": 12.1,
+      "dur": 101.6,
+      "fault": "sig.blackhole",
+      "target": "alpha"
+    },
+    {
+      "at": 18.3,
+      "dst": "bravo",
+      "kib": 4096,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 18.6,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "bravo"
+    }
+  ],
+  "version": 1
+}

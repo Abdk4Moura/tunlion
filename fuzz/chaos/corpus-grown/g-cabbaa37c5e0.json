@@ -1,0 +1,39 @@
+{
+  "hooks": {},
+  "seed": 55720702,
+  "steps": [
+    {
+      "at": 3.6,
+      "dur": 8.6,
+      "fault": "server.down"
+    },
+    {
+      "at": 8.8,
+      "dst": "charlie",
+      "op": "status",
+      "src": "charlie"
+    },
+    {
+      "a": "bravo",
+      "at": 13.2,
+      "b": "alpha",
+      "dur": 9.9,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "args": {
+        "delay_ms": 1500,
+        "dup": 0,
+        "jitter_ms": 300,
+        "loss": 5,
+        "reorder": 0
+      },
+      "at": 13.9,
+      "dur": 2.8,
+      "fault": "net.impair",
+      "target": "bravo"
+    }
+  ],
+  "version": 1
+}
