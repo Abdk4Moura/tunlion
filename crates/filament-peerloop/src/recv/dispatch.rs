@@ -2687,6 +2687,8 @@ async fn recv_run(
     // hello from the same device does not queue a second one.
     #[cfg(feature = "fleet")]
     let mut fleet_indexing: HashSet<[u8; 32]> = HashSet::new();
+    // Device keys whose certificate renewal is queued or running (owner side).
+    let mut cert_renewing: HashSet<[u8; 32]> = HashSet::new();
     // Offers that arrived while this link's `fleet-hello` was still in flight.
     // Verification is MUTUAL and the two directions are not synchronized: the
     // sender proves US, then offers, and its offer can beat our verification of
@@ -3459,6 +3461,41 @@ async fn recv_run(
                         log.debug(&format!("fleet policy from {pid}: {new_ops} new op(s)"));
                     }
                 }
+                StoreDone::CertRenewed { pid, device_pub, outcome } => {
+                    cert_renewing.remove(&device_pub);
+                    // Answer the device that asked, and only while the link
+                    // still carries the key the certificate was signed for.
+                    let asked = conn
+                        .link(&pid)
+                        .is_some_and(|l| l.identity_device_pub == Some(device_pub));
+                    match (outcome, asked) {
+                        (_, false) => log.debug(
+                            "  cert renewal not answered: the requester's link is gone or changed",
+                        ),
+                        (CertRenewal::Unsigned, true) => {}
+                        (CertRenewal::Refused, true) => {
+                            if let Some(t) = conn.transport_of(&pid) {
+                                let _ = t
+                                    .send_control(&json!({"type": "identity-cert-renew-error"}))
+                                    .await;
+                            }
+                        }
+                        (CertRenewal::Renewed { cert, deadline }, true) => {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                l.identity_cert_expires = Some(deadline);
+                            }
+                            if let Some(t) = conn.transport_of(&pid) {
+                                let _ = t
+                                    .send_control(&json!({
+                                        "type": "identity-cert-renew-ack",
+                                        "cert": cert.to_json(),
+                                    }))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                StoreDone::CertAdopted => {}
                 StoreDone::Departed { pid, name } => {
                     if let Some(name) = name {
                         log.say(&format!(
@@ -8337,39 +8374,36 @@ async fn recv_run(
                                         .await;
                                 }
                             }
+                            // The decision and the upsert of the renewed
+                            // certificate are store reads and a locked
+                            // read-modify-write of devices.json with an
+                            // fsync: off the loop, in order (StoreLane). The
+                            // answer goes out when the write is done (the
+                            // store-lane stretch), never before it. One
+                            // renewal in flight per device key: a repeat
+                            // request is answered by the queued one.
                             Some(device_pub) => {
-                                let outcome = ports.identity.renew_device_cert(&device_pub);
-                                match outcome {
-                                    CertRenewal::Refused => {
-                                        if let Some(t) = conn.transport_of(&pid) {
-                                            let _ = t
-                                                .send_control(
-                                                    &json!({"type": "identity-cert-renew-error"}),
-                                                )
-                                                .await;
-                                        }
-                                    }
-                                    CertRenewal::Unsigned => {}
-                                    CertRenewal::Renewed { cert, deadline } => {
-                                        if let Some(l) = conn.link_mut(&pid) {
-                                            l.identity_cert_expires = Some(deadline);
-                                        }
-                                        if let Some(t) = conn.transport_of(&pid) {
-                                            let _ = t
-                                                .send_control(&json!({
-                                                    "type": "identity-cert-renew-ack",
-                                                    "cert": cert.to_json(),
-                                                }))
-                                                .await;
-                                        }
-                                    }
+                                if cert_renewing.insert(device_pub) {
+                                    let (identity, pid) = (ports.identity.clone(), pid.clone());
+                                    store_lane.write(move || StoreDone::CertRenewed {
+                                        outcome: identity.renew_device_cert(&device_pub),
+                                        pid,
+                                        device_pub,
+                                    });
                                 }
                             }
                         }
                     }
                 }
                 Some("identity-cert-renew-ack") => {
-                    ports.identity.adopt_renewed_cert(&v);
+                    // REQUESTING SIDE. Adopting writes this device's
+                    // certificate record (a durable write): off the loop, in
+                    // order (StoreLane). Nothing on the loop waits for it.
+                    let (identity, v) = (ports.identity.clone(), v.clone());
+                    store_lane.write(move || {
+                        identity.adopt_renewed_cert(&v);
+                        StoreDone::CertAdopted
+                    });
                 }
                 Some("identity-cert-renew-error") => {
                     // Deliberately quiet and deliberately not fatal. A refusal
@@ -12042,6 +12076,16 @@ enum StoreDone {
     PolicyMerged { pid: String, new_ops: usize },
     /// A verified `depart` lapsed the record it names (if any).
     Departed { pid: String, name: Option<String> },
+    /// Owner side of a certificate renewal: decided and, when renewed,
+    /// stored. The loop answers the requester only now, after the write.
+    CertRenewed {
+        pid: String,
+        device_pub: [u8; 32],
+        outcome: CertRenewal,
+    },
+    /// Requesting side: a renewal ack was judged and, if accepted, written
+    /// as this device's certificate record.
+    CertAdopted,
 }
 
 /// Peer-triggered store writes, run OFF the event loop.
