@@ -83,6 +83,7 @@ impl Conn {
                 my_srflx: None,
                 peer_server_public: None,
                 server_public_dialed: Arc::new(AtomicBool::new(false)),
+                answered: Arc::new(AtomicBool::new(false)),
                 probe: false,
                 cancel: Arc::new(AtomicBool::new(false)),
             },
