@@ -1441,7 +1441,7 @@ async fn warm_hold_skips_a_departed_sid_and_rewarms_a_new_one() {
 
     // Its ladder gave up on the sid.
     conn.roster.insert("sid-old".into(), entry("sid-old"));
-    conn.suppressed_digest_adoptions.insert("sid-old".into());
+    conn.digest.suppressed_digest_adoptions.insert("sid-old".into());
     for _ in 0..3 {
         assert!(conn.warm_hold_tick(true).await.is_empty());
     }
@@ -1450,8 +1450,8 @@ async fn warm_hold_skips_a_departed_sid_and_rewarms_a_new_one() {
     assert!(!conn.warm_hold.auto.contains("visitor-4"), "a departed sid kept the device warm");
 
     // Missing from the last digest (presence says it is gone).
-    conn.suppressed_digest_adoptions.clear();
-    conn.roster_absent.insert("sid-old".into(), 1);
+    conn.digest.suppressed_digest_adoptions.clear();
+    conn.digest.roster_absent.insert("sid-old".into(), 1);
     assert!(conn.warm_hold_tick(true).await.is_empty());
     assert!(!conn.links.contains_key("sid-old"), "warm-hold dialled a sid presence dropped");
     assert!(conn.direct_pending.is_empty());
@@ -1488,7 +1488,7 @@ async fn digest_absence_prunes_the_roster_after_two_digests() {
     gone.sort();
     assert_eq!(gone, vec!["sid-ch".to_string(), "sid-room".to_string()]);
     assert!(conn.roster.contains_key("sid-here"));
-    assert!(conn.roster_absent.is_empty());
+    assert!(conn.digest.roster_absent.is_empty());
 }
 
 // --- digest reconcile liveness (PR512) --------------------------------
@@ -1677,9 +1677,9 @@ async fn digest_present_clears_the_deferral_clock() {
     );
     let t0 = Instant::now();
     assert!(!conn.digest_absent_retirable_at("sid-idle", t0));
-    assert!(conn.digest_deferred.contains_key("sid-idle"));
+    assert!(conn.digest.digest_deferred.contains_key("sid-idle"));
     conn.digest_present("sid-idle");
-    assert!(!conn.digest_deferred.contains_key("sid-idle"));
+    assert!(!conn.digest.digest_deferred.contains_key("sid-idle"));
     // A no-op `digest_present` would return true here (30s since t0).
     assert!(!conn.digest_absent_retirable_at(
         "sid-idle",
@@ -1721,13 +1721,13 @@ async fn reset_digest_reconcile_starts_a_fresh_window() {
         false,
         t0 + Duration::from_secs(1)
     ));
-    assert!(conn.digest_deferred.contains_key("sid-idle"));
-    assert_eq!(conn.room_digest_absent.get("sid-idle"), Some(&2));
+    assert!(conn.digest.digest_deferred.contains_key("sid-idle"));
+    assert_eq!(conn.digest.room_digest_absent.get("sid-idle"), Some(&2));
 
     conn.reset_digest_reconcile();
-    assert!(conn.digest_deferred.is_empty());
-    assert!(conn.room_digest_absent.is_empty());
-    assert!(conn.channel_digest_absent.is_empty());
+    assert!(conn.digest.digest_deferred.is_empty());
+    assert!(conn.digest.room_digest_absent.is_empty());
+    assert!(conn.digest.channel_digest_absent.is_empty());
 
     assert!(!conn.digest_note_at(
         "sid-idle",
@@ -1787,7 +1787,7 @@ async fn channel_loop_does_not_reset_a_room_links_grace() {
         false,
         t0 + Duration::from_secs(1)
     ));
-    assert!(conn.digest_deferred.contains_key("sid-room"));
+    assert!(conn.digest.digest_deferred.contains_key("sid-room"));
 
     // The channel loop runs on every digest. Its own link is present; the
     // room link must not be touched by it.
@@ -1799,7 +1799,7 @@ async fn channel_loop_does_not_reset_a_room_links_grace() {
         t0 + Duration::from_secs(10)
     ));
     assert!(
-        conn.digest_deferred.contains_key("sid-room"),
+        conn.digest.digest_deferred.contains_key("sid-room"),
         "the channel surface cleared a room-sourced link's clock"
     );
 
@@ -1833,7 +1833,7 @@ async fn digest_absence_is_bounded_on_a_relay_link_that_only_writes() {
     );
     let t0 = Instant::now();
     assert!(!conn.digest_absent_retirable_at("sid-relay", t0));
-    assert!(conn.digest_deferred.contains_key("sid-relay"));
+    assert!(conn.digest.digest_deferred.contains_key("sid-relay"));
     assert!(!conn.digest_absent_retirable_at(
         "sid-relay",
         t0 + DIGEST_ABSENT_IDLE_GRACE - Duration::from_millis(1)
@@ -1867,13 +1867,13 @@ async fn drop_link_clears_digest_deferral_and_counters() {
         false,
         t0 + Duration::from_secs(1)
     ));
-    assert!(conn.digest_deferred.contains_key("sid-idle"));
-    assert_eq!(conn.room_digest_absent.get("sid-idle"), Some(&2));
+    assert!(conn.digest.digest_deferred.contains_key("sid-idle"));
+    assert_eq!(conn.digest.room_digest_absent.get("sid-idle"), Some(&2));
 
     conn.drop_link("sid-idle");
-    assert!(!conn.digest_deferred.contains_key("sid-idle"));
-    assert!(!conn.room_digest_absent.contains_key("sid-idle"));
-    assert!(!conn.channel_digest_absent.contains_key("sid-idle"));
+    assert!(!conn.digest.digest_deferred.contains_key("sid-idle"));
+    assert!(!conn.digest.room_digest_absent.contains_key("sid-idle"));
+    assert!(!conn.digest.channel_digest_absent.contains_key("sid-idle"));
 }
 
 /// A sid absent after its link was already dropped stays retirable: the
@@ -1894,9 +1894,9 @@ async fn only_deferred_links_ignores_digest_deferrals() {
         "sid-idle".into(),
         direct_link("sid-idle", "x", "user@x", FakeQuic::live()),
     );
-    conn.digest_deferred.insert("sid-idle".into(), Instant::now());
+    conn.digest.digest_deferred.insert("sid-idle".into(), Instant::now());
     assert!(!conn.only_deferred_links());
-    conn.deferred_left.insert("sid-idle".into(), json!({}));
+    conn.digest.deferred_left.insert("sid-idle".into(), json!({}));
     assert!(conn.only_deferred_links());
 }
 
@@ -3115,7 +3115,7 @@ async fn an_installed_links_events_wake_the_loop_once_per_drain() {
     let generation = link.generation;
     conn.links.insert(pid.to_string(), link);
     let (candidate_tx, candidate_rx) = mpsc::unbounded_channel();
-    conn.link_events.insert(
+    conn.sources.link_events.insert(
         pid.to_string(),
         LinkEvents {
             generation,
@@ -3263,9 +3263,9 @@ async fn shipping_stuck_rebuilds_keep_the_episode_and_exhaust() {
     )
     .await
     .expect("a WebRTC link that will never connect");
-    conn.room_digest_absent.insert(pid.to_string(), 1);
+    conn.digest.room_digest_absent.insert(pid.to_string(), 1);
     let deferred_at = Instant::now();
-    conn.digest_deferred.insert(pid.to_string(), deferred_at);
+    conn.digest.digest_deferred.insert(pid.to_string(), deferred_at);
     let mut rebuilds = 0u32;
     loop {
         let Some(g) = conn.links.get(pid).map(|l| l.generation) else {
@@ -3294,8 +3294,8 @@ async fn shipping_stuck_rebuilds_keep_the_episode_and_exhaust() {
         assert_ne!(l.generation, g, "the off-loop rebuild never installed");
         rebuilds += 1;
         assert_eq!(l.attempts, rebuilds, "the install lost the ladder count");
-        assert_eq!(conn.room_digest_absent.get(pid), Some(&1));
-        assert_eq!(conn.digest_deferred.get(pid), Some(&deferred_at));
+        assert_eq!(conn.digest.room_digest_absent.get(pid), Some(&1));
+        assert_eq!(conn.digest.digest_deferred.get(pid), Some(&deferred_at));
     }
     assert!(!conn.links.contains_key(pid), "the dead peer is still linked");
     assert_eq!(rebuilds, MAX_ATTEMPTS - 1);
@@ -3328,7 +3328,7 @@ async fn link_cap_admits_a_new_contact_over_a_retrying_link() {
     assert_eq!(conn.links.len(), MAX_LINKS);
     // Evicting gives up on the sid as an exhausted ladder does: neither
     // digest adoption nor warm-hold restarts it at attempt 0.
-    assert!(conn.suppressed_digest_adoptions.contains("sid-3"));
+    assert!(conn.digest.suppressed_digest_adoptions.contains("sid-3"));
 }
 
 /// Room adoption chooses its target after spawning the build. Installing
@@ -4104,7 +4104,7 @@ async fn a_replaced_link_cannot_forward_queued_events() {
     link.generation = 7;
     conn.links.insert(pid.to_string(), link);
     let (tx, events_rx) = mpsc::unbounded_channel();
-    conn.link_events
+    conn.sources.link_events
         .insert(pid.to_string(), LinkEvents { generation: 7, rx: std::sync::Mutex::new(events_rx), departure_ready: None, departure_pending: None });
     tx.send(Ev::Control(pid.to_string(), json!({ "type": "ping" })))
         .unwrap();
@@ -4234,7 +4234,7 @@ async fn revocation_cleans_only_matching_promotion_probe_and_sources() {
     promotion.auth = Some(DirectAuth::ephemeral(8));
     promotion.standby = Some((promo_standby.clone(), "direct-quic"));
     conn.promotions.insert(promo_pid.into(), promotion);
-    conn.pending_sources.insert(
+    conn.sources.pending_sources.insert(
         net::SourceId::next(),
         PendingSource {
             pid: promo_pid.into(),
@@ -4254,7 +4254,7 @@ async fn revocation_cleans_only_matching_promotion_probe_and_sources() {
     probe.standby = Some(probe_standby.clone());
     probe.verify_started = Some(Instant::now());
     conn.resil.upgrade_probe.insert(probe_pid.into(), probe);
-    conn.pending_sources.insert(
+    conn.sources.pending_sources.insert(
         net::SourceId::next(),
         PendingSource {
             pid: probe_pid.into(),
@@ -4275,7 +4275,7 @@ async fn revocation_cleans_only_matching_promotion_probe_and_sources() {
     keep_probe.auth = Some(DirectAuth::device(9, "dev", "current-secret"));
     conn.resil.upgrade_probe.insert(keep_pid.into(), keep_probe);
     let keep_source = net::SourceId::next();
-    conn.pending_sources.insert(
+    conn.sources.pending_sources.insert(
         keep_source,
         PendingSource {
             pid: keep_pid.into(),
@@ -4296,12 +4296,12 @@ async fn revocation_cleans_only_matching_promotion_probe_and_sources() {
     assert!(!conn.resil.upgrade_probe.contains_key(probe_pid));
     assert!(promo_standby.is_dead() && probe_standby.is_dead());
     assert!(conn
-        .pending_sources
+        .sources.pending_sources
         .values()
         .all(|pending| pending.pid != promo_pid && pending.pid != probe_pid));
     assert!(conn.direct_pending.contains_key(keep_pid));
     assert!(conn.resil.upgrade_probe.contains_key(keep_pid));
-    assert!(conn.pending_sources.contains_key(&keep_source));
+    assert!(conn.sources.pending_sources.contains_key(&keep_source));
 }
 
 /// A newer same-pid device attempt whose binding the current store holds
@@ -5031,7 +5031,7 @@ async fn newer_same_pid_probe_and_promotion_survive_old_retirement() {
     promotion.auth = Some(DirectAuth::device(9, "dev", "new-secret"));
     conn.promotions.insert(pid.into(), promotion);
     let source = net::SourceId::next();
-    conn.pending_sources.insert(
+    conn.sources.pending_sources.insert(
         source,
         PendingSource {
             pid: pid.into(),
@@ -5054,7 +5054,7 @@ async fn newer_same_pid_probe_and_promotion_survive_old_retirement() {
         conn.promotions.get(pid).and_then(|p| p.attempt),
         Some(newer_attempt)
     );
-    assert!(conn.pending_sources.contains_key(&source));
+    assert!(conn.sources.pending_sources.contains_key(&source));
 }
 
 /// drop_link retires only the removed link attempt and leaves a newer
@@ -5079,7 +5079,7 @@ async fn exact_drop_link_preserves_unrelated_new_state() {
     probe.auth = Some(DirectAuth::device(9, "dev", "new-secret"));
     conn.resil.upgrade_probe.insert(pid.into(), probe);
     let source = net::SourceId::next();
-    conn.pending_sources.insert(
+    conn.sources.pending_sources.insert(
         source,
         PendingSource {
             pid: pid.into(),
@@ -5093,7 +5093,7 @@ async fn exact_drop_link_preserves_unrelated_new_state() {
     assert!(conn.retired_attempts.contains_key(&old_attempt));
     assert!(conn.direct_pending.contains_key(pid));
     assert!(conn.resil.upgrade_probe.contains_key(pid));
-    assert!(conn.pending_sources.contains_key(&source));
+    assert!(conn.sources.pending_sources.contains_key(&source));
 }
 
 /// Promotion staging rejects source-less, different-Arc-same-attempt,
@@ -5140,7 +5140,7 @@ async fn promotion_helpers_reject_before_mutation() {
     assert!(retired.is_dead());
     assert!(conn.promotions.contains_key(pid));
     assert!(conn.direct_pending.contains_key(pid));
-    assert!(conn.pending_sources.values().all(|p| p.pid != pid));
+    assert!(conn.sources.pending_sources.values().all(|p| p.pid != pid));
     assert!(conn.is_active(pid));
     assert!(conn.links.contains_key(pid));
 }
@@ -5166,7 +5166,7 @@ async fn handed_promotion_duplicate_leaves_no_orphan() {
     conn.stash_upgrade_standby(pid, incoming.clone(), "direct-quic");
     assert!(incoming.is_dead());
     assert!(conn.promotions.get(pid).is_some_and(|p| p.handed));
-    assert!(conn.pending_sources.values().all(|p| p.pid != pid));
+    assert!(conn.sources.pending_sources.values().all(|p| p.pid != pid));
 }
 
 /// A dead primary can be replaced atomically: the new epoch installs the
@@ -5862,19 +5862,19 @@ async fn chunk_attribution_fences_pairing_and_worker_dispatch() {
     // and replacement between flush and dispatch must still fence it.
     let standby = Rec::new("standby", &log);
     let standby_source = standby.source_id().unwrap();
-    conn.pending_sources.insert(standby_source, PendingSource {
+    conn.sources.pending_sources.insert(standby_source, PendingSource {
         pid: pid.into(), attempt: None, at: Instant::now(),
         events: std::collections::VecDeque::new(), bytes: 0,
     });
     assert!(conn.stage_event(chunk(standby_source, pid, pid)).is_none());
-    assert_eq!(conn.pending_sources[&standby_source].events.len(), 1);
-    assert_eq!(conn.pending_sources[&standby_source].bytes, 4);
+    assert_eq!(conn.sources.pending_sources[&standby_source].events.len(), 1);
+    assert_eq!(conn.sources.pending_sources[&standby_source].bytes, 4);
     conn.links.get_mut(pid).unwrap().source = standby_source;
     conn.flush_pending_source(standby_source);
     assert!(matches!(conn.stage_event(rx.try_recv().unwrap()), Some((Ev::Chunk(..), Some(s))) if s == standby_source));
 
     conn.links.get_mut(pid).unwrap().source = source;
-    conn.pending_sources.insert(standby_source, PendingSource {
+    conn.sources.pending_sources.insert(standby_source, PendingSource {
         pid: pid.into(), attempt: None, at: Instant::now(),
         events: std::collections::VecDeque::new(), bytes: 0,
     });
@@ -5899,7 +5899,7 @@ async fn buffered_standby_chunks_cannot_be_overtaken_at_adoption() {
     let mut link = relay_link(pid, "peer", "peer", old);
     link.source = old_source;
     conn.links.insert(pid.into(), link);
-    conn.pending_sources.insert(source, PendingSource {
+    conn.sources.pending_sources.insert(source, PendingSource {
         pid: pid.into(), attempt: None, at: Instant::now(),
         events: std::collections::VecDeque::new(), bytes: 0,
     });
@@ -5916,7 +5916,7 @@ async fn buffered_standby_chunks_cannot_be_overtaken_at_adoption() {
     let second = conn.stage_event(rx.try_recv().unwrap()).unwrap().0;
     assert!(matches!(first, Ev::Chunk(_, 42, Some(0), ref data) if data.as_ref() == b"old"));
     assert!(matches!(second, Ev::Chunk(_, 42, Some(3), ref data) if data.as_ref() == b"new"));
-    assert!(conn.replaying_sources.is_empty());
+    assert!(conn.sources.replaying_sources.is_empty());
 }
 
 #[tokio::test]
@@ -5930,12 +5930,12 @@ async fn replay_precedes_real_departure_paths_and_fences_replacement() {
         conn.links.insert(pid.into(), delegated_link(pid, transport));
         if sourced_barrier {
             let (_tx, queued) = tokio::sync::mpsc::unbounded_channel();
-            conn.link_events.insert(pid.into(), LinkEvents {
+            conn.sources.link_events.insert(pid.into(), LinkEvents {
                 generation: 7, rx: std::sync::Mutex::new(queued),
                 departure_ready: None, departure_pending: Some(source),
             });
         }
-        conn.pending_sources.insert(source, PendingSource {
+        conn.sources.pending_sources.insert(source, PendingSource {
             pid: pid.into(), attempt: None, at: Instant::now(),
             events: std::collections::VecDeque::from([Ev::Chunk(
                 pid.into(), 42, Some(0), bytes::Bytes::from_static(b"before-left"),
@@ -5966,7 +5966,7 @@ async fn replay_precedes_real_departure_paths_and_fences_replacement() {
     let old = Rec::new("old", &log);
     let source = old.source_id().unwrap();
     conn.links.insert(pid.into(), delegated_link(pid, old));
-    conn.pending_sources.insert(source, PendingSource {
+    conn.sources.pending_sources.insert(source, PendingSource {
         pid: pid.into(), attempt: None, at: Instant::now(),
         events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"x"))]), bytes: 1,
     });
@@ -5981,7 +5981,7 @@ async fn replay_precedes_real_departure_paths_and_fences_replacement() {
     // A replacement after the deferred event passes staging but before its
     // caller invokes on_peer_left must also survive.
     let current = conn.links[pid].source;
-    conn.replaying_sources.insert(current, PendingSource {
+    conn.sources.replaying_sources.insert(current, PendingSource {
         pid: pid.into(), attempt: None, at: Instant::now(),
         events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"y"))]), bytes: 1,
     });
@@ -6011,7 +6011,7 @@ async fn a_replay_overflow_closes_the_adopted_link_not_the_standby() {
     conn.links
         .insert(pid.into(), delegated_link(pid, adopted.clone()));
     // A replay already in flight for this source, with one buffered event.
-    conn.replaying_sources.insert(source, PendingSource {
+    conn.sources.replaying_sources.insert(source, PendingSource {
         pid: pid.into(), attempt: None, at: Instant::now(),
         events: std::collections::VecDeque::from([Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from_static(b"old"))]), bytes: 3,
     });
@@ -6026,7 +6026,7 @@ async fn a_replay_overflow_closes_the_adopted_link_not_the_standby() {
         inner: Box::new(Ev::Chunk(pid.into(), 42, None, bytes::Bytes::from(big))),
     };
     assert!(conn.stage_event(ev).is_none(), "the overflowing event must not be dispatched");
-    assert!(!conn.replaying_sources.contains_key(&source), "the replay entry must be dropped");
+    assert!(!conn.sources.replaying_sources.contains_key(&source), "the replay entry must be dropped");
     assert!(conn.links.contains_key(pid), "the daemon must survive the overflow");
     assert!(adopted.is_dead(), "overflow must close the adopted transport");
 }
@@ -6040,7 +6040,7 @@ async fn a_standby_source_buffers_until_adoption_then_replays() {
     let pid = "sid-source-standby";
     let t = Rec::new("standby", &log);
     let source = t.source_id().unwrap();
-    conn.pending_sources.insert(
+    conn.sources.pending_sources.insert(
         source,
         PendingSource {
             pid: pid.into(),
@@ -6056,7 +6056,7 @@ async fn a_standby_source_buffers_until_adoption_then_replays() {
         inner: Box::new(Ev::Control(pid.into(), json!({ "type": "l3-nonce" }))),
     };
     assert!(conn.stage_event(ev).is_none());
-    assert_eq!(conn.pending_sources[&source].events.len(), 1);
+    assert_eq!(conn.sources.pending_sources[&source].events.len(), 1);
     // Adopt: make the source current and flush the buffered event.
     let mut link = relay_link(pid, "peer", "peer", t);
     link.source = source;
@@ -6272,7 +6272,7 @@ async fn standby_without_probe_preserves_pending() {
     let pending = conn.direct_pending.get(pid).expect("pending was consumed");
     assert_eq!(pending.attempt, attempt);
     assert_eq!(pending.secret, ("peer".to_string(), "keep".to_string()));
-    assert!(!conn.pending_sources.contains_key(&source));
+    assert!(!conn.sources.pending_sources.contains_key(&source));
     assert!(incoming.is_dead());
 }
 
@@ -6301,7 +6301,7 @@ async fn standby_probe_mismatch_preserves_pending_and_token() {
         conn.resil.upgrade_probe.get(pid).and_then(|p| p.token),
         Some(other)
     );
-    assert!(!conn.pending_sources.contains_key(&source));
+    assert!(!conn.sources.pending_sources.contains_key(&source));
     assert!(incoming.is_dead());
 }
 
@@ -6324,7 +6324,7 @@ async fn standby_promotion_none_token_preserves_pending() {
     let pending = conn.direct_pending.get(pid).expect("pending was consumed");
     assert_eq!(pending.attempt, attempt);
     assert_eq!(pending.secret, ("peer".to_string(), "keep".to_string()));
-    assert!(!conn.pending_sources.contains_key(&source));
+    assert!(!conn.sources.pending_sources.contains_key(&source));
     assert!(conn.promotions[pid].attempt.is_none());
     assert!(incoming.is_dead());
 }
@@ -6553,7 +6553,7 @@ async fn a_completed_receive_does_not_defer_the_departed_sender() {
     conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", FakeQuic::flowing()));
     conn.recv_done = false;
     assert!(!conn.on_peer_left(&json!({ "id": pid })) && conn.links.contains_key(pid));
-    assert!(conn.deferred_left.contains_key(pid), "a mid-transfer departure was not deferred");
+    assert!(conn.digest.deferred_left.contains_key(pid), "a mid-transfer departure was not deferred");
     conn.recv_done = true;
     conn.on_peer_left(&json!({ "id": pid }));
     assert!(!conn.links.contains_key(pid), "a completed receive deferred its departed sender");
@@ -6582,7 +6582,7 @@ async fn a_queued_control_is_dispatched_before_the_departed_link_is_dropped() {
             inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
         })
         .unwrap();
-    conn.link_events.insert(
+    conn.sources.link_events.insert(
         pid.into(),
         LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
     );
@@ -6665,7 +6665,7 @@ async fn a_departure_barrier_cannot_drop_a_replacement_link() {
             inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
         })
         .unwrap();
-    conn.link_events.insert(
+    conn.sources.link_events.insert(
         pid.into(),
         LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
     );
@@ -6695,7 +6695,7 @@ async fn a_departure_with_nothing_queued_still_drops_the_link_at_once() {
     conn.links.insert(pid.into(), relay_link(pid, "peer", "peer", Rec::new("webrtc", &log)));
     conn.bind_active(pid);
     let (_queue, queued) = tokio::sync::mpsc::unbounded_channel();
-    conn.link_events.insert(
+    conn.sources.link_events.insert(
         pid.into(),
         LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
     );
@@ -6726,17 +6726,17 @@ async fn a_flowing_link_keeps_the_old_deferral_even_with_queued_events() {
             inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
         })
         .unwrap();
-    conn.link_events.insert(
+    conn.sources.link_events.insert(
         pid.into(),
         LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
     );
 
     assert!(!conn.on_peer_left(&json!({ "id": pid })));
     assert!(conn.links.contains_key(pid), "a flowing link was dropped on departure");
-    assert!(conn.deferred_left.contains_key(pid), "the flowing deferral stopped recording the leave");
+    assert!(conn.digest.deferred_left.contains_key(pid), "the flowing deferral stopped recording the leave");
     assert!(rx.try_recv().is_err(), "a flowing link's departure was queued as a barrier");
     let still_queued = conn
-        .link_events
+        .sources.link_events
         .get(pid)
         .expect("the flowing link lost its event stream")
         .rx
@@ -6779,7 +6779,7 @@ async fn a_delegated_link_hands_its_queued_decline_over_before_its_enrollment_en
             inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
         })
         .unwrap();
-    conn.link_events.insert(
+    conn.sources.link_events.insert(
         pid.into(),
         LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
     );
@@ -6813,7 +6813,7 @@ async fn a_delegated_link_hands_its_queued_decline_over_before_its_enrollment_en
     );
     assert!(!conn.links.contains_key(pid), "the delegated enrollment did not end");
     assert!(
-        !conn.deferred_left.contains_key(pid),
+        !conn.digest.deferred_left.contains_key(pid),
         "a delegated departure was made rejoinable"
     );
 }
@@ -6838,14 +6838,14 @@ async fn a_forced_delegated_departure_never_processes_queued_control() {
             inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-accept" }))),
         })
         .unwrap();
-    conn.link_events.insert(
+    conn.sources.link_events.insert(
         pid.into(),
         LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
     );
 
     assert!(!conn.on_peer_left(&json!({ "id": pid, "__fil_force_drop": true })));
     assert!(!conn.links.contains_key(pid), "a forced departure was retained");
-    assert!(!conn.link_events.contains_key(pid), "the forced departure kept the source's queue");
+    assert!(!conn.sources.link_events.contains_key(pid), "the forced departure kept the source's queue");
     // Forced teardown queues no hand-over: only its own retirement
     // tombstone may appear, never queued control or a barrier.
     let after = drained(&mut rx);
@@ -6894,7 +6894,7 @@ async fn a_validated_departure_marker_dies_with_its_link_not_the_successor() {
             inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
         })
         .unwrap();
-    conn.link_events.insert(
+    conn.sources.link_events.insert(
         pid.into(),
         LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
     );
@@ -6905,7 +6905,7 @@ async fn a_validated_departure_marker_dies_with_its_link_not_the_successor() {
         _ => panic!("the barrier was not dispatched as a room departure"),
     };
     assert!(
-        conn.link_events.get(pid).is_some_and(|e| e.departure_ready == Some(old_source)),
+        conn.sources.link_events.get(pid).is_some_and(|e| e.departure_ready == Some(old_source)),
         "the validated barrier did not record its once-only marker"
     );
 
@@ -6924,7 +6924,7 @@ async fn a_validated_departure_marker_dies_with_its_link_not_the_successor() {
         "a stale marker dropped the replacement link"
     );
     assert!(
-        conn.link_events.get(pid).is_some_and(|e| e.departure_ready.is_none()),
+        conn.sources.link_events.get(pid).is_some_and(|e| e.departure_ready.is_none()),
         "the stale marker survived its link"
     );
 }
@@ -6952,7 +6952,7 @@ async fn an_over_budget_queue_fails_closed_without_a_hand_over() {
             })
             .unwrap();
     }
-    conn.link_events.insert(
+    conn.sources.link_events.insert(
         pid.into(),
         LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
     );
@@ -7008,14 +7008,14 @@ async fn a_forced_departure_beats_a_pending_barrier() {
             inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
         })
         .unwrap();
-    conn.link_events.insert(
+    conn.sources.link_events.insert(
         pid.into(),
         LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
     );
 
     assert!(!conn.on_peer_left(&json!({ "id": pid })));
     assert!(
-        conn.link_events.get(pid).is_some_and(|e| e.departure_pending == Some(source)),
+        conn.sources.link_events.get(pid).is_some_and(|e| e.departure_pending == Some(source)),
         "the barrier was not recorded as pending"
     );
     assert!(
@@ -7023,7 +7023,7 @@ async fn a_forced_departure_beats_a_pending_barrier() {
         "a forced departure did not run the ordinary finalizer immediately"
     );
     assert!(!conn.links.contains_key(pid), "a forced departure was deferred behind its barrier");
-    assert!(!conn.link_events.contains_key(pid), "the forced departure kept the link's markers");
+    assert!(!conn.sources.link_events.contains_key(pid), "the forced departure kept the link's markers");
     let control = rx.try_recv().expect("the hand-over prefix is missing");
     assert!(
         conn.stage_event(control).is_none(),
@@ -7065,7 +7065,7 @@ async fn a_forced_departure_beats_an_already_validated_barrier() {
             inner: Box::new(Ev::Control(pid.into(), json!({ "type": "access-decline" }))),
         })
         .unwrap();
-    conn.link_events.insert(
+    conn.sources.link_events.insert(
         pid.into(),
         LinkEvents { generation: 7, rx: std::sync::Mutex::new(queued), departure_ready: None, departure_pending: None },
     );
@@ -7077,7 +7077,7 @@ async fn a_forced_departure_beats_an_already_validated_barrier() {
         _ => panic!("the barrier was not dispatched as a room departure"),
     };
     assert!(
-        conn.link_events.get(pid).is_some_and(|e| e.departure_ready == Some(source)),
+        conn.sources.link_events.get(pid).is_some_and(|e| e.departure_ready == Some(source)),
         "the validated barrier did not record its marker"
     );
 
@@ -7086,7 +7086,7 @@ async fn a_forced_departure_beats_an_already_validated_barrier() {
         "a forced departure behind a validated barrier was not immediate"
     );
     assert!(!conn.links.contains_key(pid), "the validated marker blocked the forced drop");
-    assert!(!conn.link_events.contains_key(pid), "the forced departure kept the validated marker");
+    assert!(!conn.sources.link_events.contains_key(pid), "the forced departure kept the validated marker");
     assert!(
         !conn.on_peer_left(&payload),
         "the validated barrier re-reported a link the forced drop already removed"
@@ -7421,7 +7421,7 @@ async fn closed_within(t: &RefusalT, bound: Duration) -> bool {
 /// An installed WebRTC link's event stream, as `apply_built_peer` leaves it.
 fn own_stream(conn: &mut Conn, pid: &str, generation: u32) -> mpsc::UnboundedSender<Ev> {
     let (etx, erx) = mpsc::unbounded_channel();
-    conn.link_events.insert(
+    conn.sources.link_events.insert(
         pid.to_string(),
         LinkEvents {
             generation,
@@ -7453,7 +7453,7 @@ async fn a_revoked_link_closes_on_the_peers_ack_and_not_before() {
     assert_eq!(t.closes.load(Ordering::Relaxed), 0, "closed before the peer acked");
     assert!(conn.stage_event(revoked_ack("sid-r", t.source, "not-this-cut")).is_none());
     assert!(conn.stage_event(revoked_ack("sid-x", t.source, &nonce)).is_none());
-    assert_eq!(conn.closing.len(), 1, "a stale nonce or another pid completed the cut");
+    assert_eq!(conn.sources.closing.len(), 1, "a stale nonce or another pid completed the cut");
     assert!(!closed_within(&t, Duration::from_millis(100)).await, "closed on a stale ack");
     // The peer may answer on another path of the same session (its primary
     // after a promotion, a worker): the nonce binds it, not the source.
@@ -7461,7 +7461,7 @@ async fn a_revoked_link_closes_on_the_peers_ack_and_not_before() {
         conn.stage_event(revoked_ack("sid-r", net::SourceId::next(), &nonce)).is_none(),
         "the ack authorizes nothing and is never dispatched"
     );
-    assert!(conn.closing.is_empty(), "the matching ack did not complete the cut");
+    assert!(conn.sources.closing.is_empty(), "the matching ack did not complete the cut");
     assert!(closed_within(&t, Duration::from_millis(500)).await, "not closed after the ack");
     assert!(
         start.elapsed() < REFUSAL_ACK_BUDGET,
@@ -7484,7 +7484,7 @@ async fn a_cut_links_own_stream_ack_needs_no_loop_turn() {
     let etx = own_stream(&mut conn, "sid-e", 7);
     let start = Instant::now();
     assert!(conn.drop_link_after_refusal("sid-e", refusal()));
-    assert_eq!(conn.closing.len(), 1, "the main-queue path is watched as well");
+    assert_eq!(conn.sources.closing.len(), 1, "the main-queue path is watched as well");
     let nonce = written_refusal_nonce(&t).await;
     let _ = etx.send(Ev::Sourced {
         pid: "sid-e".into(),
@@ -7565,7 +7565,7 @@ async fn a_stale_generation_stream_is_not_taken_for_the_ack() {
     conn.links.insert("sid-g".into(), direct_link("sid-g", "b", "user@b", t.clone()));
     let stale = own_stream(&mut conn, "sid-g", 6);
     assert!(conn.drop_link_after_refusal("sid-g", refusal()));
-    assert_eq!(conn.closing.len(), 1, "a stale stream was taken instead of the signal path");
+    assert_eq!(conn.sources.closing.len(), 1, "a stale stream was taken instead of the signal path");
     let nonce = written_refusal_nonce(&t).await;
     let _ = stale.send(revoked_ack("sid-g", t.source, &nonce));
     assert!(
@@ -7595,7 +7595,7 @@ async fn a_revoked_link_with_no_ack_closes_at_the_budget() {
         "a late ack was dispatched"
     );
     conn.pump_builds();
-    assert!(conn.closing.is_empty(), "a finished cut stayed registered");
+    assert!(conn.sources.closing.is_empty(), "a finished cut stayed registered");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(t.closes.load(Ordering::Relaxed), 1, "a late ack closed the link again");
 }
@@ -7642,7 +7642,7 @@ async fn a_revoked_link_with_no_transport_is_a_plain_drop() {
     conn.links.insert("sid-t".into(), l);
     assert!(!conn.drop_link_after_refusal("sid-t", refusal()));
     assert!(!conn.links.contains_key("sid-t"), "the link survived");
-    assert!(conn.closing.is_empty());
+    assert!(conn.sources.closing.is_empty());
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(t.sent.lock().unwrap().is_empty(), "a refusal went out with no transport");
     let lines = log.take();
@@ -7664,7 +7664,7 @@ async fn a_revoked_link_with_an_unassigned_source_awaits_no_ack() {
     conn.links.insert("sid-u".into(), l);
     let start = Instant::now();
     assert!(conn.drop_link_after_refusal("sid-u", refusal()));
-    assert!(conn.closing.is_empty(), "an unbindable cut was registered");
+    assert!(conn.sources.closing.is_empty(), "an unbindable cut was registered");
     let _ = written_refusal_nonce(&t).await;
     assert!(closed_within(&t, Duration::from_millis(500)).await);
     assert!(start.elapsed() < REFUSAL_ACK_BUDGET, "waited for an ack that cannot come");
@@ -7687,7 +7687,7 @@ async fn two_links_of_one_peer_cut_together_each_wait_for_their_own_ack() {
     assert!(closed_within(&gone, Duration::from_millis(500)).await, "the dead link stayed open");
     let n_live = written_refusal_nonce(&live).await;
     let n_other = conn
-        .closing
+        .sources.closing
         .iter()
         .find(|(n, e)| e.pid == "sid-old" && **n != n_live)
         .map(|(n, _)| n.clone())
@@ -7715,7 +7715,7 @@ async fn an_ack_on_a_current_link_of_the_same_pid_completes_the_cut() {
         conn.stage_event(revoked_ack("sid-c", again.source, &nonce)).is_none(),
         "an ack on a current link was dispatched"
     );
-    assert!(conn.closing.is_empty());
+    assert!(conn.sources.closing.is_empty());
     assert!(closed_within(&cut, Duration::from_millis(500)).await, "not closed after the ack");
     assert_eq!(again.closes.load(Ordering::Relaxed), 0, "the current link was closed");
 }
