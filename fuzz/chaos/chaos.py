@@ -126,7 +126,8 @@ OP_DEADLINE["visit"] = VISIT_JOIN_DEADLINE + VISIT_SEEN_DEADLINE + OP_DEADLINE["
 CHAINS = [("CHAOS", "FORWARD"), ("CHAOS_IN", "INPUT"), ("CHAOS_OUT", "OUTPUT")]
 
 FAULTS = ["net.impair", "net.partition", "net.isolate", "sig.blackhole", "sig.reset",
-          "proc.freeze", "proc.kill", "server.down", "disk.slow"]
+          "proc.freeze", "proc.kill", "server.down", "disk.slow",
+          "host.lockchurn"]
 OPS = ["exec", "send", "reach", "status", "doctor"]
 
 # Env hooks (test-hooks builds) that add INTERNAL faults with a designed
@@ -221,6 +222,8 @@ def random_fault(rng: random.Random) -> dict:
         step.update(a=a, b=b, proto=rng.choice(["all", "udp"]))
     elif kind == "server.down":
         step["dur"] = min(step["dur"], 40.0)
+    elif kind == "host.lockchurn":
+        pass                      # the machine's, no target
     else:
         step["target"] = rng.choice(DEVICES)
     if kind == "net.impair":
@@ -414,7 +417,7 @@ class World:
         self.bin_sha = self._sha(binary)
         self.can_netem = False
         self.can_disk_load = False                       # disk.slow: set in net_up
-        self.host_loads: list[subprocess.Popen] = []     # disk.slow loads now running
+        self.host_loads: list[subprocess.Popen] = []     # disk.slow / host.lockchurn loads now running
         self.snapshot = work / "snapshot"
         self.visitors: dict[str, subprocess.Popen] = {}   # visitor name -> its `up`
         self.visit_inv: Path | None = None               # this run's reusable invitation
@@ -941,6 +944,8 @@ class World:
         for d in DEVICES:
             for f in self.cfg(d).glob("diskload-*.bin"):
                 f.unlink(missing_ok=True)
+        for f in list(self.work.glob("lockchurn-*")):
+            f.unlink(missing_ok=True)
 
     def reset_for_run(self, hooks: dict) -> None:
         """Every run starts from the same enrolled state with fresh daemons."""
@@ -1176,6 +1181,52 @@ def apply_fault(w: World, st: dict, uid: str) -> Applied | None:
             if w.server_down == 0:
                 w.backend_start()
         return Applied(st, heal, lambda: not w.backend_healthy() or True, lambda: True)
+
+    if k == "host.lockchurn":
+        # Other programs on the machine take and release file locks all the
+        # time (package managers, editors, other daemons). Four threads that
+        # flock and unlock their own files, about 7000 times a second in all at
+        # 0.07 of a core (measured; with no pause it was 150000 at 1.8 cores,
+        # and 12 worlds of that starved every daemon of CPU, which O11 then
+        # reported as event-loop stalls on main): /proc/locks, which
+        # every process on the machine shares, changes under any reader of it.
+        # Bites a daemon that STARTS (or a command that looks for one) while it
+        # runs, e.g. after a proc.kill heal.
+        cnt = w.work / f"lockchurn-{uid}.count"
+        code = ("import fcntl,os,sys,threading,time\n"
+                "d,cnt=sys.argv[1],sys.argv[2]\n"
+                "n=[0]\n"
+                "def churn(i):\n"
+                "    f=open(os.path.join(d,'lockchurn-%d-%d.lock'%(os.getpid(),i)),'w')\n"
+                "    while True:\n"
+                "        fcntl.flock(f,fcntl.LOCK_EX); fcntl.flock(f,fcntl.LOCK_UN); n[0]+=1\n"
+                "        time.sleep(0.0005)\n"
+                "for i in range(4): threading.Thread(target=churn,args=(i,),daemon=True).start()\n"
+                "while True:\n"
+                "    time.sleep(0.5); open(cnt,'w').write(str(n[0]))\n")
+        p = subprocess.Popen([sys.executable, "-I", "-c", code, str(w.work), str(cnt)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        w.host_loads.append(p)
+
+        def churned() -> int:
+            try:
+                return int(cnt.read_text() or 0)
+            except (OSError, ValueError):
+                return 0
+
+        def heal():
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.wait()
+            if p in w.host_loads:
+                w.host_loads.remove(p)
+            cnt.unlink(missing_ok=True)
+            for f in w.work.glob(f"lockchurn-{p.pid}-*.lock"):
+                f.unlink(missing_ok=True)
+        return Applied(st, heal, lambda: p.poll() is None, lambda: churned() > 0)
 
     if k == "disk.slow":
         # The disk is busy (a backup, an indexer, another tenant): a loop that
@@ -1644,8 +1695,8 @@ def judge_local_status(r: dict, fault_windows: list[dict]) -> list[dict]:
             return []
     faults = sorted({f["step"]["fault"] for f in fault_windows})
     return [{"oracle": "O3b-unresponsive-during-network-fault", "hard": True,
-             "what": f"status on {r['src']} said its daemon was not responding while only network faults "
-                     f"were active ({', '.join(faults)}): {r['stderr_tail'][:200]}"}]
+             "what": f"status on {r['src']} said its daemon was not responding while no fault had frozen or "
+                     f"killed it ({', '.join(faults)} active): {r['stderr_tail'][:200]}"}]
 
 
 # O14: how long after a fault heals an op may still fail for that fault's
@@ -2777,6 +2828,12 @@ def selftest_disk_slow() -> None:
     assert apply_fault(fw, {"fault": "disk.slow", "target": "bravo", "at": 0, "dur": 5}, "t") is None
 
 
+def selftest_lockchurn() -> None:
+    rng = random.Random(7)
+    faults = [random_fault(rng) for _ in range(3000)]
+    assert any(f["fault"] == "host.lockchurn" and "target" not in f for f in faults), "host.lockchurn never drawn"
+
+
 def cmd_selftest() -> int:
     rng = random.Random(1)
     for _ in range(500):
@@ -2947,6 +3004,7 @@ def cmd_selftest() -> int:
     selftest_exec_bulk()
     selftest_cold_and_recovery()
     selftest_disk_slow()
+    selftest_lockchurn()
     print("selftest ok")
     return 0
 

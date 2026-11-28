@@ -168,6 +168,14 @@ Control:file-end), so no disk schedule is in `corpus/` until that is fixed.
 
     {"at": 0.5, "dur": 150.0, "fault": "disk.slow", "target": "alpha"}
 
+`host.lockchurn` (no target) runs four threads that flock and unlock their
+own files (about 7000 times a second, 0.07 of a core) for the window: other
+programs on the machine using file locks, so `/proc/locks` changes under
+anyone who reads it. It bites a daemon that starts while it runs (a proc.kill
+heal). `corpus/daemon-restart-under-lock-churn.json` is the #762 case (a
+daemon that misread /proc/locks never served its control socket;
+O3-unresponsive).
+
 ## Retiring a hand-written gate
 
 Only when reverting that gate's original fix makes `replay` of the matching
