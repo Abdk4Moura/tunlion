@@ -120,7 +120,16 @@ say "X1/X2"
 tty_shell bravo "$WORK/x.tty" \
   "echo BRAVO-MARK; while :; do date +%s > $WORK/beat-x; sleep 1; done" shared
 XPID=$(cat "$WORK/x.tty.pid")
-wait_for 30 "$WORK/x.tty" 'BRAVO-MARK' || fixture_die "X1: setup: bravo's named shell never started"
+# Wait for the remote loop's first beat, not for BRAVO-MARK in the terminal
+# record: util-linux `script` writes a header naming the full COMMAND, which
+# contains BRAVO-MARK, and flushes it with the client's first status line. A
+# grep for the mark could therefore return before pty-open was even sent, and
+# the client was then stopped with no remote shell at all (X2 read a beat that
+# never existed: "beat 1795880352s old"). The beat file only exists once the
+# remote shell is running the loop X2 checks. No beat within the bound is a
+# setup failure, not a pass.
+for _ in $(seq 1 30); do [ -s "$WORK/beat-x" ] && break; sleep 1; done
+[ -s "$WORK/beat-x" ] || fixture_die "X1: setup: bravo's named shell never started (no beat within 30s)"
 client_stop "$WORK/x.tty"
 sleep "$DETACH_WAIT"
 out=$(fs_bounded 45 env TUNLION_SHELL_SESSION=shared TUNLION_CONFIG_DIR="$WORK/charlie" \
