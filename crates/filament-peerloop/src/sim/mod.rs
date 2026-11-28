@@ -5,6 +5,7 @@ pub mod fuzz;
 pub mod net;
 pub mod oneshot;
 pub mod semantic;
+pub mod sender;
 pub mod store;
 pub mod world;
 
@@ -19,6 +20,6 @@ pub use semantic::{
     StateEdge, StateTransition,
 };
 pub use world::{
-    CapStatusResult, NodeSpec, OneShotDial, ScheduledFault, SimConfig, SimMutant, SimOutcome, SimTraceEntry,
+    CapStatusResult, NodeSpec, OneShotDial, ScheduledFault, SimConfig, SimSend, SimMutant, SimOutcome, SimTraceEntry,
     SimWorld,
 };

@@ -57,6 +57,11 @@ impl SimDisk {
         }
     }
 
+    /// One fsync of a received file (`HostServices::sync_received_file`).
+    pub(crate) fn file_sync(&self) {
+        self.durable_write("sync_received_file");
+    }
+
     /// The writes charged to the loop so far, oldest first.
     pub fn take_loop_writes(&self) -> Vec<(u64, &'static str, u64)> {
         std::mem::take(&mut *self.loop_writes.lock().unwrap_or_else(|e| e.into_inner()))

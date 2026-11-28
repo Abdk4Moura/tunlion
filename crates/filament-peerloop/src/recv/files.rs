@@ -145,7 +145,7 @@ pub fn partial_status_lines(dir: &Path) -> Vec<String> {
 /// Finalize a fully-received incoming file: sync, rename `.part` to final,
 /// clean up the meta sidecar, and record it. Returns true if placed.
 pub async fn finalize_incoming(
-    host: &dyn HostServices,
+    host: &std::sync::Arc<dyn HostServices>,
     log: &dyn LogSink,
     inc: IncomingFile,
     dir: &Path,
@@ -155,9 +155,9 @@ pub async fn finalize_incoming(
     report: &RecvReport,
     delivery: &std::sync::Arc<Mutex<HashMap<String, crate::recv::ports::DeliveredFile>>>,
 ) -> Result<bool> {
-    let f = inc.file.clone();
+    let (f, h) = (inc.file.clone(), host.clone());
     let _ = crate::sim_rt::run_blocking(move || {
-        let _ = f.sync_all();
+        let _ = h.sync_received_file(&f);
     })
     .await;
     if !inc.part_path.as_os_str().is_empty() {
@@ -279,7 +279,7 @@ pub async fn flush_inflight(by_sid: &mut HashMap<(String, u32), IncomingFile>) {
 /// name is the only proven one left.
 #[allow(clippy::too_many_arguments)]
 pub async fn sweep_completed_streams(
-    host: &dyn HostServices,
+    host: &std::sync::Arc<dyn HostServices>,
     log: &dyn LogSink,
     by_sid: &mut HashMap<(String, u32), IncomingFile>,
     conn: &crate::conn::Conn,
@@ -302,9 +302,9 @@ pub async fn sweep_completed_streams(
     for key in done_sids {
         if let Some(inc) = by_sid.remove(&key) {
             if to_stdout {
-                let f = inc.file.clone();
+                let (f, h) = (inc.file.clone(), host.clone());
                 let _ = crate::sim_rt::run_blocking(move || {
-                    let _ = f.sync_all();
+                    let _ = h.sync_received_file(&f);
                 })
                 .await;
                 // Every byte arrived, but arriving is not what stdout holds:

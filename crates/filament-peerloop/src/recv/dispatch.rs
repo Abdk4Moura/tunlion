@@ -4822,7 +4822,7 @@ async fn recv_run(
         // G-k completion sweep (top-of-loop): see sweep_completed_streams.
         loop_budget.enter("completion-sweep");
         let mut swept_senders = crate::recv::files::sweep_completed_streams(
-            host.as_ref(),
+            &host,
             log.as_ref(),
             &mut st.by_sid,
             &conn,
@@ -10808,9 +10808,9 @@ async fn recv_run(
                         None => continue,
                     };
                     let sender = inc.sender.clone();
-                    let f = inc.file.clone();
+                    let (f, h) = (inc.file.clone(), host.clone());
                     let _ = crate::sim_rt::run_blocking(move || {
-                        let _ = f.sync_all();
+                        let _ = h.sync_received_file(&f);
                     })
                     .await;
                     if to_stdout {
@@ -10857,7 +10857,7 @@ async fn recv_run(
                                     conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                                 let nm = inc.name.clone();
                                 if crate::recv::files::finalize_incoming(
-                                    host.as_ref(),
+                                    &host,
                                     log.as_ref(),
                                     inc,
                                     &dir,
@@ -10982,9 +10982,9 @@ async fn recv_run(
                                         ),
                                     ));
                                 }
-                                let f = inc.file.clone();
+                                let (f, h) = (inc.file.clone(), host.clone());
                                 let _ = crate::sim_rt::run_blocking(move || {
-                                    let _ = f.sync_all();
+                                    let _ = h.sync_received_file(&f);
                                 })
                                 .await;
                                 if req_offset == 0 {
@@ -11012,7 +11012,7 @@ async fn recv_run(
                         };
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         if crate::recv::files::finalize_incoming(
-                            host.as_ref(),
+                            &host,
                             log.as_ref(),
                             inc,
                             &dir,
@@ -11102,7 +11102,7 @@ async fn recv_run(
                                     conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                                 let nm = inc.name.clone();
                                 if crate::recv::files::finalize_incoming(
-                                    host.as_ref(),
+                                    &host,
                                     log.as_ref(),
                                     inc,
                                     &dir,
@@ -11216,9 +11216,9 @@ async fn recv_run(
                                         ),
                                     ));
                                 }
-                                let f = inc.file.clone();
+                                let (f, h) = (inc.file.clone(), host.clone());
                                 let _ = crate::sim_rt::run_blocking(move || {
-                                    let _ = f.sync_all();
+                                    let _ = h.sync_received_file(&f);
                                 })
                                 .await;
                                 writer_tasks.join_sid(&pid, sid, log.as_ref()).await;
@@ -11239,7 +11239,7 @@ async fn recv_run(
                         };
                         let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         if crate::recv::files::finalize_incoming(
-                            host.as_ref(),
+                            &host,
                             log.as_ref(),
                             inc,
                             &dir,
@@ -11698,7 +11698,7 @@ async fn recv_run(
                     // G-k: the dropped link may have delivered every byte but
                     // lost its file-end, finalize before deciding it's fatal.
                     let swept = crate::recv::files::sweep_completed_streams(
-                        host.as_ref(),
+                        &host,
                         log.as_ref(),
                         &mut st.by_sid,
                         &conn,
@@ -11739,7 +11739,7 @@ async fn recv_run(
                 };
                 if exhausted && paired && !keep_open {
                     let swept = crate::recv::files::sweep_completed_streams(
-                        host.as_ref(),
+                        &host,
                         log.as_ref(),
                         &mut st.by_sid,
                         &conn,
