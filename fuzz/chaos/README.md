@@ -22,6 +22,10 @@ slot: namespaces `chz<k>_*`, subnet `10.(90+k).0.0/16`, backend port
 jobs can share a machine as long as slots are free. `throughput.json` in the
 results records runs per hour and the machine's load.
 
+The campaign runs detached on the worker (its own session and log), so a
+dropped `tunlion exec` link does not end it: `run-on-lease.sh` reattaches,
+follows it to the end and fetches the results.
+
 ### Build
 
 The script builds the daemon with the `fuzz` profile (root `Cargo.toml`): no
