@@ -104,7 +104,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [core, fleet]
+        shard: [core-a, core-b, fleet]
     steps:
       - uses: actions/checkout@v4
 
@@ -176,7 +176,7 @@ jobs:
       # finished on 3 of 13 checks for exactly this reason. Counting the PASS
       # lines is what makes "green" mean "the gates ran AND passed".
       - name: Run revocation gates
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core-a' || matrix.shard == 'core-b'
         env:
           TUNLION_BIN: ${{ github.workspace }}/target/ci-test/tunlion
         run: |
@@ -239,21 +239,36 @@ jobs:
             [cli/tests/ephemeral-runner-gates.sh]=9
           )
           rc=0
-          for g in cli/tests/ssh-ca-gates.sh \
-                   cli/tests/exec-gates.sh \
-                   cli/tests/sync-gates.sh \
-                   cli/tests/fleet-cert-gates.sh \
-                   cli/tests/pty-revoke-gates.sh \
-                   cli/tests/pty-resume-gates.sh \
-                   cli/tests/term-restore-gates.sh \
-                   cli/tests/mount-revoke-gates.sh \
-                   cli/tests/l2-revoke-gates.sh \
-                   cli/tests/shell-posture-gates.sh \
-                   cli/tests/forward-refusal-gates.sh \
-                   cli/tests/revocation-live-gates.sh \
-                   cli/tests/invite-expiry-gates.sh \
-                   cli/tests/invite-withdraw-gates.sh \
-                   cli/tests/ephemeral-runner-gates.sh; do
+          case "${{ matrix.shard }}" in
+            core-a)
+              SHARD_GATES=(
+                cli/tests/ssh-ca-gates.sh
+                cli/tests/exec-gates.sh
+                cli/tests/sync-gates.sh
+                cli/tests/fleet-cert-gates.sh
+                cli/tests/pty-revoke-gates.sh
+                cli/tests/pty-resume-gates.sh
+                cli/tests/term-restore-gates.sh
+              )
+              ;;
+            core-b)
+              SHARD_GATES=(
+                cli/tests/mount-revoke-gates.sh
+                cli/tests/l2-revoke-gates.sh
+                cli/tests/shell-posture-gates.sh
+                cli/tests/forward-refusal-gates.sh
+                cli/tests/revocation-live-gates.sh
+                cli/tests/invite-expiry-gates.sh
+                cli/tests/invite-withdraw-gates.sh
+                cli/tests/ephemeral-runner-gates.sh
+              )
+              ;;
+            *)
+              echo "::error::unknown shard ${{ matrix.shard }}"
+              exit 1
+              ;;
+          esac
+          for g in "${SHARD_GATES[@]}"; do
             echo "::group::$g"
             # Label the tree the gates actually run against: CI checks out
             # GitHub's MERGE ref (pull/N/merge) by default, so "CI ran sha X"
