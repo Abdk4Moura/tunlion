@@ -10,7 +10,9 @@ use crate::sim::assertions::{evaluate_oracles, take_assertions, OracleKind, Orac
 use crate::sim::corpus::{self, CorpusEntry};
 use crate::sim::net::{Fault, HangSite, MessageChaosPolicy, Proto, SimRng};
 use crate::sim::semantic::{ProtoEvent, SemanticAction, SemanticFault, SemanticTrigger, StateEdge};
-use crate::sim::world::{NodeSpec, ScheduledFault, SimConfig, SimMutant, SimOutcome, SimWorld};
+use crate::sim::world::{
+    NodeSpec, OneShotDial, ScheduledFault, SimConfig, SimMutant, SimOutcome, SimWorld,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GuideFlags {
@@ -64,12 +66,12 @@ impl GuideFlags {
     /// PROVISIONAL: not shown to find real bugs faster than [`Self::unguided`].
     /// Chosen and judged on the same two bugs: #738 was not blind (its hang
     /// fault was placed at the bug site) and #729 is a tie (median 2 runs for
-    /// both). The held-out check on 2026-11-28 could not run: none of
-    /// #757, #761, #762, #763 or #768 is reachable in the sim (no fleet
-    /// identity or one-shot dialer, no TCP socket, no slow disk, CLI code).
-    /// On 1000 clean runs it reached 57 state edges to unguided's 54. Campaigns
-    /// default to unguided (`CampaignConfig::default()`); keep it that way
-    /// until a held-out bug the sim can reach shows this preset wins.
+    /// both). With `CampaignConfig::reach` the sim reaches two held-out bugs,
+    /// and on them (2026-11-28, 20 seeds, 40-run budget fixed in advance)
+    /// married LOST to unguided on #757 (18/20, median 16 runs, against
+    /// 20/20, median 3) and roughly tied on #768 (17/20, median 21, against
+    /// 14/20, median 16; mean 19.4 against 21.2). Campaigns default to
+    /// unguided (`CampaignConfig::default()`); keep it that way.
     pub fn married() -> Self {
         Self {
             swarm: true,
@@ -90,6 +92,12 @@ pub struct CampaignConfig {
     pub quiet_logs: bool,
     pub corpus_dir: Option<PathBuf>,
     pub regressions_dir: Option<PathBuf>,
+    /// The wider world: each schedule also draws, blindly, a fleet identity
+    /// for the daemons, one-shot fleet dialers and a slow disk (see
+    /// [`ReachDraw`]), and the network model gets random session ids, HTTP
+    /// round trips and direct-link channel bindings. Off keeps every recorded
+    /// result of the narrower sim bit-exact.
+    pub reach: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +153,67 @@ pub struct FuzzSchedule {
     status_query: Option<(usize, u64)>,
     msg_chaos: Option<(MessageChaosPolicy, u64, u64)>,
     semantic_faults: Vec<SemanticFault>,
+    #[serde(default)]
+    reach: Option<ReachDraw>,
+}
+
+/// The wider-world part of a schedule. Every field is drawn blindly: which
+/// node, when and how slow are uniform (latency log-uniform) and never look
+/// at a call site.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReachDraw {
+    /// All three daemons are members of one fleet.
+    pub fleet: bool,
+    /// One-shot fleet dials: (target node index, start ms).
+    pub one_shots: Vec<(usize, u64)>,
+    /// A slow disk: (node index, write latency ms, start ms, end ms).
+    pub slow_disk: Option<(usize, u64, u64, u64)>,
+}
+
+/// Disk write latency, log-uniform over 10 ms .. 3 s: from a quiet SSD's fsync
+/// to a disk saturated by writeback (the field saw 100 to 740 ms per write
+/// with only the disk loaded, and over 1 s under the chaos fuzzer).
+fn draw_write_ms(rng: &mut SimRng) -> u64 {
+    let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+    (10.0 * 300f64.powf(u)) as u64
+}
+
+fn draw_reach(rng: &mut SimRng, flags: &GuideFlags, duration_ms: u64) -> ReachDraw {
+    // Swarm testing applies to these faults exactly as to the network ones:
+    // a run either carries each feature or does not.
+    let (fleet_p, dial_p, disk_p) = if flags.swarm {
+        (
+            if rng.chance_pct(50) { 95 } else { 0 },
+            if rng.chance_pct(70) { 95 } else { 0 },
+            if rng.chance_pct(60) { 95 } else { 0 },
+        )
+    } else {
+        (60, 80, 50)
+    };
+    let fleet = rng.chance_pct(fleet_p);
+    let mut one_shots = Vec::new();
+    if fleet && rng.chance_pct(dial_p) {
+        let n = 1 + rng.gen_range_u64(3) as usize;
+        // A dial needs its whole candidate bound inside the run.
+        let latest = duration_ms - 17_000;
+        for _ in 0..n {
+            let at = 3_000 + rng.gen_range_u64(latest - 3_000);
+            one_shots.push((rng.gen_range_u64(3) as usize, at));
+        }
+        one_shots.sort_by_key(|(_, at)| *at);
+    }
+    let slow_disk = rng.chance_pct(disk_p).then(|| {
+        let node = rng.gen_range_u64(3) as usize;
+        let ms = draw_write_ms(rng);
+        let start = 500 + rng.gen_range_u64(40_000);
+        let end = (start + 5_000 + rng.gen_range_u64(40_001)).min(duration_ms - 2_000);
+        (node, ms, start, end.max(start + 500))
+    });
+    ReachDraw {
+        fleet,
+        one_shots,
+        slow_disk,
+    }
 }
 
 const NODE_NAMES: [&str; 3] = ["alpha", "bravo", "charlie"];
@@ -259,6 +328,31 @@ impl FuzzSchedule {
             .map(|(n, at)| vec![(NODE_NAMES[n % 3].to_string(), at)])
             .unwrap_or_default();
 
+        let mut one_shot_dials = Vec::new();
+        let mut fleet = false;
+        if let Some(r) = &self.reach {
+            fleet = r.fleet;
+            if r.fleet {
+                for (t, at) in &r.one_shots {
+                    one_shot_dials.push(OneShotDial {
+                        at_ms: *at,
+                        target: NODE_NAMES[t % 3].to_string(),
+                    });
+                }
+            }
+            if let Some((n, ms, start, end)) = r.slow_disk {
+                let node = NODE_NAMES[n % 3].to_string();
+                schedule.push(ScheduledFault {
+                    at_ms: start,
+                    fault: Fault::SlowDisk { node: node.clone(), write_ms: ms },
+                });
+                schedule.push(ScheduledFault {
+                    at_ms: end,
+                    fault: Fault::ClearSlowDisk { node },
+                });
+            }
+        }
+
         SimConfig {
             seed: self.sim_seed,
             duration_ms: self.duration_ms,
@@ -270,7 +364,9 @@ impl FuzzSchedule {
             mutant,
             quiet_logs: false,
             semantic_faults: self.semantic_faults.clone(),
-            ..Default::default()
+            reach: self.reach.is_some(),
+            fleet,
+            one_shot_dials,
         }
     }
 
@@ -280,7 +376,7 @@ impl FuzzSchedule {
 
     pub fn summary(&self) -> String {
         format!(
-            "seed={} impair={:?} part={:?} bh={:?} hang={:?} restart={:?} status={:?} sem={}",
+            "seed={} impair={:?} part={:?} bh={:?} hang={:?} restart={:?} status={:?} sem={} reach={:?}",
             self.sim_seed,
             self.impair_range,
             self.partition,
@@ -288,7 +384,8 @@ impl FuzzSchedule {
             self.hang,
             self.restart,
             self.status_query,
-            self.semantic_faults.len()
+            self.semantic_faults.len(),
+            self.reach
         )
     }
 }
@@ -348,6 +445,7 @@ fn generate_schedule(
     rng: &mut SimRng,
     flags: &GuideFlags,
     allow_gather_hang: bool,
+    reach: bool,
 ) -> FuzzSchedule {
     let duration_ms = 60_000;
     let mask = if flags.swarm {
@@ -519,7 +617,7 @@ fn generate_schedule(
         (policy, start, end.max(start + 1_000))
     });
 
-    FuzzSchedule {
+    let mut sched = FuzzSchedule {
         sim_seed: rng.next_u64(),
         duration_ms,
         impair_delay_ms: 40 + rng.gen_range_u64(80),
@@ -533,7 +631,14 @@ fn generate_schedule(
         status_query,
         msg_chaos,
         semantic_faults,
+        reach: None,
+    };
+    if reach {
+        // Its own stream, so the draws above are the same with or without it.
+        let mut r = SimRng::new(rng.next_u64());
+        sched.reach = Some(draw_reach(&mut r, flags, duration_ms));
     }
+    sched
 }
 
 fn mutate_schedule(
@@ -541,10 +646,14 @@ fn mutate_schedule(
     rng: &mut SimRng,
     flags: &GuideFlags,
     allow_gather_hang: bool,
+    reach: bool,
 ) -> FuzzSchedule {
     let mut s = base.clone();
     s.sim_seed = rng.next_u64();
-    let fresh = generate_schedule(rng, flags, allow_gather_hang);
+    let fresh = generate_schedule(rng, flags, allow_gather_hang, reach);
+    if reach && rng.chance_pct(30) {
+        s.reach = fresh.reach.clone();
+    }
 
     // Perform 1 targeted structural/timing mutation per child.
     match rng.gen_range_u64(8) {
@@ -814,10 +923,19 @@ impl Fuzzer {
                 None
             };
             let sched = match parent_sched {
-                Some(ref base) => {
-                    mutate_schedule(base, &mut rng, &campaign.flags, campaign.allow_gather_hang)
-                }
-                None => generate_schedule(&mut rng, &campaign.flags, campaign.allow_gather_hang),
+                Some(ref base) => mutate_schedule(
+                    base,
+                    &mut rng,
+                    &campaign.flags,
+                    campaign.allow_gather_hang,
+                    campaign.reach,
+                ),
+                None => generate_schedule(
+                    &mut rng,
+                    &campaign.flags,
+                    campaign.allow_gather_hang,
+                    campaign.reach,
+                ),
             };
             let mut cfg = sched.to_sim_config(campaign.mutant.clone());
             cfg.quiet_logs = campaign.quiet_logs;

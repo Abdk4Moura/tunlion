@@ -144,6 +144,7 @@ fn test_disk_corpus_persistence_minimize_and_regression_replay() {
         quiet_logs: true,
         corpus_dir: Some(corpus_dir.clone()),
         regressions_dir: None,
+        reach: false,
     });
     assert!(rep1.findings.is_empty(), "clean run1 findings: {:?}", rep1.findings);
     let (files1, bytes1) = dir_stats(&corpus_dir);
@@ -174,6 +175,7 @@ fn test_disk_corpus_persistence_minimize_and_regression_replay() {
             quiet_logs: true,
             corpus_dir: Some(corpus_dir.clone()),
             regressions_dir: None,
+            reach: false,
         },
         2,
     );
@@ -198,6 +200,7 @@ fn test_disk_corpus_persistence_minimize_and_regression_replay() {
         quiet_logs: false,
         corpus_dir: None,
         regressions_dir: Some(reg_dir.clone()),
+        reach: false,
     });
     assert!(!bug_rep.findings.is_empty(), "canary should trigger regression save");
     let (reg_files, reg_bytes) = dir_stats(&reg_dir);
@@ -223,12 +226,21 @@ struct BenchCell {
     mean_ms: f64,
 }
 
+/// `DST_REACH` (default on): the wider sim world, with fleet identities,
+/// one-shot fleet dialers and slow disks drawn blindly per schedule
+/// (`CampaignConfig::reach`). `DST_REACH=0` is the narrower sim the earlier
+/// results were recorded on.
+fn reach_from_env() -> bool {
+    std::env::var("DST_REACH").as_deref() != Ok("0")
+}
+
 fn eval_cell_seeds(
     seeds: &[u64],
     flags: &GuideFlags,
     mutant: &SimMutant,
     allow_gather_hang: bool,
     max_runs: usize,
+    reach: bool,
 ) -> BenchCell {
     let mut runs_vec = Vec::with_capacity(seeds.len());
     let mut ms_vec = Vec::with_capacity(seeds.len());
@@ -242,9 +254,17 @@ fn eval_cell_seeds(
             flags: flags.clone(),
             mutant: mutant.clone(),
             allow_gather_hang,
+            reach,
             ..Default::default()
         });
         if let Some(first_run) = rep.first_detection_run() {
+            if std::env::var("DST_PRINT_FINDINGS").as_deref() == Ok("1") {
+                let f = &rep.findings[0];
+                println!(
+                    "FIRST_FINDING seed={seed} run={first_run} {:?}",
+                    f.violations.iter().map(|v| v.summary.as_str()).collect::<Vec<_>>()
+                );
+            }
             detected += 1;
             runs_vec.push(first_run as f64);
         } else {
@@ -271,7 +291,7 @@ fn eval_cell_seeds(
 }
 
 fn eval_cell(flags: &GuideFlags, mutant: &SimMutant, allow_gather_hang: bool, max_runs: usize) -> BenchCell {
-    eval_cell_seeds(&SEEDS, flags, mutant, allow_gather_hang, max_runs)
+    eval_cell_seeds(&SEEDS, flags, mutant, allow_gather_hang, max_runs, false)
 }
 
 fn run_matrix(targets: &[(&str, SimMutant, bool)], max_runs: usize) {
@@ -356,13 +376,15 @@ fn test_clean_main_1000_runs_married() {
             mutant: SimMutant::None,
             allow_gather_hang: true,
             quiet_logs: true,
+            reach: reach_from_env(),
             ..Default::default()
         },
         workers,
     );
     println!(
-        "CLEAN_MAIN_1000: guide={} runs={} workers={} findings={} wall_ms={} state_edges={} max_busy_ms={} max_status_ms={}",
+        "CLEAN_MAIN_1000: guide={} reach={} runs={} workers={} findings={} wall_ms={} state_edges={} max_busy_ms={} max_status_ms={} milestones={:?} antecedents={:?}",
         guide,
+        reach_from_env(),
         report.runs_executed,
         workers,
         report.findings.len(),
@@ -370,7 +392,12 @@ fn test_clean_main_1000_runs_married() {
         report.state_edges_discovered,
         report.max_iter_busy_ms_seen,
         report.max_cap_status_latency_ms_seen,
+        report.milestone_counts,
+        report.antecedents_seen,
     );
+    for f in &report.findings {
+        println!("CLEAN_MAIN_FINDING: run={} seed={} {:?} sched={}", f.run_index, f.seed, f.violations, f.schedule_summary);
+    }
     assert_eq!(report.runs_executed, RUNS);
     assert!(
         report.findings.is_empty(),
@@ -425,7 +452,14 @@ fn test_real_bug_benchmark_hook() {
     println!("|---|---|---:|---:|---:|---:|---:|");
     let mut base_mean_runs = None;
     for (g_name, flags) in &guides {
-        let cell = eval_cell_seeds(&seeds, flags, &SimMutant::None, allow_gather, max_runs);
+        let cell = eval_cell_seeds(
+            &seeds,
+            flags,
+            &SimMutant::None,
+            allow_gather,
+            max_runs,
+            reach_from_env(),
+        );
         let base = *base_mean_runs.get_or_insert(cell.mean_runs);
         let speedup = base / cell.mean_runs.max(0.01);
         println!(
