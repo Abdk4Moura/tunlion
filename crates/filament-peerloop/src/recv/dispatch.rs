@@ -2681,6 +2681,12 @@ async fn recv_run(
     // unbounded number of direct attempts and fill the retirement drain.
     let mut fleet_arm_at: std::collections::HashMap<String, Instant> = Default::default();
     let mut fleet_verified: std::collections::HashSet<String> = Default::default();
+    // Peer-triggered store writes run off the loop, in order (StoreLane).
+    let store_lane = StoreLane::start(tx.clone());
+    // Device keys whose fleet index write is queued or running, so a repeat
+    // hello from the same device does not queue a second one.
+    #[cfg(feature = "fleet")]
+    let mut fleet_indexing: HashSet<[u8; 32]> = HashSet::new();
     // Offers that arrived while this link's `fleet-hello` was still in flight.
     // Verification is MUTUAL and the two directions are not synchronized: the
     // sender proves US, then offers, and its offer can beat our verification of
@@ -3407,6 +3413,66 @@ async fn recv_run(
         if let Some((e, _)) = &ev {
             loop_budget.event(e.kind());
             loop_budget.detail(|| control_type(e));
+        }
+
+        // Store writes a peer asked for, finished off the loop (StoreLane):
+        // apply what they mean for the loop's state.
+        loop_budget.enter("store-lane");
+        for done in store_lane.take_done() {
+            match done {
+                #[cfg(feature = "fleet")]
+                StoreDone::FleetIndexed { pid, generation, device_pub, shown, result } => {
+                    fleet_indexing.remove(&device_pub);
+                    let line = match result {
+                        Ok(stored) => {
+                            // Bind the link to the record just created, as the
+                            // hello's handler did when the write ran inline:
+                            // without it the FIRST contact leaves verified_name
+                            // unset until a later reconnect re-runs the lookup.
+                            // Only the same link (generation), still proven by
+                            // the same device key, and not bound meanwhile: a
+                            // link that changed since is not the one the
+                            // certificate named.
+                            if let Some(l) = conn.link_mut(&pid).filter(|l| {
+                                l.generation == generation
+                                    && l.identity_device_pub == Some(device_pub)
+                                    && l.verified_name.is_none()
+                            }) {
+                                l.verified_name = Some(stored.clone());
+                            }
+                            log.debug(&format!("fleet peer indexed as '{stored}'"));
+                            format!("outcome=indexed why=indexed-new-record name={stored:?}")
+                        }
+                        Err(e) => {
+                            log.debug(&format!("fleet peer not indexed: {e}"));
+                            format!("outcome=not-indexed why=index-write-failed name={shown:?} err={e:?}")
+                        }
+                    };
+                    fleet_hello_note(
+                        log.as_ref(),
+                        fleet_trace.as_deref(),
+                        &format!("fhello-index pid={pid} {line} dev={}", hex::encode(device_pub)),
+                    );
+                }
+                StoreDone::PolicyMerged { pid, new_ops } => {
+                    if new_ops > 0 {
+                        log.debug(&format!("fleet policy from {pid}: {new_ops} new op(s)"));
+                    }
+                }
+                StoreDone::Departed { pid, name } => {
+                    if let Some(name) = name {
+                        log.say(&format!(
+                            "{} {name} departed; slot freed immediately",
+                            log.paint(Tone::Dim, "·")
+                        ));
+                        if let Some(t) = conn.transport_of(&pid) {
+                            let _ = t
+                                .send_control(&json!({"type": "depart-ack", "name": name}))
+                                .await;
+                        }
+                    }
+                }
+            }
         }
 
         // Settle sweep: re-drive parked shell-class opens whose link proved
@@ -6943,12 +7009,17 @@ async fn recv_run(
                 // Fleet policy relayed by a sibling. Only ops the OWNER signed
                 // survive `merge_owner_cap_ops`, so a peer can relay policy but
                 // never author it.
+                // The merge is a locked read-modify-write of devices.json with
+                // an fsync (when the batch is not empty), and every verified
+                // hello re-pushes the policy: off the loop, in order
+                // (StoreLane).
                 Some("fleet-policy") => {
-                    if let Some(ops) = v["ops"].as_array() {
-                        let n = ports.store.merge_owner_cap_ops(ops);
-                        if n > 0 {
-                            log.debug(&format!("fleet policy from {pid}: {n} new op(s)"));
-                        }
+                    if let Some(ops) = v["ops"].as_array().filter(|ops| !ops.is_empty()) {
+                        let (store, ops, pid) = (ports.store.clone(), ops.clone(), pid.clone());
+                        store_lane.write(move || StoreDone::PolicyMerged {
+                            new_ops: store.merge_owner_cap_ops(&ops),
+                            pid,
+                        });
                     }
                 }
                 #[cfg(feature = "mesh")]
@@ -7461,50 +7532,54 @@ async fn recv_run(
                                             {
                                                 // Strict: a peer-asserted name may never
                                                 // take over a pinned identity (F1).
-                                                match ports.store.devices_upsert_atomic(
-                                                    &shown,
-                                                    None,
-                                                    Some(&cert),
-                                                    Some(&[]),
-                                                    Some(identity::IntroScope::Device.to_byte()),
-                                                    None,
-                                                    None,
-                                                    false,
-                                                ) {
-                                                    Ok(stored) => {
-                                                        // Bind the link to the record we
-                                                        // just created. Without this the
-                                                        // FIRST contact leaves
-                                                        // verified_name unset (there was
-                                                        // no record when we looked it up),
-                                                        // so the daemon cannot resolve
-                                                        // this peer by name until some
-                                                        // later reconnect happens to
-                                                        // re-run the lookup. The name is
-                                                        // still the PROVEN one: it came
-                                                        // from the certificate we just
-                                                        // verified.
-                                                        if let Some(l) = conn.link_mut(&pid) {
-                                                            l.verified_name = Some(stored.clone());
-                                                        }
-                                                        fhello_outcome = format!(
-                                                            "outcome=admitted why=indexed-new-record name={:?}",
-                                                            stored
-                                                        );
-                                                        log.debug(&format!(
-                                                            "fleet peer indexed as '{stored}'"
-                                                        ));
-                                                    }
-                                                    Err(e) => {
-                                                        fhello_outcome = format!(
-                                                            "outcome=admitted why=index-write-failed name={:?} err={:?}",
+                                                //
+                                                // Off the loop (StoreLane): this is a
+                                                // locked read-modify-write of
+                                                // devices.json with an fsync, and run
+                                                // here it held the loop for as long as
+                                                // the disk took, on every first hello
+                                                // from a sibling with no record. The
+                                                // link is bound to the stored name
+                                                // when the write reports back (the
+                                                // store-lane stretch at the top of the
+                                                // loop), and only if it is still this
+                                                // link, proven by this device key.
+                                                // The name is still the PROVEN one: it
+                                                // comes from the certificate verified
+                                                // here.
+                                                fhello_outcome = format!(
+                                                    "outcome=admitted why=indexing name={:?}",
+                                                    shown
+                                                );
+                                                if fleet_indexing.insert(ok.device_pub) {
+                                                    let store = ports.store.clone();
+                                                    let generation = conn
+                                                        .link(&pid)
+                                                        .map(|l| l.generation)
+                                                        .unwrap_or_default();
+                                                    let (pid, device_pub, shown) =
+                                                        (pid.clone(), ok.device_pub, shown.clone());
+                                                    store_lane.write(move || {
+                                                        let result = store
+                                                            .devices_upsert_atomic(
+                                                                &shown,
+                                                                None,
+                                                                Some(&cert),
+                                                                Some(&[]),
+                                                                Some(identity::IntroScope::Device.to_byte()),
+                                                                None,
+                                                                None,
+                                                                false,
+                                                            )
+                                                            .map_err(|e| e.to_string());
+                                                        StoreDone::FleetIndexed {
+                                                            pid,
+                                                            generation,
+                                                            device_pub,
                                                             shown,
-                                                            e.to_string()
-                                                        );
-                                                        log.debug(&format!(
-                                                            "fleet peer not indexed: {e}"
-                                                        ))
-                                                    }
+                                                            result,
+                                                        }
+                                                    });
                                                 }
                                             }
                                         }
@@ -8321,19 +8396,15 @@ async fn recv_run(
                                     log.paint(Tone::Warn, "!")
                                 ));
                             } else {
-                                if let Some(name) = ports.store.mark_lapsed_now(&dpub_arr) {
-                                    log.say(&format!(
-                                        "{} {name} departed; slot freed immediately",
-                                        log.paint(Tone::Dim, "·")
-                                    ));
-                                    if let Some(t) = conn.transport_of(&pid) {
-                                        let _ = t
-                                            .send_control(
-                                                &json!({"type": "depart-ack", "name": name}),
-                                            )
-                                            .await;
-                                    }
-                                }
+                                // A locked read-modify-write of devices.json
+                                // with an fsync: off the loop, in order
+                                // (StoreLane). The ack goes out when it is
+                                // done, as before.
+                                let (store, pid) = (ports.store.clone(), pid.clone());
+                                store_lane.write(move || StoreDone::Departed {
+                                    name: store.mark_lapsed_now(&dpub_arr),
+                                    pid,
+                                });
                             }
                         }
                     }
@@ -11912,6 +11983,67 @@ fn fleet_step(
 /// file named by `TUNLION_FLEET_HELLO_TRACE` when set, so a gate can print the
 /// owner's decisions on failure without raising the whole daemon's verbosity.
 /// Best effort: a write that fails is dropped, never surfaced as an error.
+/// A durable store write a peer's message asked for, finished off the loop,
+/// with what the loop still has to do about it.
+enum StoreDone {
+    /// A fleet sibling with no record was indexed (`devices_upsert_atomic`).
+    /// The loop binds the link to the stored name if the link is still the
+    /// one whose certificate named it.
+    #[cfg(feature = "fleet")]
+    FleetIndexed {
+        pid: String,
+        generation: u32,
+        device_pub: [u8; 32],
+        shown: String,
+        result: std::result::Result<String, String>,
+    },
+    /// A relayed `fleet-policy` was merged: how many ops were new.
+    PolicyMerged { pid: String, new_ops: usize },
+    /// A verified `depart` lapsed the record it names (if any).
+    Departed { pid: String, name: Option<String> },
+}
+
+/// Peer-triggered store writes, run OFF the event loop.
+///
+/// Each of these writes is a locked read-modify-write of devices.json with an
+/// fsync. Run inline in a handler, it held the daemon loop for as long as the
+/// disk took (the class #768 fixed for the periodic writes). The writes run in
+/// arrival order, one after another, on one writer task that hands each to a
+/// blocking thread; the result lands in `done` and the loop is woken to act
+/// on it. The write itself is unchanged, fsync included; only the loop no
+/// longer waits for it.
+struct StoreLane {
+    jobs: mpsc::UnboundedSender<Box<dyn FnOnce() -> StoreDone + Send>>,
+    done: Arc<std::sync::Mutex<Vec<StoreDone>>>,
+}
+
+impl StoreLane {
+    fn start(wake: mpsc::UnboundedSender<Ev>) -> Self {
+        let (jobs, mut rx) = mpsc::unbounded_channel::<Box<dyn FnOnce() -> StoreDone + Send>>();
+        let done: Arc<std::sync::Mutex<Vec<StoreDone>>> = Default::default();
+        let out = done.clone();
+        tokio::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                if let Ok(d) = crate::sim_rt::run_blocking(job).await {
+                    out.lock().unwrap_or_else(|e| e.into_inner()).push(d);
+                    // Any event ends the loop's wait; this one means nothing
+                    // else (see Ev::BuildWake).
+                    let _ = wake.send(Ev::BuildWake);
+                }
+            }
+        });
+        Self { jobs, done }
+    }
+
+    fn write(&self, job: impl FnOnce() -> StoreDone + Send + 'static) {
+        let _ = self.jobs.send(Box::new(job));
+    }
+
+    fn take_done(&self) -> Vec<StoreDone> {
+        std::mem::take(&mut *self.done.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
 fn fleet_hello_note(log: &dyn LogSink, sink: Option<&Path>, line: &str) {
     log.debug(line);
     fleet_trace_append(sink, line);
