@@ -31,7 +31,7 @@ use crate::mesh::{
 use crate::present::{Ask, Presentation};
 use crate::recv::ceremony::{Ceremony, Inbound as PakeInbound};
 use crate::recv::fleet_bind;
-use crate::recv::ports::{RecvDaemon, RecvPorts, RecvServers};
+use crate::recv::ports::{CertRenewal, RecvDaemon, RecvPorts, RecvServers};
 use crate::recv::report::{RecvReport, RefusalClass};
 use crate::recv::signaling_health;
 use crate::recv::MeshTunnel;
@@ -8322,13 +8322,54 @@ async fn recv_run(
                 // so renewal is also how removal works: an owner that stops
                 // renewing evicts a device without needing to reach it.
                 Some("identity-cert-renew-request") => {
-                    ports
-                        .identity
-                        .respond_to_cert_renew_request(&mut conn, pid.clone())
-                        .await;
+                    // OWNER SIDE. Only a requester proven on this link: the
+                    // certificate is re-signed for the key the link proved.
+                    if let Some(link) = conn.link(&pid) {
+                        let proven = (link.identity_binding == cap::BindingStrength::Proven)
+                            .then_some(link.identity_device_pub)
+                            .flatten();
+                        match proven {
+                            None => {
+                                log.debug("  cert renewal refused: requester is not identity-proven on this link");
+                                if let Some(t) = conn.transport_of(&pid) {
+                                    let _ = t
+                                        .send_control(&json!({"type": "identity-cert-renew-error"}))
+                                        .await;
+                                }
+                            }
+                            Some(device_pub) => {
+                                let outcome = ports.identity.renew_device_cert(&device_pub);
+                                match outcome {
+                                    CertRenewal::Refused => {
+                                        if let Some(t) = conn.transport_of(&pid) {
+                                            let _ = t
+                                                .send_control(
+                                                    &json!({"type": "identity-cert-renew-error"}),
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                    CertRenewal::Unsigned => {}
+                                    CertRenewal::Renewed { cert, deadline } => {
+                                        if let Some(l) = conn.link_mut(&pid) {
+                                            l.identity_cert_expires = Some(deadline);
+                                        }
+                                        if let Some(t) = conn.transport_of(&pid) {
+                                            let _ = t
+                                                .send_control(&json!({
+                                                    "type": "identity-cert-renew-ack",
+                                                    "cert": cert.to_json(),
+                                                }))
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Some("identity-cert-renew-ack") => {
-                    ports.identity.handle_cert_renew_ack(&v).await;
+                    ports.identity.adopt_renewed_cert(&v);
                 }
                 Some("identity-cert-renew-error") => {
                     // Deliberately quiet and deliberately not fatal. A refusal

@@ -22,6 +22,7 @@
 use crate::conn::Conn;
 use crate::host::{LogSink, Tone};
 use crate::identity::{principal_after_proof, ProofFacts};
+use crate::recv::ports::CertRenewal;
 use crate::recv::renewal;
 use crate::recv::store::{
     effective_principal_deadline, DeviceStore, OverlayKey, PRINCIPAL_STATE_LAPSED,
@@ -484,39 +485,24 @@ impl IdentityService {
     }
 
     /// OWNER SIDE: re-sign a fleet device's certificate, or refuse.
-    pub async fn respond_to_cert_renew_request(&self, conn: &mut Conn, pid: String) {
-        let Some(link) = conn.link(&pid) else { return };
-        let proven = link.identity_binding == BindingStrength::Proven;
-        let device_pub = link.identity_device_pub;
-        let (Some(device_pub), true) = (device_pub, proven) else {
-            self.log
-                .debug("  cert renewal refused: requester is not identity-proven on this link");
-            if let Some(t) = conn.transport_of(&pid) {
-                let _ = t
-                    .send_control(&json!({"type": "identity-cert-renew-error"}))
-                    .await;
-            }
-            return;
-        };
+    ///
+    /// `device_pub` is the key the asking link proved (the caller checks the
+    /// proof). Blocking: it reads the device store and keystore and, on a
+    /// renewal, upserts the renewed certificate (a locked read-modify-write of
+    /// devices.json with an fsync). The caller answers the requester with the
+    /// result, so the ack never goes out before the write.
+    pub fn renew_device_cert(&self, device_pub: &[u8; 32]) -> CertRenewal {
+        let device_pub = *device_pub;
         let Some(owner_key) = UserKey::load(&self.store.keystore()).ok().flatten() else {
             self.log
                 .debug("  cert renewal declined: this device holds no owner signing key");
-            if let Some(t) = conn.transport_of(&pid) {
-                let _ = t
-                    .send_control(&json!({"type": "identity-cert-renew-error"}))
-                    .await;
-            }
-            return;
+            return CertRenewal::Refused;
         };
         let standing = self.renewal_standing_for(&device_pub);
         match renewal::owner_decides(&standing, device_pub) {
             renewal::Decision::Refuse(why) => {
                 self.log.debug(&format!("  cert renewal refused: {why}"));
-                if let Some(t) = conn.transport_of(&pid) {
-                    let _ = t
-                        .send_control(&json!({"type": "identity-cert-renew-error"}))
-                        .await;
-                }
+                CertRenewal::Refused
             }
             renewal::Decision::Renew => {
                 let now = now_secs();
@@ -528,12 +514,7 @@ impl IdentityService {
                 else {
                     self.log
                         .debug("  cert renewal refused: no stored certificate to extend");
-                    if let Some(t) = conn.transport_of(&pid) {
-                        let _ = t
-                            .send_control(&json!({"type": "identity-cert-renew-error"}))
-                            .await;
-                    }
-                    return;
+                    return CertRenewal::Refused;
                 };
                 let Some(expires) =
                     renewal::renewal_expiry(&current, now, CERT_TTL_SECS, standing.access_until)
@@ -541,17 +522,12 @@ impl IdentityService {
                     self.log.debug(
                         "  cert renewal declined: the device's invitation ends before this would extend its certificate",
                     );
-                    if let Some(t) = conn.transport_of(&pid) {
-                        let _ = t
-                            .send_control(&json!({"type": "identity-cert-renew-error"}))
-                            .await;
-                    }
-                    return;
+                    return CertRenewal::Refused;
                 };
                 let ttl = expires.saturating_sub(now);
                 let Ok(fresh) = DeviceCert::certify(&owner_key, device_pub, now, ttl) else {
                     self.log.debug("  cert renewal failed: could not sign");
-                    return;
+                    return CertRenewal::Unsigned;
                 };
                 if let Some(record) = self.store.devices_find_by_device_pub(&device_pub) {
                     if let Some(name) = record["name"].as_str() {
@@ -567,37 +543,24 @@ impl IdentityService {
                         );
                     }
                 }
-                if let Some(l) = conn.link_mut(&pid) {
-                    let own_user_pub = self.store.owner_pub_from_keystore();
-                    let (_, not_after, max_offline, last_seen) = self
-                        .store
-                        .persisted_principal_for_cert(&fresh, own_user_pub.as_ref());
-                    let (deadline, _) = effective_principal_deadline(
-                        fresh.expires,
-                        not_after,
-                        last_seen,
-                        max_offline,
-                    );
-                    l.identity_cert_expires = Some(deadline);
-                }
-                if let Some(t) = conn.transport_of(&pid) {
-                    let _ = t
-                        .send_control(&json!({
-                            "type": "identity-cert-renew-ack",
-                            "cert": fresh.to_json(),
-                        }))
-                        .await;
-                }
+                let own_user_pub = self.store.owner_pub_from_keystore();
+                let (_, not_after, max_offline, last_seen) = self
+                    .store
+                    .persisted_principal_for_cert(&fresh, own_user_pub.as_ref());
+                let (deadline, _) =
+                    effective_principal_deadline(fresh.expires, not_after, last_seen, max_offline);
                 self.log.debug(&format!(
                     "  renewed certificate for {}",
                     hex::encode(device_pub).chars().take(8).collect::<String>()
                 ));
+                CertRenewal::Renewed { cert: fresh, deadline }
             }
         }
     }
 
     /// REQUESTING SIDE: adopt a renewed certificate, or keep the one we have.
-    pub async fn handle_cert_renew_ack(&self, v: &Value) {
+    /// Blocking: on accept it writes the local certificate record.
+    pub fn adopt_renewed_cert(&self, v: &Value) {
         let Some(fresh) = DeviceCert::from_json(&v["cert"]) else {
             self.log
                 .debug("  renewal ack carried no readable certificate");

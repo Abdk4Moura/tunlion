@@ -367,6 +367,8 @@ impl FuzzSchedule {
             reach: self.reach.is_some(),
             fleet,
             one_shot_dials,
+            fleet_primary: None,
+            renewal_due: Vec::new(),
         }
     }
 

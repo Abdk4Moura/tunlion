@@ -127,6 +127,19 @@ impl RecvEnv {
     }
 }
 
+/// The owner side of a certificate renewal, once its durable write is done:
+/// what the requester is told.
+#[derive(Debug, Clone)]
+pub enum CertRenewal {
+    /// Refused or declined: the requester hears `identity-cert-renew-error`.
+    Refused,
+    /// The owner could not sign. The requester hears nothing and asks again.
+    Unsigned,
+    /// Re-signed and stored. `deadline` is the principal deadline the fresh
+    /// certificate gives the requester's link.
+    Renewed { cert: DeviceCert, deadline: u64 },
+}
+
 /// Identity lifecycle: the proof/expose/renew/enrol handles the protocol drives.
 #[async_trait]
 pub trait RecvIdentity: Send + Sync {
@@ -151,8 +164,15 @@ pub trait RecvIdentity: Send + Sync {
     fn clear_provisional_identity(&self, name: &str);
     fn local_device_cert(&self) -> Option<DeviceCert>;
     async fn maybe_request_cert_renewal(&self, conn: &Conn, pid: &str);
-    async fn respond_to_cert_renew_request(&self, conn: &mut Conn, pid: String);
-    async fn handle_cert_renew_ack(&self, v: &Value);
+    /// OWNER SIDE of a renewal asked for by `device_pub`, already proven on
+    /// the asking link: decide, re-sign and store the renewed certificate.
+    /// BLOCKING (device-store reads and a durable write): the dispatch runs it
+    /// off its event loop and answers the requester with what it returns.
+    fn renew_device_cert(&self, device_pub: &[u8; 32]) -> CertRenewal;
+    /// REQUESTING SIDE: judge a renewal ack and, if acceptable, persist the
+    /// renewed certificate as this device's own. BLOCKING (a durable write):
+    /// the dispatch runs it off its event loop.
+    fn adopt_renewed_cert(&self, v: &Value);
     async fn respond_to_auth_key_enroll_request(&self, conn: &mut Conn, pid: String, v: Value);
     async fn handle_auth_key_enroll_response(&self, conn: &mut Conn, pid: String, v: Value);
     /// Settle window for an unproven shell-class open.
@@ -581,8 +601,10 @@ pub mod test_support {
             None
         }
         async fn maybe_request_cert_renewal(&self, _: &Conn, _: &str) {}
-        async fn respond_to_cert_renew_request(&self, _: &mut Conn, _: String) {}
-        async fn handle_cert_renew_ack(&self, _: &Value) {}
+        fn renew_device_cert(&self, _: &[u8; 32]) -> CertRenewal {
+            CertRenewal::Refused
+        }
+        fn adopt_renewed_cert(&self, _: &Value) {}
         async fn respond_to_auth_key_enroll_request(&self, _: &mut Conn, _: String, _: Value) {}
         async fn handle_auth_key_enroll_response(&self, _: &mut Conn, _: String, _: Value) {}
         fn gate_settle_ms(&self) -> u64 {

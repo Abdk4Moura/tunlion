@@ -29,7 +29,8 @@ use filament_peerloop::recv::enrollment::EnrollmentService;
 use filament_peerloop::recv::fleet_rv::FleetService;
 use filament_peerloop::recv::identity::IdentityService;
 use filament_peerloop::recv::ports::{
-    RawMode, RecvDaemon, RecvEnv, RecvIdentity, RecvPorts, RecvPrompt, RecvServers, RecvStore,
+    CertRenewal, RawMode, RecvDaemon, RecvEnv, RecvIdentity, RecvPorts, RecvPrompt, RecvServers,
+    RecvStore,
 };
 use filament_peerloop::recv::report::RecvReport;
 use filament_peerloop::recv::servers::shell::{PipeItem, PtyBackend, PtySession, PtySpawnSpec};
@@ -296,13 +297,11 @@ impl RecvIdentity for CliRecv {
     async fn maybe_request_cert_renewal(&self, conn: &Conn, pid: &str) {
         self.identity().maybe_request_cert_renewal(conn, pid).await
     }
-    async fn respond_to_cert_renew_request(&self, conn: &mut Conn, pid: String) {
-        self.identity()
-            .respond_to_cert_renew_request(conn, pid)
-            .await
+    fn renew_device_cert(&self, device_pub: &[u8; 32]) -> CertRenewal {
+        self.identity().renew_device_cert(device_pub)
     }
-    async fn handle_cert_renew_ack(&self, v: &Value) {
-        self.identity().handle_cert_renew_ack(v).await
+    fn adopt_renewed_cert(&self, v: &Value) {
+        self.identity().adopt_renewed_cert(v)
     }
     async fn respond_to_auth_key_enroll_request(&self, conn: &mut Conn, pid: String, v: Value) {
         self.enrollment
