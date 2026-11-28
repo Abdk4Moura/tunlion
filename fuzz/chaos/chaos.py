@@ -254,6 +254,12 @@ def random_op(rng: random.Random) -> dict:
               "kib": rng.choice([4, 256, 4096])}
         if rng.random() < 0.3:
             op["via"] = "stdout"
+        elif rng.random() < 0.3:
+            # A send that builds its own link instead of riding its daemon's
+            # warm one (TUNLION_NO_WARM_REUSE=1): every send did before #754,
+            # and the paths it takes (its own signaling client, its own dials
+            # and re-dials) are unreachable from a warm send.
+            op["cold"] = True
         return op
     if kind == "status":
         # Asking your own machine must answer fast, even with its daemon frozen.
@@ -1463,6 +1469,8 @@ def run_op(w: World, st: dict, phase: str) -> dict:
                 time.sleep(0.5)
         intact = got is not None and hashlib.sha256(got).digest() == hashlib.sha256(data).digest()
         res.update(rc=rc, elapsed=round(el, 2), ok=(rc == 0 and intact))
+        if st.get("cold"):
+            res["cold"] = True
         # rc 0 with the file absent or different is the worst UX outcome there is.
         res["lie"] = rc == 0 and not intact
     elif kind == "status":
@@ -1485,6 +1493,8 @@ def op_label(r: dict) -> str:
     tags = []
     if r.get("oneshot"):
         tags.append("one-shot")
+    if r.get("cold"):
+        tags.append("cold")
     if r.get("out_mib"):
         tags.append(f"{r['out_mib']} MiB")
     return r["op"] + (f" ({', '.join(tags)})" if tags else "")
@@ -1595,6 +1605,31 @@ def judge_unfaulted(r: dict, fault_windows: list[dict]) -> list[dict]:
     return [{"oracle": "O14-failed-unfaulted", "hard": True,
              "what": f"{op_label(r)} {r['src']}->{r['dst']} failed ({rc}) with no fault active or healed within "
                      f"{UNFAULTED_SETTLE:.0f}s: {tail[0][:200]}"}]
+
+
+def judge_recovered(r: dict, fault_windows: list[dict]) -> list[dict]:
+    """O15: an op that was still running UNFAULTED_SETTLE after every fault
+    that overlapped it had healed, and then failed. O14 excuses an op any
+    fault touched, so a command that lost its path during a fault and never
+    found it again once the world was whole (a send that does not re-dial
+    after a server outage) failed honestly by every other rule. The world was
+    whole for as long as O14 gives anything to settle; the op had that time to
+    recover in, as the post-heal probes (O1) do. A hang is O2's."""
+    if r.get("ok") or r.get("rc") is None or "t_start" not in r or r.get("op") == "visit":
+        return []
+    lo, hi = r["t_start"], r["t_end"]
+    touching = [f for f in fault_windows if _overlaps(f, lo, hi + 2.0)]
+    if not touching or any(f["end"] is None for f in touching):
+        return []
+    healed = max(f["end"] for f in touching)
+    # Every fault, not only those that touched the op: one still active or
+    # just healed when it failed excuses it.
+    if any(_overlaps(f, hi - UNFAULTED_SETTLE, hi + 2.0) for f in fault_windows):
+        return []
+    tail = (r.get("stderr_tail") or "").strip().splitlines()[-1:] or [""]
+    return [{"oracle": "O15-no-recovery-in-op", "hard": True,
+             "what": f"{op_label(r)} {r['src']}->{r['dst']} failed (rc {r['rc']}) {hi - healed:.0f}s after the "
+                     f"last fault it overlapped had healed: {tail[0][:200]}"}]
 
 
 def judge_diagnosis(r: dict, fault_windows: list[dict]) -> list[dict]:
@@ -1907,6 +1942,7 @@ def run_schedule(w: World, sched: dict, label: str) -> dict:
         verdict["findings"].extend(judge_diagnosis(r, fault_windows))
         verdict["findings"].extend(judge_local_status(r, fault_windows))
         verdict["findings"].extend(judge_unfaulted(r, fault_windows))
+        verdict["findings"].extend(judge_recovered(r, fault_windows))
 
     # After heal: every daemon reconnects, every path works, nobody storms.
     alive = [d for d in DEVICES if w.daemons[d] and w.daemons[d].poll() is None]
@@ -2637,6 +2673,28 @@ def selftest_exec_bulk() -> None:
     assert f[0]["oracle"] == "O2-hang" and "no output for 80s" in f[0]["what"], f
 
 
+def selftest_cold_and_recovery() -> None:
+    """Cold sends are drawn blindly (never for a code send to stdout), and O15
+    judges an op that failed after the world had been whole for the settle."""
+    rng = random.Random(5)
+    sends = [o for o in (random_op(rng) for _ in range(3000)) if o["op"] == "send"]
+    assert any(o.get("cold") for o in sends) and not any(o.get("cold") and o.get("via") for o in sends)
+    # Failed 29 s after the last overlapping heal is within the settle; 38 s
+    # is a missed recovery; a fault still active, or never healed, excuses.
+    rr = {"op": "send", "src": "alpha", "dst": "charlie", "ok": False, "rc": 6, "t_start": 17.2, "t_end": 77.6,
+          "cold": True, "stderr_tail": "Error: the receiver is unreachable"}
+    out = [{"step": {"fault": "server.down"}, "start": 16.0, "end": 48.5}]
+    assert judge_recovered(rr, out) == []
+    early = [{"step": {"fault": "server.down"}, "start": 16.0, "end": 40.0}]
+    f = judge_recovered(rr, early)
+    assert f and f[0]["oracle"] == "O15-no-recovery-in-op" and "38s after" in f[0]["what"], f
+    assert f[0]["what"].startswith("send (cold) alpha->charlie"), f
+    assert judge_recovered(rr, early + [{"step": {}, "start": 60.0, "end": 70.0}]) == []
+    assert judge_recovered(rr, [{"step": {}, "start": 16.0, "end": None}]) == []
+    assert judge_recovered(rr, []) == [], "unfaulted is O14's"
+    assert judge_recovered(dict(rr, rc=None), early) == [] and judge_recovered(dict(rr, ok=True), early) == []
+
+
 def cmd_selftest() -> int:
     rng = random.Random(1)
     for _ in range(500):
@@ -2805,6 +2863,7 @@ def cmd_selftest() -> int:
     selftest_kinds_and_coverage()
     selftest_exec_variants()
     selftest_exec_bulk()
+    selftest_cold_and_recovery()
     print("selftest ok")
     return 0
 
