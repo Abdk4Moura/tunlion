@@ -1,0 +1,107 @@
+{
+  "hooks": {
+    "alpha": {
+      "TUNLION_TEST_DROP_PEER_LEFT": "1"
+    },
+    "bravo": {}
+  },
+  "seed": 841991716,
+  "steps": [
+    {
+      "at": 1.7,
+      "dur": 5.6,
+      "fault": "sig.reset",
+      "target": "charlie"
+    },
+    {
+      "a": "alpha",
+      "at": 4.0,
+      "b": "charlie",
+      "dur": 2.2,
+      "fault": "net.partition",
+      "proto": "udp"
+    },
+    {
+      "at": 6.0,
+      "dur": 115.4,
+      "fault": "net.isolate",
+      "target": "charlie"
+    },
+    {
+      "a": "alpha",
+      "at": 6.4,
+      "b": "bravo",
+      "dur": 32.3,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "at": 6.7,
+      "dur": 25.8,
+      "fault": "sig.blackhole",
+      "target": "charlie"
+    },
+    {
+      "at": 11.0,
+      "dur": 15.4,
+      "fault": "proc.kill",
+      "target": "bravo"
+    },
+    {
+      "at": 14.1,
+      "dur": 97.0,
+      "fault": "proc.kill",
+      "target": "charlie"
+    },
+    {
+      "args": {
+        "delay_ms": 0,
+        "dup": 0,
+        "jitter_ms": 0,
+        "loss": 0,
+        "reorder": 0
+      },
+      "at": 17.5,
+      "dur": 11.6,
+      "fault": "net.impair",
+      "target": "charlie"
+    },
+    {
+      "at": 24.2,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "at": 24.6,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 28.4,
+      "dst": "charlie",
+      "op": "doctor",
+      "src": "bravo"
+    },
+    {
+      "at": 33.1,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 33.7,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "alpha"
+    },
+    {
+      "at": 35.0,
+      "dst": "charlie",
+      "op": "reach",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}
