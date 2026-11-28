@@ -1,0 +1,56 @@
+{
+  "hooks": {},
+  "origin": "written 2026-11-28 to catch #757 (8def1784a), which only the Revoke Gates sibling-shell arms caught: a one-shot dialer (no local daemon, so no broker: the fleet-secret dial) execs on a fleet sibling and on the owner, with no fault near; each must run (O14) within its bound (O2)",
+  "seed": 0,
+  "steps": [
+    {
+      "args": {
+        "delay_ms": 10,
+        "dup": 0,
+        "jitter_ms": 0,
+        "loss": 0,
+        "reorder": 0
+      },
+      "at": 1.0,
+      "dur": 2.0,
+      "fault": "net.impair",
+      "target": "alpha"
+    },
+    {
+      "at": 35.0,
+      "dst": "charlie",
+      "oneshot": true,
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 50.0,
+      "dst": "bravo",
+      "oneshot": true,
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "at": 65.0,
+      "dst": "charlie",
+      "oneshot": true,
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 80.0,
+      "dst": "bravo",
+      "oneshot": true,
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "at": 95.0,
+      "dst": "alpha",
+      "oneshot": true,
+      "op": "exec",
+      "src": "bravo"
+    }
+  ],
+  "version": 1
+}

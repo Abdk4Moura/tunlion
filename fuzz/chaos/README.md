@@ -122,6 +122,21 @@ third of sends; `corpus/send-stdout.json` is the T3 case.
 
     {"at": 1.0, "op": "send", "via": "stdout", "src": "alpha", "dst": "bravo", "kib": 5120}
 
+## Exec variants
+
+The delegates grant each other shell at setup, so an exec goes to the owner
+(a paired device) or to the other delegate (a fleet sibling). Flags vary it;
+`random_op` draws each blindly, so explore reaches them like any op:
+
+- `"oneshot": true`: the command runs as a ONE-SHOT dialer, with a copy of the
+  device's config dir minus the daemon's runtime files (so no control socket
+  to ride or to broker through) and `TUNLION_NO_WARM_REUSE=1`: a machine with
+  no `up`, as on Windows. To a sibling it dials the fleet secret.
+  `corpus/exec-oneshot-fleet-sibling.json` is the Revoke Gates sibling-shell
+  case (#757), `corpus/exec-from-degraded-machine-oneshot.json` the #749 one.
+
+    {"at": 35.0, "op": "exec", "src": "bravo", "dst": "charlie", "oneshot": true}
+
 ## Retiring a hand-written gate
 
 Only when reverting that gate's original fix makes `replay` of the matching
