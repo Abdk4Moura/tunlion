@@ -90,6 +90,18 @@ impl SimStore {
             .map(|(n, _)| n.clone())
     }
 
+    /// A record that was on disk before the run (an enrollment's), so
+    /// writing it costs no write now.
+    pub fn seed_record(&self, name: &str, device_pub: [u8; 32]) {
+        self.put(name, Some(device_pub));
+    }
+
+    /// The device's own certificate record (`write_local_device_cert_record`
+    /// in production: one durable write of the local identity file).
+    pub fn write_local_cert_record(&self) {
+        self.disk.durable_write("write_local_device_cert_record");
+    }
+
     fn put(&self, name: &str, device_pub: Option<[u8; 32]>) {
         let mut g = self.records.lock().unwrap_or_else(|e| e.into_inner());
         let slot = g.entry(name.to_string()).or_insert(None);

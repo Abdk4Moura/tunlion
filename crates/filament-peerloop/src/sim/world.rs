@@ -19,7 +19,7 @@ use crate::driver::{Cancellation, DriverOutcome, Engine};
 use crate::host::{HostServices, Level, LogSink, Tone};
 use crate::recv::dispatch::{drive, RecvCleanup};
 use crate::recv::ports::test_support::{NoDaemon, NoIdentity, NoPrompt, NoPty, NoServers};
-use crate::recv::ports::{RecvDaemon, RecvEnv, RecvIdentity, RecvPorts};
+use crate::recv::ports::{CertRenewal, RecvDaemon, RecvEnv, RecvIdentity, RecvPorts, RecvStore};
 use crate::recv::report::RecvReport;
 use crate::shell_gate::ShellPolicy;
 use crate::sim::assertions::{record_sometimes, reset_assertions, take_assertions, AssertionReport};
@@ -113,6 +113,13 @@ pub struct SimConfig {
     pub fleet: bool,
     /// One-shot fleet dialers, each a fresh short-lived client.
     pub one_shot_dials: Vec<OneShotDial>,
+    /// With `fleet`: the node that holds the owner signing key (a primary).
+    /// It holds a device record for every other member, as enrollment left,
+    /// and answers certificate renewal requests.
+    pub fleet_primary: Option<String>,
+    /// With `fleet`: members whose certificate is due for renewal, so their
+    /// daemons ask a primary to re-sign it.
+    pub renewal_due: Vec<String>,
 }
 
 /// A one-shot dial of `target` starting at `at_ms` (see `sim::oneshot`).
@@ -258,8 +265,10 @@ impl HostServices for SimHost {
 
 struct SimIdentity {
     base: NoIdentity,
+    node: String,
     fleet: Option<(Arc<SimFleet>, Arc<SimFleetMember>)>,
     store: Arc<SimStore>,
+    log: Arc<dyn LogSink>,
 }
 
 #[async_trait]
@@ -309,16 +318,86 @@ impl RecvIdentity for SimIdentity {
         }
     }
 
+    /// As production: a member that holds no owner key asks, while its
+    /// certificate is due; a primary never asks.
     async fn maybe_request_cert_renewal(&self, conn: &Conn, pid: &str) {
-        self.base.maybe_request_cert_renewal(conn, pid).await;
+        let Some((f, m)) = &self.fleet else { return };
+        if f.is_primary(&self.node) || !m.renewal_due() {
+            return;
+        }
+        if let Some(t) = conn.transport_of(pid) {
+            let _ = t
+                .send_control(&serde_json::json!({"type": "identity-cert-renew-request"}))
+                .await;
+        }
     }
 
-    async fn respond_to_cert_renew_request(&self, conn: &mut Conn, pid: String) {
-        self.base.respond_to_cert_renew_request(conn, pid).await;
+    /// The owner side as `IdentityService::renew_device_cert`: the production
+    /// decision (`renewal::owner_decides`) over this node's records, then one
+    /// durable upsert of the renewed certificate on this node's disk.
+    fn renew_device_cert(&self, device_pub: &[u8; 32]) -> CertRenewal {
+        let Some((f, _)) = self.fleet.as_ref().filter(|(f, _)| f.is_primary(&self.node)) else {
+            self.log
+                .debug("  cert renewal declined: this device holds no owner signing key");
+            return CertRenewal::Refused;
+        };
+        let name = self.store.name_for_pub(device_pub);
+        let standing = crate::recv::renewal::Standing {
+            known: name.is_some(),
+            stored_device_pub: name.as_ref().map(|_| *device_pub),
+            ..Default::default()
+        };
+        if let crate::recv::renewal::Decision::Refuse(why) =
+            crate::recv::renewal::owner_decides(&standing, *device_pub)
+        {
+            self.log.debug(&format!("  cert renewal refused: {why}"));
+            return CertRenewal::Refused;
+        }
+        let (Some(name), Some(fresh)) = (name, f.renew(device_pub)) else {
+            self.log.debug("  cert renewal failed: could not sign");
+            return CertRenewal::Unsigned;
+        };
+        let _ = self.store.devices_upsert_atomic(
+            &name,
+            None,
+            Some(&fresh),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        self.log.debug(&format!(
+            "  renewed certificate for {}",
+            hex::encode(device_pub).chars().take(8).collect::<String>()
+        ));
+        let deadline = fresh.expires;
+        CertRenewal::Renewed { cert: fresh, deadline }
     }
 
-    async fn handle_cert_renew_ack(&self, v: &Value) {
-        self.base.handle_cert_renew_ack(v).await;
+    /// The requesting side as `IdentityService::adopt_renewed_cert`: the
+    /// production check (`renewal::accept_renewal`), then one durable write
+    /// of this device's certificate record.
+    fn adopt_renewed_cert(&self, v: &Value) {
+        let Some((_, m)) = &self.fleet else { return };
+        let Some(fresh) = filament_id::DeviceCert::from_json(&v["cert"]) else {
+            self.log.debug("  renewal ack carried no readable certificate");
+            return;
+        };
+        let current = m.cert();
+        if let Err(e) = crate::recv::renewal::accept_renewal(
+            &current,
+            &fresh,
+            &current.user_pub,
+            filament_id::now_secs(),
+        ) {
+            self.log.debug(&format!("  renewal rejected: {e}"));
+            return;
+        }
+        self.store.write_local_cert_record();
+        m.adopt(fresh);
+        // Production also prints the time left, which reads the wall clock.
+        self.log.debug("  certificate renewed");
     }
 
     async fn respond_to_auth_key_enroll_request(&self, conn: &mut Conn, pid: String, v: Value) {
@@ -707,8 +786,10 @@ fn spawn_daemon(
     let ports = RecvPorts::new(
         Arc::new(SimIdentity {
             base: NoIdentity,
+            node: spec.name.clone(),
             fleet,
             store: store.clone(),
+            log: log.clone(),
         }),
         store,
         Box::new(NoServers),
@@ -1060,11 +1141,29 @@ impl SimWorld {
                 stores: Default::default(),
                 fleet: if config.fleet {
                     let names: Vec<String> = config.nodes.iter().map(|n| n.name.clone()).collect();
-                    Some(SimFleet::new(config.seed, &names).expect("sim fleet keys"))
+                    Some(
+                        SimFleet::with_roles(
+                            config.seed,
+                            &names,
+                            config.fleet_primary.as_deref(),
+                            &config.renewal_due,
+                        )
+                        .expect("sim fleet keys"),
+                    )
                 } else {
                     None
                 },
             };
+            // The primary holds a record for every other member, as
+            // enrollment left it.
+            if let (Some(f), Some(p)) = (&node_state.fleet, &config.fleet_primary) {
+                let store = node_state.store(&net, p);
+                for name in f.member_names().filter(|n| *n != p) {
+                    if let Some(m) = f.member(name) {
+                        store.seed_record(name, m.device_pub());
+                    }
+                }
+            }
             let logs = Arc::new(Mutex::new(Vec::<SimTraceEntry>::new()));
             let tracker = Arc::new(Mutex::new(WorldTracker {
                 next_pid: 1000,
