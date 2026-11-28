@@ -285,6 +285,43 @@ fn fleet_config(seed: u64, dials: Vec<(u64, &str)>) -> SimConfig {
     }
 }
 
+/// With no fault, a one-shot fleet dial of a live daemon is answered, for
+/// either order of the two session ids (they are random in the reach world,
+/// so a spread of seeds covers both), and the oracle is not vacuous.
+#[test]
+fn test_one_shot_fleet_dial_is_answered_on_a_clean_world() {
+    let mut answered = 0;
+    for seed in 1..=12u64 {
+        let cfg = fleet_config(seed, vec![(6_000, "bravo"), (12_000, "charlie"), (18_000, "alpha")]);
+        let out = SimWorld::run(cfg.clone());
+        let v = filament_peerloop::sim::evaluate_oracles(&out, &cfg);
+        assert!(v.is_empty(), "seed {seed}: {v:?}");
+        answered += out
+            .net_events
+            .iter()
+            .filter(|e| e.event.starts_with("oneshot:answered:"))
+            .count();
+        // Deterministic replay with the new world.
+        let again = SimWorld::run(cfg);
+        if out.trace_hash != again.trace_hash {
+            for (a, b) in out.events.iter().zip(again.events.iter()) {
+                if a != b {
+                    println!("FIRST_EV_DIFF: {a:?}\n          vs {b:?}");
+                    break;
+                }
+            }
+            for (a, b) in out.net_events.iter().zip(again.net_events.iter()) {
+                if a.event != b.event || a.at_ms != b.at_ms {
+                    println!("FIRST_NET_DIFF: {a:?}\n           vs {b:?}");
+                    break;
+                }
+            }
+        }
+        assert_eq!(out.trace_hash, again.trace_hash, "seed {seed} did not replay");
+    }
+    assert_eq!(answered, 36);
+}
+
 /// The fleet paths run: daemons of one fleet verify each other's
 /// production `fleet-hello` over the direct link's channel binding.
 #[test]
