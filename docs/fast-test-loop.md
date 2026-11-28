@@ -38,3 +38,46 @@ Even at **99.57% `sccache` hit rate**, **`96.4%` (`~28m 25s`) of CI wall time wa
    - Switches `cargo test (linux)`, `cargo test (windows)`, and `pty-flows` from `--release` fat-LTO to `--profile ci-test --locked`.
    - Changes `L3 CLI state` to reuse the already-compiled `cli_integration` binary (`--test cli_integration l3_state_cli::`) and asserts `test result: ok. 2 passed`.
 4. **`scripts/fast-test.sh`:** Local / Colab Pro fast inner-loop runner (`--setup`, `--cranelift`, `mold`, `cargo-nextest`, `--profile fast-test`).
+
+## 3. PR 2 & PR 3 Measured CI Impact
+
+Across PR #770 (baseline `--release` fat-LTO), PR #774 (`ci-test` + `mold` + single-binary `cli_integration`), PR #783 (3-way `gate-suite`, 2-way `revoke-gates`, uniform Linux `sccache` C/Rust env, `target/ci-test` caching, `daemon_identity_tests` `ETXTBSY` fix), and PR #3 (4-way `gate-suite` + 3-way `revoke-gates`):
+
+| Workflow / Job | PR #770 Baseline | PR #774 | PR #783 Measured | PR #3 Target |
+|---|---:|---:|---:|---:|
+| `Test/cargo test (linux)` | `29m 29s` | `23m 50s` (cold) | **`12m 10s`** | `~10-12m` |
+| `Test/cargo test (windows)` | `~22m+` | `22m 33s` (cold) | **`6m 12s`** | `~6m` |
+| `Gate Suite/gate suite` (longest shard) | `~50m+` | `50m 13s` | `23m 52s` (`net`; `core-web` `10m 19s`, `daemon` `10m 47s`) | **`~10-12m`** (splits `lan-discovery` & `lan-pairing`) |
+| `Revoke Gates/revoke gates` (longest shard) | `~23m+` | `22m 49s` | `15m 04s` (`core`; `fleet` `8m 11s`) | **`~8-10m`** (splits `core-a` & `core-b`) |
+| `Capability CI/smoke (ubuntu)` | `~14m` | `12m 57s` | `14m 03s` (`--release` retained) | `14m 03s` |
+
+### Empirical Constraints Preserved
+1. **`capability_harness` keeps `--release`:** `cli/tests/capability_harness.rs` requires `profile == "release"` for `direct_blocked_falls_back_to_webrtc_promptly`, and Windows `LOOP-BUDGET-EXCEEDED` (1,000 ms event-loop budget) exceeded 1 s at `1,026 ms` under `ci-test` `opt-level = 1`. Both `capability-ci.yml` jobs remain on `--release`.
+2. **`daemon_identity_tests` Unix `ETXTBSY` race fixed:** Consolidating 18 CLI integration tests into one binary increased concurrent `fork()` calls during test execution; copying `real_bin()` via a short-lived Unix `cp` child process plus bounded `ExecutableFileBusy` retry eliminated the flake.
+
+## 4. Reaching the ~12s Inner Loop: Local / Colab Pro Workflow and Delegable Phase 3 Roadmap
+
+### 4.1 Colab Pro / High-Core Inner Loop Setup
+Run `scripts/fast-test.sh` on a Colab Pro or multi-core Linux VM to get ~14-15s edit+test loops on `tunlion-peerloop` (`964` tests) and sub-12s runs on targeted filters:
+
+```bash
+# One-time setup (mold + clang + cargo-nextest + nightly hybrid Cranelift + optional wild linker)
+scripts/fast-test.sh --setup --nightly --wild
+
+# Warm inner loop (Hybrid Cranelift workspace + O2 LLVM deps, mold, nextest, /dev/shm tmpfs when >= 8 GiB free)
+scripts/fast-test.sh --cranelift --ramdisk peerloop
+
+# CLI binary + cli_integration (keeps LLVM automatically to avoid Clap Cranelift stack overflow)
+scripts/fast-test.sh --ramdisk cli
+
+# Experimental wild linker
+scripts/fast-test.sh --cranelift --linker wild peerloop
+```
+
+### 4.2 Remaining Delegable Optimization Levers (Project 1 Phase 3)
+1. **Replace real wall-clock sleeps in unit & CLI integration tests (`virtual time`):**
+   - `cli/tests/cli_integration/daemon_identity_tests.rs` holds a `TcpListener` thread asleep for `20s`, and `cli/tests/cli_integration/timeout_tests.rs` waits `~10s` real time against an unreachable peer.
+   - `crates/filament-peerloop/src/l2/{mux,warm_send,warm_exec}.rs` and `sync.rs` contain multi-second `tokio::time::interval` / `timeout` constants; converting internal protocol timer tests to `tokio::time::pause()` + `advance()` (coordinated after structural splits land) removes ~10-20s of idle wall-clock sleeping per test run.
+2. **Adopt `cargo-nextest` in `.github/workflows/test.yml`:** Runs unit + `cli_integration` suites across all vCPUs cleanly and isolates per-process failures without `ETXTBSY`/shared-process contention.
+3. **Crate-graph impact filtering in `scripts/ci_changes.py`:** Upgrade binary `rust=true|false` classification to fail-open per-crate outputs (while keeping required status check names green) so leaf-crate changes skip unrelated heavy suites.
+4. **Prelinked dynamic dependency crate (`dylib` monolith) for `--profile fast-test`:** Extract heavy third-party dependencies (`tokio`, `webrtc`, `quinn`, `rustls`, `reqwest`, `serde_json`, `clap`) into an opt-in workspace `dylib` dev-only wrapper so 1-line workspace edits only relink thin test binaries instead of re-linking 100+ static `.rlib` archives.

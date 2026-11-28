@@ -216,12 +216,12 @@ jobs:
     name: gate suite (ubuntu, ${{ matrix.shard }})
     runs-on: ubuntu-latest
     # The suite now includes the Windows-follow-up gates plus slower cold fixtures;
-    # keep headroom while sharded across 3 parallel runners.
+    # keep headroom while sharded across 4 parallel runners.
     timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
-        shard: [net, core-web, daemon]
+        shard: [lan-discovery, lan-pairing, core-web, daemon]
     steps:
       - uses: actions/checkout@v4
 
@@ -287,13 +287,13 @@ jobs:
       # The lan gate's tunnel topology is WireGuard (it falls back to ipip and
       # says so when wg is missing).
       - name: Install WireGuard tools
-        if: matrix.shard == 'net'
+        if: matrix.shard == 'lan-discovery' || matrix.shard == 'lan-pairing'
         run: command -v wg || sudo apt-get install -y -qq wireguard-tools
 
       # The whoami arm proves its claim ON THE WIRE, and core-receive-relay-nat
       # captures coturn relay packets with tcpdump.
       - name: Allow the wire capture
-        if: matrix.shard == 'net' || matrix.shard == 'core-web'
+        if: matrix.shard == 'lan-discovery' || matrix.shard == 'lan-pairing' || matrix.shard == 'core-web'
         run: |
           command -v tcpdump || sudo apt-get install -y -qq tcpdump
           sudo setcap cap_net_raw,cap_net_admin+eip "$(command -v tcpdump)"
@@ -424,15 +424,19 @@ jobs:
           # (`bash x`, `python3 x`) -- this precheck is stricter than the registry.
           rc=0
           case "${{ matrix.shard }}" in
-            net)
+            lan-discovery)
               SHARD_GATES=(
                 cli/tests/lan-discovery-gates.sh
-                cli/tests/lan-pairing-gates.sh
-                cli/tests/net-blockers-gates.sh
                 cli/tests/whoami-candidate-gates.sh
                 cli/tests/reach-until-direct-gates.sh
-                cli/tests/signaling-freeze-gates.sh
                 cli/tests/daemon-stop-gates.sh
+              )
+              ;;
+            lan-pairing)
+              SHARD_GATES=(
+                cli/tests/lan-pairing-gates.sh
+                cli/tests/net-blockers-gates.sh
+                cli/tests/signaling-freeze-gates.sh
               )
               ;;
             core-web)
