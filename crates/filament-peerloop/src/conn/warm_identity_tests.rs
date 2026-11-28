@@ -1159,6 +1159,7 @@ fn promote_pending(attempt: net::AttemptId, sid: &str, secret: &str) -> DirectPe
         my_srflx: None,
         peer_server_public: None,
         server_public_dialed: Arc::new(AtomicBool::new(false)),
+        answered: Arc::new(AtomicBool::new(false)),
         probe: false,
         cancel: Arc::new(AtomicBool::new(false)),
     }
@@ -2045,6 +2046,7 @@ async fn a_browser_transport_hint_establishes_without_the_direct_wait() {
             my_srflx: None,
             peer_server_public: None,
             server_public_dialed: Arc::new(AtomicBool::new(false)),
+            answered: Arc::new(AtomicBool::new(false)),
             probe: false,
             cancel: cancel.clone(),
         },
@@ -2135,6 +2137,7 @@ async fn a_transport_hint_binds_nothing_without_its_own_pending() {
             my_srflx: None,
             peer_server_public: None,
             server_public_dialed: Arc::new(AtomicBool::new(false)),
+            answered: Arc::new(AtomicBool::new(false)),
             probe: false,
             cancel,
         },
@@ -2187,6 +2190,7 @@ async fn a_hint_fills_an_empty_binding_and_never_overwrites_one() {
                 my_srflx: None,
                 peer_server_public: None,
                 server_public_dialed: Arc::new(AtomicBool::new(false)),
+                answered: Arc::new(AtomicBool::new(false)),
                 probe: false,
                 cancel: Arc::new(AtomicBool::new(false)),
             },
@@ -2266,6 +2270,7 @@ async fn an_offer_from_a_cli_peer_does_not_cancel_its_direct_race() {
             my_srflx: None,
             peer_server_public: None,
             server_public_dialed: Arc::new(AtomicBool::new(false)),
+            answered: Arc::new(AtomicBool::new(false)),
             probe: false,
             cancel: cancel.clone(),
         },
@@ -2439,6 +2444,7 @@ fn armed_promotion(
             my_srflx: None,
             peer_server_public: None,
             server_public_dialed: Arc::new(AtomicBool::new(false)),
+            answered: Arc::new(AtomicBool::new(false)),
             probe: false,
             cancel: Arc::new(AtomicBool::new(false)),
         },
@@ -2476,6 +2482,7 @@ fn expired_direct_pending(conn: &mut Conn, pid: &str, deadline: Instant) {
             my_srflx: None,
             peer_server_public: None,
             server_public_dialed: Arc::new(AtomicBool::new(false)),
+            answered: Arc::new(AtomicBool::new(false)),
             probe: false,
             cancel: Arc::new(AtomicBool::new(false)),
         },
@@ -2847,6 +2854,45 @@ async fn a_lost_race_leaves_webrtc_serving_with_nothing_to_rebuild() {
 /// at a time: draining the whole batch in one loop turn added N establishes
 /// to one iteration and exceeded the 20 s loop watchdog. Deferring must not
 /// drop a peer: every pending is returned on a later call.
+/// Cold sends on send-slow-lossy-link: the reaper retired the attempt at
+/// its deadline while the race (started later, when the peer's offer came
+/// over a slow signaling path) was still authenticating, or had just won
+/// with its DirectReady still queued. A running race, or a won one, is
+/// owed until the backstop; a lost one falls back at once.
+#[tokio::test]
+async fn the_reaper_waits_for_a_race_still_owed() {
+    let (mut conn, _far, _rx) = test_conn().await;
+    conn.direct_ok = true;
+    let pid = "sid-slow-path";
+    let past = Instant::now() - Duration::from_millis(1);
+    expired_direct_pending(&mut conn, pid, past);
+    let (release, gate) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _ = gate.await;
+    });
+    conn.direct_pending.get_mut(pid).unwrap().race_task = Some(task);
+    assert!(conn.expired_direct().is_empty(), "a running race was retired at the deadline");
+    // It won: the task is done, answered stays set, the adoption is queued.
+    conn.direct_pending.get_mut(pid).unwrap().answered.store(true, Ordering::Relaxed);
+    let _ = release.send(());
+    for _ in 0..100 {
+        if conn.direct_pending[pid].race_task.as_ref().unwrap().is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(conn.expired_direct().is_empty(), "a won race was retired before its adoption");
+    // It lost: answered cleared, the task done, so it falls back now.
+    conn.direct_pending.get_mut(pid).unwrap().answered.store(false, Ordering::Relaxed);
+    assert_eq!(conn.expired_direct().len(), 1, "a lost race did not fall back");
+    // Past the backstop even a running race falls back.
+    let stale = Instant::now() - DIRECT_ANSWERED_BACKSTOP - Duration::from_millis(1);
+    expired_direct_pending(&mut conn, pid, stale);
+    conn.direct_pending.get_mut(pid).unwrap().race_task =
+        Some(tokio::spawn(std::future::pending::<()>()));
+    assert_eq!(conn.expired_direct().len(), 1, "the backstop did not bound the wait");
+}
+
 #[tokio::test]
 async fn expired_direct_returns_one_fallback_per_call() {
     let (mut conn, _far, _rx) = test_conn().await;
@@ -3054,6 +3100,7 @@ fn direct_pending_with(attempt: net::AttemptId, secret: (&str, &str)) -> DirectP
         my_srflx: None,
         peer_server_public: None,
         server_public_dialed: Arc::new(AtomicBool::new(false)),
+        answered: Arc::new(AtomicBool::new(false)),
         probe: false,
         cancel: Arc::new(AtomicBool::new(false)),
     }

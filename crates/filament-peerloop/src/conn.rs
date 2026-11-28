@@ -1353,6 +1353,12 @@ pub struct DirectPending {
     /// attribution says "dialed and never answered" only when this is true, so
     /// the sentence is bound to the address it names.
     pub server_public_dialed: Arc<AtomicBool>,
+    /// Set by the rung-1 race once a QUIC handshake with the peer completed
+    /// (the path works and only the authentication is in flight; the race
+    /// then runs to `direct::DIRECT_ANSWERED_BUDGET`), cleared when the race
+    /// loses. Set with the race task finished means it won and its
+    /// `DirectReady` is queued. See `direct_race_still_owed`.
+    pub answered: Arc<AtomicBool>,
     /// P5 (GAP-6): this is a relay->direct UPGRADE probe, a direct dial run
     /// ALONGSIDE a live relay link (not the cold establishment path). When the
     /// race wins, `on_transport_offer` posts `Ev::DirectUpgradeReady` (verify-
@@ -1629,6 +1635,31 @@ fn direct_ladder_budget() -> Duration {
     } else {
         direct::DIRECT_BUDGET
     }
+}
+
+/// How long past its deadline the fallback reaper waits for a rung-1 race
+/// that is still running, or that won and whose `DirectReady` is still in the
+/// queue. The race bounds itself (`DIRECT_BUDGET` from ITS start, or
+/// `DIRECT_ANSWERED_BUDGET` on a path that answered), and it starts later
+/// than the deadline's clock: the deadline counts from our transport-offer,
+/// the race from the peer's, which arrives over signaling. This covers the
+/// answered extension plus that delay. A backstop: the race normally ends
+/// first, and the reaper falls back the tick after it loses.
+const DIRECT_ANSWERED_BACKSTOP: Duration =
+    Duration::from_secs(direct::DIRECT_ANSWERED_BUDGET.as_secs() - direct::DIRECT_BUDGET.as_secs() + 5);
+
+/// Whether an expired direct pending is still owed its race: the race task
+/// is still running (it ends itself at its own budget), or it won (`answered`
+/// stays set; a lost race clears it) and the adoption has not run yet, and the
+/// backstop has not passed. Retiring the attempt under a race that had not
+/// had its budget, or under a win waiting in the queue, threw away a
+/// connection that authenticated a moment later (`DIRECT-FALLBACK` then
+/// `DIRECT-ADOPT-REFUSED ... attempt retired` on send-slow-lossy-link, 800 ms
+/// RTT with 20 % loss), and the link fell to a WebRTC data channel whose SCTP
+/// moved a few hundred bytes a second on that path.
+fn direct_race_still_owed(p: &DirectPending, now: Instant) -> bool {
+    let running = p.race_task.as_ref().is_some_and(|h| !h.is_finished());
+    (running || p.answered.load(Ordering::Relaxed)) && now < p.deadline + DIRECT_ANSWERED_BACKSTOP
 }
 
 /// A pending direct attempt whose candidates are still being gathered off the
@@ -6400,6 +6431,7 @@ impl Conn {
                 // only when the race dials exactly the claimed address.
                 peer_server_public: None,
                 server_public_dialed: Arc::new(AtomicBool::new(false)),
+                answered: Arc::new(AtomicBool::new(false)),
                 probe,
                 cancel: cancel_emitter.clone(),
             },
@@ -6522,6 +6554,7 @@ impl Conn {
             .as_deref()
             .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
         let server_public_dialed = p.server_public_dialed.clone();
+        let answered = p.answered.clone();
         p.peer_server_public = peer_server_public;
         // #237 (mixed-fleet): a peer running an older build (no `proto` >= 2 in
         // its offer) gets a clear sentence instead of a hang or a mismatch. The
@@ -6617,6 +6650,7 @@ impl Conn {
                 exchange,
                 peer_claimed,
                 server_public_dialed.clone(),
+                answered.clone(),
             )
             .await
             {
@@ -6624,6 +6658,9 @@ impl Conn {
                 t.announce(&tx, |t| mk(pid_s, t, "direct-quic"));
                 return;
             }
+            // Lost: nothing is owed any more, so the reaper falls back on its
+            // next tick instead of waiting out the backstop.
+            answered.store(false, Ordering::Relaxed);
             // rung-2: UDP hole-punch, then rung-1's QUIC race over the punched
             // socket. Only fires with the flag on, a punch socket bound, and a
             // peer srflx to punch toward. On failure (e.g. symmetric NAT) we fall
@@ -7354,6 +7391,7 @@ impl Conn {
                 !p.probe
                     && !p.lan
                     && now >= p.deadline
+                    && !direct_race_still_owed(p, now)
                     && !self.links.contains_key(*pid)
                     && !self.promotions.contains_key(*pid)
             })

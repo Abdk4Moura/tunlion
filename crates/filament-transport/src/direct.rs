@@ -179,6 +179,19 @@ static FROZE_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// Total budget for the whole direct attempt before falling back to WebRTC.
 pub const DIRECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The race's budget once the path has ANSWERED: a QUIC handshake with the
+/// peer completed, so packets cross both ways and the peer's endpoint is ours.
+/// Only the authentication (a few round trips) is left, and on a lossy,
+/// high-RTT path that can take longer than `DIRECT_BUDGET`: at 800 ms RTT and
+/// 20 % loss each way the handshake plus authentication took 4 to 8 s, the
+/// race gave up at 5 s, and the connection that authenticated a moment later
+/// was refused as `attempt retired`. The send then rode a WebRTC data channel
+/// whose SCTP moved a few hundred bytes a second on that path, against 50 to
+/// 80 KiB/s on the direct link (cold sends on send-slow-lossy-link). A path
+/// that never answers (UDP blocked, wrong address) still gives up at
+/// `DIRECT_BUDGET`: the extension needs a completed handshake.
+pub const DIRECT_ANSWERED_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// ALPN, distinguishes our QUIC app; both ends must agree.
 pub(crate) const ALPN: &[u8] = b"filament-direct/1";
 /// Local pairing carrier, served on the same LAN listener. A distinct ALPN
@@ -2333,11 +2346,31 @@ fn preferred_grace(rtt: std::time::Duration) -> std::time::Duration {
 /// and every link fell back to a WebRTC data channel that crawled there. The
 /// caller's `DIRECT_BUDGET` still bounds the whole race. Errors are skipped
 /// (an unreachable candidate is noise; an auth failure is traced).
+///
+/// `answered` is set by the race's futures when a QUIC handshake completed,
+/// `preferred_answered` when the PREFERRED connection's handshake did. On a
+/// path that answered the race may run to `answered_budget` (from the start)
+/// instead of ending at `budget`, in two cases, both only the authentication
+/// left in flight on a path that works:
+///
+/// - nothing has authenticated yet;
+/// - the non-preferred connection is held and its grace ran out, but the
+///   preferred one's handshake completed. Taking the held one then dropped the
+///   preferred connection the other end was about to take (or had taken), and
+///   both ends saw "connection lost" with zero frames right after
+///   DIRECT-CONNECT ok (cold sends on send-slow-lossy-link). Waiting for it is
+///   consistent at both ends: its handshake completes at the dialer first, so
+///   an acceptor that saw it complete is matched by a dialer that waits too,
+///   and an end that gave up on it closes it, which ends the other end's wait
+///   (its future errors) on the held connection both have.
 async fn pick_preferred<T, S>(
     set: &mut S,
     is_preferred: impl Fn(&T) -> bool,
     grace: impl Fn(&T) -> std::time::Duration,
     budget: std::time::Duration,
+    answered: &AtomicBool,
+    preferred_answered: &AtomicBool,
+    answered_budget: std::time::Duration,
 ) -> Option<T>
 where
     S: futures_util::Stream<Item = Result<T>> + Unpin,
@@ -2348,12 +2381,31 @@ where
     // the wait for the preferred one is its grace, within the same budget (the
     // caller's WebRTC fallback runs on that clock), and a connection held when
     // the budget runs out is the winner, never dropped for the budget's sake.
-    let end = tokio::time::Instant::now() + budget;
-    let mut deadline = end;
+    let start = tokio::time::Instant::now();
+    let extended = start + answered_budget.max(budget);
+    let mut end = start + budget;
+    let mut grace_until: Option<tokio::time::Instant> = None;
     loop {
+        let deadline = grace_until.map_or(end, |g| g.min(end));
         let next = match tokio::time::timeout_at(deadline, set.next()).await {
             Ok(v) => v,
-            Err(_) => return fallback,
+            Err(_) => {
+                let owed = if fallback.is_none() {
+                    answered.load(Ordering::Relaxed)
+                } else {
+                    preferred_answered.load(Ordering::Relaxed)
+                };
+                let more = end < extended || grace_until.is_some_and(|g| g < end);
+                if owed && more {
+                    end = extended;
+                    grace_until = None;
+                    crate::hooks::debug(
+                        "tunlion: direct handshake answered but not yet authenticated; extending the race",
+                    );
+                    continue;
+                }
+                return fallback;
+            }
         };
         let Some(res) = next else { return fallback };
         match res {
@@ -2362,7 +2414,7 @@ where
                     return Some(w);
                 }
                 if fallback.is_none() {
-                    deadline = (tokio::time::Instant::now() + grace(&w)).min(end);
+                    grace_until = Some(tokio::time::Instant::now() + grace(&w));
                     fallback = Some(w);
                 }
             }
@@ -2400,8 +2452,9 @@ pub async fn race_connect(
     exchange: bool,
     peer_claimed: Option<SocketAddr>,
     server_public_dialed: Arc<AtomicBool>,
+    answered: Arc<AtomicBool>,
 ) -> Option<UnreadTransport> {
-    race_connect_labeled(context, endpoint, peer_cands, secret, peer_id, attempt, my_uid, peer_uid, my_id, tx, "direct-quic", exchange, peer_claimed, server_public_dialed).await
+    race_connect_answered(context, endpoint, peer_cands, secret, peer_id, attempt, my_uid, peer_uid, my_id, tx, "direct-quic", exchange, peer_claimed, server_public_dialed, answered).await
 }
 
 /// Same race, but with the route label parameterized so rung-2 (hole-punch) can
@@ -2435,6 +2488,32 @@ pub async fn race_connect_labeled(
     exchange: bool,
     peer_claimed: Option<SocketAddr>,
     server_public_dialed: Arc<AtomicBool>,
+) -> Option<UnreadTransport> {
+    let answered = Arc::new(AtomicBool::new(false));
+    race_connect_answered(context, endpoint, peer_cands, secret, peer_id, attempt, my_uid, peer_uid, my_id, tx, route, exchange, peer_claimed, server_public_dialed, answered).await
+}
+
+/// `race_connect_labeled`, with `answered` set once a QUIC handshake with the
+/// peer completed (see `DIRECT_ANSWERED_BUDGET`), so a caller that owns a
+/// fallback clock of its own can tell a race that is still authenticating on
+/// a working path from one that never reached the peer.
+#[allow(clippy::too_many_arguments)]
+pub async fn race_connect_answered(
+    context: &crate::TransportContext,
+    endpoint: BoundEndpoint,
+    peer_cands: Vec<String>,
+    secret: &str,
+    peer_id: String,
+    attempt: AttemptId,
+    my_uid: String,
+    peer_uid: String,
+    my_id: String,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+    route: &str,
+    exchange: bool,
+    peer_claimed: Option<SocketAddr>,
+    server_public_dialed: Arc<AtomicBool>,
+    answered: Arc<AtomicBool>,
 ) -> Option<UnreadTransport> {
     #[cfg(feature = "sim")]
     let endpoint = match endpoint {
@@ -2591,6 +2670,9 @@ pub async fn race_connect_labeled(
     }
 
     let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(quinn::Connection, SendStream, RecvStream, bool)>> + Send>>> = Vec::new();
+    // Set when the PREFERRED connection's QUIC handshake completed (see
+    // `pick_preferred`).
+    let preferred_answered = Arc::new(AtomicBool::new(false));
 
     // Acceptor side: accept exactly one inbound, then auth as acceptor. The
     // deterministic winner fallback below depends on this bound; an accept
@@ -2598,9 +2680,15 @@ pub async fn race_connect_labeled(
     {
         let ep = endpoint.clone();
         let tkey = tkey;
+        let answered = answered.clone();
+        let preferred_answered = preferred_answered.clone();
         futs.push(Box::pin(async move {
             let incoming = ep.accept().await.ok_or_else(|| anyhow!("endpoint closed"))?;
             let conn = incoming.await.context("accept handshake")?;
+            answered.store(true, Ordering::Relaxed);
+            if preferred_connection(false, answerer) {
+                preferred_answered.store(true, Ordering::Relaxed);
+            }
             auth_conn(context, conn, tkey, false, exchange).await
         }));
     }
@@ -2619,11 +2707,17 @@ pub async fn race_connect_labeled(
         }
         let ep = endpoint.clone();
         let tkey = tkey;
+        let answered = answered.clone();
+        let preferred_answered = preferred_answered.clone();
         futs.push(Box::pin(async move {
             let connecting = ep
                 .connect(addr, "filament-direct")
                 .context("connect")?;
             let conn = connecting.await.context("dial handshake")?;
+            answered.store(true, Ordering::Relaxed);
+            if preferred_connection(true, answerer) {
+                preferred_answered.store(true, Ordering::Relaxed);
+            }
             auth_conn(context, conn, tkey, true, exchange).await
         }));
     }
@@ -2642,13 +2736,17 @@ pub async fn race_connect_labeled(
             |w| preferred_connection(w.3, answerer),
             |w| preferred_grace(w.0.rtt()),
             DIRECT_BUDGET,
+            &answered,
+            &preferred_answered,
+            DIRECT_ANSWERED_BUDGET,
         )
         .await
     };
 
-    // `pick_preferred` ends the race at DIRECT_BUDGET, keeping a connection it
-    // holds; this outer bound is a backstop only.
-    let winner = match tokio::time::timeout(DIRECT_BUDGET + std::time::Duration::from_secs(1), race).await {
+    // `pick_preferred` ends the race at DIRECT_BUDGET (DIRECT_ANSWERED_BUDGET
+    // on a path that answered), keeping a connection it holds; this outer
+    // bound is a backstop only.
+    let winner = match tokio::time::timeout(DIRECT_ANSWERED_BUDGET + std::time::Duration::from_secs(1), race).await {
         Ok(Some(w)) => w,
         _ => {
             endpoint.close(0u32.into(), b"direct-timeout");
@@ -3258,39 +3356,131 @@ mod tests {
         let bound = std::time::Duration::from_secs(5);
         // One connection, arriving well past the grace: it is the winner.
         let mut set: FuturesUnordered<Fut> = vec![after(200, 1, false)].into_iter().collect();
-        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_secs(2))).await;
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_secs(2), &AtomicBool::new(false), &AtomicBool::new(false), std::time::Duration::from_secs(2))).await;
         assert_eq!(got.expect("race bounded").map(|w| w.0), Some(1), "a slow sole connection was dropped");
         // A preferred one inside the grace after a non-preferred one beats it.
         let mut set: FuturesUnordered<Fut> =
             vec![after(10, 1, false), after(40, 2, true)].into_iter().collect();
-        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_secs(2))).await;
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_secs(2), &AtomicBool::new(false), &AtomicBool::new(false), std::time::Duration::from_secs(2))).await;
         assert_eq!(got.expect("race bounded").map(|w| w.0), Some(2));
         // Past the grace, the non-preferred one held is taken; the race does
         // not wait for a preferred one that is still far off.
         let mut set: FuturesUnordered<Fut> =
             vec![after(10, 1, false), after(3_000, 2, true)].into_iter().collect();
         let t0 = std::time::Instant::now();
-        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_secs(2))).await;
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_secs(2), &AtomicBool::new(false), &AtomicBool::new(false), std::time::Duration::from_secs(2))).await;
         assert_eq!(got.expect("race bounded").map(|w| w.0), Some(1));
         assert!(t0.elapsed() < std::time::Duration::from_millis(1_500), "waited past the grace");
         // Nothing at all within the budget: no direct path.
         let mut set: FuturesUnordered<Fut> = vec![after(3_000, 1, true)].into_iter().collect();
         let t0 = std::time::Instant::now();
-        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_millis(100))).await;
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_millis(100), &AtomicBool::new(false), &AtomicBool::new(false), std::time::Duration::from_millis(100))).await;
         assert!(got.expect("race bounded").is_none() && t0.elapsed() < std::time::Duration::from_millis(1_500));
         // A connection held when the budget runs out is kept, not dropped.
         let mut set: FuturesUnordered<Fut> =
             vec![after(80, 1, false), after(3_000, 2, true)].into_iter().collect();
         let long = |_: &(u32, bool)| std::time::Duration::from_secs(2);
         let t0 = std::time::Instant::now();
-        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, long, std::time::Duration::from_millis(300))).await;
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, long, std::time::Duration::from_millis(300), &AtomicBool::new(false), &AtomicBool::new(false), std::time::Duration::from_millis(300))).await;
         assert_eq!(got.expect("race bounded").map(|w| w.0), Some(1));
         assert!(t0.elapsed() < std::time::Duration::from_millis(1_500), "the grace ran past the budget");
         // Only errors: nothing, once the set is exhausted.
         let mut set: FuturesUnordered<Fut> =
             vec![Box::pin(async { Err(anyhow!("unreachable")) }) as Fut].into_iter().collect();
-        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_secs(2))).await;
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, std::time::Duration::from_secs(2), &AtomicBool::new(false), &AtomicBool::new(false), std::time::Duration::from_secs(2))).await;
         assert!(got.expect("race bounded").is_none());
+    }
+
+    /// Cold sends on send-slow-lossy-link (800 ms RTT, 20 % loss each way):
+    /// the handshake completed inside the budget, the authentication a moment
+    /// after it, and the race had already given up. A path that answered runs
+    /// to the answered budget; one that never answered still ends at the base
+    /// budget.
+    #[tokio::test]
+    async fn a_race_on_a_path_that_answered_waits_for_its_authentication() {
+        use futures_util::stream::FuturesUnordered;
+        type Fut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(u32, bool)>> + Send>>;
+        let ms = std::time::Duration::from_millis;
+        let grace = |_: &(u32, bool)| ms(50);
+        let bound = std::time::Duration::from_secs(5);
+        let auth_after = |answered: Arc<AtomicBool>, hs: u64, auth: u64| -> Fut {
+            Box::pin(async move {
+                tokio::time::sleep(ms(hs)).await;
+                answered.store(true, Ordering::Relaxed);
+                tokio::time::sleep(ms(auth)).await;
+                Ok((1, true))
+            })
+        };
+        // Handshake at 100 ms, authenticated at 500 ms, base budget 300 ms.
+        let answered = Arc::new(AtomicBool::new(false));
+        let mut set: FuturesUnordered<Fut> =
+            vec![auth_after(answered.clone(), 100, 400)].into_iter().collect();
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, ms(300), &answered, &AtomicBool::new(false), ms(2_000))).await;
+        assert_eq!(got.expect("race bounded").map(|w| w.0), Some(1), "an answered path was given up");
+        // Never answered: ends at the base budget, not the answered one.
+        let answered = Arc::new(AtomicBool::new(false));
+        let never: Fut = Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok((1, true))
+        });
+        let mut set: FuturesUnordered<Fut> = vec![never].into_iter().collect();
+        let t0 = std::time::Instant::now();
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, ms(300), &answered, &AtomicBool::new(false), ms(2_000))).await;
+        assert!(got.expect("race bounded").is_none());
+        assert!(t0.elapsed() < ms(1_000), "a path that never answered waited for the answered budget");
+        // Answered but the authentication never completes: still bounded.
+        let answered = Arc::new(AtomicBool::new(false));
+        let mut set: FuturesUnordered<Fut> =
+            vec![auth_after(answered.clone(), 50, 60_000)].into_iter().collect();
+        let t0 = std::time::Instant::now();
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, ms(300), &answered, &AtomicBool::new(false), ms(800))).await;
+        assert!(got.expect("race bounded").is_none());
+        assert!(t0.elapsed() < ms(1_500), "the answered budget did not bound the race");
+    }
+
+    /// The two ends must take the same connection. Holding the non-preferred
+    /// one past its grace while the preferred one's handshake had completed,
+    /// the race took the held one and dropped the one the other end took:
+    /// "connection lost" with zero frames at both ends. A preferred connection
+    /// whose handshake completed is waited for; one that never answered is
+    /// not.
+    #[tokio::test]
+    async fn a_preferred_connection_that_answered_is_waited_for() {
+        use futures_util::stream::FuturesUnordered;
+        type Fut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(u32, bool)>> + Send>>;
+        let ms = std::time::Duration::from_millis;
+        let grace = |_: &(u32, bool)| ms(50);
+        let bound = std::time::Duration::from_secs(5);
+        let held: Fut = Box::pin(async move {
+            tokio::time::sleep(ms(10)).await;
+            Ok((1, false))
+        });
+        let pref = Arc::new(AtomicBool::new(false));
+        let p = pref.clone();
+        let preferred: Fut = Box::pin(async move {
+            tokio::time::sleep(ms(30)).await;
+            p.store(true, Ordering::Relaxed); // its handshake completed
+            tokio::time::sleep(ms(400)).await; // the authentication is slow
+            Ok((2, true))
+        });
+        let any = AtomicBool::new(true);
+        let mut set: FuturesUnordered<Fut> = vec![held, preferred].into_iter().collect();
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, ms(300), &any, &pref, ms(2_000))).await;
+        assert_eq!(got.expect("race bounded").map(|w| w.0), Some(2), "the answered preferred connection was dropped");
+        // The preferred one never answered: the held one at its grace.
+        let held: Fut = Box::pin(async move {
+            tokio::time::sleep(ms(10)).await;
+            Ok((1, false))
+        });
+        let silent: Fut = Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok((2, true))
+        });
+        let mut set: FuturesUnordered<Fut> = vec![held, silent].into_iter().collect();
+        let t0 = std::time::Instant::now();
+        let got = tokio::time::timeout(bound, pick_preferred(&mut set, |w| w.1, grace, ms(300), &any, &AtomicBool::new(false), ms(2_000))).await;
+        assert_eq!(got.expect("race bounded").map(|w| w.0), Some(1));
+        assert!(t0.elapsed() < ms(250), "waited for a preferred connection that never answered");
     }
 
     #[test]
