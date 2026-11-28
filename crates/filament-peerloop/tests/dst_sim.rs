@@ -359,3 +359,32 @@ fn test_slow_disk_is_invisible_when_writes_stay_off_the_loop() {
     let out = SimWorld::run(cfg);
     assert!(out.budget_violations.is_empty(), "{:?}", out.budget_violations);
 }
+
+/// The first verified fleet-hello from a sibling this daemon holds no record
+/// for makes it index that sibling (`devices_upsert_atomic`: a locked
+/// read-modify-write of devices.json with an fsync). With every disk slower
+/// than the loop budget, that write must not run on the event loop: the
+/// loop-budget oracle fires on the first hello if it does.
+#[test]
+fn test_first_fleet_hello_index_write_stays_off_the_loop() {
+    let mut cfg = fleet_config(3, vec![]);
+    cfg.schedule = ["alpha", "bravo", "charlie"]
+        .iter()
+        .map(|n| ScheduledFault {
+            at_ms: 0,
+            fault: Fault::SlowDisk { node: n.to_string(), write_ms: 1_500 },
+        })
+        .collect();
+    let out = SimWorld::run(cfg);
+    let indexed: Vec<String> = out
+        .events
+        .iter()
+        .filter(|e| e.message.contains("fleet peer indexed as"))
+        .map(|e| format!("{}: {}", e.node, e.message))
+        .collect();
+    println!("FLEET_INDEXED: {indexed:?}");
+    println!("BUDGET_VIOLATIONS: {:?}", out.budget_violations);
+    // Not vacuous: the fleet-hello did index a sibling under the slow disk.
+    assert!(!indexed.is_empty(), "no fleet sibling was indexed");
+    assert!(out.budget_violations.is_empty(), "{:?}", out.budget_violations);
+}
