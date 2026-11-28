@@ -1,0 +1,58 @@
+{
+  "hooks": {},
+  "origin": "written 2026-11-28 for #748 (send re-dial after a server outage), and the regression test of the fix that came out of it: two 16 MiB cold sends start while the server is down, meet their receivers on the local network, and have that link cut for 6 s mid-transfer (net.partition) while the server is still down; the server returns at 40 s. Main 2d412ab53 failed 12/12 by O15 ('the receiver is unreachable ... did not come back within 45s', 37 to 52 s after the last heal): the LAN re-dial relinked the receiver under a new pid, which the established send kept as a responder while its stall ladder rebuilt the dead LAN pid. Reverting #748 also fails 12/12.",
+  "seed": 0,
+  "steps": [
+    {
+      "args": {
+        "delay_ms": 80,
+        "dup": 0,
+        "jitter_ms": 300,
+        "loss": 5,
+        "reorder": 25
+      },
+      "at": 2.3,
+      "dur": 36.3,
+      "fault": "net.impair",
+      "target": "alpha"
+    },
+    {
+      "at": 16.0,
+      "dur": 24.0,
+      "fault": "server.down"
+    },
+    {
+      "at": 17.2,
+      "cold": true,
+      "dst": "charlie",
+      "kib": 16384,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 17.3,
+      "cold": true,
+      "dst": "bravo",
+      "kib": 16384,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "a": "alpha",
+      "at": 25.0,
+      "b": "charlie",
+      "dur": 6.0,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "a": "alpha",
+      "at": 26.0,
+      "b": "bravo",
+      "dur": 6.0,
+      "fault": "net.partition",
+      "proto": "all"
+    }
+  ],
+  "version": 1
+}
