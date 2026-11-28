@@ -1,0 +1,103 @@
+{
+  "hooks": {
+    "bravo": {
+      "TUNLION_TEST_DIRECT_FLAKY": "1"
+    }
+  },
+  "seed": 115932015,
+  "steps": [
+    {
+      "at": 0.0,
+      "dur": 6.0,
+      "fault": "sig.blackhole",
+      "target": "bravo"
+    },
+    {
+      "at": 4.8,
+      "dur": 25.9,
+      "fault": "sig.blackhole",
+      "target": "charlie"
+    },
+    {
+      "a": "alpha",
+      "at": 6.4,
+      "b": "bravo",
+      "dur": 32.3,
+      "fault": "net.partition",
+      "proto": "all"
+    },
+    {
+      "at": 6.7,
+      "dur": 6.5,
+      "fault": "sig.blackhole",
+      "target": "charlie"
+    },
+    {
+      "at": 6.8,
+      "dur": 5.6,
+      "fault": "sig.reset",
+      "target": "charlie"
+    },
+    {
+      "at": 6.9,
+      "dur": 9.7,
+      "fault": "server.down"
+    },
+    {
+      "at": 9.5,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "at": 14.0,
+      "dur": 2.2,
+      "fault": "proc.freeze",
+      "target": "charlie"
+    },
+    {
+      "at": 14.4,
+      "dst": "alpha",
+      "op": "doctor",
+      "src": "charlie"
+    },
+    {
+      "at": 16.6,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 24.2,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "charlie"
+    },
+    {
+      "at": 35.0,
+      "dst": "charlie",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 35.6,
+      "dst": "alpha",
+      "op": "exec",
+      "src": "bravo"
+    },
+    {
+      "at": 37.7,
+      "dst": "bravo",
+      "kib": 4,
+      "op": "send",
+      "src": "alpha"
+    },
+    {
+      "at": 38.7,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}
