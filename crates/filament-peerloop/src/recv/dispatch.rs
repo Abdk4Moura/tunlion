@@ -10472,14 +10472,18 @@ async fn recv_run(
                             }
                             // The lingering stream(s) are STALLED, flush their
                             // partials to disk and drop them so the resume below
-                            // re-opens the .part from its saved offset.
+                            // re-opens the .part from its saved offset. The
+                            // resume reads the offset the writes left (the
+                            // file's length and its meta), not what reached the
+                            // platter, so the fsync is for a crash only and runs
+                            // on its own task: awaited here it held the loop for
+                            // as long as the disk took.
                             for k in dup_keys {
                                 if let Some(inc) = st.by_sid.remove(&k) {
-                                    let f = inc.file.clone();
-                                    let _ = crate::sim_rt::run_blocking(move || {
-                                        let _ = f.sync_all();
-                                    })
-                                    .await;
+                                    let (f, h) = (inc.file.clone(), host.clone());
+                                    tokio::spawn(crate::sim_rt::run_blocking(move || {
+                                        let _ = h.sync_received_file(&f);
+                                    }));
                                 }
                             }
                         }
