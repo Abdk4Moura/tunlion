@@ -270,6 +270,7 @@ impl FuzzSchedule {
             mutant,
             quiet_logs: false,
             semantic_faults: self.semantic_faults.clone(),
+            ..Default::default()
         }
     }
 

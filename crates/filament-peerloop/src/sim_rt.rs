@@ -216,3 +216,83 @@ pub(crate) fn record_iter_busy(
 pub fn take_sim_telemetry() -> SimTelemetry {
     SIM_TELEMETRY.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
+
+// ---------------------------------------------------------------------------
+// Synchronous time on the daemon loop (`--features sim`).
+//
+// Under the paused-clock sim runtime a blocking call (an fsync'd write) takes
+// no virtual time at all, so the loop-budget oracle could never see one that
+// ran on the event loop. A blocking seam (the sim store's durable write) says
+// how long the call took with [`charge_blocking_ms`]. The time counts against
+// the loop only when the call ran while the loop task itself was being polled
+// (inside a [`LoopScoped`] future): that is exactly the case where production
+// would have held its event loop for that long. A call made from another task
+// or from a blocking thread held only that thread, as it does in production's
+// multi-thread runtime, and is not charged to the loop.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sim")]
+thread_local! {
+    static SIM_LOOP_SCOPE: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Charge `ms` of synchronous (blocking) time to the daemon loop being polled
+/// on this thread, if any. Returns true when the time was charged to a loop.
+#[cfg(feature = "sim")]
+pub fn charge_blocking_ms(ms: u64) -> bool {
+    SIM_LOOP_SCOPE.with(|cell| match cell.borrow().as_ref() {
+        Some(total) => {
+            total.fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        None => false,
+    })
+}
+
+/// Total synchronous time charged so far to the loop being polled on this
+/// thread (0 outside a loop poll). The loop budget reads it at the start and
+/// end of each busy stretch.
+#[cfg(feature = "sim")]
+pub(crate) fn loop_charged_ms() -> u64 {
+    SIM_LOOP_SCOPE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0, |t| t.load(std::sync::atomic::Ordering::Relaxed))
+    })
+}
+
+/// A future that marks every poll of `inner` as "the daemon loop is running on
+/// this thread" for [`charge_blocking_ms`]. Tasks `inner` spawns are separate
+/// tasks and are not inside the scope.
+#[cfg(feature = "sim")]
+pub struct LoopScoped<F> {
+    inner: std::pin::Pin<Box<F>>,
+    total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(feature = "sim")]
+impl<F> LoopScoped<F> {
+    pub fn new(inner: F) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+}
+
+#[cfg(feature = "sim")]
+impl<F: std::future::Future> std::future::Future for LoopScoped<F> {
+    type Output = F::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let total = self.total.clone();
+        let prev = SIM_LOOP_SCOPE.with(|cell| cell.replace(Some(total)));
+        let out = self.inner.as_mut().poll(cx);
+        SIM_LOOP_SCOPE.with(|cell| *cell.borrow_mut() = prev);
+        out
+    }
+}

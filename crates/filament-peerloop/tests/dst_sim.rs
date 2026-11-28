@@ -256,3 +256,69 @@ fn test_throughput_benchmark() {
     );
     assert!(runs_per_sec > 5.0, "too slow: {runs_per_sec:.2} runs/sec");
 }
+
+fn fleet_config(seed: u64, dials: Vec<(u64, &str)>) -> SimConfig {
+    let (ab, ac, bc) = ("s-ab".to_string(), "s-ac".to_string(), "s-bc".to_string());
+    let node = |n: &str, u: &str, peers: Vec<(&str, &String)>| NodeSpec {
+        name: n.to_string(),
+        uid: u.to_string(),
+        peers: peers.into_iter().map(|(p, s)| (p.to_string(), s.clone())).collect(),
+    };
+    SimConfig {
+        seed,
+        duration_ms: 40_000,
+        nodes: vec![
+            node("alpha", "uid-alpha", vec![("bravo", &ab), ("charlie", &ac)]),
+            node("bravo", "uid-bravo", vec![("alpha", &ab), ("charlie", &bc)]),
+            node("charlie", "uid-charlie", vec![("alpha", &ac), ("bravo", &bc)]),
+        ],
+        reach: true,
+        fleet: true,
+        one_shot_dials: dials
+            .into_iter()
+            .map(|(at_ms, t)| filament_peerloop::sim::OneShotDial {
+                at_ms,
+                target: t.to_string(),
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// The fleet paths run: daemons of one fleet verify each other's
+/// production `fleet-hello` over the direct link's channel binding.
+#[test]
+fn test_fleet_daemons_verify_each_others_hello() {
+    let cfg = fleet_config(3, vec![]);
+    let out = SimWorld::run(cfg);
+    let verified = out
+        .events
+        .iter()
+        .filter(|e| e.message.contains("step=verified") || e.message.contains("step=admitted"))
+        .count();
+    let refused = out
+        .events
+        .iter()
+        .filter(|e| e.message.contains("fleet-hello") && (e.message.contains("rejected") || e.message.contains("refused")))
+        .map(|e| e.message.clone())
+        .collect::<Vec<_>>();
+    println!("FLEET_HELLO: admitted_lines={verified} refused={refused:?}");
+    assert!(refused.is_empty(), "fleet-hello refused: {refused:?}");
+    assert!(verified >= 2, "no fleet-hello was verified");
+}
+
+/// A slow disk makes a durable write ON the loop visible to the loop-budget
+/// oracle, and leaves an off-loop write alone: on clean main every periodic
+/// store write runs on a blocking thread, so a slow disk alone trips nothing
+/// in a world with no fleet traffic.
+#[test]
+fn test_slow_disk_is_invisible_when_writes_stay_off_the_loop() {
+    let mut cfg = two_node_config(77, 70_000);
+    cfg.reach = true;
+    cfg.schedule = vec![
+        ScheduledFault { at_ms: 1_000, fault: Fault::SlowDisk { node: "alpha".to_string(), write_ms: 2_500 } },
+        ScheduledFault { at_ms: 65_000, fault: Fault::ClearSlowDisk { node: "alpha".to_string() } },
+    ];
+    let out = SimWorld::run(cfg);
+    assert!(out.budget_violations.is_empty(), "{:?}", out.budget_violations);
+}

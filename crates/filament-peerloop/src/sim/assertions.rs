@@ -175,7 +175,9 @@ pub fn evaluate_oracles(outcome: &SimOutcome, config: &SimConfig) -> Vec<OracleV
                     | Fault::ClearImpair { .. }
                     | Fault::Hang { .. }
                     | Fault::SetMessageChaos { .. }
-                    | Fault::ClearMessageChaos => {}
+                    | Fault::ClearMessageChaos
+                    | Fault::SlowDisk { .. }
+                    | Fault::ClearSlowDisk { .. } => {}
                 }
             }
         } else {
