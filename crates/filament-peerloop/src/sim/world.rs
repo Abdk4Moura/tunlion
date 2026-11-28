@@ -26,7 +26,8 @@ use crate::sim::assertions::{record_sometimes, reset_assertions, take_assertions
 use crate::sim::fleet::{SimFleet, SimFleetMember};
 use crate::sim::net::{Fault, NetTraceEvent, SimNetwork};
 use crate::sim::oneshot::OneShot;
-use crate::sim::store::SimStore;
+pub use crate::sim::sender::SimSend;
+use crate::sim::store::{SimDisk, SimStore};
 use crate::sim::semantic::{
     ProtoEvent, SemanticAction, SemanticFault, SemanticTrigger, StateEdge, StateTransition,
 };
@@ -120,6 +121,8 @@ pub struct SimConfig {
     /// With `fleet`: members whose certificate is due for renewal, so their
     /// daemons ask a primary to re-sign it.
     pub renewal_due: Vec<String>,
+    /// Files sent between daemons over their held link (see `sim::sender`).
+    pub sends: Vec<SimSend>,
 }
 
 /// A one-shot dial of `target` starting at `at_ms` (see `sim::oneshot`).
@@ -185,6 +188,8 @@ struct SimHost {
     peers: Vec<(String, String)>,
     ctl_slot: Arc<Mutex<Option<mpsc::UnboundedSender<Req>>>>,
     fleet_member: Option<Arc<SimFleetMember>>,
+    /// The node's disk: a received file's fsync takes its write latency.
+    disk: Arc<SimDisk>,
 }
 
 #[async_trait]
@@ -248,6 +253,31 @@ impl HostServices for SimHost {
 
     fn device_record_revoked(&self, _name: &str) -> bool {
         false
+    }
+
+    /// A file transfer from a proven, unrevoked peer that the legacy policy
+    /// allows is admitted, as production admits a trusted sibling's send.
+    /// Every other capability keeps the inert host's answer (deny).
+    fn cap_gate_effective(
+        &self,
+        gate: crate::host::CapGate<'_>,
+    ) -> filament_cap::capability::GateDecision {
+        use filament_cap::capability::{BindingStrength, GateDecision};
+        if gate.action == filament_cap::capability::CAP_TRANSFER
+            && gate.legacy_allowed
+            && gate.binding == BindingStrength::Proven
+            && !gate.cert_revoked
+            && !gate.denied
+        {
+            GateDecision::Allow
+        } else {
+            GateDecision::Deny { cap_reason: None }
+        }
+    }
+
+    fn sync_received_file(&self, file: &std::fs::File) -> std::io::Result<()> {
+        self.disk.file_sync();
+        file.sync_all()
     }
 
     async fn serve_control(
@@ -520,6 +550,8 @@ impl RecvIdentity for SimIdentity {
 struct SimDaemon {
     pid: u32,
     inner: NoDaemon,
+    /// The daemon's liveness probes, for a warm send's preflight ping.
+    liveness: crate::daemon_ctl::LivenessProbes,
 }
 
 #[async_trait]
@@ -531,6 +563,13 @@ impl RecvDaemon for SimDaemon {
         tx: &mpsc::UnboundedSender<filament_transport::net::Ev>,
         req: Req,
     ) {
+        // A sim sender rides the daemon's held link, as `tunlion send --to`
+        // does (see sim::sender). Everything else stays unserved.
+        #[cfg(unix)]
+        if matches!(req.kind, ReqKind::SendLink { .. }) {
+            crate::l2::warm_send::handle_warm_send(conn, &self.liveness, req).await;
+            return;
+        }
         self.inner.warm_req(conn, muxes, tx, req).await;
     }
 
@@ -568,11 +607,14 @@ impl RecvDaemon for SimDaemon {
     }
 
     async fn reach_ping(&mut self, conn: &Conn, pid: &str, v: &Value) {
-        self.inner.reach_ping(conn, pid, v).await;
+        if let Some(t) = conn.transport_of(pid) {
+            let _ = t.send_control(&crate::daemon_ctl::liveness_pong(v)).await;
+        }
     }
 
     async fn reach_pong(&mut self, conn: &Conn, pid: &str, v: &Value) {
-        self.inner.reach_pong(conn, pid, v).await;
+        let peer = conn.link_peer_name(pid);
+        self.liveness.answered(peer.as_deref(), pid, v);
     }
 
     fn peer_present(
@@ -703,6 +745,17 @@ impl RecvDaemon for SimDaemon {
     fn request_reload(&mut self) {}
 }
 
+/// A node's receive inbox. A world that sends files has its own, which it
+/// empties at start: worlds run side by side in one test process, and one
+/// that removes an inbox another is using changes what that one logs.
+fn sim_inbox(node: &str, sends: bool) -> PathBuf {
+    if sends {
+        PathBuf::from(format!("/tmp/sim-send-inbox-{node}"))
+    } else {
+        PathBuf::from(format!("/tmp/sim-inbox-{node}"))
+    }
+}
+
 struct RunningNode {
     spec: NodeSpec,
     engine: Option<Engine<DriverOutcome<Result<()>>>>,
@@ -739,6 +792,8 @@ fn build_recv_env(spec: &NodeSpec, pid: u32) -> RecvEnv {
 /// fleet membership.
 #[derive(Clone, Default)]
 struct NodeState {
+    /// The world sends files (`SimConfig::sends`): its own inboxes.
+    sends: bool,
     stores: Arc<Mutex<BTreeMap<String, Arc<SimStore>>>>,
     fleet: Option<Arc<SimFleet>>,
 }
@@ -781,6 +836,7 @@ fn spawn_daemon(
         peers: spec.peers.clone(),
         ctl_slot: ctl_slot.clone(),
         fleet_member: fleet.as_ref().map(|(_, m)| m.clone()),
+        disk: net.disk(&spec.name),
     });
     let env = build_recv_env(spec, pid);
     let ports = RecvPorts::new(
@@ -796,13 +852,14 @@ fn spawn_daemon(
         Box::new(SimDaemon {
             pid,
             inner: NoDaemon,
+            liveness: crate::daemon_ctl::LivenessProbes::new(),
         }),
         Arc::new(NoPrompt),
         Box::new(NoPty),
         Arc::new(crate::present::NoScreen),
         env,
     );
-    let dir = PathBuf::from(format!("/tmp/sim-inbox-{}", spec.name));
+    let dir = sim_inbox(&spec.name, state.sends);
     let cancel = Cancellation::default();
     // Every poll of the daemon future is "the loop is running" for the
     // blocking-time charge (sim_rt::LoopScoped).
@@ -1138,6 +1195,7 @@ impl SimWorld {
 
             let net = SimNetwork::with_options(config.seed, config.mutant.clone(), config.reach);
             let node_state = NodeState {
+                sends: !config.sends.is_empty(),
                 stores: Default::default(),
                 fleet: if config.fleet {
                     let names: Vec<String> = config.nodes.iter().map(|n| n.name.clone()).collect();
@@ -1162,6 +1220,14 @@ impl SimWorld {
                     if let Some(m) = f.member(name) {
                         store.seed_record(name, m.device_pub());
                     }
+                }
+            }
+            // A world that sends files starts with empty inboxes: a partial
+            // or a stored file from an earlier run would be resumed or
+            // renamed around, and the run would not replay.
+            if !config.sends.is_empty() {
+                for n in &config.nodes {
+                    let _ = std::fs::remove_dir_all(sim_inbox(&n.name, true));
                 }
             }
             let logs = Arc::new(Mutex::new(Vec::<SimTraceEntry>::new()));
@@ -1293,6 +1359,7 @@ impl SimWorld {
                 QueryCapStatus(String),
                 InjectInlineStall(u64),
                 OneShotDial(String),
+                Send(SimSend),
             }
             let mut timeline: Vec<(u64, Action)> = config
                 .schedule
@@ -1311,6 +1378,9 @@ impl SimWorld {
             }
             for d in &config.one_shot_dials {
                 timeline.push((d.at_ms, Action::OneShotDial(d.target.clone())));
+            }
+            for snd in &config.sends {
+                timeline.push((snd.at_ms, Action::Send(snd.clone())));
             }
             let mut one_shots: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             timeline.sort_by_key(|(at, _)| *at);
@@ -1354,6 +1424,23 @@ impl SimWorld {
                     }
                     Action::InjectInlineStall(stall_ms) => {
                         sim_rt::set_sim_inline_stall_ms(stall_ms);
+                    }
+                    Action::Send(snd) => {
+                        let slot = running
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .iter()
+                            .find(|n| n.spec.name == snd.from)
+                            .map(|n| n.ctl_slot.clone());
+                        if let Some(slot) = slot {
+                            let n = one_shots.len() + 1;
+                            one_shots.push(tokio::spawn(crate::sim::sender::send(
+                                net.clone(),
+                                slot,
+                                snd,
+                                n,
+                            )));
+                        }
                     }
                     Action::OneShotDial(target) => {
                         if let Some(f) = node_state.fleet.as_ref() {

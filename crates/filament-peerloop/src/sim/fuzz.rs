@@ -369,6 +369,7 @@ impl FuzzSchedule {
             one_shot_dials,
             fleet_primary: None,
             renewal_due: Vec::new(),
+            sends: Vec::new(),
         }
     }
 

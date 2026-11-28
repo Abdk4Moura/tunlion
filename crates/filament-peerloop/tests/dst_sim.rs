@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use filament_peerloop::sim::{
-    Fault, NodeSpec, Proto, ScheduledFault, SimConfig, SimMutant, SimWorld,
+    Fault, NodeSpec, Proto, ScheduledFault, SimConfig, SimMutant, SimSend, SimWorld,
 };
 
 fn two_node_config(seed: u64, duration_ms: u64) -> SimConfig {
@@ -432,5 +432,71 @@ fn test_cert_renewal_writes_stay_off_the_loop() {
     let adopted = adopted.expect("the requester never adopted a renewed certificate");
     // The requester adopts only what the owner acked, after its write.
     assert!(renewed < adopted, "adopted at event {adopted} before the owner renewed at {renewed}");
+    assert!(out.budget_violations.is_empty(), "{:?}", out.budget_violations);
+}
+
+/// Receive completion: the fsync of the received file, the whole-file check
+/// and the rename. With the receiver's disk slower than the loop budget,
+/// none of it may run on the event loop: the loop-budget oracle fires on
+/// `file-end` (or `MaybeComplete`) if it does. The sender must still get its
+/// `delivery-ack`, and only after the receiver verified and stored the file.
+#[test]
+fn test_receive_completion_stays_off_the_loop() {
+    // A fleet world: the sender's fleet-hello proves its identity, so the
+    // receiving daemon decides the offer instead of holding it.
+    let mut cfg = fleet_config(3, vec![]);
+    cfg.duration_ms = 60_000;
+    cfg.schedule = vec![ScheduledFault {
+        at_ms: 0,
+        fault: Fault::SlowDisk { node: "bravo".to_string(), write_ms: 1_500 },
+    }];
+    cfg.sends = vec![SimSend {
+        at_ms: 10_000,
+        from: "alpha".to_string(),
+        to: "bravo".to_string(),
+        bytes: 1 << 20,
+    }];
+    let out = SimWorld::run(cfg.clone());
+    let again = SimWorld::run(cfg);
+    if out.trace_hash != again.trace_hash {
+        if let Some((a, b)) = out.events.iter().zip(again.events.iter()).find(|(a, b)| a != b) {
+            println!("FIRST_EV_DIFF: {a:?}\n          vs {b:?}");
+        }
+        if let Some((a, b)) = out
+            .net_events
+            .iter()
+            .zip(again.net_events.iter())
+            .find(|(a, b)| a.event != b.event || a.at_ms != b.at_ms)
+        {
+            println!("FIRST_NET_DIFF: {a:?}\n           vs {b:?}");
+        }
+    }
+    assert_eq!(out.trace_hash, again.trace_hash, "did not replay");
+    let sends: Vec<String> = out
+        .net_events
+        .iter()
+        .filter(|e| e.event.starts_with("send:"))
+        .map(|e| format!("{}@{}", e.event, e.at_ms))
+        .collect();
+    let verified = out
+        .events
+        .iter()
+        .find(|e| e.node == "bravo" && e.message.contains("verified (whole-file sha256 matched), acked"))
+        .map(|e| e.at_ms);
+    let acked = out
+        .net_events
+        .iter()
+        .find(|e| e.event.starts_with("send:acked:alpha:bravo"))
+        .map(|e| e.at_ms);
+    println!("SENDS: {sends:?}");
+    println!("BUDGET_VIOLATIONS: {:?}", out.budget_violations);
+    // Not vacuous: the file went through the receiver's completion and the
+    // sender heard the delivery-ack, under the slow disk.
+    let acked = acked.unwrap_or_else(|| panic!("the send was not acked: {sends:?}"));
+    let verified = verified.expect("bravo never verified the file");
+    // The ack follows the receiver's check and store, never precedes it.
+    assert!(verified <= acked, "acked at {acked} ms before bravo verified at {verified} ms");
+    let stored = std::fs::metadata("/tmp/sim-send-inbox-bravo/sim-send-1.bin").map(|m| m.len());
+    assert_eq!(stored.ok(), Some(1 << 20), "the file was not stored whole");
     assert!(out.budget_violations.is_empty(), "{:?}", out.budget_violations);
 }

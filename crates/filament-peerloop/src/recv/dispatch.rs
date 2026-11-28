@@ -1059,6 +1059,10 @@ impl DeferredControl {
 /// Receive-transfer and consent state for one dispatch.
 pub struct RecvState {
     pub by_sid: HashMap<(String, u32), IncomingFile>,
+    /// Streams whose completion (fsync, whole-file check, rename) is running
+    /// off the loop, keyed like `by_sid`. Each left `by_sid` when its
+    /// completion was queued and is answered when the result comes back.
+    pub completing: HashMap<(String, u32), CompletionInFlight>,
     pub verify_fails: HashMap<String, u32>,
     pub completed: usize,
     pub ever_received: bool,
@@ -1069,6 +1073,29 @@ pub struct RecvState {
     pub recv_pending_offers: HashMap<String, DeferredControl>,
     pub recv_cers: HashMap<String, Ceremony>,
     pub recv_deadlines: HashMap<String, Instant>,
+}
+
+/// One receive completion running off the loop (`start_completion`).
+pub struct CompletionInFlight {
+    /// The transfer id.
+    pub id: String,
+    /// Re-offers of this transfer that arrived meanwhile, with their link.
+    /// They are decided once the completion is answered: by then a stored
+    /// file is in the delivery map and the re-offer is re-acked, and one
+    /// that was not stored resumes from its partial.
+    pub reoffers: Vec<(String, DeferredControl)>,
+}
+
+impl RecvState {
+    /// No stream is receiving and none is completing.
+    pub fn streams_idle(&self) -> bool {
+        self.by_sid.is_empty() && self.completing.is_empty()
+    }
+
+    /// The completion in flight for transfer `id`, if any.
+    fn completing_id(&mut self, id: &str) -> Option<&mut CompletionInFlight> {
+        self.completing.values_mut().find(|c| c.id == id)
+    }
 }
 
 /// Resources retained when the inline driver is cancelled at ANY yielding
@@ -1911,6 +1938,7 @@ async fn recv_run(
     let writer_tasks = cleanup.writers.clone();
     let st = cleanup.state.insert(RecvState {
         by_sid: HashMap::new(),
+        completing: HashMap::new(),
         verify_fails: HashMap::new(),
         completed: 0usize,
         ever_received: false,
@@ -2683,6 +2711,8 @@ async fn recv_run(
     let mut fleet_verified: std::collections::HashSet<String> = Default::default();
     // Peer-triggered store writes run off the loop, in order (StoreLane).
     let store_lane = StoreLane::start(tx.clone());
+    // Receive completions run off the loop too, on their own lane.
+    let recv_lane = StoreLane::start(tx.clone());
     // Device keys whose fleet index write is queued or running, so a repeat
     // hello from the same device does not queue a second one.
     #[cfg(feature = "fleet")]
@@ -2932,7 +2962,7 @@ async fn recv_run(
         if test_hooks::wedge_loop_on_shutdown() && !conn.links.is_empty() {
             std::future::pending::<()>().await;
         }
-        if !daemon && !keep_open && st.by_sid.is_empty() {
+        if !daemon && !keep_open && st.streams_idle() {
             if let Some(what) = sender_cancelled.take() {
                 conn.present.clear_sticky();
                 let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
@@ -2956,7 +2986,7 @@ async fn recv_run(
         if !daemon
             && !keep_open
             && st.completed == 0
-            && st.by_sid.is_empty()
+            && st.streams_idle()
             && st.pending.is_empty()
             && st.recv_pending_offers.is_empty()
         {
@@ -3420,7 +3450,7 @@ async fn recv_run(
         // Store writes a peer asked for, finished off the loop (StoreLane):
         // apply what they mean for the loop's state.
         loop_budget.enter("store-lane");
-        for done in store_lane.take_done() {
+        for done in store_lane.take_done().into_iter().chain(recv_lane.take_done()) {
             match done {
                 #[cfg(feature = "fleet")]
                 StoreDone::FleetIndexed { pid, generation, device_pub, shown, result } => {
@@ -3496,6 +3526,149 @@ async fn recv_run(
                     }
                 }
                 StoreDone::CertAdopted => {}
+                StoreDone::RecvCompleted { pid, sid, ack_sid, id, sender, outcome } => {
+                    let reoffers = st
+                        .completing
+                        .remove(&(pid.clone(), sid))
+                        .map(|c| c.reoffers)
+                        .unwrap_or_default();
+                    match outcome {
+                        Completion::Failed(e) => return Err(e),
+                        Completion::Refused { fid, token, msg } => {
+                            st.verify_fails.remove(&id);
+                            if let Some(t) = conn.transport_of(&pid) {
+                                let _ = t
+                                    .send_control(&protocol::refuse_msg(&fid, token, &msg))
+                                    .await;
+                            }
+                        }
+                        Completion::GaveUp { name } => {
+                            log.critical(&log.paint(
+                                Tone::Err,
+                                &format!(
+                                    "  {name}: whole-file checksum still wrong after {MAX_VERIFY_FAILS} re-fetches, refusing to accept a corrupt file (partial kept)"
+                                ),
+                            ));
+                            st.verify_fails.remove(&id);
+                        }
+                        Completion::Refetch { inc, req_offset, restart_from_zero } => {
+                            let mut inc = *inc;
+                            let fails = st.verify_fails.entry(id.clone()).or_insert(0);
+                            *fails += 1;
+                            if restart_from_zero {
+                                log.debug(&log.paint(
+                                    Tone::Warn,
+                                    &format!(
+                                        "  {}: received all bytes but whole-file checksum FAILED (corrupt), re-fetching from 0 (attempt {})",
+                                        inc.name, *fails
+                                    ),
+                                ));
+                            } else {
+                                log.debug(&log.paint(
+                                    Tone::Warn,
+                                    &format!(
+                                        "  {}: TRUNCATED ({}/{}), checksum can't match yet; re-requesting the rest (attempt {})",
+                                        inc.name,
+                                        crate::present::human(req_offset),
+                                        crate::present::human(inc.size),
+                                        *fails
+                                    ),
+                                ));
+                            }
+                            writer_tasks.join_sid(&pid, sid, log.as_ref()).await;
+                            inc.completion.reset(&inc.end_seen);
+                            st.by_sid.insert((pid.clone(), sid), inc);
+                            if let Some(t) = conn.transport_of(&pid) {
+                                let _ = t
+                                    .send_control(&protocol::accept_msg(&id, req_offset))
+                                    .await;
+                            }
+                        }
+                        Completion::Unverified => {
+                            st.completed += 1;
+                            conn.note_completed_transfer(&pid, sender.as_deref());
+                        }
+                        Completion::NotPlaced => {
+                            st.verify_fails.remove(&id);
+                        }
+                        Completion::Verified { name: nm } => {
+                            st.verify_fails.remove(&id);
+                            st.completed += 1;
+                            conn.note_completed_transfer(&pid, sender.as_deref());
+                            // BUG-ACKLOSS reproducer: tear the link DOWN at the
+                            // instant the ack is due, so the sender never sees it and
+                            // its transport observes ApplicationClosed(0,""). In
+                            // `=once` mode this fires only the FIRST time, so a daemon
+                            // receiver recovers (delivers) on the re-dial.
+                            //
+                            // RESTORED 2026-08-30. This arm was wired in 12a8db82 and
+                            // was gone by the next commit, with no commit deleting it;
+                            // the else-if chain survived MINUS its first arm, which is
+                            // what a botched conflict resolution looks like. For ~620
+                            // commits `cli/tests/ack-loss-repro.sh` set
+                            // TUNLION_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
+                            // its "premature" round ran an ordinary transfer and the
+                            // promptness verdict measured the happy path.
+                            // `hooks_that_nothing_calls` now fails if any hook loses
+                            // its last call site again.
+                            if test_hooks::premature_close_after_ack()
+                                && !(test_hooks::premature_close_once()
+                                    && test_hooks::premature_already_fired())
+                            {
+                                if test_hooks::premature_close_once() {
+                                    test_hooks::premature_mark_fired();
+                                }
+                                log.say(&log.paint(
+                                    Tone::Warn,
+                                    &format!(
+                                        "    [test] {nm} PREMATURE-CLOSE at ack (reproducing ack-loss / corpse)"
+                                    ),
+                                ));
+                                // Drop first: its close releases a sync task parked in a write.
+                                conn.drop_link(&pid);
+                                sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
+                            } else if test_hooks::suppress_delivery_ack() {
+                                log.say(&log.paint(
+                                    Tone::Warn,
+                                    &format!("    [test] {nm} verified but SUPPRESSING delivery-ack"),
+                                ));
+                            } else if let Some(t) = conn.transport_of(&pid) {
+                                let _ = t
+                                    .send_control(&crate::recv::files::delivery_ack(
+                                        &id,
+                                        ack_sid,
+                                        &ports.env.delivery,
+                                    ))
+                                    .await;
+                                // OFF THE LOOP. The ack is already queued and
+                                // goes out on its own; the flush only waits
+                                // for the peer to acknowledge it, and a
+                                // sender that reads the ack and exits never
+                                // does. Unbounded inline, that parked the
+                                // whole loop (gate 11c, G-k); bounded inline
+                                // it still held the loop for up to
+                                // ACK_FLUSH_BUDGET on every file whose sender
+                                // left, which the loop budget (#731) reported
+                                // as `handler/Control:file-end` 2007 ms. Nothing
+                                // after this point depends on the flush, so it
+                                // runs on its own task with the same bound.
+                                let flush_t = t.clone();
+                                tokio::spawn(async move {
+                                    let _ = tokio::time::timeout(ACK_FLUSH_BUDGET, flush_t.flush()).await;
+                                });
+                                log.say(&log.paint(
+                                    Tone::Dim,
+                                    &format!("    {nm} verified (whole-file sha256 matched), acked"),
+                                ));
+                            }
+                        }
+                    }
+                    // Re-offers of this transfer that waited for it: decide them
+                    // now (a stored file is re-acked, anything else resumes).
+                    for (p, ov) in reoffers {
+                        let _ = tx.send(ov.into_event(&p));
+                    }
+                }
                 StoreDone::Departed { pid, name } => {
                     if let Some(name) = name {
                         log.say(&format!(
@@ -4822,7 +4995,7 @@ async fn recv_run(
         // G-k completion sweep (top-of-loop): see sweep_completed_streams.
         loop_budget.enter("completion-sweep");
         let mut swept_senders = crate::recv::files::sweep_completed_streams(
-            host.as_ref(),
+            &host,
             log.as_ref(),
             &mut st.by_sid,
             &conn,
@@ -4843,7 +5016,7 @@ async fn recv_run(
         // gate-11c fence exact: a mid-transfer link (by_sid non-empty) sees
         // recv_done=false and reconnects unchanged.
         conn.recv_done =
-            protocol::recv_transfer_done(st.completed, keep_open, st.by_sid.is_empty());
+            protocol::recv_transfer_done(st.completed, keep_open, st.streams_idle());
         // WARM-HOLD: when a transfer completes, mark the peer as warm so we
         // proactively reconnect if the link drops.
         // Each completion records its own sender (`note_completed_transfer`),
@@ -4853,7 +5026,7 @@ async fn recv_run(
         for name in swept_senders.drain(..) {
             conn.note_warm_use(&name);
         }
-        if st.completed > 0 || !st.by_sid.is_empty() {
+        if st.completed > 0 || !st.streams_idle() {
             st.ever_received = true; // a channel was up; Bug-5 wedge hint no longer applies
         }
 
@@ -4938,7 +5111,7 @@ async fn recv_run(
         // in-progress reconnect keeps `by_sid` non-empty and so is unaffected.
         if st.completed > 0
             && !keep_open
-            && st.by_sid.is_empty()
+            && st.streams_idle()
             && st.pending.is_empty()
             && !conn.links.is_empty()
             && conn.only_deferred_links()
@@ -4962,7 +5135,7 @@ async fn recv_run(
         // non-empty) is untouched, and --keep-open still lingers by design.
         if st.completed > 0
             && !keep_open
-            && st.by_sid.is_empty()
+            && st.streams_idle()
             && st.pending.is_empty()
             && conn.links.is_empty()
         {
@@ -5035,7 +5208,7 @@ async fn recv_run(
         if let Some(why) = quiet_exit_reason(
             st.completed,
             keep_open,
-            st.by_sid.is_empty() && st.pending.is_empty(),
+            st.streams_idle() && st.pending.is_empty(),
             links_clear,
             // The Mode B test hook restores the old links-gated exit wholesale,
             // so gate 18b's baseline still proves the drop matters.
@@ -9807,6 +9980,22 @@ async fn recv_run(
                             continue;
                         }
                     }
+                    // Every byte of this transfer is here and its completion is
+                    // running off the loop (the sender asked again, say over a
+                    // rebuilt link). Decide this offer once that completion is
+                    // answered, not against a partial being verified and
+                    // renamed; tell the sender it is not forgotten meanwhile.
+                    if let Some(c) = st.completing_id(&id) {
+                        c.reoffers.push((
+                            pid.clone(),
+                            DeferredControl { value: v.clone(), source: event_source },
+                        ));
+                        let _ = t.send_control(&protocol::pending_msg(&id)).await;
+                        log.debug(&format!(
+                            "  {name}: offered again while its completion runs; deciding it after"
+                        ));
+                        continue;
+                    }
 
                     // A pinned receive refuses unverifiable legacy offers and
                     // content with a different advertised digest before writing
@@ -10283,14 +10472,18 @@ async fn recv_run(
                             }
                             // The lingering stream(s) are STALLED, flush their
                             // partials to disk and drop them so the resume below
-                            // re-opens the .part from its saved offset.
+                            // re-opens the .part from its saved offset. The
+                            // resume reads the offset the writes left (the
+                            // file's length and its meta), not what reached the
+                            // platter, so the fsync is for a crash only and runs
+                            // on its own task: awaited here it held the loop for
+                            // as long as the disk took.
                             for k in dup_keys {
                                 if let Some(inc) = st.by_sid.remove(&k) {
-                                    let f = inc.file.clone();
-                                    let _ = crate::sim_rt::run_blocking(move || {
-                                        let _ = f.sync_all();
-                                    })
-                                    .await;
+                                    let (f, h) = (inc.file.clone(), host.clone());
+                                    tokio::spawn(crate::sim_rt::run_blocking(move || {
+                                        let _ = h.sync_received_file(&f);
+                                    }));
                                 }
                             }
                         }
@@ -10720,6 +10913,15 @@ async fn recv_run(
                         .filter(|c| !c.is_control())
                         .take(300)
                         .collect();
+                    // Every byte already arrived and the completion is running:
+                    // its own check decides the file. Removing the partial by
+                    // name below would pull it from under the completion.
+                    if st.completing_id(&id).is_some() {
+                        log.debug(&format!(
+                            "  file-cancel for {id} after its last byte ({reason}); its completion decides"
+                        ));
+                        continue;
+                    }
                     let keys: Vec<(String, u32)> = st
                         .by_sid
                         .iter()
@@ -10801,241 +11003,49 @@ async fn recv_run(
                     if !process_now {
                         continue;
                     }
-                    // No inflight writes — process inline (fast path).
-                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
-                    let mut inc = match st.by_sid.remove(&(pid.clone(), sid)) {
-                        Some(i) => i,
-                        None => continue,
+                    // No inflight writes: complete now, off the loop.
+                    let Some(inc) = st.by_sid.remove(&(pid.clone(), sid)) else {
+                        continue;
                     };
-                    let sender = inc.sender.clone();
-                    let f = inc.file.clone();
-                    let _ = crate::sim_rt::run_blocking(move || {
-                        let _ = f.sync_all();
-                    })
-                    .await;
                     if to_stdout {
+                        let sender = inc.sender.clone();
+                        let (f, h) = (inc.file.clone(), host.clone());
+                        let _ = crate::sim_rt::run_blocking(move || {
+                            let _ = h.sync_received_file(&f);
+                        })
+                        .await;
                         stdout_delivered(&inc, &conn, &pid, sid, &report, &ports.env.delivery).await?;
                         st.completed += 1;
                         conn.note_completed_transfer(&pid, sender.as_deref());
                         continue;
                     }
-                    let id = inc.id.clone();
-                    // A write already failed (disk full, read-only): that is the
-                    // answer, not a checksum mismatch to re-fetch three times.
-                    let failed = inc.write_err.lock().unwrap().clone();
-                    if let Some(wf) = failed {
-                        st.verify_fails.remove(&id);
-                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        let (fid, token, msg) = refuse_failed_write(
-                            inc,
-                            &dir,
-                            &wf,
-                            &from,
+                    let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                    start_completion(
+                        st,
+                        &recv_lane,
+                        &pid,
+                        sid,
+                        inc,
+                        from,
+                        CompletionCtx {
+                            dir: &dir,
+                            output: &output,
                             daemon,
-                            &report,
-                            log.as_ref(),
-                            host.as_ref(),
-                        );
-                        if let Some(t) = conn.transport_of(&pid) {
-                            let _ = t
-                                .send_control(&protocol::refuse_msg(&fid, token, &msg))
-                                .await;
-                        }
-                        continue;
-                    }
-                    if inc.full.is_some() {
-                        let verdict = crate::recv::verify_incoming(&inc).await;
-                        match verdict {
-                            protocol::VerifyResult::Match => {
-                                st.verify_fails.remove(&id);
-                                let rename_to = if st.completed == 0 {
-                                    output.clone()
-                                } else {
-                                    None
-                                };
-                                let from =
-                                    conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                                let nm = inc.name.clone();
-                                if crate::recv::files::finalize_incoming(
-                                    host.as_ref(),
-                                    log.as_ref(),
-                                    inc,
-                                    &dir,
-                                    rename_to.as_deref(),
-                                    daemon,
-                                    &from,
-                                    &report,
-                                    &ports.env.delivery,
-                                )
-                                .await?
-                                {
-                                    st.completed += 1;
-                                    conn.note_completed_transfer(&pid, sender.as_deref());
-                                    // BUG-ACKLOSS reproducer: tear the link DOWN at the
-                                    // instant the ack is due, so the sender never sees it and
-                                    // its transport observes ApplicationClosed(0,""). In
-                                    // `=once` mode this fires only the FIRST time, so a daemon
-                                    // receiver recovers (delivers) on the re-dial.
-                                    //
-                                    // RESTORED 2026-08-30. This arm was wired in 12a8db82 and
-                                    // was gone by the next commit, with no commit deleting it;
-                                    // the else-if chain survived MINUS its first arm, which is
-                                    // what a botched conflict resolution looks like. For ~620
-                                    // commits `cli/tests/ack-loss-repro.sh` set
-                                    // TUNLION_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
-                                    // its "premature" round ran an ordinary transfer and the
-                                    // promptness verdict measured the happy path.
-                                    // `hooks_that_nothing_calls` now fails if any hook loses
-                                    // its last call site again.
-                                    if test_hooks::premature_close_after_ack()
-                                        && !(test_hooks::premature_close_once()
-                                            && test_hooks::premature_already_fired())
-                                    {
-                                        if test_hooks::premature_close_once() {
-                                            test_hooks::premature_mark_fired();
-                                        }
-                                        log.say(&log.paint(
-                                            Tone::Warn,
-                                            &format!(
-                                                "    [test] {nm} PREMATURE-CLOSE at ack (reproducing ack-loss / corpse)"
-                                            ),
-                                        ));
-                                        // Drop first: its close releases a sync task parked in a write.
-                                        conn.drop_link(&pid);
-                                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
-                                    } else if test_hooks::suppress_delivery_ack() {
-                                        log.say(&log.paint(
-                                            Tone::Warn,
-                                            &format!(
-                                                "    [test] {nm} verified but SUPPRESSING delivery-ack"
-                                            ),
-                                        ));
-                                    } else if let Some(t) = conn.transport_of(&pid) {
-                                        let _ = t
-                                            .send_control(&crate::recv::files::delivery_ack(
-                                                &id,
-                                                sid,
-                                                &ports.env.delivery,
-                                            ))
-                                            .await;
-                                        // OFF THE LOOP. The ack is already queued and
-                                        // goes out on its own; the flush only waits
-                                        // for the peer to acknowledge it, and a
-                                        // sender that reads the ack and exits never
-                                        // does. Unbounded inline, that parked the
-                                        // whole loop (gate 11c, G-k); bounded inline
-                                        // it still held the loop for up to
-                                        // ACK_FLUSH_BUDGET on every file whose sender
-                                        // left, which the loop budget (#731) reported
-                                        // as `handler/Control:file-end` 2007 ms. Nothing
-                                        // after this point depends on the flush, so it
-                                        // runs on its own task with the same bound.
-                                        let flush_t = t.clone();
-                                        tokio::spawn(async move {
-                                            let _ = tokio::time::timeout(ACK_FLUSH_BUDGET, flush_t.flush()).await;
-                                        });
-                                        log.say(&log.paint(
-                                            Tone::Dim,
-                                            &format!(
-                                                "    {nm} verified (whole-file sha256 matched), acked"
-                                            ),
-                                        ));
-                                    }
-                                }
-                            }
-                            protocol::VerifyResult::Mismatch { restart_from_zero } => {
-                                let fails = st.verify_fails.entry(id.clone()).or_insert(0);
-                                *fails += 1;
-                                if *fails > MAX_VERIFY_FAILS {
-                                    log.critical(&log.paint(
-                                        Tone::Err,
-                                        &format!(
-                                            "  {}: whole-file checksum still wrong after {MAX_VERIFY_FAILS} re-fetches, refusing to accept a corrupt file (partial kept)",
-                                            inc.name
-                                        ),
-                                    ));
-                                    st.verify_fails.remove(&id);
-                                    continue;
-                                }
-                                let mut req_offset = inc.received.load(Ordering::Relaxed);
-                                if restart_from_zero {
-                                    let _ = crate::recv::safe_create_part(&inc.part_path).await;
-                                    inc.received.store(0, Ordering::Relaxed);
-                                    inc.ranges.lock().unwrap().clear();
-                                    req_offset = 0;
-                                    log.debug(&log.paint(
-                                        Tone::Warn,
-                                        &format!(
-                                            "  {}: received all bytes but whole-file checksum FAILED (corrupt), re-fetching from 0 (attempt {})",
-                                            inc.name, *fails
-                                        ),
-                                    ));
-                                } else {
-                                    log.debug(&log.paint(
-                                        Tone::Warn,
-                                        &format!(
-                                            "  {}: TRUNCATED ({}/{}), checksum can't match yet; re-requesting the rest (attempt {})",
-                                            inc.name,
-                                            crate::present::human(req_offset),
-                                            crate::present::human(inc.size),
-                                            *fails
-                                        ),
-                                    ));
-                                }
-                                let f = inc.file.clone();
-                                let _ = crate::sim_rt::run_blocking(move || {
-                                    let _ = f.sync_all();
-                                })
-                                .await;
-                                if req_offset == 0 {
-                                    if let Ok(f) =
-                                        crate::recv::safe_resume_part(&inc.part_path).await
-                                    {
-                                        inc.file = Arc::new(f.into_std().await);
-                                    }
-                                }
-                                writer_tasks.join_sid(&pid, sid, log.as_ref()).await;
-                                inc.completion.reset(&inc.end_seen);
-                                st.by_sid.insert((pid.clone(), sid), inc);
-                                if let Some(t) = conn.transport_of(&pid) {
-                                    let _ = t
-                                        .send_control(&protocol::accept_msg(&id, req_offset))
-                                        .await;
-                                }
-                            }
-                        }
-                    } else {
-                        let rename_to = if st.completed == 0 {
-                            output.clone()
-                        } else {
-                            None
-                        };
-                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        if crate::recv::files::finalize_incoming(
-                            host.as_ref(),
-                            log.as_ref(),
-                            inc,
-                            &dir,
-                            rename_to.as_deref(),
-                            daemon,
-                            &from,
-                            &report,
-                            &ports.env.delivery,
-                        )
-                        .await?
-                        {
-                            st.completed += 1;
-                            conn.note_completed_transfer(&pid, sender.as_deref());
-                        }
-                    }
+                            host: &host,
+                            log: &log,
+                            report: &report,
+                            delivery: &ports.env.delivery,
+                        },
+                    );
                 }
                 _ => {}
             },
             Ev::MaybeComplete(pid, sid) => {
                 // A background writer task finished and was the last inflight,
-                // and end_seen was already set. Finalize (verify + delv ack).
-                // Continuation is bound to the code-authorized link; a
-                // completion with no link finishes bytes already written.
+                // and end_seen was already set. Complete it (verify + delivery
+                // ack), off the loop. Continuation is bound to the
+                // code-authorized link; a completion with no link finishes
+                // bytes already written.
                 if !admit_code_stream_event(
                     &conn,
                     &mut code_authority_cache,
@@ -11050,211 +11060,32 @@ async fn recv_run(
                 {
                     continue;
                 }
-                let ack_sid = {
-                    st.by_sid
-                        .get(&(pid.clone(), sid))
-                        .map(|inc| inc.ack_sid)
-                        .unwrap_or(0)
-                };
-                if let Some(mut inc) = st.by_sid.remove(&(pid.clone(), sid)) {
-                    let sender = inc.sender.clone();
+                if let Some(inc) = st.by_sid.remove(&(pid.clone(), sid)) {
                     if to_stdout {
-                        stdout_delivered(&inc, &conn, &pid, ack_sid, &report, &ports.env.delivery).await?;
+                        let sender = inc.sender.clone();
+                        stdout_delivered(&inc, &conn, &pid, inc.ack_sid, &report, &ports.env.delivery).await?;
                         st.completed += 1;
                         conn.note_completed_transfer(&pid, sender.as_deref());
                         continue;
                     }
-                    let id = inc.id.clone();
-                    // A write already failed (disk full, read-only): that is the
-                    // answer, not a checksum mismatch to re-fetch three times.
-                    let failed = inc.write_err.lock().unwrap().clone();
-                    if let Some(wf) = failed {
-                        st.verify_fails.remove(&id);
-                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        let (fid, token, msg) = refuse_failed_write(
-                            inc,
-                            &dir,
-                            &wf,
-                            &from,
+                    let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                    start_completion(
+                        st,
+                        &recv_lane,
+                        &pid,
+                        sid,
+                        inc,
+                        from,
+                        CompletionCtx {
+                            dir: &dir,
+                            output: &output,
                             daemon,
-                            &report,
-                            log.as_ref(),
-                            host.as_ref(),
-                        );
-                        if let Some(t) = conn.transport_of(&pid) {
-                            let _ = t
-                                .send_control(&protocol::refuse_msg(&fid, token, &msg))
-                                .await;
-                        }
-                        continue;
-                    }
-                    if inc.full.is_some() {
-                        let verdict = crate::recv::verify_incoming(&inc).await;
-                        match verdict {
-                            protocol::VerifyResult::Match => {
-                                st.verify_fails.remove(&id);
-                                let rename_to = if st.completed == 0 {
-                                    output.clone()
-                                } else {
-                                    None
-                                };
-                                let from =
-                                    conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                                let nm = inc.name.clone();
-                                if crate::recv::files::finalize_incoming(
-                                    host.as_ref(),
-                                    log.as_ref(),
-                                    inc,
-                                    &dir,
-                                    rename_to.as_deref(),
-                                    daemon,
-                                    &from,
-                                    &report,
-                                    &ports.env.delivery,
-                                )
-                                .await?
-                                {
-                                    st.completed += 1;
-                                    conn.note_completed_transfer(&pid, sender.as_deref());
-                                    // BUG-ACKLOSS reproducer: tear the link DOWN at the
-                                    // instant the ack is due, so the sender never sees it and
-                                    // its transport observes ApplicationClosed(0,""). In
-                                    // `=once` mode this fires only the FIRST time, so a daemon
-                                    // receiver recovers (delivers) on the re-dial.
-                                    //
-                                    // RESTORED 2026-08-30. This arm was wired in 12a8db82 and
-                                    // was gone by the next commit, with no commit deleting it;
-                                    // the else-if chain survived MINUS its first arm, which is
-                                    // what a botched conflict resolution looks like. For ~620
-                                    // commits `cli/tests/ack-loss-repro.sh` set
-                                    // TUNLION_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
-                                    // its "premature" round ran an ordinary transfer and the
-                                    // promptness verdict measured the happy path.
-                                    // `hooks_that_nothing_calls` now fails if any hook loses
-                                    // its last call site again.
-                                    if test_hooks::premature_close_after_ack()
-                                        && !(test_hooks::premature_close_once()
-                                            && test_hooks::premature_already_fired())
-                                    {
-                                        if test_hooks::premature_close_once() {
-                                            test_hooks::premature_mark_fired();
-                                        }
-                                        log.say(&log.paint(
-                                            Tone::Warn,
-                                            &format!(
-                                                "    [test] {nm} PREMATURE-CLOSE at ack (reproducing ack-loss / corpse)"
-                                            ),
-                                        ));
-                                        // Drop first: its close releases a sync task parked in a write.
-                                        conn.drop_link(&pid);
-                                        sync_tasks.cancel_sync_for_pid(&pid, log.as_ref()).await;
-                                    } else if test_hooks::suppress_delivery_ack() {
-                                        log.say(&log.paint(
-                                            Tone::Warn,
-                                            &format!(
-                                                "    [test] {nm} verified but SUPPRESSING delivery-ack"
-                                            ),
-                                        ));
-                                    } else if let Some(t) = conn.transport_of(&pid) {
-                                        let _ = t
-                                            .send_control(&crate::recv::files::delivery_ack(
-                                                &id,
-                                                ack_sid,
-                                                &ports.env.delivery,
-                                            ))
-                                            .await;
-                                        log.say(&log.paint(
-                                            Tone::Dim,
-                                            &format!(
-                                                "    {nm} verified (whole-file sha256 matched), acked"
-                                            ),
-                                        ));
-                                    }
-                                }
-                            }
-                            protocol::VerifyResult::Mismatch { restart_from_zero } => {
-                                let fails = st.verify_fails.entry(id.clone()).or_insert(0);
-                                *fails += 1;
-                                if *fails > MAX_VERIFY_FAILS {
-                                    log.critical(&log.paint(
-                                        Tone::Err,
-                                        &format!(
-                                            "  {}: whole-file checksum still wrong after {MAX_VERIFY_FAILS} re-fetches, refusing to accept a corrupt file (partial kept)",
-                                            inc.name
-                                        ),
-                                    ));
-                                    st.verify_fails.remove(&id);
-                                    continue;
-                                }
-                                let mut req_offset = inc.received.load(Ordering::Relaxed);
-                                if restart_from_zero {
-                                    let _ = crate::recv::safe_create_part(&inc.part_path).await;
-                                    if let Ok(f) =
-                                        crate::recv::safe_resume_part(&inc.part_path).await
-                                    {
-                                        inc.file = Arc::new(f.into_std().await);
-                                    }
-                                    inc.received.store(0, Ordering::Relaxed);
-                                    inc.ranges.lock().unwrap().clear();
-                                    req_offset = 0;
-                                    log.debug(&log.paint(
-                                        Tone::Warn,
-                                        &format!(
-                                            "  {}: received all bytes but whole-file checksum FAILED (corrupt), re-fetching from 0 (attempt {})",
-                                            inc.name, *fails
-                                        ),
-                                    ));
-                                } else {
-                                    log.debug(&log.paint(
-                                        Tone::Warn,
-                                        &format!(
-                                            "  {}: TRUNCATED ({}/{}), checksum can't match yet; re-requesting the rest (attempt {})",
-                                            inc.name,
-                                            crate::present::human(req_offset),
-                                            crate::present::human(inc.size),
-                                            *fails
-                                        ),
-                                    ));
-                                }
-                                let f = inc.file.clone();
-                                let _ = crate::sim_rt::run_blocking(move || {
-                                    let _ = f.sync_all();
-                                })
-                                .await;
-                                writer_tasks.join_sid(&pid, sid, log.as_ref()).await;
-                                inc.completion.reset(&inc.end_seen);
-                                st.by_sid.insert((pid.clone(), sid), inc);
-                                if let Some(t) = conn.transport_of(&pid) {
-                                    let _ = t
-                                        .send_control(&protocol::accept_msg(&id, req_offset))
-                                        .await;
-                                }
-                            }
-                        }
-                    } else {
-                        let rename_to = if st.completed == 0 {
-                            output.clone()
-                        } else {
-                            None
-                        };
-                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        if crate::recv::files::finalize_incoming(
-                            host.as_ref(),
-                            log.as_ref(),
-                            inc,
-                            &dir,
-                            rename_to.as_deref(),
-                            daemon,
-                            &from,
-                            &report,
-                            &ports.env.delivery,
-                        )
-                        .await?
-                        {
-                            st.completed += 1;
-                            conn.note_completed_transfer(&pid, sender.as_deref());
-                        }
-                    }
+                            host: &host,
+                            log: &log,
+                            report: &report,
+                            delivery: &ports.env.delivery,
+                        },
+                    );
                 }
             }
             Ev::Chunk(pid, sid, offset, data) => {
@@ -11698,7 +11529,7 @@ async fn recv_run(
                     // G-k: the dropped link may have delivered every byte but
                     // lost its file-end, finalize before deciding it's fatal.
                     let swept = crate::recv::files::sweep_completed_streams(
-                        host.as_ref(),
+                        &host,
                         log.as_ref(),
                         &mut st.by_sid,
                         &conn,
@@ -11714,7 +11545,7 @@ async fn recv_run(
                     for name in swept {
                         conn.note_warm_use(&name);
                     }
-                    if st.completed == 0 {
+                    if st.completed == 0 && st.completing.is_empty() {
                         bail!(crate::recv::transfer_truth::sender_gone_message(
                             &format!(
                                 "the sender is unreachable: the connection to it failed {MAX_ATTEMPTS} times"
@@ -11739,7 +11570,7 @@ async fn recv_run(
                 };
                 if exhausted && paired && !keep_open {
                     let swept = crate::recv::files::sweep_completed_streams(
-                        host.as_ref(),
+                        &host,
                         log.as_ref(),
                         &mut st.by_sid,
                         &conn,
@@ -11755,7 +11586,7 @@ async fn recv_run(
                     for name in swept {
                         conn.note_warm_use(&name);
                     }
-                    if st.completed == 0 {
+                    if st.completed == 0 && st.completing.is_empty() {
                         bail!(crate::recv::transfer_truth::sender_gone_message(
                             &format!(
                                 "the sender is unreachable: the connection to it failed {MAX_ATTEMPTS} times"
@@ -11825,7 +11656,7 @@ async fn recv_run(
                 let left_mid_transfer = st.by_sid.keys().any(|(p, _)| *p == left_pid);
                 if conn.on_peer_left(&v) {
                     let secs = conn.rejoin.rejoin_window.as_secs();
-                    if !st.by_sid.is_empty() {
+                    if !st.streams_idle() {
                         // Keep partials writable-but-parked; resume comes via
                         // rejoin (C6) or a later re-offer against the .part.
                         log.say(&log.paint(
@@ -12086,6 +11917,38 @@ enum StoreDone {
     /// Requesting side: a renewal ack was judged and, if accepted, written
     /// as this device's certificate record.
     CertAdopted,
+    /// A receive completion ran (`start_completion`). The loop answers the
+    /// sender only now: the delivery-ack after the durable write, the
+    /// whole-file check and the rename; a refusal or a re-fetch otherwise.
+    RecvCompleted {
+        pid: String,
+        sid: u32,
+        ack_sid: u32,
+        id: String,
+        sender: Option<String>,
+        outcome: Completion,
+    },
+}
+
+/// What a receive completion came to (`run_completion`).
+enum Completion {
+    /// A write had already failed: the partial was dropped, and this is the
+    /// typed refusal for the sender (`refuse_failed_write`).
+    Refused { fid: String, token: &'static str, msg: String },
+    /// The whole-file digest matched and the file was stored.
+    Verified { name: String },
+    /// No digest was offered; the file was stored by size (no ack).
+    Unverified,
+    /// Stored by an earlier completion of the same stream (duplicate).
+    NotPlaced,
+    /// The digest is still wrong after `MAX_VERIFY_FAILS` re-fetches: the
+    /// partial is kept and the transfer fails.
+    GaveUp { name: String },
+    /// The digest did not match: re-fetch from `req_offset` (0 when the
+    /// bytes were corrupt). The stream goes back into `by_sid`.
+    Refetch { inc: Box<IncomingFile>, req_offset: u64, restart_from_zero: bool },
+    /// Placing the file failed; the loop fails as it did when this ran inline.
+    Failed(anyhow::Error),
 }
 
 /// Peer-triggered store writes, run OFF the event loop.
@@ -12097,19 +11960,27 @@ enum StoreDone {
 /// blocking thread; the result lands in `done` and the loop is woken to act
 /// on it. The write itself is unchanged, fsync included; only the loop no
 /// longer waits for it.
+///
+/// The same lane, a second instance, runs receive completions
+/// (`start_completion`): those are async jobs that hand their blocking steps
+/// to blocking threads themselves. A completion hashes a whole file, so it
+/// has its own lane and never holds up a store write.
 struct StoreLane {
-    jobs: mpsc::UnboundedSender<Box<dyn FnOnce() -> StoreDone + Send>>,
+    jobs: mpsc::UnboundedSender<LaneJob>,
     done: Arc<std::sync::Mutex<Vec<StoreDone>>>,
 }
 
+/// One lane job. `None` is a job that panicked: nothing to apply.
+type LaneJob = std::pin::Pin<Box<dyn std::future::Future<Output = Option<StoreDone>> + Send>>;
+
 impl StoreLane {
     fn start(wake: mpsc::UnboundedSender<Ev>) -> Self {
-        let (jobs, mut rx) = mpsc::unbounded_channel::<Box<dyn FnOnce() -> StoreDone + Send>>();
+        let (jobs, mut rx) = mpsc::unbounded_channel::<LaneJob>();
         let done: Arc<std::sync::Mutex<Vec<StoreDone>>> = Default::default();
         let out = done.clone();
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
-                if let Ok(d) = crate::sim_rt::run_blocking(job).await {
+                if let Some(d) = job.await {
                     out.lock().unwrap_or_else(|e| e.into_inner()).push(d);
                     // Any event ends the loop's wait; this one means nothing
                     // else (see Ev::BuildWake).
@@ -12121,7 +11992,17 @@ impl StoreLane {
     }
 
     fn write(&self, job: impl FnOnce() -> StoreDone + Send + 'static) {
-        let _ = self.jobs.send(Box::new(job));
+        let _ = self
+            .jobs
+            .send(Box::pin(async move { crate::sim_rt::run_blocking(job).await.ok() }));
+    }
+
+    /// Queue an async job. It runs as its own task, so a panic in it is
+    /// contained (the job yields nothing) and the lane goes on.
+    fn run(&self, job: impl std::future::Future<Output = StoreDone> + Send + 'static) {
+        let _ = self
+            .jobs
+            .send(Box::pin(async move { tokio::spawn(job).await.ok() }));
     }
 
     fn take_done(&self) -> Vec<StoreDone> {
@@ -12324,6 +12205,146 @@ async fn stdout_delivered(
         }
     }
     Ok(())
+}
+
+/// The invocation-wide inputs of a receive completion.
+struct CompletionCtx<'a> {
+    dir: &'a Path,
+    output: &'a Option<String>,
+    daemon: bool,
+    host: &'a Arc<dyn HostServices>,
+    log: &'a Arc<dyn LogSink>,
+    report: &'a RecvReport,
+    delivery: &'a Arc<std::sync::Mutex<HashMap<String, crate::recv::ports::DeliveredFile>>>,
+}
+
+/// Queue the completion of stream (`pid`, `sid`), whose bytes have all
+/// arrived, on the receive lane. The stream has left `by_sid`; it is held in
+/// `completing` until the result is applied (`StoreDone::RecvCompleted`), so
+/// the one-shot exits, which wait for an empty table, wait for it too. The
+/// lane runs completions one at a time in the order queued.
+fn start_completion(
+    st: &mut RecvState,
+    lane: &StoreLane,
+    pid: &str,
+    sid: u32,
+    inc: IncomingFile,
+    from: String,
+    cx: CompletionCtx<'_>,
+) {
+    let id = inc.id.clone();
+    let ack_sid = inc.ack_sid;
+    let sender = inc.sender.clone();
+    // `-o NAME` names the first file stored: the first one queued while
+    // nothing is stored or completing.
+    let rename_to = if st.completed == 0 && st.completing.is_empty() {
+        cx.output.clone()
+    } else {
+        None
+    };
+    let prior_fails = st.verify_fails.get(&id).copied().unwrap_or(0);
+    st.completing.insert(
+        (pid.to_string(), sid),
+        CompletionInFlight { id: id.clone(), reoffers: Vec::new() },
+    );
+    let job = CompletionJob {
+        inc,
+        dir: cx.dir.to_path_buf(),
+        rename_to,
+        from,
+        daemon: cx.daemon,
+        prior_fails,
+        host: cx.host.clone(),
+        log: cx.log.clone(),
+        report: cx.report.clone(),
+        delivery: cx.delivery.clone(),
+    };
+    let pid = pid.to_string();
+    lane.run(async move {
+        let outcome = run_completion(job).await;
+        StoreDone::RecvCompleted { pid, sid, ack_sid, id, sender, outcome }
+    });
+}
+
+/// Everything a receive completion needs, owned, so it can run off the loop.
+struct CompletionJob {
+    inc: IncomingFile,
+    dir: PathBuf,
+    rename_to: Option<String>,
+    from: String,
+    daemon: bool,
+    /// Failed whole-file checks of this transfer so far (`verify_fails`).
+    prior_fails: u32,
+    host: Arc<dyn HostServices>,
+    log: Arc<dyn LogSink>,
+    report: RecvReport,
+    delivery: Arc<std::sync::Mutex<HashMap<String, crate::recv::ports::DeliveredFile>>>,
+}
+
+/// The disk side of a receive completion, run on the receive lane, never on
+/// the loop: the fsync, the whole-file check, and the rename and record (or
+/// the refusal, or the reset for a re-fetch). It decides exactly what the
+/// inline handler decided; the loop only sends the answer.
+async fn run_completion(job: CompletionJob) -> Completion {
+    let CompletionJob { mut inc, dir, rename_to, from, daemon, prior_fails, host, log, report, delivery } = job;
+    let (f, h) = (inc.file.clone(), host.clone());
+    let _ = crate::sim_rt::run_blocking(move || {
+        let _ = h.sync_received_file(&f);
+    })
+    .await;
+    // A write already failed (disk full, read-only): that is the answer, not
+    // a checksum mismatch to re-fetch three times.
+    let failed = inc.write_err.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(wf) = failed {
+        let (fid, token, msg) =
+            refuse_failed_write(inc, &dir, &wf, &from, daemon, &report, log.as_ref(), host.as_ref());
+        return Completion::Refused { fid, token, msg };
+    }
+    let verified = inc.full.is_some();
+    if verified {
+        if let protocol::VerifyResult::Mismatch { restart_from_zero } =
+            crate::recv::verify_incoming(&inc).await
+        {
+            if prior_fails + 1 > MAX_VERIFY_FAILS {
+                return Completion::GaveUp { name: inc.name.clone() };
+            }
+            let mut req_offset = inc.received.load(Ordering::Relaxed);
+            if restart_from_zero {
+                let _ = crate::recv::safe_create_part(&inc.part_path).await;
+                if let Ok(f) = crate::recv::safe_resume_part(&inc.part_path).await {
+                    inc.file = Arc::new(f.into_std().await);
+                }
+                inc.received.store(0, Ordering::Relaxed);
+                inc.ranges.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                req_offset = 0;
+            }
+            let (f, h) = (inc.file.clone(), host.clone());
+            let _ = crate::sim_rt::run_blocking(move || {
+                let _ = h.sync_received_file(&f);
+            })
+            .await;
+            return Completion::Refetch { inc: Box::new(inc), req_offset, restart_from_zero };
+        }
+    }
+    let name = inc.name.clone();
+    match crate::recv::files::finalize_incoming(
+        &host,
+        log.as_ref(),
+        inc,
+        &dir,
+        rename_to.as_deref(),
+        daemon,
+        &from,
+        &report,
+        &delivery,
+    )
+    .await
+    {
+        Ok(true) if verified => Completion::Verified { name },
+        Ok(true) => Completion::Unverified,
+        Ok(false) => Completion::NotPlaced,
+        Err(e) => Completion::Failed(e),
+    }
 }
 
 /// A write to an incoming file failed. Report it on this side (must-see), drop
@@ -12721,6 +12742,7 @@ mod lifecycle_tests {
     fn empty_recv_state() -> RecvState {
         RecvState {
             by_sid: HashMap::new(),
+            completing: HashMap::new(),
             verify_fails: HashMap::new(),
             completed: 0,
             ever_received: false,

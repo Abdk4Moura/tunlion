@@ -882,11 +882,31 @@ const LINK_REVOKED_ACK_SEND: Duration = Duration::from_secs(5);
 /// Warm execs this process is running as the initiator. While any is live the
 /// receive loop ticks fast, so a refusal read on a link whose events wait for
 /// a loop turn reaches the exec (and is acknowledged) promptly.
+#[cfg(not(feature = "sim"))]
 static WARM_EXECS_LIVE: AtomicU32 = AtomicU32::new(0);
+
+// Under `sim` a world is one thread (its current-thread runtime), and test
+// worlds run side by side in one process: the count is per world, so one
+// world's warm send does not change how fast another world's loops tick.
+#[cfg(feature = "sim")]
+thread_local! {
+    static WARM_EXECS_LIVE: AtomicU32 = const { AtomicU32::new(0) };
+}
+
+fn warm_execs_live<R>(f: impl FnOnce(&AtomicU32) -> R) -> R {
+    #[cfg(not(feature = "sim"))]
+    {
+        f(&WARM_EXECS_LIVE)
+    }
+    #[cfg(feature = "sim")]
+    {
+        WARM_EXECS_LIVE.with(f)
+    }
+}
 
 /// Whether this process has a warm exec in flight (see [`WarmExecLive`]).
 pub fn warm_exec_live() -> bool {
-    WARM_EXECS_LIVE.load(Ordering::Relaxed) > 0
+    warm_execs_live(|n| n.load(Ordering::Relaxed) > 0)
 }
 
 /// Counts one in-flight warm exec for its lifetime.
@@ -894,14 +914,14 @@ pub struct WarmExecLive(());
 
 impl WarmExecLive {
     pub fn enter() -> Self {
-        WARM_EXECS_LIVE.fetch_add(1, Ordering::Relaxed);
+        warm_execs_live(|n| n.fetch_add(1, Ordering::Relaxed));
         WarmExecLive(())
     }
 }
 
 impl Drop for WarmExecLive {
     fn drop(&mut self) {
-        WARM_EXECS_LIVE.fetch_sub(1, Ordering::Relaxed);
+        warm_execs_live(|n| n.fetch_sub(1, Ordering::Relaxed));
     }
 }
 

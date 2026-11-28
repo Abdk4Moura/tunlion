@@ -360,6 +360,11 @@ pub trait HostServices: Send + Sync + 'static {
     fn publish_received_file(&self, _file: &std::fs::File) -> std::io::Result<()> {
         Ok(())
     }
+    /// Make a received file's bytes durable (fsync). The one place a receive
+    /// waits for the disk, so a host (the sim) can model a slow one.
+    fn sync_received_file(&self, file: &std::fs::File) -> std::io::Result<()> {
+        file.sync_all()
+    }
     /// Extract an archive after a received file was stored, when the host's
     /// settings ask for it. `Err` is a rendered reason, never fatal to storage.
     fn extract_received_archive(
