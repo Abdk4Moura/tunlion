@@ -330,6 +330,13 @@ def window_end(s: dict) -> float:
 _TS = re.compile(r"^\S*\d{4}-\d\d-\d\dT[\d:.]+Z?\s*")
 _SUBS = [
     (re.compile(r"'[^']*'|\"[^\"]*\"|`[^`]*`"), "Q"),
+    # Signaling session ids (20 chars of base64url, e.g. zbpsKxXrSCsLQ9b-AAAX,
+    # OuHC_pnAKaTFeDkwAAAN) are fresh every run and not hex, so they survived
+    # every rule below: 652 of 712 kinds across 12 runs occurred in exactly
+    # one run, every run looked "new", and the feedback steered nothing.
+    # A run of 16+ id characters with a digit or an inner capital is an id;
+    # words and snake_case names never are.
+    (re.compile(r"(?<![\w-])(?=[\w-]{16,}(?![\w-]))(?=[\w-]*(?:\d|[a-z][A-Z]))[\w-]+"), "I"),
     (re.compile(r"(/[\w.\-]+)+"), "P"),
     (re.compile(r"\b[\da-f]{8,}\b", re.I), "H"),
     (re.compile(r"\b[\da-f]*:[\da-f:]{4,}\b", re.I), "H"),
@@ -337,9 +344,15 @@ _SUBS = [
 ]
 
 
+# Task and thread dump lines (the tree a stalled daemon prints) describe
+# where it was parked, not what it did: each dump is a fresh set of lines,
+# so counting them made any run with a dump look like new ground.
+_DUMP = re.compile(r"^\s*(?:[\u2500-\u257f]|#\d+\s+0x|Thread \d+ )")
+
+
 def line_kind(line: str) -> str | None:
     line = _TS.sub("", line.strip())
-    if not line:
+    if not line or _DUMP.match(line):
         return None
     for rx, rep in _SUBS:
         line = rx.sub(rep, line)
@@ -2164,12 +2177,30 @@ def cmd_replay(worlds: list[World], out: Path, files: list[Path], repeat: int = 
     return 1 if any(fails.values()) else 0
 
 
+SEEN = HERE / "seen.json"
+
+
+def load_seen(path: Path = SEEN) -> set[str]:
+    """The behaviours earlier campaigns reached (empty when none recorded)."""
+    try:
+        return set(json.loads(path.read_text()))
+    except FileNotFoundError:
+        return set()
+
+
 def cmd_explore(worlds: list[World], out: Path, budget_s: float, seed: int, corpus: list[Path], first=None) -> int:
     """Every world mutates from ONE shared queue and feeds ONE shared set of
     seen behaviours, so a schedule kept by one world is mutated by all."""
     lock = threading.Lock()
     queue = [json.loads(p.read_text()) for p in corpus]
-    seen: set[str] = set()
+    # Coverage carried over from earlier campaigns (fuzz/chaos/seen.json,
+    # refreshed by absorb.py): a behaviour any campaign already reached is not
+    # new, so its schedules are not kept again and the queue stays on ground
+    # nobody has covered. Starting from an empty set made every campaign
+    # re-keep and re-mutate the same few hundred schedules.
+    seen: set[str] = load_seen()
+    known_at_start = len(seen)
+    log(f"explore: {len(queue)} seed schedules, {len(seen)} behaviours already covered")
     found: dict[str, Path | None] = {}
     tally = {"runs": 0, "bites": 0}
     per_world = {w.k: 0 for w in worlds}
@@ -2212,6 +2243,7 @@ def cmd_explore(worlds: list[World], out: Path, budget_s: float, seed: int, corp
                     # Saved as it grows: a campaign stopped early keeps what it learned.
                     grown.mkdir(exist_ok=True)
                     (grown / f"q{len(queue) - 1:03d}.json").write_text(json.dumps(sched, indent=2, sort_keys=True))
+                    (out / "seen.json").write_text(json.dumps(sorted(seen)))
                     log(f"  run {n}: +{len(new)} new behaviours (total {len(seen)}), kept")
                 if v["hard"]:
                     key = "|".join(sorted({finding_key(f) for f in v["hard"]}))
@@ -2239,7 +2271,9 @@ def cmd_explore(worlds: list[World], out: Path, budget_s: float, seed: int, corp
                 found[key] = d
             log(f"  FINDING ({repro}) -> {d}")
     run_worlds(worlds, job, first)
+    (out / "seen.json").write_text(json.dumps(sorted(seen)))
     summary = {"runs": tally["runs"], "runs_per_world": per_world, "behaviours": len(seen),
+               "new_behaviours": len(seen) - known_at_start,
                "faults_bit": tally["bites"], "findings": [str(p) for p in found.values() if p], "seed": seed}
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     if tally["runs"] and tally["bites"] == 0:
@@ -2352,6 +2386,38 @@ def selftest_visitors() -> None:
             raise AssertionError(bad_s)
         except ValueError:
             pass
+
+
+def selftest_kinds_and_coverage() -> None:
+    # The feedback signal must not see a run's own ids or dumps as behaviour.
+    a = line_kind("2026-11-27T22:12:12Z reach-pong sent pid=OuHC_pnAKaTFeDkwAAAN result=Ok(())")
+    b = line_kind("2026-11-28T01:00:00Z reach-pong sent pid=zbpsKxXrSCsLQ9b-AAAX result=Ok(())")
+    assert a == b == "reach-pong sent pid=I result=Ok(())", (a, b)
+    assert line_kind("connection_established_successfully ok") == "connection_established_successfully ok"
+    assert line_kind("authentication succeeded for bravo") == "authentication succeeded for bravo"
+    assert line_kind("  \u2514\u257c poll_read at /x/y.rs:3:9") is None, "a task dump line is not behaviour"
+    assert line_kind("#3  0x000055d1 in foo ()") is None, "a thread dump frame is not behaviour"
+    # Coverage carries over: a missing seen.json is empty, a present one loads.
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        assert load_seen(Path(t) / "seen.json") == set()
+        (Path(t) / "seen.json").write_text(json.dumps(["x", "y"]))
+        assert load_seen(Path(t) / "seen.json") == {"x", "y"}
+        # absorb folds a campaign in once: the union, and each schedule once.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("absorb", HERE / "absorb.py")
+        ab = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ab)
+        here, out = Path(t) / "repo", Path(t) / "out"
+        (out / "corpus-grown").mkdir(parents=True)
+        here.mkdir()
+        (out / "seen.json").write_text(json.dumps(["y", "z"]))
+        (here / "seen.json").write_text(json.dumps(["x"]))
+        sched = {"version": 1, "steps": [{"at": 1.0, "fault": "proc.kill", "target": "bravo", "dur": 2}]}
+        (out / "corpus-grown" / "q000.json").write_text(json.dumps(sched))
+        assert ab.absorb(out, here) == (1, 3, 1)
+        assert ab.absorb(out, here) == (3, 3, 0), "absorbing the same campaign again adds nothing"
+        assert set(json.loads((here / "seen.json").read_text())) == {"x", "y", "z"}
 
 
 def selftest_save_finding() -> None:
@@ -2542,6 +2608,7 @@ def cmd_selftest() -> int:
             else:
                 assert st["op"] in OPS + ["visit"], (p, st)
     selftest_save_finding()
+    selftest_kinds_and_coverage()
     print("selftest ok")
     return 0
 

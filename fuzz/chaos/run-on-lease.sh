@@ -129,7 +129,7 @@ tar -C "\$job" -czf "\$job/out.tgz" out
 # The essentials (verdicts, findings with their logs, grown corpus) in a small
 # tarball fetched first: the exec channel can drop a long stream, and losing
 # the per-run records must never cost the findings.
-( cd "\$job" && tar -czf out-essential.tgz --ignore-failed-read \$(cd "\$job" && ls -d out/summary.json out/throughput.json out/replay-rates.json out/canary.json out/hookcheck.json out/findings out/corpus-grown 2>/dev/null) )
+( cd "\$job" && tar -czf out-essential.tgz --ignore-failed-read \$(cd "\$job" && ls -d out/summary.json out/seen.json out/throughput.json out/replay-rates.json out/canary.json out/hookcheck.json out/findings out/corpus-grown 2>/dev/null) )
 echo "CHAOS_OUT=\$job/out.tgz"
 echo "CHAOS_OUT_ESSENTIAL=\$job/out-essential.tgz"
 EOF

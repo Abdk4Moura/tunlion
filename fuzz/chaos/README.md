@@ -53,6 +53,22 @@ signaling link that is down still refuses, naming which. (Until 2026-11-26
 every case refused as "signaling not ready ... noanswer"; the cause was the
 daemon misreading /proc/locks under lock churn and not serving its socket.)
 
+## Coverage carries over
+
+`explore` keeps a schedule only when it reaches a behaviour (a daemon log
+line reduced to its kind: timestamps, numbers, paths, quoted values, hex and
+session ids replaced; task and thread dump lines ignored) that no campaign has
+reached before. The behaviours already covered are in `seen.json`, and the
+schedules that reached them are in `corpus-grown/`, which `explore` seeds
+from. After a campaign, fold it back in so the next one starts where it
+stopped instead of re-covering the same cases:
+
+    python3 -I fuzz/chaos/absorb.py chaos-results/<job>/out
+    git add fuzz/chaos/seen.json fuzz/chaos/corpus-grown && git commit
+
+The summary's `new_behaviours` is what the campaign added. A campaign that
+adds little is a sign the mutator, not the product, has run out of ground.
+
 ## Findings
 
 Each finding is a directory under `chaos-results/<job>/out/findings/<id>/`
