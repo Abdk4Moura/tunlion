@@ -146,7 +146,9 @@ EOF
 LOG="$ROOT/chaos-results/$JOB.log"; mkdir -p "$ROOT/chaos-results"
 echo "== run $MODE on $WORKER (log: $LOG)"
 WENV=(--env HOME=/home/runner --env PATH=/home/runner/work/_temp/bin:/home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)
-tunlion exec "$WORKER" "${WENV[@]}" -- bash -c "$REMOTE" 2>&1 | tee "$LOG"
+# `|| true`: a dropped link must not end this script (set -e, pipefail) before
+# the reattach below; whether the campaign finished is read from the log.
+tunlion exec "$WORKER" "${WENV[@]}" -- bash -c "$REMOTE" 2>&1 | tee "$LOG" || true
 # The link dropped before the campaign finished: it is still running on the
 # worker, detached. Reattach and follow it to the end (bounded).
 JOBDIR=$(grep -oP '^CHAOS_JOB=\K.*' "$LOG" | tail -1)
@@ -155,7 +157,7 @@ while [ -n "$JOBDIR" ] && ! grep -q '^CHAOS_OUT_ESSENTIAL=' "$LOG" && [ "$tries"
   tries=$((tries + 1))
   echo "== the exec link dropped; reattaching to the campaign on $WORKER (try $tries)" | tee -a "$LOG"
   sleep 20
-  tunlion exec "$WORKER" -- bash -c "p=\$(cat '$JOBDIR/campaign.pid' 2>/dev/null); [ -n \"\$p\" ] && tail -n 0 -F '$JOBDIR/campaign.log' --pid=\"\$p\" 2>/dev/null; grep '^CHAOS_' '$JOBDIR/campaign.log'" 2>&1 | tee -a "$LOG"
+  tunlion exec "$WORKER" -- bash -c "p=\$(cat '$JOBDIR/campaign.pid' 2>/dev/null); [ -n \"\$p\" ] && tail -n 0 -F '$JOBDIR/campaign.log' --pid=\"\$p\" 2>/dev/null; grep '^CHAOS_' '$JOBDIR/campaign.log'" 2>&1 | tee -a "$LOG" || true
 done
 OUT=$(grep -oP '^CHAOS_OUT=\K.*' "$LOG" | tail -1)
 RC=$(grep -oP '^CHAOS_RC=\K\d+' "$LOG" | tail -1)
