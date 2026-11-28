@@ -43,13 +43,24 @@ fn daemon_is_found_by_executable_and_an_unrelated_pid_is_rejected() {
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
 
-    // Copy the binary under a name with no "tunlion" substring.
+    // Copy the binary under a name with no "tunlion" substring. Use `cp` on
+    // Unix so parallel test-thread `fork()` calls never inherit an open write
+    // descriptor on `renamed` and trigger `ETXTBSY` on `spawn`.
     let renamed = scratch.join("bg-224");
-    std::fs::copy(real_bin(), &renamed).unwrap();
     #[cfg(unix)]
     {
+        let status = Command::new("cp")
+            .arg(real_bin())
+            .arg(&renamed)
+            .status()
+            .expect("copy renamed daemon");
+        assert!(status.success(), "copy renamed daemon failed: {status}");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&renamed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::copy(real_bin(), &renamed).unwrap();
     }
 
     // Hold a listener open so the daemon's signaling connect blocks instead of
@@ -80,16 +91,30 @@ fn daemon_is_found_by_executable_and_an_unrelated_pid_is_rejected() {
     )
     .unwrap();
 
-    // Spawn the real daemon under the renamed binary.
-    let mut child = Command::new(&renamed)
-        .env("TUNLION_CONFIG_DIR", &cfg)
-        .arg("up")
-        .arg("--server")
-        .arg(&server)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn renamed daemon");
+    // Spawn the real daemon under the renamed binary (retry briefly on
+    // ETXTBSY if a sibling test thread just forked).
+    let mut child = {
+        let mut attempts = 0;
+        loop {
+            let mut cmd = Command::new(&renamed);
+            cmd.env("TUNLION_CONFIG_DIR", &cfg)
+                .arg("up")
+                .arg("--server")
+                .arg(&server)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            match cmd.spawn() {
+                Ok(child) => break child,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 10 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => panic!("spawn renamed daemon: {err:?}"),
+            }
+        }
+    };
 
     // The daemon must be FOUND: `status` reports it running under its own pid.
     let mut found = None;
