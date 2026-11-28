@@ -594,7 +594,7 @@ fn log_warm_pick(conn: &Conn, peer: &str, chosen: &str) {
             l.direct,
             l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false),
             l.established_at.map(|t| t.elapsed().as_millis()),
-            conn.deferred_left.contains_key(p),
+            conn.is_deferred_left(p),
         ));
     }
 }

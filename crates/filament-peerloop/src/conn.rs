@@ -42,6 +42,18 @@
 //!     frozen `recv_cmd`; the abstraction waits on the `Link` move.
 //!   - `crate::test_hooks` and the FLEET/REJOIN constants: process/test facts, not
 //!     host services.
+mod digest;
+mod source_routing;
+
+pub use self::digest::{DigestSurface, DigestTracker};
+#[cfg(test)]
+use self::digest::DIGEST_ABSENT_IDLE_GRACE;
+pub use self::source_routing::{
+    AckWatch, ClosingLink, LinkEvents, PendingSource, RefusalOutcome, SourceRouting,
+    deliver_refusal,
+};
+use self::source_routing::{QueueDrain, ev_weight};
+
 use crate::handoff::{self, HandoffTransport};
 use crate::holepunch;
 use crate::host::{peer_entry, HostServices, Level, LogSink, Tone};
@@ -377,183 +389,6 @@ fn close_dropped_link(old: Link) {
             }
         });
     }
-}
-
-/// A link cut by a revocation whose refusal is still in flight, keyed in
-/// `Conn::closing` by the refusal's nonce. Control-plane only: the link is
-/// gone from `links`, so no Control/PcState/ChannelReady from its source is
-/// dispatched, and this entry only recognizes the peer's `link-revoked-ack`
-/// carrying exactly this nonce, read for this pid on any of its paths. The
-/// nonce is ours, fresh and random per cut, and only the peer that received
-/// the frame holds it, so accepting the ack from any path of that peer does
-/// not widen what it proves; two links cut together each wait for their own.
-/// It authorizes nothing either way: it only lets the closer close sooner.
-/// Untagged data events from a main-queue link can still reach the loop until
-/// the close, exactly as during the plain drop's grace; they open nothing new.
-pub struct ClosingLink {
-    pid: String,
-    ack: Option<oneshot::Sender<()>>,
-}
-
-/// `inner` is a `link-revoked-ack` from `ipid`: its pid and nonce.
-fn refusal_ack_nonce(inner: &Ev) -> Option<(&str, &str)> {
-    match inner {
-        Ev::Control(ipid, v) if v["type"].as_str() == Some("link-revoked-ack") => {
-            v["nonce"].as_str().map(|n| (ipid.as_str(), n))
-        }
-        _ => None,
-    }
-}
-
-/// What became of a revoked link's refusal. A DIAGNOSTIC, never a delivery
-/// verdict: only `Acknowledged` says something positive (the peer recorded
-/// it), and nothing may read the others as "not delivered". A one-shot peer
-/// never acknowledges at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefusalOutcome {
-    /// The peer answered with `link-revoked-ack` for this nonce, which it sends
-    /// only after it recorded the refusal on the link.
-    Acknowledged,
-    /// Written, no ack within the budget (a dead, frozen, older or one-shot
-    /// peer, or a link whose reader ended).
-    Unconfirmed,
-    /// The write itself failed: the transport was already gone.
-    SendFailed,
-    /// The write did not complete within the budget.
-    SendTimedOut,
-}
-
-impl RefusalOutcome {
-    fn describe(self) -> &'static str {
-        match self {
-            RefusalOutcome::Acknowledged => "acknowledged by the peer",
-            RefusalOutcome::Unconfirmed => "sent, not acknowledged within the budget (unconfirmed)",
-            RefusalOutcome::SendFailed => "send failed, the link was already gone",
-            RefusalOutcome::SendTimedOut => "send did not complete within the budget",
-        }
-    }
-}
-
-/// Where a cut link's ack may show up. Both are optional: `signal` is fired by
-/// `Conn` when the ack reaches the main queue; `stream` is the link's own
-/// candidate stream, read here directly so no loop turn is needed.
-pub struct AckWatch {
-    pub pid: String,
-    pub nonce: String,
-    pub signal: Option<oneshot::Receiver<()>>,
-    pub stream: Option<mpsc::UnboundedReceiver<Ev>>,
-}
-
-async fn ack_signal(signal: &mut Option<oneshot::Receiver<()>>) -> bool {
-    match signal {
-        Some(rx) => rx.await.is_ok(),
-        None => std::future::pending().await,
-    }
-}
-
-async fn ack_stream(stream: &mut Option<mpsc::UnboundedReceiver<Ev>>) -> Option<Ev> {
-    match stream {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-enum AckStep {
-    Acked,
-    SignalGone,
-    Event(Ev),
-    StreamEnded,
-    Deadline,
-}
-
-/// Write `frame` and wait for its ack, both under ONE deadline `budget` from
-/// now. A peer that never reads, never acks, or whose write parks forever
-/// costs at most `budget`; a link whose reader ended on a dead transport ends
-/// the wait at once. Everything else read from the stream is discarded. Must run off the event loop (it awaits the peer).
-pub async fn deliver_refusal(
-    t: &dyn Transport,
-    frame: &Value,
-    watch: Option<AckWatch>,
-    budget: Duration,
-) -> RefusalOutcome {
-    let deadline = tokio::time::Instant::now() + budget;
-    match tokio::time::timeout_at(deadline, t.send_control(frame)).await {
-        Err(_) => return RefusalOutcome::SendTimedOut,
-        Ok(Err(_)) => return RefusalOutcome::SendFailed,
-        Ok(Ok(())) => {}
-    }
-    let Some(mut watch) = watch else {
-        return RefusalOutcome::Unconfirmed;
-    };
-    loop {
-        if watch.signal.is_none() && watch.stream.is_none() {
-            return RefusalOutcome::Unconfirmed;
-        }
-        let step = tokio::select! {
-            acked = ack_signal(&mut watch.signal) => {
-                if acked { AckStep::Acked } else { AckStep::SignalGone }
-            }
-            ev = ack_stream(&mut watch.stream) => match ev {
-                Some(ev) => AckStep::Event(ev),
-                None => AckStep::StreamEnded,
-            },
-            _ = tokio::time::sleep_until(deadline) => AckStep::Deadline,
-        };
-        match step {
-            AckStep::Acked => return RefusalOutcome::Acknowledged,
-            AckStep::SignalGone => watch.signal = None,
-            AckStep::StreamEnded => {
-                watch.stream = None;
-                // The reader ended. With the transport dead too, nothing can
-                // answer on any path any more: stop now, not at the deadline.
-                if t.is_dead() {
-                    return RefusalOutcome::Unconfirmed;
-                }
-            }
-            AckStep::Deadline => return RefusalOutcome::Unconfirmed,
-            AckStep::Event(Ev::Sourced { pid, inner, .. }) => {
-                let ours = refusal_ack_nonce(&inner).is_some_and(|(ipid, nonce)| {
-                    ipid == pid && pid == watch.pid && nonce == watch.nonce
-                });
-                if ours {
-                    return RefusalOutcome::Acknowledged;
-                }
-            }
-            AckStep::Event(_) => {}
-        }
-    }
-}
-/// A link absent from a channel/room digest is retired only after its transport
-/// has been quiet this long. Presence is best-effort and a signaling reconnect
-/// gives the peer a new sid, so the old sid vanishes from the digest while its
-/// data channel is still the one carrying a shell. The grace is for the
-/// transport shapes where "quiet" can still mean a peer that is there (a relay
-/// path between keepalives) or where no transport exists yet.
-///
-/// It is NOT the bound for a DIRECT link. Direct QUIC has no `heard_ms` and its
-/// `idle_ms` includes our own writes, but `is_alive`/`is_dead` are the
-/// transport's own verdict (7 s keepalive, 21 s idle timeout). An idle shell is
-/// a healthy direct link, so it is kept for as long as the connection is alive;
-/// the grace must not retire it 30 s after a signaling reconnect. When QUIC
-/// reports the connection dead/closed, retirement is immediate. That path is
-/// transport-bounded, not grace-bounded.
-///
-/// `Conn::digest_link_active` is the decision: direct -> transport liveness;
-/// relay/DataChannel -> peer-originated `heard_ms`; anything else -> idle.
-const DIGEST_ABSENT_IDLE_GRACE: Duration = Duration::from_secs(30);
-/// "Moving enough to call the peer present" for digest retirement, in ms, for a
-/// relay/DataChannel transport that does not track peer-originated traffic.
-/// Direct QUIC does NOT use this clock (its liveness is transport-bounded); see
-/// `Conn::digest_link_active`.
-const DIGEST_ACTIVE_MS: u64 = 3_000;
-
-/// Which signaling surface owns a link, and therefore which digest may judge
-/// its absence. A channel-introduced link is room-independent: only
-/// `channel_peers` speaks about it. A room-sourced link is the converse.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DigestSurface {
-    Channel,
-    Room,
 }
 
 /// The local-discovery reservation that authenticated a LAN link.
@@ -1573,15 +1408,6 @@ fn discard_state(state: BuildState, peer: Arc<net::Peer>) {
     close_built(peer);
 }
 
-fn ev_weight(ev: &Ev) -> usize {
-    match ev {
-        Ev::Sourced { inner, .. } => ev_weight(inner),
-        Ev::Chunk(_, _, _, bytes) => bytes.len().max(1),
-        Ev::Control(_, value) | Ev::LocalControl(_, value) => value.to_string().len().max(1),
-        _ => 1,
-    }
-}
-
 /// Move the build's own queued events into its bounded early buffer. Returns
 /// false when a bound was hit; the caller cancels that build. Nothing from the
 /// previous link can enter this channel, so everything here is candidate-local.
@@ -1959,45 +1785,6 @@ pub struct RetiredIntent {
     pub at: Instant,
 }
 
-/// One installed link's candidate-origin event stream. Owned by `Conn`, keyed
-/// by pid, and drained once per loop turn. It dies with its link.
-pub struct LinkEvents {
-    pub generation: u32,
-    pub rx: std::sync::Mutex<mpsc::UnboundedReceiver<Ev>>,
-    /// Set by `stage_event` when it admits a departure barrier for THIS exact
-    /// source (the link's current primary). `on_peer_left` consumes it once to
-    /// distinguish that validated hand-over from a fresh room departure; it
-    /// dies with this entry (replacement/drop re-insert it or remove it) and is
-    /// never written by anything that has not passed the exact-source gate.
-    pub departure_ready: Option<net::SourceId>,
-    /// A departure barrier for this exact source is queued (its events were
-    /// already handed over, so the local queue is empty). A DUPLICATE ordinary
-    /// peer-left for the same link must not finalize on that empty queue; it
-    /// waits for the barrier, which is already in the main queue.
-    pub departure_pending: Option<net::SourceId>,
-}
-
-/// What a bounded hand-over of one link's already-read events moved.
-enum QueueDrain {
-    Empty,
-    Moved(usize),
-    /// More than the per-link event budget was queued: the hand-over cannot be
-    /// completed without an unbounded loop, so the caller drops instead.
-    Overflow,
-}
-
-/// Source-bound events from a standby/upgrade transport that is not adopted
-/// yet. They are replayed only if that exact source becomes the link source.
-pub struct PendingSource {
-    pub pid: String,
-    /// The direct attempt that owns this source. None for a generic staged
-    /// source; direct standby cleanup only touches an exact match.
-    pub attempt: Option<net::AttemptId>,
-    pub at: Instant,
-    pub events: std::collections::VecDeque<Ev>,
-    pub bytes: usize,
-}
-
 /// Result of a side-effect-free readiness validation. `Duplicate` means the
 /// exact same live or held transport is already owned, so the caller must not
 /// close it or mutate state. `Reject` requires closing only the incoming
@@ -2063,9 +1850,6 @@ pub struct Conn {
     /// Local discovery (`filament_transport::lan`), when it is on for this
     /// session. Set by the loop after construction.
     pub lan: Option<filament_transport::lan::LanService>,
-    /// Peer IDs whose exhausted stall ladder deliberately gave up. Contact
-    /// clears these; digest reconciliation skips them.
-    pub suppressed_digest_adoptions: SimHashSet<String>,
     pub active: Option<String>, // the transfer-target sid (send side)
     /// A code-claimed receive is bound to the peer that completed PAKE. The sid
     /// may change on signaling reconnect, so retain its install uid as well.
@@ -2081,37 +1865,8 @@ pub struct Conn {
     /// Peer-absence / rejoin-grace state (the reconnect window + declared brb).
     pub rejoin: RejoinState,
     pub chunk_size: usize,
-    /// #28 (deferred drop): sids that got a peer-left while their data channel
-    /// was still FLOWING. The signaling socket left the room, but the WebRTC
-    /// link is independent and may be a cosmetic reconnect mid-transfer. We do
-    /// NOT drop immediately (that kills a live transfer) and do NOT drop never
-    /// (a hard-killed peer reads flowing for a beat and would strand the
-    /// sender). Instead we stash the original peer-left payload here and
-    /// re-check on every main-loop tick: once the link goes idle past the
-    /// flowing threshold (or its channel is dead), we re-inject the stored
-    /// peer-left so the normal handler runs verbatim, now dropping it. A live
-    /// reconnect never goes idle (the transfer completes on it), so its entry
-    /// is reaped harmlessly once done. Cleared in drop_link so a supersede of a
-    /// deferred sid can't leave a stale blocker.
-    pub deferred_left: SimHashMap<String, Value>,
-    /// Digest reconcile deferral: sid -> when its live transport was first seen
-    /// absent from a digest while it could not yet be called departed. A
-    /// signaling reconnect gives the peer a fresh sid, so the old sid disappears
-    /// from `channel_peers` while its direct link still serves a shell; dropping
-    /// it there is the PR512 tear-down. A live direct link is deferred for as
-    /// long as QUIC says the connection is alive; a relay link while it still
-    /// hears the peer, then for `DIGEST_ABSENT_IDLE_GRACE` after that stops.
-    /// Cleared when the sid reappears, when the link is dropped, and on a fresh
-    /// signaling sid. Not used by `on_peer_left`, which keeps its own payload
-    /// (`deferred_left`) because a peer-left is a real roster departure.
-    pub digest_deferred: SimHashMap<String, Instant>,
-    /// Per-surface digest hysteresis, kept with `digest_deferred` so a link is
-    /// always judged by the digest that OWNS it. A channel-introduced link must
-    /// never be ticked by the room surface (and vice versa): the other surface
-    /// is legitimately missing it, and clearing its clock there turned the
-    /// bounded deferral into an eternal one. Values are consecutive misses.
-    pub channel_digest_absent: SimHashMap<String, u8>,
-    pub room_digest_absent: SimHashMap<String, u8>,
+    pub digest: DigestTracker,
+    pub sources: SourceRouting,
     /// Gate-18 Mode B: set TRUE by the recv loop, each tick, exactly when the
     /// transfer is COMPLETE and nothing is in flight (`completed>0 &&
     /// by_sid.is_empty() && !keep_open`). When it holds, `on_stuck` DROPS a
@@ -2193,13 +1948,6 @@ pub struct Conn {
     /// `worker-ports` control message handler delivers the acceptor's port list
     /// through it. Removed by the receiver on delivery (one-shot).
     pub worker_port_tx: HashMap<String, oneshot::Sender<Vec<u16>>>,
-    /// Owner-only roster push bookkeeping: the (epoch, valid_until) last pushed
-    /// and the live links it reached, so a re-push fires only on a membership
-    /// change (new epoch), a validity refresh (new valid_until), or a new link.
-    pub roster_pushed: Option<(u64, u64, HashSet<String>)>,
-    /// Owner-only: the `(epoch, valid_until)` of the fleet grant set last
-    /// delivered on each link, so an unchanged set is not resent every tick.
-    pub fleet_grants_pushed: HashMap<String, (u64, u64)>,
     /// Retry ladder: the stuck attempt per peer sid whose backoff timer is
     /// running. `on_stuck` records it and returns; `Ev::RetryLink` resumes it.
     pub stuck_retry: SimHashMap<String, StuckRetry>,
@@ -2237,11 +1985,6 @@ pub struct Conn {
     /// only an authenticated re-pair/vouch clears that exact secret. Fleet
     /// rendezvous secrets are NOT device identities and never enter this set.
     pub revoked_bindings: SimHashSet<String>,
-    /// Candidate-origin event streams for INSTALLED links, keyed by pid. The
-    /// entry is owned by the link: drop_link/replacement removes and drains it,
-    /// so a queued ChannelReady/Control from the old generation is discarded
-    /// instead of being replayed onto the new link.
-    pub link_events: SimHashMap<String, LinkEvents>,
     /// Set by a candidate sender when it has queued a `BuildWake`, cleared by
     /// `pump_builds` before it drains. One wake is outstanding at a time, so a
     /// busy data channel cannot flood the main queue with wakes.
@@ -2251,17 +1994,6 @@ pub struct Conn {
     pub direct_gathering: HashMap<String, DirectGathering>,
     /// Finished gatherings, drained by `pump_builds`.
     pub direct_gathered: Arc<std::sync::Mutex<Vec<DirectGathered>>>,
-    /// Links cut by a revocation whose refusal is still in flight, keyed by the
-    /// refusal's nonce. See `ClosingLink` and `drop_link_after_refusal`.
-    pub closing: SimHashMap<String, ClosingLink>,
-    /// Source-bound standby/upgrade events awaiting adoption. Bounded per source
-    /// and in total; overflow closes the standby instead of growing forever.
-    pub pending_sources: SimHashMap<net::SourceId, PendingSource>,
-    pub replaying_sources: SimHashMap<net::SourceId, PendingSource>,
-    pub replay_departures: SimHashMap<String, (net::SourceId, bool)>,
-    /// Roster sids absent from consecutive channel/room digests, for the
-    /// two-tick hysteresis in `prune_roster_absent`.
-    pub roster_absent: SimHashMap<String, u8>,
     /// The injected terminal sink. Every line `Conn` renders goes through this
     /// instead of `crate::ui`, so the host can be a test capture or a daemon
     /// journal. See `filament_peerloop::host`.
@@ -2444,7 +2176,6 @@ impl Conn {
             to_filter,
             links: SimHashMap::default(),
             roster: SimHashMap::default(),
-            suppressed_digest_adoptions: SimHashSet::default(),
             active: None,
             active_binding: None,
             code_session: None,
@@ -2455,10 +2186,8 @@ impl Conn {
                 away: None,
             },
             chunk_size: net::MAX_DC_PAYLOAD,
-            deferred_left: SimHashMap::default(),
-            digest_deferred: SimHashMap::default(),
-            channel_digest_absent: SimHashMap::default(),
-            room_digest_absent: SimHashMap::default(),
+            digest: DigestTracker::default(),
+            sources: SourceRouting::default(),
             recv_done: false,
             direct_pending: SimHashMap::default(),
             retired_attempts: SimHashMap::default(),
@@ -2482,8 +2211,6 @@ impl Conn {
             direct_endpoint: None,
             warm_hold: WarmHold::default(),
             worker_port_tx: HashMap::new(),
-            roster_pushed: None,
-            fleet_grants_pushed: HashMap::new(),
             stuck_retry: SimHashMap::default(),
             ice_cache: SharedIceCache::default(),
             builds: SimHashMap::default(),
@@ -2496,15 +2223,9 @@ impl Conn {
             current_intent: SimHashMap::default(),
             revoked_peers: SimHashMap::default(),
             revoked_bindings: SimHashSet::default(),
-            link_events: SimHashMap::default(),
             candidate_wake: Arc::new(AtomicBool::new(false)),
             direct_gathering: HashMap::new(),
             direct_gathered: Arc::new(std::sync::Mutex::new(Vec::new())),
-            closing: SimHashMap::default(),
-            pending_sources: SimHashMap::default(),
-            replaying_sources: SimHashMap::default(),
-            replay_departures: SimHashMap::default(),
-            roster_absent: SimHashMap::default(),
             log,
             host,
             present: Arc::new(NoScreen),
@@ -2591,132 +2312,6 @@ impl Conn {
             }
         }
         out
-    }
-
-    /// Owner-only: mint the current roster and push it to every live link whose
-    /// view is stale (membership changed = new epoch, validity refreshed = new
-    /// valid_until, or a newly-established link). A push that fails is dropped
-    /// silently here; the next tick re-tries because `roster_pushed` still holds
-    /// the old mark, so a lost push is not a fact we swallow.
-    pub async fn roster_maintenance(&mut self) {
-        let Some(blob_json) = self.host.roster_snapshot_json() else {
-            return;
-        };
-        let Ok(blob) = serde_json::from_str::<Value>(&blob_json) else {
-            return;
-        };
-        let epoch = blob["epoch"].as_u64().unwrap_or(0);
-        let until = blob["valid_until"].as_u64().unwrap_or(0);
-        let live: HashSet<String> = self
-            .links
-            .iter()
-            .filter(|(_, l)| l.transport.as_ref().is_some_and(|t| t.is_alive()))
-            .map(|(pid, _)| pid.clone())
-            .collect();
-        let should_push = match &self.roster_pushed {
-            None => true,
-            Some((e, u, pids)) => *e != epoch || *u != until || *pids != live,
-        };
-        if !should_push {
-            return;
-        }
-        let mut msg = blob.clone();
-        msg["type"] = json!("roster");
-        let mut pushed_to: HashSet<String> = HashSet::new();
-        let mut sends = tokio::task::JoinSet::new();
-        for pid in &live {
-            if let Some(t) = self.transport_of(pid) {
-                let msg = msg.clone();
-                let pid = pid.clone();
-                sends.spawn(async move {
-                    let sent = tokio::time::timeout(
-                        Duration::from_millis(750),
-                        t.send_control(&msg),
-                    )
-                    .await
-                    .is_ok_and(|r| r.is_ok());
-                    (pid, sent)
-                });
-            }
-        }
-        while let Some(result) = sends.join_next().await {
-            if let Ok((pid, true)) = result {
-                pushed_to.insert(pid);
-            }
-        }
-        if pushed_to.len() != live.len() {
-            // A failed push is a fact worth surfacing: a spoke that missed it
-            // stays stale until the next successful push. Re-tried next tick.
-            let missed = live.len() - pushed_to.len();
-            self.log.say(&format!(
-                "  {} roster push did not reach {missed} device(s); will retry",
-                self.log.paint(Tone::Warn, self.log.glyph_warn())
-            ));
-        }
-        self.roster_pushed = Some((epoch, until, pushed_to));
-    }
-
-    /// Owner-only: deliver each live link's device the owner-signed grant set
-    /// ABOUT THAT DEVICE, when it changed (new epoch or refreshed validity) or
-    /// the link is new. Each device only ever receives its own set. A failed
-    /// send is retried next tick because the mark is not advanced.
-    pub async fn fleet_grants_maintenance(&mut self) {
-        let targets: Vec<(String, [u8; 32])> = self
-            .links
-            .iter()
-            .filter(|(_, l)| l.transport.as_ref().is_some_and(|t| t.is_alive()))
-            .filter_map(|(pid, l)| {
-                // The proven device key when identity has resolved; otherwise the
-                // certificate on the record this PAIRED link was proven against
-                // (a pair-secret MAC proves the link is that device). Only a
-                // pair-secret link may use the fallback.
-                let dev = l.identity_device_pub.or_else(|| {
-                    let (name, _) = l.expected_secret.as_ref()?;
-                    self.host.device_cert_for(name).map(|c| c.device_pub)
-                })?;
-                Some((pid.clone(), dev))
-            })
-            .collect();
-        self.fleet_grants_pushed.retain(|pid, _| self.links.contains_key(pid));
-        let mut pending = Vec::new();
-        for (pid, target) in targets {
-            let Some(blob) = self
-                .host
-                .fleet_grants_snapshot_json(&target)
-                .and_then(|j| serde_json::from_str::<Value>(&j).ok())
-            else {
-                continue;
-            };
-            let mark = (
-                blob["epoch"].as_u64().unwrap_or(0),
-                blob["valid_until"].as_u64().unwrap_or(0),
-            );
-            if self.fleet_grants_pushed.get(&pid) == Some(&mark) {
-                continue;
-            }
-            let mut msg = blob;
-            msg["type"] = json!("fleet-grants");
-            if let Some(t) = self.transport_of(&pid) {
-                pending.push((pid, mark, t, msg));
-            }
-        }
-        let mut sends = tokio::task::JoinSet::new();
-        for (pid, mark, t, msg) in pending {
-            sends.spawn(async move {
-                let sent = tokio::time::timeout(
-                    Duration::from_millis(750),
-                    t.send_control(&msg),
-                )
-                .await
-                .is_ok_and(|r| r.is_ok());
-                (pid, mark, sent)
-            });
-        }
-        while let Some(result) = sends.join_next().await {
-            if let Ok((pid, mark, true)) = result {
-                self.fleet_grants_pushed.insert(pid, mark);
-            }
-        }
     }
 
     /// #28: is the link keyed by `pid` actively moving transfer bytes right now?
@@ -2861,7 +2456,7 @@ impl Conn {
     }
 
     fn adoption_allowed(&mut self, peer_id: &str, source: AdoptSource) -> bool {
-        match_adoption_source(&mut self.suppressed_digest_adoptions, peer_id, source)
+        match_adoption_source(&mut self.digest.suppressed_digest_adoptions, peer_id, source)
     }
 
     pub fn bind_active(&mut self, peer_id: &str) {
@@ -3085,7 +2680,7 @@ impl Conn {
         let active_deferred = self
             .active
             .as_ref()
-            .is_some_and(|a| self.deferred_left.contains_key(a));
+            .is_some_and(|a| self.digest.deferred_left.contains_key(a));
         // A code-receive binding hands the slot only to the exact sid whose
         // ceremony confirmed; a new sid (even the same install) needs a fresh
         // code. No binding (every non-code path): unchanged.
@@ -3177,7 +2772,7 @@ impl Conn {
     /// from that sid). A device that comes back does so on a NEW sid, which is
     /// neither, so a laptop that slept is re-warmed as soon as it reappears.
     fn warm_dialable(&self, pid: &str) -> bool {
-        !self.roster_absent.contains_key(pid) && !self.suppressed_digest_adoptions.contains(pid)
+        !self.digest.roster_absent.contains_key(pid) && !self.digest.suppressed_digest_adoptions.contains(pid)
     }
 
     /// What link `pid` holds and how long it has been up, for log lines.
@@ -3328,7 +2923,7 @@ impl Conn {
                 .filter(|e| e.generation == old.generation)
                 .map(|e| e.rx.into_inner().unwrap_or_else(|p| p.into_inner()));
             let (ack_tx, ack_rx) = oneshot::channel();
-            self.closing.insert(
+            self.sources.closing.insert(
                 nonce.clone(),
                 ClosingLink { pid: pid.to_string(), ack: Some(ack_tx) },
             );
@@ -3367,12 +2962,6 @@ impl Conn {
     /// queued on it.
     #[track_caller]
     fn unlink(&mut self, pid: &str) -> (Option<Link>, Option<LinkEvents>) {
-        // #686: fence the departure behind any adopted-source replay. This
-        // runs on every invalidation, an ordinary drop and a revocation cut.
-        self.replaying_sources.retain(|_, pending| pending.pid != pid);
-        if self.replay_departures.get(pid).is_some_and(|(_, ready)| !ready) {
-            self.replay_departures.remove(pid);
-        }
         // A drop is an invalidation: a candidate still building for this peer
         // must not publish after the link it was replacing is gone.
         self.cancel_build(pid);
@@ -3382,10 +2971,7 @@ impl Conn {
             // for this attempt must not resurrect the link.
             self.retire_attempt(pid, attempt, None);
         }
-        // The installed link owns its candidate-origin stream; dropping the
-        // receiver discards any queued ChannelReady/Control from this
-        // generation instead of forwarding it to a later link.
-        let events = self.link_events.remove(pid);
+        let events = self.sources.clear_for_unlink(pid);
         self.log.debug(&format!(
             "  drop_link({pid}) ordered by {}",
             std::panic::Location::caller()
@@ -3398,10 +2984,7 @@ impl Conn {
         // so a supersede (maybe_adopt) of a deferred same-uid sid can't leave a
         // stale entry blocking adoption. Invariant: deferred_left only ever
         // holds sids that are still live links.
-        self.deferred_left.remove(pid);
-        self.digest_deferred.remove(pid);
-        self.channel_digest_absent.remove(pid);
-        self.room_digest_absent.remove(pid);
+        self.digest.clear_peer(pid);
         self.buffered_offers.remove(pid);
         self.held_signals.remove(pid);
         self.stuck_retry.remove(pid);
@@ -3707,7 +3290,7 @@ impl Conn {
         let Some(pid) = v["id"].as_str() else {
             return false;
         };
-        self.roster_absent.remove(pid);
+        self.digest.roster_absent.remove(pid);
         // Only a link that carries traffic keeps the entry. An attempt still
         // in flight toward a sid the server just reported gone cannot finish
         // (its signals are refused), and keeping the entry for it is what let
@@ -3721,50 +3304,6 @@ impl Conn {
             self.log.debug(&format!("roster: forgot {pid} (known-peer-left)"));
         }
         removed
-    }
-
-    /// Digest reconcile for the ROSTER (links have their own reapers): a sid
-    /// absent from two consecutive digests, with no live link, is forgotten.
-    /// A channel-introduced entry (it carries `channel`) is judged against the
-    /// channel digest, anything else against the room digest. The backstop for
-    /// a `known-peer-left` that never arrived. Returns the sids forgotten.
-    pub fn prune_roster_absent(
-        &mut self,
-        channel_present: &HashSet<String>,
-        room_present: &HashSet<String>,
-    ) -> Vec<String> {
-        let mut gone = Vec::new();
-        let pids: Vec<String> = self.roster.keys().cloned().collect();
-        for pid in pids {
-            let via_channel = self.roster[&pid]["channel"].as_str().is_some();
-            let present = if via_channel {
-                channel_present.contains(&pid)
-            } else {
-                room_present.contains(&pid)
-            };
-            // Present, or reached over a link that carries traffic. An attempt
-            // in flight is neither: a retry ladder that is mid-attempt at every
-            // digest used to reset this count each time, so the entry of a
-            // departed sid outlived it and warm-hold kept dialling it.
-            if present || self.link_carries(&pid) {
-                self.roster_absent.remove(&pid);
-                continue;
-            }
-            let count = self.roster_absent.entry(pid.clone()).or_insert(0);
-            *count += 1;
-            if *count >= 2 {
-                gone.push(pid);
-            }
-        }
-        for pid in &gone {
-            self.roster.remove(pid);
-            self.webrtc_only.remove(pid);
-            self.roster_absent.remove(pid);
-            self.log.debug(&format!("roster: forgot {pid} (absent from two digests)"));
-        }
-        let roster = &self.roster;
-        self.roster_absent.retain(|pid, _| roster.contains_key(pid));
-        gone
     }
 
     /// Resume a dormant warm peer (e.g., when it reappears in signaling presence)
@@ -4240,18 +3779,18 @@ impl Conn {
         // a replaced/dropped link's queued events are discarded, never applied
         // to a newer link that reused the pid.
         let linked: Vec<(String, u32)> = self
-            .link_events
+            .sources.link_events
             .iter()
             .map(|(pid, events)| (pid.clone(), events.generation))
             .collect();
         for (pid, generation) in linked {
             let current = self.links.get(&pid).map(|l| l.generation) == Some(generation);
             if !current {
-                self.link_events.remove(&pid);
+                self.sources.link_events.remove(&pid);
                 continue;
             }
             let tx = self.tx.clone();
-            if let Some(events) = self.link_events.get_mut(&pid) {
+            if let Some(events) = self.sources.link_events.get_mut(&pid) {
                 let mut rx = events
                     .rx
                     .lock()
@@ -4294,7 +3833,7 @@ impl Conn {
         });
         self.current_intent.retain(|pid, _| active.contains(pid));
         let stale_sources: Vec<net::SourceId> = self
-            .pending_sources
+            .sources.pending_sources
             .iter()
             .filter(|(_, pending)| now.duration_since(pending.at) >= BUILD_REAP_GRACE)
             .map(|(source, _)| *source)
@@ -4486,7 +4025,7 @@ impl Conn {
         // The forwarder is owned by the link: pump_builds drains this receiver
         // only while the link still carries `generation`, and drop_link/
         // replacement removes it, discarding queued stale events.
-        self.link_events.insert(pid, LinkEvents { generation, rx: std::sync::Mutex::new(candidate_rx), departure_ready: None, departure_pending: None });
+        self.sources.link_events.insert(pid, LinkEvents { generation, rx: std::sync::Mutex::new(candidate_rx), departure_ready: None, departure_pending: None });
     }
 
     /// The retry-episode state a stuck-attempt rebuild must not lose: the
@@ -4498,9 +4037,9 @@ impl Conn {
         Some(StuckEpisode {
             attempts: l.attempts,
             presence: l.presence,
-            channel_absent: self.channel_digest_absent.get(pid).copied(),
-            room_absent: self.room_digest_absent.get(pid).copied(),
-            digest_deferred: self.digest_deferred.get(pid).copied(),
+            channel_absent: self.digest.channel_digest_absent.get(pid).copied(),
+            room_absent: self.digest.room_digest_absent.get(pid).copied(),
+            digest_deferred: self.digest.digest_deferred.get(pid).copied(),
         })
     }
 
@@ -4510,13 +4049,13 @@ impl Conn {
             l.presence = episode.presence;
         }
         if let Some(n) = episode.channel_absent {
-            self.channel_digest_absent.insert(pid.to_string(), n);
+            self.digest.channel_digest_absent.insert(pid.to_string(), n);
         }
         if let Some(n) = episode.room_absent {
-            self.room_digest_absent.insert(pid.to_string(), n);
+            self.digest.room_digest_absent.insert(pid.to_string(), n);
         }
         if let Some(at) = episode.digest_deferred {
-            self.digest_deferred.insert(pid.to_string(), at);
+            self.digest.digest_deferred.insert(pid.to_string(), at);
         }
     }
 
@@ -4553,7 +4092,7 @@ impl Conn {
         // episode at attempt 0) until the sid itself makes contact. Without
         // this an evicted departed sid was re-dialled by warm-hold seconds
         // later and its ladder never got to exhaust.
-        self.suppressed_digest_adoptions.insert(victim.clone());
+        self.digest.suppressed_digest_adoptions.insert(victim.clone());
         self.drop_link(&victim);
         true
     }
@@ -4697,262 +4236,6 @@ impl Conn {
     /// is about to handle it. A replacement after forwarding therefore cannot
     /// replay an old callback. Returns the inner event plus its source (used by
     /// handlers that defer/requeue the event).
-    pub fn stage_event(&mut self, ev: Ev) -> Option<(Ev, Option<net::SourceId>)> {
-        match ev {
-            Ev::ReplayDeparture(pid, source, payload) => {
-                if self.replay_departures.get(&pid) != Some(&(source, false)) {
-                    return None;
-                }
-                if self.links.get(&pid).map(|link| link.source) != Some(source) {
-                    self.replay_departures.remove(&pid);
-                    return None;
-                }
-                if self.replaying_sources.contains_key(&source) {
-                    let _ = self.tx.send(Ev::ReplayDeparture(pid, source, payload));
-                    return None;
-                }
-                self.replay_departures.insert(pid, (source, true));
-                return Some((Ev::PeerLeft(payload), Some(source)));
-            }
-            Ev::ReplaySource(source) => {
-                let pending = self.replaying_sources.get_mut(&source)?;
-                let pid = pending.pid.clone();
-                let inner = pending.events.pop_front()?;
-                pending.bytes = pending.bytes.saturating_sub(ev_weight(&inner));
-                if pending.events.is_empty() {
-                    self.replaying_sources.remove(&source);
-                }
-                return self.source_current(&pid, source, &inner).then_some((inner, Some(source)));
-            }
-            Ev::AttemptDrained(attempt) => {
-                self.retired_attempts.remove(&attempt);
-                None
-            }
-            Ev::Sourced { pid, source, inner } => {
-                // A departure barrier (`on_peer_left` queued it behind that
-                // link's already-read events). The exact-source gate still runs
-                // HERE, but the event is then handed to the ordinary caller as
-                // a normal `Ev::PeerLeft`: its pre-drop snapshot and messaging
-                // must run as they do for any room departure. The once-only
-                // marker records that this departure was already validated, so
-                // `on_peer_left` can finish it without re-draining the queue.
-                if let Ev::PeerLeft(v) = inner.as_ref() {
-                    if v["id"].as_str() != Some(pid.as_str()) {
-                        return None;
-                    }
-                    // A replacement adopted after the barrier was queued is
-                    // newer authority and must survive; a stale barrier only
-                    // self-rejects (and never marks anything).
-                    if !self.source_current(&pid, source, inner.as_ref()) {
-                        return None;
-                    }
-                    if self.replaying_sources.contains_key(&source) {
-                        let _ = self.tx.send(Ev::Sourced { pid, source, inner });
-                        return None;
-                    }
-                    match self.link_events.get_mut(&pid) {
-                        Some(events)
-                            if self.links.get(&pid).map(|link| link.generation)
-                                == Some(events.generation) =>
-                        {
-                            events.departure_ready = Some(source);
-                        }
-                        // No live queue for this link (dropped since the drain):
-                        // there is nothing this hand-over protects.
-                        _ => return None,
-                    }
-                    let v = v.clone();
-                    return Some((Ev::PeerLeft(v), Some(source)));
-                }
-                // Envelope and inner pid must agree, and nesting is invalid:
-                // otherwise checking one pid would handle another.
-                let valid_inner = match inner.as_ref() {
-                    Ev::Control(ipid, _)
-                    | Ev::PcState(ipid, _)
-                    | Ev::ChannelReady(ipid, _)
-                    | Ev::Chunk(ipid, ..) => ipid == &pid,
-                    _ => false,
-                };
-                if !valid_inner {
-                    return None;
-                }
-                // The ack for a cut link's refusal, from whichever path of that
-                // peer it came back on (current or not). It is consumed here:
-                // it authorizes nothing and is never dispatched.
-                if self.closing_ack(&pid, inner.as_ref()) {
-                    return None;
-                }
-                if self.source_current(&pid, source, inner.as_ref()) {
-                    if self.replaying_sources.contains_key(&source) {
-                        // The replay tokens were queued behind already-read newer
-                        // events. Swap this arrival behind the oldest buffered
-                        // event, so the consumer sees source order, not queue order.
-                        let total: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.bytes).sum();
-                        let Some(pending) = self.replaying_sources.get_mut(&source) else { return None; };
-                        if pending.pid != pid { return None; }
-                        // The token invariant says one buffered event per token.
-                        // If it does not hold, fail closed: drop the replay and
-                        // close the transport rather than panic in the daemon's
-                        // event loop.
-                        let Some(older) = pending.events.pop_front() else {
-                            self.replaying_sources.remove(&source);
-                            if let Some(t) = self.transport_of(&pid) { t.force_close(); }
-                            return None;
-                        };
-                        let bytes = pending.bytes.saturating_sub(ev_weight(&older))
-                            .saturating_add(ev_weight(&inner));
-                        let total_after = total.saturating_sub(pending.bytes).saturating_add(bytes);
-                        if bytes > MAX_BUILD_EVENT_BYTES || total_after > MAX_BUILD_EVENT_BYTES {
-                            self.replaying_sources.remove(&source);
-                            if let Some(t) = self.transport_of(&pid) { t.force_close(); }
-                            return None;
-                        }
-                        pending.bytes = bytes;
-                        pending.events.push_back(*inner);
-                        return self.source_current(&pid, source, &older).then_some((older, Some(source)));
-                    }
-                    return Some((*inner, Some(source)));
-                }
-                // A standby/upgrade attempt may deliver before adoption. Buffer
-                // it only for its registered source and pid, bounded.
-                if self.pending_sources.get(&source).is_some_and(|p| p.pid == pid) {
-                    self.buffer_pending_source(pid, source, *inner);
-                }
-                None
-            }
-            // A transport-origin event must never arrive untagged. Fail closed
-            // whether or not a link exists.
-            Ev::Control(..) | Ev::PcState(..) | Ev::ChannelReady(..) | Ev::Chunk(..) => None,
-            // Loop-authored events are explicitly trusted: they are created by
-            // this loop, not a transport callback.
-            Ev::LocalControl(pid, value) => Some((Ev::Control(pid, value), None)),
-            Ev::LocalPcState(pid, state) => Some((Ev::PcState(pid, state), None)),
-            other => Some((other, None)),
-        }
-    }
-
-    /// Forget cut-link entries whose closer has finished. Never awaits.
-    fn pump_closing(&mut self) {
-        self.closing.retain(|_, entry| entry.ack.as_ref().is_some_and(|a| !a.is_closed()));
-    }
-
-    /// A `link-revoked-ack` answering a cut in flight completes it: the nonce
-    /// must be that cut's, read for that cut's pid (on any of its paths).
-    /// Returns whether `inner` was a `link-revoked-ack` at all; every
-    /// one is consumed (a stale or unknown one is logged), since it authorizes
-    /// nothing and has no handler.
-    fn closing_ack(&mut self, pid: &str, inner: &Ev) -> bool {
-        let Some((ipid, nonce)) = refusal_ack_nonce(inner) else {
-            return false;
-        };
-        let matched =
-            ipid == pid && self.closing.get(nonce).is_some_and(|entry| entry.pid == pid);
-        if matched {
-            if let Some(mut entry) = self.closing.remove(nonce) {
-                if let Some(ack) = entry.ack.take() {
-                    let _ = ack.send(());
-                }
-            }
-        } else {
-            self.log.debug(&format!(
-                "link-revoked-ack from {pid} for nonce {nonce}: already settled or unknown \
-                 (duplicate acks on a second path are expected)"
-            ));
-        }
-        true
-    }
-
-    /// A source is current when it is the link's primary source, or (for
-    /// Control and Chunk only) one of its current worker sources. PcState/ChannelReady
-    /// and a departure barrier (`Ev::PeerLeft`) are primary-only so a worker
-    /// can never trigger primary teardown/readiness or a departure.
-    fn source_current(&self, pid: &str, source: net::SourceId, inner: &Ev) -> bool {
-        let Some(link) = self.links.get(pid) else {
-            return false;
-        };
-        if link.source == source {
-            return true;
-        }
-        matches!(inner, Ev::Control(..) | Ev::Chunk(..)) && link.worker_sources.contains(&source)
-    }
-
-    /// Buffer a pre-adoption event for a registered source. Per-source and total
-    /// bounds are the existing build-event budget; overflow fails closed by
-    /// dropping the pending source and its standby transport.
-    fn buffer_pending_source(&mut self, pid: String, source: net::SourceId, inner: Ev) {
-        let weight = ev_weight(&inner);
-        let total_events: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.events.len()).sum();
-        let total_bytes: usize = self.pending_sources.values().chain(self.replaying_sources.values()).map(|p| p.bytes).sum();
-        let over_total = total_events >= MAX_BUILD_EVENTS
-            || total_bytes.saturating_add(weight) > MAX_BUILD_EVENT_BYTES;
-        let is_new = !self.pending_sources.contains_key(&source);
-        let over_sources = is_new && self.pending_sources.len() >= MAX_PENDING_BUILDS;
-        let over_source = self.pending_sources.get(&source).is_none_or(|p| {
-            p.events.len() >= MAX_BUILD_EVENTS
-                || p.bytes.saturating_add(weight) > MAX_BUILD_EVENT_BYTES
-        });
-        if over_total || over_sources || over_source {
-            self.drop_pending_source(source);
-            return;
-        }
-        let entry = self
-            .pending_sources
-            .entry(source)
-            .or_insert_with(|| PendingSource {
-                pid: pid.clone(),
-                attempt: None,
-                at: Instant::now(),
-                events: std::collections::VecDeque::new(),
-                bytes: 0,
-            });
-        entry.bytes += weight;
-        entry.events.push_back(inner);
-    }
-
-    /// Drop a pending source and close its standby, so overflow cannot leave a
-    /// live transport that will never be adopted.
-    fn drop_pending_source(&mut self, source: net::SourceId) {
-        let Some(pending) = self.pending_sources.remove(&source) else {
-            return;
-        };
-        if let Some(promotion) = self.promotions.get_mut(&pending.pid) {
-            let matches = promotion
-                .standby
-                .as_ref()
-                .is_some_and(|(transport, _)| transport.source_id() == Some(source));
-            if matches {
-                if let Some((transport, _)) = promotion.standby.take() {
-                    transport.force_close();
-                }
-            }
-        }
-        if let Some(probe) = self.resil.upgrade_probe.get_mut(&pending.pid) {
-            let matches = probe
-                .standby
-                .as_ref()
-                .is_some_and(|transport| transport.source_id() == Some(source));
-            if matches {
-                if let Some(transport) = probe.standby.take() {
-                    transport.force_close();
-                }
-            }
-        }
-    }
-
-    /// Queue one token per buffered event. Newer already-queued events swap with
-    /// the oldest replay item at the final gate, preserving source order.
-    fn flush_pending_source(&mut self, source: net::SourceId) {
-        let Some(pending) = self.pending_sources.remove(&source) else {
-            return;
-        };
-        let count = pending.events.len();
-        if count == 0 { return; }
-        self.replaying_sources.insert(source, pending);
-        for _ in 0..count {
-            let _ = self.tx.send(Ev::ReplaySource(source));
-        }
-    }
-
     /// Stage an inbound signal for a candidate that is still being built.
     /// Returns true when consumed. Callers must invoke this before their normal
     /// signal handler. The candidate is named by the server-stamped envelope
@@ -5888,7 +5171,7 @@ impl Conn {
                 }
             }
         }
-        self.pending_sources
+        self.sources.pending_sources
             .retain(|_, pending| !(pending.pid == pid && pending.attempt == Some(attempt)));
     }
 
@@ -6113,7 +5396,7 @@ impl Conn {
                 t.force_close();
             }
             if let Some(attempt) = st.attempt {
-                self.pending_sources
+                self.sources.pending_sources
                     .retain(|_, pending| !(pending.pid == pid && pending.attempt == Some(attempt)));
             }
         }
@@ -7502,7 +6785,7 @@ impl Conn {
                 Tone::Dim,
                 &format!("dropping peer (connection {why} after {attempts} attempts)"),
             ));
-            self.suppressed_digest_adoptions.insert(pid.to_string());
+            self.digest.suppressed_digest_adoptions.insert(pid.to_string());
             self.drop_link(pid);
             return Ok(was_active);
         }
@@ -9045,7 +8328,7 @@ impl Conn {
                 }
                 DirectReadyCheck::Accept { .. } => {}
             }
-            self.pending_sources.insert(
+            self.sources.pending_sources.insert(
                 source,
                 PendingSource {
                     pid: pid.to_string(),
@@ -9098,7 +8381,7 @@ impl Conn {
             }
             DirectReadyCheck::Accept { .. } => {}
         }
-        self.pending_sources.insert(
+        self.sources.pending_sources.insert(
             source,
             PendingSource {
                 pid: pid.to_string(),
@@ -9231,23 +8514,19 @@ impl Conn {
         // and finalizer below. Ordinary ready/pending behaviour is unchanged.
         let forced = v["__fil_force_drop"].as_bool() == Some(true);
         if forced {
-            self.replay_departures.remove(pid_val);
-            if let Some(events) = self.link_events.get_mut(pid_val) {
-                events.departure_ready = None;
-                events.departure_pending = None;
-            }
+            self.sources.force_clear_departure(pid_val);
         } else {
-            if let Some((source, ready)) = self.replay_departures.get(pid_val).copied() {
+            if let Some((source, ready)) = self.sources.replay_departures.get(pid_val).copied() {
                 if self.links.get(pid_val).map(|link| link.source) != Some(source) {
-                    self.replay_departures.remove(pid_val);
+                    self.sources.replay_departures.remove(pid_val);
                     if ready { return false; }
                 } else {
                     if !ready { return false; }
-                    self.replay_departures.remove(pid_val);
+                    self.sources.replay_departures.remove(pid_val);
                 }
             } else if let Some(source) = self.links.get(pid_val).map(|link| link.source) {
-                if self.replaying_sources.contains_key(&source) {
-                    self.replay_departures.insert(pid_val.to_string(), (source, false));
+                if self.sources.replaying_sources.contains_key(&source) {
+                    self.sources.replay_departures.insert(pid_val.to_string(), (source, false));
                     let _ = self.tx.send(Ev::ReplayDeparture(pid_val.to_string(), source, v.clone()));
                     return false;
                 }
@@ -9260,7 +8539,7 @@ impl Conn {
             // ran: the successor is newer authority, so nothing of it is touched
             // (not even the cleanup below), and the stale marker dies here.
             if let Some(source) = self
-                .link_events
+                .sources.link_events
                 .get_mut(pid_val)
                 .and_then(|events| events.departure_ready.take())
             {
@@ -9276,7 +8555,7 @@ impl Conn {
             // barrier; the barrier does the drop. Checked after the ready marker
             // (that one is the validated hand-over itself).
             if let Some(source) = self
-                .link_events
+                .sources.link_events
                 .get(pid_val)
                 .and_then(|events| events.departure_pending)
             {
@@ -9284,7 +8563,7 @@ impl Conn {
                     return false;
                 }
                 // The link it protected is gone or replaced: the flag dies with it.
-                if let Some(events) = self.link_events.get_mut(pid_val) {
+                if let Some(events) = self.sources.link_events.get_mut(pid_val) {
                     events.departure_pending = None;
                 }
             }
@@ -9301,7 +8580,7 @@ impl Conn {
                 .debug(&format!("peer-left invalidated build pid={pid}{generation}"));
         }
         self.cancel_build(&pid);
-        self.pending_sources.retain(|_, pending| pending.pid != pid);
+        self.sources.retain_pending_except_pid(&pid);
         if !self.links.contains_key(&pid) {
             return false;
         }
@@ -9332,7 +8611,7 @@ impl Conn {
         if !forced && !delegated && !defer_disabled && !self.recv_done && self.link_flowing(&pid) {
             // Idempotent: first peer-left for this sid records the original
             // payload; a duplicate is swallowed (no double-defer, no drop).
-            self.deferred_left
+            self.digest.deferred_left
                 .entry(pid.clone())
                 .or_insert_with(|| v.clone());
             let name = self
@@ -9365,7 +8644,7 @@ impl Conn {
                             source,
                             inner: Box::new(Ev::PeerLeft(v.clone())),
                         });
-                        if let Some(events) = self.link_events.get_mut(&pid) {
+                        if let Some(events) = self.sources.link_events.get_mut(&pid) {
                             events.departure_pending = Some(source);
                         }
                         self.log.debug(&format!(
@@ -9427,271 +8706,6 @@ impl Conn {
             self.rejoin.waiting_rejoin = Some(Instant::now());
         }
         was_active
-    }
-
-    /// Move a BOUNDED batch of the events already READ from `pid`'s current
-    /// link (its candidate queue) onto the main queue, in arrival order,
-    /// without touching another link's stream. The batch is capped at the
-    /// existing per-link event budget, so a producer still writing cannot keep
-    /// this loop spinning; over the cap the caller fails closed instead of
-    /// retrying or retaining. Only called from `on_peer_left`, immediately
-    /// before queueing the departure barrier, so those events are dispatched
-    /// while the link they came from still exists.
-    fn drain_current_link_events(&mut self, pid: &str) -> QueueDrain {
-        let Some(generation) = self.link_events.get(pid).map(|events| events.generation) else {
-            return QueueDrain::Empty;
-        };
-        // The entry must belong to the link this leave names. A newer
-        // generation is different authority and is not ours to drain.
-        if self.links.get(pid).map(|link| link.generation) != Some(generation) {
-            return QueueDrain::Empty;
-        }
-        let tx = self.tx.clone();
-        let Some(events) = self.link_events.get_mut(pid) else {
-            return QueueDrain::Empty;
-        };
-        let mut rx = events
-            .rx
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut moved = 0;
-        while moved < MAX_BUILD_EVENTS {
-            match rx.try_recv() {
-                Ok(ev) => {
-                    let _ = tx.send(ev);
-                    moved += 1;
-                }
-                Err(_) => {
-                    return if moved == 0 {
-                        QueueDrain::Empty
-                    } else {
-                        QueueDrain::Moved(moved)
-                    };
-                }
-            }
-        }
-        // Exactly at the cap: probe once (never loop) to tell "the queue ended
-        // there" from "there is more than may be handed over in one turn".
-        if rx.try_recv().is_ok() {
-            QueueDrain::Overflow
-        } else {
-            QueueDrain::Moved(moved)
-        }
-    }
-
-    /// #28: re-check every deferred peer-left. Called on every main-loop tick
-    /// (idempotent, cheap). A deferred sid is discharged when it is no longer
-    /// flowing, its data channel went idle past the threshold OR died
-    /// (idle_ms == u64::MAX). We then re-inject the ORIGINAL peer-left payload
-    /// (flagged force) so the normal Ev::PeerLeft handler runs verbatim, same
-    /// loop-side flush/messaging/rejoin behaviour as a non-deferred leave, with
-    /// the link now correctly dropped. A sid that vanished from `links` (e.g. a
-    /// supersede dropped it; drop_link already cleared its entry, but belt-and-
-    /// braces) is forgotten silently. A still-flowing sid is left to keep
-    /// flowing, the reconnect case, where the transfer completes on the live
-    /// channel and the all-done exit reaps it.
-    pub fn reap_deferred(&mut self) {
-        if self.deferred_left.is_empty() {
-            return;
-        }
-        let ready: Vec<(String, Value)> = self
-            .deferred_left
-            .iter()
-            .filter(|(sid, _)| !self.links.contains_key(*sid) || !self.link_flowing(sid))
-            .map(|(sid, v)| (sid.clone(), v.clone()))
-            .collect();
-        for (sid, mut payload) in ready {
-            self.deferred_left.remove(&sid);
-            if !self.links.contains_key(&sid) {
-                continue; // link already gone (superseded); nothing to drop
-            }
-            // Force the drop this time (the channel is now idle/dead).
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert("__fil_force_drop".into(), Value::Bool(true));
-            }
-            let name = self
-                .link(&sid)
-                .map(|l| l.name.clone())
-                .unwrap_or_else(|| "peer".into());
-            // DEBUG, resilience internal (deferred-leave reap).
-            self.log.debug(&format!(
-                "{name} link went idle after deferred leave, dropping now"
-            ));
-            // Re-inject so the loop's own peer-left branch handles partials,
-            // messaging and the rejoin window exactly as a fresh leave would.
-            let _ = self.tx.send(Ev::PeerLeft(payload));
-        }
-    }
-
-    /// Digest reconcile decision for ONE link on the surface that owns it.
-    ///
-    /// The digest describes SIGNALING presence, but the data channel is
-    /// independent. A signaling reconnect gives the peer a new sid, so the old
-    /// sid legitimately drops out of `channel_peers` while the direct link is
-    /// still the one carrying a shell. `on_peer_left` already defers that case
-    /// (`deferred_left` + `reap_deferred`); digest reconcile did not, and tore
-    /// those links down (PR512, `cli/src/recv_cmd.rs` reconcile loop).
-    ///
-    /// Hysteresis and deferral stay on `surface`: a link is offered to exactly
-    /// one digest. Presence there (or a fresh signaling sid) clears both its
-    /// miss count and its clock; absence counts two consecutive misses, then
-    /// defers while the link is alive and active (see
-    /// `digest_absent_retirable_at`). Returns true when the caller may retire
-    /// the link now.
-    pub fn digest_note(
-        &mut self,
-        pid: &str,
-        surface: DigestSurface,
-        present: bool,
-        fresh: bool,
-    ) -> bool {
-        self.digest_note_at(pid, surface, present, fresh, Instant::now())
-    }
-
-    fn digest_note_at(
-        &mut self,
-        pid: &str,
-        surface: DigestSurface,
-        present: bool,
-        fresh: bool,
-        now: Instant,
-    ) -> bool {
-        let candidate = {
-            let counts = match surface {
-                DigestSurface::Channel => &mut self.channel_digest_absent,
-                DigestSurface::Room => &mut self.room_digest_absent,
-            };
-            if present || fresh {
-                counts.remove(pid);
-                false
-            } else {
-                let count = counts.entry(pid.to_string()).or_insert(0);
-                *count += 1;
-                *count >= 2
-            }
-        };
-        if present || fresh {
-            // Only the owning surface may clear this link's clock.
-            self.digest_deferred.remove(pid);
-            return false;
-        }
-        candidate && self.digest_absent_retirable_at(pid, now)
-    }
-
-    /// May the caller retire a link that missed two digests? Dead/closed
-    /// transport: yes, at once. A live DIRECT link: no, for as long as its QUIC
-    /// connection is alive (an idle shell is not a departed peer; the transport
-    /// idle/dead verdict is the bound). A live relay: no while it is still
-    /// hearing the peer, then `DIGEST_ABSENT_IDLE_GRACE` from when that stopped.
-    /// A transport-less/peer-only link still gets the bounded grace.
-    ///
-    /// `has_live_transport` deliberately counts an in-progress WebRTC peer
-    /// (#246) even before a transport exists, so a dead primary beside a still
-    /// live peer model gets this bounded grace rather than an immediate drop.
-    /// That is a delay, not an exemption: the grace still runs.
-    pub fn digest_absent_retirable(&mut self, pid: &str) -> bool {
-        self.digest_absent_retirable_at(pid, Instant::now())
-    }
-
-    fn digest_absent_retirable_at(&mut self, pid: &str, now: Instant) -> bool {
-        if !self.has_live_transport(pid) {
-            self.digest_deferred.remove(pid);
-            return true;
-        }
-        // A direct link whose QUIC connection has closed is gone NOW, even if
-        // the transport's `dead` flag has not latched yet. `has_live_transport`
-        // asks the weaker `!is_dead()`; for a direct primary it is the stricter
-        // `is_alive()` that says whether the shell can still be served. Without
-        // this, a closed-but-not-yet-dead QUIC link would sit out the 30 s grace.
-        if self.links.get(pid).is_some_and(|l| {
-            l.direct && l.transport.as_ref().is_some_and(|t| !t.is_alive())
-        }) {
-            self.digest_deferred.remove(pid);
-            return true;
-        }
-        if self.digest_link_active(pid) {
-            // A live transport outranks a missing presence entry. Refresh the
-            // clock so the grace starts if/when the link really goes quiet.
-            self.digest_deferred.insert(pid.to_string(), now);
-            return false;
-        }
-        let first = *self.digest_deferred.entry(pid.to_string()).or_insert(now);
-        if now.saturating_duration_since(first) >= DIGEST_ABSENT_IDLE_GRACE {
-            self.digest_deferred.remove(pid);
-            return true;
-        }
-        false
-    }
-
-    /// Is the PEER demonstrably active on this link right now?
-    ///
-    /// Three transport shapes, deliberately:
-    ///
-    /// * **Direct QUIC** has no peer-originated `heard_ms`. Its `idle_ms` is
-    ///   stamped by our own writes too, so a quiet shell and a busy transfer are
-    ///   indistinguishable by bytes. Use the transport's own liveness instead:
-    ///   `is_alive()` (and not `is_dead()`) is the QUIC 7 s keepalive / 21 s
-    ///   idle verdict. An alive link is kept for as long as it is alive; a
-    ///   closed/dead one retires at once (see `digest_absent_retirable_at`).
-    /// * **Relay/DataChannel** keepalives are OUR writes and stamp `idle_ms`, so
-    ///   a link to a wiped or SIGSTOPped peer can read busy forever. Its
-    ///   `heard_ms` is peer-only; the shared `link_manager::relay_peer_live`
-    ///   rule bounds it, and silence still reaches the grace and retires.
-    /// * **Untracked** transports fall back to idle for compatibility.
-    ///
-    /// This is intentionally not `link_flowing` (which backs supersede/peer-left
-    /// and must keep its byte-movement meaning).
-    fn digest_link_active(&self, pid: &str) -> bool {
-        let Some(l) = self.links.get(pid) else {
-            return false;
-        };
-        let Some(t) = l.transport.as_ref() else {
-            return false;
-        };
-        if t.is_dead() || !t.is_alive() {
-            return false;
-        }
-        if l.direct {
-            // Transport-bounded: no 30 s idle cutoff for a live direct link.
-            return true;
-        }
-        if let Some(peer_live) = crate::link_manager::relay_peer_live(t.heard_ms()) {
-            return peer_live;
-        }
-        t.idle_ms() < DIGEST_ACTIVE_MS
-    }
-
-    /// The sid is present again in a digest: nothing is deferred for it. The
-    /// next absence starts a fresh grace window.
-    pub fn digest_present(&mut self, pid: &str) {
-        self.digest_deferred.remove(pid);
-    }
-
-    /// A fresh signaling sid invalidates the previous digest window. The peer is
-    /// re-subscribing on its own new sid at the same time, so an absence window
-    /// that started before the reconnect (or the first digest after it) must not
-    /// carry over and retire a link that never stopped flowing.
-    pub fn reset_digest_reconcile(&mut self) {
-        self.digest_deferred.clear();
-        self.channel_digest_absent.clear();
-        self.room_digest_absent.clear();
-    }
-
-    /// #28 exit reconciliation: true when every remaining link is one we're only
-    /// holding open for its deferred-drop reap (vacuously true with no links). A
-    /// link in `deferred_left` is a peer whose signaling already left; once all
-    /// transfers are complete it protects nothing, so it must not delay exit by
-    /// the full deferral window.
-    ///
-    /// `digest_deferred` is deliberately NOT counted here. Unlike a peer-left,
-    /// a digest miss can be a presence gap while the peer is still active on the
-    /// data channel; a one-shot receiver that already completed a file must not
-    /// exit out from under a sender that may offer another. The bounded grace
-    /// and the normal quiet/Mode-B exits retire it.
-    pub fn only_deferred_links(&self) -> bool {
-        self.links
-            .keys()
-            .all(|k| self.deferred_left.contains_key(k))
     }
 
     /// C21: any traffic from a peer cancels its declared absence.

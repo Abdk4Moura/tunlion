@@ -5410,7 +5410,7 @@ async fn recv_run(
                             // Not channel-owned: clear only a stale channel miss
                             // count. Its room clock belongs to the room loop and
                             // must survive this pass.
-                            conn.channel_digest_absent.remove(&pid);
+                            conn.clear_digest_absent(crate::conn::DigestSurface::Channel, &pid);
                             continue;
                         };
                         if conn.digest_note(
@@ -5500,7 +5500,7 @@ async fn recv_run(
                         let Some(present) = present else {
                             // Not room-owned: only a stale room count may be
                             // cleared, never the channel surface's clock.
-                            conn.room_digest_absent.remove(&pid);
+                            conn.clear_digest_absent(crate::conn::DigestSurface::Room, &pid);
                             continue;
                         };
                         if conn.digest_note(
