@@ -122,6 +122,15 @@ pub enum Fault {
         policy: MessageChaosPolicy,
     },
     ClearMessageChaos,
+    /// Every durable write on `node`'s disk takes `write_ms` from now on
+    /// (fsync under writeback pressure, a saturated or failing disk).
+    SlowDisk {
+        node: String,
+        write_ms: u64,
+    },
+    ClearSlowDisk {
+        node: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,6 +167,7 @@ enum RaceWaiterOutcome {
         tx: mpsc::UnboundedSender<SimWireMsg>,
         rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<SimWireMsg>>>>,
         peer_sid: String,
+        cb: Option<Vec<u8>>,
     },
 }
 
@@ -201,6 +211,11 @@ struct NetInner {
     tracker: NodeStateTracker,
     event_tx: Option<mpsc::UnboundedSender<(u64, String, ProtoEvent)>>,
     trace: Vec<NetTraceEvent>,
+    /// The wider world model (`SimConfig::reach`): server-assigned random
+    /// session ids, HTTP requests that take a round trip, and a TLS-exporter
+    /// channel binding on direct links, as production has.
+    reach: bool,
+    disks: BTreeMap<String, Arc<crate::sim::store::SimDisk>>,
 }
 
 struct PendingSigDelivery {
@@ -373,6 +388,10 @@ impl SimNetwork {
     }
 
     pub fn with_mutant(seed: u64, mutant: SimMutant) -> Arc<Self> {
+        Self::with_options(seed, mutant, false)
+    }
+
+    pub fn with_options(seed: u64, mutant: SimMutant, reach: bool) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(NetInner {
                 rng: SimRng::new(seed),
@@ -398,8 +417,24 @@ impl SimNetwork {
                 tracker: NodeStateTracker::default(),
                 event_tx: None,
                 trace: Vec::new(),
+                reach,
+                disks: BTreeMap::new(),
             }),
         })
+    }
+
+    /// `node`'s disk (created on first use; it outlives a restart).
+    pub fn disk(&self, node: &str) -> Arc<crate::sim::store::SimDisk> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.disks.entry(node.to_string()).or_default().clone()
+    }
+
+    /// Append a world-level event to the network trace (part of the hash).
+    pub fn record_trace(&self, event: impl Into<String>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(event);
     }
 
     pub fn register_node_identity(&self, node: &str, uid: &str) {
@@ -521,6 +556,14 @@ impl SimNetwork {
             Fault::ClearMessageChaos => {
                 g.record("fault:clear_msg_chaos");
                 g.msg_chaos = MessageChaosPolicy::default();
+            }
+            Fault::SlowDisk { node, write_ms } => {
+                g.record(format!("fault:slow_disk:{node}:{write_ms}"));
+                g.disks.entry(node).or_default().set_write_ms(write_ms);
+            }
+            Fault::ClearSlowDisk { node } => {
+                g.record(format!("fault:clear_slow_disk:{node}"));
+                g.disks.entry(node).or_default().set_write_ms(0);
             }
         }
     }
@@ -679,7 +722,17 @@ impl SignalingConnector for SimSignalingConnector {
             let sid = {
                 let mut g = self.net.inner.lock().unwrap_or_else(|e| e.into_inner());
                 g.next_sid += 1;
-                let sid = format!("sim-sid-{}", g.next_sid);
+                let sid = if g.reach {
+                    // A socket.io id: 20 random characters. Which end of a pair
+                    // sorts higher is then random, as it is in production.
+                    const ALPHA: &[u8] =
+                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+                    (0..20)
+                        .map(|_| ALPHA[g.rng.gen_range_u64(ALPHA.len() as u64) as usize] as char)
+                        .collect()
+                } else {
+                    format!("sim-sid-{}", g.next_sid)
+                };
                 let suppress_heal = g.drop_post_heal_reconnect;
                 g.sig_clients.insert(
                     conn_id,
@@ -950,15 +1003,25 @@ struct SimHttpBackend {
 impl HttpBackend for SimHttpBackend {
     fn get_json<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<Value>> {
         Box::pin(async move {
-            let (hang_ms, blackholed, ip) = {
+            let (hang_ms, blackholed, ip, rtt_ms) = {
                 let mut g = self.net.inner.lock().unwrap_or_else(|e| e.into_inner());
                 let hang = g.take_hang(&self.node, HangSite::HttpGetJson);
                 let bh = g.blackholed.contains(self.node.as_ref());
                 let ip = g.node_ip(&self.node);
-                (hang, bh, ip)
+                // An HTTP request is a round trip to the server.
+                let rtt = if g.reach {
+                    g.one_way_delay_ms(&self.node, "server", false)
+                        + g.one_way_delay_ms("server", &self.node, false)
+                } else {
+                    0
+                };
+                (hang, bh, ip, rtt)
             };
             if let Some(ms) = hang_ms {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            if rtt_ms > 0 && !blackholed {
+                tokio::time::sleep(Duration::from_millis(rtt_ms)).await;
             }
             if blackholed {
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1035,6 +1098,10 @@ impl DirectBackend for SimDirectBackend {
                 }
                 let (a_tx, a_rx) = mpsc::unbounded_channel();
                 let (b_tx, b_rx) = mpsc::unbounded_channel();
+                // The TLS exporter both ends of one QUIC connection derive.
+                let cb: Option<Vec<u8>> = g.reach.then(|| {
+                    (0..4).flat_map(|_| g.rng.next_u64().to_le_bytes()).collect()
+                });
                 g.record(format!(
                     "direct:pair:{}:{}<->{}",
                     req.route, self.node, peer_waiter.node
@@ -1073,6 +1140,7 @@ impl DirectBackend for SimDirectBackend {
                     tx: b_tx,
                     rx: Arc::new(Mutex::new(Some(a_rx))),
                     peer_sid: req.my_id.clone(),
+                    cb: cb.clone(),
                 });
                 peer_waiter.notify.notify_waiters();
                 *matched.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -1080,6 +1148,7 @@ impl DirectBackend for SimDirectBackend {
                         tx: a_tx,
                         rx: Arc::new(Mutex::new(Some(b_rx))),
                         peer_sid: peer_waiter.my_sid,
+                        cb,
                     });
             } else {
                 g.direct_waiters.push(DirectWaiter {
@@ -1096,7 +1165,7 @@ impl DirectBackend for SimDirectBackend {
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(1_800);
         loop {
-            if let Some(RaceWaiterOutcome::Connected { tx, rx, peer_sid }) =
+            if let Some(RaceWaiterOutcome::Connected { tx, rx, peer_sid, cb }) =
                 matched.lock().unwrap_or_else(|e| e.into_inner()).take()
             {
                 let rx_chan = rx.lock().unwrap_or_else(|e| e.into_inner()).take()?;
@@ -1127,6 +1196,7 @@ impl DirectBackend for SimDirectBackend {
                     last_heard_ms: last_heard_ms.clone(),
                     last_idle_ms,
                     out_tx: tx,
+                    cb,
                 });
                 let ev_tx = req.tx.clone();
                 let pid = if peer_sid.is_empty() {
@@ -1250,10 +1320,15 @@ struct SimTransport {
     last_heard_ms: Arc<AtomicU64>,
     last_idle_ms: Arc<AtomicU64>,
     out_tx: mpsc::UnboundedSender<SimWireMsg>,
+    cb: Option<Vec<u8>>,
 }
 
 #[async_trait]
 impl Transport for SimTransport {
+    fn channel_binding(&self) -> Option<Vec<u8>> {
+        self.cb.clone()
+    }
+
     async fn send_control(&self, msg: &Value) -> Result<()> {
         if self.dead.load(Ordering::Acquire) {
             anyhow::bail!("sim transport closed");

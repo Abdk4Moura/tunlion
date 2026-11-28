@@ -18,12 +18,15 @@ use crate::control::{Req, ReqKind};
 use crate::driver::{Cancellation, DriverOutcome, Engine};
 use crate::host::{HostServices, Level, LogSink, Tone};
 use crate::recv::dispatch::{drive, RecvCleanup};
-use crate::recv::ports::test_support::{NoDaemon, NoIdentity, NoPrompt, NoPty, NoServers, NoStore};
+use crate::recv::ports::test_support::{NoDaemon, NoIdentity, NoPrompt, NoPty, NoServers};
 use crate::recv::ports::{RecvDaemon, RecvEnv, RecvIdentity, RecvPorts};
 use crate::recv::report::RecvReport;
 use crate::shell_gate::ShellPolicy;
 use crate::sim::assertions::{record_sometimes, reset_assertions, take_assertions, AssertionReport};
+use crate::sim::fleet::{SimFleet, SimFleetMember};
 use crate::sim::net::{Fault, NetTraceEvent, SimNetwork};
+use crate::sim::oneshot::OneShot;
+use crate::sim::store::SimStore;
 use crate::sim::semantic::{
     ProtoEvent, SemanticAction, SemanticFault, SemanticTrigger, StateEdge, StateTransition,
 };
@@ -102,6 +105,21 @@ pub struct SimConfig {
     pub mutant: SimMutant,
     pub quiet_logs: bool,
     pub semantic_faults: Vec<SemanticFault>,
+    /// The wider world model: random server session ids, HTTP round trips and
+    /// a channel binding on direct links (see `SimNetwork::with_options`).
+    pub reach: bool,
+    /// Every daemon is a member of one sim fleet (owner key, rendezvous secret,
+    /// certified device key), so the fleet paths run as in production.
+    pub fleet: bool,
+    /// One-shot fleet dialers, each a fresh short-lived client.
+    pub one_shot_dials: Vec<OneShotDial>,
+}
+
+/// A one-shot dial of `target` starting at `at_ms` (see `sim::oneshot`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneShotDial {
+    pub at_ms: u64,
+    pub target: String,
 }
 
 struct CapturingLog {
@@ -159,6 +177,7 @@ impl CapturingLog {
 struct SimHost {
     peers: Vec<(String, String)>,
     ctl_slot: Arc<Mutex<Option<mpsc::UnboundedSender<Req>>>>,
+    fleet_member: Option<Arc<SimFleetMember>>,
 }
 
 #[async_trait]
@@ -205,7 +224,15 @@ impl HostServices for SimHost {
     }
 
     fn fleet_rv_present(&self) -> bool {
-        false
+        self.fleet_member.is_some()
+    }
+
+    #[cfg(feature = "mesh")]
+    fn overlay_pubkey(&self) -> std::result::Result<[u8; 32], String> {
+        self.fleet_member
+            .as_ref()
+            .map(|m| m.device_pub())
+            .ok_or_else(|| "this host has no overlay key store".to_string())
     }
 
     fn device_allows(&self, _name: &str, capability: &str) -> bool {
@@ -229,7 +256,11 @@ impl HostServices for SimHost {
     }
 }
 
-struct SimIdentity(NoIdentity);
+struct SimIdentity {
+    base: NoIdentity,
+    fleet: Option<(Arc<SimFleet>, Arc<SimFleetMember>)>,
+    store: Arc<SimStore>,
+}
 
 #[async_trait]
 impl RecvIdentity for SimIdentity {
@@ -264,47 +295,50 @@ impl RecvIdentity for SimIdentity {
     }
 
     fn load_provisional_identity(&self, name: &str) -> Option<filament_id::DeviceCert> {
-        self.0.load_provisional_identity(name)
+        self.base.load_provisional_identity(name)
     }
 
     fn clear_provisional_identity(&self, name: &str) {
-        self.0.clear_provisional_identity(name);
+        self.base.clear_provisional_identity(name);
     }
 
     fn local_device_cert(&self) -> Option<filament_id::DeviceCert> {
-        self.0.local_device_cert()
+        match &self.fleet {
+            Some((_, m)) => Some(m.cert()),
+            None => self.base.local_device_cert(),
+        }
     }
 
     async fn maybe_request_cert_renewal(&self, conn: &Conn, pid: &str) {
-        self.0.maybe_request_cert_renewal(conn, pid).await;
+        self.base.maybe_request_cert_renewal(conn, pid).await;
     }
 
     async fn respond_to_cert_renew_request(&self, conn: &mut Conn, pid: String) {
-        self.0.respond_to_cert_renew_request(conn, pid).await;
+        self.base.respond_to_cert_renew_request(conn, pid).await;
     }
 
     async fn handle_cert_renew_ack(&self, v: &Value) {
-        self.0.handle_cert_renew_ack(v).await;
+        self.base.handle_cert_renew_ack(v).await;
     }
 
     async fn respond_to_auth_key_enroll_request(&self, conn: &mut Conn, pid: String, v: Value) {
-        self.0
+        self.base
             .respond_to_auth_key_enroll_request(conn, pid, v)
             .await;
     }
 
     async fn handle_auth_key_enroll_response(&self, conn: &mut Conn, pid: String, v: Value) {
-        self.0
+        self.base
             .handle_auth_key_enroll_response(conn, pid, v)
             .await;
     }
 
     fn gate_settle_ms(&self) -> u64 {
-        self.0.gate_settle_ms()
+        self.base.gate_settle_ms()
     }
 
     fn hold_expired(&self, held: filament_transport::clock::Instant) -> bool {
-        self.0.hold_expired(held)
+        self.base.hold_expired(held)
     }
 
     async fn resend_identity_challenge(
@@ -313,33 +347,37 @@ impl RecvIdentity for SimIdentity {
         pid: &str,
         identity_nonces: &HashMap<String, ([u8; 32], filament_transport::clock::Instant, [u8; 32])>,
     ) -> bool {
-        self.0
+        self.base
             .resend_identity_challenge(t, pid, identity_nonces)
             .await
     }
 
     fn device_name_for_pub(&self, device_pub: &[u8; 32]) -> Option<String> {
-        self.0.device_name_for_pub(device_pub)
+        self.store.name_for_pub(device_pub)
     }
 
     fn device_cert_revoked(&self, device_pub: &[u8; 32]) -> bool {
-        self.0.device_cert_revoked(device_pub)
+        self.base.device_cert_revoked(device_pub)
     }
 
     fn device_tombstoned(&self, device_pub: &[u8; 32]) -> bool {
-        self.0.device_tombstoned(device_pub)
+        self.base.device_tombstoned(device_pub)
     }
 
     fn sibling_admissible(&self, device_pub: &[u8; 32]) -> bool {
-        self.0.sibling_admissible(device_pub)
+        // The owner's roster lists every member of the sim fleet.
+        match &self.fleet {
+            Some((f, _)) => f.lists(device_pub),
+            None => self.base.sibling_admissible(device_pub),
+        }
     }
 
     fn owner_pub_for_resources(&self) -> Option<[u8; 32]> {
-        self.0.owner_pub_for_resources()
+        self.base.owner_pub_for_resources()
     }
 
     fn reinvite_for(&self, device_pub: &[u8; 32]) -> Option<crate::refusal::Reinvite> {
-        self.0.reinvite_for(device_pub)
+        self.base.reinvite_for(device_pub)
     }
 
     fn reinvite_refusal(
@@ -347,15 +385,15 @@ impl RecvIdentity for SimIdentity {
         refusal: crate::refusal::Refusal,
         device_pub: Option<&[u8; 32]>,
     ) -> crate::refusal::Refusal {
-        self.0.reinvite_refusal(refusal, device_pub)
+        self.base.reinvite_refusal(refusal, device_pub)
     }
 
     fn enroll_channel(&self, public_key: &[u8; 32]) -> String {
-        self.0.enroll_channel(public_key)
+        self.base.enroll_channel(public_key)
     }
 
     fn is_armed(&self) -> bool {
-        self.0.is_armed()
+        self.base.is_armed()
     }
 
     fn verify_and_store_roster(
@@ -364,7 +402,7 @@ impl RecvIdentity for SimIdentity {
         from_pub: &[u8; 32],
         now: u64,
     ) -> Result<bool> {
-        self.0.verify_and_store_roster(v, from_pub, now)
+        self.base.verify_and_store_roster(v, from_pub, now)
     }
 
     fn verify_depart(
@@ -373,27 +411,30 @@ impl RecvIdentity for SimIdentity {
         msg: &str,
         sig: &[u8; 64],
     ) -> std::result::Result<(), &'static str> {
-        self.0.verify_depart(device_pub, msg, sig)
+        self.base.verify_depart(device_pub, msg, sig)
     }
 
     fn fleet_channel(&self) -> Option<String> {
-        self.0.fleet_channel()
+        self.fleet.as_ref().map(|(f, _)| f.channel())
     }
 
     fn fleet_rv(&self) -> Option<String> {
-        self.0.fleet_rv()
+        self.fleet.as_ref().map(|(f, _)| f.rv().to_string())
     }
 
     fn is_fleet_channel(&self, ch: &str) -> bool {
-        self.0.is_fleet_channel(ch)
+        !ch.is_empty() && self.fleet_channel().as_deref() == Some(ch)
     }
 
-    fn make_fleet_hello(&self, _: &[u8], _: &str) -> Result<Value> {
-        anyhow::bail!("sim identity has no fleet cert")
+    fn make_fleet_hello(&self, cb: &[u8], name: &str) -> Result<Value> {
+        match &self.fleet {
+            Some((_, m)) => m.make_hello(cb, name),
+            None => anyhow::bail!("sim identity has no fleet cert"),
+        }
     }
 
     fn fleet_owner_pub(&self) -> Option<[u8; 32]> {
-        self.0.fleet_owner_pub()
+        self.fleet.as_ref().map(|(f, _)| f.owner_pub())
     }
 }
 
@@ -615,14 +656,41 @@ fn build_recv_env(spec: &NodeSpec, pid: u32) -> RecvEnv {
     }
 }
 
+/// What a node keeps across a restart: its disk and device store, and its
+/// fleet membership.
+#[derive(Clone, Default)]
+struct NodeState {
+    stores: Arc<Mutex<BTreeMap<String, Arc<SimStore>>>>,
+    fleet: Option<Arc<SimFleet>>,
+}
+
+impl NodeState {
+    fn store(&self, net: &Arc<SimNetwork>, node: &str) -> Arc<SimStore> {
+        self.stores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(node.to_string())
+            .or_insert_with(|| Arc::new(SimStore::new(net.disk(node))))
+            .clone()
+    }
+
+    fn fleet_member(&self, node: &str) -> Option<(Arc<SimFleet>, Arc<SimFleetMember>)> {
+        let f = self.fleet.as_ref()?;
+        Some((f.clone(), f.member(node)?))
+    }
+}
+
 fn spawn_daemon(
     net: &Arc<SimNetwork>,
     spec: &NodeSpec,
     pid: u32,
     logs: Arc<Mutex<Vec<SimTraceEntry>>>,
     quiet_logs: bool,
+    state: &NodeState,
 ) -> RunningNode {
     net.register_node_identity(&spec.name, &spec.uid);
+    let store = state.store(net, &spec.name);
+    let fleet = state.fleet_member(&spec.name);
     let ctl_slot = Arc::new(Mutex::new(None));
     let tctx = net.node_context(&spec.name);
     let log: Arc<dyn LogSink> = Arc::new(CapturingLog {
@@ -633,11 +701,16 @@ fn spawn_daemon(
     let host: Arc<dyn HostServices> = Arc::new(SimHost {
         peers: spec.peers.clone(),
         ctl_slot: ctl_slot.clone(),
+        fleet_member: fleet.as_ref().map(|(_, m)| m.clone()),
     });
     let env = build_recv_env(spec, pid);
     let ports = RecvPorts::new(
-        Arc::new(SimIdentity(NoIdentity)),
-        Arc::new(NoStore),
+        Arc::new(SimIdentity {
+            base: NoIdentity,
+            fleet,
+            store: store.clone(),
+        }),
+        store,
         Box::new(NoServers),
         Box::new(SimDaemon {
             pid,
@@ -650,7 +723,9 @@ fn spawn_daemon(
     );
     let dir = PathBuf::from(format!("/tmp/sim-inbox-{}", spec.name));
     let cancel = Cancellation::default();
-    let engine = Engine::start(cancel, move |stop, readiness| async move {
+    // Every poll of the daemon future is "the loop is running" for the
+    // blocking-time charge (sim_rt::LoopScoped).
+    let engine = Engine::start(cancel, move |stop, readiness| crate::sim_rt::LoopScoped::new(async move {
         let mut cleanup = RecvCleanup::default();
         drive(
             "http://sim.local",
@@ -679,7 +754,7 @@ fn spawn_daemon(
             &mut cleanup,
         )
         .await
-    });
+    }));
     RunningNode {
         spec: spec.clone(),
         engine: Some(engine),
@@ -819,6 +894,7 @@ async fn kill_world_node(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn restart_world_node(
     net: &Arc<SimNetwork>,
     tracker: &Mutex<WorldTracker>,
@@ -827,6 +903,7 @@ fn restart_world_node(
     mutant: &SimMutant,
     quiet_logs: bool,
     name: &str,
+    state: &NodeState,
 ) {
     {
         let mut t = tracker.lock().unwrap_or_else(|e| e.into_inner());
@@ -850,7 +927,7 @@ fn restart_world_node(
             t.next_pid += 1;
             p
         };
-        r[pos] = spawn_daemon(net, &spec, pid, logs.clone(), quiet_logs);
+        r[pos] = spawn_daemon(net, &spec, pid, logs.clone(), quiet_logs, state);
     }
     net.record_proto_event(name, ProtoEvent::PeerRestarted);
 }
@@ -909,6 +986,7 @@ async fn execute_semantic_action(
     logs: Arc<Mutex<Vec<SimTraceEntry>>>,
     mutant: SimMutant,
     quiet_logs: bool,
+    state: NodeState,
 ) {
     if delay_ms > 0 {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -938,7 +1016,7 @@ async fn execute_semantic_action(
             if down_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(down_ms)).await;
             }
-            restart_world_node(&net, &tracker, &running, &logs, &mutant, quiet_logs, &node);
+            restart_world_node(&net, &tracker, &running, &logs, &mutant, quiet_logs, &node, &state);
         }
     }
 }
@@ -966,6 +1044,10 @@ impl SimWorld {
 
         rt.block_on(async move {
             clock::reset_sim_epoch();
+            if config.reach {
+                // Ids the logs print must replay too (see sim_ids).
+                filament_transport::net::sim_ids::begin();
+            }
             sim_rt::reset_sim_rng(config.seed);
             sim_rt::reset_sim_telemetry();
             reset_assertions();
@@ -973,7 +1055,16 @@ impl SimWorld {
             sim_rt::set_sim_watchdog_disabled(true);
             sim_rt::set_sim_inline_stall_ms(0);
 
-            let net = SimNetwork::with_mutant(config.seed, config.mutant.clone());
+            let net = SimNetwork::with_options(config.seed, config.mutant.clone(), config.reach);
+            let node_state = NodeState {
+                stores: Default::default(),
+                fleet: if config.fleet {
+                    let names: Vec<String> = config.nodes.iter().map(|n| n.name.clone()).collect();
+                    Some(SimFleet::new(config.seed, &names).expect("sim fleet keys"))
+                } else {
+                    None
+                },
+            };
             let logs = Arc::new(Mutex::new(Vec::<SimTraceEntry>::new()));
             let tracker = Arc::new(Mutex::new(WorldTracker {
                 next_pid: 1000,
@@ -990,7 +1081,7 @@ impl SimWorld {
                         t.next_pid += 1;
                         p
                     };
-                    spawn_daemon(&net, spec, pid, logs.clone(), config.quiet_logs)
+                    spawn_daemon(&net, spec, pid, logs.clone(), config.quiet_logs, &node_state)
                 })
                 .collect();
             let running = Arc::new(Mutex::new(initial_running));
@@ -1007,6 +1098,7 @@ impl SimWorld {
                 let s_mutant = config.mutant.clone();
                 let s_quiet = config.quiet_logs;
                 let s_tasks = semantic_subtasks.clone();
+                let s_state = node_state.clone();
                 Some(tokio::spawn(async move {
                     let mut counts: BTreeMap<(Option<String>, ProtoEvent), u8> = BTreeMap::new();
                     let mut fired = vec![false; faults.len()];
@@ -1051,6 +1143,7 @@ impl SimWorld {
                                             s_logs.clone(),
                                             s_mutant.clone(),
                                             s_quiet,
+                                            s_state.clone(),
                                         ));
                                         s_tasks.lock().unwrap_or_else(|e| e.into_inner()).push(h);
                                     }
@@ -1072,11 +1165,12 @@ impl SimWorld {
                                         let r2 = s_running.clone();
                                         let l2 = s_logs.clone();
                                         let m2 = s_mutant.clone();
+                                        let st2 = s_state.clone();
                                         let h = tokio::spawn(async move {
                                             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                                             if n2.is_blackholed(&check_node) {
                                                 execute_semantic_action(
-                                                    action, 0, n2, t2, r2, l2, m2, s_quiet,
+                                                    action, 0, n2, t2, r2, l2, m2, s_quiet, st2,
                                                 )
                                                 .await;
                                             }
@@ -1099,6 +1193,7 @@ impl SimWorld {
                 RestartNode(String),
                 QueryCapStatus(String),
                 InjectInlineStall(u64),
+                OneShotDial(String),
             }
             let mut timeline: Vec<(u64, Action)> = config
                 .schedule
@@ -1115,6 +1210,10 @@ impl SimWorld {
             if let Some((at_ms, stall_ms)) = config.inline_stall_injection {
                 timeline.push((at_ms, Action::InjectInlineStall(stall_ms)));
             }
+            for d in &config.one_shot_dials {
+                timeline.push((d.at_ms, Action::OneShotDial(d.target.clone())));
+            }
+            let mut one_shots: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             timeline.sort_by_key(|(at, _)| *at);
 
             let mut cursor_ms = 0u64;
@@ -1139,6 +1238,7 @@ impl SimWorld {
                             &config.mutant,
                             config.quiet_logs,
                             &name,
+                            &node_state,
                         );
                     }
                     Action::QueryCapStatus(name) => {
@@ -1156,6 +1256,21 @@ impl SimWorld {
                     Action::InjectInlineStall(stall_ms) => {
                         sim_rt::set_sim_inline_stall_ms(stall_ms);
                     }
+                    Action::OneShotDial(target) => {
+                        if let Some(f) = node_state.fleet.as_ref() {
+                            let n = one_shots.len() + 1;
+                            record_sometimes("one_shot_dial");
+                            one_shots.push(tokio::spawn(crate::sim::oneshot::dial(
+                                net.clone(),
+                                OneShot {
+                                    name: format!("oneshot{n}"),
+                                    uid: format!("uid-oneshot{n}"),
+                                    target,
+                                    fleet_rv: f.rv().to_string(),
+                                },
+                            )));
+                        }
+                    }
                 }
             }
 
@@ -1164,6 +1279,9 @@ impl SimWorld {
             }
 
             if let Some(h) = semantic_handle {
+                h.abort();
+            }
+            for h in one_shots {
                 h.abort();
             }
             {
@@ -1206,6 +1324,7 @@ impl SimWorld {
             sim_rt::set_sim_inline_stall_ms(0);
             sim_rt::set_sim_watchdog_disabled(false);
             sim_rt::set_sim_blocking_inline(false);
+            filament_transport::net::sim_ids::end();
             let events = logs.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let net_events = net.trace_events();
             let state_edges = net.state_edges();
@@ -1224,6 +1343,14 @@ impl SimWorld {
                 record_sometimes("reconnect_after_peer_restart");
             }
 
+            {
+                let stores = node_state.stores.lock().unwrap_or_else(|e| e.into_inner());
+                for (node, _) in stores.iter() {
+                    if !net.disk(node).take_loop_writes().is_empty() {
+                        record_sometimes("slow_disk_write_on_loop");
+                    }
+                }
+            }
             let budget_violations: Vec<String> = events
                 .iter()
                 .filter(|e| e.message.contains("LOOP-BUDGET-EXCEEDED"))

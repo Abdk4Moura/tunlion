@@ -89,7 +89,9 @@ ssh-bootstrap = ["dep:authkeys-managed"]
 # `test-hooks` feature here, so a gate build injects into the moved code too.
 test-hooks = []
 debug-logs = []
-sim = ["filament-transport/sim", "filament-signal/sim", "tokio/test-util"]
+# The deterministic simulation (src/sim). It models fleet members, so it
+# compiles the fleet and overlay code it exercises.
+sim = ["mesh", "fleet", "filament-transport/sim", "filament-signal/sim", "tokio/test-util"]
 
 [dependencies]
 # Versions copied verbatim from cli/Cargo.toml, so the dependency graph and

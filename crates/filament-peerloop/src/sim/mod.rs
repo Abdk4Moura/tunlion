@@ -1,8 +1,11 @@
 pub mod assertions;
 pub mod corpus;
+pub mod fleet;
 pub mod fuzz;
 pub mod net;
+pub mod oneshot;
 pub mod semantic;
+pub mod store;
 pub mod world;
 
 pub use assertions::{
@@ -16,6 +19,6 @@ pub use semantic::{
     StateEdge, StateTransition,
 };
 pub use world::{
-    CapStatusResult, NodeSpec, ScheduledFault, SimConfig, SimMutant, SimOutcome, SimTraceEntry,
+    CapStatusResult, NodeSpec, OneShotDial, ScheduledFault, SimConfig, SimMutant, SimOutcome, SimTraceEntry,
     SimWorld,
 };

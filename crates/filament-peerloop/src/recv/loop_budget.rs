@@ -197,6 +197,11 @@ pub struct IterationBudget {
     slowest_detail: Option<String>,
     event: &'static str,
     detail: Option<String>,
+    /// Sim builds: the loop's charged synchronous time when the open stretch
+    /// started (`sim_rt::loop_charged_ms`). A blocking call made inside the
+    /// stretch takes no virtual time, so its charge is added to the stretch.
+    #[cfg(feature = "sim")]
+    sim_charge_at_open: u64,
 }
 
 impl IterationBudget {
@@ -215,6 +220,8 @@ impl IterationBudget {
             slowest_detail: None,
             event: NO_EVENT,
             detail: None,
+            #[cfg(feature = "sim")]
+            sim_charge_at_open: 0,
         }
     }
 
@@ -246,6 +253,10 @@ impl IterationBudget {
     pub fn enter(&mut self, phase: &'static str) {
         self.close_stretch();
         let paused_before = self.clock.as_ref().map_or(0, |c| c.paused_ms());
+        #[cfg(feature = "sim")]
+        {
+            self.sim_charge_at_open = crate::sim_rt::loop_charged_ms();
+        }
         self.open = Some((filament_transport::clock::now(), phase, paused_before));
     }
 
@@ -266,7 +277,13 @@ impl IterationBudget {
 
     fn close_stretch(&mut self) {
         if let Some((at, phase, paused_before)) = self.open.take() {
-            let took = filament_transport::clock::now().saturating_duration_since(at);
+            #[allow(unused_mut)]
+            let mut took = filament_transport::clock::now().saturating_duration_since(at);
+            #[cfg(feature = "sim")]
+            {
+                let charged = crate::sim_rt::loop_charged_ms().saturating_sub(self.sim_charge_at_open);
+                took += Duration::from_millis(charged);
+            }
             if let Some(c) = &self.clock {
                 if c.paused_ms() != paused_before || (took > PAUSE_SLACK && c.stale()) {
                     self.paused = true;

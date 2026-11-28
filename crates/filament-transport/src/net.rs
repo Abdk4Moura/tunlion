@@ -347,6 +347,57 @@ pub fn upgrade_verify_idle_ms() -> u64 {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SourceId(u64);
 
+/// Deterministic id spaces for the simulation (`--features sim`).
+///
+/// `SourceId` and `AttemptId` come from process-wide counters, so their values
+/// depend on every other run in the process (and on parallel workers), and
+/// they appear in the daemon's logs. A sim run turns on a per-thread id space
+/// starting at 1 ([`sim_ids::begin`]); each run is one thread, so its ids are
+/// the same on every replay. Ids taken on any other thread (a blocking pool
+/// thread) still come from the global counter, which starts far above the
+/// per-run space so the two never meet.
+#[cfg(feature = "sim")]
+pub mod sim_ids {
+    use std::cell::Cell;
+
+    pub(crate) enum Kind {
+        SourceId,
+        AttemptId,
+    }
+
+    thread_local! {
+        static SPACE: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
+    }
+
+    /// Start a fresh id space on this thread (a sim run begins).
+    pub fn begin() {
+        SPACE.with(|c| c.set(Some((1, 1))));
+    }
+
+    /// Leave the per-thread space (a sim run ends).
+    pub fn end() {
+        SPACE.with(|c| c.set(None));
+    }
+
+    pub(crate) fn next(kind: Kind) -> Option<u64> {
+        SPACE.with(|c| {
+            let (mut s, mut a) = c.get()?;
+            let v = match kind {
+                Kind::SourceId => {
+                    s += 1;
+                    s - 1
+                }
+                Kind::AttemptId => {
+                    a += 1;
+                    a - 1
+                }
+            };
+            c.set(Some((s, a)));
+            Some(v)
+        })
+    }
+}
+
 impl SourceId {
     /// Placeholder for test fixtures and non-transport events. Never current.
     pub const UNASSIGNED: Self = SourceId(0);
@@ -354,7 +405,12 @@ impl SourceId {
     /// Monotonic, checked allocation: exhaustion fails loud instead of wrapping
     /// onto an id that may still have queued events.
     pub fn next() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        #[cfg(feature = "sim")]
+        if let Some(v) = sim_ids::next(sim_ids::Kind::SourceId) {
+            return SourceId(v);
+        }
+        static NEXT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(if cfg!(feature = "sim") { 1 << 40 } else { 1 });
         let value = NEXT
             .fetch_update(
                 std::sync::atomic::Ordering::Relaxed,
@@ -384,7 +440,12 @@ pub struct AttemptId(u64);
 
 impl AttemptId {
     pub fn next() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        #[cfg(feature = "sim")]
+        if let Some(v) = sim_ids::next(sim_ids::Kind::AttemptId) {
+            return AttemptId(v);
+        }
+        static NEXT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(if cfg!(feature = "sim") { 1 << 40 } else { 1 });
         let value = NEXT
             .fetch_update(
                 std::sync::atomic::Ordering::Relaxed,
