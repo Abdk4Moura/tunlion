@@ -375,7 +375,8 @@ fn test_first_fleet_hello_index_write_stays_off_the_loop() {
             fault: Fault::SlowDisk { node: n.to_string(), write_ms: 1_500 },
         })
         .collect();
-    let out = SimWorld::run(cfg);
+    let out = SimWorld::run(cfg.clone());
+    assert_eq!(out.trace_hash, SimWorld::run(cfg).trace_hash, "did not replay");
     let indexed: Vec<String> = out
         .events
         .iter()
