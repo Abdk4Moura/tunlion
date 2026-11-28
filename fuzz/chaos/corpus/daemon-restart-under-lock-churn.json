@@ -1,0 +1,61 @@
+{
+  "hooks": {},
+  "origin": "written 2026-11-28 to catch #762 (baf5be515): a daemon misread /proc/locks under lock churn and never served its control socket; daemons restarted (proc.kill heals) while other programs churn file locks; each must answer its control socket after heal (O3-unresponsive)",
+  "seed": 0,
+  "steps": [
+    {
+      "at": 0.5,
+      "dur": 70.0,
+      "fault": "host.lockchurn"
+    },
+    {
+      "at": 5.0,
+      "dur": 2.0,
+      "fault": "proc.kill",
+      "target": "bravo"
+    },
+    {
+      "at": 15.0,
+      "dur": 2.0,
+      "fault": "proc.kill",
+      "target": "charlie"
+    },
+    {
+      "at": 25.0,
+      "dur": 2.0,
+      "fault": "proc.kill",
+      "target": "alpha"
+    },
+    {
+      "at": 40.0,
+      "dur": 2.0,
+      "fault": "proc.kill",
+      "target": "bravo"
+    },
+    {
+      "at": 50.0,
+      "dur": 2.0,
+      "fault": "proc.kill",
+      "target": "charlie"
+    },
+    {
+      "at": 60.0,
+      "dst": "alpha",
+      "op": "status",
+      "src": "alpha"
+    },
+    {
+      "at": 61.0,
+      "dst": "bravo",
+      "op": "status",
+      "src": "bravo"
+    },
+    {
+      "at": 62.0,
+      "dst": "charlie",
+      "op": "status",
+      "src": "charlie"
+    }
+  ],
+  "version": 1
+}
