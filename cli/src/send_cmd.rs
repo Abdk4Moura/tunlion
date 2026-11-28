@@ -2400,10 +2400,20 @@ pub(crate) async fn send_cmd(
                             Some(p) => p.fingerprints().await,
                             None => None,
                         } {
-                            t.send_control(&json!({
+                            let proof = json!({
                                 "type": "pair-proof",
                                 "mac": proof_for(sec, &conn.my_uid, &conn.my_uid, l.uid.as_deref().unwrap_or(""), &my_fp, &their_fp),
-                            })).await?;
+                            });
+                            // Same as the offer below: a link that died
+                            // before this write is lost, not the send's end.
+                            if let Err(e) = t.send_control(&proof).await {
+                                ui::debug(&format!("send: proving identity on {pid} failed ({e}); the link is lost"));
+                                conn.drop_link(&pid);
+                                if conn.is_active(&pid) {
+                                    conn.active = None;
+                                }
+                                continue;
+                            }
                         } else {
                             ui::say(&ui::paint(
                                 ui::Tone::Warn,
@@ -2434,6 +2444,14 @@ pub(crate) async fn send_cmd(
                     // prior accept so receivers continue from their partial.
                     // (The `--code` path offers later, post-PAKE; this is the
                     // local-network / known-device / direct path.)
+                    // A link can die between coming up and this write (a LAN
+                    // link reset in the same second the warm send adopted it).
+                    // That is a lost link like any other, not the end of the
+                    // send: drop it and let the loop repair or re-dial, which
+                    // re-offers everything unfinished. Ending the send here
+                    // failed it with "the warm link to the daemon is closed"
+                    // after heal while its retry succeeded.
+                    let mut offer_failed = None;
                     for o in outgoing.lock().await.iter() {
                         if o.done {
                             continue;
@@ -2447,10 +2465,26 @@ pub(crate) async fn send_cmd(
                             o.full.as_deref(),
                             o.accepted_once,
                         );
-                        t.send_control(&offer).await?;
+                        if let Err(e) = t.send_control(&offer).await {
+                            offer_failed = Some(e);
+                            break;
+                        }
                         if answer_clock.is_none() {
                             answer_clock = Some(Instant::now());
                         }
+                    }
+                    if let Some(e) = offer_failed {
+                        ui::debug(&format!("send: offering on {pid} failed ({e}); the link is lost"));
+                        if warm_pid.as_deref() != Some(pid.as_str()) {
+                            // The warm link's death is handled at the top of the
+                            // loop (repaired link, then our own); any other link
+                            // goes the way a dead link does.
+                            conn.drop_link(&pid);
+                            if conn.is_active(&pid) {
+                                conn.active = None;
+                            }
+                        }
+                        offered_to = None;
                     }
                 }
             }

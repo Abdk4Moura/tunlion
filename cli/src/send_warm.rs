@@ -134,6 +134,9 @@ impl WarmSendTransport {
         }
         let mut w = self.writer.lock().await;
         let Some(w) = w.as_mut() else {
+            // Mark it, so the send loop sees a dead link and moves on to the
+            // repaired one instead of only this write failing.
+            self.mark_dead("the daemon's control connection closed");
             bail!("the warm link to the daemon is closed");
         };
         if let Err(e) = filament_peerloop::exec_frame::write_frame(w, kind, payload).await {
