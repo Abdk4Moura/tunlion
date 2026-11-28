@@ -146,21 +146,28 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
-      - name: Cache target dir (deps + fingerprints)
+      - name: Install fast linker (mold)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq mold clang
+          echo "RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }-Clinker=clang -Clink-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+
+      - name: Cache target dir (ci-test deps + fingerprints)
         uses: actions/cache@v4
         with:
           path: |
-            target/release/.fingerprint/
-            target/release/deps/
-            target/release/build/
-            target/release/libtunlion_cli*
-          key: ${{ runner.os }}-target-${{ hashFiles('Cargo.lock') }}
+            target/ci-test/.fingerprint/
+            target/ci-test/deps/
+            target/ci-test/build/
+            target/ci-test/libtunlion_cli*
+          key: ${{ runner.os }}-target-ci-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-target-
+            ${{ runner.os }}-target-ci-test-
 
       - name: Build tunlion (test-hooks)
         working-directory: cli
-        run: cargo build --features test-hooks --release
+        run: cargo build --features test-hooks --profile ci-test --locked
         env:
           RUST_MIN_STACK: 8388608
           CMAKE_C_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'sccache' || '' }}
@@ -170,7 +177,7 @@ jobs:
 
       - name: Codesign binary (macOS)
         if: runner.os == 'macOS'
-        run: codesign --force --sign - target/release/tunlion
+        run: codesign --force --sign - target/ci-test/tunlion
 
       # Loop budget (crates/filament-peerloop/src/recv/loop_budget.rs): every
       # test-hooks daemon this job starts judges each event-loop iteration's
@@ -205,7 +212,7 @@ jobs:
         if: runner.os == 'Linux'
         env:
           TUNLION_SKIP_BUILD: "1"
-          TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
+          TUNLION_BIN: ${{ github.workspace }}/target/ci-test/tunlion
           TUNLION_TEST_SERVER: http://127.0.0.1:8077
         run: |
           set -euo pipefail
@@ -304,8 +311,8 @@ jobs:
           # migration, share the root target dir. Accept either so this test
           # does not depend on the layout.
           $built = @(
-            (Join-Path $PWD 'cli/target/release/tunlion.exe'),
-            (Join-Path $PWD 'target/release/tunlion.exe')
+            (Join-Path $PWD 'cli/target/ci-test/tunlion.exe'),
+            (Join-Path $PWD 'target/ci-test/tunlion.exe')
           ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           if (-not $built) { throw 'tunlion.exe not found under cli/target or target' }
           Copy-Item -LiteralPath $built -Destination $payload
@@ -596,10 +603,10 @@ jobs:
           # opposite here and briefly declared every macOS harness green
           # invalid; it was wrong and the greens were always valid.
           if [ "$RUNNER_OS" = "macOS" ]; then
-            cargo test --features test-hooks --release --test capability_harness \
+            cargo test --features test-hooks --profile ci-test --locked --test capability_harness \
               -- --nocapture --test-threads=1 2>&1 | tee /tmp/harness-macos.log
           else
-            cargo test --features test-hooks --release --test capability_harness \
+            cargo test --features test-hooks --profile ci-test --locked --test capability_harness \
               -- --nocapture --test-threads=1
           fi
         env:
@@ -627,7 +634,7 @@ jobs:
         shell: bash
         run: bash cli/tests/expiry-race-gates.sh
         env:
-          TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
+          TUNLION_BIN: ${{ github.workspace }}/target/ci-test/tunlion
         timeout-minutes: 6
 
       - name: Loop-stall exit gate (Linux)
@@ -635,7 +642,7 @@ jobs:
         shell: bash
         run: bash cli/tests/loop-stall-exit-gates.sh
         env:
-          TUNLION_BIN: ${{ github.workspace }}/target/release/tunlion
+          TUNLION_BIN: ${{ github.workspace }}/target/ci-test/tunlion
         timeout-minutes: 6
 
       - name: Loop budget verdict

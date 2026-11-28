@@ -54,6 +54,13 @@ jobs:
           if ! sccache --start-server >/dev/null 2>&1 && ! sccache --show-stats >/dev/null 2>&1; then
             echo "::warning::sccache unavailable; building without it"
             echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          else
+            {
+              echo "CMAKE_C_COMPILER_LAUNCHER=sccache"
+              echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"
+              echo "CC=sccache cc"
+              echo "CXX=sccache c++"
+            } >> "$GITHUB_ENV"
           fi
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -65,6 +72,16 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
+      - name: Cache target dir (ci-test deps + fingerprints)
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/ci-test/.fingerprint/
+            target/ci-test/deps/
+            target/ci-test/build/
+          key: ${{ runner.os }}-target-ci-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-ci-test-
       # The receive cells in tests/pty_flows.rs drive a real `receive` in a
       # real terminal against the signaling backend, so its deps are needed
       # here (the same pinned set as gate-suite.yml). Under CI those cells
@@ -82,9 +99,6 @@ jobs:
       - name: Test
         working-directory: cli
         run: cargo test --profile ci-test --locked
-        env:
-          CMAKE_C_COMPILER_LAUNCHER: sccache
-          CMAKE_CXX_COMPILER_LAUNCHER: sccache
       # `tunlion skill` embeds cli/skills/tunlion/SKILL.md with include_str!,
       # and `cargo publish` (publish-registries.yml, cli-v* tags) verifies by
       # building the packaged crate. A file the package leaves out is a failed
@@ -129,9 +143,6 @@ jobs:
           sudo env TUNLION_NETNS_RIG=1 PATH="$PATH" "$exe" --ignored --exact --nocapture \
             subnet_forward::tests::forwarding_rules_actually_forward_on_a_real_kernel 2>&1 | tee /tmp/netns-rig.log
           grep -q 'test result: ok. 1 passed' /tmp/netns-rig.log
-        env:
-          CMAKE_C_COMPILER_LAUNCHER: sccache
-          CMAKE_CXX_COMPILER_LAUNCHER: sccache
       # `cargo test` in cli/ runs the CLI package's tests only: a path
       # dependency is BUILT, never tested. Every crate under crates/ therefore
       # had unit tests that no CI job ran, so they could rot silently. Named
@@ -152,11 +163,6 @@ jobs:
               echo "::endgroup::"
             fi
           done 2>&1 | tee /tmp/crate-tests.log
-        env:
-          CMAKE_C_COMPILER_LAUNCHER: sccache
-          CMAKE_CXX_COMPILER_LAUNCHER: sccache
-          CC: sccache cc
-          CXX: sccache c++
       # `l3` is NOT a default peerloop feature, so the crate loop above compiles
       # and tests the library WITHOUT the overlay plane. Run the L3 suite
       # explicitly: userspace netstack bind/dial with no TUN, verified-peer
@@ -164,11 +170,6 @@ jobs:
       # exit-route tests. This is the exact-head gate for the library API.
       - name: L3 overlay library (feature l3, no TUN)
         run: cargo test --profile ci-test --locked -p tunlion-peerloop --features l3
-        env:
-          CMAKE_C_COMPILER_LAUNCHER: sccache
-          CMAKE_CXX_COMPILER_LAUNCHER: sccache
-          CC: sccache cc
-          CXX: sccache c++
       # The CLI's no-endpoint expose/addr answers live in `cli_integration`
       # (`l3_state_cli` module). Reuses the already-built `cli_integration`
       # binary from the Test step instead of triggering a fresh cross-workspace
@@ -233,6 +234,16 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
+      - name: Cache target dir (ci-test deps + fingerprints)
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/ci-test/.fingerprint/
+            target/ci-test/deps/
+            target/ci-test/build/
+          key: ${{ runner.os }}-target-ci-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-ci-test-
       - name: Test
         working-directory: cli
         shell: bash
