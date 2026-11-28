@@ -1,0 +1,37 @@
+{
+  "hooks": {},
+  "seed": 665988081,
+  "steps": [
+    {
+      "at": 6.2,
+      "dst": "bravo",
+      "op": "doctor",
+      "src": "charlie"
+    },
+    {
+      "at": 7.5,
+      "dur": 2.3,
+      "fault": "proc.kill",
+      "target": "alpha"
+    },
+    {
+      "at": 11.1,
+      "dur": 17.0,
+      "fault": "net.isolate",
+      "target": "alpha"
+    },
+    {
+      "at": 18.4,
+      "dst": "charlie",
+      "op": "status",
+      "src": "charlie"
+    },
+    {
+      "at": 24.9,
+      "dst": "bravo",
+      "op": "status",
+      "src": "bravo"
+    }
+  ],
+  "version": 1
+}

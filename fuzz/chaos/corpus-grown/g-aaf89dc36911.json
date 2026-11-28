@@ -1,0 +1,55 @@
+{
+  "hooks": {
+    "alpha": {
+      "TUNLION_TEST_DROP_PEER_LEFT": "1"
+    }
+  },
+  "seed": 335636960,
+  "steps": [
+    {
+      "args": {
+        "delay_ms": 80,
+        "dup": 5,
+        "jitter_ms": 300,
+        "loss": 50,
+        "reorder": 0
+      },
+      "at": 1.9,
+      "dur": 13.2,
+      "fault": "net.impair",
+      "target": "alpha"
+    },
+    {
+      "at": 2.3,
+      "dur": 27.4,
+      "fault": "net.isolate",
+      "target": "alpha"
+    },
+    {
+      "at": 5.5,
+      "dur": 12.4,
+      "fault": "proc.freeze",
+      "target": "alpha"
+    },
+    {
+      "args": {
+        "delay_ms": 1500,
+        "dup": 0,
+        "jitter_ms": 300,
+        "loss": 5,
+        "reorder": 0
+      },
+      "at": 12.8,
+      "dur": 72.2,
+      "fault": "net.impair",
+      "target": "charlie"
+    },
+    {
+      "at": 38.9,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}

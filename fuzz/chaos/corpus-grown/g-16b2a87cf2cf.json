@@ -1,0 +1,55 @@
+{
+  "hooks": {},
+  "seed": 97912674,
+  "steps": [
+    {
+      "at": 5.0,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 5.9,
+      "dst": "charlie",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "args": {
+        "delay_ms": 1500,
+        "dup": 0,
+        "jitter_ms": 50,
+        "loss": 50,
+        "reorder": 0
+      },
+      "at": 8.0,
+      "dur": 13.1,
+      "fault": "net.impair",
+      "target": "charlie"
+    },
+    {
+      "at": 8.9,
+      "dur": 2.5,
+      "fault": "server.down"
+    },
+    {
+      "at": 13.8,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    },
+    {
+      "at": 13.9,
+      "dur": 25.4,
+      "fault": "proc.kill",
+      "target": "charlie"
+    },
+    {
+      "at": 16.6,
+      "dst": "bravo",
+      "op": "reach",
+      "src": "alpha"
+    }
+  ],
+  "version": 1
+}
